@@ -1,0 +1,72 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "partitioncache"
+version = "0.4.0"
+description = "A partition cache implementation"
+requires-python = ">=3.9"
+dependencies = [
+    "networkx",
+    "sqlglot",
+    "bitarray",
+    "python-dotenv",
+    "tqdm",
+]
+
+[project.optional-dependencies]
+testing = [
+    "pytest",
+    "tox",
+    "flake8",
+    "pytest-cov",
+    "pytest-mock",
+    "mypy",
+]
+
+db = [
+    "psycopg",
+    "rocksdict",
+    "redis",
+    "duckdb",
+]
+
+rocksdb = [
+    "rocksdb",  # Seperate because it is not available on all platforms
+]
+
+[project.urls]
+homepage = "https://example.com/project-homepage"
+repository = "https://example.com/project-repository"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"partitioncache" = ["py.typed"]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+zip-safe = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[project.scripts]
+
+pcache-observer = "partitioncache.cli.monitor_cache_queue:main"
+pcache-manage = "partitioncache.cli.manage_cache:main"
+pcache-add = "partitioncache.cli.add_to_cache:main"
+pcache-get = "partitioncache.cli.read_from_cache:main"
+
+[tool.mypy]
+mypy_path = "src"
+check_untyped_defs = true
+warn_redundant_casts = true
+warn_unused_ignores = false
+warn_unreachable = true
+warn_return_any = true
+
+[tool.flake8]
+max-line-length = 160
