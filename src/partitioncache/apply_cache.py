@@ -93,7 +93,7 @@ def extend_query_with_partition_keys(
         partition_keys (set[int] | set[str]): The set of partition keys to extend the query with.
         partition_key (str): The identifier for the partition.
         method (Literal["IN", "VALUES", "TMP_TABLE_IN", "TMP_TABLE_JOIN"]): The method to use to extend the query.
-        p0_alias (str | None): The alias of the table to use for the partition key.
+        p0_alias (str | None): The alias of the table to use for the partition key. If not set for JOIN methods, it will JOIN on all tables.
 
     Returns:
         str: The extended SQL query as string.
@@ -154,9 +154,12 @@ def extend_query_with_partition_keys(
         for from_clause in from_clauses:
             # Get alias of the table
             table_alias = from_clause.alias_or_name
-
+            
+            if p0_alias is not None and table_alias != p0_alias:
+                continue
+            
             # Create the new join expression
-            join_expr = f"{from_clause.this.name} AS {table_alias} INNER JOIN tmp_partition_keys AS tmp_{table_alias} ON {table_alias}.{partition_key} = tmp_{table_alias}.partition_key"
+            join_expr = f"tmp_partition_keys AS tmp_{table_alias} INNER JOIN {from_clause.this.name} AS {table_alias} ON tmp_{table_alias}.partition_key = {table_alias}.{partition_key}"
 
             # Replace the old join expression with the new one
             from_clause.this.replace(join_expr)
