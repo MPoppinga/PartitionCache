@@ -147,6 +147,8 @@ def extend_query_with_partition_keys(
         x = sqlglot.parse_one(query)
 
         from_clauses: list[exp.Join | exp.From] = list(x.find_all(exp.Join))
+
+        # Add first table from FROM as not present in JOINs
         from_1st = x.find(exp.From)
         if from_1st is not None:
             from_clauses.append(from_1st)
@@ -154,12 +156,20 @@ def extend_query_with_partition_keys(
         for from_clause in from_clauses:
             # Get alias of the table
             table_alias = from_clause.alias_or_name
-            
+
             if p0_alias is not None and table_alias != p0_alias:
                 continue
-            
-            # Create the new join expression
-            join_expr = f"tmp_partition_keys AS tmp_{table_alias} INNER JOIN {from_clause.this.name} AS {table_alias} ON tmp_{table_alias}.partition_key = {table_alias}.{partition_key}"
+
+            # Create the new join expression using sqlglot
+            join_expr = (
+                from_clause.this.sql()  # Original table
+                + " "  # Space between tables
+                + exp.Join(
+                    this=exp.Identifier(this=f"tmp_partition_keys AS tmp_{table_alias}"),
+                    on=exp.EQ(this=exp.Identifier(this=f"tmp_{table_alias}.partition_key"), expression=exp.Identifier(this=f"{table_alias}.{partition_key}")),
+                    kind="INNER",
+                ).sql()  # New join expression
+            )
 
             # Replace the old join expression with the new one
             from_clause.this.replace(join_expr)
