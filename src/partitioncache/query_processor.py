@@ -45,9 +45,10 @@ def clean_query(query: str) -> str:
     # Removing tailing semicolon
     query = re.sub(r";\s*$", "", query)
 
-    # Remove all double quotes from the normalized query
+    # Remove all double quotes(postgresql) and backticks(mysql) from the normalized query
     query = query.replace('"', "")  # TODO currently double quotes are not supported in identifiers in PartitionCache
-
+    query = query.replace("`", "")  # TODO currently backticks are not supported in identifiers in PartitionCache
+    
     return query
 
 

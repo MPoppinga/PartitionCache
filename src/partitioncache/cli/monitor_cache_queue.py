@@ -15,12 +15,14 @@ import redis
 
 from partitioncache.cache_handler import get_cache_handler
 from partitioncache.db_handler.abstract import AbstractDBHandler
+from partitioncache.db_handler.mysql import MySQLDBHandler
 from partitioncache.db_handler.postgres import PostgresDBHandler
+from partitioncache.db_handler.sqlite import SQLiteDBHandler
 from partitioncache.query_processor import generate_all_query_hash_pairs
 
 parser = argparse.ArgumentParser()
 
-parser.add_argument("--db_backend", type=str, default="sqlite", help="database backend")
+parser.add_argument("--db_backend", type=str, default="sqlite", help="database backend", choices=["postgresql", "mysql", "sqlite"])
 parser.add_argument("--cache_backend", type=str, default="rocksdb", help="cache backend")
 parser.add_argument("--db_dir", type=str, default="data/test_db.sqlite", help="database directory")
 parser.add_argument("--db_env_file", type=str, help="database environment file")
@@ -64,12 +66,22 @@ def run_and_store_query(query: str, hash: str):
                 raise ValueError("db_env_file is required")
 
             db_handler = PostgresDBHandler(
-                host=os.getenv("DB_HOST", "localhost"),
-                port=int(os.getenv("DB_PORT", 5432)),
-                user=os.getenv("DB_USER", "postgres"),
-                password=os.getenv("DB_PASSWORD", "postgres"),
+                host=os.getenv("PG_DB_HOST", os.getenv("DB_HOST", "localhost")),
+                port=int(os.getenv("PG_DB_PORT", os.getenv("DB_PORT", 5432))),
+                user=os.getenv("PG_DB_USER", os.getenv("DB_USER", "postgres")),
+                password=os.getenv("PG_DB_PASSWORD", os.getenv("DB_PASSWORD", "postgres")),
                 dbname=args.db_name,
             )
+        elif args.db_backend == "mysql":
+            db_handler = MySQLDBHandler(
+                host=os.getenv("MY_DB_HOST", os.getenv("DB_HOST", "localhost")),
+                port=int(os.getenv("MY_DB_PORT", os.getenv("DB_PORT", 3306))),
+                user=os.getenv("MY_DB_USER", os.getenv("DB_USER", "root")),
+                password=os.getenv("MY_DB_PASSWORD", os.getenv("DB_PASSWORD", "root")),
+                dbname=args.db_name,
+            )
+        elif args.db_backend == "sqlite":
+            db_handler = SQLiteDBHandler(args.db_dir)
         else:
             raise AssertionError("No db backend specified, querying not possible")
 
@@ -116,7 +128,7 @@ def process_completed_future(future, hash):
     global pool  # Ensure pool is accessible
     if pool is None:
         raise AssertionError("No pool set up")
-    
+
     with status_lock:
         if hash in active_futures:
             active_futures.remove(hash)
@@ -136,7 +148,6 @@ def process_completed_future(future, hash):
 
 
 def main():
-    
     if args.db_backend is None:
         raise ValueError("db_backend is required")
 
@@ -178,7 +189,7 @@ def main():
                         print_status(active, pending)
                     rr: list[bytes]
 
-                    rr = pop_redis(r) # type: ignore
+                    rr = pop_redis(r)  # type: ignore
                     print("Found query in queue")
 
                     query = rr[1].decode("utf-8")
@@ -222,7 +233,6 @@ def main():
                     print("Exiting")
                     pool.shutdown(wait=True)
                     break
-
 
     # Start the job fetcher in the main thread
     job_fetcher()
