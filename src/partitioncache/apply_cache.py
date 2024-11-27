@@ -81,7 +81,12 @@ def find_p0_alias(query: str) -> str:
 
 
 def extend_query_with_partition_keys(
-    query: str, partition_keys: set[int] | set[str], partition_key: str, method: Literal["IN", "VALUES", "TMP_TABLE_JOIN"] = "IN", p0_alias: str | None = None
+    query: str,
+    partition_keys: set[int] | set[str], 
+    partition_key: str,
+    method: Literal["IN", "VALUES", "TMP_TABLE_JOIN"] = "IN",
+    p0_alias: str | None = None,
+    analyze_tmp_table: bool = True
 ) -> str:
     """
     Extend a given SQL query with the cache functionality.
@@ -139,9 +144,9 @@ def extend_query_with_partition_keys(
 
         newquery = f"""CREATE TEMPORARY TABLE tmp_partition_keys (partition_key INT PRIMARY KEY);
                     INSERT INTO tmp_partition_keys (partition_key) (VALUES({"),(".join(str(pk) for pk in partition_keys)}));
-                    CREATE INDEX tmp_partition_keys_idx ON tmp_partition_keys USING HASH(partition_key);
-                    ANALYZE tmp_partition_keys;
                     """
+        if analyze_tmp_table:
+            newquery += "CREATE INDEX tmp_partition_keys_idx ON tmp_partition_keys USING HASH(partition_key);ANALYZE tmp_partition_keys;"
 
         ## Add as inner join to all tables
         x = sqlglot.parse_one(query)
