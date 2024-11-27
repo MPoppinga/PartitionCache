@@ -13,7 +13,7 @@ class ShelveCacheHandler(AbstractCacheHandler):
 
     def __init__(self, db_path: str, read_only: bool = False) -> None:
         logger.warning(
-            "ShevefCacheHandler does not support concurrent writes, "
+            "ShelveCacheHandler does not support concurrent writes, "
             "New enties are only visible after the database is closed and reopened."
             "Use another cache backend if concurrent operation is desired."
         )
@@ -31,6 +31,7 @@ class ShelveCacheHandler(AbstractCacheHandler):
             # Open the shelve file with appropriate flag
             flag = "r" if read_only else "c"
             self.db = shelve.open(db_path, flag=flag, writeback=True)
+            
         except Exception as e:
             raise RuntimeError(f"Failed to open shelve database at {db_path}: {str(e)}")
 
