@@ -6,14 +6,14 @@ from partitioncache.cache_handler.abstract import AbstractCacheHandler
 logger = getLogger("PartitionCache")
 
 
-class ShelfCacheHandler(AbstractCacheHandler):
+class ShelveCacheHandler(AbstractCacheHandler):
     """
     Handles access to a cache using shelve module.
     """
 
     def __init__(self, db_path: str, read_only: bool = False) -> None:
         logger.warning(
-            "ShelfCacheHandler does not support concurrent writes, "
+            "ShevefCacheHandler does not support concurrent writes, "
             "New enties are only visible after the database is closed and reopened."
             "Use another cache backend if concurrent operation is desired."
         )
@@ -28,11 +28,11 @@ class ShelfCacheHandler(AbstractCacheHandler):
             db_path = db_path[:-4]
 
         try:
-            # Open the shelf file with appropriate flag
+            # Open the shelve file with appropriate flag
             flag = "r" if read_only else "c"
             self.db = shelve.open(db_path, flag=flag, writeback=True)
         except Exception as e:
-            raise RuntimeError(f"Failed to open shelf database at {db_path}: {str(e)}")
+            raise RuntimeError(f"Failed to open shelve database at {db_path}: {str(e)}")
 
         self.allow_lazy = False
 
@@ -99,19 +99,19 @@ class ShelfCacheHandler(AbstractCacheHandler):
 
     def close(self) -> None:
         """
-        Close the shelf database.
+        Close the shelve database.
         """
         self.db.close()
 
     def compact(self) -> None:
         """
-        Shelf doesn't support compaction, but we can sync to ensure all data is written.
+        Shelve doesn't support compaction, but we can sync to ensure all data is written.
         """
         self.db.sync()
 
     def get_all_keys(self) -> list[str]:
         """
-        Get all keys from the shelf cache.
+        Get all keys from the shelve cache.
 
         Returns:
             list[str]: List of keys

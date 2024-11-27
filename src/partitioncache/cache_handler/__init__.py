@@ -134,14 +134,14 @@ def get_cache_handler(cache_type: str) -> AbstractCacheHandler:
         if not db_path:
             raise ValueError("ROCKSDB_DICT_PATH environment variable not set")
         return RocksDictCacheHandler(db_path=db_path)
-    elif cache_type == "shelf":
-        from partitioncache.cache_handler.shelf import ShelfCacheHandler
+    elif cache_type == "shelve":
+        from partitioncache.cache_handler.shelve import ShelveCacheHandler
         
-        db_path = os.getenv("SHELF_PATH")
+        db_path = os.getenv("SHELVE_PATH")
         if not db_path:
-            raise ValueError("SHELF_PATH environment variable not set")
-        read_only = os.getenv("SHELF_READ_ONLY", "false").lower() == "true"
-        return ShelfCacheHandler(
+            raise ValueError("SHELVE_PATH environment variable not set")
+        read_only = os.getenv("SHELVE_READ_ONLY", "false").lower() == "true"
+        return ShelveCacheHandler(
             db_path=db_path,
             read_only=read_only
         )
