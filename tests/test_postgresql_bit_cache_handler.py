@@ -1,6 +1,7 @@
 import pytest
 from unittest.mock import Mock, patch
 from psycopg import sql
+from partitioncache.cache_handler.abstract import AbstractCacheHandler_Lazy
 from partitioncache.cache_handler.postgresql_bit import PostgreSQLBitCacheHandler
 
 INIT_CALLS = [
@@ -34,15 +35,16 @@ def cache_handler(mock_db, mock_cursor):
 
 def test_init(cache_handler):
     assert cache_handler.tablename == "test_bit_cache_table"
-    assert cache_handler.allow_lazy is True
+    assert isinstance(cache_handler, PostgreSQLBitCacheHandler)
+    assert isinstance(cache_handler, AbstractCacheHandler_Lazy)
     
     # Check that the necessary SQL commands were executed
     expected_calls = INIT_CALLS
     
     for call in expected_calls:
-        cache_handler.cursor.execute.assert_any_call(call)
+        cache_handler.cursor.execute.assert_any_call(call) # type: ignore
     
-    assert cache_handler.cursor.execute.call_count == len(expected_calls)
+    assert cache_handler.cursor.execute.call_count == len(expected_calls) # type: ignore
 
 def test_set_set(cache_handler):
     cache_handler.set_set("key1", {1, 2, 3})
