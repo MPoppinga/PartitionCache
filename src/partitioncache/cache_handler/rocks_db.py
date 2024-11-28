@@ -10,6 +10,7 @@ from partitioncache.cache_handler.abstract import AbstractCacheHandler
 
 logger = getLogger("PartitionCache")
 
+
 class RocksDBCacheHandler(AbstractCacheHandler):
     """
     Handles access to a RocksDB cache.
@@ -18,7 +19,6 @@ class RocksDBCacheHandler(AbstractCacheHandler):
 
     def __init__(self, db_path: str, read_only: bool = False) -> None:
         self.db = DB(db_path, Options(create_if_missing=True), read_only=read_only)  # type: ignore
-        self.allow_lazy = False
 
     def get(self, key: str, settype=int) -> set[int] | set[str] | None:
         search_space_list = self.db.get(key.encode())
@@ -34,6 +34,16 @@ class RocksDBCacheHandler(AbstractCacheHandler):
         Returns True if the key exists in the cache, otherwise False.
         """
         return self.db.get(key.encode()) is not None
+
+    def filter_existing_keys(self, keys: set) -> set:
+        """
+        Checks in RocksDB which of the keys exists in cache and returns the set of existing keys.
+        """
+        existing_keys = set()
+        for key in keys:
+            if self.db.get(key.encode()) is not None:
+                existing_keys.add(key)
+        return existing_keys
 
     def get_intersected(self, keys: set[str], settype=int) -> tuple[set[int] | None, int]:
         """
@@ -82,6 +92,9 @@ class RocksDBCacheHandler(AbstractCacheHandler):
 
     def set_null(self, key: str) -> None:
         self.db.put(key.encode(), b"\x00", sync=True)
+
+    def is_null(self, key: str) -> bool:
+        return self.db.get(key.encode()) == b"\x00"
 
     def delete(self, key: str) -> None:
         key_b = key.encode("utf-8")

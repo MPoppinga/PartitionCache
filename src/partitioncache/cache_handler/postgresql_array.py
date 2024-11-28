@@ -4,12 +4,12 @@ from logging import getLogger
 import psycopg
 from psycopg import sql
 
-from partitioncache.cache_handler.abstract import AbstractCacheHandler
+from partitioncache.cache_handler.abstract import AbstractCacheHandler_Lazy
 
 logger = getLogger("PartitionCache")
 
 
-class PostgreSQLArrayCacheHandler(AbstractCacheHandler):
+class PostgreSQLArrayCacheHandler(AbstractCacheHandler_Lazy):
     def __init__(self, db_name, db_host, db_user, db_password, db_port, db_table) -> None:
         """
         Initialize the cache handler with the given db name."""
@@ -22,8 +22,6 @@ class PostgreSQLArrayCacheHandler(AbstractCacheHandler):
             sql.SQL("CREATE INDEX IF NOT EXISTS idx_large_sets_elements ON {} USING GIN (value gin__int_ops);").format(sql.Identifier(self.tablename))
         )
         self.cursor.execute(sql.SQL("CREATE INDEX IF NOT EXISTS idx_large_sets_keys ON {} (key);").format(sql.Identifier(self.tablename)))
-
-        self.allow_lazy = True
 
     def close(self):
         self.cursor.close()

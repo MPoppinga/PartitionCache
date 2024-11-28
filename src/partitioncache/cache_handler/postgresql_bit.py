@@ -1,13 +1,15 @@
-from partitioncache.cache_handler.abstract import AbstractCacheHandler
-import psycopg
-from psycopg import sql
-from bitarray import bitarray
 from logging import getLogger
+
+import psycopg
+from bitarray import bitarray
+from psycopg import sql
+
+from partitioncache.cache_handler.abstract import AbstractCacheHandler_Lazy
 
 logger = getLogger("PartitionCache")
 
 
-class PostgreSQLBitCacheHandler(AbstractCacheHandler):
+class PostgreSQLBitCacheHandler(AbstractCacheHandler_Lazy):
     def __init__(self, db_name, db_host, db_user, db_password, db_port, db_table, bitsize) -> None:
         """
         Initialize the cache handler with the given db name."""
@@ -16,8 +18,6 @@ class PostgreSQLBitCacheHandler(AbstractCacheHandler):
         self.bitsize = bitsize + 1  # Add one to the bitsize to avoid off by one errors
         self.cursor = self.db.cursor()
         self.cursor.execute(f"CREATE TABLE IF NOT EXISTS {self.tablename} (key TEXT PRIMARY KEY, value bit({self.bitsize}));")  # type: ignore
-
-        self.allow_lazy = True
 
     def close(self):
         self.cursor.close()
@@ -105,7 +105,6 @@ class PostgreSQLBitCacheHandler(AbstractCacheHandler):
         keys_set = set(x[0] for x in self.cursor.fetchall())
         logger.info(f"Found {len(keys_set)} existing hashkeys")
         return keys_set
-
 
     def get_intersected_lazy(self, keys: set[str]) -> tuple[sql.Composed | None, int]:
         fitered_keys = self.filter_existing_keys(keys)

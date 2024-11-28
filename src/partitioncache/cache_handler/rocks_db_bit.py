@@ -4,10 +4,10 @@ from rocksdb import (
     Options,  # type: ignore
 )
 
-from partitioncache.cache_handler.abstract import AbstractCacheHandler
+from partitioncache.cache_handler.rocks_db import RocksDBCacheHandler
 
 
-class RocksDBBitCacheHandler(AbstractCacheHandler):
+class RocksDBBitCacheHandler(RocksDBCacheHandler):
     """
     Handles access to a RocksDB cache using bitarrays for efficient storage.
     """
@@ -41,7 +41,6 @@ class RocksDBBitCacheHandler(AbstractCacheHandler):
         #    block_cache_compressed=compressed_cache,
         # )
 
-        self.allow_lazy = False
         self.bitsize = bitsize + 1  # Add one to the bitsize to avoid off by one errors
 
     def get(self, key: str, settype=int) -> set[int] | None:
@@ -55,12 +54,6 @@ class RocksDBBitCacheHandler(AbstractCacheHandler):
         bitval = bitarray()
         bitval.frombytes(value)
         return set(bitval.search(bitarray("1")))
-
-    def exists(self, key: str) -> bool:
-        """
-        Returns True if the key exists in the cache, otherwise False.
-        """
-        return self.db.get(key.encode()) is not None
 
     def get_intersected(self, keys: set[str], settype=int) -> tuple[set[int] | None, int]:
         """
@@ -104,32 +97,3 @@ class RocksDBBitCacheHandler(AbstractCacheHandler):
             return
 
         self.db.put(key.encode(), bitval.tobytes(), sync=True)
-
-    def set_null(self, key: str) -> None:
-        self.db.put(key.encode(), b"\x00", sync=True)
-
-    def delete(self, key: str) -> None:
-        self.db.delete(key.encode())
-
-    def close(self) -> None:
-        """
-        RocksDB does not have a close method, so we can skip this.
-        """
-        pass
-
-    def compact(self) -> None:
-        self.db.compact_range()
-
-    def get_all_keys(self) -> list:
-        """
-        Get all keys from the RocksDB cache.
-
-        Returns:
-            list: _description_
-        """
-        keys = []
-        it = self.db.iterkeys()
-        it.seek_to_first()
-        for key in it:
-            keys.append(key.decode("utf-8"))
-        return keys

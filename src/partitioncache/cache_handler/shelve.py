@@ -1,6 +1,7 @@
 import shelve
-from pathlib import Path
 from logging import getLogger
+from pathlib import Path
+
 from partitioncache.cache_handler.abstract import AbstractCacheHandler
 
 logger = getLogger("PartitionCache")
@@ -31,12 +32,9 @@ class ShelveCacheHandler(AbstractCacheHandler):
             # Open the shelve file with appropriate flag
             flag = "r" if read_only else "c"
             self.db = shelve.open(db_path, flag=flag, writeback=True)
-            
+
         except Exception as e:
             raise RuntimeError(f"Failed to open shelve database at {db_path}: {str(e)}")
-
-        self.allow_lazy = False
-
 
     def get(self, key: str, settype=int) -> set[int] | set[str] | None:
         # If not in cache, get from DB
@@ -86,6 +84,8 @@ class ShelveCacheHandler(AbstractCacheHandler):
         self.db[key] = "NULL"
         self.db.sync()
 
+    def is_null(self, key: str) -> bool:
+        return self.db.get(key) == "NULL"
 
     def delete(self, key: str) -> None:
         """
@@ -96,7 +96,6 @@ class ShelveCacheHandler(AbstractCacheHandler):
             self.db.sync()
         except KeyError:
             pass
-
 
     def close(self) -> None:
         """

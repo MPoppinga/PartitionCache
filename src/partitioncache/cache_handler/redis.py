@@ -12,7 +12,6 @@ class RedisCacheHandler(AbstractCacheHandler):
         """
         Initialize the cache handler with the given db name."""
         self.db = redis.Redis(host=db_host, port=db_port, db=db_name, password=db_password)
-        self.allow_lazy = False
 
     def get(self, key: str, settype=int) -> set[int] | set[str] | None:
         key_type = self.db.type(key)
@@ -44,6 +43,16 @@ class RedisCacheHandler(AbstractCacheHandler):
         Returns True if the key exists in the cache, otherwise False.
         """
         return self.db.exists(key) != 0
+
+    def filter_existing_keys(self, keys: set) -> set:
+        """
+        Checks in redis which of the keys exists in cache and returns the set of existing keys.
+        """
+        pipe = self.db.pipeline()
+        for key in keys:
+            pipe.type(key)
+        key_types = pipe.execute()
+        return set([key for key, key_type in zip(keys, key_types) if key_type == b"set"])
 
     def get_intersected(self, keys: set[str], settype=int) -> tuple[set[int] | set[str] | None, int]:
         """
@@ -79,6 +88,9 @@ class RedisCacheHandler(AbstractCacheHandler):
 
     def set_null(self, key: str) -> None:
         self.db.set(key, "\x00")
+
+    def is_null(self, key: str) -> bool:
+        return self.db.get(key) == "\x00"
 
     def delete(self, key: str) -> None:
         self.db.delete(key)

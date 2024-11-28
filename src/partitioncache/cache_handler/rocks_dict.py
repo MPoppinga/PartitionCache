@@ -1,6 +1,8 @@
-from rocksdict import Rdict, Options, AccessType
-from partitioncache.cache_handler.abstract import AbstractCacheHandler
 from logging import getLogger
+
+from rocksdict import AccessType, Options, Rdict
+
+from partitioncache.cache_handler.abstract import AbstractCacheHandler
 
 logger = getLogger("PartitionCache")
 
@@ -20,8 +22,6 @@ class RocksDictCacheHandler(AbstractCacheHandler):
         opts.set_allow_mmap_reads(True)  # Enable memory-mapped reads
         opts.increase_parallelism(4)  # Increase parallel operations
         self.db = Rdict(db_path, options=opts, access_type=AccessType.read_only() if read_only else AccessType.read_write())
-        self.allow_lazy = False
-
 
     def get(self, key: str, settype=int) -> set[int] | set[str] | None:
         # get from DB
@@ -36,6 +36,16 @@ class RocksDictCacheHandler(AbstractCacheHandler):
         Returns True if the key exists in the cache, otherwise False.
         """
         return key in self.db
+
+    def filter_existing_keys(self, keys: set) -> set:
+        """
+        Checks in RocksDB which of the keys exists in cache and returns the set of existing keys.
+        """
+        existing_keys = set()
+        for key in keys:
+            if self.db.get(key.encode()) is not None:
+                existing_keys.add(key)
+        return existing_keys
 
     def get_intersected(self, keys: set[str], settype=int) -> tuple[set[int] | None, int]:
         """
@@ -68,6 +78,8 @@ class RocksDictCacheHandler(AbstractCacheHandler):
         """
         self.db[key] = "NULL"
 
+    def is_null(self, key: str) -> bool:
+        return self.db.get(key) == "NULL"
 
     def delete(self, key: str) -> None:
         """

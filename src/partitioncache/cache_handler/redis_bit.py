@@ -1,11 +1,12 @@
 import uuid
+
 import redis
 from bitarray import bitarray
 
-from partitioncache.cache_handler.abstract import AbstractCacheHandler
+from partitioncache.cache_handler.redis import RedisCacheHandler
 
 
-class RedisBitCacheHandler(AbstractCacheHandler):
+class RedisBitCacheHandler(RedisCacheHandler):
     """
     Handles access to a Redis Bitarray cace
     """
@@ -14,7 +15,6 @@ class RedisBitCacheHandler(AbstractCacheHandler):
         """
         Initialize the cache handler with the given db name."""
         self.db = redis.Redis(host=db_host, port=db_port, db=db_name, password=db_password)
-        self.allow_lazy = False
         self.bitsize = bitsize + 1  # Add one to the bitsize to avoid off by one errors
 
     def get(self, key: str, settype=int) -> set[int] | set[str] | None:
@@ -31,12 +31,6 @@ class RedisBitCacheHandler(AbstractCacheHandler):
 
         bitval = bitarray(value.decode())  # type: ignore
         return set(bitval.search(bitarray("1")))
-
-    def exists(self, key: str) -> bool:
-        """
-        Returns True if the key exists in the cache, otherwise False.
-        """
-        return self.db.exists(key) != 0
 
     def get_intersected(self, keys: set[str], settype=int) -> tuple[set[int] | set[str] | None, int]:
         """
@@ -62,6 +56,16 @@ class RedisBitCacheHandler(AbstractCacheHandler):
             self.db.delete(f"temp_{randuuid}")
             return set(bitval.search(bitarray("1"))), len(valid_keys)
 
+    def filter_existing_keys(self, keys: set) -> set:
+        """
+        Checks in redis which of the keys exists in cache and returns the set of existing keys.
+        """
+        pipe = self.db.pipeline()
+        for key in keys:
+            pipe.type(key)
+        key_types = pipe.execute()
+        return set([key for key, key_type in zip(keys, key_types) if key_type == b"string"])
+
     def set_set(self, key: str, value: set[int] | set[str], settype=int) -> None:
         if settype is str:
             raise ValueError("Only integer values are supported")
@@ -77,15 +81,3 @@ class RedisBitCacheHandler(AbstractCacheHandler):
             return
 
         self.db.set(key, val.to01())
-
-    def set_null(self, key: str) -> None:
-        self.db.set(key, "\x00")
-
-    def delete(self, key: str) -> None:
-        self.db.delete(key)
-
-    def close(self) -> None:
-        self.db.close()
-
-    def get_all_keys(self) -> list:
-        return [key.decode() for key in self.db.keys("*")]  # type: ignore

@@ -12,7 +12,7 @@ from typing import Literal
 import sqlglot
 import sqlglot.expressions as exp
 
-from partitioncache.cache_handler.abstract import AbstractCacheHandler
+from partitioncache.cache_handler.abstract import AbstractCacheHandler, AbstractCacheHandler_Lazy
 from partitioncache.query_processor import generate_all_hashes
 
 logger = getLogger("PartitionCache")
@@ -65,6 +65,8 @@ def get_partition_keys_lazy(query: str, cache_handler: AbstractCacheHandler, par
     )
 
     # -> tuple[sql.Composed | None , int]
+    if not isinstance(cache_handler, AbstractCacheHandler_Lazy):
+        raise ValueError("Cache handler does not support lazy intersection")
     lazy_cache_subquery, used_hashes = cache_handler.get_intersected_lazy(set(hashses))
     return lazy_cache_subquery, used_hashes
 
