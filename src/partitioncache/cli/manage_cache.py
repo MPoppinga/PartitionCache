@@ -133,7 +133,7 @@ def count_queue():
         port=int(os.getenv("REDIS_PORT", 6379)),
         db=int(os.getenv("QUERY_QUEUE_REDIS_DB", 1)),  # Ensure this matches your queue DB
     )
-    queue_length = r.llen("query_queue")
+    queue_length = r.llen(os.getenv("QUERY_QUEUE_REDIS_QUEUE_KEY", "query_queue"))
     logger.info(f"Number of entries in the queue: {queue_length}")
     long_running_queries_length = r.llen("long_running_queries")
     logger.info(f"Number of long running queries: {long_running_queries_length}")
@@ -146,7 +146,7 @@ def clear_queue():
         port=int(os.getenv("REDIS_PORT", 6379)),
         db=int(os.getenv("QUERY_QUEUE_REDIS_DB", 1)),  # Ensure this matches your queue DB
     )
-    r.delete("query_queue")
+    r.delete(os.getenv("QUERY_QUEUE_REDIS_QUEUE_KEY", "query_queue"))
     r.delete("long_running_queries")
     logger.info("Queue cleared.")
     r.close()
