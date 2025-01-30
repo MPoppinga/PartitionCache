@@ -2,6 +2,7 @@ import argparse
 import os
 import pickle
 from logging import getLogger
+import logging
 
 import redis
 from dotenv import load_dotenv
@@ -11,6 +12,8 @@ from partitioncache.cache_handler import get_cache_handler
 from partitioncache.cache_handler.abstract import AbstractCacheHandler
 
 logger = getLogger("PartitionCache")
+logger.setLevel(logging.INFO)
+logger.addHandler(logging.StreamHandler())
 
 
 def copy_cache(from_cache_type: str, to_cache_type: str):

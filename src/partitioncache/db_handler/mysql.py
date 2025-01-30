@@ -6,7 +6,6 @@ from logging import getLogger
 from typing import Any, List
 
 import mysql.connector
-from mysql.connector import pooling
 
 from partitioncache.db_handler.abstract import AbstractDBHandler
 

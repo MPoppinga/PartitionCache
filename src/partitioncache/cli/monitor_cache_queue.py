@@ -8,7 +8,7 @@ import datetime
 import multiprocessing
 import os
 import threading
-
+import time
 import dotenv
 import psycopg
 import redis
@@ -27,6 +27,7 @@ parser.add_argument("--cache_backend", type=str, default="rocksdb", help="cache 
 parser.add_argument("--db_dir", type=str, default="data/test_db.sqlite", help="database directory")
 parser.add_argument("--db_env_file", type=str, help="database environment file")
 parser.add_argument("--partition_key", type=str, default="partition_key", help="search space identifier")
+parser.add_argument("--close", action="store_true", default=False, help="Close the cache after operation")
 
 parser.add_argument("--max_processes", type=int, default=12, help="max number of processes to use")
 ## DB Info
@@ -48,6 +49,7 @@ status_lock = threading.Lock()
 active_futures: list[str] = []
 pending_jobs: list[tuple[str, str]] = []
 pool: concurrent.futures.ProcessPoolExecutor | None = None  # Initialize pool as None
+exit_event = threading.Event()  # Create an event to signal exit
 
 
 def pop_redis(r: redis.Redis):
@@ -71,6 +73,7 @@ def run_and_store_query(query: str, hash: str):
                 user=os.getenv("PG_DB_USER", os.getenv("DB_USER", "postgres")),
                 password=os.getenv("PG_DB_PASSWORD", os.getenv("DB_PASSWORD", "postgres")),
                 dbname=args.db_name,
+                timeout=args.long_running_query_timeout,
             )
         elif args.db_backend == "mysql":
             db_handler = MySQLDBHandler(
@@ -86,6 +89,7 @@ def run_and_store_query(query: str, hash: str):
             raise AssertionError("No db backend specified, querying not possible")
 
         try:
+            t = time.perf_counter()
             result = set(db_handler.execute(query))
 
             # Apply limit if specified
@@ -104,7 +108,7 @@ def run_and_store_query(query: str, hash: str):
 
         print(f"Running query {hash}")
         print(f"Query {hash} returned {len(result)} results")
-
+        print(f"Query {hash} took {time.perf_counter() - t} seconds")
         db_handler.close()
 
         cache_handler.set_set(hash, result)
@@ -145,9 +149,14 @@ def process_completed_future(future, hash):
             print(f"Started query {next_hash} from pending queue")
 
         print_status(len(active_futures), len(pending_jobs))
+        if args.close and len(active_futures) == 0 and len(pending_jobs) == 0:
+            print("Closing cache at ", datetime.datetime.now())
+            exit_event.set()  # Signal to exit
+            
 
 
 def main():
+    print("Starting main, Current Time: ", datetime.datetime.now())
     if args.db_backend is None:
         raise ValueError("db_backend is required")
 
@@ -180,7 +189,7 @@ def main():
     def job_fetcher():
         global pool  # Make pool accessible in process_completed_future
         with concurrent.futures.ProcessPoolExecutor(max_workers=args.max_processes) as pool:
-            while True:
+            while not exit_event.is_set():
                 try:
                     print("Waiting for query")
                     with status_lock:
@@ -231,7 +240,8 @@ def main():
 
                 except KeyboardInterrupt:
                     print("Exiting")
-                    pool.shutdown(wait=True)
+                    exit_event.set()  # Ensure the exit event is set
+                    pool.shutdown(wait=True)  # Wait for all processes to finish
                     break
 
     # Start the job fetcher in the main thread
