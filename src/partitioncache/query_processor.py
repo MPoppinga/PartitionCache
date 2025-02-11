@@ -174,7 +174,7 @@ def extract_and_group_query_conditions(
     Extracts all conditions from a query
     Splits it by distance functions, attributes and subqueries for the partition key
     """
-    attribute_conditions: dict[str, list[str]] = defaultdict(list)  # {table_alias: [conditions]}
+    attribute_conditions: dict[str, list[str]] = dict()  # {table_alias: [conditions]}
     distance_conditions: dict[tuple[str, str], list[str]] = defaultdict(list)  # {(table_alias1, table_alias2): [conditions]}
     other_functions: dict[tuple, list[str]] = defaultdict(list)  # {(table_alias1, ...): [conditions]}
     partition_key_conditions: list[str] = []  #   # List of all subqueries
@@ -191,6 +191,10 @@ def extract_and_group_query_conditions(
 
     table_aliases = [x.split(" ")[-1] for x in tables]
     table = [x.split(" ")[0] for x in tables][0]  # TODO Ensure robustness
+
+    # define emtpy list for attribute_conditions for each tablealias
+    for ta in table_aliases:
+        attribute_conditions[ta] = list()
 
     # get all conditions from where clause
     condition_list: list[str] = extract_conjunctive_conditions(query)

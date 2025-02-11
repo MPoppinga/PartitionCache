@@ -63,7 +63,7 @@ def test_basic_query():
         table,
     ) = extract_and_group_query_conditions(query, partition_key)
 
-    assert attribute_conditions == {"rp0": ["field1 = 1"]}
+    assert attribute_conditions == {"rp0": ["field1 = 1"], "rp1": []}
     assert distance_conditions == {("rp0", "rp1"): ["DIST(rp0.geo, rp1.geo) <= 4.0"]}
     assert or_conditions == {}
     assert partition_key_conditions == []
@@ -97,7 +97,7 @@ def test_complex_query():
     ) = extract_and_group_query_conditions(query, partition_key)
 
     assert dict(or_conditions) == {("rp2",): ["(rp2.field2 = 2 OR rp2.field2 = 3)"]}
-    assert dict(attribute_conditions) == {"rp0": ["field1 = 1"]}
+    assert dict(attribute_conditions) == {"rp0": ["field1 = 1"], "rp1": [], "rp2": [], "rp3": []}
 
     assert dict(distance_conditions) == {
         ("rp0", "rp3"): ["DIST(rp0.geo, rp3.geo) <= 4.0"]
@@ -159,7 +159,7 @@ def test_query_with_multiple_distance_conditions():
         table,
     ) = extract_and_group_query_conditions(query, partition_key)
 
-    assert attribute_conditions == {}
+    assert attribute_conditions == {"rp0": [], "rp1": [], "rp2": []}
     assert distance_conditions == {
         ("rp0", "rp1"): ["DIST(rp0.geo, rp1.geo) <= 4.0"],
         ("rp0", "rp2"): ["DIST(rp0.geo, rp2.geo) <= 5.0"],
@@ -188,7 +188,7 @@ def test_query_with_no_conditions():
         table,
     ) = extract_and_group_query_conditions(query, partition_key)
 
-    assert attribute_conditions == {}
+    assert attribute_conditions == {"rp0": []}
     assert distance_conditions == {}
     assert len(other_functions) == 0
     assert partition_key_conditions == []
@@ -220,7 +220,7 @@ def test_query_with_3_or_conditions():
         table,
     ) = extract_and_group_query_conditions(query, partition_key)
 
-    assert attribute_conditions == {"rp0": ["field1 = 1"]}
+    assert attribute_conditions == {"rp0": ["field1 = 1"], "rp1": [], "rp2": []}
     assert distance_conditions == {}
     assert len(other_functions) == 0
     assert partition_key_conditions == []
@@ -256,7 +256,7 @@ def test_udf_with_3_tables():
         table,
     ) = extract_and_group_query_conditions(query, partition_key)
 
-    assert attribute_conditions == {"rp0": ["field1 = 1"]}
+    assert attribute_conditions == {"rp0": ["field1 = 1"], "rp1": [], "rp2": []}
     assert distance_conditions == {}
     assert other_functions == {("rp0", "rp1", "rp2"): ["MY_UDF(rp0.attr, rp1.attr, rp2.attr) > 10"]}
     assert partition_key_conditions == []
