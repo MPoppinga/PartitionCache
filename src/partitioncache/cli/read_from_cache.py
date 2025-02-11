@@ -17,7 +17,7 @@ logger = getLogger("PartitionCache")
 # set logger to warning
 logger.setLevel(WARNING)
 
-def main():
+def main(file=sys.stdout):
     parser = argparse.ArgumentParser(description="Read partition keys from cache for a given query")
     
     parser.add_argument(
@@ -47,13 +47,19 @@ def main():
         help="Path to environment file with cache configuration"
     )
 
-
     parser.add_argument(
         "--output-format",
         choices=['list', 'json', 'lines'],
         default='list',
         help="Output format for the partition keys, list is a simple comma separated list of partition keys, json is a json array and lines is one partition key per line"
     )
+    
+    parser.add_argument(
+        "--output-file",
+        type=str,
+        help="Path to file to write the partition keys to, if not specified, the partition keys will be printed to the console"
+    )    
+    
 
     args = parser.parse_args()
 
@@ -61,6 +67,12 @@ def main():
     if args.env_file:
         dotenv.load_dotenv(args.env_file)
     cache_handler = None
+    
+    if args.output_file:
+        with open(args.output_file, 'w') as f:
+            file = f
+    else:
+        file = sys.stdout
     
     try:
         # Initialize cache handler
@@ -82,19 +94,25 @@ def main():
             logger.warning("No partition keys found in cache")
             sys.exit(0)
 
-        # Output results in the specified format
-        if args.output_format == 'json':
-            import json
-            print(json.dumps(list(partition_keys)))
-        
-        elif args.output_format == 'lines':  # list format
-            for key in partition_keys:
-                sys.stdout.write(f"{key}\n")
-        elif args.output_format == 'list':
-            sys.stdout.write(",".join([str(x) for x in partition_keys]))
+        try:
+            # Output results in the specified format
+            if args.output_format == 'json':
+                import json
+                print(json.dumps(sorted(list(partition_keys))), file=file)
+            
+            elif args.output_format == 'lines':
+                for key in sorted(partition_keys):
+                    print(str(key), file=file)
+            else:  # list format
+                print(",".join(str(x) for x in sorted(partition_keys)), file=file)
 
-        # Print summary
-        logger.info(f"Found {len(partition_keys)} partition keys")
+            # Print summary
+            logger.info(f"Found {len(partition_keys)} partition keys")
+            sys.exit(0)
+
+        except Exception as e:
+            logger.error(f"Error formatting output: {str(e)}")
+            sys.exit(1)
 
     except Exception as e:
         logger.error(f"Error reading from cache: {str(e)}")
