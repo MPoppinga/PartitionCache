@@ -86,7 +86,7 @@ def extend_query_with_partition_keys(
     query: str,
     partition_keys: set[int] | set[str], 
     partition_key: str,
-    method: Literal["IN", "VALUES", "TMP_TABLE_JOIN"] = "IN",
+    method: Literal["IN", "VALUES", "TMP_TABLE_JOIN", "TMP_TABLE_IN"] = "IN",
     p0_alias: str | None = None,
     analyze_tmp_table: bool = True
 ) -> str:
@@ -182,4 +182,28 @@ def extend_query_with_partition_keys(
             from_clause.this.replace(join_expr)
 
         # Return the new query with the tmp table setup
+        return newquery + x.sql()
+    
+    elif method == "TMP_TABLE_IN":
+        ## TMP TABLE Setup
+        newquery = f"""CREATE TEMPORARY TABLE tmp_partition_keys (partition_key INT PRIMARY KEY);
+                    INSERT INTO tmp_partition_keys (partition_key) (VALUES({"),(".join(str(pk) for pk in partition_keys)}));
+                    """
+        if analyze_tmp_table:
+            newquery += "CREATE INDEX tmp_partition_keys_idx ON tmp_partition_keys USING HASH(partition_key);ANALYZE tmp_partition_keys;"
+
+        ## Add WHERE IN condition
+        x = sqlglot.parse_one(query)
+        
+        # Find the WHERE clause or create a new one
+        where: exp.Where | None = x.find(exp.Where)
+        
+        # Create the IN expression
+        partition_expr = sqlglot.parse_one(f"{p0_alias}.{partition_key} IN (SELECT partition_key FROM tmp_partition_keys)")
+        
+        if where is None:
+            where = exp.Where(this=partition_expr)
+        else:
+            where.args["this"] = exp.and_(where.args["this"], partition_expr)
+            
         return newquery + x.sql()
