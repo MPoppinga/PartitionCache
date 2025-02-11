@@ -458,6 +458,25 @@ def normalize_distance_conditions(original_query: str, bucket_steps: float = 1.0
     # TODO Ensure one of the values is a number
     # TODO Ensure number is on second position
     # TODO Ensure number is not negative
+    
+    # Check if at least one value is a number
+    for distance_condition in distance_conditions_between + distance_conditions_smaller + distance_conditions_greater:
+        if not any(str(x).replace('.','',1).isdigit() for x in distance_condition.split()):
+            logger.warning(f"No numeric value found in distance condition: {distance_condition}")
+            
+    # Check if number is on right side of comparison operator for distance functions
+    for distance_condition in distance_conditions_between + distance_conditions_smaller + distance_conditions_greater:
+        if is_distance_function(distance_condition):
+            if "<" in distance_condition or ">" in distance_condition:
+                parts = distance_condition.split("<" if "<" in distance_condition else ">")
+                if len(parts) == 2 and not str(parts[1].strip()).replace('.','',1).isdigit():
+                    logger.warning(f"Numeric value not on right side of comparison in distance condition: {distance_condition}")
+                
+    # Check for negative numbers
+    for distance_condition in distance_conditions_between + distance_conditions_smaller + distance_conditions_greater:
+        numbers = [float(x) for x in re.findall(r'-?\d*\.?\d+', distance_condition)]
+        if any(n < 0 for n in numbers):
+            logger.warning(f"Negative value found in distance condition: {distance_condition}")
 
     for distance_condition in distance_conditions_between:
         if restrict_to_dist_functions and not is_distance_function(distance_condition):
@@ -541,10 +560,10 @@ def generate_all_query_hash_pairs(
     query = clean_query(query)
 
     # Create all possible partial queries
-    query_set_diff_cmbinations = set(
+    query_set_diff_combinations = set(
         generate_partial_queries(query, partition_key, min_component_size, follow_graph, keep_all_attributes, other_functions_as_distance_conditions=True)
     )
-    query_set.update(query_set_diff_cmbinations)
+    query_set.update(query_set_diff_combinations)
 
     # Create bucket variant with normalized distances (Example: 1.6 - 3.6 -> 1 - 4 WITH bucket_steps = 1)
     nor_dist_query = normalize_distance_conditions(query)
