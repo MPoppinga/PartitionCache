@@ -520,7 +520,11 @@ def normalize_distance_conditions(original_query: str, bucket_steps: float = 1.0
             value = value.replace(";", "")
             if float(value) < 0:
                 continue
-            valuef = (int(float(value) / bucket_steps) * bucket_steps) + bucket_steps
+            b = (int(float(value) / bucket_steps) * bucket_steps)
+            if b == float(value):
+                valuef = b 
+            else:
+                valuef = b + bucket_steps
             new_condition = f"{distance_condition.split('<')[0]} < {valuef:g}"
         query = query.replace(distance_condition, new_condition)
 
