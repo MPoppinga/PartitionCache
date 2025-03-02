@@ -79,7 +79,7 @@ def find_p0_alias(query: str) -> str:
     table = x.find(exp.Table)
     if table is None:
         raise ValueError("No table found in query")
-    return table.alias
+    return table.alias_or_name
 
 
 def extend_query_with_partition_keys(
@@ -123,6 +123,7 @@ def extend_query_with_partition_keys(
         partition_expr = sqlglot.parse_one(f"{p0_alias}.{partition_key} IN ({partition_keys_str})")
         if where is None:
             where = exp.Where(this=partition_expr)
+            x.args["where"] = where
         else:
             # Add partition condition to existing WHERE with AND
             where.args["this"] = exp.and_(where.args["this"], partition_expr)
