@@ -146,3 +146,8 @@ pcache-manage \
 If using a python application its possible to direclty call the relevant functions. # TODO comprehensive documenttion
 
 
+# License
+
+PartitionCache is licensed under the GNU Lesser General Public License v3.0.
+
+See [COPYING](COPYING) and [COPYING.LESSER](COPYING.LESSER) for more details.
