@@ -34,7 +34,7 @@ def mock_args():
 def test_main_direct_execution(mock_cache_handler, mock_db_handler, mock_args):
     with patch('argparse.ArgumentParser.parse_args', return_value=mock_args), \
          patch('partitioncache.cli.add_to_cache.get_cache_handler', return_value=mock_cache_handler), \
-         patch('partitioncache.cli.add_to_cache.PostgresDBHandler', return_value=mock_db_handler), \
+         patch('partitioncache.cli.add_to_cache.get_db_handler', return_value=mock_db_handler), \
          patch.dict(os.environ, {
              'PG_DB_HOST': 'localhost',
              'PG_DB_PORT': '5432',
@@ -68,7 +68,7 @@ def test_main_no_recompose(mock_cache_handler, mock_db_handler, mock_args):
     
     with patch('argparse.ArgumentParser.parse_args', return_value=mock_args), \
          patch('partitioncache.cli.add_to_cache.get_cache_handler', return_value=mock_cache_handler), \
-         patch('partitioncache.cli.add_to_cache.PostgresDBHandler', return_value=mock_db_handler), \
+         patch('partitioncache.cli.add_to_cache.get_db_handler', return_value=mock_db_handler), \
          patch.dict(os.environ, {
              'PG_DB_HOST': 'localhost',
              'PG_DB_PORT': '5432',
@@ -92,7 +92,7 @@ def test_main_with_env_file(mock_cache_handler, mock_db_handler, mock_args, tmp_
     
     with patch('argparse.ArgumentParser.parse_args', return_value=mock_args), \
          patch('partitioncache.cli.add_to_cache.get_cache_handler', return_value=mock_cache_handler), \
-         patch('partitioncache.cli.add_to_cache.PostgresDBHandler', return_value=mock_db_handler), \
+         patch('partitioncache.cli.add_to_cache.get_db_handler', return_value=mock_db_handler), \
          patch('partitioncache.cli.add_to_cache.generate_all_query_hash_pairs', return_value=[("SELECT * FROM table", "hash1")]):
         
         main()

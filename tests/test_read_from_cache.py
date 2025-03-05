@@ -22,6 +22,7 @@ def mock_args():
             self.partition_key = "partition_key"
             self.env_file = None
             self.output_format = "list"
+            self.output_file = None
     return Args()
 
 @pytest.fixture
@@ -32,10 +33,11 @@ def test_main_list_output(mock_cache_handler, mock_args, capture_stdout):
     partition_keys = {1, 2, 3}
     with patch('argparse.ArgumentParser.parse_args', return_value=mock_args), \
          patch('partitioncache.cli.read_from_cache.get_cache_handler', return_value=mock_cache_handler), \
-         patch('partitioncache.cli.read_from_cache.get_partition_keys', return_value=(partition_keys, 1, 1)):
+         patch('partitioncache.cli.read_from_cache.get_partition_keys', return_value=(partition_keys, 1, 1)), \
+         patch('sys.stdout', capture_stdout):
 
         with pytest.raises(SystemExit) as exc_info:
-            main(file=capture_stdout)
+            main()
         
         assert exc_info.value.code == 0
         output = capture_stdout.getvalue().strip()
@@ -48,10 +50,11 @@ def test_main_json_output(mock_cache_handler, mock_args, capture_stdout):
 
     with patch('argparse.ArgumentParser.parse_args', return_value=mock_args), \
          patch('partitioncache.cli.read_from_cache.get_cache_handler', return_value=mock_cache_handler), \
-         patch('partitioncache.cli.read_from_cache.get_partition_keys', return_value=(partition_keys, 1, 1)):
+         patch('partitioncache.cli.read_from_cache.get_partition_keys', return_value=(partition_keys, 1, 1)), \
+         patch('sys.stdout', capture_stdout):
 
         with pytest.raises(SystemExit) as exc_info:
-            main(file=capture_stdout)
+            main()
         
         assert exc_info.value.code == 0
         output = capture_stdout.getvalue().strip()
@@ -63,10 +66,11 @@ def test_main_lines_output(mock_cache_handler, mock_args, capture_stdout):
 
     with patch('argparse.ArgumentParser.parse_args', return_value=mock_args), \
          patch('partitioncache.cli.read_from_cache.get_cache_handler', return_value=mock_cache_handler), \
-         patch('partitioncache.cli.read_from_cache.get_partition_keys', return_value=(partition_keys, 1, 1)):
+         patch('partitioncache.cli.read_from_cache.get_partition_keys', return_value=(partition_keys, 1, 1)), \
+         patch('sys.stdout', capture_stdout):
 
         with pytest.raises(SystemExit) as exc_info:
-            main(file=capture_stdout)
+            main()
         
         assert exc_info.value.code == 0
         output = sorted(line.strip() for line in capture_stdout.getvalue().strip().split('\n'))
