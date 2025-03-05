@@ -9,10 +9,8 @@ from logging import getLogger
 import dotenv
 
 from partitioncache.cache_handler import get_cache_handler
+from partitioncache.db_handler import get_db_handler
 from partitioncache.db_handler.abstract import AbstractDBHandler
-from partitioncache.db_handler.mysql import MySQLDBHandler
-from partitioncache.db_handler.postgres import PostgresDBHandler
-from partitioncache.db_handler.sqlite import SQLiteDBHandler
 from partitioncache.query_processor import clean_query, generate_all_query_hash_pairs, hash_query
 from partitioncache.queue import push_to_queue
 
@@ -65,13 +63,10 @@ def main():
             # Initialize cache handler
             cache_handler = get_cache_handler(args.cache_backend)
 
-            # Initialize database handler
+            # Get database handler
             db_handler: AbstractDBHandler
             if args.db_backend == "postgresql":
-                if args.db_env_file is None:
-                    raise ValueError("db_env_file is required")
-
-                db_handler = PostgresDBHandler(
+                db_handler = get_db_handler('postgres',
                     host=os.getenv("PG_DB_HOST", os.getenv("DB_HOST", "localhost")),
                     port=int(os.getenv("PG_DB_PORT", os.getenv("DB_PORT", 5432))),
                     user=os.getenv("PG_DB_USER", os.getenv("DB_USER", "postgres")),
@@ -79,7 +74,7 @@ def main():
                     dbname=args.db_name,
                 )
             elif args.db_backend == "mysql":
-                db_handler = MySQLDBHandler(
+                db_handler = get_db_handler('mysql',
                     host=os.getenv("MY_DB_HOST", os.getenv("DB_HOST", "localhost")),
                     port=int(os.getenv("MY_DB_PORT", os.getenv("DB_PORT", 3306))),
                     user=os.getenv("MY_DB_USER", os.getenv("DB_USER", "root")),
@@ -87,9 +82,9 @@ def main():
                     dbname=args.db_name,
                 )
             elif args.db_backend == "sqlite":
-                db_handler = SQLiteDBHandler(args.db_dir)
+                db_handler = get_db_handler('sqlite', db_path=args.db_dir)
             else:
-                raise AssertionError("No db backend specified, querying not possible")
+                raise ValueError(f"Unsupported database backend: {args.db_backend}")
 
             if not args.no_recompose:
                 logger.info("Recomposing query")

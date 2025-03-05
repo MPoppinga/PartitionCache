@@ -8,10 +8,9 @@ version = "0.4.0"
 description = "A partition cache implementation"
 requires-python = ">=3.9"
 license = { text = "LGPL-3.0-or-later" }
-license-files = ["COPYING", "COPYING.LESSER"]
 dependencies = [
     "networkx",
-    "sqlglot",
+    "sqlglot>=25.0.0,<26.0.0",
     "bitarray",
     "python-dotenv",
     "tqdm",
@@ -51,6 +50,7 @@ where = ["src"]
 [tool.setuptools]
 package-dir = {"" = "src"}
 zip-safe = false
+license-files = ["COPYING", "COPYING.LESSER"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

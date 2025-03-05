@@ -14,10 +14,8 @@ import psycopg
 import redis
 
 from partitioncache.cache_handler import get_cache_handler
+from partitioncache.db_handler import get_db_handler
 from partitioncache.db_handler.abstract import AbstractDBHandler
-from partitioncache.db_handler.mysql import MySQLDBHandler
-from partitioncache.db_handler.postgres import PostgresDBHandler
-from partitioncache.db_handler.sqlite import SQLiteDBHandler
 from partitioncache.query_processor import generate_all_query_hash_pairs
 
 parser = argparse.ArgumentParser()
@@ -67,7 +65,7 @@ def run_and_store_query(query: str, hash: str):
             if args.db_env_file is None:
                 raise ValueError("db_env_file is required")
 
-            db_handler = PostgresDBHandler(
+            db_handler = get_db_handler('postgres', 
                 host=os.getenv("PG_DB_HOST", os.getenv("DB_HOST", "localhost")),
                 port=int(os.getenv("PG_DB_PORT", os.getenv("DB_PORT", 5432))),
                 user=os.getenv("PG_DB_USER", os.getenv("DB_USER", "postgres")),
@@ -76,7 +74,7 @@ def run_and_store_query(query: str, hash: str):
                 timeout=args.long_running_query_timeout,
             )
         elif args.db_backend == "mysql":
-            db_handler = MySQLDBHandler(
+            db_handler = get_db_handler('mysql',
                 host=os.getenv("MY_DB_HOST", os.getenv("DB_HOST", "localhost")),
                 port=int(os.getenv("MY_DB_PORT", os.getenv("DB_PORT", 3306))),
                 user=os.getenv("MY_DB_USER", os.getenv("DB_USER", "root")),
@@ -84,7 +82,7 @@ def run_and_store_query(query: str, hash: str):
                 dbname=args.db_name,
             )
         elif args.db_backend == "sqlite":
-            db_handler = SQLiteDBHandler(args.db_dir)
+            db_handler = get_db_handler('sqlite', db_path=args.db_dir)
         else:
             raise AssertionError("No db backend specified, querying not possible")
 
