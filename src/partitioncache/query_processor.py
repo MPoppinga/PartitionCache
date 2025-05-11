@@ -468,7 +468,7 @@ def normalize_distance_conditions(original_query: str, bucket_steps: float = 1.0
     for distance_condition in distance_conditions_between + distance_conditions_smaller + distance_conditions_greater:
         if is_distance_function(distance_condition):
             if "<" in distance_condition or ">" in distance_condition:
-                parts = re.split(r'(<=|>=|<>|==|<|>)', distance_condition, 1)
+                parts = re.split(r'(<=|>=|<|>)', distance_condition)
                 if len(parts) == 2 and not str(parts[1].strip()).replace('.','',1).isdigit():
                     logger.warning(f"Numeric value not on right side of comparison in distance condition: {distance_condition}")
                 

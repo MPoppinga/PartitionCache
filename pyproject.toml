@@ -10,7 +10,7 @@ requires-python = ">=3.9"
 license = { text = "LGPL-3.0-or-later" }
 dependencies = [
     "networkx",
-    "sqlglot",
+    "sqlglot>=25.0.0,<26.0.0",
     "bitarray",
     "python-dotenv",
     "tqdm",
