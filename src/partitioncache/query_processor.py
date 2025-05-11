@@ -186,7 +186,7 @@ def extract_and_group_query_conditions(
     tables = [x.strip() for x in tables]
 
     # warn if more than one table is used
-    if len(set([x.split(" ")[0] for x in tables])) > 1:
+    if len(set([x.split(" ")[0] for x in tables])) > 1: # TODO find a better way to check if issues are caused by mixing multiple tables	
         logger.warning(f"More than one table is used in the query ({', '.join(set([x.split(" ")[0] for x in tables]))}). This may cause unexpected behavior.")
 
     table_aliases = [x.split(" ")[-1] for x in tables]
@@ -294,7 +294,7 @@ def generate_partial_queries(
         distance_conditions,
         other_functions,
         partition_key_conditions,
-        or_conditions,  # TODO Fix
+        or_conditions,  # TODO Fix # TODO what to fix here?
         table_aliases,
         table,
     ) = extract_and_group_query_conditions(query, partition_key)
@@ -468,7 +468,7 @@ def normalize_distance_conditions(original_query: str, bucket_steps: float = 1.0
     for distance_condition in distance_conditions_between + distance_conditions_smaller + distance_conditions_greater:
         if is_distance_function(distance_condition):
             if "<" in distance_condition or ">" in distance_condition:
-                parts = distance_condition.split("<" if "<" in distance_condition else ">")
+                parts = re.split(r'(<=|>=|<>|==|<|>)', distance_condition, 1)
                 if len(parts) == 2 and not str(parts[1].strip()).replace('.','',1).isdigit():
                     logger.warning(f"Numeric value not on right side of comparison in distance condition: {distance_condition}")
                 

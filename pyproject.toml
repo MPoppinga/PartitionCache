@@ -38,8 +38,8 @@ rocksdb = [
 ]
 
 [project.urls]
-homepage = "https://example.com/project-homepage"
-repository = "https://example.com/project-repository"
+homepage = "https://github.com/MPoppinga/PartitionCache"
+repository = "https://github.com/MPoppinga/PartitionCache"
 
 [tool.setuptools.packages.find]
 where = ["src"]

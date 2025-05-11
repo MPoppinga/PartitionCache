@@ -147,7 +147,7 @@ def extend_query_with_partition_keys(
 
         newquery = f"""CREATE TEMPORARY TABLE tmp_partition_keys (partition_key INT PRIMARY KEY);
                     INSERT INTO tmp_partition_keys (partition_key) (VALUES({"),(".join(str(pk) for pk in partition_keys)}));
-                    """
+                    """ #TODO use CREATE AS SELECT, combine with other partition queries
         if analyze_tmp_table:
             newquery += "CREATE INDEX tmp_partition_keys_idx ON tmp_partition_keys USING HASH(partition_key);ANALYZE tmp_partition_keys;"
 
@@ -189,7 +189,7 @@ def extend_query_with_partition_keys(
         ## TMP TABLE Setup
         newquery = f"""CREATE TEMPORARY TABLE tmp_partition_keys (partition_key INT PRIMARY KEY);
                     INSERT INTO tmp_partition_keys (partition_key) (VALUES({"),(".join(str(pk) for pk in partition_keys)}));
-                    """
+                    """  #TODO use CREATE AS SELECT, combine with other partition queries
         if analyze_tmp_table:
             newquery += "CREATE INDEX tmp_partition_keys_idx ON tmp_partition_keys USING HASH(partition_key);ANALYZE tmp_partition_keys;"
 
