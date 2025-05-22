@@ -6,6 +6,7 @@ data
 *.png
 *.env
 *.txt
+*.osm.pbf
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -165,3 +166,4 @@ cython_debug/
 # IDEs
 .idea/
 .vscode/
+
