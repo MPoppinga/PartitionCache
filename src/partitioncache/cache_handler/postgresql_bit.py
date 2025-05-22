@@ -17,16 +17,16 @@ class PostgreSQLBitCacheHandler(AbstractCacheHandler_Lazy, AbstractCacheHandler_
         self.tablename = db_table
         self.bitsize = bitsize + 1  # Add one to the bitsize to avoid off by one errors
         self.cursor = self.db.cursor()
-        self.cursor.execute(f"""CREATE TABLE IF NOT EXISTS {self.tablename}_cache (
+        self.cursor.execute(sql.SQL("""CREATE TABLE IF NOT EXISTS {}_cache (
             query_hash TEXT PRIMARY KEY, 
             partition_keys BIT VARYING, 
             partition_keys_count integer NOT NULL GENERATED ALWAYS AS (length(replace(partition_keys::text, '0','')) ) STORED
-        );""")  # type: ignore
-        self.cursor.execute(f"""CREATE TABLE IF NOT EXISTS {self.tablename}_queries (
+        );""").format(sql.Identifier(self.tablename)))  # type: ignore
+        self.cursor.execute(sql.SQL("""CREATE TABLE IF NOT EXISTS {}_queries (
             query_hash TEXT NOT NULL PRIMARY KEY,
             query TEXT NOT NULL,
             last_seen TIMESTAMP NOT NULL DEFAULT now()
-        );""")  # type: ignore
+        );""").format(sql.Identifier(self.tablename)))  # type: ignore
         self.db.commit()
         
 
