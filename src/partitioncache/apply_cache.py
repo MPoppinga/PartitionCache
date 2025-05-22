@@ -19,7 +19,7 @@ logger = getLogger("PartitionCache")
 
 
 def get_partition_keys(
-    query: str, cache_handler: AbstractCacheHandler, partition_key: str, canonicalize_queries=False
+    query: str, cache_handler: AbstractCacheHandler, partition_key: str, min_component_size=2, canonicalize_queries=False
 ) -> tuple[set[int] | set[str] | None, int, int]:
     """
     Using the partition cache to get the partition keys for a given query.
@@ -37,7 +37,7 @@ def get_partition_keys(
     cache_entry_hashes = generate_all_hashes(
         query=query,
         partition_key=partition_key,
-        min_component_size=2,
+        min_component_size=min_component_size,
         follow_graph=True,
         fix_attributes=False,
         canonicalize_queries=canonicalize_queries,
@@ -52,14 +52,14 @@ def get_partition_keys(
     return partition_keys, len(cache_entry_hashes), count
 
 
-def get_partition_keys_lazy(query: str, cache_handler: AbstractCacheHandler, partition_key: str, canonicalize_queries=False) -> tuple:
+def get_partition_keys_lazy(query: str, cache_handler: AbstractCacheHandler, partition_key: str, min_component_size=2, canonicalize_queries=False) -> tuple:
     """
     Gets the lazy intersection representation of the partition keys for the given query and the number of hashes used.
     """
     hashses = generate_all_hashes(
         query=query,
         partition_key=partition_key,
-        min_component_size=2,
+        min_component_size=min_component_size,
         fix_attributes=False,
         canonicalize_queries=canonicalize_queries,
     )
