@@ -144,7 +144,7 @@ class AbstractCacheHandler_Lazy(AbstractCacheHandler):
     """
 
     @abstractmethod
-    def get_intersected_lazy(self, keys: set[str]):
+    def get_intersected_lazy(self, keys: set[str]) -> tuple[str | None, int]:
         """
         Lazily get the intersection representation of all sets in the cache associated with the given keys.
 
@@ -155,5 +155,22 @@ class AbstractCacheHandler_Lazy(AbstractCacheHandler):
 
         Args:
             keys (set[str]): A set of keys to intersect.
+        """
+        raise NotImplementedError
+
+
+class AbstractCacheHandler_Query(ABC):
+    """
+    Abstract class for cache handlers that store queries.
+    """
+
+    @abstractmethod
+    def set_query(self, key: str, querytext: str) -> None:
+        """
+        Store a query in the cache associated with the given key.
+
+        Args:
+            key (str): The key to associate with the query.
+            querytext (str): The query to store.
         """
         raise NotImplementedError

@@ -186,11 +186,11 @@ def extract_and_group_query_conditions(
     tables = [x.strip() for x in tables]
 
     # warn if more than one table is used
-    if len(set([x.split(" ")[0] for x in tables])) > 1: # TODO find a better way to check if issues are caused by mixing multiple tables	
-        logger.warning(f"More than one table is used in the query ({', '.join(set([x.split(" ")[0] for x in tables]))}). This may cause unexpected behavior.")
+    if len(set([re.split(r'\s+', x)[0] for x in tables])) > 1:
+        logger.warning(f"More than one table is used in the query ({', '.join(set([re.split(r'\s+', x)[0] for x in tables]))}). This may cause unexpected behavior.")
 
-    table_aliases = [x.split(" ")[-1] for x in tables]
-    table = [x.split(" ")[0] for x in tables][0]  # TODO Ensure robustness
+    table_aliases = [re.split(r'\s+', x)[-1] for x in tables]
+    table = [re.split(r'\s+', x)[0] for x in tables][0]  # TODO Ensure robustness
 
     # define emtpy list for attribute_conditions for each tablealias
     for ta in table_aliases:
