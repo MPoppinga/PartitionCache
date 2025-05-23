@@ -96,12 +96,14 @@ class RedisQueueHandler(AbstractQueueHandler):
             r = self._get_redis_connection()
             queue_key = self._get_queue_key("query_fragment")
 
-            # Push each query-hash pair as a JSON-encoded string with partition_key
+            # Use a Redis pipeline to batch the rpush commands
+            pipeline = r.pipeline()
             for query, hash_value in query_hash_pairs:
                 fragment_data = json.dumps({"query": query, "hash": hash_value, "partition_key": partition_key})
-                r.rpush(queue_key, fragment_data)
+                pipeline.rpush(queue_key, fragment_data)
 
-            logger.debug(f"Pushed {len(query_hash_pairs)} fragments to Redis query fragment queue: {queue_key}")
+            pipeline.execute()
+            logger.debug(f"Pushed {len(query_hash_pairs)} fragments to Redis query fragment queue using pipeline: {queue_key}")
             return True
         except Exception as e:
             logger.error(f"Failed to push fragments to Redis query fragment queue: {e}")
