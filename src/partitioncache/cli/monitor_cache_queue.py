@@ -46,8 +46,9 @@ args = parser.parse_args()
 status_lock = threading.Lock()
 active_futures: list[str] = []
 pending_jobs: list[tuple[str, str]] = []
-pool: concurrent.futures.ProcessPoolExecutor | None = None  # Initialize pool as None
+# pool: concurrent.futures.ProcessPoolExecutor | None = None  # This global variable is no longer used.
 exit_event = threading.Event()  # Create an event to signal exit
+outgoing_fragment_queue = multiprocessing.Queue()
 
 
 def pop_redis(r: redis.Redis):
@@ -125,11 +126,11 @@ def print_status(active, pending):
     print(f"Active processes: {active}, Pending jobs: {pending}")
 
 
-def process_completed_future(future, hash):
+def process_completed_future(future, hash, pool_executor: concurrent.futures.ProcessPoolExecutor):
     """Process a completed future and update job status."""
-    global pool  # Ensure pool is accessible
-    if pool is None:
-        raise AssertionError("No pool set up")
+    # global pool  # No longer needed, pool_executor is passed as an argument
+    if pool_executor is None: # Should not happen if called correctly
+        raise AssertionError("No pool_executor provided to process_completed_future")
 
     with status_lock:
         if hash in active_futures:
@@ -141,9 +142,9 @@ def process_completed_future(future, hash):
         # Start a new job from pending if available
         if pending_jobs:
             next_query, next_hash = pending_jobs.pop(0)
-            new_future = pool.submit(run_and_store_query, next_query, next_hash)
+            new_future = pool_executor.submit(run_and_store_query, next_query, next_hash)
             active_futures.append(next_hash)
-            new_future.add_done_callback(lambda f: process_completed_future(f, next_hash))
+            new_future.add_done_callback(lambda f: process_completed_future(f, next_hash, pool_executor))
             print(f"Started query {next_hash} from pending queue")
 
         print_status(len(active_futures), len(pending_jobs))
@@ -185,65 +186,128 @@ def main():
 
     # Function to continually fetch and submit jobs
     def job_fetcher():
-        global pool  # Make pool accessible in process_completed_future
-        with concurrent.futures.ProcessPoolExecutor(max_workers=args.max_processes) as pool:
-            while not exit_event.is_set():
-                try:
-                    print("Waiting for query")
-                    with status_lock:
-                        active = len(active_futures)
-                        pending = len(pending_jobs)
-                        print_status(active, pending)
-                    rr: list[bytes]
+        # global pool  # Make pool accessible in process_completed_future # No longer needed here
+        # with concurrent.futures.ProcessPoolExecutor(max_workers=args.max_processes) as pool: # pool is managed in main
+        while not exit_event.is_set():
+            try:
+                print("Waiting for query")
+                # with status_lock: # Not needed here anymore, status is managed by worker controller
+                #     active = len(active_futures)
+                #     pending = len(pending_jobs)
+                #     print_status(active, pending)
+                rr: list[bytes]
 
-                    rr = pop_redis(r)  # type: ignore
-                    print("Found query in queue")
+                rr = pop_redis(r)  # type: ignore
+                print("Found query in queue")
 
-                    query = rr[1].decode("utf-8")
+                query = rr[1].decode("utf-8")
 
-                    # Process the query
-                    query_hash_pair_list = generate_all_query_hash_pairs(query, args.partition_key, 1, True, True)
+                # Process the query
+                query_hash_pair_list = generate_all_query_hash_pairs(query, args.partition_key, 1, True, True)
 
-                    print(f"Found {len(query_hash_pair_list)} subqueries in query to store in cache")
+                print(f"Found {len(query_hash_pair_list)} subqueries in query to store in cache")
 
-                    # Order by length of query
-                    query_hash_pair_list.sort(key=lambda x: len(x[0]), reverse=True)
+                # Order by length of query
+                query_hash_pair_list.sort(key=lambda x: len(x[0]), reverse=True)
 
-                    for query, hash in query_hash_pair_list:
-                        if main_cache_handler.exists(hash):
-                            print(f"Query {hash} already in cache")
-                            continue
+                for query, hash in query_hash_pair_list:
+                    # The following checks are now responsibility of the worker process or a pre-processing step if needed.
+                    # if main_cache_handler.exists(hash):
+                    #     print(f"Query {hash} already in cache")
+                    #     continue
+                    #
+                    # # Check for existing termination bits before submitting
+                    # if main_cache_handler.exists(f"_LIMIT_{hash}"):
+                    #     print(f"Query {hash} previously hit limit, skipping")
+                    #     continue
+                    # if main_cache_handler.exists(f"_TIMEOUT_{hash}"):
+                    #     print(f"Query {hash} previously timed out, skipping")
+                    #     continue
+                    #
+                    # if hash in active_futures or any(job[1] == hash for job in pending_jobs):
+                    #     print(f"Query {hash} already in process")
+                    #     continue
 
-                        # Check for existing termination bits before submitting
-                        if main_cache_handler.exists(f"_LIMIT_{hash}"):
-                            print(f"Query {hash} previously hit limit, skipping")
-                            continue
-                        if main_cache_handler.exists(f"_TIMEOUT_{hash}"):
-                            print(f"Query {hash} previously timed out, skipping")
-                            continue
+                    outgoing_fragment_queue.put((query, hash))
+                    print(f"Added fragment {hash} to outgoing queue")
 
-                        if hash in active_futures or any(job[1] == hash for job in pending_jobs):
-                            print(f"Query {hash} already in process")
-                            continue
-
-                        with status_lock:
-                            if len(active_futures) < args.max_processes:
-                                future = pool.submit(run_and_store_query, query, hash)
-                                active_futures.append(hash)
-                                future.add_done_callback(lambda f, h=hash: process_completed_future(f, h))  # type: ignore
-                                print(f"Started query {hash}")
-                            else:
-                                pending_jobs.append((query, hash))
-                                print(f"Queued query {hash}")
-
-                except KeyboardInterrupt:
-                    print("Exiting")
-                    exit_event.set()  # Ensure the exit event is set
-                    pool.shutdown(wait=True)  # Wait for all processes to finish
+            except KeyboardInterrupt:
+                print("Exiting")
+                exit_event.set()  # Ensure the exit event is set
+                # pool.shutdown(wait=True)  # pool is managed in main
+                break
+            except Exception as e:
+                print(f"Error in job_fetcher: {str(e)}")
+                # Potentially add more robust error handling or signaling here
+                # For now, just print and continue, or break if it's critical
+                if exit_event.is_set(): # If already exiting, don't try to recover
                     break
+                time.sleep(1) # Avoid busy-looping on persistent errors
 
-    # Start the job fetcher in the main thread
-    job_fetcher()
+
+    # Start the job fetcher in a separate thread (this will be handled in the next step)
+    # For now, setting up the main processing loop that consumes from outgoing_fragment_queue
+    
+    fetcher_thread = threading.Thread(target=job_fetcher, daemon=True) # daemon=True allows main program to exit even if thread is running
+    fetcher_thread.start()
+
+    with concurrent.futures.ProcessPoolExecutor(max_workers=args.max_processes) as pool_executor:
+        while not exit_event.is_set():
+            try:
+                query, hash = outgoing_fragment_queue.get(timeout=1)
+                print(f"Retrieved fragment {hash} from outgoing_fragment_queue")
+
+                if main_cache_handler.exists(hash):
+                    print(f"Query {hash} already in cache, skipping submission.")
+                    continue
+                if main_cache_handler.exists(f"_LIMIT_{hash}"):
+                    print(f"Query {hash} previously hit limit, skipping submission.")
+                    continue
+                if main_cache_handler.exists(f"_TIMEOUT_{hash}"):
+                    print(f"Query {hash} previously timed out, skipping submission.")
+                    continue
+                
+                with status_lock:
+                    if hash in active_futures or any(job[1] == hash for job in pending_jobs):
+                        print(f"Query {hash} already in process, skipping submission.")
+                        continue
+
+                    if len(active_futures) < args.max_processes:
+                        future = pool_executor.submit(run_and_store_query, query, hash)
+                        active_futures.append(hash)
+                        # Pass pool_executor to the callback
+                        future.add_done_callback(lambda f, h=hash: process_completed_future(f, h, pool_executor))
+                        print(f"Started query {hash} from outgoing_fragment_queue")
+                    else:
+                        pending_jobs.append((query, hash))
+                        print(f"Queued query {hash} from outgoing_fragment_queue (pool full)")
+                    
+                    print_status(len(active_futures), len(pending_jobs))
+
+            except multiprocessing.queues.Empty: # Corrected exception type
+                # print("outgoing_fragment_queue is empty, continuing...")
+                if args.close and len(active_futures) == 0 and len(pending_jobs) == 0 and outgoing_fragment_queue.empty():
+                    # If close is signaled, no active/pending jobs, and queue is empty, then break
+                    # This check is added here to ensure that if job_fetcher finishes and signals close,
+                    # and all processing is done, the main loop can also terminate.
+                    print("All jobs processed and queue is empty after close signal. Exiting main processing loop.")
+                    exit_event.set() # Ensure other parts of the system know to exit
+                    break
+                time.sleep(0.1)  # Prevent busy-waiting
+                continue
+            except KeyboardInterrupt:
+                print("Main loop interrupted. Shutting down...")
+                exit_event.set()
+                break
+            except Exception as e:
+                print(f"Error in main processing loop: {str(e)}")
+                exit_event.set() # Signal exit on unexpected error
+                break
+        
+        print("Main processing loop finished. Waiting for fetcher thread to join...")
+        fetcher_thread.join(timeout=5) # Wait for fetcher to finish, with a timeout
+        print("Fetcher thread joined. Shutting down ProcessPoolExecutor...")
+        # The 'with' statement handles pool_executor.shutdown(wait=True)
 
 
 if __name__ == "__main__":
