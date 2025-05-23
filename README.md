@@ -59,12 +59,11 @@ pcache-observer is a process that monitors the queue for new cache requests, all
 
 ```
 pcache-observer \
-  --db_backend=postgresql \
+  --db-backend=postgresql \
   --db-name=mydb \
-  --db_env-file=.env \
   --cache-backend=redis \
-  --partition_key="partition_key" \ 
-  --long_running_query_timeout=300
+  --partition-key="partition_key" \ 
+  --long-running-query-timeout=300
 ```
 
 Usage: pcache-add 
@@ -73,16 +72,17 @@ pcache-add allows adding individual queries to the cache directly or sending the
 
 ```
 pcache-add \
-  --query="SELECT * FROM table" \
+  --query="SELECT * FROM table WHERE partition_key = 'value'" \
+  --partition-key="partition_key" \
   --db-name=mydb \
-  --env-file=.env \
   --cache-backend=redis
 ```
 
 ```
 pcache-add \
-  --query="SELECT * FROM table" \
+  --query="SELECT * FROM table WHERE partition_key = 'value'" \
   --queue \
+  --partition-key="partition_key" \
   --env-file=.env
 ```
 
