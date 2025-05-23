@@ -83,10 +83,15 @@ def query_fragment_processor():
 
 
 def run_and_store_query(query: str, hash: str, partition_key: str):
+    """Worker function to execute and store a query.
+    
+    Args:
+        query: SQL query string to execute
+        hash: Unique hash identifier for the query
+        partition_key: Partition key for organizing cached results
+    """
     if not args.db_name:
         args.db_name = os.getenv("DB_NAME")
-    
-    """Worker function to execute and store a query."""
     try:
         cache_handler = get_cache_handler(args.cache_backend)
 
@@ -174,7 +179,7 @@ def process_completed_future(future, hash):
             next_query, next_hash, next_partition_key = pending_jobs.pop(0)  # Now includes partition_key
             new_future = pool.submit(run_and_store_query, next_query, next_hash, next_partition_key)
             active_futures.append(next_hash)
-            new_future.add_done_callback(lambda f: process_completed_future(f, next_hash))
+            new_future.add_done_callback(lambda f, h=next_hash: process_completed_future(f, h))
             print(f"Started query {next_hash} from pending queue")
 
         # Check queue lengths for status using generic function
