@@ -187,7 +187,8 @@ def extract_and_group_query_conditions(
 
     # warn if more than one table is used
     if len(set([re.split(r'\s+', x)[0] for x in tables])) > 1:
-        logger.warning(f"More than one table is used in the query ({', '.join(set([re.split(r'\s+', x)[0] for x in tables]))}). This may cause unexpected behavior.")
+        table_names = set([re.split(r'\s+', x)[0] for x in tables])
+        logger.warning(f"More than one table is used in the query ({', '.join(table_names)}). This may cause unexpected behavior.")
 
     table_aliases = [re.split(r'\s+', x)[-1] for x in tables]
     table = [re.split(r'\s+', x)[0] for x in tables][0]  # TODO Ensure robustness
