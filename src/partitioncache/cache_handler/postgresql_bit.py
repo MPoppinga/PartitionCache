@@ -114,7 +114,8 @@ class PostgreSQLBitCacheHandler(AbstractCacheHandler_Lazy, AbstractCacheHandler_
         return sql.SQL("SELECT BIT_AND(partition_keys) FROM (SELECT partition_keys FROM {0} WHERE query_hash = ANY(%s)) AS selected").format(sql.Identifier(self.tablename + "_cache"))
 
     def get_intersected_sql_wk(self, keys) -> str:
-        return f"SELECT BIT_AND(partition_keys) AS bit_result FROM (SELECT partition_keys FROM {self.tablename}_cache WHERE query_hash IN ('{'\', \''.join(list(keys))}')) AS selected"
+        in_part = "', '".join(list(keys))
+        return f"SELECT BIT_AND(partition_keys) AS bit_result FROM (SELECT partition_keys FROM {self.tablename}_cache WHERE query_hash IN ('{in_part}')) AS selected"
 
     def filter_existing_keys(self, keys: set) -> set:
         """
