@@ -629,12 +629,12 @@ def generate_all_hashes(
     Generates all hashes for the given query.
     """
     qh_pairs = generate_all_query_hash_pairs(
-        query,
-        partition_key,
-        min_component_size,
-        follow_graph,
-        fix_attributes,
-        canonicalize_queries,
+        query=query,
+        partition_key=partition_key,
+        min_component_size=min_component_size,
+        follow_graph=follow_graph,
+        keep_all_attributes=fix_attributes,
+        canonicalize_queries=canonicalize_queries,
     )
     return [x[1] for x in qh_pairs]
 

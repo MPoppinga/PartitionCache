@@ -133,13 +133,13 @@ def count_queue():
 
     try:
         queue_lengths = get_queue_lengths()
-        incoming_count = queue_lengths.get("incoming", 0)
-        outgoing_count = queue_lengths.get("outgoing", 0)
+        original_query_count = queue_lengths.get("original_query_queue", 0)
+        query_fragment_count = queue_lengths.get("query_fragment_queue", 0)
 
         logger.info(f"Queue statistics (using {provider}):")
-        logger.info(f"  Original query queue: {incoming_count} entries")
-        logger.info(f"  Query fragment queue: {outgoing_count} entries")
-        logger.info(f"  Total queue entries: {incoming_count + outgoing_count}")
+        logger.info(f"  Original query queue: {original_query_count} entries")
+        logger.info(f"  Query fragment queue: {query_fragment_count} entries")
+        logger.info(f"  Total queue entries: {original_query_count + query_fragment_count}")
 
     except Exception as e:
         logger.error(f"Error counting queues: {e}")
@@ -152,37 +152,37 @@ def clear_queue():
     try:
         from partitioncache.queue import clear_all_queues
 
-        incoming_cleared, outgoing_cleared = clear_all_queues()
+        original_query_cleared, query_fragment_cleared = clear_all_queues()
 
         logger.info(f"{provider.title()} queues cleared:")
-        logger.info(f"  Original query queue: {incoming_cleared} entries cleared")
-        logger.info(f"  Query fragment queue: {outgoing_cleared} entries cleared")
+        logger.info(f"  Original query queue: {original_query_cleared} entries cleared")
+        logger.info(f"  Query fragment queue: {query_fragment_cleared} entries cleared")
 
     except Exception as e:
         logger.error(f"Error clearing {provider} queues: {e}")
 
 
-def clear_incoming_queue():
+def clear_original_query_queue():
     """Clear only the original query queue."""
     provider = os.environ.get("QUERY_QUEUE_PROVIDER", "postgresql")
 
     try:
-        from partitioncache.queue import clear_original_query_queue as clear_incoming
+        from partitioncache.queue import clear_original_query_queue
 
-        deleted_count = clear_incoming()
+        deleted_count = clear_original_query_queue()
         logger.info(f"Original query queue: {deleted_count} entries cleared")
     except Exception as e:
         logger.error(f"Error clearing {provider} original query queue: {e}")
 
 
-def clear_outgoing_queue():
+def clear_query_fragment_queue():
     """Clear only the query fragment queue."""
     provider = os.environ.get("QUERY_QUEUE_PROVIDER", "postgresql")
 
     try:
-        from partitioncache.queue import clear_query_fragment_queue as clear_outgoing
+        from partitioncache.queue import clear_query_fragment_queue
 
-        deleted_count = clear_outgoing()
+        deleted_count = clear_query_fragment_queue()
         logger.info(f"Query fragment queue: {deleted_count} entries cleared")
     except Exception as e:
         logger.error(f"Error clearing {provider} query fragment queue: {e}")
@@ -372,13 +372,13 @@ def main():
     )
 
     parser.add_argument(
-        "--clear-incoming-queue",
+        "--clear-original-query-queue",
         action="store_true",
         help="Clear only the original query queue",
     )
 
     parser.add_argument(
-        "--clear-outgoing-queue",
+        "--clear-query-fragment-queue",
         action="store_true",
         help="Clear only the query fragment queue",
     )
@@ -424,14 +424,14 @@ def main():
         if not args.cache_type or args.max_entries is None:
             parser.error("Remove large entries mode requires --cache and --max-entries arguments")
         remove_large_entries(args.cache_type, args.max_entries)
-    elif args.clear_incoming_queue:
-        clear_incoming_queue()
-    elif args.clear_outgoing_queue:
-        clear_outgoing_queue()
+    elif args.clear_original_query_queue:
+        clear_original_query_queue()
+    elif args.clear_query_fragment_queue:
+        clear_query_fragment_queue()
     else:
         parser.error(
             "Please specify a mode: --export, --copy, --delete, --restore, --count, --count-queue, --clear-queue, --delete-all, --count-all,"
-            " --remove-termination, --remove-large, --clear-incoming-queue, --clear-outgoing-queue"
+            " --remove-termination, --remove-large, --clear-original-query-queue, --clear-query-fragment-queue"
         )
 
     # Cleanup

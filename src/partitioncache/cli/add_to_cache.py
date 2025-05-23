@@ -24,7 +24,7 @@ def main():
     # Query configuration
     parser.add_argument("--query", type=str, help="SQL query to cache")
 
-    parser.add_argument("--query-file", type=str, help="Path to file containing SQL query to add to cache")
+    parser.add_argument("--query-file", type=str, help="Path to file containing a SQL query to add to cache")
 
     parser.add_argument("--no-recompose", action="store_true", help="Do not recompose the query before adding to cache, the query is added as is to the cache or fragment queue")
 
