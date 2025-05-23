@@ -14,7 +14,7 @@ logger = getLogger("PartitionCache")
 class RedisQueueHandler(AbstractQueueHandler):
     """
     Redis implementation of the queue handler.
-    Uses Redis lists for original query and query fragment queues.
+    Uses Redis lists for original query and query fragment queues with partition_key support.
     """
 
     def __init__(self, host: str, port: int, db: int, password: Optional[str] = None, queue_key: str = "query_queue"):
@@ -57,12 +57,13 @@ class RedisQueueHandler(AbstractQueueHandler):
         """Get queue key with appropriate suffix."""
         return f"{self.queue_key}_{suffix}"
 
-    def push_to_original_query_queue(self, query: str) -> bool:
+    def push_to_original_query_queue(self, query: str, partition_key: str) -> bool:
         """
         Push an original query to the original query queue to be processed into fragments.
 
         Args:
             query (str): The original query to be pushed to the original query queue.
+            partition_key (str): The partition key for this query.
 
         Returns:
             bool: True if the query was pushed successfully, False otherwise.
@@ -70,19 +71,23 @@ class RedisQueueHandler(AbstractQueueHandler):
         try:
             r = self._get_redis_connection()
             queue_key = self._get_queue_key("original_query")
-            r.rpush(queue_key, query)
+            
+            # Store query with partition_key as JSON
+            query_data = json.dumps({"query": query, "partition_key": partition_key})
+            r.rpush(queue_key, query_data)
             logger.debug(f"Pushed query to Redis original query queue: {queue_key}")
             return True
         except Exception as e:
             logger.error(f"Failed to push query to Redis original query queue: {e}")
             return False
 
-    def push_to_query_fragment_queue(self, query_hash_pairs: List[Tuple[str, str]]) -> bool:
+    def push_to_query_fragment_queue(self, query_hash_pairs: List[Tuple[str, str]], partition_key: str) -> bool:
         """
         Push query fragments (as query-hash pairs) directly to the query fragment queue.
 
         Args:
             query_hash_pairs (List[Tuple[str, str]]): List of (query, hash) tuples to push to fragment queue.
+            partition_key (str): The partition key for these query fragments.
 
         Returns:
             bool: True if all fragments were pushed successfully, False otherwise.
@@ -91,9 +96,9 @@ class RedisQueueHandler(AbstractQueueHandler):
             r = self._get_redis_connection()
             queue_key = self._get_queue_key("query_fragment")
 
-            # Push each query-hash pair as a JSON-encoded string
+            # Push each query-hash pair as a JSON-encoded string with partition_key
             for query, hash_value in query_hash_pairs:
-                fragment_data = json.dumps({"query": query, "hash": hash_value})
+                fragment_data = json.dumps({"query": query, "hash": hash_value, "partition_key": partition_key})
                 r.rpush(queue_key, fragment_data)
 
             logger.debug(f"Pushed {len(query_hash_pairs)} fragments to Redis query fragment queue: {queue_key}")
@@ -102,41 +107,88 @@ class RedisQueueHandler(AbstractQueueHandler):
             logger.error(f"Failed to push fragments to Redis query fragment queue: {e}")
             return False
 
-    def pop_from_original_query_queue(self) -> Optional[str]:
+    def pop_from_original_query_queue(self) -> Optional[Tuple[str, str]]:
         """
         Pop an original query from the original query queue.
+        Uses a short timeout for non-blocking behavior.
 
         Returns:
-            str or None: The query string if available, None if queue is empty or error occurred.
+            Tuple[str, str] or None: (query, partition_key) tuple if available, None if queue is empty or error occurred.
         """
         try:
             r = self._get_redis_connection()
             queue_key = self._get_queue_key("original_query")
-            result = r.blpop([queue_key], timeout=1)  # 1 second timeout
+            result = r.blpop([queue_key], timeout=1)  # 1 second timeout for non-blocking behavior
             if result is not None and isinstance(result, (list, tuple)) and len(result) >= 2:
-                return result[1].decode("utf-8")
+                query_data = json.loads(result[1].decode("utf-8"))
+                return query_data["query"], query_data["partition_key"]
             return None
         except Exception as e:
             logger.error(f"Failed to pop from Redis original query queue: {e}")
             return None
 
-    def pop_from_query_fragment_queue(self) -> Optional[Tuple[str, str]]:
+    def pop_from_query_fragment_queue(self) -> Optional[Tuple[str, str, str]]:
         """
         Pop a query fragment from the query fragment queue.
+        Uses a short timeout for non-blocking behavior.
 
         Returns:
-            Tuple[str, str] or None: (query, hash) tuple if available, None if queue is empty or error occurred.
+            Tuple[str, str, str] or None: (query, hash, partition_key) tuple if available, None if queue is empty or error occurred.
         """
         try:
             r = self._get_redis_connection()
             queue_key = self._get_queue_key("query_fragment")
-            result = r.blpop([queue_key], timeout=1)  # 1 second timeout
+            result = r.blpop([queue_key], timeout=1)  # 1 second timeout for non-blocking behavior
             if result is not None and isinstance(result, (list, tuple)) and len(result) >= 2:
                 fragment_data = json.loads(result[1].decode("utf-8"))
-                return fragment_data["query"], fragment_data["hash"]
+                return fragment_data["query"], fragment_data["hash"], fragment_data["partition_key"]
             return None
         except Exception as e:
             logger.error(f"Failed to pop from Redis query fragment queue: {e}")
+            return None
+
+    def pop_from_original_query_queue_blocking(self, timeout: int = 60) -> Optional[Tuple[str, str]]:
+        """
+        Pop an original query from the original query queue with configurable blocking timeout.
+
+        Args:
+            timeout (int): Maximum time to wait in seconds (default: 30)
+
+        Returns:
+            Tuple[str, str] or None: (query, partition_key) tuple if available, None if timeout or error occurred.
+        """
+        try:
+            r = self._get_redis_connection()
+            queue_key = self._get_queue_key("original_query")
+            result = r.blpop([queue_key], timeout=timeout)
+            if result is not None and isinstance(result, (list, tuple)) and len(result) >= 2:
+                query_data = json.loads(result[1].decode("utf-8"))
+                return query_data["query"], query_data["partition_key"]
+            return None
+        except Exception as e:
+            logger.error(f"Failed to pop from Redis original query queue with blocking: {e}")
+            return None
+
+    def pop_from_query_fragment_queue_blocking(self, timeout: int = 60) -> Optional[Tuple[str, str, str]]:
+        """
+        Pop a query fragment from the query fragment queue with configurable blocking timeout.
+
+        Args:
+            timeout (int): Maximum time to wait in seconds (default: 30)
+
+        Returns:
+            Tuple[str, str, str] or None: (query, hash, partition_key) tuple if available, None if timeout or error occurred.
+        """
+        try:
+            r = self._get_redis_connection()
+            queue_key = self._get_queue_key("query_fragment")
+            result = r.blpop([queue_key], timeout=timeout)
+            if result is not None and isinstance(result, (list, tuple)) and len(result) >= 2:
+                fragment_data = json.loads(result[1].decode("utf-8"))
+                return fragment_data["query"], fragment_data["hash"], fragment_data["partition_key"]
+            return None
+        except Exception as e:
+            logger.error(f"Failed to pop from Redis query fragment queue with blocking: {e}")
             return None
 
     def get_queue_lengths(self) -> dict:
@@ -144,7 +196,7 @@ class RedisQueueHandler(AbstractQueueHandler):
         Get the current lengths of both original query and query fragment queues.
 
         Returns:
-            dict: Dictionary with 'original_query' and 'query_fragment' queue lengths.
+            dict: Dictionary with 'original_query_queue' and 'query_fragment_queue' queue lengths.
         """
         try:
             r = self._get_redis_connection()
@@ -158,10 +210,10 @@ class RedisQueueHandler(AbstractQueueHandler):
             original_query_count = int(cast(int, original_query_len)) if original_query_len is not None else 0
             query_fragment_count = int(cast(int, query_fragment_len)) if query_fragment_len is not None else 0
 
-            return {"original_query": original_query_count, "query_fragment": query_fragment_count}
+            return {"original_query_queue": original_query_count, "query_fragment_queue": query_fragment_count}
         except Exception as e:
             logger.error(f"Failed to get Redis queue lengths: {e}")
-            return {"original_query": 0, "query_fragment": 0}
+            return {"original_query_queue": 0, "query_fragment_queue": 0}
 
     def clear_original_query_queue(self) -> int:
         """

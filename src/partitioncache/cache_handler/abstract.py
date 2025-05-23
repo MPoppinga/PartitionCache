@@ -165,12 +165,13 @@ class AbstractCacheHandler_Query(ABC):
     """
 
     @abstractmethod
-    def set_query(self, key: str, querytext: str) -> None:
+    def set_query(self, key: str, querytext: str, partition_key: str = "partition_key") -> None:
         """
         Store a query in the cache associated with the given key.
 
         Args:
             key (str): The key to associate with the query.
             querytext (str): The query to store.
+            partition_key (str): The partition key for this query (default: "partition_key").
         """
         raise NotImplementedError

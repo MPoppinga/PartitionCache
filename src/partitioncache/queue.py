@@ -24,9 +24,9 @@ def _get_queue_handler():
     return _queue_handler
 
 
-def push_to_incoming_queue(query: str) -> bool:
+def push_to_original_query_queue(query: str, partition_key: str = "partition_key") -> bool:
     """
-    Push an original query to the incoming queue to be processed into fragments.
+    Push an original query to the original query queue to be processed into fragments.
 
     Requires the following environment variables to be set, based on the QUERY_QUEUE_PROVIDER:
 
@@ -44,120 +44,170 @@ def push_to_incoming_queue(query: str) -> bool:
     - QUERY_QUEUE_REDIS_QUEUE_KEY (base key, will have _original_query appended)
 
     Args:
-        query (str): The original query to be pushed to the incoming queue.
+        query (str): The original query to be pushed to the original query queue.
+        partition_key (str): The partition key for this query (default: "partition_key").
 
     Returns:
         bool: True if the query was pushed to the queue, False otherwise.
     """
     try:
         handler = _get_queue_handler()
-        return handler.push_to_original_query_queue(query)
+        return handler.push_to_original_query_queue(query, partition_key)
     except Exception as e:
-        logger.error(f"Failed to push query to incoming queue: {e}")
+        logger.error(f"Failed to push query to original query queue: {e}")
         return False
 
 
-def push_to_outgoing_queue(query_hash_pairs: List[Tuple[str, str]]) -> bool:
+def push_to_query_fragment_queue(query_hash_pairs: List[Tuple[str, str]], partition_key: str = "partition_key") -> bool:
     """
-    Push query fragments (as query-hash pairs) directly to the outgoing queue.
+    Push query fragments (as query-hash pairs) directly to the query fragment queue.
 
     Args:
-        query_hash_pairs (List[Tuple[str, str]]): List of (query, hash) tuples to push to outgoing queue.
+        query_hash_pairs (List[Tuple[str, str]]): List of (query, hash) tuples to push to query fragment queue.
+        partition_key (str): The partition key for these query fragments (default: "partition_key").
 
     Returns:
         bool: True if all fragments were pushed successfully, False otherwise.
     """
     try:
         handler = _get_queue_handler()
-        return handler.push_to_query_fragment_queue(query_hash_pairs)
+        return handler.push_to_query_fragment_queue(query_hash_pairs, partition_key)
     except Exception as e:
-        logger.error(f"Failed to push fragments to outgoing queue: {e}")
+        logger.error(f"Failed to push fragments to query fragment queue: {e}")
         return False
 
 
-def pop_from_incoming_queue() -> Optional[str]:
+def pop_from_original_query_queue() -> Optional[Tuple[str, str]]:
     """
-    Pop an original query from the incoming queue.
+    Pop an original query from the original query queue.
 
     Returns:
-        str or None: The query string if available, None if queue is empty or error occurred.
+        Tuple[str, str] or None: (query, partition_key) tuple if available, None if queue is empty or error occurred.
     """
     try:
         handler = _get_queue_handler()
         return handler.pop_from_original_query_queue()
     except Exception as e:
-        logger.error(f"Failed to pop from incoming queue: {e}")
+        logger.error(f"Failed to pop from original query queue: {e}")
         return None
 
 
-def pop_from_outgoing_queue() -> Optional[Tuple[str, str]]:
+def pop_from_original_query_queue_blocking(timeout: int = 60) -> Optional[Tuple[str, str]]:
     """
-    Pop a query fragment from the outgoing queue.
+    Pop an original query from the original query queue with blocking wait.
+    Uses provider-specific blocking mechanisms when available.
+
+    Args:
+        timeout (int): Maximum time to wait in seconds (default: 60)
 
     Returns:
-        Tuple[str, str] or None: (query, hash) tuple if available, None if queue is empty or error occurred.
+        Tuple[str, str] or None: (query, partition_key) tuple if available, None if timeout or error occurred.
+    """
+    try:
+        handler = _get_queue_handler()
+        
+        # Check if handler supports blocking operations
+        if hasattr(handler, 'pop_from_original_query_queue_blocking'):
+            return handler.pop_from_original_query_queue_blocking(timeout)  # type: ignore
+        else:
+            # Fallback to regular pop
+            return handler.pop_from_original_query_queue()
+    except Exception as e:
+        logger.error(f"Failed to pop from original query queue with blocking: {e}")
+        return None
+
+
+def pop_from_query_fragment_queue() -> Optional[Tuple[str, str, str]]:
+    """
+    Pop a query fragment from the query fragment queue.
+
+    Returns:
+        Tuple[str, str, str] or None: (query, hash, partition_key) tuple if available, None if queue is empty or error occurred.
     """
     try:
         handler = _get_queue_handler()
         return handler.pop_from_query_fragment_queue()
     except Exception as e:
-        logger.error(f"Failed to pop from outgoing queue: {e}")
+        logger.error(f"Failed to pop from query fragment queue: {e}")
+        return None
+
+
+def pop_from_query_fragment_queue_blocking(timeout: int = 60) -> Optional[Tuple[str, str, str]]:
+    """
+    Pop a query fragment from the query fragment queue with blocking wait.
+    Uses provider-specific blocking mechanisms when available.
+
+    Args:
+        timeout (int): Maximum time to wait in seconds (default: 60)
+
+    Returns:
+        Tuple[str, str, str] or None: (query, hash, partition_key) tuple if available, None if timeout or error occurred.
+    """
+    try:
+        handler = _get_queue_handler()
+        
+        # Check if handler supports blocking operations
+        if hasattr(handler, 'pop_from_query_fragment_queue_blocking'):
+            return handler.pop_from_query_fragment_queue_blocking(timeout)  # type: ignore
+        else:
+            # Fallback to regular pop
+            return handler.pop_from_query_fragment_queue()
+    except Exception as e:
+        logger.error(f"Failed to pop from query fragment queue with blocking: {e}")
         return None
 
 
 def get_queue_lengths() -> dict:
     """
-    Get the current lengths of both incoming and outgoing queues.
+    Get the current lengths of both original query and query fragment queues.
 
     Returns:
-        dict: Dictionary with 'incoming' and 'outgoing' queue lengths for backward compatibility.
+        dict: Dictionary with 'original_query_queue' and 'query_fragment_queue' queue lengths.
     """
     try:
         handler = _get_queue_handler()
-        lengths = handler.get_queue_lengths()
-        # Convert to old key names for backward compatibility
-        return {"incoming": lengths.get("original_query", 0), "outgoing": lengths.get("query_fragment", 0)}
+        return handler.get_queue_lengths()
     except Exception as e:
         logger.error(f"Failed to get queue lengths: {e}")
-        return {"incoming": 0, "outgoing": 0}
+        return {"original_query_queue": 0, "query_fragment_queue": 0}
 
 
-def clear_incoming_queue() -> int:
+def clear_original_query_queue() -> int:
     """
-    Clear the incoming queue and return the number of entries cleared.
+    Clear the original query queue and return the number of entries cleared.
 
     Returns:
-        int: Number of entries cleared from the incoming queue.
+        int: Number of entries cleared from the original query queue.
     """
     try:
         handler = _get_queue_handler()
         return handler.clear_original_query_queue()
     except Exception as e:
-        logger.error(f"Failed to clear incoming queue: {e}")
+        logger.error(f"Failed to clear original query queue: {e}")
         return 0
 
 
-def clear_outgoing_queue() -> int:
+def clear_query_fragment_queue() -> int:
     """
-    Clear the outgoing queue and return the number of entries cleared.
+    Clear the query fragment queue and return the number of entries cleared.
 
     Returns:
-        int: Number of entries cleared from the outgoing queue.
+        int: Number of entries cleared from the query fragment queue.
     """
     try:
         handler = _get_queue_handler()
         return handler.clear_query_fragment_queue()
     except Exception as e:
-        logger.error(f"Failed to clear outgoing queue: {e}")
+        logger.error(f"Failed to clear query fragment queue: {e}")
         return 0
 
 
 def clear_all_queues() -> Tuple[int, int]:
     """
-    Clear both incoming and outgoing queues.
+    Clear both original query and query fragment queues.
 
     Returns:
-        Tuple[int, int]: (incoming_cleared, outgoing_cleared) number of entries cleared.
+        Tuple[int, int]: (original_query_cleared, query_fragment_cleared) number of entries cleared.
     """
     try:
         handler = _get_queue_handler()
@@ -167,17 +217,18 @@ def clear_all_queues() -> Tuple[int, int]:
         return (0, 0)
 
 
-def push_to_queue(query: str) -> bool:
+def push_to_queue(query: str, partition_key: str = "partition_key") -> bool:
     """
-    Legacy function for backward compatibility. Pushes to incoming queue.
+    Legacy function for backward compatibility. Pushes to original query queue.
 
     Args:
         query (str): The query to be pushed to the queue.
+        partition_key (str): The partition key for this query (default: "partition_key").
 
     Returns:
         bool: True if the query was pushed to the queue, False otherwise.
     """
-    return push_to_incoming_queue(query)
+    return push_to_original_query_queue(query, partition_key)
 
 
 def close_queue_handler() -> None:
@@ -195,15 +246,12 @@ def close_queue_handler() -> None:
             _queue_handler = None
 
 
-# Legacy function to support existing imports
-def push_fragments_to_outgoing_queue(query_hash_pairs: List[Tuple[str, str]]) -> bool:
+def get_queue_provider() -> str:
     """
-    Legacy function name for backward compatibility with tests and existing code.
-
-    Args:
-        query_hash_pairs: List of (query, hash) tuples to push to outgoing queue.
-
+    Get the current queue provider type.
+    
     Returns:
-        bool: True if all fragments were pushed successfully, False otherwise.
+        str: The queue provider type ('postgresql' or 'redis')
     """
-    return push_to_outgoing_queue(query_hash_pairs)
+    import os
+    return os.environ.get("QUERY_QUEUE_PROVIDER", "postgresql")

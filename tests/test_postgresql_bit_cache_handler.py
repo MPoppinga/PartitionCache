@@ -14,6 +14,7 @@ INIT_CALLS = [
     (
         "CREATE TABLE IF NOT EXISTS test_bit_cache_table_queries "
         "(query_hash TEXT NOT NULL PRIMARY KEY, query TEXT NOT NULL, "
+        "partition_key TEXT NOT NULL, "
         "last_seen TIMESTAMP NOT NULL DEFAULT now());"
     ),
 ]
@@ -71,12 +72,13 @@ def test_set_query(cache_handler):
     test_query = "SELECT * FROM test_bit_cache_table_cache WHERE query_hash = %s"
     cache_handler.set_query("key1", test_query)
 
-    # The implementation uses sql.SQL().format() which creates a sql.Composed object
+    # The implementation now uses sql.SQL().format() and includes partition_key
     expected_sql = sql.SQL(
-        """INSERT INTO {}_queries VALUES (%s, %s)
-                            ON CONFLICT (query_hash) DO UPDATE SET query = %s, last_seen = now()"""
-    ).format(sql.Identifier("test_bit_cache_table"))
-    expected_params = ("key1", test_query, test_query)
+        "INSERT INTO {0} VALUES (%s, %s, %s) "
+        "ON CONFLICT (query_hash) DO UPDATE SET "
+        "query = %s, partition_key = %s, last_seen = now()"
+    ).format(sql.Identifier("test_bit_cache_table_queries"))
+    expected_params = ("key1", test_query, "partition_key", test_query, "partition_key")
 
     cache_handler.cursor.execute.assert_called_with(expected_sql, expected_params)
     cache_handler.db.commit.assert_called()
@@ -95,7 +97,12 @@ def test_get(cache_handler):
     cache_handler.cursor.fetchone.return_value = (expected_bits,)
     result = cache_handler.get("key1")
     assert result == {1, 3}
-    cache_handler.cursor.execute.assert_called_with("SELECT partition_keys FROM test_bit_cache_table_cache WHERE query_hash = %s", ("key1",))
+    
+    # The implementation now uses sql.Composed object
+    expected_sql = sql.SQL("SELECT partition_keys FROM {0} WHERE query_hash = %s").format(
+        sql.Identifier("test_bit_cache_table_cache")
+    )
+    cache_handler.cursor.execute.assert_called_with(expected_sql, ("key1",))
 
 
 def test_get_none(cache_handler):
@@ -111,7 +118,12 @@ def test_get_str_type(cache_handler):
 
 def test_set_null(cache_handler):
     cache_handler.set_null("null_key")
-    cache_handler.cursor.execute.assert_called_with("INSERT INTO test_bit_cache_table_cache VALUES (%s, %s)", ("null_key", None))
+    
+    # The implementation now uses sql.Composed object
+    expected_sql = sql.SQL("INSERT INTO {0} VALUES (%s, %s)").format(
+        sql.Identifier("test_bit_cache_table_cache")
+    )
+    cache_handler.cursor.execute.assert_called_with(expected_sql, ("null_key", None))
 
 
 def test_is_null(cache_handler):
