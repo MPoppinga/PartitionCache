@@ -13,33 +13,39 @@ from partitioncache.cache_handler.abstract import AbstractCacheHandler_Query
 from partitioncache.db_handler import get_db_handler
 from partitioncache.db_handler.abstract import AbstractDBHandler
 from partitioncache.query_processor import clean_query, generate_all_query_hash_pairs, hash_query
-from partitioncache.queue import push_to_queue
+from partitioncache.queue import push_to_incoming_queue, push_to_outgoing_queue
 
 logger = getLogger("PartitionCache")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Add queries to the partition cache")
+    parser = argparse.ArgumentParser(description="Add queries to the partition cache either directly or via the queue")
 
-    parser.add_argument("--query", type=str, help="SQL query to add to cache")
-    
-    parser.add_argument("--query-file", type=str,  help="Path to file containing SQL queries to add to cache")
+    # Query configuration
+    parser.add_argument("--query", type=str, help="SQL query to cache")
 
-    parser.add_argument("--queue", action="store_true", help="Add query to queue instead of executing directly")
+    parser.add_argument("--query-file", type=str, help="Path to file containing SQL query to add to cache")
 
-    parser.add_argument("--no-recompose", action="store_true", help="Do not recompose the query before adding to cache, if true the query is added as is")
+    parser.add_argument("--no-recompose", action="store_true", help="Do not recompose the query before adding to cache, the query is added as is")
 
-    # Database configuration
+    parser.add_argument("--partition-key", type=str, required=True, help="Name of the partition key column")
+
+    # Queue configuration
+    parser.add_argument("--queue", action="store_true", help="Add query to incoming queue instead of executing directly")
+
+    parser.add_argument("--queue-provider", type=str, default="postgresql", help="Queue provider to use")
+
+    # Direct execution configuration
+    parser.add_argument("--direct", action="store_true", help="Calculate fragments directly instead of using the incoming queue")
+
     parser.add_argument("--db-backend", type=str, default="postgresql", help="Database backend (currently only postgresql supported)")
 
-    parser.add_argument("--db-name", type=str, required=True, help="Database name")
+    parser.add_argument("--db-name", type=str, help="Database name")
 
     parser.add_argument("--env-file", type=str, help="Path to environment file with database credentials")
 
     # Cache configuration
     parser.add_argument("--cache-backend", type=str, default="postgresql_bit", help="Cache backend to use")
-
-    parser.add_argument("--partition-key", type=str, default="partition_key", help="Name of the partition key column")
 
     args = parser.parse_args()
 
@@ -48,36 +54,49 @@ def main():
         dotenv.load_dotenv(args.env_file)
     elif os.path.exists(".env"):
         dotenv.load_dotenv(".env")
-        
-    if args.query is None and args.query_file is None:
-        logger.error("Either --query or --query-file must be provided")
+
+    # Validate mutually exclusive options
+    queue_options = [args.queue, args.direct]
+    if sum(queue_options) != 1:
+        logger.error("Only one of --queue or --direct can be specified")
         exit(1)
-    if args.query is not None and args.query_file is not None:
+
+    query_options = [args.query is not None, args.query_file is not None]
+    if sum(query_options) != 1:
         logger.error("Only one of --query or --query-file can be provided")
         exit(1)
-    
+
     if args.query_file:
         with open(args.query_file, "r") as f:
             query = f.read()
     else:
         query = args.query
-        
-    
 
-    if args.queue:
-        if args.no_recompose:
-            logger.error("Queue mode does not support --no-recompose")
-            exit(1)
-        # Add to queue for async processing
-        success = push_to_queue(query)
+    if args.queue:  # Add to queue for async processing
+        if not args.no_recompose:  # Add to query fragment queue for async processing
+            query_hash_pairs = generate_all_query_hash_pairs(
+                query,
+                args.partition_key,
+                min_component_size=1,
+                follow_graph=True,
+                keep_all_attributes=True,
+            )
+            success = push_to_outgoing_queue(query_hash_pairs)
+        else:
+            success = push_to_incoming_queue(query)
         if success:
             logger.info("Query successfully added to queue")
         else:
             logger.error("Failed to add query to queue")
             exit(1)
+
     else:  # Execute directly
         if not args.no_recompose:
             logger.warning("Direct mode with recomposing may take a long time on large queries, consider using the queue instead")
+
+        if args.db_name is None:
+            logger.error("Database name is required")
+            exit(1)
 
         try:
             # Initialize cache handler
@@ -86,7 +105,8 @@ def main():
             # Get database handler
             db_handler: AbstractDBHandler
             if args.db_backend == "postgresql":
-                db_handler = get_db_handler('postgres',
+                db_handler = get_db_handler(
+                    "postgres",
                     host=os.getenv("PG_DB_HOST", os.getenv("DB_HOST", "localhost")),
                     port=int(os.getenv("PG_DB_PORT", os.getenv("DB_PORT", 5432))),
                     user=os.getenv("PG_DB_USER", os.getenv("DB_USER", "postgres")),
@@ -94,7 +114,8 @@ def main():
                     dbname=args.db_name,
                 )
             elif args.db_backend == "mysql":
-                db_handler = get_db_handler('mysql',
+                db_handler = get_db_handler(
+                    "mysql",
                     host=os.getenv("MY_DB_HOST", os.getenv("DB_HOST", "localhost")),
                     port=int(os.getenv("MY_DB_PORT", os.getenv("DB_PORT", 3306))),
                     user=os.getenv("MY_DB_USER", os.getenv("DB_USER", "root")),
@@ -102,7 +123,7 @@ def main():
                     dbname=args.db_name,
                 )
             elif args.db_backend == "sqlite":
-                db_handler = get_db_handler('sqlite', db_path=args.db_dir)
+                db_handler = get_db_handler("sqlite", db_path=args.db_dir)
             else:
                 raise ValueError(f"Unsupported database backend: {args.db_backend}")
 
@@ -111,7 +132,11 @@ def main():
 
                 # Generate query-hash pairs
                 query_hash_pairs = generate_all_query_hash_pairs(
-                    query, args.partition_key, min_component_size=1, follow_graph=True, keep_all_attributes=True
+                    query,
+                    args.partition_key,
+                    min_component_size=1,
+                    follow_graph=True,
+                    keep_all_attributes=True,
                 )
 
             else:

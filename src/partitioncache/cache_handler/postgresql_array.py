@@ -17,18 +17,26 @@ class PostgreSQLArrayCacheHandler(AbstractCacheHandler_Lazy, AbstractCacheHandle
         self.tablename = db_table
         self.cursor = self.db.cursor()
         self.cursor.execute("CREATE EXTENSION IF NOT EXISTS intarray;")
-        self.cursor.execute(sql.SQL("CREATE TABLE IF NOT EXISTS {} (key TEXT PRIMARY KEY, value INTEGER[]);").format(sql.Identifier(self.tablename + "_cache")))
         self.cursor.execute(
-            sql.SQL("CREATE INDEX IF NOT EXISTS idx_large_sets_elements ON {} USING GIN (value gin__int_ops);").format(sql.Identifier(self.tablename + "_cache"))
+            sql.SQL("CREATE TABLE IF NOT EXISTS {0} (query_hash TEXT PRIMARY KEY, value INTEGER[]);")
+            .format(sql.Identifier(self.tablename + "_cache"))
         )
-        self.cursor.execute(sql.SQL("CREATE INDEX IF NOT EXISTS idx_large_sets_keys ON {} (key);").format(sql.Identifier(self.tablename + "_cache")))
-        
-        self.cursor.execute(sql.SQL("""CREATE TABLE IF NOT EXISTS {} (
+        self.cursor.execute(
+            sql.SQL("CREATE INDEX IF NOT EXISTS idx_large_sets_elements ON {0} USING GIN (value gin__int_ops);").format(
+                sql.Identifier(self.tablename + "_cache")
+            )
+        )
+        self.cursor.execute(sql.SQL("CREATE INDEX IF NOT EXISTS idx_large_sets_keys ON {0} (query_hash);")
+                            .format(sql.Identifier(self.tablename + "_cache")))
+
+        self.cursor.execute(
+            sql.SQL("""CREATE TABLE IF NOT EXISTS {0} (
             query_hash TEXT NOT NULL PRIMARY KEY,
             query TEXT NOT NULL,
             last_seen TIMESTAMP NOT NULL DEFAULT now()
-        );""").format(sql.Identifier(self.tablename + "_queries"))) 
-        
+        );""").format(sql.Identifier(self.tablename + "_queries"))
+        )
+
         self.db.commit()
 
     def close(self):
@@ -49,12 +57,15 @@ class PostgreSQLArrayCacheHandler(AbstractCacheHandler_Lazy, AbstractCacheHandle
         val = list(value)
         self.cursor.execute(f"INSERT INTO {self.tablename}_cache VALUES (%s, %s)", (key, val))  # type: ignore
         self.db.commit()
-        
-    def set_query(self, key: str, querytext: str) -> None:
-        self.cursor.execute(f"""INSERT INTO {self.tablename}_queries VALUES (%s, %s) 
-                            ON CONFLICT (query_hash) DO UPDATE SET query = %s, last_seen = now()""", (key, querytext, querytext))  # type: ignore
-        self.db.commit()
 
+    def set_query(self, key: str, querytext: str) -> None:
+        self.cursor.execute(
+            sql.SQL("INSERT INTO {0} VALUES (%s, %s) ON CONFLICT (query_hash) DO UPDATE SET query = %s, last_seen = now()").format(
+                sql.Identifier(self.tablename + "_queries")
+            ),
+            (key, querytext, querytext),
+        )
+        self.db.commit()
 
     def get(self, key: str, settype=int) -> set[int] | set[str] | None:
         if settype is str:
@@ -110,7 +121,12 @@ class PostgreSQLArrayCacheHandler(AbstractCacheHandler_Lazy, AbstractCacheHandle
         """
         Returns the set of keys that exist in the cache.
         """
-        self.cursor.execute(f"SELECT query_hash FROM {self.tablename}_cache WHERE query_hash = ANY(%s) AND value IS NOT NULL", [list(keys)])  # type: ignore
+        self.cursor.execute(
+            sql.SQL("SELECT query_hash FROM {0} WHERE query_hash = ANY(%s) AND value IS NOT NULL").format(
+                sql.Identifier(self.tablename + "_cache")
+            ),
+            [list(keys)],
+        )
         keys_set = set(x[0] for x in self.cursor.fetchall())
         logger.info(f"Found {len(keys_set)} existing hashkeys")
         return keys_set
@@ -135,7 +151,9 @@ class PostgreSQLArrayCacheHandler(AbstractCacheHandler_Lazy, AbstractCacheHandle
 
         # Create the FROM part of the query
         from_parts = [
-            sql.SQL("(SELECT value FROM {} WHERE query_hash = {}) AS {}").format(sql.Identifier(self.tablename), sql.Literal(key), sql.Identifier(f"k{i}"))
+            sql.SQL("(SELECT value FROM {0} WHERE query_hash = {1}) AS {2}").format(
+                sql.Identifier(self.tablename + "_cache"), sql.Literal(key), sql.Identifier(f"k{i}")
+            )
             for i, key in enumerate(keys_list)
         ]
 

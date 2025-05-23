@@ -4,12 +4,12 @@ import pickle
 from logging import getLogger
 import logging
 
-import redis
 from dotenv import load_dotenv
 from tqdm import tqdm  # type: ignore
 
 from partitioncache.cache_handler import get_cache_handler
 from partitioncache.cache_handler.abstract import AbstractCacheHandler
+from partitioncache.queue import get_queue_lengths
 
 logger = getLogger("PartitionCache")
 logger.setLevel(logging.INFO)
@@ -128,28 +128,64 @@ def count_cache(cache_type: str):
 
 
 def count_queue():
-    r = redis.Redis(
-        host=os.getenv("REDIS_HOST", ""),
-        port=int(os.getenv("REDIS_PORT", 6379)),
-        db=int(os.getenv("QUERY_QUEUE_REDIS_DB", 1)),  # Ensure this matches your queue DB
-    )
-    queue_length = r.llen(os.getenv("QUERY_QUEUE_REDIS_QUEUE_KEY", "query_queue"))
-    logger.info(f"Number of entries in the queue: {queue_length}")
-    long_running_queries_length = r.llen("long_running_queries")
-    logger.info(f"Number of long running queries: {long_running_queries_length}")
-    r.close()
+    """Count entries in both original query and query fragment queues."""
+    provider = os.environ.get("QUERY_QUEUE_PROVIDER", "postgresql")  # Default to PostgreSQL
+
+    try:
+        queue_lengths = get_queue_lengths()
+        incoming_count = queue_lengths.get("incoming", 0)
+        outgoing_count = queue_lengths.get("outgoing", 0)
+
+        logger.info(f"Queue statistics (using {provider}):")
+        logger.info(f"  Original query queue: {incoming_count} entries")
+        logger.info(f"  Query fragment queue: {outgoing_count} entries")
+        logger.info(f"  Total queue entries: {incoming_count + outgoing_count}")
+
+    except Exception as e:
+        logger.error(f"Error counting queues: {e}")
 
 
 def clear_queue():
-    r = redis.Redis(
-        host=os.getenv("REDIS_HOST", ""),
-        port=int(os.getenv("REDIS_PORT", 6379)),
-        db=int(os.getenv("QUERY_QUEUE_REDIS_DB", 1)),  # Ensure this matches your queue DB
-    )
-    r.delete(os.getenv("QUERY_QUEUE_REDIS_QUEUE_KEY", "query_queue"))
-    r.delete("long_running_queries")
-    logger.info("Queue cleared.")
-    r.close()
+    """Clear both original query and query fragment queues."""
+    provider = os.environ.get("QUERY_QUEUE_PROVIDER", "postgresql")
+
+    try:
+        from partitioncache.queue import clear_all_queues
+
+        incoming_cleared, outgoing_cleared = clear_all_queues()
+
+        logger.info(f"{provider.title()} queues cleared:")
+        logger.info(f"  Original query queue: {incoming_cleared} entries cleared")
+        logger.info(f"  Query fragment queue: {outgoing_cleared} entries cleared")
+
+    except Exception as e:
+        logger.error(f"Error clearing {provider} queues: {e}")
+
+
+def clear_incoming_queue():
+    """Clear only the original query queue."""
+    provider = os.environ.get("QUERY_QUEUE_PROVIDER", "postgresql")
+
+    try:
+        from partitioncache.queue import clear_incoming_queue as clear_incoming
+
+        deleted_count = clear_incoming()
+        logger.info(f"Original query queue: {deleted_count} entries cleared")
+    except Exception as e:
+        logger.error(f"Error clearing {provider} original query queue: {e}")
+
+
+def clear_outgoing_queue():
+    """Clear only the query fragment queue."""
+    provider = os.environ.get("QUERY_QUEUE_PROVIDER", "postgresql")
+
+    try:
+        from partitioncache.queue import clear_outgoing_queue as clear_outgoing
+
+        deleted_count = clear_outgoing()
+        logger.info(f"Query fragment queue: {deleted_count} entries cleared")
+    except Exception as e:
+        logger.error(f"Error clearing {provider} query fragment queue: {e}")
 
 
 def delete_all_caches():
@@ -277,7 +313,7 @@ def main():
     parser.add_argument(
         "--clear-queue",
         action="store_true",
-        help="Clear the queue",
+        help="Clear both original query and query fragment queues",
     )
 
     parser.add_argument(
@@ -335,6 +371,18 @@ def main():
         help="Maximum number of entries allowed in a set (for --remove-large)",
     )
 
+    parser.add_argument(
+        "--clear-incoming-queue",
+        action="store_true",
+        help="Clear only the original query queue",
+    )
+
+    parser.add_argument(
+        "--clear-outgoing-queue",
+        action="store_true",
+        help="Clear only the query fragment queue",
+    )
+
     args = parser.parse_args()
 
     # Load environment variables
@@ -376,9 +424,14 @@ def main():
         if not args.cache_type or args.max_entries is None:
             parser.error("Remove large entries mode requires --cache and --max-entries arguments")
         remove_large_entries(args.cache_type, args.max_entries)
+    elif args.clear_incoming_queue:
+        clear_incoming_queue()
+    elif args.clear_outgoing_queue:
+        clear_outgoing_queue()
     else:
         parser.error(
-            "Please specify a mode: --export, --copy, --delete, --restore, --count, --count_queue, --clear_queue, --delete-all, --count-all, --remove-termination, --remove-large"
+            "Please specify a mode: --export, --copy, --delete, --restore, --count, --count-queue, --clear-queue, --delete-all, --count-all,"
+            " --remove-termination, --remove-large, --clear-incoming-queue, --clear-outgoing-queue"
         )
 
     # Cleanup

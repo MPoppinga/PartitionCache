@@ -2,7 +2,11 @@ from partitioncache.query_processor import extract_and_group_query_conditions
 
 
 def test_extract_query_conditions():
-    query = "SELECT * FROM table AS t1, table AS t2 WHERE t1.search_space = t2.search_space AND DIST(t1.g, t2.g) BETWEEN 1.6 AND 3.6 AND t1.attribute = 'value' AND t2.attribute2 > 0.1;"
+    query = (
+        "SELECT * FROM table AS t1, table AS t2 WHERE t1.search_space = t2.search_space "
+        "AND DIST(t1.g, t2.g) BETWEEN 1.6 AND 3.6 "
+        "AND t1.attribute = 'value' AND t2.attribute2 > 0.1;"
+    )
     partition_key = "search_space"
     (
         attribute_conditions,
@@ -22,14 +26,11 @@ def test_extract_query_conditions():
     assert attribute_conditions == expected_attribute_conditions
 
     # Test distance_conditions
-    expected_distance_conditions = {
-        ("t1", "t2"): ["DIST(t1.g, t2.g) BETWEEN 1.6 AND 3.6"]
-    }
+    expected_distance_conditions = {("t1", "t2"): ["DIST(t1.g, t2.g) BETWEEN 1.6 AND 3.6"]}
     assert distance_conditions == expected_distance_conditions
 
     # Test other_functions
     assert len(other_functions) == 0
-
 
     # Test partition_key_conditions
     assert partition_key_conditions == []
@@ -99,9 +100,7 @@ def test_complex_query():
     assert dict(or_conditions) == {("rp2",): ["(rp2.field2 = 2 OR rp2.field2 = 3)"]}
     assert dict(attribute_conditions) == {"rp0": ["field1 = 1"], "rp1": [], "rp2": [], "rp3": []}
 
-    assert dict(distance_conditions) == {
-        ("rp0", "rp3"): ["DIST(rp0.geo, rp3.geo) <= 4.0"]
-    }
+    assert dict(distance_conditions) == {("rp0", "rp3"): ["DIST(rp0.geo, rp3.geo) <= 4.0"]}
     assert partition_key_conditions == [
         "search_space IN (0, 1, 2, 3, 4, 5, 6, 7, 8, 9)",
         "search_space IN (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10))",
@@ -132,9 +131,7 @@ def test_query_with_subquery():
     assert attribute_conditions == {"rp0": ["field1 = 1"]}
     assert distance_conditions == {}
     assert or_conditions == {}
-    assert partition_key_conditions == [
-        "search_space IN (SELECT x FROM other_table WHERE y = 1 AND z = 2)"
-    ]
+    assert partition_key_conditions == ["search_space IN (SELECT x FROM other_table WHERE y = 1 AND z = 2)"]
     assert table_aliases == ["rp0"]
     assert table == "random_point"
 
@@ -263,4 +260,3 @@ def test_udf_with_3_tables():
     assert or_conditions == {}
     assert set(table_aliases) == {"rp0", "rp1", "rp2"}
     assert table == "random_point"
-

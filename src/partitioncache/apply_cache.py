@@ -52,7 +52,14 @@ def get_partition_keys(
     return partition_keys, len(cache_entry_hashes), count
 
 
-def get_partition_keys_lazy(query: str, cache_handler: AbstractCacheHandler, partition_key: str, min_component_size=2, canonicalize_queries=False) -> tuple:
+def get_partition_keys_lazy(
+    query: str,
+    cache_handler: AbstractCacheHandler,
+    partition_key: str,
+    min_component_size=2,
+    canonicalize_queries=False,
+    follow_graph=True,
+) -> tuple:
     """
     Gets the lazy intersection representation of the partition keys for the given query and the number of hashes used.
     """
@@ -62,6 +69,7 @@ def get_partition_keys_lazy(query: str, cache_handler: AbstractCacheHandler, par
         min_component_size=min_component_size,
         fix_attributes=False,
         canonicalize_queries=canonicalize_queries,
+        follow_graph=follow_graph,
     )
 
     # -> tuple[sql.Composed | None , int]
@@ -84,16 +92,17 @@ def find_p0_alias(query: str) -> str:
 
 def extend_query_with_partition_keys(
     query: str,
-    partition_keys: set[int] | set[str], 
+    partition_keys: set[int] | set[str],
     partition_key: str,
     method: Literal["IN", "VALUES", "TMP_TABLE_JOIN", "TMP_TABLE_IN"] = "IN",
     p0_alias: str | None = None,
-    analyze_tmp_table: bool = True
+    analyze_tmp_table: bool = True,
 ) -> str:
     """
     Extend a given SQL query with the cache functionality.
 
-    This covers basic cases, in many cases this may not be fitting, in these cases the SQL rewrite should happen in the calling software where the original query was created.
+    This covers basic cases, in many cases this may not be fitting, in these cases the SQL rewrite should happen in the calling software where
+    the original query was created.
 
     Args:
         query (str): The SQL query to be extended.
@@ -143,15 +152,15 @@ def extend_query_with_partition_keys(
         return x.sql()
 
     elif method == "TMP_TABLE_JOIN":
-        ## TMP TABLE Setup
+        # TMP TABLE Setup
 
         newquery = f"""CREATE TEMPORARY TABLE tmp_partition_keys (partition_key INT PRIMARY KEY);
                     INSERT INTO tmp_partition_keys (partition_key) (VALUES({"),(".join(str(pk) for pk in partition_keys)}));
-                    """ #TODO use CREATE AS SELECT, combine with other partition queries
+                    """  # TODO use CREATE AS SELECT, combine with other partition queries
         if analyze_tmp_table:
             newquery += "CREATE INDEX tmp_partition_keys_idx ON tmp_partition_keys USING HASH(partition_key);ANALYZE tmp_partition_keys;"
 
-        ## Add as inner join to all tables
+        # Add as inner join to all tables
         x = sqlglot.parse_one(query)
 
         from_clauses: list[exp.Join | exp.From] = list(x.find_all(exp.Join))
@@ -174,7 +183,10 @@ def extend_query_with_partition_keys(
                 + " "  # Space between tables
                 + exp.Join(
                     this=exp.Identifier(this=f"tmp_partition_keys AS tmp_{table_alias}"),
-                    on=exp.EQ(this=exp.Identifier(this=f"tmp_{table_alias}.partition_key"), expression=exp.Identifier(this=f"{table_alias}.{partition_key}")),
+                    on=exp.EQ(
+                        this=exp.Identifier(this=f"tmp_{table_alias}.partition_key"),
+                        expression=exp.Identifier(this=f"{table_alias}.{partition_key}"),
+                    ),
                     kind="INNER",
                 ).sql()  # New join expression
             )
@@ -184,27 +196,27 @@ def extend_query_with_partition_keys(
 
         # Return the new query with the tmp table setup
         return newquery + x.sql()
-    
+
     elif method == "TMP_TABLE_IN":
-        ## TMP TABLE Setup
+        # TMP TABLE Setup
         newquery = f"""CREATE TEMPORARY TABLE tmp_partition_keys (partition_key INT PRIMARY KEY);
                     INSERT INTO tmp_partition_keys (partition_key) (VALUES({"),(".join(str(pk) for pk in partition_keys)}));
-                    """  #TODO use CREATE AS SELECT, combine with other partition queries
+                    """  # TODO use CREATE AS SELECT, combine with other partition queries
         if analyze_tmp_table:
             newquery += "CREATE INDEX tmp_partition_keys_idx ON tmp_partition_keys USING HASH(partition_key);ANALYZE tmp_partition_keys;"
 
-        ## Add WHERE IN condition
+        # Add WHERE IN condition
         x = sqlglot.parse_one(query)
-        
+
         # Find the WHERE clause or create a new one
         where: exp.Where | None = x.find(exp.Where)
-        
+
         # Create the IN expression
         partition_expr = sqlglot.parse_one(f"{p0_alias}.{partition_key} IN (SELECT partition_key FROM tmp_partition_keys)")
-        
+
         if where is None:
             where = exp.Where(this=partition_expr)
         else:
             where.args["this"] = exp.and_(where.args["this"], partition_expr)
-            
+
         return newquery + x.sql()
