@@ -17,18 +17,21 @@ class PostgreSQLBitCacheHandler(AbstractCacheHandler_Lazy, AbstractCacheHandler_
         self.tablename = db_table
         self.bitsize = bitsize + 1  # Add one to the bitsize to avoid off by one errors
         self.cursor = self.db.cursor()
-        self.cursor.execute(sql.SQL("""CREATE TABLE IF NOT EXISTS {}_cache (
-            query_hash TEXT PRIMARY KEY, 
-            partition_keys BIT VARYING, 
+        self.cursor.execute(
+            sql.SQL("""CREATE TABLE IF NOT EXISTS {}(
+            query_hash TEXT PRIMARY KEY,
+            partition_keys BIT VARYING,
             partition_keys_count integer NOT NULL GENERATED ALWAYS AS (length(replace(partition_keys::text, '0','')) ) STORED
-        );""").format(sql.Identifier(self.tablename)))  # type: ignore
-        self.cursor.execute(sql.SQL("""CREATE TABLE IF NOT EXISTS {}_queries (
+        );""").format(sql.Identifier(self.tablename + "_cache"))
+        ) 
+        self.cursor.execute(
+            sql.SQL("""CREATE TABLE IF NOT EXISTS {}(
             query_hash TEXT NOT NULL PRIMARY KEY,
             query TEXT NOT NULL,
             last_seen TIMESTAMP NOT NULL DEFAULT now()
-        );""").format(sql.Identifier(self.tablename)))  # type: ignore
+        );""").format(sql.Identifier(self.tablename + "_queries"))
+        ) 
         self.db.commit()
-        
 
     def close(self):
         self.cursor.close()
@@ -54,17 +57,25 @@ class PostgreSQLBitCacheHandler(AbstractCacheHandler_Lazy, AbstractCacheHandler_
 
         self.cursor.execute(f"INSERT INTO {self.tablename}_cache VALUES (%s, %s)", (key, val.to01()))  # type: ignore
         self.db.commit()
-        
+
     def set_query(self, key: str, querytext: str) -> None:
-        self.cursor.execute(f"""INSERT INTO {self.tablename}_queries VALUES (%s, %s) 
-                            ON CONFLICT (query_hash) DO UPDATE SET query = %s, last_seen = now()""", (key, querytext, querytext))  # type: ignore
+        self.cursor.execute(
+            sql.SQL("""INSERT INTO {0} VALUES (%s, %s)
+                            ON CONFLICT (query_hash) DO UPDATE SET query = %s, last_seen = now()""").format(
+                sql.Identifier(self.tablename + "_queries")
+            ),
+            (key, querytext, querytext),
+        )
         self.db.commit()
 
     def get(self, key: str, settype=int) -> set[int] | set[str] | None:
         if settype is str:
             raise ValueError("Only integer values are supported")
 
-        self.cursor.execute(f"SELECT partition_keys FROM {self.tablename}_cache WHERE query_hash = %s", (key,))  # type: ignore
+        self.cursor.execute(
+            sql.SQL("SELECT partition_keys FROM {0} WHERE query_hash = %s").format(sql.Identifier(self.tablename + "_cache")),
+            (key,),
+        )
         result = self.cursor.fetchone()
         if result is None:
             return None
@@ -73,10 +84,16 @@ class PostgreSQLBitCacheHandler(AbstractCacheHandler_Lazy, AbstractCacheHandler_
         return set(bitarray_result.search(bitarray("1")))
 
     def set_null(self, key: str) -> None:
-        self.cursor.execute(f"INSERT INTO {self.tablename}_cache VALUES (%s, %s)", (key, None))  # type: ignore
+        self.cursor.execute(
+            sql.SQL("INSERT INTO {0} VALUES (%s, %s)").format(sql.Identifier(self.tablename + "_cache")),
+            (key, None),
+        )
 
     def is_null(self, key: str) -> bool:
-        self.cursor.execute(f"SELECT partition_keys FROM {self.tablename}_cache WHERE query_hash = %s", (key,))  # type: ignore
+        self.cursor.execute(
+            sql.SQL("SELECT partition_keys FROM {0} WHERE query_hash = %s").format(sql.Identifier(self.tablename + "_cache")),
+            (key,),
+        )
         result = self.cursor.fetchone()
         if result == [None]:
             return True
@@ -86,7 +103,10 @@ class PostgreSQLBitCacheHandler(AbstractCacheHandler_Lazy, AbstractCacheHandler_
         """
         Returns True if the key exists in the cache, otherwise False.
         """
-        self.cursor.execute(f"SELECT partition_keys FROM {self.tablename}_cache WHERE query_hash = %s", (key,))  # type: ignore
+        self.cursor.execute(
+            sql.SQL("SELECT partition_keys FROM {0} WHERE query_hash = %s").format(sql.Identifier(self.tablename + "_cache")),
+            (key,),
+        )
         x = self.cursor.fetchone()
         if x is None:
             return False
@@ -94,7 +114,9 @@ class PostgreSQLBitCacheHandler(AbstractCacheHandler_Lazy, AbstractCacheHandler_
 
     def get_intersected(self, keys: set[str]) -> tuple[set[int] | set[str] | None, int]:
         # Check which exits
-        query = sql.SQL("SELECT query_hash FROM {0} WHERE query_hash = ANY(%s) AND partition_keys IS NOT NULL").format(sql.Identifier(self.tablename + "_cache"))
+        query = sql.SQL("SELECT query_hash FROM {0} WHERE query_hash = ANY(%s) AND partition_keys IS NOT NULL").format(
+            sql.Identifier(self.tablename + "_cache")
+        )
         self.cursor.execute(query, (list(keys),))
         keys_set = set(x[0] for x in self.cursor.fetchall())
 
@@ -111,17 +133,31 @@ class PostgreSQLBitCacheHandler(AbstractCacheHandler_Lazy, AbstractCacheHandler_
         return r, len(keys_set)
 
     def get_intersected_sql(self) -> sql.Composed:
-        return sql.SQL("SELECT BIT_AND(partition_keys) FROM (SELECT partition_keys FROM {0} WHERE query_hash = ANY(%s)) AS selected").format(sql.Identifier(self.tablename + "_cache"))
+        return sql.SQL("SELECT BIT_AND(partition_keys) FROM (SELECT partition_keys FROM {0} WHERE query_hash = ANY(%s)) AS selected").format(
+            sql.Identifier(self.tablename + "_cache")
+        )
 
     def get_intersected_sql_wk(self, keys) -> str:
         in_part = "', '".join(list(keys))
-        return f"SELECT BIT_AND(partition_keys) AS bit_result FROM (SELECT partition_keys FROM {self.tablename}_cache WHERE query_hash IN ('{in_part}')) AS selected"
+        return (
+            sql.SQL("SELECT BIT_AND(partition_keys) AS bit_result FROM "
+                    "(SELECT partition_keys FROM {0} WHERE query_hash IN ({1})) AS selected").format(
+                sql.Identifier(self.tablename + "_cache"),
+                sql.Literal(in_part),
+            )
+            .as_string()
+        )
 
     def filter_existing_keys(self, keys: set) -> set:
         """
         Returns the set of keys that exist in the cache.
         """
-        self.cursor.execute(f"SELECT query_hash FROM {self.tablename}_cache WHERE query_hash = ANY(%s) AND partition_keys IS NOT NULL", [list(keys)])  # type: ignore
+        self.cursor.execute(
+            sql.SQL("SELECT query_hash FROM {0} WHERE query_hash = ANY(%s) AND partition_keys IS NOT NULL").format(
+                sql.Identifier(self.tablename + "_cache")
+            ),
+            [list(keys)],
+        )
         query_hashkeys = set(x[0] for x in self.cursor.fetchall())
         logger.info(f"Found {len(query_hashkeys)} existing hashkeys")
         return query_hashkeys
@@ -134,7 +170,8 @@ class PostgreSQLBitCacheHandler(AbstractCacheHandler_Lazy, AbstractCacheHandler_
 
         intersect_sql_str = self.get_intersected_sql_wk(fitered_keys)
 
-        r = sql.SQL("""(
+        r = (
+            sql.SQL("""(
        WITH bit_result AS (
             {0}
         ),
@@ -147,10 +184,13 @@ class PostgreSQLBitCacheHandler(AbstractCacheHandler_Lazy, AbstractCacheHandler_
         SELECT unnest(array_agg(bit_index)) AS pocket_key
         FROM numbered_bits
         WHERE get_bit(bit_result, bit_index) = 1)
-        """).format(
-            sql.SQL(intersect_sql_str),  # type: ignore
-            sql.Literal(self.bitsize - 1),
-        ).as_string()
+        """)
+            .format(
+                sql.SQL(intersect_sql_str),  # type: ignore
+                sql.Literal(self.bitsize - 1),
+            )
+            .as_string()
+        )
 
         return r, len(fitered_keys)
 

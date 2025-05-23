@@ -48,7 +48,7 @@ def clean_query(query: str) -> str:
     # Remove all double quotes(postgresql) and backticks(mysql) from the normalized query
     query = query.replace('"', "")  # TODO currently double quotes are not supported in identifiers in PartitionCache
     query = query.replace("`", "")  # TODO currently backticks are not supported in identifiers in PartitionCache
-    
+
     return query
 
 
@@ -177,7 +177,7 @@ def extract_and_group_query_conditions(
     attribute_conditions: dict[str, list[str]] = dict()  # {table_alias: [conditions]}
     distance_conditions: dict[tuple[str, str], list[str]] = defaultdict(list)  # {(table_alias1, table_alias2): [conditions]}
     other_functions: dict[tuple, list[str]] = defaultdict(list)  # {(table_alias1, ...): [conditions]}
-    partition_key_conditions: list[str] = []  #   # List of all subqueries
+    partition_key_conditions: list[str] = []  # List of all subqueries
     or_conditions: dict[tuple, list[str]] = defaultdict(list)  # {(table_alias1, table_alias2, ...): [conditions(w/alias)]}
 
     # get tables
@@ -186,12 +186,12 @@ def extract_and_group_query_conditions(
     tables = [x.strip() for x in tables]
 
     # warn if more than one table is used
-    if len(set([re.split(r'\s+', x)[0] for x in tables])) > 1:
-        table_names = set([re.split(r'\s+', x)[0] for x in tables])
+    if len(set([re.split(r"\s+", x)[0] for x in tables])) > 1:
+        table_names = set([re.split(r"\s+", x)[0] for x in tables])
         logger.warning(f"More than one table is used in the query ({', '.join(table_names)}). This may cause unexpected behavior.")
 
-    table_aliases = [re.split(r'\s+', x)[-1] for x in tables]
-    table = [re.split(r'\s+', x)[0] for x in tables][0]  # TODO Ensure robustness
+    table_aliases = [re.split(r"\s+", x)[-1] for x in tables]
+    table = [re.split(r"\s+", x)[0] for x in tables][0]  # TODO Ensure robustness
 
     # define emtpy list for attribute_conditions for each tablealias
     for ta in table_aliases:
@@ -280,8 +280,11 @@ def generate_partial_queries(
     query: str: The query to be split
     partition_key: str: The identifier of the search space
     min_component_size: int: The minimum number of tables in the partial queries
-    follow_graph: bool: If True, the function will only return partial queries that are connected to each other.    If False, it will return all possible combinations of tables
-    keep_all_attributesbool: If True, the function will only return partial queries with the original attributes.    If False, it will return also partial queries with fewer attributes
+    follow_graph: bool: If True, the function will only return partial queries that are connected to each other.
+        If False, it will return all possible combinations of tables
+    keep_all_attributes: bool: If True, the function will only return partial queries with the original attributes.
+        If False, it will return also partial queries with fewer attributes
+    other_functions_as_distance_conditions: bool: 
 
     return: List[str]: List of all possible partial queries
 
@@ -322,7 +325,7 @@ def generate_partial_queries(
         if keep_all_attributes:
             table_conditions_vaiants = [attribute_conditions]
         else:
-            table_conditions_vaiants = remove_single_conditions(attribute_conditions)  # create variants with less attributes, TODO make this more efficient
+            table_conditions_vaiants = remove_single_conditions(attribute_conditions)  # create variants with less attributes
 
         # If multiple variants of table conditions are available, create a partial query for each variant
         for var_attribute_conditions in table_conditions_vaiants:
@@ -375,7 +378,7 @@ def generate_partial_queries(
             # Add join conditions for given partition_key
             for i in range(1, len(new_table_list)):
                 for j in range(i + 1, len(new_table_list) + 1):
-                    query_where.append(f"{new_table_list[i-1]}.{partition_key} = {new_table_list[j-1]}.{partition_key}")
+                    query_where.append(f"{new_table_list[i - 1]}.{partition_key} = {new_table_list[j - 1]}.{partition_key}")
 
             new_table_list_with_alias = [f"{table} AS {a}" for a in new_table_list]
             q = f"SELECT DISTINCT {new_table_list[0]}.{partition_key} FROM {', '.join(new_table_list_with_alias)} WHERE {' AND '.join(query_where)}"
@@ -391,7 +394,10 @@ def generate_partial_queries(
                         for subquery in comb:  # Add all partition_key_conditions of this combination to the query
                             p_subquery = f"{new_table_list[0]}.{subquery}"
                             query_where_comb.append(p_subquery)
-                        q = f"SELECT DISTINCT {new_table_list[0]}.{partition_key} FROM {', '.join(new_table_list_with_alias)} WHERE {' AND '.join(query_where_comb)}"
+                        q = (
+                            f"SELECT DISTINCT {new_table_list[0]}.{partition_key} FROM "
+                            + f"{', '.join(new_table_list_with_alias)} WHERE {' AND '.join(query_where_comb)}"
+                        )
                         ret.append(q)
 
     # Add also the raw partition_key queries
@@ -459,23 +465,23 @@ def normalize_distance_conditions(original_query: str, bucket_steps: float = 1.0
     # TODO Ensure one of the values is a number
     # TODO Ensure number is on second position
     # TODO Ensure number is not negative
-    
+
     # Check if at least one value is a number
     for distance_condition in distance_conditions_between + distance_conditions_smaller + distance_conditions_greater:
-        if not any(str(x).replace('.','',1).isdigit() for x in distance_condition.split()):
+        if not any(str(x).replace(".", "", 1).isdigit() for x in distance_condition.split()):
             logger.warning(f"No numeric value found in distance condition: {distance_condition}")
-            
+
     # Check if number is on right side of comparison operator for distance functions
     for distance_condition in distance_conditions_between + distance_conditions_smaller + distance_conditions_greater:
         if is_distance_function(distance_condition):
             if "<" in distance_condition or ">" in distance_condition:
-                parts = re.split(r'(<=|>=|<|>)', distance_condition)
-                if len(parts) == 2 and not str(parts[1].strip()).replace('.','',1).isdigit():
+                parts = re.split(r"(<=|>=|<|>)", distance_condition)
+                if len(parts) == 2 and not str(parts[1].strip()).replace(".", "", 1).isdigit():
                     logger.warning(f"Numeric value not on right side of comparison in distance condition: {distance_condition}")
-                
+
     # Check for negative numbers
     for distance_condition in distance_conditions_between + distance_conditions_smaller + distance_conditions_greater:
-        numbers = [float(x) for x in re.findall(r'-?\d*\.?\d+', distance_condition)]
+        numbers = [float(x) for x in re.findall(r"-?\d*\.?\d+", distance_condition)]
         if any(n < 0 for n in numbers):
             logger.warning(f"Negative value found in distance condition: {distance_condition}")
 
@@ -521,9 +527,9 @@ def normalize_distance_conditions(original_query: str, bucket_steps: float = 1.0
             value = value.replace(";", "")
             if float(value) < 0:
                 continue
-            b = (int(float(value) / bucket_steps) * bucket_steps)
+            b = int(float(value) / bucket_steps) * bucket_steps
             if b == float(value):
-                valuef = b 
+                valuef = b
             else:
                 valuef = b + bucket_steps
             new_condition = f"{distance_condition.split('<')[0]} < {valuef:g}"
@@ -566,7 +572,14 @@ def generate_all_query_hash_pairs(
 
     # Create all possible partial queries
     query_set_diff_combinations = set(
-        generate_partial_queries(query, partition_key, min_component_size, follow_graph, keep_all_attributes, other_functions_as_distance_conditions=True)
+        generate_partial_queries(
+            query,
+            partition_key,
+            min_component_size,
+            follow_graph,
+            keep_all_attributes,
+            other_functions_as_distance_conditions=True,
+        )
     )
     query_set.update(query_set_diff_combinations)
 
