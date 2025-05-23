@@ -33,6 +33,7 @@ class PostgreSQLArrayCacheHandler(AbstractCacheHandler_Lazy, AbstractCacheHandle
             sql.SQL("""CREATE TABLE IF NOT EXISTS {0} (
             query_hash TEXT NOT NULL PRIMARY KEY,
             query TEXT NOT NULL,
+            partition_key TEXT NOT NULL,
             last_seen TIMESTAMP NOT NULL DEFAULT now()
         );""").format(sql.Identifier(self.tablename + "_queries"))
         )
@@ -58,13 +59,14 @@ class PostgreSQLArrayCacheHandler(AbstractCacheHandler_Lazy, AbstractCacheHandle
         self.cursor.execute(f"INSERT INTO {self.tablename}_cache VALUES (%s, %s)", (key, val))  # type: ignore
         self.db.commit()
 
-    def set_query(self, key: str, querytext: str) -> None:
-        self.cursor.execute(
-            sql.SQL("INSERT INTO {0} VALUES (%s, %s) ON CONFLICT (query_hash) DO UPDATE SET query = %s, last_seen = now()").format(
-                sql.Identifier(self.tablename + "_queries")
-            ),
-            (key, querytext, querytext),
-        )
+    def set_query(self, key: str, querytext: str, partition_key: str = "partition_key") -> None:
+        query_sql = sql.SQL(
+            "INSERT INTO {0} VALUES (%s, %s, %s) "
+            "ON CONFLICT (query_hash) DO UPDATE SET "
+            "query = %s, partition_key = %s, last_seen = now()"
+        ).format(sql.Identifier(self.tablename + "_queries"))
+        
+        self.cursor.execute(query_sql, (key, querytext, partition_key, querytext, partition_key))
         self.db.commit()
 
     def get(self, key: str, settype=int) -> set[int] | set[str] | None:

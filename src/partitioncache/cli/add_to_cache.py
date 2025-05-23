@@ -13,7 +13,7 @@ from partitioncache.cache_handler.abstract import AbstractCacheHandler_Query
 from partitioncache.db_handler import get_db_handler
 from partitioncache.db_handler.abstract import AbstractDBHandler
 from partitioncache.query_processor import clean_query, generate_all_query_hash_pairs, hash_query
-from partitioncache.queue import push_to_incoming_queue, push_to_outgoing_queue
+from partitioncache.queue import push_to_original_query_queue, push_to_query_fragment_queue
 
 logger = getLogger("PartitionCache")
 
@@ -26,12 +26,14 @@ def main():
 
     parser.add_argument("--query-file", type=str, help="Path to file containing SQL query to add to cache")
 
-    parser.add_argument("--no-recompose", action="store_true", help="Do not recompose the query before adding to cache, the query is added as is")
+    parser.add_argument("--no-recompose", action="store_true", help="Do not recompose the query before adding to cache, the query is added as is to the cache or fragment queue")
 
     parser.add_argument("--partition-key", type=str, required=True, help="Name of the partition key column")
 
     # Queue configuration
-    parser.add_argument("--queue", action="store_true", help="Add query to incoming queue instead of executing directly")
+    parser.add_argument("--queue", action="store_true", help="Add query to fragment queue instead of executing directly")
+    
+    parser.add_argument("--queue-original", action="store_true", help="Add query to original query queue instead of fragment queue")
 
     parser.add_argument("--queue-provider", type=str, default="postgresql", help="Queue provider to use")
 
@@ -40,9 +42,9 @@ def main():
 
     parser.add_argument("--db-backend", type=str, default="postgresql", help="Database backend (currently only postgresql supported)")
 
-    parser.add_argument("--db-name", type=str, help="Database name")
+    parser.add_argument("--db-name", type=str, help="Database name, if not specified, the database name will be read from the environment file")
 
-    parser.add_argument("--env-file", type=str, help="Path to environment file with database credentials")
+    parser.add_argument("--env", type=str, default=".env", help="Path to environment file with database credentials")
 
     # Cache configuration
     parser.add_argument("--cache-backend", type=str, default="postgresql_bit", help="Cache backend to use")
@@ -50,10 +52,7 @@ def main():
     args = parser.parse_args()
 
     # Load environment variables
-    if args.env_file is not None:
-        dotenv.load_dotenv(args.env_file)
-    elif os.path.exists(".env"):
-        dotenv.load_dotenv(".env")
+    dotenv.load_dotenv(args.env)
 
     # Validate mutually exclusive options
     queue_options = [args.queue, args.direct]
@@ -73,30 +72,38 @@ def main():
         query = args.query
 
     if args.queue:  # Add to queue for async processing
-        if not args.no_recompose:  # Add to query fragment queue for async processing
-            query_hash_pairs = generate_all_query_hash_pairs(
-                query,
-                args.partition_key,
-                min_component_size=1,
-                follow_graph=True,
-                keep_all_attributes=True,
-            )
-            success = push_to_outgoing_queue(query_hash_pairs)
+        if args.queue_original:
+            success = push_to_original_query_queue(query, args.partition_key)
         else:
-            success = push_to_incoming_queue(query)
+            if not args.no_recompose:  # Add to query fragment queue for async processing
+                query_hash_pairs = generate_all_query_hash_pairs(
+                    query,
+                    args.partition_key,
+                    min_component_size=1,
+                    follow_graph=True,
+                    keep_all_attributes=True,
+                )
+                success = push_to_query_fragment_queue(query_hash_pairs, args.partition_key)
+            else:
+                query = clean_query(query)
+                query_hash_pairs = [(query, hash_query(query))]
+                success = push_to_query_fragment_queue(query_hash_pairs, args.partition_key)
         if success:
             logger.info("Query successfully added to queue")
         else:
             logger.error("Failed to add query to queue")
             exit(1)
 
-    else:  # Execute directly
+    elif args.direct:  # Execute directly
         if not args.no_recompose:
             logger.warning("Direct mode with recomposing may take a long time on large queries, consider using the queue instead")
 
         if args.db_name is None:
-            logger.error("Database name is required")
-            exit(1)
+            db_name = os.getenv("DB_NAME")
+            if db_name is None:
+                logger.error("--db-name is required")
+                exit(1)
+            args.db_name = db_name
 
         try:
             # Initialize cache handler
@@ -149,6 +156,8 @@ def main():
             for query, hash_value in query_hash_pairs:
                 if cache_handler.exists(hash_value):
                     logger.info(f"Query {hash_value} already in cache")
+                    if isinstance(cache_handler, AbstractCacheHandler_Query):
+                        cache_handler.set_query(hash_value, query, args.partition_key)
                     continue
 
                 # Execute query and store results
@@ -156,7 +165,7 @@ def main():
                 if result:
                     cache_handler.set_set(hash_value, result)
                     if isinstance(cache_handler, AbstractCacheHandler_Query):
-                        cache_handler.set_query(hash_value, query)
+                        cache_handler.set_query(hash_value, query, args.partition_key)
                     logger.info(f"Stored query {hash_value} with {len(result)} results")
                 else:
                     logger.warning(f"Query {hash_value} returned no results")

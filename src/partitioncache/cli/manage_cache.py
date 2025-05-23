@@ -167,7 +167,7 @@ def clear_incoming_queue():
     provider = os.environ.get("QUERY_QUEUE_PROVIDER", "postgresql")
 
     try:
-        from partitioncache.queue import clear_incoming_queue as clear_incoming
+        from partitioncache.queue import clear_original_query_queue as clear_incoming
 
         deleted_count = clear_incoming()
         logger.info(f"Original query queue: {deleted_count} entries cleared")
@@ -180,7 +180,7 @@ def clear_outgoing_queue():
     provider = os.environ.get("QUERY_QUEUE_PROVIDER", "postgresql")
 
     try:
-        from partitioncache.queue import clear_outgoing_queue as clear_outgoing
+        from partitioncache.queue import clear_query_fragment_queue as clear_outgoing
 
         deleted_count = clear_outgoing()
         logger.info(f"Query fragment queue: {deleted_count} entries cleared")

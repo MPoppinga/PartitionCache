@@ -14,20 +14,9 @@ This will start a PostgreSQL database with PostGIS enabled, accessible on port 5
 
 ## 2. Configure Environment Variables
 
-Copy the template and edit as needed:
+You can use the provided `.env.example` file to configure the environment variables.
 
-```bash
-cp .env.example .env
-```
 
-Edit `.env` and set:
-- `DB_HOST=db`
-- `DB_PORT=55432`
-- `DB_USER=osmuser`
-- `DB_PASSWORD=osmpassword`
-- `DB_NAME=osm_poi_db`
-
-These match the defaults in `db.env` and `docker-compose.yml`.
 
 ## 3. Install Python Dependencies
 
@@ -52,3 +41,25 @@ Use the provided script to run example queries, with and without PartitionCache:
 ```bash
 python run_poi_queries.py
 ```
+
+## 6.a Add a query to the cache
+
+```bash
+pcache-add --direct --query-file examples/openstreetmap_poi/testqueries_examples/q1.sql --partition-key zipcode --env examples/openstreetmap_poi/.env.example 
+```
+
+## 6.b Monitor the cache queue
+
+```bash
+pcache-monitor --env examples/openstreetmap_poi/.env.example
+```
+
+Add query to the cache queue
+
+```bash
+pcache-add --query-file examples/openstreetmap_poi/testqueries_examples/q1.sql --partition-key zipcode --env examples/openstreetmap_poi/.env.example --queue-provider postgresql 
+# or
+pcache-add --queue --query-file examples/openstreetmap_poi/testqueries_examples/q1.sql --partition-key zipcode --env examples/openstreetmap_poi/.env.example --queue-original
+```
+
+

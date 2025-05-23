@@ -2,15 +2,11 @@
 Unit tests for the monitor cache queue module.
 """
 
-import json
 import os
-import threading
-import time
 import pytest
-from unittest.mock import Mock, patch, MagicMock, call
+from unittest.mock import Mock, patch
 from partitioncache.cli.monitor_cache_queue import (
     query_fragment_processor,
-    push_fragments_to_outgoing_queue,
     run_and_store_query,
     fragment_executor,
     print_status,
@@ -60,15 +56,15 @@ class TestQueryFragmentProcessor:
     """Test query fragment processor functionality."""
     
     @patch('partitioncache.cli.monitor_cache_queue.exit_event')
-    @patch('partitioncache.cli.monitor_cache_queue.pop_from_incoming_queue')
+    @patch('partitioncache.cli.monitor_cache_queue.pop_from_original_query_queue')
     @patch('partitioncache.cli.monitor_cache_queue.generate_all_query_hash_pairs')
-    @patch('partitioncache.cli.monitor_cache_queue.push_fragments_to_outgoing_queue')
-    def test_query_fragment_processor_success(self, mock_push_fragments, mock_generate, 
-                                            mock_pop, mock_exit_event, mock_args):
+    @patch('partitioncache.cli.monitor_cache_queue.push_to_query_fragment_queue')
+    def test_query_fragment_processor_success(self, mock_push_fragments, mock_generate,
+                                              mock_pop, mock_exit_event, mock_args):
         """Test successful query fragment processing."""
         # Setup mocks
         mock_exit_event.is_set.side_effect = [False, True]  # Run once then exit
-        mock_pop.return_value = "SELECT * FROM test_table"
+        mock_pop.return_value = ("SELECT * FROM test_table", "test_partition_key")  
         mock_generate.return_value = [("SELECT DISTINCT t1.partition_key FROM test_table t1", "hash1")]
         
         # Monkey patch args into the module
@@ -87,11 +83,11 @@ class TestQueryFragmentProcessor:
         
         # Verify calls
         mock_pop.assert_called_once()
-        mock_generate.assert_called_once_with("SELECT * FROM test_table", "partition_key", 1, True, True)
-        mock_push_fragments.assert_called_once_with([("SELECT DISTINCT t1.partition_key FROM test_table t1", "hash1")])
+        mock_generate.assert_called_once_with("SELECT * FROM test_table", "test_partition_key", 1, True, True)
+        mock_push_fragments.assert_called_once_with([("SELECT DISTINCT t1.partition_key FROM test_table t1", "hash1")], "test_partition_key")
     
     @patch('partitioncache.cli.monitor_cache_queue.exit_event')
-    @patch('partitioncache.cli.monitor_cache_queue.pop_from_incoming_queue')
+    @patch('partitioncache.cli.monitor_cache_queue.pop_from_original_query_queue')
     def test_query_fragment_processor_empty_queue(self, mock_pop, mock_exit_event, mock_args):
         """Test query fragment processor with empty queue."""
         mock_exit_event.is_set.side_effect = [False, True]  # Run once then exit
@@ -114,7 +110,7 @@ class TestQueryFragmentProcessor:
         mock_pop.assert_called_once()
     
     @patch('partitioncache.cli.monitor_cache_queue.exit_event')
-    @patch('partitioncache.cli.monitor_cache_queue.pop_from_incoming_queue')
+    @patch('partitioncache.cli.monitor_cache_queue.pop_from_original_query_queue')
     def test_query_fragment_processor_error_handling(self, mock_pop, mock_exit_event, mock_args):
         """Test query fragment processor error handling."""
         mock_exit_event.is_set.side_effect = [False, True]  # Run once then exit
@@ -138,30 +134,6 @@ class TestQueryFragmentProcessor:
         mock_sleep.assert_called_once_with(1)
 
 
-class TestPushFragmentsToOutgoingQueue:
-    """Test push fragments to outgoing queue functionality."""
-    
-    @patch('partitioncache.cli.monitor_cache_queue.push_to_outgoing_queue')
-    def test_push_fragments_success(self, mock_push_to_outgoing):
-        """Test successful fragment pushing."""
-        mock_push_to_outgoing.return_value = True
-        
-        query_hash_pairs = [("query1", "hash1"), ("query2", "hash2")]
-        
-        result = push_fragments_to_outgoing_queue(query_hash_pairs)
-        
-        assert result is True
-        mock_push_to_outgoing.assert_called_once_with(query_hash_pairs)
-    
-    @patch('partitioncache.cli.monitor_cache_queue.push_to_outgoing_queue')
-    def test_push_fragments_error(self, mock_push_to_outgoing):
-        """Test fragment pushing with error."""
-        mock_push_to_outgoing.side_effect = Exception("Queue error")
-        
-        # Should not raise exception, should return False
-        result = push_fragments_to_outgoing_queue([("query", "hash")])
-        assert result is False
-
 
 class TestRunAndStoreQuery:
     """Test run and store query functionality."""
@@ -184,7 +156,7 @@ class TestRunAndStoreQuery:
         mcq_module.args = mock_args
         
         try:
-            result = run_and_store_query("SELECT * FROM test", "test_hash")
+            result = run_and_store_query("SELECT * FROM test", "test_hash", "test_partition_key")
         finally:
             # Restore original args
             if original_args is not None:
@@ -215,7 +187,7 @@ class TestRunAndStoreQuery:
         mcq_module.args = mock_args
         
         try:
-            result = run_and_store_query("SELECT * FROM test", "test_hash")
+            result = run_and_store_query("SELECT * FROM test", "test_hash", "test_partition_key")
         finally:
             # Restore original args
             if original_args is not None:
@@ -246,7 +218,7 @@ class TestRunAndStoreQuery:
         mcq_module.args = mock_args
         
         try:
-            result = run_and_store_query("SELECT * FROM test", "test_hash")
+            result = run_and_store_query("SELECT * FROM test", "test_hash", "test_partition_key")
         finally:
             # Restore original args
             if original_args is not None:
@@ -271,7 +243,7 @@ class TestRunAndStoreQuery:
                 mcq_module.args = mock_args
                 
                 try:
-                    result = run_and_store_query("SELECT * FROM test", "test_hash")
+                    result = run_and_store_query("SELECT * FROM test", "test_hash", "test_partition_key")
                 finally:
                     # Restore original args
                     if original_args is not None:
@@ -307,7 +279,7 @@ class TestProcessCompletedFuture:
             with patch('partitioncache.cli.monitor_cache_queue.active_futures', ['hash1', 'hash2']):
                 with patch('partitioncache.cli.monitor_cache_queue.pending_jobs', []):
                     with patch('partitioncache.cli.monitor_cache_queue.pool') as mock_pool:
-                        with patch('partitioncache.cli.monitor_cache_queue.get_queue_lengths', return_value={'incoming': 0, 'outgoing': 0}):
+                        with patch('partitioncache.cli.monitor_cache_queue.get_queue_lengths', return_value={'original_query_queue': 0, 'query_fragment_queue': 0}):
                             # Monkey patch args into the module
                             import partitioncache.cli.monitor_cache_queue as mcq_module
                             original_args = getattr(mcq_module, 'args', None)
@@ -327,9 +299,10 @@ class TestProcessCompletedFuture:
         """Test future completion with pending jobs."""
         with patch('partitioncache.cli.monitor_cache_queue.status_lock'):
             with patch('partitioncache.cli.monitor_cache_queue.active_futures', ['hash1']) as mock_active:
-                with patch('partitioncache.cli.monitor_cache_queue.pending_jobs', [('query2', 'hash2')]) as mock_pending:
+                with patch('partitioncache.cli.monitor_cache_queue.pending_jobs', 
+                           [('query2', 'hash2', 'test_partition_key')]) as mock_pending:  # 3-tuple now
                     with patch('partitioncache.cli.monitor_cache_queue.pool') as mock_pool:
-                        with patch('partitioncache.cli.monitor_cache_queue.get_queue_lengths', return_value={'incoming': 0, 'outgoing': 0}):
+                        with patch('partitioncache.cli.monitor_cache_queue.get_queue_lengths', return_value={'original_query_queue': 0, 'query_fragment_queue': 0}):
                             mock_pool.submit.return_value = Mock()
                             
                             # Monkey patch args into the module
@@ -354,75 +327,106 @@ class TestProcessCompletedFuture:
 class TestFragmentExecutorComponents:
     """Test components of fragment executor."""
     
-    def test_fragment_executor_empty_queue(self, mock_args):
-        """Test fragment executor with empty outgoing queue."""
+    def test_fragment_executor_empty_queue(self, mock_args, mock_env):
+        """Test fragment executor with empty query fragment queue."""
+        # Set up mock args with required attributes
+        mock_args.status_log_interval = 10
+        mock_args.disable_optimized_polling = False
+        
         with patch('partitioncache.cli.monitor_cache_queue.exit_event') as mock_exit_event:
-            with patch('partitioncache.cli.monitor_cache_queue.pop_from_outgoing_queue') as mock_pop:
-                with patch('partitioncache.cli.monitor_cache_queue.get_cache_handler') as mock_get_cache:
-                    mock_exit_event.is_set.side_effect = [False, True]  # Run once then exit
-                    mock_pop.return_value = None  # Empty queue
-                    
-                    mock_cache = Mock()
-                    mock_get_cache.return_value = mock_cache
-                    
-                    # Monkey patch args into the module
-                    import partitioncache.cli.monitor_cache_queue as mcq_module
-                    original_args = getattr(mcq_module, 'args', None)
-                    mcq_module.args = mock_args
-                    
-                    try:
-                        # This would normally run forever, but our mock will exit after one iteration
-                        fragment_executor()
-                    finally:
-                        # Restore original args
-                        if original_args is not None:
-                            mcq_module.args = original_args
-                        else:
-                            delattr(mcq_module, 'args')
-                    
-                    mock_pop.assert_called()
+            with patch('partitioncache.cli.monitor_cache_queue.pop_from_query_fragment_queue') as mock_pop:
+                with patch('partitioncache.cli.monitor_cache_queue.pop_from_query_fragment_queue_blocking') as mock_pop_blocking:
+                    with patch('partitioncache.cli.monitor_cache_queue.get_cache_handler') as mock_get_cache:
+                        with patch('partitioncache.cli.monitor_cache_queue.get_queue_lengths') as mock_get_lengths:
+                            with patch('partitioncache.cli.monitor_cache_queue.time.time') as mock_time:
+                                with patch('partitioncache.cli.monitor_cache_queue.get_queue_provider') as mock_get_provider:
+                                    mock_exit_event.is_set.side_effect = [False, True]  # Run once then exit
+                                    mock_pop.return_value = None  # Empty queue
+                                    mock_pop_blocking.return_value = None  # Empty queue for blocking calls too
+                                    mock_get_lengths.return_value = {'original_query_queue': 0, 'query_fragment_queue': 0}
+                                    mock_time.return_value = 1000.0  # Fixed time value
+                                    mock_get_provider.return_value = "redis"  # Use redis to avoid PostgreSQL blocking
+                                    
+                                    mock_cache = Mock()
+                                    mock_get_cache.return_value = mock_cache
+                                    
+                                    # Monkey patch args and reset consecutive_empty_polls
+                                    import partitioncache.cli.monitor_cache_queue as mcq_module
+                                    original_args = getattr(mcq_module, 'args', None)
+                                    original_consecutive_empty_polls = getattr(mcq_module, 'consecutive_empty_polls', 0)
+                                    mcq_module.args = mock_args
+                                    mcq_module.consecutive_empty_polls = 0  # Reset for clean test
+                                    
+                                    try:
+                                        # This would normally run forever, but our mock will exit after one iteration
+                                        fragment_executor()
+                                    finally:
+                                        # Restore original values
+                                        if original_args is not None:
+                                            mcq_module.args = original_args
+                                        else:
+                                            delattr(mcq_module, 'args')
+                                        mcq_module.consecutive_empty_polls = original_consecutive_empty_polls
+                                    
+                                    # Either regular or blocking pop should be called
+                                    assert mock_pop.called or mock_pop_blocking.called
 
-    def test_fragment_executor_cached_query(self, mock_args):
+    def test_fragment_executor_cached_query(self, mock_args, mock_env):
         """Test fragment executor with already cached query."""
+        # Set up mock args with required attributes
+        mock_args.status_log_interval = 10
+        mock_args.disable_optimized_polling = False
+        
         with patch('partitioncache.cli.monitor_cache_queue.exit_event') as mock_exit_event:
-            with patch('partitioncache.cli.monitor_cache_queue.pop_from_outgoing_queue') as mock_pop:
-                with patch('partitioncache.cli.monitor_cache_queue.get_cache_handler') as mock_get_cache:
-                    mock_exit_event.is_set.side_effect = [False, True]  # Run once then exit
-                    mock_pop.return_value = ("SELECT * FROM test", "cached_hash")
-                    
-                    mock_cache = Mock()
-                    mock_cache.exists.return_value = True  # Already in cache
-                    mock_get_cache.return_value = mock_cache
-                    
-                    # Monkey patch args into the module
-                    import partitioncache.cli.monitor_cache_queue as mcq_module
-                    original_args = getattr(mcq_module, 'args', None)
-                    mcq_module.args = mock_args
-                    
-                    try:
-                        fragment_executor()
-                    finally:
-                        # Restore original args
-                        if original_args is not None:
-                            mcq_module.args = original_args
-                        else:
-                            delattr(mcq_module, 'args')
-                    
-                    mock_cache.exists.assert_called_with("cached_hash")
+            with patch('partitioncache.cli.monitor_cache_queue.pop_from_query_fragment_queue') as mock_pop:
+                with patch('partitioncache.cli.monitor_cache_queue.pop_from_query_fragment_queue_blocking') as mock_pop_blocking:
+                    with patch('partitioncache.cli.monitor_cache_queue.get_cache_handler') as mock_get_cache:
+                        with patch('partitioncache.cli.monitor_cache_queue.get_queue_lengths') as mock_get_lengths:
+                            with patch('partitioncache.cli.monitor_cache_queue.time.time') as mock_time:
+                                with patch('partitioncache.cli.monitor_cache_queue.get_queue_provider') as mock_get_provider:
+                                    mock_exit_event.is_set.side_effect = [False, True]  # Run once then exit
+                                    mock_pop.return_value = ("SELECT * FROM test", "cached_hash", "test_partition_key")  # Now 3-tuple
+                                    mock_pop_blocking.return_value = ("SELECT * FROM test", "cached_hash", "test_partition_key")  # For blocking calls too
+                                    mock_get_lengths.return_value = {'original_query_queue': 0, 'query_fragment_queue': 0}
+                                    mock_time.return_value = 1000.0  # Fixed time value
+                                    mock_get_provider.return_value = "redis"  # Use redis to avoid PostgreSQL blocking
+                                    
+                                    mock_cache = Mock()
+                                    mock_cache.exists.return_value = True  # Already in cache
+                                    mock_get_cache.return_value = mock_cache
+                                    
+                                    # Monkey patch args and reset consecutive_empty_polls
+                                    import partitioncache.cli.monitor_cache_queue as mcq_module
+                                    original_args = getattr(mcq_module, 'args', None)
+                                    original_consecutive_empty_polls = getattr(mcq_module, 'consecutive_empty_polls', 0)
+                                    mcq_module.args = mock_args
+                                    mcq_module.consecutive_empty_polls = 0  # Reset for clean test
+                                    
+                                    try:
+                                        fragment_executor()
+                                    finally:
+                                        # Restore original values
+                                        if original_args is not None:
+                                            mcq_module.args = original_args
+                                        else:
+                                            delattr(mcq_module, 'args')
+                                        mcq_module.consecutive_empty_polls = original_consecutive_empty_polls
+                                    
+                                    mock_cache.exists.assert_called_with("cached_hash")
 
 
 class TestIntegration:
     """Integration tests for monitor cache queue."""
     
     @patch('partitioncache.cli.monitor_cache_queue.exit_event')
-    @patch('partitioncache.cli.monitor_cache_queue.pop_from_incoming_queue')
+    @patch('partitioncache.cli.monitor_cache_queue.pop_from_original_query_queue')
     @patch('partitioncache.cli.monitor_cache_queue.generate_all_query_hash_pairs')
-    @patch('partitioncache.cli.monitor_cache_queue.push_to_outgoing_queue')
+    @patch('partitioncache.cli.monitor_cache_queue.push_to_query_fragment_queue')
     def test_end_to_end_fragment_processing(self, mock_push_to_outgoing, mock_generate, mock_pop, mock_exit_event, mock_args):
         """Test end-to-end fragment processing workflow."""
         # Setup mocks for one iteration
         mock_exit_event.is_set.side_effect = [False, True]
-        mock_pop.return_value = "SELECT * FROM test_table WHERE id = 1"
+        mock_pop.return_value = ("SELECT * FROM test_table WHERE id = 1", "test_partition_key")  # Now returns tuple
         mock_generate.return_value = [
             ("SELECT DISTINCT t1.partition_key FROM test_table t1 WHERE t1.id = 1", "hash1")
         ]
@@ -446,11 +450,11 @@ class TestIntegration:
         mock_pop.assert_called_once()
         mock_generate.assert_called_once_with(
             "SELECT * FROM test_table WHERE id = 1", 
-            "partition_key", 
+            "test_partition_key",  # Now uses partition_key from queue
             1, 
             True, 
             True
         )
         mock_push_to_outgoing.assert_called_once_with([
             ("SELECT DISTINCT t1.partition_key FROM test_table t1 WHERE t1.id = 1", "hash1")
-        ]) 
+        ], "test_partition_key")  # Now includes partition_key parameter 
