@@ -36,18 +36,18 @@ class AbstractCacheHandler(ABC):
         return datatype in cls.get_supported_datatypes()
 
     @classmethod
-    def validate_datatype_compatibility(cls, settype: str) -> None:
+    def validate_datatype_compatibility(cls, datatype: str) -> None:
         """
         Validate that this cache handler supports the given Python type.
 
         Args:
-            settype (Type): The Python type to validate
+            settype (str): The datatype to validate (e.g., "integer", "text", "float", "timestamp")
 
         Raises:
             ValueError: If the type is not supported
         """
-        if not cls.supports_datatype(settype):
-            type_name = getattr(settype, "__name__", str(settype))
+        if not cls.supports_datatype(datatype):
+            type_name = getattr(datatype, "__name__", str(datatype))
             handler_name = cls.__name__
             raise ValueError(f"Cache handler '{handler_name}' does not support Python type '{type_name}' ")
 
