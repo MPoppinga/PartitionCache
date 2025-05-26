@@ -119,7 +119,7 @@ class PostgreSQLArrayCacheHandler(PostgreSQLAbstractCacheHandler):
         try:
             # Try to get datatype from metadata
             datatype = self._get_partition_datatype(partition_key)
-            
+
             # Determine the datatype of the incoming value
             sample = next(iter(value))
             if isinstance(sample, int):
@@ -133,7 +133,7 @@ class PostgreSQLArrayCacheHandler(PostgreSQLAbstractCacheHandler):
             else:
                 logger.error(f"Unsupported value type: {type(sample)}")
                 return False
-            
+
             if datatype is None:
                 # Partition key is not set in metadata, so we use the inferred datatype
                 datatype = value_datatype

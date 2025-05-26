@@ -24,7 +24,7 @@ from partitioncache.queue import (
     pop_from_query_fragment_queue_blocking,
     push_to_query_fragment_queue,
     get_queue_provider_name,
-    get_queue_lengths
+    get_queue_lengths,
 )
 
 args: argparse.Namespace
@@ -83,7 +83,7 @@ def query_fragment_processor():
 
 def run_and_store_query(query: str, query_hash: str, partition_key: str, partition_datatype: str | None = None):
     """Worker function to execute and store a query.
-    
+
     Args:
         query: SQL query string to execute
         query_hash: Unique hash identifier for the query

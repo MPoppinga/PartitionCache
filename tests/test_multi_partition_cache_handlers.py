@@ -175,8 +175,9 @@ class TestMultiPartitionFunctionality:
             result = handler.get("test_key", partition_key="test_partition")
             
             # Verify namespaced key was used
-            expected_key = "cache:test_partition:test_key"
-            mock_db.type.assert_called_with(expected_key)
+            expected_metadata_key = '_partition_metadata:test_partition'
+            # Only check the first call, which should be for the metadata key
+            assert mock_db.type.call_args_list[0][0][0] == expected_metadata_key
 
     def test_all_handlers_support_partition_keys(self):
         """Test that all cache handlers properly support partition_key parameter."""

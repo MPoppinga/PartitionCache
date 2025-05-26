@@ -10,13 +10,11 @@ class RocksDBBitCacheHandler(RocksDBAbstractCacheHandler):
     This handler supports multiple partition keys but only integer datatypes.
     """
 
-
-    
     @classmethod
     def get_supported_datatypes(cls) -> set[str]:
         """RocksDB bit handler supports only integer datatype."""
         return {"integer"}
-    
+
     def __repr__(self) -> str:
         return "rocksdb_bit"
 
@@ -68,7 +66,6 @@ class RocksDBBitCacheHandler(RocksDBAbstractCacheHandler):
         bitval.frombytes(value)
         return set(bitval.search(bitarray("1")))
 
-
     def get_intersected(self, keys: set[str], partition_key: str = "partition_key") -> tuple[set[int] | set[str] | set[float] | set[datetime] | None, int]:
         """
         Returns the intersection of all sets in the cache that are associated with the given keys.
@@ -77,7 +74,7 @@ class RocksDBBitCacheHandler(RocksDBAbstractCacheHandler):
         datatype = self._get_partition_datatype(partition_key)
         if datatype is None:
             return None, 0
-        
+
         count_match = 0
         result: bitarray | None = None
 
@@ -108,12 +105,12 @@ class RocksDBBitCacheHandler(RocksDBAbstractCacheHandler):
             return True
         # Ensure partition exists with correct datatype and bitsize
         self._ensure_partition_exists(partition_key)
-        
+
         # Get the correct bitsize for this partition
         bitsize = self._get_partition_bitsize(partition_key)
         if bitsize is None:
             bitsize = self.default_bitsize
-            
+
         bitval = bitarray(bitsize)
         try:
             for k in value:
@@ -136,10 +133,6 @@ class RocksDBBitCacheHandler(RocksDBAbstractCacheHandler):
         """Register a partition key with the cache handler."""
         if datatype != "integer":
             raise ValueError("RocksDB bit handler supports only integer datatype")
-        
+
         bitsize = kwargs.get("bitsize", self.default_bitsize)
         self._ensure_partition_exists(partition_key, bitsize)
-
-
-
-

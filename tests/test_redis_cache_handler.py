@@ -65,8 +65,9 @@ def test_get_set_type_int(cache_handler, mock_redis):
 def test_get_set_type_str(cache_handler, mock_redis):
     cache_key = "cache:partition_key:str_set_key"
     metadata_key = "_partition_metadata:partition_key"
+    # First call for metadata check, second call for cache key check
+    mock_redis.type.side_effect = [b"string", b"set"]
     mock_redis.get.side_effect = lambda k: b"text" if k == metadata_key else None
-    mock_redis.type.return_value = b"set"
     mock_redis.smembers.return_value = {b'foo', b'bar'}
     result = cache_handler.get("str_set_key")
     assert result == {"foo", "bar"}
@@ -86,6 +87,8 @@ def test_get_set_invalid_type(cache_handler, mock_redis):
 def test_exists_true(cache_handler, mock_redis):
     cache_key = "cache:partition_key:existing_key"
     metadata_key = "_partition_metadata:partition_key"
+    # First call for metadata check
+    mock_redis.type.return_value = b"string"
     mock_redis.get.side_effect = lambda k: b"integer" if k == metadata_key else None
     mock_redis.exists.return_value = 1
     assert cache_handler.exists("existing_key") is True

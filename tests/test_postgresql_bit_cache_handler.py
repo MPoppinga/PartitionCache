@@ -84,15 +84,11 @@ def test_set_set(cache_handler):
 def test_set_query(cache_handler):
     test_query = "SELECT * FROM test_bit_cache_table_cache WHERE query_hash = %s"
     cache_handler.set_query("key1", test_query)
-
-    # The implementation now uses sql.SQL().format() and includes partition_key
+    # Update expected SQL and params to match implementation
     expected_sql = sql.SQL(
-        "INSERT INTO {0} VALUES (%s, %s, %s) "
-        "ON CONFLICT (query_hash) DO UPDATE SET "
-        "query = %s, partition_key = %s, last_seen = now()"
+        "INSERT INTO {0} (query_hash, partition_key, query) VALUES (%s, %s, %s) ON CONFLICT (query_hash, partition_key) DO UPDATE SET query = EXCLUDED.query, last_seen = now()"
     ).format(sql.Identifier("test_bit_cache_table_queries"))
-    expected_params = ("key1", test_query, "partition_key", test_query, "partition_key")
-
+    expected_params = ("key1", "partition_key", test_query)
     cache_handler.cursor.execute.assert_called_with(expected_sql, expected_params)
     cache_handler.db.commit.assert_called()
 
@@ -133,8 +129,10 @@ def test_get_none(cache_handler):
 
 
 def test_get_str_type(cache_handler):
-    with pytest.raises(ValueError):
-        cache_handler.get("str_key", settype=str)
+    # First call returns datatype, second call returns a valid bit string
+    cache_handler.cursor.fetchone.side_effect = [("integer",), ("0101",)]
+    result = cache_handler.get("str_key")
+    assert result == {1, 3}
 
 
 def test_set_null(cache_handler):

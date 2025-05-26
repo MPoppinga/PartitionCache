@@ -16,7 +16,7 @@ class AbstractCacheHandler(ABC):
     def get_supported_datatypes(cls) -> set[str]:
         """
         Get the set of datatypes supported by this cache handler.
-        
+
         Returns:
             Set[str]: Set of supported datatype strings (e.g., {"integer", "text", "float", "timestamp"})
         """
@@ -26,40 +26,37 @@ class AbstractCacheHandler(ABC):
     def supports_datatype(cls, datatype: str) -> bool:
         """
         Check if this cache handler supports a specific datatype.
-        
+
         Args:
             datatype (str): The datatype to check (e.g., "integer", "text", "float", "timestamp")
-            
+
         Returns:
             bool: True if supported, False otherwise
         """
         return datatype in cls.get_supported_datatypes()
 
-
     @classmethod
     def validate_datatype_compatibility(cls, settype: str) -> None:
         """
         Validate that this cache handler supports the given Python type.
-        
+
         Args:
             settype (Type): The Python type to validate
-            
+
         Raises:
             ValueError: If the type is not supported
         """
         if not cls.supports_datatype(settype):
-            type_name = getattr(settype, '__name__', str(settype))
+            type_name = getattr(settype, "__name__", str(settype))
             handler_name = cls.__name__
-            raise ValueError(
-                f"Cache handler '{handler_name}' does not support Python type '{type_name}' "
-            )
+            raise ValueError(f"Cache handler '{handler_name}' does not support Python type '{type_name}' ")
 
     @abstractmethod
     def __init__(self):
         """
         Initialize the cache handler.
         """
-    
+
     @abstractmethod
     def __repr__(self) -> str:
         """
@@ -118,7 +115,7 @@ class AbstractCacheHandler(ABC):
             key (str): The key to associate with the set.
             value (set[int] | set[str] | set[float] | set[datetime]): The set to store.
             partition_key (str, optional): The partition key namespace. Defaults to "partition_key".
-            
+
         Returns:
             bool: True if the operation was successful, False otherwise.
         """
@@ -132,7 +129,7 @@ class AbstractCacheHandler(ABC):
         Args:
             key (str): The key to associate with the null value.
             partition_key (str, optional): The partition key namespace. Defaults to "partition_key".
-            
+
         Returns:
             bool: True if the operation was successful, False otherwise.
         """
@@ -162,7 +159,7 @@ class AbstractCacheHandler(ABC):
         Args:
             key (str): The key to delete.
             partition_key (str, optional): The partition key namespace. Defaults to "partition_key".
-            
+
         Returns:
             bool: True if the operation was successful, False otherwise.
         """
@@ -204,7 +201,7 @@ class AbstractCacheHandler(ABC):
             key (str): The key to associate with the query.
             querytext (str): The query to store.
             partition_key (str): The partition key for this query (default: "partition_key").
-            
+
         Returns:
             bool: True if the operation was successful, False otherwise.
         """
@@ -215,14 +212,14 @@ class AbstractCacheHandler(ABC):
         Compact the cache to optimize storage as recommended for some cache handlers.
         """
         pass
-    
+
     @abstractmethod
     def get_datatype(self, partition_key: str) -> str | None:
         """
         Get the datatype of the cache handler. If the partition key is not set up, return None.
         """
         raise NotImplementedError
-    
+
     @abstractmethod
     def register_partition_key(self, partition_key: str, datatype: str, **kwargs) -> None:
         """
@@ -238,7 +235,6 @@ class AbstractCacheHandler(ABC):
         Close the cache handler and release any resources allocated by the cache handler.
         """
         raise NotImplementedError
-
 
     @abstractmethod
     def get_instance(cls, *args, **kwargs) -> "AbstractCacheHandler":

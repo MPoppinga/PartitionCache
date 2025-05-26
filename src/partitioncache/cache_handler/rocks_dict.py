@@ -37,23 +37,23 @@ class RocksDictCacheHandler(AbstractCacheHandler):
 
         # Initialize metadata tracking for partition keys
         self._ensure_metadata_structure()
-    
+
     def _ensure_metadata_structure(self) -> None:
         """Ensure metadata structure exists for tracking partition keys."""
         # RocksDict doesn't need explicit structure creation
         pass
-    
+
     def _get_partition_datatype(self, partition_key: str) -> str | None:
         """Get the datatype for a partition key from metadata."""
         metadata_key = f"_partition_metadata:{partition_key}"
         datatype = self.db.get(metadata_key)
         return datatype if datatype is not None and datatype != "NULL" else None
-    
+
     def _set_partition_datatype(self, partition_key: str, datatype: str) -> None:
         """Set the datatype for a partition key in metadata."""
         metadata_key = f"_partition_metadata:{partition_key}"
         self.db[metadata_key] = datatype
-    
+
     def _get_cache_key(self, key: str, partition_key: str) -> str:
         """Get the RocksDict key for a cache entry with partition key namespace."""
         return f"cache:{partition_key}:{key}"
@@ -64,7 +64,7 @@ class RocksDictCacheHandler(AbstractCacheHandler):
         datatype = self._get_partition_datatype(partition_key)
         if datatype is None:
             return None
-        
+
         cache_key = self._get_cache_key(key, partition_key)
         result = self.db.get(cache_key)
         if result is None or result == "NULL":
@@ -92,7 +92,7 @@ class RocksDictCacheHandler(AbstractCacheHandler):
         datatype = self._get_partition_datatype(partition_key)
         if datatype is None:
             return set()
-        
+
         existing_keys = set()
         for key in keys:
             cache_key = self._get_cache_key(key, partition_key)
@@ -108,7 +108,7 @@ class RocksDictCacheHandler(AbstractCacheHandler):
         datatype = self._get_partition_datatype(partition_key)
         if datatype is None:
             return None, 0
-        
+
         count_match = 0
         result: set | None = None
         for key in keys:
@@ -148,7 +148,7 @@ class RocksDictCacheHandler(AbstractCacheHandler):
                 raise ValueError(f"Unsupported value type: {type(sample)}")
             self._set_partition_datatype(partition_key, datatype)
         val = value
-        
+
         try:
             cache_key = self._get_cache_key(key, partition_key)
             logger.info(f"saving {len(val)} values in cache {cache_key}")
@@ -166,7 +166,7 @@ class RocksDictCacheHandler(AbstractCacheHandler):
             existing_datatype = self._get_partition_datatype(partition_key)
             if existing_datatype is None:
                 self._set_partition_datatype(partition_key, "integer")
-            
+
             cache_key = self._get_cache_key(key, partition_key)
             self.db[cache_key] = "NULL"
             return True
@@ -179,7 +179,7 @@ class RocksDictCacheHandler(AbstractCacheHandler):
         datatype = self._get_partition_datatype(partition_key)
         if datatype is None:
             return False
-        
+
         cache_key = self._get_cache_key(key, partition_key)
         return self.db.get(cache_key) == "NULL"
 
@@ -191,7 +191,7 @@ class RocksDictCacheHandler(AbstractCacheHandler):
             cache_key = self._get_cache_key(key, partition_key)
             if cache_key in self.db:
                 del self.db[cache_key]
-            
+
             # Also delete associated query
             query_key = f"query:{partition_key}:{key}"
             if query_key in self.db:
@@ -204,11 +204,7 @@ class RocksDictCacheHandler(AbstractCacheHandler):
         """Store a query in the cache associated with the given key."""
         try:
             query_key = f"query:{partition_key}:{key}"
-            query_data = {
-                "query": querytext,
-                "partition_key": partition_key,
-                "last_seen": datetime.now().isoformat()
-            }
+            query_data = {"query": querytext, "partition_key": partition_key, "last_seen": datetime.now().isoformat()}
             self.db[query_key] = query_data
             return True
         except Exception:
@@ -242,7 +238,7 @@ class RocksDictCacheHandler(AbstractCacheHandler):
             if key_str.startswith(prefix) and not key_str.startswith("_partition_metadata:"):
                 keys.append(key_str[prefix_len:])
         return keys
-    
+
     def get_partition_keys(self) -> list[tuple[str, str]]:
         """Get all partition keys and their datatypes."""
         result = []
@@ -264,7 +260,7 @@ class RocksDictCacheHandler(AbstractCacheHandler):
     def get_datatype(self, partition_key: str) -> str | None:
         """Get the datatype of the cache handler. If the partition key is not set, return None."""
         return self._get_partition_datatype(partition_key)
-    
+
     def register_partition_key(self, partition_key: str, datatype: str, **kwargs) -> None:
         """Register a partition key with the cache handler."""
         if datatype not in self.get_supported_datatypes():

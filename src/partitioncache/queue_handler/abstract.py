@@ -17,7 +17,7 @@ class AbstractQueueHandler(ABC):
     def __init__(self, **kwargs):
         """
         Initialize the queue handler.
-        
+
         Args:
             **kwargs: Configuration parameters specific to the queue implementation
         """
@@ -57,7 +57,7 @@ class AbstractQueueHandler(ABC):
     def pop_from_original_query_queue(self) -> Optional[Tuple[str, str, str]]:
         """
         Pop an original query from the original query queue.
-        
+
         Returns:
             Tuple[str, str, str] or None: (query, partition_key, partition_datatype) tuple if available, None if queue is empty or error occurred.
         """
@@ -67,7 +67,7 @@ class AbstractQueueHandler(ABC):
     def pop_from_query_fragment_queue(self) -> Optional[Tuple[str, str, str, str]]:
         """
         Pop a query fragment from the query fragment queue.
-        
+
         Returns:
             Tuple[str, str, str, str] or None: (query, hash, partition_key, partition_datatype) tuple if available, None if queue is empty or error occurred.
         """
@@ -77,7 +77,7 @@ class AbstractQueueHandler(ABC):
     def get_queue_lengths(self) -> dict:
         """
         Get the current lengths of both original query and query fragment queues.
-        
+
         Returns:
             dict: Dictionary with 'original_query_queue' and 'query_fragment_queue' queue lengths.
         """
@@ -87,7 +87,7 @@ class AbstractQueueHandler(ABC):
     def clear_original_query_queue(self) -> int:
         """
         Clear the original query queue and return the number of entries cleared.
-        
+
         Returns:
             int: Number of entries cleared from the original query queue.
         """
@@ -97,7 +97,7 @@ class AbstractQueueHandler(ABC):
     def clear_query_fragment_queue(self) -> int:
         """
         Clear the query fragment queue and return the number of entries cleared.
-        
+
         Returns:
             int: Number of entries cleared from the query fragment queue.
         """
@@ -107,7 +107,7 @@ class AbstractQueueHandler(ABC):
     def clear_all_queues(self) -> Tuple[int, int]:
         """
         Clear both original query and query fragment queues.
-        
+
         Returns:
             Tuple[int, int]: (original_query_cleared, query_fragment_cleared) number of entries cleared.
         """
@@ -145,7 +145,9 @@ class AbstractPriorityQueueHandler(AbstractQueueHandler):
         pass
 
     @abstractmethod
-    def push_to_query_fragment_queue_with_priority(self, query_hash_pairs: List[Tuple[str, str]], partition_key: str, priority: int = 1, partition_datatype: str | None = None) -> bool:
+    def push_to_query_fragment_queue_with_priority(
+        self, query_hash_pairs: List[Tuple[str, str]], partition_key: str, priority: int = 1, partition_datatype: str | None = None
+    ) -> bool:
         """
         Push query fragments with specified priority.
         If a fragment already exists, increment its priority.
@@ -171,4 +173,4 @@ class AbstractPriorityQueueHandler(AbstractQueueHandler):
         """
         Default implementation using priority system with priority=1.
         """
-        return self.push_to_query_fragment_queue_with_priority(query_hash_pairs, partition_key, 1, partition_datatype) 
+        return self.push_to_query_fragment_queue_with_priority(query_hash_pairs, partition_key, 1, partition_datatype)

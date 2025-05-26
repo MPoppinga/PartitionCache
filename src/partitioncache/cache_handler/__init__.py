@@ -1,4 +1,5 @@
 import os
+
 from partitioncache.cache_handler.abstract import AbstractCacheHandler
 
 
@@ -35,13 +36,13 @@ def get_cache_handler(cache_type: str, singleton: bool = False) -> AbstractCache
             )
         else:
             return PostgreSQLArrayCacheHandler(
-            db_name=db_name,
-            db_host=db_host,
-            db_user=db_user,
-            db_password=db_password,
-            db_port=db_port,
-            db_table=db_table,
-        )
+                db_name=db_name,
+                db_host=db_host,
+                db_user=db_user,
+                db_password=db_password,
+                db_port=db_port,
+                db_table=db_table,
+            )
     elif cache_type == "postgresql_bit":
         from partitioncache.cache_handler.postgresql_bit import PostgreSQLBitCacheHandler
 
@@ -68,13 +69,13 @@ def get_cache_handler(cache_type: str, singleton: bool = False) -> AbstractCache
             raise ValueError("PG_BIT_CACHE_BITSIZE environment variable not set")
         if singleton:
             return PostgreSQLBitCacheHandler.get_instance(
-            db_name=db_name,
-            db_host=db_host,
-            db_user=db_user,
-            db_password=db_password,
-            db_port=db_port,
-            db_table=db_table,
-            bitsize=int(bitsize),
+                db_name=db_name,
+                db_host=db_host,
+                db_user=db_user,
+                db_password=db_password,
+                db_port=db_port,
+                db_table=db_table,
+                bitsize=int(bitsize),
             )
         else:
             return PostgreSQLBitCacheHandler(
@@ -101,10 +102,10 @@ def get_cache_handler(cache_type: str, singleton: bool = False) -> AbstractCache
             raise ValueError("REDIS_PORT environment variable not set")
         if singleton:
             return RedisCacheHandler.get_instance(
-            db_name=db_name,
-            db_host=db_host,
-            db_password=db_password,
-            db_port=db_port,
+                db_name=db_name,
+                db_host=db_host,
+                db_password=db_password,
+                db_port=db_port,
             )
         else:
             return RedisCacheHandler(
@@ -144,7 +145,7 @@ def get_cache_handler(cache_type: str, singleton: bool = False) -> AbstractCache
                 db_password=db_password,
                 db_port=db_port,
                 bitsize=int(bitsize),
-        )
+            )
     elif cache_type == "rocksdb":
         from partitioncache.cache_handler.rocks_db_set import RocksDBCacheHandler
 

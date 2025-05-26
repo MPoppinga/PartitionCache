@@ -284,7 +284,7 @@ def generate_partial_queries(
         If False, it will return all possible combinations of tables
     keep_all_attributes: bool: If True, the function will only return partial queries with the original attributes.
         If False, it will return also partial queries with fewer attributes
-    other_functions_as_distance_conditions: bool: 
+    other_functions_as_distance_conditions: bool:
 
     return: List[str]: List of all possible partial queries
 

@@ -24,17 +24,23 @@ def main():
 
     parser.add_argument("--query-file", type=str, help="Path to file containing a SQL query to add to cache")
 
-    parser.add_argument("--no-recompose", action="store_true", help="Do not recompose the query before adding to cache, the query is added as is to the cache or fragment queue")
+    parser.add_argument(
+        "--no-recompose", action="store_true", help="Do not recompose the query before adding to cache, the query is added as is to the cache or fragment queue"
+    )
 
     parser.add_argument("--partition-key", type=str, required=True, help="Name of the partition key column")
 
-    parser.add_argument("--partition-datatype", type=str, default=None, 
-                       choices=["integer", "float", "text", "timestamp"],
-                       help="Datatype of the partition key (if not specified, the datatype will be inferred from the query)")
+    parser.add_argument(
+        "--partition-datatype",
+        type=str,
+        default=None,
+        choices=["integer", "float", "text", "timestamp"],
+        help="Datatype of the partition key (if not specified, the datatype will be inferred from the query)",
+    )
 
     # Queue configuration
     parser.add_argument("--queue", action="store_true", help="Add query to fragment queue instead of executing directly")
-    
+
     parser.add_argument("--queue-original", action="store_true", help="Add query to original query queue instead of fragment queue")
 
     parser.add_argument("--queue-provider", type=str, default="postgresql", help="Queue provider to use")
@@ -72,8 +78,8 @@ def main():
         with open(args.query_file, "r") as f:
             query = f.read()
     else:
-        query = args.query        
-        
+        query = args.query
+
     if args.queue_original:
         success = partitioncache.push_to_original_query_queue(query, args.partition_key, args.partition_datatype, args.queue_provider)
         if success:

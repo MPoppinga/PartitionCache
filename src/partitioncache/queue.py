@@ -26,7 +26,7 @@ def _get_queue_handler(queue_provider: str | None = None):
 
 
 def push_to_original_query_queue(
-    query: str, partition_key: str = "partition_key", partition_datatype: str| None = None, queue_provider: str | None = None
+    query: str, partition_key: str = "partition_key", partition_datatype: str | None = None, queue_provider: str | None = None
 ) -> bool:
     """
     Push an original query to the original query queue to be processed into fragments.
@@ -225,14 +225,14 @@ def clear_all_queues(queue_provider: str | None = None) -> Tuple[int, int]:
         return (0, 0)
 
 
-def push_to_queue(query: str, partition_key: str = "partition_key", partition_datatype: str = "integer", queue_provider: str | None = None) -> bool:
+def push_to_queue(query: str, partition_key: str = "partition_key", partition_datatype: str | None = None, queue_provider: str | None = None) -> bool:
     """
     Legacy function for backward compatibility. Pushes to original query queue.
 
     Args:
         query (str): The query to be pushed to the queue.
         partition_key (str): The partition key for this query (default: "partition_key").
-        partition_datatype (str): The datatype of the partition key (default: "integer").
+        partition_datatype (str): The datatype of the partition key (default: None).
 
     Returns:
         bool: True if the query was pushed to the queue, False otherwise.

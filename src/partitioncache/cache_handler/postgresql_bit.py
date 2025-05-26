@@ -10,7 +10,6 @@ logger = getLogger("PartitionCache")
 
 
 class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
-
     def __repr__(self) -> str:
         return "postgresql_bit"
 
@@ -20,7 +19,7 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
         This handler supports multiple partition keys but only integer datatypes (for bit arrays).
         """
         super().__init__(db_name, db_host, db_user, db_password, db_port, db_table)
-        
+
         self.default_bitsize = bitsize  # Bitsize should be configured correctly by user (bitsize=1001 to store values 0-1000)
 
         # Create metadata table to track partition keys with bitsize per partition
@@ -45,8 +44,6 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
         )
 
         self.db.commit()
-
-
 
     def _get_partition_bitsize(self, partition_key: str) -> int | None:
         """Get the bitsize for a partition key from metadata."""
@@ -97,7 +94,6 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
         if existing_datatype is None:
             # Create new table
             self._create_partition_table(partition_key, bitsize)
-
 
     def set_set(self, key: str, value: set[int] | set[str] | set[float] | set[datetime], partition_key: str = "partition_key") -> bool:
         """
@@ -151,8 +147,6 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
         bitarray_result = bitarray(result[0])
 
         return set(bitarray_result.search(bitarray("1")))
-
-
 
     def get_intersected(self, keys: set[str], partition_key: str = "partition_key") -> tuple[set[int] | set[str] | None, int]:
         """Get intersection from partition-specific table."""
@@ -255,8 +249,6 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
 
         return r, len(filtered_keys)
 
-
-
     @classmethod
     def get_supported_datatypes(cls) -> set[str]:
         """PostgreSQL bit handler supports only integer datatype."""
@@ -265,7 +257,7 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
     def get_datatype(self, partition_key: str) -> str | None:
         """Get the datatype of the cache handler. If the partition key is not set, return None."""
         return self._get_partition_datatype(partition_key)
-    
+
     def register_partition_key(self, partition_key: str, datatype: str, **kwargs) -> None:
         """Register a partition key with the cache handler."""
         if datatype != "integer":
