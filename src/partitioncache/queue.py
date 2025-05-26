@@ -5,6 +5,7 @@ This module provides a clean interface for queue operations while delegating the
 implementation to specific queue handlers via the factory pattern.
 """
 
+import os
 from typing import List, Tuple, Optional
 from logging import getLogger
 
@@ -16,15 +17,17 @@ logger = getLogger("PartitionCache")
 _queue_handler = None
 
 
-def _get_queue_handler():
+def _get_queue_handler(queue_provider: str | None = None):
     """Get or create the queue handler instance."""
     global _queue_handler
     if _queue_handler is None:
-        _queue_handler = get_queue_handler()
+        _queue_handler = get_queue_handler(queue_provider)
     return _queue_handler
 
 
-def push_to_original_query_queue(query: str, partition_key: str = "partition_key") -> bool:
+def push_to_original_query_queue(
+    query: str, partition_key: str = "partition_key", partition_datatype: str| None = None, queue_provider: str | None = None
+) -> bool:
     """
     Push an original query to the original query queue to be processed into fragments.
 
@@ -46,53 +49,58 @@ def push_to_original_query_queue(query: str, partition_key: str = "partition_key
     Args:
         query (str): The original query to be pushed to the original query queue.
         partition_key (str): The partition key for this query (default: "partition_key").
+        partition_datatype (str): The datatype of the partition key (default: None).
+        queue_provider (str): The queue provider to use (default: None, which uses the environment variable QUERY_QUEUE_PROVIDER).
 
     Returns:
         bool: True if the query was pushed to the queue, False otherwise.
     """
     try:
-        handler = _get_queue_handler()
-        return handler.push_to_original_query_queue(query, partition_key)
+        handler = _get_queue_handler(queue_provider)
+        return handler.push_to_original_query_queue(query, partition_key, partition_datatype)
     except Exception as e:
         logger.error(f"Failed to push query to original query queue: {e}")
         return False
 
 
-def push_to_query_fragment_queue(query_hash_pairs: List[Tuple[str, str]], partition_key: str = "partition_key") -> bool:
+def push_to_query_fragment_queue(
+    query_hash_pairs: List[Tuple[str, str]], partition_key: str = "partition_key", partition_datatype: str = "integer", queue_provider: str | None = None
+) -> bool:
     """
     Push query fragments (as query-hash pairs) directly to the query fragment queue.
 
     Args:
         query_hash_pairs (List[Tuple[str, str]]): List of (query, hash) tuples to push to query fragment queue.
         partition_key (str): The partition key for these query fragments (default: "partition_key").
-
+        partition_datatype (str): The datatype of the partition key (default: "integer").
+        queue_provider (str): The queue provider to use (default: None, which uses the environment variable QUERY_QUEUE_PROVIDER).
     Returns:
         bool: True if all fragments were pushed successfully, False otherwise.
     """
     try:
-        handler = _get_queue_handler()
-        return handler.push_to_query_fragment_queue(query_hash_pairs, partition_key)
+        handler = _get_queue_handler(queue_provider)
+        return handler.push_to_query_fragment_queue(query_hash_pairs, partition_key, partition_datatype)
     except Exception as e:
         logger.error(f"Failed to push fragments to query fragment queue: {e}")
         return False
 
 
-def pop_from_original_query_queue() -> Optional[Tuple[str, str]]:
+def pop_from_original_query_queue(queue_provider: str | None = None) -> Optional[Tuple[str, str, str]]:
     """
     Pop an original query from the original query queue.
 
     Returns:
-        Tuple[str, str] or None: (query, partition_key) tuple if available, None if queue is empty or error occurred.
+        Tuple[str, str, str] or None: (query, partition_key, partition_datatype) tuple if available, None if queue is empty or error occurred.
     """
     try:
-        handler = _get_queue_handler()
+        handler = _get_queue_handler(queue_provider)
         return handler.pop_from_original_query_queue()
     except Exception as e:
         logger.error(f"Failed to pop from original query queue: {e}")
         return None
 
 
-def pop_from_original_query_queue_blocking(timeout: int = 60) -> Optional[Tuple[str, str]]:
+def pop_from_original_query_queue_blocking(timeout: int = 60, queue_provider: str | None = None) -> Optional[Tuple[str, str, str]]:
     """
     Pop an original query from the original query queue with blocking wait.
     Uses provider-specific blocking mechanisms when available.
@@ -101,13 +109,13 @@ def pop_from_original_query_queue_blocking(timeout: int = 60) -> Optional[Tuple[
         timeout (int): Maximum time to wait in seconds (default: 60)
 
     Returns:
-        Tuple[str, str] or None: (query, partition_key) tuple if available, None if timeout or error occurred.
+        Tuple[str, str, str] or None: (query, partition_key, partition_datatype) tuple if available, None if timeout or error occurred.
     """
     try:
-        handler = _get_queue_handler()
-        
+        handler = _get_queue_handler(queue_provider)
+
         # Check if handler supports blocking operations
-        if hasattr(handler, 'pop_from_original_query_queue_blocking'):
+        if hasattr(handler, "pop_from_original_query_queue_blocking"):
             return handler.pop_from_original_query_queue_blocking(timeout)  # type: ignore
         else:
             # Fallback to regular pop
@@ -117,22 +125,22 @@ def pop_from_original_query_queue_blocking(timeout: int = 60) -> Optional[Tuple[
         return None
 
 
-def pop_from_query_fragment_queue() -> Optional[Tuple[str, str, str]]:
+def pop_from_query_fragment_queue(queue_provider: str | None = None) -> Optional[Tuple[str, str, str, str]]:
     """
     Pop a query fragment from the query fragment queue.
 
     Returns:
-        Tuple[str, str, str] or None: (query, hash, partition_key) tuple if available, None if queue is empty or error occurred.
+        Tuple[str, str, str, str] or None: (query, hash, partition_key, partition_datatype) tuple if available, None if queue is empty or error occurred.
     """
     try:
-        handler = _get_queue_handler()
+        handler = _get_queue_handler(queue_provider)
         return handler.pop_from_query_fragment_queue()
     except Exception as e:
         logger.error(f"Failed to pop from query fragment queue: {e}")
         return None
 
 
-def pop_from_query_fragment_queue_blocking(timeout: int = 60) -> Optional[Tuple[str, str, str]]:
+def pop_from_query_fragment_queue_blocking(timeout: int = 60, queue_provider: str | None = None) -> Optional[Tuple[str, str, str, str]]:
     """
     Pop a query fragment from the query fragment queue with blocking wait.
     Uses provider-specific blocking mechanisms when available.
@@ -141,13 +149,13 @@ def pop_from_query_fragment_queue_blocking(timeout: int = 60) -> Optional[Tuple[
         timeout (int): Maximum time to wait in seconds (default: 60)
 
     Returns:
-        Tuple[str, str, str] or None: (query, hash, partition_key) tuple if available, None if timeout or error occurred.
+        Tuple[str, str, str, str] or None: (query, hash, partition_key, partition_datatype) tuple if available, None if timeout or error occurred.
     """
     try:
-        handler = _get_queue_handler()
-        
+        handler = _get_queue_handler(queue_provider)
+
         # Check if handler supports blocking operations
-        if hasattr(handler, 'pop_from_query_fragment_queue_blocking'):
+        if hasattr(handler, "pop_from_query_fragment_queue_blocking"):
             return handler.pop_from_query_fragment_queue_blocking(timeout)  # type: ignore
         else:
             # Fallback to regular pop
@@ -157,7 +165,7 @@ def pop_from_query_fragment_queue_blocking(timeout: int = 60) -> Optional[Tuple[
         return None
 
 
-def get_queue_lengths() -> dict:
+def get_queue_lengths(queue_provider: str | None = None) -> dict:
     """
     Get the current lengths of both original query and query fragment queues.
 
@@ -165,14 +173,14 @@ def get_queue_lengths() -> dict:
         dict: Dictionary with 'original_query_queue' and 'query_fragment_queue' queue lengths.
     """
     try:
-        handler = _get_queue_handler()
+        handler = _get_queue_handler(queue_provider)
         return handler.get_queue_lengths()
     except Exception as e:
         logger.error(f"Failed to get queue lengths: {e}")
         return {"original_query_queue": 0, "query_fragment_queue": 0}
 
 
-def clear_original_query_queue() -> int:
+def clear_original_query_queue(queue_provider: str | None = None) -> int:
     """
     Clear the original query queue and return the number of entries cleared.
 
@@ -180,14 +188,14 @@ def clear_original_query_queue() -> int:
         int: Number of entries cleared from the original query queue.
     """
     try:
-        handler = _get_queue_handler()
+        handler = _get_queue_handler(queue_provider)
         return handler.clear_original_query_queue()
     except Exception as e:
         logger.error(f"Failed to clear original query queue: {e}")
         return 0
 
 
-def clear_query_fragment_queue() -> int:
+def clear_query_fragment_queue(queue_provider: str | None = None) -> int:
     """
     Clear the query fragment queue and return the number of entries cleared.
 
@@ -195,14 +203,14 @@ def clear_query_fragment_queue() -> int:
         int: Number of entries cleared from the query fragment queue.
     """
     try:
-        handler = _get_queue_handler()
+        handler = _get_queue_handler(queue_provider)
         return handler.clear_query_fragment_queue()
     except Exception as e:
         logger.error(f"Failed to clear query fragment queue: {e}")
         return 0
 
 
-def clear_all_queues() -> Tuple[int, int]:
+def clear_all_queues(queue_provider: str | None = None) -> Tuple[int, int]:
     """
     Clear both original query and query fragment queues.
 
@@ -210,25 +218,26 @@ def clear_all_queues() -> Tuple[int, int]:
         Tuple[int, int]: (original_query_cleared, query_fragment_cleared) number of entries cleared.
     """
     try:
-        handler = _get_queue_handler()
+        handler = _get_queue_handler(queue_provider)
         return handler.clear_all_queues()
     except Exception as e:
         logger.error(f"Failed to clear all queues: {e}")
         return (0, 0)
 
 
-def push_to_queue(query: str, partition_key: str = "partition_key") -> bool:
+def push_to_queue(query: str, partition_key: str = "partition_key", partition_datatype: str = "integer", queue_provider: str | None = None) -> bool:
     """
     Legacy function for backward compatibility. Pushes to original query queue.
 
     Args:
         query (str): The query to be pushed to the queue.
         partition_key (str): The partition key for this query (default: "partition_key").
+        partition_datatype (str): The datatype of the partition key (default: "integer").
 
     Returns:
         bool: True if the query was pushed to the queue, False otherwise.
     """
-    return push_to_original_query_queue(query, partition_key)
+    return push_to_original_query_queue(query, partition_key, partition_datatype, queue_provider)
 
 
 def close_queue_handler() -> None:
@@ -246,12 +255,12 @@ def close_queue_handler() -> None:
             _queue_handler = None
 
 
-def get_queue_provider() -> str:
+def get_queue_provider_name() -> str:
     """
     Get the current queue provider type.
-    
+
     Returns:
         str: The queue provider type ('postgresql' or 'redis')
     """
-    import os
+
     return os.environ.get("QUERY_QUEUE_PROVIDER", "postgresql")

@@ -99,7 +99,23 @@ def delete_cache(cache_type: str):
 
 
 def get_all_keys(cache: AbstractCacheHandler) -> list[str]:
-    return cache.get_all_keys()
+    """Get all keys from all partitions in the cache."""
+    all_keys = []
+    
+    # All cache handlers now have get_partition_keys method
+    try:
+        partitions = getattr(cache, 'get_partition_keys', lambda: [])()
+        if partitions:
+            for partition_key, _ in partitions:
+                all_keys.extend(cache.get_all_keys(partition_key))
+        else:
+            # No partitions found, try default partition key
+            all_keys.extend(cache.get_all_keys("partition_key"))
+    except (AttributeError, TypeError):
+        # Fallback for cases where partition enumeration fails
+        all_keys.extend(cache.get_all_keys("partition_key"))
+    
+    return all_keys
 
 
 def count_cache(cache_type: str):
@@ -186,6 +202,75 @@ def clear_query_fragment_queue():
         logger.info(f"Query fragment queue: {deleted_count} entries cleared")
     except Exception as e:
         logger.error(f"Error clearing {provider} query fragment queue: {e}")
+
+
+def delete_partition(cache_type: str, partition_key: str):
+    """Delete a specific partition and all its data."""
+    try:
+        cache = get_cache_handler(cache_type)
+        
+        if hasattr(cache, 'delete_partition'):
+            success = cache.delete_partition(partition_key)  # type: ignore
+            if success:
+                logger.info(f"Successfully deleted partition '{partition_key}' from {cache_type} cache")
+            else:
+                logger.error(f"Failed to delete partition '{partition_key}' from {cache_type} cache")
+        else:
+            logger.error(f"Cache handler {cache_type} does not support partition deletion")
+            
+        cache.close()
+    except ValueError as e:
+        logger.error(f"Cache configuration error for {cache_type}: {e}")
+    except Exception as e:
+        logger.error(f"Error deleting partition {partition_key} from {cache_type}: {e}")
+
+
+def prune_old_queries(cache_type: str, days_old: int):
+    """Remove queries older than specified days."""
+    try:
+        cache = get_cache_handler(cache_type)
+        
+        if hasattr(cache, 'prune_old_queries'):
+            removed_count = cache.prune_old_queries(days_old)  # type: ignore
+            logger.info(f"Pruned {removed_count} old queries (older than {days_old} days) from {cache_type} cache")
+        else:
+            logger.warning(f"Cache handler {cache_type} does not support automatic query pruning")
+            logger.info("Manual pruning: Use --remove-termination to remove timeout/limit entries")
+            
+        cache.close()
+    except ValueError as e:
+        logger.error(f"Cache configuration error for {cache_type}: {e}")
+    except Exception as e:
+        logger.error(f"Error pruning old queries from {cache_type}: {e}")
+
+
+def prune_all_caches(days_old: int):
+    """Remove old queries from all cache types."""
+    cache_types = [
+        "postgresql_array",
+        "postgresql_bit", 
+        "redis",
+        "redis_bit",
+        "rocksdb",
+        "rocksdb_bit",
+        "rocksdict"
+    ]
+    
+    total_removed = 0
+    for cache_type in cache_types:
+        try:
+            cache = get_cache_handler(cache_type)
+            if hasattr(cache, 'prune_old_queries'):
+                removed_count = cache.prune_old_queries(days_old)  # type: ignore
+                total_removed += removed_count
+                logger.info(f"{cache_type}: Pruned {removed_count} old queries")
+            cache.close()
+        except ValueError:
+            logger.debug(f"Cache type {cache_type} not configured, skipping")
+        except Exception as e:
+            logger.error(f"Error pruning {cache_type}: {e}")
+    
+    logger.info(f"Total queries pruned across all caches: {total_removed}")
 
 
 def delete_all_caches():
@@ -383,6 +468,32 @@ def main():
         help="Clear only the query fragment queue",
     )
 
+    # Partition management arguments
+    parser.add_argument(
+        "--delete-partition",
+        action="store_true",
+        help="Delete a specific partition and all its data",
+    )
+    
+    parser.add_argument(
+        "--partition-key",
+        type=str,
+        help="Partition key for partition operations",
+    )
+
+    parser.add_argument(
+        "--prune-old-queries",
+        action="store_true",
+        help="Remove queries older than specified days",
+    )
+    
+    parser.add_argument(
+        "--days-old",
+        type=int,
+        default=30,
+        help="Number of days for pruning old queries (default: 30)",
+    )
+
     args = parser.parse_args()
 
     # Load environment variables
@@ -428,10 +539,20 @@ def main():
         clear_original_query_queue()
     elif args.clear_query_fragment_queue:
         clear_query_fragment_queue()
+    elif args.delete_partition:
+        if not args.cache_type or not args.partition_key:
+            parser.error("Delete partition mode requires --cache and --partition-key arguments")
+        delete_partition(args.cache_type, args.partition_key)
+    elif args.prune_old_queries:
+        if args.cache_type:
+            prune_old_queries(args.cache_type, args.days_old)
+        else:
+            # Prune all caches
+            prune_all_caches(args.days_old)
     else:
         parser.error(
             "Please specify a mode: --export, --copy, --delete, --restore, --count, --count-queue, --clear-queue, --delete-all, --count-all,"
-            " --remove-termination, --remove-large, --clear-original-query-queue, --clear-query-fragment-queue"
+            " --remove-termination, --remove-large, --clear-original-query-queue, --clear-query-fragment-queue, --delete-partition, --prune-old-queries"
         )
 
     # Cleanup

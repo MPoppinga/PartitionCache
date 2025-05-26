@@ -57,13 +57,14 @@ class RedisQueueHandler(AbstractQueueHandler):
         """Get queue key with appropriate suffix."""
         return f"{self.queue_key}_{suffix}"
 
-    def push_to_original_query_queue(self, query: str, partition_key: str) -> bool:
+    def push_to_original_query_queue(self, query: str, partition_key: str, partition_datatype: str | None = None) -> bool:
         """
         Push an original query to the original query queue to be processed into fragments.
 
         Args:
             query (str): The original query to be pushed to the original query queue.
             partition_key (str): The partition key for this query.
+            partition_datatype (str): The datatype of the partition key (default: "integer").
 
         Returns:
             bool: True if the query was pushed successfully, False otherwise.
@@ -72,8 +73,8 @@ class RedisQueueHandler(AbstractQueueHandler):
             r = self._get_redis_connection()
             queue_key = self._get_queue_key("original_query")
             
-            # Store query with partition_key as JSON
-            query_data = json.dumps({"query": query, "partition_key": partition_key})
+            # Store query with partition_key and partition_datatype as JSON
+            query_data = json.dumps({"query": query, "partition_key": partition_key, "partition_datatype": partition_datatype})
             r.rpush(queue_key, query_data)
             logger.debug(f"Pushed query to Redis original query queue: {queue_key}")
             return True
@@ -81,13 +82,14 @@ class RedisQueueHandler(AbstractQueueHandler):
             logger.error(f"Failed to push query to Redis original query queue: {e}")
             return False
 
-    def push_to_query_fragment_queue(self, query_hash_pairs: List[Tuple[str, str]], partition_key: str) -> bool:
+    def push_to_query_fragment_queue(self, query_hash_pairs: List[Tuple[str, str]], partition_key: str, partition_datatype: str | None = None) -> bool:
         """
         Push query fragments (as query-hash pairs) directly to the query fragment queue.
 
         Args:
             query_hash_pairs (List[Tuple[str, str]]): List of (query, hash) tuples to push to fragment queue.
             partition_key (str): The partition key for these query fragments.
+            partition_datatype (str): The datatype of the partition key (default: None).
 
         Returns:
             bool: True if all fragments were pushed successfully, False otherwise.
@@ -99,7 +101,7 @@ class RedisQueueHandler(AbstractQueueHandler):
             # Use a Redis pipeline to batch the rpush commands
             pipeline = r.pipeline()
             for query, hash_value in query_hash_pairs:
-                fragment_data = json.dumps({"query": query, "hash": hash_value, "partition_key": partition_key})
+                fragment_data = json.dumps({"query": query, "hash": hash_value, "partition_key": partition_key, "partition_datatype": partition_datatype})
                 pipeline.rpush(queue_key, fragment_data)
 
             pipeline.execute()
@@ -109,13 +111,13 @@ class RedisQueueHandler(AbstractQueueHandler):
             logger.error(f"Failed to push fragments to Redis query fragment queue: {e}")
             return False
 
-    def pop_from_original_query_queue(self) -> Optional[Tuple[str, str]]:
+    def pop_from_original_query_queue(self) -> Optional[Tuple[str, str, str]]:
         """
         Pop an original query from the original query queue.
         Uses a short timeout for non-blocking behavior.
 
         Returns:
-            Tuple[str, str] or None: (query, partition_key) tuple if available, None if queue is empty or error occurred.
+            Tuple[str, str, str] or None: (query, partition_key, partition_datatype) tuple if available, None if queue is empty or error occurred.
         """
         try:
             r = self._get_redis_connection()
@@ -123,19 +125,19 @@ class RedisQueueHandler(AbstractQueueHandler):
             result = r.blpop([queue_key], timeout=1)  # 1 second timeout for non-blocking behavior
             if result is not None and isinstance(result, (list, tuple)) and len(result) >= 2:
                 query_data = json.loads(result[1].decode("utf-8"))
-                return query_data["query"], query_data["partition_key"]
+                return query_data["query"], query_data["partition_key"], query_data.get("partition_datatype", "integer")
             return None
         except Exception as e:
             logger.error(f"Failed to pop from Redis original query queue: {e}")
             return None
 
-    def pop_from_query_fragment_queue(self) -> Optional[Tuple[str, str, str]]:
+    def pop_from_query_fragment_queue(self) -> Optional[Tuple[str, str, str, str]]:
         """
         Pop a query fragment from the query fragment queue.
         Uses a short timeout for non-blocking behavior.
 
         Returns:
-            Tuple[str, str, str] or None: (query, hash, partition_key) tuple if available, None if queue is empty or error occurred.
+            Tuple[str, str, str, str] or None: (query, hash, partition_key, partition_datatype) tuple if available, None if queue is empty or error occurred.
         """
         try:
             r = self._get_redis_connection()
@@ -143,13 +145,13 @@ class RedisQueueHandler(AbstractQueueHandler):
             result = r.blpop([queue_key], timeout=1)  # 1 second timeout for non-blocking behavior
             if result is not None and isinstance(result, (list, tuple)) and len(result) >= 2:
                 fragment_data = json.loads(result[1].decode("utf-8"))
-                return fragment_data["query"], fragment_data["hash"], fragment_data["partition_key"]
+                return fragment_data["query"], fragment_data["hash"], fragment_data["partition_key"], fragment_data.get("partition_datatype", "integer")
             return None
         except Exception as e:
             logger.error(f"Failed to pop from Redis query fragment queue: {e}")
             return None
 
-    def pop_from_original_query_queue_blocking(self, timeout: int = 60) -> Optional[Tuple[str, str]]:
+    def pop_from_original_query_queue_blocking(self, timeout: int = 60) -> Optional[Tuple[str, str, str]]:
         """
         Pop an original query from the original query queue with configurable blocking timeout.
 
@@ -157,7 +159,7 @@ class RedisQueueHandler(AbstractQueueHandler):
             timeout (int): Maximum time to wait in seconds (default: 30)
 
         Returns:
-            Tuple[str, str] or None: (query, partition_key) tuple if available, None if timeout or error occurred.
+            Tuple[str, str, str] or None: (query, partition_key, partition_datatype) tuple if available, None if timeout or error occurred.
         """
         try:
             r = self._get_redis_connection()
@@ -165,13 +167,13 @@ class RedisQueueHandler(AbstractQueueHandler):
             result = r.blpop([queue_key], timeout=timeout)
             if result is not None and isinstance(result, (list, tuple)) and len(result) >= 2:
                 query_data = json.loads(result[1].decode("utf-8"))
-                return query_data["query"], query_data["partition_key"]
+                return query_data["query"], query_data["partition_key"], query_data.get("partition_datatype", "integer")
             return None
         except Exception as e:
             logger.error(f"Failed to pop from Redis original query queue with blocking: {e}")
             return None
 
-    def pop_from_query_fragment_queue_blocking(self, timeout: int = 60) -> Optional[Tuple[str, str, str]]:
+    def pop_from_query_fragment_queue_blocking(self, timeout: int = 60) -> Optional[Tuple[str, str, str, str]]:
         """
         Pop a query fragment from the query fragment queue with configurable blocking timeout.
 
@@ -179,7 +181,7 @@ class RedisQueueHandler(AbstractQueueHandler):
             timeout (int): Maximum time to wait in seconds (default: 30)
 
         Returns:
-            Tuple[str, str, str] or None: (query, hash, partition_key) tuple if available, None if timeout or error occurred.
+            Tuple[str, str, str, str] or None: (query, hash, partition_key, partition_datatype) tuple if available, None if timeout or error occurred.
         """
         try:
             r = self._get_redis_connection()
@@ -187,7 +189,7 @@ class RedisQueueHandler(AbstractQueueHandler):
             result = r.blpop([queue_key], timeout=timeout)
             if result is not None and isinstance(result, (list, tuple)) and len(result) >= 2:
                 fragment_data = json.loads(result[1].decode("utf-8"))
-                return fragment_data["query"], fragment_data["hash"], fragment_data["partition_key"]
+                return fragment_data["query"], fragment_data["hash"], fragment_data["partition_key"], fragment_data.get("partition_datatype", "integer")
             return None
         except Exception as e:
             logger.error(f"Failed to pop from Redis query fragment queue with blocking: {e}")

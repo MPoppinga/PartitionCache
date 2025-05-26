@@ -3,11 +3,10 @@ import psycopg2
 import time
 from dotenv import load_dotenv
 
-from partitioncache.cache_handler import get_cache_handler
-from partitioncache.apply_cache import get_partition_keys, extend_query_with_partition_keys, get_partition_keys_lazy
+import partitioncache
 
 # Load environment variables
-load_dotenv(".env.example", override=True)
+load_dotenv(".env", override=True)
 
 DB_NAME = os.getenv("DB_NAME")
 DB_USER = os.getenv("DB_USER")
@@ -16,8 +15,10 @@ DB_HOST = os.getenv("DB_HOST")
 DB_PORT = os.getenv("DB_PORT")
 
 # Choose your cache backend (see README for options)
-CACHE_BACKEND = os.getenv("CACHE_BACKEND", "postgresql_bit")  # or "postgresql_array", "rocksdb", etc.
-PARTITION_KEY = os.getenv("PARTITION_KEY", "zipcode")
+CACHE_BACKEND = os.getenv("CACHE_BACKEND", "postgresql_array")
+
+
+# TODO allow option to add query to queue
 
 QUERIES = []
 for file in sorted(os.listdir("testqueries_examples")):
@@ -37,33 +38,42 @@ def run_query(conn, query, params=None):
     return rows, elapsed
 
 
-def main():
-    print("Connecting to database...")
-    conn = psycopg2.connect(dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD, host=DB_HOST, port=DB_PORT)
-
-    print(f"Initializing PartitionCache backend: {CACHE_BACKEND}")
-    cache_handler = get_cache_handler(CACHE_BACKEND)
-
+def test_partition_key(conn, partition_key: str, datatype: str = "integer"):
+    """Test queries with a specific partition key."""
+    print(f"\n{'='*60}")
+    print(f"Testing with partition key: {partition_key} (datatype: {datatype})")
+    print(f"Cache backend: {CACHE_BACKEND}")
+    print(f"{'='*60}")
+    
+    # Create cache handler using the API
+    try:
+        cache = partitioncache.create_cache_helper(CACHE_BACKEND, partition_key, datatype)
+    except ValueError as e:
+        print(f"Cache configuration error: {e}")
+        return
+    
     for description, sql_query in QUERIES:
         print(f"\n---\nQuery: {description}\n")
+        
         # Run without cache
         rows, elapsed = run_query(conn, sql_query)
         print(f"Without PartitionCache: {len(rows)} results in {elapsed:.3f} seconds")
 
         start_cache = time.perf_counter()
         # Use PartitionCache to get partition keys for this query
-        partition_keys, num_subqueries, num_hits = get_partition_keys(
+        partition_keys, num_subqueries, num_hits = partitioncache.get_partition_keys(
             query=sql_query,
-            cache_handler=cache_handler,
-            partition_key=PARTITION_KEY,
+            cache_handler=cache.underlying_handler,
+            partition_key=partition_key,
             min_component_size=1,
         )
+        
         if partition_keys:
             # Extend the query to restrict to cached partition keys
-            sql_cached = extend_query_with_partition_keys(
+            sql_cached = partitioncache.extend_query_with_partition_keys(
                 sql_query,
                 partition_keys,
-                partition_key=PARTITION_KEY,
+                partition_key=partition_key,
                 method="IN",
                 p0_alias="p1",  # assumes p1 is the main table alias for partition key
             )
@@ -73,32 +83,46 @@ def main():
                 f"With PartitionCache: {len(rows_cached)} results in {elapsed_cache_get:.3f} + "
                 f"{elapsed_cached:.3f} seconds (cache hits: {num_hits})"
             )
-
         else:
-            print("No Partiton Keys found. Hint: Add one of the queries to the cache to improve performance.")
+            print("No partition keys found in cache. Hint: Add queries to cache using:")
+            print(f"  pcache-add --direct --query-file testqueries_examples/{description} --partition-key {partition_key} --partition-datatype {datatype} --cache-backend {CACHE_BACKEND}")
+            print(f"  Or add all queries: for f in testqueries_examples/*.sql; do pcache-add --direct --query-file \"$f\" --partition-key {partition_key} --partition-datatype {datatype} --cache-backend {CACHE_BACKEND}; done")
 
-        # Lazy get
-        start_cache = time.perf_counter()
-        lazy_cache_subquery, nr_used_hashes = get_partition_keys_lazy(
-            query=sql_query,
-            cache_handler=cache_handler,
-            partition_key=PARTITION_KEY,
-            min_component_size=1,
-        )
-        if lazy_cache_subquery is not None:
-            elapsed_cache_get = time.perf_counter() - start_cache
-            sql_cached = sql_query.strip().strip(";") + " AND p1.zipcode IN (" + lazy_cache_subquery + ")"
-            rows_cached, elapsed_cached = run_query(conn, sql_cached)
-            print(
-                f"With PartitionCache: {len(rows_cached)} results in {elapsed_cache_get:.3f} + "
-                f"{elapsed_cached:.3f} seconds (cache hits: {nr_used_hashes})"
+        # Test lazy intersection if supported
+        if hasattr(cache.underlying_handler, 'get_intersected_lazy'):
+            start_cache = time.perf_counter()
+            lazy_cache_subquery, nr_used_hashes = partitioncache.get_partition_keys_lazy(
+                query=sql_query,
+                cache_handler=cache.underlying_handler,
+                partition_key=partition_key,
+                min_component_size=1,
             )
-        else:
-            print("No Partiton Keys found. Hint: Add one of the queries to the cache to improve performance.")
+            if lazy_cache_subquery is not None:
+                elapsed_cache_get = time.perf_counter() - start_cache
+                sql_cached = sql_query.strip().strip(";") + f" AND p1.{partition_key} IN (" + lazy_cache_subquery + ")"
+                rows_cached, elapsed_cached = run_query(conn, sql_cached)
+                print(
+                    f"With PartitionCache (lazy): {len(rows_cached)} results in {elapsed_cache_get:.3f} + "
+                    f"{elapsed_cached:.3f} seconds (cache hits: {nr_used_hashes})"
+                )
 
-    cache_handler.close()
+    cache.close()
+
+
+def main():
+    print("Connecting to database...")
+    conn = psycopg2.connect(dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD, host=DB_HOST, port=DB_PORT)
+
+    print(f"Initializing PartitionCache backend: {CACHE_BACKEND}")
+    
+    # Test with zipcode partition key (integer)
+    test_partition_key(conn, "zipcode", "integer")
+    
+    # Test with landkreis partition key (text)
+    test_partition_key(conn, "landkreis", "text")
+
     conn.close()
-    print("Done.")
+    print("\nDone.")
 
 
 if __name__ == "__main__":

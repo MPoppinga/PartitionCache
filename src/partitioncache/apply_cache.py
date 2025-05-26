@@ -8,6 +8,7 @@ It utilizes the given cache to extend the SQL query with the set of possible par
 
 from logging import getLogger
 from typing import Literal
+from datetime import datetime
 
 import sqlglot
 import sqlglot.expressions as exp
@@ -20,7 +21,7 @@ logger = getLogger("PartitionCache")
 
 def get_partition_keys(
     query: str, cache_handler: AbstractCacheHandler, partition_key: str, min_component_size=2, canonicalize_queries=False
-) -> tuple[set[int] | set[str] | None, int, int]:
+) -> tuple[set[int] | set[str] | set[float] | set[datetime] | None, int, int]:
     """
     Using the partition cache to get the partition keys for a given query.
 
@@ -30,7 +31,7 @@ def get_partition_keys(
         partition_key: The identifier for the partition.
 
     Returns:
-       set[int] | set[str] | None: The set of partition keys.
+       set[int] | set[str] | set[float] | set[datetime] | None: The set of partition keys.
     """
 
     # Generate all hashes for the given query (Only consider subqueries with two ore more components that are connected, allow modifying attributes)
@@ -46,7 +47,7 @@ def get_partition_keys(
     logger.info(f"Found {len(cache_entry_hashes)} subqueries in query")
 
     # Get the partition keys from the cache based on the hashes
-    partition_keys, count = cache_handler.get_intersected(set(cache_entry_hashes))
+    partition_keys, count = cache_handler.get_intersected(set(cache_entry_hashes), partition_key=partition_key)
 
     logger.info(f"Extended query with {count} hashes")
     return partition_keys, len(cache_entry_hashes), count
@@ -75,7 +76,9 @@ def get_partition_keys_lazy(
     # -> tuple[sql.Composed | None , int]
     if not isinstance(cache_handler, AbstractCacheHandler_Lazy):
         raise ValueError("Cache handler does not support lazy intersection")
-    lazy_cache_subquery, used_hashes = cache_handler.get_intersected_lazy(set(hashses))
+    
+    lazy_cache_subquery, used_hashes = cache_handler.get_intersected_lazy(set(hashses), partition_key=partition_key)
+    
     return lazy_cache_subquery, used_hashes
 
 
@@ -92,7 +95,7 @@ def find_p0_alias(query: str) -> str:
 
 def extend_query_with_partition_keys(
     query: str,
-    partition_keys: set[int] | set[str],
+    partition_keys: set[int] | set[str] | set[float] | set[datetime],
     partition_key: str,
     method: Literal["IN", "VALUES", "TMP_TABLE_JOIN", "TMP_TABLE_IN"] = "IN",
     p0_alias: str | None = None,
