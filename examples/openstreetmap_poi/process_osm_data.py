@@ -8,7 +8,7 @@ import time
 
 from dotenv import load_dotenv
 import os
-from tqdm import tqdm  # Added tqdm for improved progress bars
+from tqdm import tqdm
 
 # Load environment variables from .env file
 load_dotenv(".env", override=True)
@@ -33,9 +33,12 @@ class POIHandler(osmium.SimpleHandler):
         self.pois = []
         self.postal_areas = index.Index()
         self.postal_codes = {}
+        self.admin_areas = index.Index()  # For landkreis (administrative districts)
+        self.admin_districts = {}
         self.progress_bar = tqdm(desc="Processing POIs", unit="elements", dynamic_ncols=True)
 
     def area(self, a):
+        # Handle postal code areas
         if 'postal_code' in a.tags:
             try:
                 outer_rings = []
@@ -53,12 +56,34 @@ class POIHandler(osmium.SimpleHandler):
                 
                     self.postal_areas.insert(a.id, polygon.bounds, obj=(polygon, a.tags['postal_code']))
                 else:
-                    print(f"Warning: No outer rings found for area {a.id}")
+                    print(f"Warning: No outer rings found for postal area {a.id}")
             except Exception as e:
-                print(f"Error processing area {a.id}: {str(e)}")
+                print(f"Error processing postal area {a.id}: {str(e)}")
 
-        # get centroid for pois (which are areas)
-        # check if ['amenity', 'shop', 'tourism', 'leisure']: is in tags
+        # Handle administrative districts (landkreis)
+        if ('admin_level' in a.tags and a.tags['admin_level'] == '6' and 'name' in a.tags):
+            try:
+                outer_rings = []
+                inner_rings = []
+                for outer_ring in a.outer_rings():
+                    outer_rings.append([(n.lon, n.lat) for n in outer_ring])
+                    for inner_ring in a.inner_rings(outer_ring):
+                        inner_rings.append([(n.lon, n.lat) for n in inner_ring])
+                
+                if outer_rings:
+                    if len(outer_rings) == 1:
+                        polygon = Polygon(outer_rings[0], inner_rings)
+                    else:
+                        polygon = MultiPolygon([Polygon(ring, inner_rings) for ring in outer_rings])
+                
+                    district_name = a.tags['name']
+                    self.admin_areas.insert(a.id, polygon.bounds, obj=(polygon, district_name))
+                else:
+                    print(f"Warning: No outer rings found for admin area {a.id}")
+            except Exception as e:
+                print(f"Error processing admin area {a.id}: {str(e)}")
+
+        # Handle POIs that are areas
         if any(key in a.tags for key in ['amenity', 'shop', 'tourism', 'leisure']):
             for outer_ring in a.outer_rings():
                 polygon = Polygon([(n.lon, n.lat) for n in outer_ring])
@@ -71,6 +96,7 @@ class POIHandler(osmium.SimpleHandler):
                     'type': poi_type,
                     'subtype': poi_subtype,
                     'zipcode': a.tags.get('postal_code', None),
+                    'landkreis': None,  # Will be set later
                     'geom': centroid
                 })
         self.print_progress()
@@ -80,13 +106,15 @@ class POIHandler(osmium.SimpleHandler):
         poi_type, poi_subtype = self.get_poi_type(tags)
         if poi_type:
             point = Point(n.location.lon, n.location.lat)
-            zipcode = None  # Must be to later as areas not available: self.get_zipcode(point)
+            zipcode = None  # Will be set later as areas not available yet
+            landkreis = None  # Will be set later
             self.pois.append({
                 'id': n.id,
                 'name': tags.get('name', ''),
                 'type': poi_type,
                 'subtype': poi_subtype,
                 'zipcode': zipcode,
+                'landkreis': landkreis,
                 'geom': point
             })
         self.print_progress()
@@ -109,6 +137,16 @@ class POIHandler(osmium.SimpleHandler):
                     return None
         return None
 
+    def get_landkreis(self, point):
+        """Get the landkreis (administrative district) for a given point."""
+        for item in self.admin_areas.intersection(point.bounds, objects=True):
+            if item.object is None:
+                continue
+            area, district_name = item.object
+            if point.within(area):
+                return district_name
+        return None
+
     def print_progress(self):
         self.progress_bar.update(1)
 
@@ -125,6 +163,7 @@ def create_table(conn):
             type TEXT,
             subtype TEXT,
             zipcode INTEGER,
+            landkreis TEXT,
             geom GEOMETRY(Point, 25832)
         );
 
@@ -141,10 +180,10 @@ def insert_pois(conn, pois):
         with conn.cursor() as cur:
             for i, poi in enumerate(pois, 1):
                 cur.execute("""
-                INSERT INTO pois (id, name, type, subtype, zipcode, geom)
-                VALUES (%s, %s, %s, %s, %s, ST_Transform(ST_SetSRID(ST_GeomFromText(%s), 4326), 25832))
+                INSERT INTO pois (id, name, type, subtype, zipcode, landkreis, geom)
+                VALUES (%s, %s, %s, %s, %s, %s, ST_Transform(ST_SetSRID(ST_GeomFromText(%s), 4326), 25832))
                 ON CONFLICT (id) DO NOTHING;
-                """, (poi['id'], poi['name'], poi['type'], poi['subtype'], poi['zipcode'], poi['geom'].wkt))
+                """, (poi['id'], poi['name'], poi['type'], poi['subtype'], poi['zipcode'], poi['landkreis'], poi['geom'].wkt))
                 pbar.update(1)
                 if i % 1000 == 0:
                     conn.commit()
@@ -187,13 +226,11 @@ def main():
     handler = POIHandler()
     handler.apply_file(OSM_FILE)
 
-    # set the pois to the postal codes
-    for poi in handler.pois:
-        poi["zipcode"] = handler.get_zipcode(poi["geom"])   
-
-    ## pickle the pois
-    #with open('pois.pkl', 'wb') as f:
-    #    pickle.dump(handler.pois, f)
+    print("\nAssigning postal codes and administrative districts to POIs...")
+    # Set the postal codes and landkreis for all POIs
+    for poi in tqdm(handler.pois, desc="Processing POI locations"):
+        poi["zipcode"] = handler.get_zipcode(poi["geom"])
+        poi["landkreis"] = handler.get_landkreis(poi["geom"])
 
     handler.close_progress()
 
@@ -218,17 +255,21 @@ def main():
     sql = """CREATE INDEX IF NOT EXISTS pois_geom_idx ON pois USING GIST (geom);
         CREATE INDEX IF NOT EXISTS pois_type_idx ON pois (type);
         CREATE INDEX IF NOT EXISTS pois_subtype_idx ON pois (subtype);
-        CREATE INDEX IF NOT EXISTS pois_idx ON pois (zipcode, type, subtype, geom);
+        CREATE INDEX IF NOT EXISTS pois_zipcode_idx ON pois (zipcode, type, subtype, geom);
+        CREATE INDEX IF NOT EXISTS pois_landkreis_idx ON pois (landkreis, type, subtype, geom);
         CREATE MATERIALIZED VIEW IF NOT EXISTS zipcodes AS 
-        SELECT DISTINCT zipcode FROM pois;
+        SELECT DISTINCT zipcode FROM pois WHERE zipcode IS NOT NULL;
+        CREATE MATERIALIZED VIEW IF NOT EXISTS landkreise AS 
+        SELECT DISTINCT landkreis FROM pois WHERE landkreis IS NOT NULL;
         REFRESH MATERIALIZED VIEW zipcodes;
+        REFRESH MATERIALIZED VIEW landkreise;
         """
     with conn.cursor() as cur:
         cur.execute(sql)
         conn.commit()
     
     with conn.cursor() as cur:
-        cur.execute("CLUSTER pois USING pois_idx;")
+        cur.execute("CLUSTER pois USING pois_zipcode_idx;")
         conn.commit()
 
     conn.close()

@@ -8,9 +8,7 @@ import sys
 from logging import getLogger, WARNING
 
 import dotenv
-
-from partitioncache.cache_handler import get_cache_handler
-from partitioncache.apply_cache import get_partition_keys
+import partitioncache
 
 logger = getLogger("PartitionCache")
 
@@ -42,6 +40,14 @@ def main(file=sys.stdout):
     )
     
     parser.add_argument(
+        "--partition-datatype",
+        type=str,
+        default="integer",
+        choices=["integer", "float", "text", "timestamp"],
+        help="Datatype of the partition key (default: integer)"
+    )
+    
+    parser.add_argument(
         "--env-file",
         type=str,
         help="Path to environment file with cache configuration"
@@ -66,8 +72,8 @@ def main(file=sys.stdout):
     # Load environment variables if specified
     if args.env_file:
         dotenv.load_dotenv(args.env_file)
-    cache_handler = None
-    
+
+    cache = None    
     if args.output_file:
         with open(args.output_file, 'w') as f:
             file = f
@@ -75,13 +81,13 @@ def main(file=sys.stdout):
         file = sys.stdout
     
     try:
-        # Initialize cache handler
-        cache_handler = get_cache_handler(args.cache_backend)
+        # Initialize cache handler using API
+        cache = partitioncache.create_cache_helper(args.cache_backend, args.partition_key, args.partition_datatype)
 
-        # Get partition keys
-        partition_keys, num_subqueries, num_hits = get_partition_keys(
+        # Get partition keys # TODO use cache.get_partition_keys() etc instead
+        partition_keys, num_subqueries, num_hits = partitioncache.get_partition_keys(
             query=args.query,
-            cache_handler=cache_handler,
+            cache_handler=cache.underlying_handler,
             partition_key=args.partition_key,
         )
 
@@ -118,8 +124,8 @@ def main(file=sys.stdout):
         logger.error(f"Error reading from cache: {str(e)}")
         sys.exit(1)
     finally:
-        if cache_handler is not None:
-            cache_handler.close()
+        if cache is not None:
+            cache.close()
 
 if __name__ == "__main__":
     main()

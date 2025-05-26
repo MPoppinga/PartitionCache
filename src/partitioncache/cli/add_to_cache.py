@@ -7,13 +7,11 @@ import os
 from logging import getLogger
 
 import dotenv
+import partitioncache
 
-from partitioncache.cache_handler import get_cache_handler
-from partitioncache.cache_handler.abstract import AbstractCacheHandler_Query
 from partitioncache.db_handler import get_db_handler
 from partitioncache.db_handler.abstract import AbstractDBHandler
 from partitioncache.query_processor import clean_query, generate_all_query_hash_pairs, hash_query
-from partitioncache.queue import push_to_original_query_queue, push_to_query_fragment_queue
 
 logger = getLogger("PartitionCache")
 
@@ -29,6 +27,10 @@ def main():
     parser.add_argument("--no-recompose", action="store_true", help="Do not recompose the query before adding to cache, the query is added as is to the cache or fragment queue")
 
     parser.add_argument("--partition-key", type=str, required=True, help="Name of the partition key column")
+
+    parser.add_argument("--partition-datatype", type=str, default=None, 
+                       choices=["integer", "float", "text", "timestamp"],
+                       help="Datatype of the partition key (if not specified, the datatype will be inferred from the query)")
 
     # Queue configuration
     parser.add_argument("--queue", action="store_true", help="Add query to fragment queue instead of executing directly")
@@ -48,6 +50,7 @@ def main():
 
     # Cache configuration
     parser.add_argument("--cache-backend", type=str, default="postgresql_bit", help="Cache backend to use")
+    # TODO allow Null values to use the env files entries
 
     args = parser.parse_args()
 
@@ -55,9 +58,9 @@ def main():
     dotenv.load_dotenv(args.env)
 
     # Validate mutually exclusive options
-    queue_options = [args.queue, args.direct]
+    queue_options = [args.queue, args.direct, args.queue_original]
     if sum(queue_options) != 1:
-        logger.error("Only one of --queue or --direct can be specified")
+        logger.error("Only one of --queue, --direct or --queue-original can be specified")
         exit(1)
 
     query_options = [args.query is not None, args.query_file is not None]
@@ -69,29 +72,34 @@ def main():
         with open(args.query_file, "r") as f:
             query = f.read()
     else:
-        query = args.query
-
-    if args.queue:  # Add to queue for async processing
-        if args.queue_original:
-            success = push_to_original_query_queue(query, args.partition_key)
-        else:
-            if not args.no_recompose:  # Add to query fragment queue for async processing
-                query_hash_pairs = generate_all_query_hash_pairs(
-                    query,
-                    args.partition_key,
-                    min_component_size=1,
-                    follow_graph=True,
-                    keep_all_attributes=True,
-                )
-                success = push_to_query_fragment_queue(query_hash_pairs, args.partition_key)
-            else:
-                query = clean_query(query)
-                query_hash_pairs = [(query, hash_query(query))]
-                success = push_to_query_fragment_queue(query_hash_pairs, args.partition_key)
+        query = args.query        
+        
+    if args.queue_original:
+        success = partitioncache.push_to_original_query_queue(query, args.partition_key, args.partition_datatype, args.queue_provider)
         if success:
-            logger.info("Query successfully added to queue")
+            logger.info("Query successfully added to original query queue")
         else:
-            logger.error("Failed to add query to queue")
+            logger.error("Failed to add query to original query queue")
+            exit(1)
+
+    elif args.queue:  # Add to queue for async processing
+        if not args.no_recompose:  # Add to query fragment queue for async processing
+            query_hash_pairs = generate_all_query_hash_pairs(
+                query,
+                args.partition_key,
+                min_component_size=1,
+                follow_graph=True,
+                keep_all_attributes=True,
+            )
+            success = partitioncache.push_to_query_fragment_queue(query_hash_pairs, args.partition_key, args.partition_datatype, args.queue_provider)
+        else:
+            query = clean_query(query)
+            query_hash_pairs = [(query, hash_query(query))]
+            success = partitioncache.push_to_query_fragment_queue(query_hash_pairs, args.partition_key, args.partition_datatype, args.queue_provider)
+        if success:
+            logger.info("Query successfully added to query fragment queue")
+        else:
+            logger.error("Failed to add query to query fragment queue")
             exit(1)
 
     elif args.direct:  # Execute directly
@@ -106,8 +114,8 @@ def main():
             args.db_name = db_name
 
         try:
-            # Initialize cache handler
-            cache_handler = get_cache_handler(args.cache_backend)
+            # Initialize cache handler using API
+            cache = partitioncache.create_cache_helper(args.cache_backend, args.partition_key, args.partition_datatype)
 
             # Get database handler
             db_handler: AbstractDBHandler
@@ -154,24 +162,22 @@ def main():
 
             # Process each query-hash pair
             for query, hash_value in query_hash_pairs:
-                if cache_handler.exists(hash_value):
+                if cache.exists(hash_value):
                     logger.info(f"Query {hash_value} already in cache")
-                    if isinstance(cache_handler, AbstractCacheHandler_Query):
-                        cache_handler.set_query(hash_value, query, args.partition_key)
+                    cache.set_query(hash_value, query)
                     continue
 
                 # Execute query and store results
                 result = set(db_handler.execute(query))
                 if result:
-                    cache_handler.set_set(hash_value, result)
-                    if isinstance(cache_handler, AbstractCacheHandler_Query):
-                        cache_handler.set_query(hash_value, query, args.partition_key)
+                    cache.set_set(hash_value, result)
+                    cache.set_query(hash_value, query)
                     logger.info(f"Stored query {hash_value} with {len(result)} results")
                 else:
                     logger.warning(f"Query {hash_value} returned no results")
 
             db_handler.close()
-            cache_handler.close()
+            cache.close()
 
         except Exception as e:
             logger.error(f"Error processing query: {str(e)}")

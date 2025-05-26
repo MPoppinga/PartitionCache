@@ -25,7 +25,54 @@ Reduction of the search space:
 - Frequent subqueries can also be stored with their partition identifiers
 - New queries get checked against the cache. If the query or a part of the query is present in the cache, the search space can be restricted to the stored partition identifiers
 
-###  Example
+## Multi-Partition Support
+
+PartitionCache supports multiple partition keys with different datatypes:
+
+- **Multiple Partition Keys**: Manage different partition strategies simultaneously (e.g., `city_id`, `region_id`, `time_bucket`)
+- **Multiple Datatypes**: Different partitions can store different data types (integer, float, text, timestamp)
+- **Variable Bit Lengths**: Bit array handlers support different bit sizes per partition
+- **Automatic Validation**: Datatype conflicts are automatically detected and prevented
+
+See [Multi-Partition Documentation](docs/cache_handlers_multi_partition.md) for detailed usage examples.
+
+##  API
+
+PartitionCache provides a clean, consistent API with automatic datatype validation and helpful error messages:
+
+```python
+import partitioncache
+
+# Create a cache handler with automatic datatype validation
+cache = partitioncache.create_cache_helper("postgresql_array", "user_id", "integer")
+
+# Store partition keys for a query
+cache.set_set("query_hash", {1, 2, 3, 4, 5})
+
+# Retrieve partition keys
+partition_keys = cache.get("query_hash")
+
+# Get partition keys for a complex query
+partition_keys, subqueries, hits = partitioncache.get_partition_keys(
+    query="SELECT * FROM users WHERE age > 25",
+    cache_handler=cache.underlying_handler,
+    partition_key="user_id"
+)
+
+# Extend query with cached partition keys
+optimized_query = partitioncache.extend_query_with_partition_keys(
+    query="SELECT * FROM users WHERE age > 25",
+    partition_keys=partition_keys,
+    partition_key="user_id"
+)
+
+
+# List all available backends and their supported datatypes
+backends = partitioncache.list_cache_types()
+print(backends["postgresql_array"])  # ['integer', 'float', 'text', 'timestamp']
+```
+
+### Example
 
 "For all cities in the world, find where a public park larger than 1000 m² lies within 50m of a street named 'main street'."
 
@@ -42,93 +89,192 @@ For example, "all schools in Europe which are within 1km of a public park larger
 pip install git+https://github.com/MPoppinga/PartitionCache@main
 ```
 
-##  Usage
+## Usage
 
 Notes:
 At the current state, the library only supports a specific subset of SQL syntax which is available for PostgreSQL.
 For example, CTEs are not supported, and JOINs and subqueries are only partially supported. We aim to increase the robustness and flexibility of our approach in future releases.
 
-An example workload is available at [https://github.com/MPoppinga/ComplexMine](https://github.com/MPoppinga/ComplexMine).
+An example workload is available at [examples/openstreetmap_poi](examples/openstreetmap_poi/).
+
+### Python API
+
+#### Basic Usage
+
+```python
+import partitioncache
+
+# Create cache with automatic datatype validation
+cache = partitioncache.create_cache(
+    cache_type="postgresql_array",
+    partition_key="city_id", 
+    datatype="integer"
+)
+
+# Store query results
+cache.set_set("query_hash_123", {1, 5, 10, 15})
+
+# Retrieve cached results
+partition_keys = cache.get("query_hash_123")
+# Returns: {1, 5, 10, 15}
+
+# Check available cache types and datatypes
+print(partitioncache.list_cache_types())
+# Returns: {'postgresql_array': ['integer', 'float', 'text', 'timestamp'], ...}
+```
+
+#### Advanced Query Processing
+
+```python
+# Get partition keys for a complex query
+partition_keys, num_subqueries, cache_hits = partitioncache.get_partition_keys(
+    query="SELECT * FROM pois WHERE type='restaurant' AND city_id IN (1,2,3)",
+    cache_handler=cache.underlying_handler,
+    partition_key="city_id"
+)
+
+if partition_keys:
+    # Extend original query with cached partition keys
+    optimized_query = partitioncache.extend_query_with_partition_keys(
+        query="SELECT * FROM pois WHERE type='restaurant'",
+        partition_keys=partition_keys,
+        partition_key="city_id",
+        method="IN"
+    )
+    print(f"Optimized query: {optimized_query}")
+```
+
+#### Multiple Partition Keys
+
+```python
+# Create handlers for different partition strategies
+zipcode_cache = partitioncache.create_cache("postgresql_array", "zipcode", "integer")
+district_cache = partitioncache.create_cache("postgresql_array", "district", "text")
+
+# Store data in different partitions
+zipcode_cache.set_set("restaurants_query", {10001, 10002, 10003})
+district_cache.set_set("restaurants_query", {"Manhattan", "Brooklyn"})
+```
 
 ### CLI Usage
 
-#### Cache population
-Usage: pcache-observer 
+#### Cache Population
 
-pcache-observer is a process that monitors the queue for new cache requests, allowing asynchronous population of the cache:
+Add queries to cache directly:
 
+```bash
+pcache-add --direct \
+  --query "SELECT DISTINCT city_id FROM pois WHERE type='restaurant'" \
+  --partition-key "city_id" \
+  --partition-datatype "integer" \
+  --cache-backend "postgresql_array" \
+  --env .env
 ```
+
+Add queries to processing queue:
+
+```bash
+pcache-add --queue-original \
+  --query "SELECT DISTINCT city_id FROM pois WHERE type='restaurant'" \
+  --partition-key "city_id" \
+  --partition-datatype "integer" \
+  --env .env
+```
+
+Add from file with automatic backend recommendation:
+
+```bash
+# The tool will suggest optimal backends for your datatype
+pcache-add --direct \
+  --query-file "my_query.sql" \
+  --partition-key "zipcode" \
+  --partition-datatype "integer" \
+  --cache-backend "$(pcache-add --help | grep 'Recommended')" \
+  --env .env
+```
+
+#### Queue Monitoring
+
+Monitor and process queued queries:
+
+```bash
 pcache-observer \
-  --db-backend=postgresql \
-  --db-name=mydb \
-  --cache-backend=redis \
-  --partition-key="partition_key" \ 
-  --long-running-query-timeout=300
-```
-
-Usage: pcache-add 
-
-pcache-add allows adding individual queries to the cache directly or sending them to the queue:
-
-```
-pcache-add \
-  --query="SELECT * FROM table WHERE partition_key = 'value'" \
-  --partition-key="partition_key" \
-  --db-name=mydb \
-  --cache-backend=redis
-```
-
-```
-pcache-add \
-  --query="SELECT * FROM table WHERE partition_key = 'value'" \
-  --queue \
-  --partition-key="partition_key" \
-  --env-file=.env
+  --cache-backend "postgresql_array" \
+  --db-backend "postgresql"
 ```
 
 #### Cache Usage
 
-Usage: pcache-get
+Retrieve partition keys for a query:
 
-pcache-get returns the list of all partition keys based on the provided query, restricting the search space to as few partition_keys as possible:
-
-```
+```bash
 pcache-get \
-  --query="SELECT * FROM table" \
-  --cache-backend=rocksdb
+  --query "SELECT * FROM pois WHERE type='restaurant'" \
+  --partition-key "city_id" \
+  --partition-datatype "integer" \
+  --cache-backend "postgresql_array" \
+  --env .env
+```
+
+Get partition keys in different formats:
+
+```bash
+# JSON format
+pcache-get --query "SELECT * FROM pois WHERE type='restaurant'" \
+  --partition-key "city_id" --partition-datatype "integer" \
+  --cache-backend "postgresql_array" --output-format json --env .env
+
+# One per line
+pcache-get --query "SELECT * FROM pois WHERE type='restaurant'" \
+  --partition-key "city_id" --partition-datatype "integer" \
+  --cache-backend "postgresql_array" --output-format lines --env .env
 ```
 
 #### Cache Management
 
-pcache-manage allows copying, deleting, and archiving entries from the individual cache backends that have been set up.
+```bash
+# Export cache
+pcache-manage --export \
+  --cache "postgresql_array" \
+  --file "cache_backup.pkl"
 
-Usage: pcache-manage 
+# Copy between cache types
+pcache-manage --copy \
+  --from "rocksdb" \
+  --to "postgresql_array"
 
-```
-pcache-manage \
-  --export \
-  --cache=redis \ 
-  --env-file=.env \
-  --file=redis_export.pkl
-```
-
-```
-pcache-manage \
-  --delete \
-  --cache=redis \ 
-  --env-file=.env 
+# Delete specific partition
+pcache-manage --delete-partition \
+  --cache "postgresql_array" \
+  --partition-key "city_id"
 ```
 
-```
-pcache-manage \
-  --copy \
-  --from=rocksdb_bit \ 
-  --to=postgresql_array \ 
-  --env-file=.env 
+### Supported Cache Backends
+
+| Backend | Integer | Float | Text | Timestamp | Notes |
+|---------|---------|-------|------|-----------|-------|
+| `postgresql_array` | ✓ | ✓ | ✓ | ✓ | Full-featured, recommended |
+| `postgresql_bit` | ✓ | ✗ | ✗ | ✗ | Memory efficient for integers |
+| `redis` | ✓ | ✗ | ✓ | ✗ | Distributed caching |
+| `redis_bit` | ✓ | ✗ | ✗ | ✗ | Memory efficient Redis |
+| `rocksdb` | ✓ | ✗ | ✓ | ✗ | File-based, good for development |
+| `rocksdb_bit` | ✓ | ✗ | ✗ | ✗ | Memory efficient file-based |
+| `rocksdict` | ✓ | ✓ | ✓ | ✓ | Full-featured file-based |
+
+## Examples
+
+### OpenStreetMap POI Example
+
+A comprehensive example using real OpenStreetMap data with both zipcode and administrative district partitioning:
+
+```bash
+cd examples/openstreetmap_poi
+docker-compose up -d
+python process_osm_data.py
+python run_poi_queries.py
 ```
 
-### Direct Usage
-If using a Python application, it's possible to directly call the relevant functions.
+See [examples/openstreetmap_poi/README.md](examples/openstreetmap_poi/README.md) for detailed instructions.
 
 ## License
 

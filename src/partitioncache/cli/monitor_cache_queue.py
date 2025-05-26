@@ -13,7 +13,7 @@ import dotenv
 import psycopg
 
 from partitioncache.cache_handler import get_cache_handler
-from partitioncache.cache_handler.abstract import AbstractCacheHandler_Query
+
 from partitioncache.db_handler import get_db_handler
 from partitioncache.db_handler.abstract import AbstractDBHandler
 from partitioncache.query_processor import generate_all_query_hash_pairs
@@ -23,7 +23,7 @@ from partitioncache.queue import (
     pop_from_query_fragment_queue,
     pop_from_query_fragment_queue_blocking,
     push_to_query_fragment_queue,
-    get_queue_provider,
+    get_queue_provider_name,
     get_queue_lengths
 )
 
@@ -32,7 +32,7 @@ args: argparse.Namespace
 # Initialize threading components
 status_lock = threading.Lock()
 active_futures: list[str] = []
-pending_jobs: list[tuple[str, str, str]] = []  # Changed to include partition_key
+pending_jobs: list[tuple[str, str, str, str]] = []  # (query, hash, partition_key, partition_datatype)
 pool: concurrent.futures.ProcessPoolExecutor | None = None  # Initialize pool as None
 exit_event = threading.Event()  # Create an event to signal exit
 fragment_processor_exit = threading.Event()  # Exit signal for fragment processor
@@ -48,11 +48,10 @@ def query_fragment_processor():
 
     while not exit_event.is_set():
         try:
-            # Pop query from original query queue - now returns (query, partition_key)
+            # Pop query from original query queue
             # Use blocking or non-blocking based on settings
             if not getattr(args, "disable_optimized_polling", False):
                 # Use efficient blocking pop (with LISTEN/NOTIFY for PostgreSQL, native blocking for Redis)
-                queue_provider = get_queue_provider()
                 query_result = pop_from_original_query_queue_blocking(timeout=60)
             else:
                 # Use regular pop when optimized polling is disabled
@@ -61,15 +60,15 @@ def query_fragment_processor():
             if query_result is None:
                 continue  # Timeout occurred, check exit event and try again
 
-            query, partition_key = query_result
-            print(f"Processing original query into fragments for partition_key: {partition_key}")
+            query, partition_key, partition_datatype = query_result
+            print(f"Processing original query into fragments for partition_key: {partition_key} (datatype: {partition_datatype})")
 
             # Process the query into fragments using the partition_key from queue
             query_hash_pairs = generate_all_query_hash_pairs(query, partition_key, 1, True, True)
             print(f"Generated {len(query_hash_pairs)} fragments from original query")
 
-            # Push fragments to query fragment queue using the partition_key from queue
-            success = push_to_query_fragment_queue(query_hash_pairs, partition_key)
+            # Push fragments to query fragment queue using the partition_key and datatype from queue
+            success = push_to_query_fragment_queue(query_hash_pairs, partition_key, partition_datatype)
             if success:
                 print(f"Pushed {len(query_hash_pairs)} fragments to query fragment queue")
             else:
@@ -82,13 +81,14 @@ def query_fragment_processor():
     print("Query fragment processor thread exiting")
 
 
-def run_and_store_query(query: str, hash: str, partition_key: str):
+def run_and_store_query(query: str, query_hash: str, partition_key: str, partition_datatype: str | None = None):
     """Worker function to execute and store a query.
     
     Args:
         query: SQL query string to execute
-        hash: Unique hash identifier for the query
+        query_hash: Unique hash identifier for the query
         partition_key: Partition key for organizing cached results
+        partition_datatype: Datatype of the partition key (default: None)
     """
     if not args.db_name:
         args.db_name = os.getenv("DB_NAME")
@@ -126,30 +126,32 @@ def run_and_store_query(query: str, hash: str, partition_key: str):
 
             # Apply limit if specified
             if args.limit is not None and result is not None and len(result) >= args.limit:
-                print(f"Query {hash} limited to {args.limit} partition keys")
-                cache_handler.set_null(f"_LIMIT_{hash}")  # Set null termination bit
+                print(f"Query {query_hash} limited to {args.limit} partition keys")
+                cache_handler.set_null(f"_LIMIT_{query_hash}", partition_key)  # Set null termination bit
                 return True
 
         except psycopg.OperationalError as e:
             if "statement timeout" in str(e):
-                print(f"Query {hash} is a long running query")
-                cache_handler.set_null(f"_TIMEOUT_{hash}")  # Set null termination bit
+                print(f"Query {query_hash} is a long running query")
+                cache_handler.set_null(f"_TIMEOUT_{query_hash}", partition_key)  # Set null termination bit
                 return True
             else:
                 raise e
 
-        print(f"Running query {hash} for partition_key: {partition_key}")
-        print(f"Query {hash} returned {len(result)} results")
-        print(f"Query {hash} took {time.perf_counter() - t} seconds")
+        print(f"Running query {query_hash} for partition_key: {partition_key} (datatype: {partition_datatype})")
+        print(f"Query {query_hash} returned {len(result)} results")
+        print(f"Query {query_hash} took {time.perf_counter() - t} seconds")
         db_handler.close()
 
-        cache_handler.set_set(hash, result)
-        if isinstance(cache_handler, AbstractCacheHandler_Query):
-            cache_handler.set_query(hash, query, partition_key)
-        print(f"Stored {hash} in cache")
+        if partition_datatype is not None:
+            cache_handler.register_partition_key(partition_key, partition_datatype)
+
+        cache_handler.set_set(query_hash, result, partition_key)
+        cache_handler.set_query(query_hash, query, partition_key)
+        print(f"Stored {query_hash} in cache")
         return True
     except Exception as e:
-        print(f"Error processing query {hash}: {str(e)}")
+        print(f"Error processing query {query_hash}: {str(e)}")
         with multiprocessing.Lock():
             with open("tmp/error_sql_file.sql", "a") as f:
                 f.write(f"Error from run on {datetime.datetime.now()}\n")
@@ -161,23 +163,23 @@ def print_status(active, pending, original_query_queue=0, query_fragment_queue=0
     print(f"Active processes: {active}, Pending jobs: {pending}, Original query queue: {original_query_queue}, Query fragment queue: {query_fragment_queue}")
 
 
-def process_completed_future(future, hash):
+def process_completed_future(future, query_hash):
     """Process a completed future and update job status."""
     global pool  # Ensure pool is accessible
     if pool is None:
         raise AssertionError("No pool set up")
 
     with status_lock:
-        if hash in active_futures:
-            active_futures.remove(hash)
-            print(f"Completed query {hash}")
+        if query_hash in active_futures:
+            active_futures.remove(query_hash)
+            print(f"Completed query {query_hash}")
         else:
-            print(f"Warning: Completed hash {hash} not found in active_futures")
+            print(f"Warning: Completed hash {query_hash} not found in active_futures")
 
         # Start a new job from pending if available
         if pending_jobs:
-            next_query, next_hash, next_partition_key = pending_jobs.pop(0)  # Now includes partition_key
-            new_future = pool.submit(run_and_store_query, next_query, next_hash, next_partition_key)
+            next_query, next_hash, next_partition_key, next_partition_datatype = pending_jobs.pop(0)
+            new_future = pool.submit(run_and_store_query, next_query, next_hash, next_partition_key, next_partition_datatype)
             active_futures.append(next_hash)
             new_future.add_done_callback(lambda f, h=next_hash: process_completed_future(f, h))
             print(f"Started query {next_hash} from pending queue")
@@ -237,36 +239,35 @@ def fragment_executor():
                     print("Waiting for fragment from fragment queue")
                     print_status(active, pending, incoming_count, fragment_count)
 
-                # Pop fragment from fragment queue - now returns (query, hash, partition_key)
+                # Pop fragment from fragment queue
                 # Use blocking or non-blocking based on settings
                 if not args.disable_optimized_polling:
                     # Use efficient blocking pop (with LISTEN/NOTIFY for PostgreSQL, native blocking for Redis)
-                    queue_provider = get_queue_provider()
+                    queue_provider = get_queue_provider_name()
                     print(f"Using {queue_provider} blocking pop")
                     fragment_result = pop_from_query_fragment_queue_blocking(timeout=60)
                 else:
                     # Use regular pop when optimized polling is disabled
-                    queue_provider = get_queue_provider()
+                    queue_provider = get_queue_provider_name()
                     print(f"Using regular pop for {queue_provider}")
                     fragment_result = pop_from_query_fragment_queue()
 
                 if fragment_result is None:
                     continue  # Timeout occurred, check exit event and try again
-                query, hash_value, partition_key = fragment_result
-                print(f"Found fragment in fragment queue: {hash_value} for partition_key: {partition_key}")
+                query, hash_value, partition_key, partition_datatype = fragment_result
+                print(f"Found fragment in fragment queue: {hash_value} for partition_key: {partition_key} (datatype: {partition_datatype})")
 
                 # Check if already in cache or being processed
-                if main_cache_handler.exists(hash_value):
+                if main_cache_handler.exists(hash_value, partition_key):
                     print(f"Query {hash_value} already in cache")
-                    if isinstance(main_cache_handler, AbstractCacheHandler_Query):
-                        main_cache_handler.set_query(hash_value, query, partition_key)  # update the query last_seen
+                    main_cache_handler.set_query(hash_value, query, partition_key)  # update the query last_seen
                     continue
 
                 # Check for existing termination bits before submitting
-                if main_cache_handler.exists(f"_LIMIT_{hash_value}"):
+                if main_cache_handler.exists(f"_LIMIT_{hash_value}", partition_key):
                     print(f"Query {hash_value} previously hit limit, skipping")
                     continue
-                if main_cache_handler.exists(f"_TIMEOUT_{hash_value}"):
+                if main_cache_handler.exists(f"_TIMEOUT_{hash_value}", partition_key):
                     print(f"Query {hash_value} previously timed out, skipping")
                     continue
 
@@ -276,12 +277,12 @@ def fragment_executor():
 
                 with status_lock:
                     if len(active_futures) < args.max_processes:
-                        future = pool.submit(run_and_store_query, query, hash_value, partition_key)
+                        future = pool.submit(run_and_store_query, query, hash_value, partition_key, partition_datatype)
                         active_futures.append(hash_value)
                         future.add_done_callback(lambda f, h=hash_value: process_completed_future(f, h))  # type: ignore
                         print(f"Started query {hash_value}")
                     else:
-                        pending_jobs.append((query, hash_value, partition_key))  # Now includes partition_key
+                        pending_jobs.append((query, hash_value, partition_key, partition_datatype))
                         print(f"Queued query {hash_value}")
 
             except KeyboardInterrupt:
@@ -307,7 +308,7 @@ def main():
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--db-backend", type=str, default="postgresql", help="database backend", choices=["postgresql", "mysql", "sqlite"])
-    parser.add_argument("--cache-backend", type=str, default="postgresql_bit", help="cache backend")
+    parser.add_argument("--cache-backend", type=str, default=None, help="cache backend")
     parser.add_argument("--db-dir", type=str, default="data/test_db.sqlite", help="database directory")
     parser.add_argument("--env", type=str, default=".env", help="Path to environment file with database credentials")
     parser.add_argument("--close", action="store_true", default=False, help="Close the cache after operation")
@@ -338,6 +339,9 @@ def main():
 
     # Load dotenv
     dotenv.load_dotenv(args.env)
+
+    if args.cache_backend is None:
+        args.cache_backend = os.getenv("CACHE_BACKEND", "postgresql_bit")
 
     # Validate queue configuration (supports both PostgreSQL and Redis)
     try:
