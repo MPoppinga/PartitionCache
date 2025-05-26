@@ -83,7 +83,7 @@ Expected output shows timing comparisons and cache effectiveness for each partit
 pcache-add --direct \
   --query-file testqueries_examples/q1.sql \
   --partition-key zipcode \
-  --partition-datatype integer \ # interger is the default
+  --partition-datatype integer \ # integer is the default
   --cache-backend postgresql_array \
   --env .env
 
@@ -91,7 +91,7 @@ pcache-add --direct \
 pcache-add --queue-original \
   --query-file testqueries_examples/q1.sql \
   --partition-key zipcode \
-  --partition-datatype integer \ # interger is the default
+  --partition-datatype integer \ # integer is the default
   --env .env
 
 # Add all test queries for zipcode
@@ -99,7 +99,7 @@ for query in testqueries_examples/*.sql; do
   pcache-add --direct \
     --query-file "$query" \
     --partition-key zipcode \
-    --partition-datatype integer \ # interger is the default
+    --partition-datatype integer \ # integer is the default
     --cache-backend postgresql_array \
     --env .env
 done
