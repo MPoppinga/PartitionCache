@@ -32,7 +32,7 @@ class MySQLDBHandler(AbstractDBHandler):
             "pool_name": "mypool",
             "pool_size": 5,
             "connect_timeout": int(timeout) if timeout != "0" else None,
-            "consume_results": True
+            "consume_results": True,
         }
         try:
             self.conn = mysql.connector.connect(**dbconfig)

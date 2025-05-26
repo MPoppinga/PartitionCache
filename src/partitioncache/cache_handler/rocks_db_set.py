@@ -14,17 +14,13 @@ class RocksDBCacheHandler(RocksDBAbstractCacheHandler):
     This handler supports multiple partition keys but only integer and string datatypes.
     """
 
-    
     @classmethod
     def get_supported_datatypes(cls) -> set[str]:
         """RocksDB supports integer and text datatypes only."""
-        return {"integer", "text"}    
-    
+        return {"integer", "text"}
+
     def __repr__(self) -> str:
         return "rocksdb"
-
-
-
 
     def get(self, key: str, partition_key: str = "partition_key") -> set[int] | set[str] | set[float] | set[datetime] | None:
         """Get value from partition-specific cache namespace."""
@@ -32,12 +28,12 @@ class RocksDBCacheHandler(RocksDBAbstractCacheHandler):
         datatype = self._get_partition_datatype(partition_key)
         if datatype is None:
             return None
-        
+
         cache_key = self._get_cache_key(key, partition_key)
         search_space_list = self.db.get(cache_key.encode())
         if search_space_list is None or search_space_list == b"\x00":
             return None
-        
+
         settype = None
         datatype = self._get_partition_datatype(partition_key)
         if datatype is not None:
@@ -51,10 +47,11 @@ class RocksDBCacheHandler(RocksDBAbstractCacheHandler):
         if settype is str:
             return set(search_space_list.decode().split(","))
         else:
-            return set(struct.unpack(f"!{(len(search_space_list)//4)}I", search_space_list))
+            return set(struct.unpack(f"!{(len(search_space_list) // 4)}I", search_space_list))
 
-
-    def get_intersected(self, keys: set[str], partition_key: str = "partition_key", settype=int) -> tuple[set[int] | set[str] | set[float] | set[datetime] | None, int]:
+    def get_intersected(
+        self, keys: set[str], partition_key: str = "partition_key", settype=int
+    ) -> tuple[set[int] | set[str] | set[float] | set[datetime] | None, int]:
         """
         RocksDB has no native intersection operation, so we have to do it manually.
         Returns the intersection of all sets in the cache that are associated with the given keys.
@@ -63,7 +60,7 @@ class RocksDBCacheHandler(RocksDBAbstractCacheHandler):
         datatype = self._get_partition_datatype(partition_key)
         if datatype is None:
             return None, 0
-        
+
         count_match = 0
         result: set | None = None
         for key in keys:
@@ -122,7 +119,3 @@ class RocksDBCacheHandler(RocksDBAbstractCacheHandler):
             return True
         except Exception:
             return False
-
-
-
-

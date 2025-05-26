@@ -72,7 +72,7 @@ class RedisQueueHandler(AbstractQueueHandler):
         try:
             r = self._get_redis_connection()
             queue_key = self._get_queue_key("original_query")
-            
+
             # Store query with partition_key and partition_datatype as JSON
             query_data = json.dumps({"query": query, "partition_key": partition_key, "partition_datatype": partition_datatype})
             r.rpush(queue_key, query_data)

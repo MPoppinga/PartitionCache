@@ -76,9 +76,9 @@ def get_partition_keys_lazy(
     # -> tuple[sql.Composed | None , int]
     if not isinstance(cache_handler, AbstractCacheHandler_Lazy):
         raise ValueError("Cache handler does not support lazy intersection")
-    
+
     lazy_cache_subquery, used_hashes = cache_handler.get_intersected_lazy(set(hashses), partition_key=partition_key)
-    
+
     return lazy_cache_subquery, used_hashes
 
 

@@ -16,7 +16,6 @@ class RedisBitCacheHandler(RedisAbstractCacheHandler):
     This handler supports multiple partition keys but only integer datatypes (for bit arrays).
     """
 
-
     @classmethod
     def get_supported_datatypes(cls) -> set[str]:
         """Redis bit handler supports only integer datatype."""
@@ -71,9 +70,6 @@ class RedisBitCacheHandler(RedisAbstractCacheHandler):
         bitval = bitarray(value.decode())  # type: ignore
         return set(bitval.search(bitarray("1")))
 
-
-
-    
     def filter_existing_keys(self, keys: set, partition_key: str = "partition_key") -> set:
         """
         Checks in Redis which of the keys exists in cache and returns the set of existing keys.
@@ -157,10 +153,6 @@ class RedisBitCacheHandler(RedisAbstractCacheHandler):
         """Register a partition key with the cache handler."""
         if datatype != "integer":
             raise ValueError("Redis bit handler supports only integer datatype")
-        
+
         bitsize = kwargs.get("bitsize", self.default_bitsize)
         self._ensure_partition_exists(partition_key, bitsize)
-
-  
-
-

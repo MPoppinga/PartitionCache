@@ -101,10 +101,10 @@ def delete_cache(cache_type: str):
 def get_all_keys(cache: AbstractCacheHandler) -> list[str]:
     """Get all keys from all partitions in the cache."""
     all_keys = []
-    
+
     # All cache handlers now have get_partition_keys method
     try:
-        partitions = getattr(cache, 'get_partition_keys', lambda: [])()
+        partitions = getattr(cache, "get_partition_keys", lambda: [])()
         if partitions:
             for partition_key, _ in partitions:
                 all_keys.extend(cache.get_all_keys(partition_key))
@@ -114,7 +114,7 @@ def get_all_keys(cache: AbstractCacheHandler) -> list[str]:
     except (AttributeError, TypeError):
         # Fallback for cases where partition enumeration fails
         all_keys.extend(cache.get_all_keys("partition_key"))
-    
+
     return all_keys
 
 
@@ -208,8 +208,8 @@ def delete_partition(cache_type: str, partition_key: str):
     """Delete a specific partition and all its data."""
     try:
         cache = get_cache_handler(cache_type)
-        
-        if hasattr(cache, 'delete_partition'):
+
+        if hasattr(cache, "delete_partition"):
             success = cache.delete_partition(partition_key)  # type: ignore
             if success:
                 logger.info(f"Successfully deleted partition '{partition_key}' from {cache_type} cache")
@@ -217,7 +217,7 @@ def delete_partition(cache_type: str, partition_key: str):
                 logger.error(f"Failed to delete partition '{partition_key}' from {cache_type} cache")
         else:
             logger.error(f"Cache handler {cache_type} does not support partition deletion")
-            
+
         cache.close()
     except ValueError as e:
         logger.error(f"Cache configuration error for {cache_type}: {e}")
@@ -229,14 +229,14 @@ def prune_old_queries(cache_type: str, days_old: int):
     """Remove queries older than specified days."""
     try:
         cache = get_cache_handler(cache_type)
-        
-        if hasattr(cache, 'prune_old_queries'):
+
+        if hasattr(cache, "prune_old_queries"):
             removed_count = cache.prune_old_queries(days_old)  # type: ignore
             logger.info(f"Pruned {removed_count} old queries (older than {days_old} days) from {cache_type} cache")
         else:
             logger.warning(f"Cache handler {cache_type} does not support automatic query pruning")
             logger.info("Manual pruning: Use --remove-termination to remove timeout/limit entries")
-            
+
         cache.close()
     except ValueError as e:
         logger.error(f"Cache configuration error for {cache_type}: {e}")
@@ -246,21 +246,13 @@ def prune_old_queries(cache_type: str, days_old: int):
 
 def prune_all_caches(days_old: int):
     """Remove old queries from all cache types."""
-    cache_types = [
-        "postgresql_array",
-        "postgresql_bit", 
-        "redis",
-        "redis_bit",
-        "rocksdb",
-        "rocksdb_bit",
-        "rocksdict"
-    ]
-    
+    cache_types = ["postgresql_array", "postgresql_bit", "redis", "redis_bit", "rocksdb", "rocksdb_bit", "rocksdict"]
+
     total_removed = 0
     for cache_type in cache_types:
         try:
             cache = get_cache_handler(cache_type)
-            if hasattr(cache, 'prune_old_queries'):
+            if hasattr(cache, "prune_old_queries"):
                 removed_count = cache.prune_old_queries(days_old)  # type: ignore
                 total_removed += removed_count
                 logger.info(f"{cache_type}: Pruned {removed_count} old queries")
@@ -269,7 +261,7 @@ def prune_all_caches(days_old: int):
             logger.debug(f"Cache type {cache_type} not configured, skipping")
         except Exception as e:
             logger.error(f"Error pruning {cache_type}: {e}")
-    
+
     logger.info(f"Total queries pruned across all caches: {total_removed}")
 
 
@@ -474,7 +466,7 @@ def main():
         action="store_true",
         help="Delete a specific partition and all its data",
     )
-    
+
     parser.add_argument(
         "--partition-key",
         type=str,
@@ -486,7 +478,7 @@ def main():
         action="store_true",
         help="Remove queries older than specified days",
     )
-    
+
     parser.add_argument(
         "--days-old",
         type=int,

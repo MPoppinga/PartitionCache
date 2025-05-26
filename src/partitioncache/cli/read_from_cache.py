@@ -15,57 +15,36 @@ logger = getLogger("PartitionCache")
 # set logger to warning
 logger.setLevel(WARNING)
 
+
 def main(file=sys.stdout):
     parser = argparse.ArgumentParser(description="Read partition keys from cache for a given query")
-    
-    parser.add_argument(
-        "--query",
-        type=str,
-        required=True,
-        help="SQL query to look up in cache"
-    )
-    
-    parser.add_argument(
-        "--cache-backend",
-        type=str,
-        default="rocksdb",
-        help="Cache backend to use"
-    )
-    
-    parser.add_argument(
-        "--partition-key",
-        type=str,
-        default="partition_key",
-        help="Name of the partition key column"
-    )
-    
+
+    parser.add_argument("--query", type=str, required=True, help="SQL query to look up in cache")
+
+    parser.add_argument("--cache-backend", type=str, default="rocksdb", help="Cache backend to use")
+
+    parser.add_argument("--partition-key", type=str, default="partition_key", help="Name of the partition key column")
+
     parser.add_argument(
         "--partition-datatype",
         type=str,
         default="integer",
         choices=["integer", "float", "text", "timestamp"],
-        help="Datatype of the partition key (default: integer)"
+        help="Datatype of the partition key (default: integer)",
     )
-    
-    parser.add_argument(
-        "--env-file",
-        type=str,
-        help="Path to environment file with cache configuration"
-    )
+
+    parser.add_argument("--env-file", type=str, help="Path to environment file with cache configuration")
 
     parser.add_argument(
         "--output-format",
-        choices=['list', 'json', 'lines'],
-        default='list',
-        help="Output format for the partition keys, list is a simple comma separated list of partition keys, json is a json array and lines is one partition key per line"
+        choices=["list", "json", "lines"],
+        default="list",
+        help="Output format for the partition keys, list is a simple comma separated list of partition keys, json is a json array and lines is one partition key per line",
     )
-    
+
     parser.add_argument(
-        "--output-file",
-        type=str,
-        help="Path to file to write the partition keys to, if not specified, the partition keys will be printed to the console"
-    )    
-    
+        "--output-file", type=str, help="Path to file to write the partition keys to, if not specified, the partition keys will be printed to the console"
+    )
 
     args = parser.parse_args()
 
@@ -73,13 +52,13 @@ def main(file=sys.stdout):
     if args.env_file:
         dotenv.load_dotenv(args.env_file)
 
-    cache = None    
+    cache = None
     if args.output_file:
-        with open(args.output_file, 'w') as f:
+        with open(args.output_file, "w") as f:
             file = f
     else:
         file = sys.stdout
-    
+
     try:
         # Initialize cache handler using API
         cache = partitioncache.create_cache_helper(args.cache_backend, args.partition_key, args.partition_datatype)
@@ -102,11 +81,12 @@ def main(file=sys.stdout):
 
         try:
             # Output results in the specified format
-            if args.output_format == 'json':
+            if args.output_format == "json":
                 import json
+
                 print(json.dumps(sorted(list(partition_keys))), file=file)
-            
-            elif args.output_format == 'lines':
+
+            elif args.output_format == "lines":
                 for key in sorted(partition_keys):
                     print(str(key), file=file)
             else:  # list format
@@ -126,6 +106,7 @@ def main(file=sys.stdout):
     finally:
         if cache is not None:
             cache.close()
+
 
 if __name__ == "__main__":
     main()

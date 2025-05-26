@@ -60,7 +60,7 @@ class TestQueueInterface:
         result = push_to_original_query_queue("SELECT * FROM table", "test_partition_key")
 
         assert result is True
-        mock_handler.push_to_original_query_queue.assert_called_once_with("SELECT * FROM table", "test_partition_key", "integer")
+        mock_handler.push_to_original_query_queue.assert_called_once_with("SELECT * FROM table", "test_partition_key", None)
 
     @patch("partitioncache.queue._get_queue_handler")
     def test_push_to_original_query_queue_default_partition_key(self, mock_get_handler):
@@ -72,7 +72,7 @@ class TestQueueInterface:
         result = push_to_original_query_queue("SELECT * FROM table")
 
         assert result is True
-        mock_handler.push_to_original_query_queue.assert_called_once_with("SELECT * FROM table", "partition_key", "integer")
+        mock_handler.push_to_original_query_queue.assert_called_once_with("SELECT * FROM table", "partition_key", None)
 
     @patch("partitioncache.queue._get_queue_handler")
     def test_push_to_original_query_queue_error(self, mock_get_handler):
@@ -167,7 +167,7 @@ class TestLegacyFunctions:
         result = push_to_queue("SELECT * FROM table", "test_partition_key")
 
         assert result is True
-        mock_push_original.assert_called_once_with("SELECT * FROM table", "test_partition_key", "integer", None)
+        mock_push_original.assert_called_once_with("SELECT * FROM table", "test_partition_key", None, None)
 
     @patch("partitioncache.queue.push_to_original_query_queue")
     def test_push_to_queue_default_partition_key(self, mock_push_original):
@@ -177,7 +177,7 @@ class TestLegacyFunctions:
         result = push_to_queue("SELECT * FROM table")
 
         assert result is True
-        mock_push_original.assert_called_once_with("SELECT * FROM table", "partition_key", "integer", None)
+        mock_push_original.assert_called_once_with("SELECT * FROM table", "partition_key", None, None)
 
 
 class TestQueueLengths:

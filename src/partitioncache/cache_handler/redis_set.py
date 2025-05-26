@@ -3,13 +3,11 @@ from datetime import datetime
 from partitioncache.cache_handler.redis_abstract import RedisAbstractCacheHandler
 
 
-class RedisCacheHandler(RedisAbstractCacheHandler): 
+class RedisCacheHandler(RedisAbstractCacheHandler):
     """
     Handles access to a Redis cache.
     This handler supports multiple partition keys but only integer and string datatypes.
     """
-    
-
 
     @classmethod
     def get_supported_datatypes(cls) -> set[str]:
@@ -18,9 +16,6 @@ class RedisCacheHandler(RedisAbstractCacheHandler):
 
     def __repr__(self) -> str:
         return "redis"
-    
-   
-
 
     def get(self, key: str, partition_key: str = "partition_key") -> set[int] | set[str] | set[float] | set[datetime] | None:
         """Get value from partition-specific cache namespace."""
@@ -28,7 +23,7 @@ class RedisCacheHandler(RedisAbstractCacheHandler):
         datatype = self._get_partition_datatype(partition_key)
         if datatype is None:
             return None
-        
+
         cache_key = self._get_cache_key(key, partition_key)
         key_type = self.db.type(cache_key)
 
@@ -45,8 +40,7 @@ class RedisCacheHandler(RedisAbstractCacheHandler):
             raise ValueError(f"The key '{cache_key}' does not contain a set")
 
         members = self.db.smembers(cache_key)
-        
-        
+
         settype = None
         datatype = self._get_partition_datatype(partition_key)
         if datatype is not None:
@@ -64,7 +58,6 @@ class RedisCacheHandler(RedisAbstractCacheHandler):
         else:
             raise ValueError(f"Unsupported set type: {settype}")
 
-
     def filter_existing_keys(self, keys: set, partition_key: str = "partition_key") -> set:
         """
         Checks in redis which of the keys exists in cache and returns the set of existing keys.
@@ -73,13 +66,13 @@ class RedisCacheHandler(RedisAbstractCacheHandler):
         datatype = self._get_partition_datatype(partition_key)
         if datatype is None:
             return set()
-        
+
         pipe = self.db.pipeline()
         cache_keys = [self._get_cache_key(key, partition_key) for key in keys]
         for cache_key in cache_keys:
             pipe.type(cache_key)
         key_types = pipe.execute()
-        
+
         existing_keys = set()
         for key, key_type in zip(keys, key_types):
             if key_type == b"set":
@@ -112,7 +105,7 @@ class RedisCacheHandler(RedisAbstractCacheHandler):
             return self.get(original_key, partition_key), 1
         else:
             intersected = self.db.sinter(*valid_cache_keys)  # type: ignore
-            
+
         settype = None
         datatype = self._get_partition_datatype(partition_key)
         if datatype is not None:
@@ -129,7 +122,7 @@ class RedisCacheHandler(RedisAbstractCacheHandler):
                 return set(member.decode() for member in intersected), valid_keys_count  # type: ignore
             else:
                 raise ValueError(f"Unsupported set type: {settype}")
-        return None, 0 
+        return None, 0
 
     def set_set(self, key: str, value: set[int] | set[str] | set[float] | set[datetime], partition_key: str = "partition_key") -> bool:
         """Store a set in the cache for a specific partition key."""
@@ -161,5 +154,3 @@ class RedisCacheHandler(RedisAbstractCacheHandler):
             return True
         except Exception:
             return False
-
-

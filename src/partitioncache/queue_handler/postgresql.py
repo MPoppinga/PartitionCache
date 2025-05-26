@@ -48,10 +48,10 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
     def _initialize_tables(self):
         """Initialize PostgreSQL tables for queue storage."""
         import time
-        
+
         max_retries = 3
         retry_delay = 1.0
-        
+
         for attempt in range(max_retries):
             try:
                 conn = self._get_connection()
@@ -161,7 +161,7 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
                 conn.commit()
                 logger.debug("PostgreSQL queue tables initialized successfully")
                 return  # Success, exit retry loop
-                
+
             except Exception as e:
                 error_msg = str(e).lower()
                 if "tuple concurrently updated" in error_msg or "deadlock detected" in error_msg:
@@ -194,15 +194,18 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
         try:
             conn = self._get_connection()
             cursor = conn.cursor()
-            cursor.execute("""
+            cursor.execute(
+                """
                 INSERT INTO original_query_queue (query, partition_key, partition_datatype, priority, updated_at) 
                 VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP)
                 ON CONFLICT (query, partition_key) 
                 DO UPDATE SET 
                     priority = original_query_queue.priority + 1,
                     updated_at = CURRENT_TIMESTAMP
-            """, (query, partition_key, partition_datatype, priority))
-            
+            """,
+                (query, partition_key, partition_datatype, priority),
+            )
+
             conn.commit()
             logger.debug("Pushed/updated query in PostgreSQL original query queue")
             return True
@@ -210,7 +213,9 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
             logger.error(f"Failed to push query to PostgreSQL original query queue: {e}")
             return False
 
-    def push_to_query_fragment_queue_with_priority(self, query_hash_pairs: List[Tuple[str, str]], partition_key: str, priority: int = 1, partition_datatype: str | None = None) -> bool:
+    def push_to_query_fragment_queue_with_priority(
+        self, query_hash_pairs: List[Tuple[str, str]], partition_key: str, priority: int = 1, partition_datatype: str | None = None
+    ) -> bool:
         """
         Push query fragments with specified priority.
         If a fragment already exists, increment its priority.
@@ -230,14 +235,17 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
 
             # Insert all query-hash pairs with priority support
             for query, hash_value in query_hash_pairs:
-                cursor.execute("""
+                cursor.execute(
+                    """
                     INSERT INTO query_fragment_queue (query, hash, partition_key, partition_datatype, priority, updated_at) 
                     VALUES (%s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
                     ON CONFLICT (hash, partition_key) 
                     DO UPDATE SET 
                         priority = query_fragment_queue.priority + 1,
                         updated_at = CURRENT_TIMESTAMP
-                """, (query, hash_value, partition_key, partition_datatype, priority))
+                """,
+                    (query, hash_value, partition_key, partition_datatype, priority),
+                )
 
             conn.commit()
             logger.debug(f"Pushed/updated {len(query_hash_pairs)} fragments in PostgreSQL query fragment queue")
@@ -304,40 +312,34 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
         import psycopg
         import time
         import select
-        
+
         # First try to get an item immediately
         result = self.pop_from_original_query_queue()
         if result is not None:
             return result
-        
+
         # If no item available, set up LISTEN for notifications
         listen_conn = None
         start_time = time.time()
-        
+
         try:
             # Create a separate connection for LISTEN/NOTIFY
-            listen_conn = psycopg.connect(
-                host=self.host, 
-                port=self.port, 
-                user=self.user, 
-                password=self.password, 
-                dbname=self.dbname
-            )
+            listen_conn = psycopg.connect(host=self.host, port=self.port, user=self.user, password=self.password, dbname=self.dbname)
             listen_conn.autocommit = True
-            
+
             # Start listening for notifications
             cursor = listen_conn.cursor()
             cursor.execute("LISTEN original_query_available")
-            
+
             # Main blocking loop with LISTEN/NOTIFY
             while time.time() - start_time < timeout:
                 remaining_time = max(0, timeout - (time.time() - start_time))
                 if remaining_time <= 0:
                     break
-                
+
                 # Wait for notification with timeout (max 5 seconds per iteration)
                 wait_time = min(5.0, remaining_time)
-                
+
                 try:
                     # Use select to wait for notifications with timeout
                     if select.select([listen_conn.fileno()], [], [], wait_time):
@@ -354,22 +356,22 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
                         result = self.pop_from_original_query_queue()
                         if result is not None:
                             return result
-                        
+
                 except (OSError, psycopg.Error) as e:
                     logger.debug(f"LISTEN/NOTIFY error, falling back to polling: {e}")
                     # Fall back to polling for remainder of timeout
                     break
-            
+
             # Final check or fallback polling
             remaining_time = max(0, timeout - (time.time() - start_time))
             if remaining_time > 0:
                 result = self.pop_from_original_query_queue()
                 if result is not None:
                     return result
-            
+
             logger.debug(f"Blocking pop from original query queue timed out after {timeout} seconds")
             return None
-            
+
         except Exception as e:
             logger.error(f"Error during blocking pop from original query queue: {e}")
             # Fallback to simple polling for remaining time
@@ -443,40 +445,34 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
         import psycopg
         import time
         import select
-        
+
         # First try to get an item immediately
         result = self.pop_from_query_fragment_queue()
         if result is not None:
             return result
-        
+
         # If no item available, set up LISTEN for notifications
         listen_conn = None
         start_time = time.time()
-        
+
         try:
             # Create a separate connection for LISTEN/NOTIFY
-            listen_conn = psycopg.connect(
-                host=self.host, 
-                port=self.port, 
-                user=self.user, 
-                password=self.password, 
-                dbname=self.dbname
-            )
+            listen_conn = psycopg.connect(host=self.host, port=self.port, user=self.user, password=self.password, dbname=self.dbname)
             listen_conn.autocommit = True
-            
+
             # Start listening for notifications
             cursor = listen_conn.cursor()
             cursor.execute("LISTEN query_fragment_available")
-            
+
             # Main blocking loop with LISTEN/NOTIFY
             while time.time() - start_time < timeout:
                 remaining_time = max(0, timeout - (time.time() - start_time))
                 if remaining_time <= 0:
                     break
-                
+
                 # Wait for notification with timeout (max 5 seconds per iteration)
                 wait_time = min(5.0, remaining_time)
-                
+
                 try:
                     # Use select to wait for notifications with timeout
                     if select.select([listen_conn.fileno()], [], [], wait_time):
@@ -493,22 +489,22 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
                         result = self.pop_from_query_fragment_queue()
                         if result is not None:
                             return result
-                        
+
                 except (OSError, psycopg.Error) as e:
                     logger.debug(f"LISTEN/NOTIFY error, falling back to polling: {e}")
                     # Fall back to polling for remainder of timeout
                     break
-            
+
             # Final check or fallback polling
             remaining_time = max(0, timeout - (time.time() - start_time))
             if remaining_time > 0:
                 result = self.pop_from_query_fragment_queue()
                 if result is not None:
                     return result
-            
+
             logger.debug(f"Blocking pop from query fragment queue timed out after {timeout} seconds")
             return None
-            
+
         except Exception as e:
             logger.error(f"Error during blocking pop from query fragment queue: {e}")
             # Fallback to simple polling for remaining time
@@ -606,10 +602,7 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
 
             conn.commit()
 
-            logger.info(
-                f"Cleared {original_query_deleted} entries from original query queue, "
-                f"{query_fragment_deleted} entries from query fragment queue"
-            )
+            logger.info(f"Cleared {original_query_deleted} entries from original query queue, {query_fragment_deleted} entries from query fragment queue")
             return (original_query_deleted, query_fragment_deleted)
         except Exception as e:
             logger.error(f"Failed to clear PostgreSQL queues: {e}")

@@ -1,7 +1,6 @@
-
 from datetime import datetime
 from bitarray import bitarray
-from rocksdb import ( # type: ignore
+from rocksdb import (  # type: ignore
     DB,  # type: ignore
     Options,  # type: ignore
 )
@@ -16,19 +15,16 @@ class RocksDBAbstractCacheHandler(AbstractCacheHandler):
     """
 
     _instance = None
-    
-    
+
     @classmethod
     def get_instance(cls, db_path: str, read_only: bool = False, **kwargs):
         if cls._instance is None:
             cls._instance = cls(db_path, read_only=read_only, **kwargs)
         return cls._instance
 
-
-
     def __init__(self, db_path: str, read_only: bool = False, **kwargs) -> None:
-        self.db = DB(db_path, Options(create_if_missing=True), read_only=read_only) 
-        
+        self.db = DB(db_path, Options(create_if_missing=True), read_only=read_only)
+
         # rocksdb options
         # opts = rocksdb.Options()
         # opts.create_if_missing = True
@@ -53,7 +49,6 @@ class RocksDBAbstractCacheHandler(AbstractCacheHandler):
         #    block_cache=cache,
         #    block_cache_compressed=compressed_cache,
         # )
-        
 
     def exists(self, key: str, partition_key: str = "partition_key") -> bool:
         """
@@ -75,31 +70,31 @@ class RocksDBAbstractCacheHandler(AbstractCacheHandler):
         datatype = self._get_partition_datatype(partition_key)
         if datatype is None:
             return set()
-        
+
         existing_keys = set()
         for key in keys:
             cache_key = self._get_cache_key(key, partition_key)
             if self.db.get(cache_key.encode()) is not None:
                 existing_keys.add(key)
         return existing_keys
-    
+
     def _get_partition_datatype(self, partition_key: str) -> str | None:
         """Get the datatype for a partition key from metadata."""
         metadata_key = f"_partition_metadata:{partition_key}"
         datatype_bytes = self.db.get(metadata_key.encode())
         return datatype_bytes.decode() if datatype_bytes is not None else None
-    
+
     def _set_partition_datatype(self, partition_key: str, datatype: str) -> None:
         """Set the datatype for a partition key in metadata."""
         if datatype != "integer":
             raise ValueError("RocksDB bit handler only supports integer datatype")
         metadata_key = f"_partition_metadata:{partition_key}"
         self.db.put(metadata_key.encode(), datatype.encode(), sync=True)
-    
+
     def _get_cache_key(self, key: str, partition_key: str) -> str:
         """Get the RocksDB key for a cache entry with partition key namespace."""
         return f"cache:{partition_key}:{key}"
-    
+
     def set_null(self, key: str, partition_key: str = "partition_key") -> bool:
         """Set null value in partition-specific cache."""
         try:
@@ -107,7 +102,7 @@ class RocksDBAbstractCacheHandler(AbstractCacheHandler):
             existing_datatype = self._get_partition_datatype(partition_key)
             if existing_datatype is None:
                 self._set_partition_datatype(partition_key, "integer")
-            
+
             cache_key = self._get_cache_key(key, partition_key)
             self.db.put(cache_key.encode(), b"\x00", sync=True)
             return True
@@ -120,7 +115,7 @@ class RocksDBAbstractCacheHandler(AbstractCacheHandler):
         datatype = self._get_partition_datatype(partition_key)
         if datatype is None:
             return False
-        
+
         cache_key = self._get_cache_key(key, partition_key)
         return self.db.get(cache_key.encode()) == b"\x00"
 
@@ -130,20 +125,20 @@ class RocksDBAbstractCacheHandler(AbstractCacheHandler):
             cache_key = self._get_cache_key(key, partition_key)
             key_b = cache_key.encode("utf-8")
             self.db.delete(key_b)
-            
+
             # Also delete associated query
             query_key = f"query:{partition_key}:{key}"
             self.db.delete(query_key.encode("utf-8"))
             return True
         except Exception:
             return False
-    
+
     def get_partition_keys(self) -> list[tuple[str, str]]:
         """Get all partition keys and their datatypes."""
         result = []
         it = self.db.iterkeys()
         it.seek_to_first()
-        
+
         for key in it:
             key_str = key.decode("utf-8")
             if key_str.startswith("_partition_metadata:"):
@@ -157,13 +152,13 @@ class RocksDBAbstractCacheHandler(AbstractCacheHandler):
     def get_datatype(self, partition_key: str) -> str | None:
         """Get the datatype of the cache handler. If the partition key is not set, return None."""
         return self._get_partition_datatype(partition_key)
-    
+
     def register_partition_key(self, partition_key: str, datatype: str, **kwargs) -> None:
         """Register a partition key with the cache handler."""
         if datatype not in self.get_supported_datatypes():
             raise ValueError(f"Unsupported datatype: {datatype}")
         self._set_partition_datatype(partition_key, datatype)
-        
+
     def close(self) -> None:
         """
         RocksDB does not have a close method, so we can skip this.
@@ -183,7 +178,7 @@ class RocksDBAbstractCacheHandler(AbstractCacheHandler):
         keys = []
         it = self.db.iterkeys()
         it.seek_to_first()
-        
+
         # Filter keys for specific partition
         prefix = f"cache:{partition_key}:"
         prefix_len = len(prefix)
@@ -192,9 +187,6 @@ class RocksDBAbstractCacheHandler(AbstractCacheHandler):
             if key_str.startswith(prefix) and not key_str.startswith("_partition_metadata:"):
                 keys.append(key_str[prefix_len:])
         return keys
-
-
-
 
     def set_query(self, key: str, querytext: str, partition_key: str = "partition_key") -> bool:
         """Store a query in the cache associated with the given key."""
