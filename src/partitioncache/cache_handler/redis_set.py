@@ -41,22 +41,12 @@ class RedisCacheHandler(RedisAbstractCacheHandler):
 
         members = self.db.smembers(cache_key)
 
-        settype = None
-        datatype = self._get_partition_datatype(partition_key)
-        if datatype is not None:
-            if datatype == "integer":
-                settype = int
-            elif datatype == "text":
-                settype = str
-            else:
-                raise ValueError(f"Unsupported datatype: {datatype}")
-
-        if settype is int:
+        if datatype == "integer":
             return set(int(member) for member in members)  # type: ignore
-        elif settype is str:
+        elif datatype == "text":
             return set(member.decode() for member in members)  # type: ignore
         else:
-            raise ValueError(f"Unsupported set type: {settype}")
+            raise ValueError(f"Unsupported datatype: {datatype}")
 
     def filter_existing_keys(self, keys: set, partition_key: str = "partition_key") -> set:
         """

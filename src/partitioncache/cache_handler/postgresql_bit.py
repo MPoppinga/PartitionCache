@@ -13,7 +13,7 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
     def __repr__(self) -> str:
         return "postgresql_bit"
 
-    def __init__(self, db_name, db_host, db_user, db_password, db_port, db_table, bitsize) -> None:
+    def __init__(self, db_name: str, db_host: str, db_user: str, db_password: str, db_port: str | int, db_table: str, bitsize: int) -> None:
         """
         Initialize the cache handler with the given db name.
         This handler supports multiple partition keys but only integer datatypes (for bit arrays).
@@ -21,25 +21,27 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
         super().__init__(db_name, db_host, db_user, db_password, db_port, db_table)
 
         self.default_bitsize = bitsize  # Bitsize should be configured correctly by user (bitsize=1001 to store values 0-1000)
-
         # Create metadata table to track partition keys with bitsize per partition
         self.cursor.execute(
             sql.SQL("""CREATE TABLE IF NOT EXISTS {0} (
                 partition_key TEXT PRIMARY KEY,
                 datatype TEXT NOT NULL CHECK (datatype = 'integer'),
-                bitsize INTEGER NOT NULL DEFAULT %s,
+                bitsize INTEGER NOT NULL DEFAULT {1},
                 created_at TIMESTAMP DEFAULT now()
-            );""").format(sql.Identifier(self.tableprefix + "_partition_metadata")),
-            (self.default_bitsize,),
+            );""").format(
+                sql.Identifier(self.tableprefix + "_partition_metadata"),
+                sql.Literal(self.default_bitsize)
+            )
         )
 
         # Create queries table (shared across all partition keys)
         self.cursor.execute(
             sql.SQL("""CREATE TABLE IF NOT EXISTS {0} (
-            query_hash TEXT NOT NULL PRIMARY KEY,
+            query_hash TEXT NOT NULL,
             query TEXT NOT NULL,
             partition_key TEXT NOT NULL,
-            last_seen TIMESTAMP NOT NULL DEFAULT now()
+            last_seen TIMESTAMP NOT NULL DEFAULT now(),
+            PRIMARY KEY (query_hash, partition_key)
         );""").format(sql.Identifier(self.tableprefix + "_queries"))
         )
 
@@ -79,7 +81,7 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
 
         # Insert metadata
         self.cursor.execute(
-            sql.SQL("INSERT INTO {0} (partition_key, datatype, bitsize) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING").format(
+            sql.SQL("INSERT INTO {0} (partition_key, datatype, bitsize) VALUES (%s, %s, %s) ON CONFLICT (partition_key) DO NOTHING").format(
                 sql.Identifier(self.tableprefix + "_partition_metadata")
             ),
             (partition_key, "integer", bitsize),
@@ -120,7 +122,7 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
                 elif isinstance(k, str):
                     val[int(k)] = 1
                 else:
-                    raise ValueError("Only integer values are supported")
+                    raise ValueError(f"Only integer values are supported for bit arrays: {k} : {value}")
             table_name = f"{self.tableprefix}_cache_{partition_key}"
             self.cursor.execute(sql.SQL("INSERT INTO {0} VALUES (%s, %s)").format(sql.Identifier(table_name)), (key, val.to01()))
             self.db.commit()
