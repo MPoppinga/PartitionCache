@@ -9,14 +9,16 @@ logger = getLogger("PartitionCache")
 
 class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
     _instance = None
+    _refcount = 0
 
     @classmethod
     def get_instance(cls, *args, **kwargs):
         if cls._instance is None:
             cls._instance = cls(*args, **kwargs)
+        cls._refcount += 1
         return cls._instance
 
-    def __init__(self, db_name, db_host, db_user, db_password, db_port, db_table) -> None:
+    def __init__(self, db_name: str, db_host: str, db_user: str, db_password: str, db_port: str | int, db_table: str) -> None:
         """
         Initialize the cache handler with the given db name.
         This handler supports multiple partition keys with datatypes: integer, float, text, timestamp.
@@ -36,13 +38,18 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
         return result[0] if result else None
 
     def close(self):
-        try:
-            if self.cursor:
-                self.cursor.close()
-            if self.db:
-                self.db.close()
-        except Exception as e:
-            logger.error(f"Error closing PostgreSQL connection: {e}")
+        self._refcount -= 1
+        if self._refcount <= 0:
+            # Actually close the connection
+            try:
+                if self.cursor:
+                    self.cursor.close()
+                if self.db:
+                    self.db.close()
+            except Exception as e:
+                logger.error(f"Error closing PostgreSQL connection: {e}")
+            self._instance = None
+            self._refcount = 0
 
     def set_query(self, key: str, querytext: str, partition_key: str = "partition_key") -> bool:
         """Store a query in the cache associated with the given key."""

@@ -20,10 +20,7 @@ CACHE_BACKEND = os.getenv("CACHE_BACKEND", "postgresql_array")
 
 # TODO allow option to add query to queue
 
-QUERIES = []
-for file in sorted(os.listdir("testqueries_examples")):
-    with open(os.path.join("testqueries_examples", file), "r") as f:
-        QUERIES.append((file, f.read()))
+
 
 
 def run_query(conn, query, params=None):
@@ -41,72 +38,74 @@ def run_query(conn, query, params=None):
 def test_partition_key(conn, partition_key: str, datatype: str = "integer"):
     """Test queries with a specific partition key."""
     print(f"\n{'='*60}")
-    print(f"Testing with partition key: {partition_key} (datatype: {datatype})")
+    print(f"Running with partition key: {partition_key} (datatype: {datatype})")
     print(f"Cache backend: {CACHE_BACKEND}")
     print(f"{'='*60}")
     
-    # Create cache handler using the API
+    queries = []
+    for file in sorted(os.listdir(os.path.join("testqueries_examples", partition_key))):
+        with open(os.path.join("testqueries_examples", partition_key, file), "r") as f:
+            queries.append((file, f.read()))
+    
+    # Create cache handler using the API with context manager
     try:
-        cache = partitioncache.create_cache_helper(CACHE_BACKEND, partition_key, datatype)
+        with partitioncache.create_cache_helper(CACHE_BACKEND, partition_key, datatype) as cache:
+            for description, sql_query in queries:
+                print(f"\n---\nQuery: {description}\n")
+                
+                # Run without cache
+                rows, elapsed = run_query(conn, sql_query)
+                print(f"Without PartitionCache: {len(rows)} results in {elapsed:.3f} seconds")
+
+                start_cache = time.perf_counter()
+                # Use PartitionCache to get partition keys for this query
+                partition_keys, num_subqueries, num_hits = partitioncache.get_partition_keys(
+                    query=sql_query,
+                    cache_handler=cache.underlying_handler,
+                    partition_key=partition_key,
+                    min_component_size=1,
+                )
+                
+                if partition_keys:
+                    # Extend the query to restrict to cached partition keys
+                    sql_cached = partitioncache.extend_query_with_partition_keys(
+                        sql_query,
+                        partition_keys,
+                        partition_key=partition_key,
+                        method="IN",
+                        p0_alias="p1",  # assumes p1 is the main table alias for partition key
+                    )
+                    elapsed_cache_get = time.perf_counter() - start_cache
+                    rows_cached, elapsed_cached = run_query(conn, sql_cached)
+                    print(
+                        f"With PartitionCache: {len(rows_cached)} results in {elapsed_cache_get:.3f} + "
+                        f"{elapsed_cached:.3f} seconds (cache hits: {num_hits})"
+                    )
+                else:
+                    print("No partition keys found in cache. Hint: Add queries to cache using:")
+                    print(f"  pcache-add --direct --query-file testqueries_examples/{partition_key}/{description} --partition-key {partition_key} --partition-datatype {datatype} --cache-backend {CACHE_BACKEND}")
+                    print(f"  Or add all queries: for f in testqueries_examples/{partition_key}/*.sql; do pcache-add --direct --query-file \"$f\" --partition-key {partition_key} --partition-datatype {datatype} --cache-backend {CACHE_BACKEND}; done")
+
+                # Test lazy intersection if supported
+                if hasattr(cache.underlying_handler, 'get_intersected_lazy'):
+                    start_cache = time.perf_counter()
+                    lazy_cache_subquery, nr_used_hashes = partitioncache.get_partition_keys_lazy(
+                        query=sql_query,
+                        cache_handler=cache.underlying_handler,
+                        partition_key=partition_key,
+                        min_component_size=1,
+                    )
+                    if lazy_cache_subquery is not None:
+                        elapsed_cache_get = time.perf_counter() - start_cache
+                        sql_cached = sql_query.strip().strip(";") + f" AND p1.{partition_key} IN (" + lazy_cache_subquery + ")"
+                        rows_cached, elapsed_cached = run_query(conn, sql_cached)
+                        print(
+                            f"With PartitionCache (lazy): {len(rows_cached)} results in {elapsed_cache_get:.3f} + "
+                            f"{elapsed_cached:.3f} seconds (cache hits: {nr_used_hashes})"
+                        )
     except ValueError as e:
         print(f"Cache configuration error: {e}")
         return
-    
-    for description, sql_query in QUERIES:
-        print(f"\n---\nQuery: {description}\n")
-        
-        # Run without cache
-        rows, elapsed = run_query(conn, sql_query)
-        print(f"Without PartitionCache: {len(rows)} results in {elapsed:.3f} seconds")
-
-        start_cache = time.perf_counter()
-        # Use PartitionCache to get partition keys for this query
-        partition_keys, num_subqueries, num_hits = partitioncache.get_partition_keys(
-            query=sql_query,
-            cache_handler=cache.underlying_handler,
-            partition_key=partition_key,
-            min_component_size=1,
-        )
-        
-        if partition_keys:
-            # Extend the query to restrict to cached partition keys
-            sql_cached = partitioncache.extend_query_with_partition_keys(
-                sql_query,
-                partition_keys,
-                partition_key=partition_key,
-                method="IN",
-                p0_alias="p1",  # assumes p1 is the main table alias for partition key
-            )
-            elapsed_cache_get = time.perf_counter() - start_cache
-            rows_cached, elapsed_cached = run_query(conn, sql_cached)
-            print(
-                f"With PartitionCache: {len(rows_cached)} results in {elapsed_cache_get:.3f} + "
-                f"{elapsed_cached:.3f} seconds (cache hits: {num_hits})"
-            )
-        else:
-            print("No partition keys found in cache. Hint: Add queries to cache using:")
-            print(f"  pcache-add --direct --query-file testqueries_examples/{description} --partition-key {partition_key} --partition-datatype {datatype} --cache-backend {CACHE_BACKEND}")
-            print(f"  Or add all queries: for f in testqueries_examples/*.sql; do pcache-add --direct --query-file \"$f\" --partition-key {partition_key} --partition-datatype {datatype} --cache-backend {CACHE_BACKEND}; done")
-
-        # Test lazy intersection if supported
-        if hasattr(cache.underlying_handler, 'get_intersected_lazy'):
-            start_cache = time.perf_counter()
-            lazy_cache_subquery, nr_used_hashes = partitioncache.get_partition_keys_lazy(
-                query=sql_query,
-                cache_handler=cache.underlying_handler,
-                partition_key=partition_key,
-                min_component_size=1,
-            )
-            if lazy_cache_subquery is not None:
-                elapsed_cache_get = time.perf_counter() - start_cache
-                sql_cached = sql_query.strip().strip(";") + f" AND p1.{partition_key} IN (" + lazy_cache_subquery + ")"
-                rows_cached, elapsed_cached = run_query(conn, sql_cached)
-                print(
-                    f"With PartitionCache (lazy): {len(rows_cached)} results in {elapsed_cache_get:.3f} + "
-                    f"{elapsed_cached:.3f} seconds (cache hits: {nr_used_hashes})"
-                )
-
-    cache.close()
 
 
 def main():

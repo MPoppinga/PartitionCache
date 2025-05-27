@@ -15,7 +15,8 @@ class RocksDictCacheHandler(AbstractCacheHandler):
     """
 
     _instance = None
-
+    _refcount = 0
+    
     @classmethod
     def get_supported_datatypes(cls) -> set[str]:
         """RocksDict supports all datatypes with native serialization."""
@@ -214,7 +215,11 @@ class RocksDictCacheHandler(AbstractCacheHandler):
         """
         Close the RocksDict database.
         """
-        self.db.close()
+        self._refcount -= 1
+        if self._refcount <= 0:
+            self.db.close()
+            self._instance = None
+            self._refcount = 0
 
     def compact(self) -> None:
         """
@@ -255,6 +260,7 @@ class RocksDictCacheHandler(AbstractCacheHandler):
     def get_instance(cls, db_path: str, read_only: bool = False):
         if cls._instance is None:
             cls._instance = cls(db_path, read_only=read_only)
+        cls._refcount += 1
         return cls._instance
 
     def get_datatype(self, partition_key: str) -> str | None:

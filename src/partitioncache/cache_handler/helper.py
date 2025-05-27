@@ -44,6 +44,7 @@ class PartitionCacheHelper:
         """
         self._cache_handler = cache_handler
         self._partition_key = partition_key
+        self._settype = None
 
         # Check if partition key is already known and get the datatype
         # If datatype is specified, compare it with the known datatype
@@ -273,9 +274,21 @@ class PartitionCacheHelper:
             self._cache_handler.close()
         except Exception as e:
             logger.error(f"Failed to close cache handler: {e}")
+        del self._cache_handler
 
     def __repr__(self) -> str:
         return f"PartitionCacheHandler(partition_key='{self._partition_key}', datatype='{self._settype}', handler_type='{self._cache_handler.__repr__()}')"
+
+    def __enter__(self):
+        """Context manager entry."""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit - only close if not a singleton."""
+        # Don't close singleton instances as they may be reused
+        if getattr(self._cache_handler.__class__, '_instance', None) is None:
+            self.close()
+        return False
 
 
 class LazyPartitionCacheHelper(PartitionCacheHelper):

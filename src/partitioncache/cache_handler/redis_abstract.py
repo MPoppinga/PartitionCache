@@ -12,11 +12,13 @@ class RedisAbstractCacheHandler(AbstractCacheHandler):
     """
 
     _instance = None
+    _refcount = 0
 
     @classmethod
     def get_instance(cls, *args, **kwargs):
         if cls._instance is None:
             cls._instance = cls(*args, **kwargs)
+        cls._refcount += 1
         return cls._instance
 
     def __init__(self, db_name, db_host, db_password, db_port) -> None:
@@ -127,7 +129,11 @@ class RedisAbstractCacheHandler(AbstractCacheHandler):
             return False
 
     def close(self) -> None:
-        self.db.close()
+        self._refcount -= 1
+        if self._refcount <= 0:
+            self.db.close()
+            self._instance = None
+            self._refcount = 0
 
     def get_all_keys(self, partition_key: str) -> list:
         """Get all keys for a specific partition key."""

@@ -34,24 +34,15 @@ class RocksDBCacheHandler(RocksDBAbstractCacheHandler):
         if search_space_list is None or search_space_list == b"\x00":
             return None
 
-        settype = None
-        datatype = self._get_partition_datatype(partition_key)
-        if datatype is not None:
-            if datatype == "integer":
-                settype = int
-            elif datatype == "text":
-                settype = str
-            else:
-                raise ValueError(f"Unsupported datatype: {datatype}")
-
-        if settype is str:
+        if datatype == "text":
             return set(search_space_list.decode().split(","))
-        else:
+        elif datatype == "integer":
             return set(struct.unpack(f"!{(len(search_space_list) // 4)}I", search_space_list))
+        else:
+            raise ValueError(f"Unsupported datatype: {datatype}")
 
     def get_intersected(
-        self, keys: set[str], partition_key: str = "partition_key", settype=int
-    ) -> tuple[set[int] | set[str] | set[float] | set[datetime] | None, int]:
+        self, keys: set[str], partition_key: str = "partition_key") -> tuple[set[int] | set[str] | set[float] | set[datetime] | None, int]:
         """
         RocksDB has no native intersection operation, so we have to do it manually.
         Returns the intersection of all sets in the cache that are associated with the given keys.
