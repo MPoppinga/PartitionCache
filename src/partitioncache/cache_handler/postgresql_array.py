@@ -24,29 +24,41 @@ class PostgreSQLArrayCacheHandler(PostgreSQLAbstractCacheHandler):
     def __init__(self, db_name, db_host, db_user, db_password, db_port, db_table) -> None:
         super().__init__(db_name, db_host, db_user, db_password, db_port, db_table)
 
-        self.cursor.execute("CREATE EXTENSION IF NOT EXISTS intarray;")
+        # Try to create intarray extension safely
+        try:
+            self.cursor.execute("CREATE EXTENSION IF NOT EXISTS intarray;")
+            self.db.commit()
+        except Exception as e:
+            logger.warning(f"Failed to create intarray extension (this is optional): {e}")
 
-        # Create metadata table to track partition keys and their datatypes
-        self.cursor.execute(
-            sql.SQL("""CREATE TABLE IF NOT EXISTS {0} (
-                partition_key TEXT PRIMARY KEY,
-                datatype TEXT NOT NULL CHECK (datatype IN ('integer', 'float', 'text', 'timestamp')),
-                created_at TIMESTAMP DEFAULT now()
-            );""").format(sql.Identifier(self.tableprefix + "_partition_metadata"))
-        )
+        try:
+            self.cursor.execute(
+                sql.SQL("""CREATE TABLE IF NOT EXISTS {0} (
+                    partition_key TEXT PRIMARY KEY,
+                    datatype TEXT NOT NULL CHECK (datatype IN ('integer', 'float', 'text', 'timestamp')),
+                    created_at TIMESTAMP DEFAULT now()
+                );""").format(sql.Identifier(self.tableprefix + "_partition_metadata"))
+            )
 
-        # Shared queries table
-        self.cursor.execute(
-            sql.SQL("""CREATE TABLE IF NOT EXISTS {0} (
-                query_hash TEXT NOT NULL,
-                partition_key TEXT NOT NULL,
-                query TEXT NOT NULL,
-                last_seen TIMESTAMP NOT NULL DEFAULT now(),
-                PRIMARY KEY (query_hash, partition_key)
-            );""").format(sql.Identifier(self.tableprefix + "_queries"))
-        )
+            # Shared queries table
+            self.cursor.execute(
+                sql.SQL("""CREATE TABLE IF NOT EXISTS {0} (
+                    query_hash TEXT NOT NULL,
+                    partition_key TEXT NOT NULL,
+                    query TEXT NOT NULL,
+                    last_seen TIMESTAMP NOT NULL DEFAULT now(),
+                    PRIMARY KEY (query_hash, partition_key)
+                );""").format(sql.Identifier(self.tableprefix + "_queries"))
+            )
 
-        self.db.commit()
+            self.db.commit()
+        except Exception as e:
+            logger.error(f"Failed to create metadata tables: {e}")
+            try:
+                self.db.rollback()
+            except Exception as rollback_error:
+                logger.error(f"Failed to rollback after metadata table creation error: {rollback_error}")
+            raise
 
     def _create_partition_table(self, partition_key: str, datatype: str) -> None:
         """Create a cache table for a specific partition key with appropriate datatype."""
@@ -64,40 +76,58 @@ class PostgreSQLArrayCacheHandler(PostgreSQLAbstractCacheHandler):
         else:
             raise ValueError(f"Unsupported datatype: {datatype}")
 
-        # Create the cache table
-        self.cursor.execute(
-            sql.SQL("""CREATE TABLE IF NOT EXISTS {0} (
-                query_hash TEXT PRIMARY KEY,
-                value {1},
-                created_at TIMESTAMP DEFAULT now()
-            );""").format(sql.Identifier(table_name), sql.SQL(sql_datatype))
-        )
-
-        # Create appropriate index based on datatype
-        if datatype == "integer":
-            # Use intarray-specific GIN index for integers
+        try:
+            # Create the cache table
             self.cursor.execute(
-                sql.SQL("CREATE INDEX IF NOT EXISTS {0} ON {1} USING GIN (value gin__int_ops);").format(
-                    sql.Identifier(f"idx_{table_name}_value"), sql.Identifier(table_name)
-                )
-            )
-        else:
-            # Use standard GIN index for other types
-            self.cursor.execute(
-                sql.SQL("CREATE INDEX IF NOT EXISTS {0} ON {1} USING GIN (value);").format(
-                    sql.Identifier(f"idx_{table_name}_value"), sql.Identifier(table_name)
-                )
+                sql.SQL("""CREATE TABLE IF NOT EXISTS {0} (
+                    query_hash TEXT PRIMARY KEY,
+                    value {1},
+                    created_at TIMESTAMP DEFAULT now()
+                );""").format(sql.Identifier(table_name), sql.SQL(sql_datatype))
             )
 
-        # Insert metadata
-        self.cursor.execute(
-            sql.SQL("INSERT INTO {0} (partition_key, datatype) VALUES (%s, %s) ON CONFLICT DO NOTHING").format(
-                sql.Identifier(self.tableprefix + "_partition_metadata")
-            ),
-            (partition_key, datatype),
-        )
+            # Create appropriate index based on datatype
+            if datatype == "integer":
+                # Use intarray-specific GIN index for integers - with error handling
+                try:
+                    self.cursor.execute(
+                        sql.SQL("CREATE INDEX IF NOT EXISTS {0} ON {1} USING GIN (value gin__int_ops);").format(
+                            sql.Identifier(f"idx_{table_name}_value"), sql.Identifier(table_name)
+                        )
+                    )
+                except Exception as index_error:
+                    logger.warning(f"Failed to create intarray GIN index, falling back to standard GIN index: {index_error}")
+                    # Fallback to standard GIN index if intarray fails
+                    self.cursor.execute(
+                        sql.SQL("CREATE INDEX IF NOT EXISTS {0} ON {1} USING GIN (value);").format(
+                            sql.Identifier(f"idx_{table_name}_value"), sql.Identifier(table_name)
+                        )
+                    )
+            else:
+                # Use standard GIN index for other types
+                self.cursor.execute(
+                    sql.SQL("CREATE INDEX IF NOT EXISTS {0} ON {1} USING GIN (value);").format(
+                        sql.Identifier(f"idx_{table_name}_value"), sql.Identifier(table_name)
+                    )
+                )
 
-        self.db.commit()
+            # Insert metadata
+            self.cursor.execute(
+                sql.SQL("INSERT INTO {0} (partition_key, datatype) VALUES (%s, %s) ON CONFLICT (partition_key) DO NOTHING").format(
+                    sql.Identifier(self.tableprefix + "_partition_metadata")
+                ),
+                (partition_key, datatype),
+            )
+
+            self.db.commit()
+        except Exception as e:
+            logger.error(f"Failed to create partition table {table_name}: {e}")
+            # Rollback the transaction to prevent "current transaction is aborted" error
+            try:
+                self.db.rollback()
+            except Exception as rollback_error:
+                logger.error(f"Failed to rollback transaction during table creation: {rollback_error}")
+            raise
 
     def _ensure_partition_table(self, partition_key: str, datatype: str) -> bool:
         """Ensure a partition table exists with the correct datatype."""
@@ -145,7 +175,10 @@ class PostgreSQLArrayCacheHandler(PostgreSQLAbstractCacheHandler):
                 if datatype != value_datatype:
                     logger.error(f"Value datatype '{value_datatype}' does not match partition datatype '{datatype}' for partition '{partition_key}'")
                     return False
-            val = value
+            
+            # Convert set to list for PostgreSQL array serialization
+            val = list(value)
+            
             # Get partition-specific table
             table_name = f"{self.tableprefix}_cache_{partition_key}"
             self.cursor.execute(
@@ -158,6 +191,11 @@ class PostgreSQLArrayCacheHandler(PostgreSQLAbstractCacheHandler):
             return True
         except Exception as e:
             logger.error(f"Failed to set value for key {key} in partition {partition_key}: {e}")
+            # Rollback the transaction to prevent "current transaction is aborted" error
+            try:
+                self.db.rollback()
+            except Exception as rollback_error:
+                logger.error(f"Failed to rollback transaction: {rollback_error}")
             return False
 
     def get(self, key: str, partition_key: str = "partition_key") -> set[int] | set[str] | set[float] | set[datetime] | None:
