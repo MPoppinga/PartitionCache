@@ -22,9 +22,9 @@ def get_cache_handler(cache_type: str, singleton: bool = False) -> AbstractCache
         db_port = os.getenv("DB_PORT")
         if not db_port:
             raise ValueError("DB_PORT environment variable not set")
-        db_table = os.getenv("PG_CACHE_TABLE")
+        db_table = os.getenv("PG_ARRAY_CACHE_TABLE")
         if not db_table:
-            raise ValueError("PG_CACHE_TABLE environment variable not set")
+            raise ValueError("PG_ARRAY_CACHE_TABLE environment variable not set")
         if singleton:
             return PostgreSQLArrayCacheHandler.get_instance(
                 db_name=db_name,

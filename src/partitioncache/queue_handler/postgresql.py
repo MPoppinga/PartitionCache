@@ -47,135 +47,113 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
 
     def _initialize_tables(self):
         """Initialize PostgreSQL tables for queue storage."""
-        import time
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
 
-        max_retries = 3
-        retry_delay = 1.0
+            # Create original query queue table with partition_key and priority
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS original_query_queue (
+                    id SERIAL PRIMARY KEY,
+                    query TEXT NOT NULL,
+                    partition_key TEXT NOT NULL,
+                    partition_datatype TEXT,
+                    priority INTEGER NOT NULL DEFAULT 1,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(query, partition_key)
+                )
+            """)
 
-        for attempt in range(max_retries):
-            try:
-                conn = self._get_connection()
-                cursor = conn.cursor()
+            # Create query fragment queue table with partition_key and priority
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS query_fragment_queue (
+                    id SERIAL PRIMARY KEY,
+                    query TEXT NOT NULL,
+                    hash TEXT NOT NULL,
+                    partition_key TEXT NOT NULL,
+                    partition_datatype TEXT,
+                    priority INTEGER NOT NULL DEFAULT 1,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(hash, partition_key)
+                )
+            """)
 
-                # Create original query queue table with partition_key and priority
-                cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS original_query_queue (
-                        id SERIAL PRIMARY KEY,
-                        query TEXT NOT NULL,
-                        partition_key TEXT NOT NULL,
-                        partition_datatype TEXT,
-                        priority INTEGER NOT NULL DEFAULT 1,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        UNIQUE(query, partition_key)
-                    )
-                """)
+            # Create trigger functions for notifications
+            cursor.execute("""
+                CREATE OR REPLACE FUNCTION notify_original_query_insert()
+                RETURNS TRIGGER AS $$
+                BEGIN
+                    PERFORM pg_notify('original_query_available', '');
+                    RETURN NEW;
+                END;
+                $$ LANGUAGE plpgsql;
+            """)
 
-                # Create query fragment queue table with partition_key and priority
-                cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS query_fragment_queue (
-                        id SERIAL PRIMARY KEY,
-                        query TEXT NOT NULL,
-                        hash TEXT NOT NULL,
-                        partition_key TEXT NOT NULL,
-                        partition_datatype TEXT,
-                        priority INTEGER NOT NULL DEFAULT 1,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        UNIQUE(hash, partition_key)
-                    )
-                """)
+            cursor.execute("""
+                CREATE OR REPLACE FUNCTION notify_query_fragment_insert()
+                RETURNS TRIGGER AS $$
+                BEGIN
+                    PERFORM pg_notify('query_fragment_available', '');
+                    RETURN NEW;
+                END;
+                $$ LANGUAGE plpgsql;
+            """)
 
-                # Create trigger functions for notifications
-                cursor.execute("""
-                    CREATE OR REPLACE FUNCTION notify_original_query_insert()
-                    RETURNS TRIGGER AS $$
-                    BEGIN
-                        PERFORM pg_notify('original_query_available', '');
-                        RETURN NEW;
-                    END;
-                    $$ LANGUAGE plpgsql;
-                """)
+            # Create triggers using IF NOT EXISTS to avoid conflicts
+            cursor.execute("""
+                CREATE TRIGGER IF NOT EXISTS trigger_notify_original_query_insert
+                    AFTER INSERT ON original_query_queue
+                    FOR EACH ROW EXECUTE FUNCTION notify_original_query_insert();
+            """)
 
-                cursor.execute("""
-                    CREATE OR REPLACE FUNCTION notify_query_fragment_insert()
-                    RETURNS TRIGGER AS $$
-                    BEGIN
-                        PERFORM pg_notify('query_fragment_available', '');
-                        RETURN NEW;
-                    END;
-                    $$ LANGUAGE plpgsql;
-                """)
+            cursor.execute("""
+                CREATE TRIGGER IF NOT EXISTS trigger_notify_query_fragment_insert
+                    AFTER INSERT ON query_fragment_queue
+                    FOR EACH ROW EXECUTE FUNCTION notify_query_fragment_insert();
+            """)
 
-                # Create triggers that fire on INSERT (including ON CONFLICT DO UPDATE)
-                cursor.execute("""
-                    DROP TRIGGER IF EXISTS trigger_notify_original_query_insert ON original_query_queue;
-                    CREATE TRIGGER trigger_notify_original_query_insert
-                        AFTER INSERT ON original_query_queue
-                        FOR EACH ROW EXECUTE FUNCTION notify_original_query_insert();
-                """)
+            # Also create UPDATE triggers to catch ON CONFLICT DO UPDATE cases
+            cursor.execute("""
+                CREATE TRIGGER IF NOT EXISTS trigger_notify_original_query_update
+                    AFTER UPDATE ON original_query_queue
+                    FOR EACH ROW EXECUTE FUNCTION notify_original_query_insert();
+            """)
 
-                cursor.execute("""
-                    DROP TRIGGER IF EXISTS trigger_notify_query_fragment_insert ON query_fragment_queue;
-                    CREATE TRIGGER trigger_notify_query_fragment_insert
-                        AFTER INSERT ON query_fragment_queue
-                        FOR EACH ROW EXECUTE FUNCTION notify_query_fragment_insert();
-                """)
+            cursor.execute("""
+                CREATE TRIGGER IF NOT EXISTS trigger_notify_query_fragment_update
+                    AFTER UPDATE ON query_fragment_queue
+                    FOR EACH ROW EXECUTE FUNCTION notify_query_fragment_insert();
+            """)
 
-                # Also create UPDATE triggers to catch ON CONFLICT DO UPDATE cases
-                cursor.execute("""
-                    DROP TRIGGER IF EXISTS trigger_notify_original_query_update ON original_query_queue;
-                    CREATE TRIGGER trigger_notify_original_query_update
-                        AFTER UPDATE ON original_query_queue
-                        FOR EACH ROW EXECUTE FUNCTION notify_original_query_insert();
-                """)
+            # Create indexes for better performance
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_original_query_queue_priority_created_at
+                ON original_query_queue(priority DESC, created_at ASC)
+            """)
 
-                cursor.execute("""
-                    DROP TRIGGER IF EXISTS trigger_notify_query_fragment_update ON query_fragment_queue;
-                    CREATE TRIGGER trigger_notify_query_fragment_update
-                        AFTER UPDATE ON query_fragment_queue
-                        FOR EACH ROW EXECUTE FUNCTION notify_query_fragment_insert();
-                """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_query_fragment_queue_priority_created_at
+                ON query_fragment_queue(priority DESC, created_at ASC)
+            """)
 
-                # Create indexes for better performance
-                cursor.execute("""
-                    CREATE INDEX IF NOT EXISTS idx_original_query_queue_priority_created_at
-                    ON original_query_queue(priority DESC, created_at ASC)
-                """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_original_query_queue_partition_key
+                ON original_query_queue(partition_key)
+            """)
 
-                cursor.execute("""
-                    CREATE INDEX IF NOT EXISTS idx_query_fragment_queue_priority_created_at
-                    ON query_fragment_queue(priority DESC, created_at ASC)
-                """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_query_fragment_queue_partition_key
+                ON query_fragment_queue(partition_key)
+            """)
 
-                cursor.execute("""
-                    CREATE INDEX IF NOT EXISTS idx_original_query_queue_partition_key
-                    ON original_query_queue(partition_key)
-                """)
+            conn.commit()
+            logger.debug("PostgreSQL queue tables initialized successfully")
 
-                cursor.execute("""
-                    CREATE INDEX IF NOT EXISTS idx_query_fragment_queue_partition_key
-                    ON query_fragment_queue(partition_key)
-                """)
-
-                conn.commit()
-                logger.debug("PostgreSQL queue tables initialized successfully")
-                return  # Success, exit retry loop
-
-            except Exception as e:
-                error_msg = str(e).lower()
-                if "tuple concurrently updated" in error_msg or "deadlock detected" in error_msg:
-                    if attempt < max_retries - 1:
-                        logger.warning(f"Concurrent access detected during table initialization (attempt {attempt + 1}), retrying in {retry_delay}s...")
-                        time.sleep(retry_delay)
-                        retry_delay *= 2  # Exponential backoff
-                        continue
-                    else:
-                        logger.warning("Failed to initialize tables due to concurrent access, but tables likely exist")
-                        return  # Give up but don't fail completely
-                else:
-                    logger.error(f"Failed to initialize PostgreSQL queue tables: {e}")
-                    raise
+        except Exception as e:
+            logger.error(f"Failed to initialize PostgreSQL queue tables: {e}")
+            raise
 
     def push_to_original_query_queue_with_priority(self, query: str, partition_key: str, priority: int = 1, partition_datatype: str | None = None) -> bool:
         """

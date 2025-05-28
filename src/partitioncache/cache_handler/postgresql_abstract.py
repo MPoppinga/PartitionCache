@@ -65,6 +65,11 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
             return True
         except Exception as e:
             logger.error(f"Failed to set query for key {key}: {e}")
+            # Rollback the transaction to prevent "current transaction is aborted" error
+            try:
+                self.db.rollback()
+            except Exception as rollback_error:
+                logger.error(f"Failed to rollback transaction: {rollback_error}")
             return False
 
     def set_null(self, key: str, partition_key: str = "partition_key") -> bool:
@@ -84,6 +89,11 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
             return True
         except Exception as e:
             logger.error(f"Failed to set null for key {key} in partition {partition_key}: {e}")
+            # Rollback the transaction to prevent "current transaction is aborted" error
+            try:
+                self.db.rollback()
+            except Exception as rollback_error:
+                logger.error(f"Failed to rollback transaction: {rollback_error}")
             return False
 
     def is_null(self, key: str, partition_key: str = "partition_key") -> bool:
@@ -149,6 +159,11 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
             return True
         except Exception as e:
             logger.error(f"Failed to delete key {key} from partition {partition_key}: {e}")
+            # Rollback the transaction to prevent "current transaction is aborted" error
+            try:
+                self.db.rollback()
+            except Exception as rollback_error:
+                logger.error(f"Failed to rollback transaction: {rollback_error}")
             return False
 
     def delete_partition(self, partition_key: str) -> bool:
@@ -178,6 +193,11 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
             return True
         except Exception as e:
             logger.error(f"Failed to delete partition {partition_key}: {e}")
+            # Rollback the transaction to prevent "current transaction is aborted" error
+            try:
+                self.db.rollback()
+            except Exception as rollback_error:
+                logger.error(f"Failed to rollback transaction: {rollback_error}")
             return False
 
     def prune_old_queries(self, days_old: int = 30) -> int:
@@ -212,6 +232,11 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
             return removed_count
         except Exception as e:
             logger.error(f"Failed to prune old queries: {e}")
+            # Rollback the transaction to prevent "current transaction is aborted" error
+            try:
+                self.db.rollback()
+            except Exception as rollback_error:
+                logger.error(f"Failed to rollback transaction: {rollback_error}")
             return 0
 
     def get_partition_keys(self) -> list[tuple[str, str]]:
