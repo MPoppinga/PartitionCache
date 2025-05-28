@@ -103,26 +103,26 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
 
             # Create triggers using IF NOT EXISTS to avoid conflicts
             cursor.execute("""
-                CREATE TRIGGER IF NOT EXISTS trigger_notify_original_query_insert
+                CREATE OR REPLACE TRIGGER trigger_notify_original_query_insert
                     AFTER INSERT ON original_query_queue
                     FOR EACH ROW EXECUTE FUNCTION notify_original_query_insert();
             """)
 
             cursor.execute("""
-                CREATE TRIGGER IF NOT EXISTS trigger_notify_query_fragment_insert
+                CREATE OR REPLACE TRIGGER trigger_notify_query_fragment_insert
                     AFTER INSERT ON query_fragment_queue
                     FOR EACH ROW EXECUTE FUNCTION notify_query_fragment_insert();
             """)
 
             # Also create UPDATE triggers to catch ON CONFLICT DO UPDATE cases
             cursor.execute("""
-                CREATE TRIGGER IF NOT EXISTS trigger_notify_original_query_update
+                 CREATE OR REPLACE TRIGGER trigger_notify_original_query_update
                     AFTER UPDATE ON original_query_queue
                     FOR EACH ROW EXECUTE FUNCTION notify_original_query_insert();
             """)
 
             cursor.execute("""
-                CREATE TRIGGER IF NOT EXISTS trigger_notify_query_fragment_update
+                CREATE OR REPLACE TRIGGER trigger_notify_query_fragment_update
                     AFTER UPDATE ON query_fragment_queue
                     FOR EACH ROW EXECUTE FUNCTION notify_query_fragment_insert();
             """)
