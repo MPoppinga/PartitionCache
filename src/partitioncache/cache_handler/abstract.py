@@ -8,7 +8,7 @@ class AbstractCacheHandler(ABC):
     Abstract class for cache handlers.
     The Cache handlers are responsible for storing and retrieving partition keys from the cache.
     They contain the logic for storing and retrieving the partition keys from the cache, as well as the logic for intersecting sets of partition keys.
-    The Cache handler also store the original query togehther with the last seen timestamp.
+    The Cache handler also store the original query together with the last seen timestamp.
     """
 
     @classmethod
