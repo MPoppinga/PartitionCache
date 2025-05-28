@@ -1,7 +1,7 @@
 
 SELECT p1.name AS ice_cream_name,
        p2.name AS swimming_pool,
-       p3.name AS supermark_name,
+       p3.name AS supermarket_name,
        p1.landkreis
 FROM pois AS p1
    , pois as p2
