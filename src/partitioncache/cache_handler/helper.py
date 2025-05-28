@@ -36,7 +36,7 @@ class PartitionCacheHelper:
         Args:
             cache_handler: The underlying cache handler instance
             partition_key: The partition key for this wrapper
-            settype: The Python type for values (int, str, float, datetime)
+            settype: The datatype string for values (e.g., 'int', 'str', 'float', 'datetime')
             cache_handler_type: Optional cache handler type for early validation
 
         Raises:
