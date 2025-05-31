@@ -13,12 +13,12 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
     def __repr__(self) -> str:
         return "postgresql_bit"
 
-    def __init__(self, db_name: str, db_host: str, db_user: str, db_password: str, db_port: str | int, db_table: str, bitsize: int) -> None:
+    def __init__(self, db_name: str, db_host: str, db_user: str, db_password: str, db_port: str | int, db_tableprefix: str, bitsize: int) -> None:
         """
         Initialize the cache handler with the given db name.
         This handler supports multiple partition keys but only integer datatypes (for bit arrays).
         """
-        super().__init__(db_name, db_host, db_user, db_password, db_port, db_table)
+        super().__init__(db_name, db_host, db_user, db_password, db_port, db_tableprefix)
 
         self.default_bitsize = bitsize  # Bitsize should be configured correctly by user (bitsize=1001 to store values 0-1000)
         # Create metadata table to track partition keys with bitsize per partition
@@ -124,7 +124,7 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
                 else:
                     raise ValueError(f"Only integer values are supported for bit arrays: {k} : {value}")
             table_name = f"{self.tableprefix}_cache_{partition_key}"
-            self.cursor.execute(sql.SQL("INSERT INTO {0} VALUES (%s, %s)").format(sql.Identifier(table_name)), (key, val.to01()))
+            self.cursor.execute(sql.SQL("INSERT INTO {0} (query_hash, partition_keys) VALUES (%s, %s)").format(sql.Identifier(table_name)), (key, val.to01()))
             self.db.commit()
             return True
         except Exception as e:

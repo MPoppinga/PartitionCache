@@ -40,7 +40,7 @@ def cache_handler(mock_db, mock_cursor):
             db_user="test_user",
             db_password="test_password",
             db_port=5432,
-            db_table="test_bit_cache_table",
+            db_tableprefix="test_bit_cache_table",
             bitsize=100,
         )
         handler.cursor.return_value = mock_cursor  # type: ignore

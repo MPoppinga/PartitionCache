@@ -109,7 +109,7 @@ def extend_query_with_partition_keys(
 
     Args:
         query (str): The SQL query to be extended.
-        partition_keys (set[int] | set[str]): The set of partition keys to extend the query with.
+        partition_keys (set[int] | set[str]| set[float] | set[datetime]): The set of partition keys to extend the query with.
         partition_key (str): The identifier for the partition.
         method (Literal["IN", "VALUES", "TMP_TABLE_IN", "TMP_TABLE_JOIN"]): The method to use to extend the query.
         p0_alias (str | None): The alias of the table to use for the partition key. If not set for JOIN methods, it will JOIN on all tables.
@@ -126,7 +126,7 @@ def extend_query_with_partition_keys(
 
     if method == "IN":
         # Convert partition_keys to string representation for SQL
-        partition_keys_str = ",".join(str(pk) for pk in partition_keys)
+        partition_keys_str = ",".join(f"'{pk}'" if not isinstance(pk, int) else str(pk) for pk in partition_keys)
 
         x = sqlglot.parse_one(query)
 
@@ -143,7 +143,7 @@ def extend_query_with_partition_keys(
         return x.sql()
 
     elif method == "VALUES":
-        partition_keys_str = "),(".join(str(pk) for pk in partition_keys)
+        partition_keys_str = "),(".join(f"'{pk}'" if not isinstance(pk, int) else str(pk) for pk in partition_keys)
 
         x = sqlglot.parse_one(query)
         where: exp.Where | None = x.find(exp.Where)
@@ -156,9 +156,10 @@ def extend_query_with_partition_keys(
 
     elif method == "TMP_TABLE_JOIN":
         # TMP TABLE Setup
-
-        newquery = f"""CREATE TEMPORARY TABLE tmp_partition_keys (partition_key INT PRIMARY KEY);
-                    INSERT INTO tmp_partition_keys (partition_key) (VALUES({"),(".join(str(pk) for pk in partition_keys)}));
+        partition_keys_str = "),(".join(f"'{pk}'" if not isinstance(pk, int) else str(pk) for pk in partition_keys) 
+        partition_key_type = "INT" if isinstance(next(iter(partition_keys)), int) else "TEXT"
+        newquery = f"""CREATE TEMPORARY TABLE tmp_partition_keys (partition_key {partition_key_type} PRIMARY KEY);
+                    INSERT INTO tmp_partition_keys (partition_key) (VALUES({partition_keys_str}));
                     """  # TODO use CREATE AS SELECT, combine with other partition queries
         if analyze_tmp_table:
             newquery += "CREATE INDEX tmp_partition_keys_idx ON tmp_partition_keys USING HASH(partition_key);ANALYZE tmp_partition_keys;"
@@ -202,8 +203,10 @@ def extend_query_with_partition_keys(
 
     elif method == "TMP_TABLE_IN":
         # TMP TABLE Setup
-        newquery = f"""CREATE TEMPORARY TABLE tmp_partition_keys (partition_key INT PRIMARY KEY);
-                    INSERT INTO tmp_partition_keys (partition_key) (VALUES({"),(".join(str(pk) for pk in partition_keys)}));
+        partition_keys_str = "),(".join(f"'{pk}'" if not isinstance(pk, int) else str(pk) for pk in partition_keys)
+        partition_key_type = "INT" if isinstance(next(iter(partition_keys)), int) else "TEXT"
+        newquery = f"""CREATE TEMPORARY TABLE tmp_partition_keys (partition_key {partition_key_type} PRIMARY KEY);
+                    INSERT INTO tmp_partition_keys (partition_key) (VALUES({partition_keys_str}));
                     """  # TODO use CREATE AS SELECT, combine with other partition queries
         if analyze_tmp_table:
             newquery += "CREATE INDEX tmp_partition_keys_idx ON tmp_partition_keys USING HASH(partition_key);ANALYZE tmp_partition_keys;"

@@ -135,7 +135,7 @@ class TestProcessorStatus:
             3       # recent_failures
         )
         
-        status = get_processor_status(mock_conn)
+        status = get_processor_status(mock_conn, "partitioncache", "partitioncache_queue")
         
         assert status is not None
         assert status["enabled"] is True
@@ -154,7 +154,7 @@ class TestProcessorStatus:
         mock_conn.cursor.return_value.__exit__ = Mock(return_value=None)
         mock_cursor.fetchone.return_value = None
         
-        status = get_processor_status(mock_conn)
+        status = get_processor_status(mock_conn, "partitioncache", "partitioncache_queue")
         assert status is None
 
 
@@ -180,12 +180,25 @@ class TestDatabaseOperations:
     """Test database operation functions."""
     
     @patch("partitioncache.cli.setup_direct_processor.SQL_FILE")
-    def test_setup_database_objects(self, mock_sql_file):
+    @patch("partitioncache.queue_handler.get_queue_handler")
+    @patch("partitioncache.cache_handler.get_cache_handler")
+    @patch("partitioncache.cli.setup_direct_processor.get_queue_table_prefix_from_env")
+    def test_setup_database_objects(self, mock_get_queue_prefix, mock_get_cache_handler, mock_get_queue_handler, mock_sql_file):
         """Test setting up database objects."""
         from partitioncache.cli.setup_direct_processor import setup_database_objects
         
+        # Mock handlers
+        mock_queue_handler = Mock()
+        mock_get_queue_handler.return_value = mock_queue_handler
+        
+        mock_cache_handler = Mock()
+        mock_get_cache_handler.return_value = mock_cache_handler
+        
+        # Mock queue prefix
+        mock_get_queue_prefix.return_value = "partitioncache_queue"
+        
         # Mock SQL file content
-        mock_sql_file.read_text.return_value = "CREATE TABLE partitioncache_test;"
+        mock_sql_file.read_text.return_value = "CREATE TABLE test_table;"
         
         # Mock connection and cursor
         mock_conn = Mock()
@@ -193,19 +206,31 @@ class TestDatabaseOperations:
         mock_conn.cursor.return_value.__enter__ = Mock(return_value=mock_cursor)
         mock_conn.cursor.return_value.__exit__ = Mock(return_value=None)
         
-        # Test with default prefix
-        setup_database_objects(mock_conn, "partitioncache")
-        mock_cursor.execute.assert_called_with("CREATE TABLE partitioncache_test;")
-        mock_conn.commit.assert_called_once()
+        # Test database objects setup
+        setup_database_objects(mock_conn)
         
-        # Reset mocks
-        mock_cursor.reset_mock()
-        mock_conn.reset_mock()
+        # Verify queue handler was initialized and closed
+        mock_get_queue_handler.assert_called_once()
+        mock_queue_handler.close.assert_called_once()
         
-        # Test with custom prefix
-        setup_database_objects(mock_conn, "myapp")
-        # Should replace prefix in SQL
-        mock_cursor.execute.assert_called_with("CREATE TABLE myapp_test;")
+        # Verify cache handler was initialized and closed
+        mock_get_cache_handler.assert_called_once_with("postgresql_array")
+        mock_cache_handler.close.assert_called_once()
+        
+        # Verify SQL execution - should be called twice:
+        # 1. Main SQL file content
+        # 2. partitioncache_initialize_processor_tables function call
+        assert mock_cursor.execute.call_count == 2
+        
+        # Check the first call (main SQL content)
+        first_call = mock_cursor.execute.call_args_list[0]
+        assert first_call[0][0] == "CREATE TABLE test_table;"
+        
+        # Check the second call (partitioncache_initialize_processor_tables)
+        second_call = mock_cursor.execute.call_args_list[1]
+        assert "SELECT partitioncache_initialize_processor_tables(%s)" in second_call[0][0]
+        assert second_call[0][1] == ["partitioncache_queue"]
+        
         mock_conn.commit.assert_called_once()
     
     def test_setup_pg_cron_job(self):
@@ -218,7 +243,7 @@ class TestDatabaseOperations:
         mock_conn.cursor.return_value.__exit__ = Mock(return_value=None)
         
         # Test with 1 second frequency
-        setup_pg_cron_job(mock_conn, "partitioncache", 1)
+        setup_pg_cron_job(mock_conn, "partitioncache", "partitioncache_queue", 1)
         
         # Should delete existing job and create new one
         assert mock_cursor.execute.call_count == 2
@@ -257,8 +282,8 @@ class TestCLIIntegration:
         with patch("sys.argv", ["setup_direct_processor.py", "status"]):
             main()
         
-        # Should execute status query
-        mock_cursor.execute.assert_called_with("SELECT * FROM get_processor_status()")
+        # Should execute status query with both prefixes
+        mock_cursor.execute.assert_called_with("SELECT * FROM partitioncache_get_processor_status(%s, %s)", ["partitioncache", "partitioncache_queue"])
         mock_conn.close.assert_called_once()
     
     @patch("partitioncache.cli.setup_direct_processor.get_db_connection")

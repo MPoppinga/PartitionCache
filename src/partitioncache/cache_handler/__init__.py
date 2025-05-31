@@ -22,9 +22,9 @@ def get_cache_handler(cache_type: str, singleton: bool = False) -> AbstractCache
         db_port = os.getenv("DB_PORT")
         if not db_port:
             raise ValueError("DB_PORT environment variable not set")
-        db_table = os.getenv("PG_ARRAY_CACHE_TABLE")
+        db_table = os.getenv("PG_ARRAY_CACHE_TABLE_PREFIX")
         if not db_table:
-            raise ValueError("PG_ARRAY_CACHE_TABLE environment variable not set")
+            raise ValueError("PG_ARRAY_CACHE_TABLE_PREFIX environment variable not set")
         if singleton:
             return PostgreSQLArrayCacheHandler.get_instance(
                 db_name=db_name,
@@ -32,7 +32,7 @@ def get_cache_handler(cache_type: str, singleton: bool = False) -> AbstractCache
                 db_user=db_user,
                 db_password=db_password,
                 db_port=db_port,
-                db_table=db_table,
+                db_tableprefix=db_table,
             )
         else:
             return PostgreSQLArrayCacheHandler(
@@ -41,7 +41,7 @@ def get_cache_handler(cache_type: str, singleton: bool = False) -> AbstractCache
                 db_user=db_user,
                 db_password=db_password,
                 db_port=db_port,
-                db_table=db_table,
+                db_tableprefix=db_table,
             )
     elif cache_type == "postgresql_bit":
         from partitioncache.cache_handler.postgresql_bit import PostgreSQLBitCacheHandler
@@ -61,9 +61,9 @@ def get_cache_handler(cache_type: str, singleton: bool = False) -> AbstractCache
         db_port = os.getenv("DB_PORT")
         if not db_port:
             raise ValueError("DB_PORT environment variable not set")
-        db_table = os.getenv("PG_BIT_CACHE_TABLE")
+        db_table = os.getenv("PG_BIT_CACHE_TABLE_PREFIX")
         if not db_table:
-            raise ValueError("PG_BIT_CACHE_TABLE environment variable not set")
+            raise ValueError("PG_BIT_CACHE_TABLE_PREFIX environment variable not set")
         bitsize = os.getenv("PG_BIT_CACHE_BITSIZE")
         if not bitsize:
             raise ValueError("PG_BIT_CACHE_BITSIZE environment variable not set")
@@ -74,7 +74,7 @@ def get_cache_handler(cache_type: str, singleton: bool = False) -> AbstractCache
                 db_user=db_user,
                 db_password=db_password,
                 db_port=db_port,
-                db_table=db_table,
+                db_tableprefix=db_table,
                 bitsize=int(bitsize),
             )
         else:
@@ -84,7 +84,7 @@ def get_cache_handler(cache_type: str, singleton: bool = False) -> AbstractCache
                 db_user=db_user,
                 db_password=db_password,
                 db_port=db_port,
-                db_table=db_table,
+                db_tableprefix=db_table,
                 bitsize=int(bitsize),
             )
     elif cache_type == "redis":

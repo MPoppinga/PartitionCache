@@ -2,8 +2,13 @@
 PostgreSQL queue handler implementation.
 """
 
+import os
 from typing import List, Tuple, Optional
 from logging import getLogger
+import psycopg.sql as sql
+import psycopg
+import time
+import select
 
 from partitioncache.queue_handler.abstract import AbstractPriorityQueueHandler
 
@@ -33,6 +38,12 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
         self.password = password
         self.dbname = dbname
         self._connection = None
+        
+        # Get table prefix from environment variable
+        table_prefix = os.getenv("PG_QUEUE_TABLE_PREFIX", "partitioncache_queue")
+        self.table_prefix = table_prefix
+        self.original_queue_table = f"{self.table_prefix}_original_query_queue"
+        self.fragment_queue_table = f"{self.table_prefix}_query_fragment_queue"
 
         # Initialize tables on first connection
         self._initialize_tables()
@@ -40,20 +51,19 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
     def _get_connection(self):
         """Get PostgreSQL connection with proper configuration."""
         if self._connection is None or self._connection.closed:
-            import psycopg
-
             self._connection = psycopg.connect(host=self.host, port=self.port, user=self.user, password=self.password, dbname=self.dbname)
         return self._connection
 
     def _initialize_tables(self):
         """Initialize PostgreSQL tables for queue storage."""
         try:
+
             conn = self._get_connection()
             cursor = conn.cursor()
 
             # Create original query queue table with partition_key and priority
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS original_query_queue (
+            cursor.execute(sql.SQL("""
+                CREATE TABLE IF NOT EXISTS {} (
                     id SERIAL PRIMARY KEY,
                     query TEXT NOT NULL,
                     partition_key TEXT NOT NULL,
@@ -63,11 +73,11 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE(query, partition_key)
                 )
-            """)
+            """).format(sql.Identifier(self.original_queue_table)))
 
             # Create query fragment queue table with partition_key and priority
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS query_fragment_queue (
+            cursor.execute(sql.SQL("""
+                CREATE TABLE IF NOT EXISTS {} (
                     id SERIAL PRIMARY KEY,
                     query TEXT NOT NULL,
                     hash TEXT NOT NULL,
@@ -78,7 +88,7 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE(hash, partition_key)
                 )
-            """)
+            """).format(sql.Identifier(self.fragment_queue_table)))
 
             # Create trigger functions for notifications
             cursor.execute("""
@@ -102,51 +112,63 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
             """)
 
             # Create triggers using IF NOT EXISTS to avoid conflicts
-            cursor.execute("""
+            cursor.execute(sql.SQL("""
                 CREATE OR REPLACE TRIGGER trigger_notify_original_query_insert
-                    AFTER INSERT ON original_query_queue
+                    AFTER INSERT ON {}
                     FOR EACH ROW EXECUTE FUNCTION notify_original_query_insert();
-            """)
+            """).format(sql.Identifier(self.original_queue_table)))
 
-            cursor.execute("""
+            cursor.execute(sql.SQL("""
                 CREATE OR REPLACE TRIGGER trigger_notify_query_fragment_insert
-                    AFTER INSERT ON query_fragment_queue
+                    AFTER INSERT ON {}
                     FOR EACH ROW EXECUTE FUNCTION notify_query_fragment_insert();
-            """)
+            """).format(sql.Identifier(self.fragment_queue_table)))
 
             # Also create UPDATE triggers to catch ON CONFLICT DO UPDATE cases
-            cursor.execute("""
+            cursor.execute(sql.SQL("""
                  CREATE OR REPLACE TRIGGER trigger_notify_original_query_update
-                    AFTER UPDATE ON original_query_queue
+                    AFTER UPDATE ON {}
                     FOR EACH ROW EXECUTE FUNCTION notify_original_query_insert();
-            """)
+            """).format(sql.Identifier(self.original_queue_table)))
 
-            cursor.execute("""
+            cursor.execute(sql.SQL("""
                 CREATE OR REPLACE TRIGGER trigger_notify_query_fragment_update
-                    AFTER UPDATE ON query_fragment_queue
+                    AFTER UPDATE ON {}
                     FOR EACH ROW EXECUTE FUNCTION notify_query_fragment_insert();
-            """)
+            """).format(sql.Identifier(self.fragment_queue_table)))
 
             # Create indexes for better performance
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_original_query_queue_priority_created_at
-                ON original_query_queue(priority DESC, created_at ASC)
-            """)
+            cursor.execute(sql.SQL("""
+                CREATE INDEX IF NOT EXISTS {}
+                ON {}(priority DESC, created_at ASC)
+            """).format(
+                sql.Identifier(f"idx_{self.original_queue_table}_priority_created_at"),
+                sql.Identifier(self.original_queue_table)
+            ))
 
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_query_fragment_queue_priority_created_at
-                ON query_fragment_queue(priority DESC, created_at ASC)
-            """)
+            cursor.execute(sql.SQL("""
+                CREATE INDEX IF NOT EXISTS {}
+                ON {}(priority DESC, created_at ASC)
+            """).format(
+                sql.Identifier(f"idx_{self.fragment_queue_table}_priority_created_at"),
+                sql.Identifier(self.fragment_queue_table)
+            ))
 
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_original_query_queue_partition_key
-                ON original_query_queue(partition_key)
-            """)
+            cursor.execute(sql.SQL("""
+                CREATE INDEX IF NOT EXISTS {}
+                ON {}(partition_key)
+            """).format(
+                sql.Identifier(f"idx_{self.original_queue_table}_partition_key"),
+                sql.Identifier(self.original_queue_table)
+            ))
 
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_query_fragment_queue_partition_key
-                ON query_fragment_queue(partition_key)
-            """)
+            cursor.execute(sql.SQL("""
+                CREATE INDEX IF NOT EXISTS {}
+                ON {}(partition_key)
+            """).format(
+                sql.Identifier(f"idx_{self.fragment_queue_table}_partition_key"),
+                sql.Identifier(self.fragment_queue_table)
+            ))
 
             conn.commit()
             logger.debug("PostgreSQL queue tables initialized successfully")
@@ -173,14 +195,14 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
             conn = self._get_connection()
             cursor = conn.cursor()
             cursor.execute(
-                """
-                INSERT INTO original_query_queue (query, partition_key, partition_datatype, priority, updated_at) 
+                sql.SQL("""
+                INSERT INTO {} (query, partition_key, partition_datatype, priority, updated_at) 
                 VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP)
                 ON CONFLICT (query, partition_key) 
                 DO UPDATE SET 
-                    priority = original_query_queue.priority + 1,
+                    priority = {}.priority + 1,
                     updated_at = CURRENT_TIMESTAMP
-            """,
+            """).format(sql.Identifier(self.original_queue_table), sql.Identifier(self.original_queue_table)),
                 (query, partition_key, partition_datatype, priority),
             )
 
@@ -199,74 +221,77 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
         If a fragment already exists, increment its priority.
 
         Args:
-            query_hash_pairs (List[Tuple[str, str]]): List of (query, hash) tuples to push to fragment queue.
+            query_hash_pairs (List[Tuple[str, str]]): List of (query, hash) tuples to push.
             partition_key (str): The partition key for these query fragments.
-            priority (int): Initial priority for the fragments (default: 1).
+            priority (int): Initial priority for the query fragments (default: 1).
             partition_datatype (str): The datatype of the partition key (default: "integer").
 
         Returns:
             bool: True if all fragments were pushed/updated successfully, False otherwise.
         """
         try:
+            
             conn = self._get_connection()
             cursor = conn.cursor()
 
-            # Insert all query-hash pairs with priority support
             for query, hash_value in query_hash_pairs:
                 cursor.execute(
-                    """
-                    INSERT INTO query_fragment_queue (query, hash, partition_key, partition_datatype, priority, updated_at) 
+                    sql.SQL("""
+                    INSERT INTO {} (query, hash, partition_key, partition_datatype, priority, updated_at) 
                     VALUES (%s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
                     ON CONFLICT (hash, partition_key) 
                     DO UPDATE SET 
-                        priority = query_fragment_queue.priority + 1,
+                        priority = {}.priority + 1,
                         updated_at = CURRENT_TIMESTAMP
-                """,
+                """).format(sql.Identifier(self.fragment_queue_table), sql.Identifier(self.fragment_queue_table)),
                     (query, hash_value, partition_key, partition_datatype, priority),
                 )
 
             conn.commit()
-            logger.debug(f"Pushed/updated {len(query_hash_pairs)} fragments in PostgreSQL query fragment queue")
+            logger.debug(f"Pushed/updated {len(query_hash_pairs)} query fragments in PostgreSQL query fragment queue")
             return True
         except Exception as e:
-            logger.error(f"Failed to push fragments to PostgreSQL query fragment queue: {e}")
+            logger.error(f"Failed to push query fragments to PostgreSQL query fragment queue: {e}")
             return False
 
     def pop_from_original_query_queue(self) -> Optional[Tuple[str, str, str]]:
         """
         Pop an original query from the original query queue.
-        Prioritizes queries with highest priority, then oldest creation time.
+        Uses PostgreSQL's SELECT FOR UPDATE SKIP LOCKED for atomic operations.
 
         Returns:
-            Tuple[str, str, str] or None: (query, partition_key, partition_datatype) tuple if available, None if queue is empty or error occurred.
+            Tuple[str, str, str] or None: (query, partition_key, partition_datatype) tuple if available, None if queue is empty.
         """
         cursor = None
         try:
+      
             conn = self._get_connection()
             cursor = conn.cursor()
 
-            # Use a transaction to ensure atomicity
+            # Begin transaction for atomic pop operation
             cursor.execute("BEGIN")
 
             # Get the highest priority entry (highest priority first, then oldest)
-            cursor.execute("""
-                SELECT id, query, partition_key, partition_datatype FROM original_query_queue 
+            cursor.execute(sql.SQL("""
+                SELECT id, query, partition_key, partition_datatype FROM {} 
                 ORDER BY priority DESC, created_at ASC 
                 LIMIT 1 FOR UPDATE SKIP LOCKED
-            """)
+            """).format(sql.Identifier(self.original_queue_table)))
 
-            result = cursor.fetchone()
-            if result is None:
+            entry = cursor.fetchone()
+            if not entry:
                 cursor.execute("ROLLBACK")
                 return None
 
-            entry_id, query, partition_key, partition_datatype = result
+            entry_id, query, partition_key, partition_datatype = entry
 
             # Delete the entry
-            cursor.execute("DELETE FROM original_query_queue WHERE id = %s", (entry_id,))
+            cursor.execute(sql.SQL("DELETE FROM {} WHERE id = %s").format(sql.Identifier(self.original_queue_table)), (entry_id,))
             cursor.execute("COMMIT")
 
-            return (query, partition_key, partition_datatype)
+            logger.debug("Popped query from PostgreSQL original query queue")
+            return (query, partition_key, partition_datatype or "")
+
         except Exception as e:
             logger.error(f"Failed to pop from PostgreSQL original query queue: {e}")
             try:
@@ -287,9 +312,7 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
         Returns:
             Tuple[str, str, str] or None: (query, partition_key, partition_datatype) tuple if available, None if timeout or error occurred.
         """
-        import psycopg
-        import time
-        import select
+
 
         # First try to get an item immediately
         result = self.pop_from_original_query_queue()
@@ -368,38 +391,42 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
     def pop_from_query_fragment_queue(self) -> Optional[Tuple[str, str, str, str]]:
         """
         Pop a query fragment from the query fragment queue.
-        Prioritizes fragments with highest priority, then oldest creation time.
+        Uses PostgreSQL's SELECT FOR UPDATE SKIP LOCKED for atomic operations.
 
         Returns:
-            Tuple[str, str, str, str] or None: (query, hash, partition_key, partition_datatype) tuple if available, None if queue is empty or error occurred.
+            Tuple[str, str, str, str] or None: (query, hash, partition_key, partition_datatype) tuple if available, None if queue is empty.
         """
         cursor = None
         try:
+            
+            
             conn = self._get_connection()
             cursor = conn.cursor()
 
-            # Use a transaction to ensure atomicity
+            # Begin transaction for atomic pop operation
             cursor.execute("BEGIN")
 
             # Get the highest priority entry (highest priority first, then oldest)
-            cursor.execute("""
-                SELECT id, query, hash, partition_key, partition_datatype FROM query_fragment_queue 
+            cursor.execute(sql.SQL("""
+                SELECT id, query, hash, partition_key, partition_datatype FROM {} 
                 ORDER BY priority DESC, created_at ASC 
                 LIMIT 1 FOR UPDATE SKIP LOCKED
-            """)
+            """).format(sql.Identifier(self.fragment_queue_table)))
 
-            result = cursor.fetchone()
-            if result is None:
+            entry = cursor.fetchone()
+            if not entry:
                 cursor.execute("ROLLBACK")
                 return None
 
-            entry_id, query, hash_value, partition_key, partition_datatype = result
+            entry_id, query, hash_value, partition_key, partition_datatype = entry
 
             # Delete the entry
-            cursor.execute("DELETE FROM query_fragment_queue WHERE id = %s", (entry_id,))
+            cursor.execute(sql.SQL("DELETE FROM {} WHERE id = %s").format(sql.Identifier(self.fragment_queue_table)), (entry_id,))
             cursor.execute("COMMIT")
 
-            return (query, hash_value, partition_key, partition_datatype)
+            logger.debug("Popped query fragment from PostgreSQL query fragment queue")
+            return (query, hash_value, partition_key, partition_datatype or "")
+
         except Exception as e:
             logger.error(f"Failed to pop from PostgreSQL query fragment queue: {e}")
             try:
@@ -420,10 +447,7 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
         Returns:
             Tuple[str, str, str, str] or None: (query, hash, partition_key, partition_datatype) tuple if available, None if timeout or error occurred.
         """
-        import psycopg
-        import time
-        import select
-
+        
         # First try to get an item immediately
         result = self.pop_from_query_fragment_queue()
         if result is not None:
@@ -509,11 +533,11 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
             conn = self._get_connection()
             cursor = conn.cursor()
 
-            cursor.execute("SELECT COUNT(*) FROM original_query_queue")
+            cursor.execute(sql.SQL("SELECT COUNT(*) FROM {}").format(sql.Identifier(self.original_queue_table)))
             original_query_result = cursor.fetchone()
             original_query_count = original_query_result[0] if original_query_result else 0
 
-            cursor.execute("SELECT COUNT(*) FROM query_fragment_queue")
+            cursor.execute(sql.SQL("SELECT COUNT(*) FROM {}").format(sql.Identifier(self.fragment_queue_table)))
             query_fragment_result = cursor.fetchone()
             query_fragment_count = query_fragment_result[0] if query_fragment_result else 0
 
@@ -532,10 +556,10 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
         try:
             conn = self._get_connection()
             cursor = conn.cursor()
-            cursor.execute("DELETE FROM original_query_queue")
+            cursor.execute(sql.SQL("DELETE FROM {}").format(sql.Identifier(self.original_queue_table)))
             deleted_count = cursor.rowcount or 0
             conn.commit()
-            logger.info(f"Cleared {deleted_count} entries from PostgreSQL original query queue")
+            logger.debug(f"Cleared {deleted_count} entries from PostgreSQL original query queue")
             return deleted_count
         except Exception as e:
             logger.error(f"Failed to clear PostgreSQL original query queue: {e}")
@@ -551,10 +575,10 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
         try:
             conn = self._get_connection()
             cursor = conn.cursor()
-            cursor.execute("DELETE FROM query_fragment_queue")
+            cursor.execute(sql.SQL("DELETE FROM {}").format(sql.Identifier(self.fragment_queue_table)))
             deleted_count = cursor.rowcount or 0
             conn.commit()
-            logger.info(f"Cleared {deleted_count} entries from PostgreSQL query fragment queue")
+            logger.debug(f"Cleared {deleted_count} entries from PostgreSQL query fragment queue")
             return deleted_count
         except Exception as e:
             logger.error(f"Failed to clear PostgreSQL query fragment queue: {e}")
@@ -572,18 +596,17 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
             cursor = conn.cursor()
 
             # Clear both tables
-            cursor.execute("DELETE FROM original_query_queue")
+            cursor.execute(sql.SQL("DELETE FROM {}").format(sql.Identifier(self.original_queue_table)))
             original_query_deleted = cursor.rowcount or 0
 
-            cursor.execute("DELETE FROM query_fragment_queue")
+            cursor.execute(sql.SQL("DELETE FROM {}").format(sql.Identifier(self.fragment_queue_table)))
             query_fragment_deleted = cursor.rowcount or 0
 
             conn.commit()
-
-            logger.info(f"Cleared {original_query_deleted} entries from original query queue, {query_fragment_deleted} entries from query fragment queue")
+            logger.debug(f"Cleared all PostgreSQL queues: {original_query_deleted} original, {query_fragment_deleted} fragments")
             return (original_query_deleted, query_fragment_deleted)
         except Exception as e:
-            logger.error(f"Failed to clear PostgreSQL queues: {e}")
+            logger.error(f"Failed to clear all PostgreSQL queues: {e}")
             return (0, 0)
 
     def close(self) -> None:

@@ -1,6 +1,5 @@
 from abc import ABC, abstractmethod
 from datetime import datetime
-from typing import Type
 
 
 class AbstractCacheHandler(ABC):
@@ -233,6 +232,13 @@ class AbstractCacheHandler(ABC):
     def close(self) -> None:
         """
         Close the cache handler and release any resources allocated by the cache handler.
+        """
+        raise NotImplementedError
+    
+    @abstractmethod
+    def get_partition_keys(self) -> list[tuple[str, str]]:
+        """
+        Get all partition keys and their datatypes.
         """
         raise NotImplementedError
 
