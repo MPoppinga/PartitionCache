@@ -21,8 +21,8 @@ class PostgreSQLArrayCacheHandler(PostgreSQLAbstractCacheHandler):
     def __repr__(self) -> str:
         return "postgresql_array"
 
-    def __init__(self, db_name, db_host, db_user, db_password, db_port, db_table) -> None:
-        super().__init__(db_name, db_host, db_user, db_password, db_port, db_table)
+    def __init__(self, db_name, db_host, db_user, db_password, db_port, db_tableprefix) -> None:
+        super().__init__(db_name, db_host, db_user, db_password, db_port, db_tableprefix)
 
         # Try to create intarray extension safely
         try:
@@ -81,7 +81,7 @@ class PostgreSQLArrayCacheHandler(PostgreSQLAbstractCacheHandler):
             self.cursor.execute(
                 sql.SQL("""CREATE TABLE IF NOT EXISTS {0} (
                     query_hash TEXT PRIMARY KEY,
-                    value {1},
+                    partition_keys {1},
                     created_at TIMESTAMP DEFAULT now()
                 );""").format(sql.Identifier(table_name), sql.SQL(sql_datatype))
             )
@@ -91,23 +91,23 @@ class PostgreSQLArrayCacheHandler(PostgreSQLAbstractCacheHandler):
                 # Use intarray-specific GIN index for integers - with error handling
                 try:
                     self.cursor.execute(
-                        sql.SQL("CREATE INDEX IF NOT EXISTS {0} ON {1} USING GIN (value gin__int_ops);").format(
-                            sql.Identifier(f"idx_{table_name}_value"), sql.Identifier(table_name)
+                        sql.SQL("CREATE INDEX IF NOT EXISTS {0} ON {1} USING GIN (partition_keys gin__int_ops);").format(
+                            sql.Identifier(f"idx_{table_name}_partition_keys"), sql.Identifier(table_name)
                         )
                     )
                 except Exception as index_error:
                     logger.warning(f"Failed to create intarray GIN index, falling back to standard GIN index: {index_error}")
                     # Fallback to standard GIN index if intarray fails
                     self.cursor.execute(
-                        sql.SQL("CREATE INDEX IF NOT EXISTS {0} ON {1} USING GIN (value);").format(
-                            sql.Identifier(f"idx_{table_name}_value"), sql.Identifier(table_name)
+                        sql.SQL("CREATE INDEX IF NOT EXISTS {0} ON {1} USING GIN (partition_keys);").format(
+                            sql.Identifier(f"idx_{table_name}_partition_keys"), sql.Identifier(table_name)
                         )
                     )
             else:
                 # Use standard GIN index for other types
                 self.cursor.execute(
-                    sql.SQL("CREATE INDEX IF NOT EXISTS {0} ON {1} USING GIN (value);").format(
-                        sql.Identifier(f"idx_{table_name}_value"), sql.Identifier(table_name)
+                    sql.SQL("CREATE INDEX IF NOT EXISTS {0} ON {1} USING GIN (partition_keys);").format(
+                        sql.Identifier(f"idx_{table_name}_partition_keys"), sql.Identifier(table_name)
                     )
                 )
 
@@ -182,7 +182,7 @@ class PostgreSQLArrayCacheHandler(PostgreSQLAbstractCacheHandler):
             # Get partition-specific table
             table_name = f"{self.tableprefix}_cache_{partition_key}"
             self.cursor.execute(
-                sql.SQL("INSERT INTO {0} (query_hash, value) VALUES (%s, %s) ON CONFLICT (query_hash) DO UPDATE SET value = EXCLUDED.value").format(
+                sql.SQL("INSERT INTO {0} (query_hash, partition_keys) VALUES (%s, %s) ON CONFLICT (query_hash) DO UPDATE SET partition_keys = EXCLUDED.partition_keys").format(
                     sql.Identifier(table_name)
                 ),
                 (key, val),
@@ -206,7 +206,7 @@ class PostgreSQLArrayCacheHandler(PostgreSQLAbstractCacheHandler):
             return None
 
         table_name = f"{self.tableprefix}_cache_{partition_key}"
-        self.cursor.execute(sql.SQL("SELECT value FROM {0} WHERE query_hash = %s").format(sql.Identifier(table_name)), (key,))
+        self.cursor.execute(sql.SQL("SELECT partition_keys FROM {0} WHERE query_hash = %s").format(sql.Identifier(table_name)), (key,))
         result = self.cursor.fetchone()
         if result is None or result[0] is None:
             return None
@@ -249,7 +249,8 @@ class PostgreSQLArrayCacheHandler(PostgreSQLAbstractCacheHandler):
 
             table_name = f"{self.tableprefix}_cache_{partition_key}"
             self.cursor.execute(
-                sql.SQL("SELECT query_hash FROM {0} WHERE query_hash = ANY(%s) AND value IS NOT NULL").format(sql.Identifier(table_name)), (list(keys),)
+                sql.SQL("SELECT query_hash FROM {0} WHERE query_hash = ANY(%s) AND partition_keys IS NOT NULL").format(sql.Identifier(table_name)),
+                [list(keys)],
             )
             keys_set = set(x[0] for x in self.cursor.fetchall())
             logger.info(f"Found {len(keys_set)} existing hashkeys for partition {partition_key}")
@@ -284,17 +285,17 @@ class PostgreSQLArrayCacheHandler(PostgreSQLAbstractCacheHandler):
 
         if datatype == "integer":
             # Use intarray intersection for integers
-            select_parts = [sql.SQL("({})").format(sql.SQL(" & ").join(sql.Identifier(f"k{i}", "value") for i in range(len(keys_list))))]
+            select_parts = [sql.SQL("({})").format(sql.SQL(" & ").join(sql.Identifier(f"k{i}", "partition_keys") for i in range(len(keys_list))))]
         else:
             # Use standard array intersection for other types
-            intersect_expr = sql.Identifier("k0", "value")
+            intersect_expr = sql.Identifier("k0", "partition_keys")
             for i in range(1, len(keys_list)):
-                intersect_expr = sql.SQL("array(select unnest({}) intersect select unnest({}))").format(intersect_expr, sql.Identifier(f"k{i}", "value"))
+                intersect_expr = sql.SQL("array(select unnest({}) intersect select unnest({}))").format(intersect_expr, sql.Identifier(f"k{i}", "partition_keys"))
             select_parts = [intersect_expr]
 
         # Create the FROM part of the query
         from_parts = [
-            sql.SQL("(SELECT value FROM {0} WHERE query_hash = {1}) AS {2}").format(sql.Identifier(table_name), sql.Literal(key), sql.Identifier(f"k{i}"))
+            sql.SQL("(SELECT partition_keys FROM {0} WHERE query_hash = {1}) AS {2}").format(sql.Identifier(table_name), sql.Literal(key), sql.Identifier(f"k{i}"))
             for i, key in enumerate(keys_list)
         ]
 

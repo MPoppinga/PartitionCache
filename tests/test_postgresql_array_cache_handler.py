@@ -21,7 +21,7 @@ def mock_cursor():
 def cache_handler(mock_db, mock_cursor):
     with patch("psycopg.connect", return_value=mock_db):
         handler = PostgreSQLArrayCacheHandler(
-            db_name="test_db", db_host="localhost", db_user="test_user", db_password="test_password", db_port=5432, db_table="test_cache_table"
+            db_name="test_db", db_host="localhost", db_user="test_user", db_password="test_password", db_port=5432, db_tableprefix="test_cache_table"
         )
         handler.cursor = mock_cursor  # type: ignore
         handler.db = mock_db  # type: ignore
@@ -256,7 +256,7 @@ def test_database_connection_error():
     with patch("psycopg.connect", side_effect=psycopg.OperationalError):
         with pytest.raises(psycopg.OperationalError):
             PostgreSQLArrayCacheHandler(
-                db_name="test_db", db_host="localhost", db_user="test_user", db_password="test_password", db_port=5432, db_table="test_cache_table"
+                db_name="test_db", db_host="localhost", db_user="test_user", db_password="test_password", db_port=5432, db_tableprefix="test_cache_table"
             )
 
 

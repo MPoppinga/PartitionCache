@@ -18,14 +18,14 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
         cls._refcount += 1
         return cls._instance
 
-    def __init__(self, db_name: str, db_host: str, db_user: str, db_password: str, db_port: str | int, db_table: str) -> None:
+    def __init__(self, db_name: str, db_host: str, db_user: str, db_password: str, db_port: str | int, db_tableprefix: str) -> None:
         """
         Initialize the cache handler with the given db name.
         This handler supports multiple partition keys with datatypes: integer, float, text, timestamp.
         Creates distinct tables per partition key based on datatype.
         """
         self.db = psycopg.connect(dbname=db_name, host=db_host, password=db_password, port=db_port, user=db_user)
-        self.tableprefix = db_table
+        self.tableprefix = db_tableprefix
         self.cursor = self.db.cursor()
 
     @cache
@@ -76,13 +76,15 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
         """Set null value in partition-specific table."""
         try:
             # Ensure partition exists with default datatype
-            self._get_partition_datatype(partition_key)
+            datatype = self._get_partition_datatype(partition_key)
+            if datatype is None:
+                return False
 
             table_name = f"{self.tableprefix}_cache_{partition_key}"
             self.cursor.execute(
-                sql.SQL("INSERT INTO {0} (query_hash, value) VALUES (%s, %s) ON CONFLICT (query_hash) DO UPDATE SET value = EXCLUDED.value").format(
-                    sql.Identifier(table_name)
-                ),
+                sql.SQL(
+                    "INSERT INTO {0} (query_hash, partition_keys) VALUES (%s, %s) ON CONFLICT (query_hash) DO UPDATE SET partition_keys = EXCLUDED.partition_keys"
+                ).format(sql.Identifier(table_name)),
                 (key, None),
             )
             self.db.commit()

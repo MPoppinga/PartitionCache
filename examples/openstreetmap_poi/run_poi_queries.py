@@ -84,7 +84,9 @@ def test_partition_key(conn, partition_key: str, datatype: str = "integer"):
                 else:
                     print("No partition keys found in cache. Hint: Add queries to cache using:")
                     print(f"  pcache-add --direct --query-file testqueries_examples/{partition_key}/{description} --partition-key {partition_key} --partition-datatype {datatype} --cache-backend {CACHE_BACKEND}")
-                    print(f"  Or add all queries: for f in testqueries_examples/{partition_key}/*.sql; do pcache-add --direct --query-file \"$f\" --partition-key {partition_key} --partition-datatype {datatype} --cache-backend {CACHE_BACKEND}; done")
+                    print("  or use queue with direct processor (recommended):")
+                    print("  pcache-direct-processor setup && pcache-direct-processor enable # Setup and enable direct processor")
+                    print(f"  pcache-add --queue --query-file testqueries_examples/{partition_key}/{description} --partition-key {partition_key}")
 
                 # Test lazy intersection if supported
                 if hasattr(cache.underlying_handler, 'get_intersected_lazy'):

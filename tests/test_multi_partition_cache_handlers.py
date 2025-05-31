@@ -24,7 +24,7 @@ class TestMultiPartitionFunctionality:
             
             handler = PostgreSQLArrayCacheHandler(
                 db_name="test", db_host="localhost", db_user="user", 
-                db_password="pass", db_port=5432, db_table="test_table"
+                db_password="pass", db_port=5432, db_tableprefix="test_table"
             )
             handler.cursor = mock_cursor
             handler.db = mock_db
@@ -58,7 +58,7 @@ class TestMultiPartitionFunctionality:
             
             handler = PostgreSQLArrayCacheHandler(
                 db_name="test", db_host="localhost", db_user="user", 
-                db_password="pass", db_port=5432, db_table="test_table"
+                db_password="pass", db_port=5432, db_tableprefix="test_table"
             )
             handler.cursor = mock_cursor
             handler.db = mock_db
@@ -84,7 +84,7 @@ class TestMultiPartitionFunctionality:
             
             handler = PostgreSQLBitCacheHandler(
                 db_name="test", db_host="localhost", db_user="user", 
-                db_password="pass", db_port=5432, db_table="test_table", bitsize=1000
+                db_password="pass", db_port=5432, db_tableprefix="test_table", bitsize=1000
             )
             handler.cursor = mock_cursor
             handler.db = mock_db
@@ -109,7 +109,7 @@ class TestMultiPartitionFunctionality:
             
             handler = PostgreSQLArrayCacheHandler(
                 db_name="test", db_host="localhost", db_user="user", 
-                db_password="pass", db_port=5432, db_table="test_table"
+                db_password="pass", db_port=5432, db_tableprefix="test_table"
             )
             handler.cursor = mock_cursor
             handler.db = mock_db
@@ -134,7 +134,7 @@ class TestMultiPartitionFunctionality:
             
             handler = PostgreSQLArrayCacheHandler(
                 db_name="test", db_host="localhost", db_user="user", 
-                db_password="pass", db_port=5432, db_table="test_table"
+                db_password="pass", db_port=5432, db_tableprefix="test_table"
             )
             handler.cursor = mock_cursor
             handler.db = mock_db
@@ -216,7 +216,7 @@ class TestMultiPartitionFunctionality:
             
             handler = PostgreSQLArrayCacheHandler(
                 db_name="test", db_host="localhost", db_user="user", 
-                db_password="pass", db_port=5432, db_table="test_table"
+                db_password="pass", db_port=5432, db_tableprefix="test_table"
             )
             handler.cursor = mock_cursor
             handler.db = mock_db

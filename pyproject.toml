@@ -45,7 +45,7 @@ repository = "https://github.com/MPoppinga/PartitionCache"
 where = ["src"]
 
 [tool.setuptools.package-data]
-"partitioncache" = ["py.typed"]
+"partitioncache" = ["py.typed", "**/*.sql"]
 
 [tool.setuptools]
 package-dir = {"" = "src"}
@@ -61,6 +61,7 @@ pcache-observer = "partitioncache.cli.monitor_cache_queue:main"
 pcache-manage = "partitioncache.cli.manage_cache:main"
 pcache-add = "partitioncache.cli.add_to_cache:main"
 pcache-get = "partitioncache.cli.read_from_cache:main"
+pcache-direct-processor = "partitioncache.cli.setup_direct_processor:main"
 
 [tool.mypy]
 mypy_path = "src"
