@@ -131,6 +131,25 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
             logger.error(f"Failed to check existence for key {key} in partition {partition_key}: {e}")
             return False
 
+    def filter_existing_keys(self, keys: set, partition_key: str = "partition_key") -> set:
+        """Return the set of keys that exist in the partition-specific cache."""
+        try:
+            datatype = self._get_partition_datatype(partition_key)
+            if datatype is None:
+                return set()
+
+            table_name = f"{self.tableprefix}_cache_{partition_key}"
+            self.cursor.execute(
+                sql.SQL("SELECT query_hash FROM {0} WHERE query_hash = ANY(%s) AND partition_keys IS NOT NULL").format(sql.Identifier(table_name)),
+                [list(keys)],
+            )
+            keys_set = set(x[0] for x in self.cursor.fetchall())
+            logger.info(f"Found {len(keys_set)} existing hashkeys for partition {partition_key}")
+            return keys_set
+        except Exception as e:
+            logger.error(f"Failed to filter existing keys in partition {partition_key}: {e}")
+            return set()
+
     def get_all_keys(self, partition_key: str) -> list:
         """Get all keys for a specific partition key."""
         datatype = self._get_partition_datatype(partition_key)

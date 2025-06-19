@@ -28,10 +28,7 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
                 datatype TEXT NOT NULL CHECK (datatype = 'integer'),
                 bitsize INTEGER NOT NULL DEFAULT {1},
                 created_at TIMESTAMP DEFAULT now()
-            );""").format(
-                sql.Identifier(self.tableprefix + "_partition_metadata"),
-                sql.Literal(self.default_bitsize)
-            )
+            );""").format(sql.Identifier(self.tableprefix + "_partition_metadata"), sql.Literal(self.default_bitsize))
         )
 
         # Create queries table (shared across all partition keys)
@@ -193,23 +190,6 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
             )
             .as_string()
         )
-
-    def filter_existing_keys(self, keys: set, partition_key: str = "partition_key") -> set:
-        """
-        Returns the set of keys that exist in the partition-specific cache.
-        """
-        datatype = self._get_partition_datatype(partition_key)
-        if datatype is None:
-            return set()
-
-        table_name = f"{self.tableprefix}_cache_{partition_key}"
-        self.cursor.execute(
-            sql.SQL("SELECT query_hash FROM {0} WHERE query_hash = ANY(%s) AND partition_keys IS NOT NULL").format(sql.Identifier(table_name)),
-            [list(keys)],
-        )
-        query_hashkeys = set(x[0] for x in self.cursor.fetchall())
-        logger.info(f"Found {len(query_hashkeys)} existing hashkeys for partition {partition_key}")
-        return query_hashkeys
 
     def get_intersected_lazy(self, keys: set[str], partition_key: str = "partition_key") -> tuple[str | None, int]:
         """Get lazy intersection for partition-specific table."""
