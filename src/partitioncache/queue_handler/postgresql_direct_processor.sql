@@ -233,6 +233,7 @@ BEGIN
             CREATE TABLE IF NOT EXISTS %I (
                 query_hash TEXT PRIMARY KEY,
                 partition_keys %s[]
+                partition_keys_count integer NOT NULL GENERATED ALWAYS AS length(partition_keys) STORED
             )', v_cache_table, 
             CASE p_datatype 
                 WHEN 'integer' THEN 'INTEGER'
