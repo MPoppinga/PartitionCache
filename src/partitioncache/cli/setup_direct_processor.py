@@ -42,7 +42,8 @@ import dotenv
 logger = getLogger("PartitionCache")
 
 # SQL file location
-SQL_FILE = Path(__file__).parent.parent / "queue_handler" / "postgresql_direct_processor.sql"
+SQL_FILE = Path(__file__).parent.parent / "queue_handler" / "postgresql_queue_processor.sql"
+SQL_INFO_FILE = Path(__file__).parent.parent / "queue_handler" / "postgresql_queue_processor_info.sql"
 
 
 def get_table_prefix_from_env() -> str:
@@ -172,11 +173,14 @@ def setup_database_objects(conn):
         raise
     
     # Read and execute SQL file for direct processor specific objects
-    sql_content = SQL_FILE.read_text()
-    
+    sql_content = SQL_FILE.read_text()    
 
     with conn.cursor() as cur:
         cur.execute(sql_content)
+        
+    sql_info_content = SQL_INFO_FILE.read_text()
+    with conn.cursor() as cur:
+        cur.execute(sql_info_content)
     
     # Initialize processor tables with correct queue prefix
     logger.info("Initializing processor tables with queue prefix...")

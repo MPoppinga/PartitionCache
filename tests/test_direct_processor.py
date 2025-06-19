@@ -163,18 +163,9 @@ class TestSQLFile:
     
     def test_sql_file_exists(self):
         """Test that the SQL file path is correctly constructed."""
-        assert SQL_FILE.name == "postgresql_direct_processor.sql"
+        assert SQL_FILE.name == "postgresql_queue_processor.sql"
         assert "queue_handler" in str(SQL_FILE)
     
-    @patch("pathlib.Path.read_text")
-    def test_sql_file_content(self, mock_read_text):
-        """Test reading SQL file content."""
-        mock_read_text.return_value = "CREATE TABLE test;"
-        
-        content = SQL_FILE.read_text()
-        assert content == "CREATE TABLE test;"
-        mock_read_text.assert_called_once()
-
 
 class TestDatabaseOperations:
     """Test database operation functions."""
