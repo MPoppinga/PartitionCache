@@ -191,15 +191,14 @@ CREATE OR REPLACE FUNCTION partitioncache_bootstrap_partition(
     p_table_prefix TEXT, 
     p_partition_key TEXT, 
     p_datatype TEXT,
-    p_cache_backend TEXT DEFAULT NULL
+    p_cache_backend TEXT,
+    p_bitsize INTEGER DEFAULT NULL
 )
 RETURNS BOOLEAN AS $$
 DECLARE
     v_metadata_table TEXT;
     v_cache_table TEXT;
     v_partition_exists BOOLEAN;
-    v_bitsize INTEGER := 1000; -- Default bitsize for bit caches
-    v_backend TEXT;
 BEGIN
     v_metadata_table := partitioncache_get_metadata_table_name(p_table_prefix);
     v_cache_table := partitioncache_get_cache_table_name(p_table_prefix, p_partition_key);
@@ -212,15 +211,12 @@ BEGIN
         RETURN true; -- Already exists, nothing to do
     END IF;
     
-    -- Determine cache backend from environment or parameter
-    v_backend := COALESCE(p_cache_backend, 'array'); -- Default to array if not specified
-    
-    -- Create metadata entry
-    IF v_backend = 'bit' THEN
+    -- Create metadata entry based on cache backend
+    IF p_cache_backend = 'bit' THEN
         -- For bit cache, include bitsize
         EXECUTE format(
-            'INSERT INTO %I (partition_key, datatype, bitsize) VALUES (%L, %L, %L)',
-            v_metadata_table, p_partition_key, p_datatype, v_bitsize
+            'INSERT INTO %I (partition_key, datatype, bitsize) VALUES (%L, %L, %L) ON CONFLICT(partition_key) DO NOTHING',
+            v_metadata_table, p_partition_key, p_datatype, p_bitsize
         );
         
         -- Create bit cache table
@@ -230,10 +226,10 @@ BEGIN
                 partition_keys BIT VARYING,
                 partition_keys_count INTEGER NOT NULL GENERATED ALWAYS AS (length(replace(partition_keys::text, ''0'', ''''))) STORED
             )', v_cache_table);
-    ELSIF v_backend = 'roaringbit' THEN
+    ELSIF p_cache_backend = 'roaringbit' THEN
         -- For roaring bit cache
         EXECUTE format(
-            'INSERT INTO %I (partition_key, datatype) VALUES (%L, %L)',
+            'INSERT INTO %I (partition_key, datatype) VALUES (%L, %L) ON CONFLICT(partition_key) DO NOTHING',
             v_metadata_table, p_partition_key, p_datatype
         );
         
@@ -245,10 +241,10 @@ BEGIN
                 partition_keys roaringbitmap,
                 partition_keys_count INTEGER NOT NULL GENERATED ALWAYS AS (rb_cardinality(partition_keys)) STORED
             )', v_cache_table);
-    ELSE
+    ELSE -- 'array'
         -- For array cache
         EXECUTE format(
-            'INSERT INTO %I (partition_key, datatype) VALUES (%L, %L)',
+            'INSERT INTO %I (partition_key, datatype) VALUES (%L, %L) ON CONFLICT(partition_key) DO NOTHING',
             v_metadata_table, p_partition_key, p_datatype
         );
         
@@ -329,7 +325,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 -- Main function to process a single query from the queue
-CREATE OR REPLACE FUNCTION partitioncache_process_queue_item(p_table_prefix TEXT, p_queue_prefix TEXT DEFAULT 'partitioncache_queue')
+CREATE OR REPLACE FUNCTION partitioncache_process_queue_item(p_table_prefix TEXT, p_queue_prefix TEXT, p_cache_backend TEXT)
 RETURNS TABLE(processed BOOLEAN, message TEXT) AS $$
 DECLARE
     v_queue_item RECORD;
@@ -342,7 +338,6 @@ DECLARE
     v_metadata_table TEXT;
     v_queries_table TEXT;
     v_queue_table TEXT;
-    v_cache_backend TEXT;
     v_bitsize INTEGER;
     v_bit_query TEXT;
 BEGIN
@@ -462,51 +457,26 @@ BEGIN
             END;
         END IF;
         
-        -- Bootstrap partition if it doesn't exist yet
-        -- Determine cache backend type from environment variables or existing table structure
-        SELECT CASE
-            WHEN EXISTS (
-                SELECT 1 FROM information_schema.columns
-                WHERE table_name = v_cache_table
-                AND column_name = 'partition_keys'
-                AND data_type = 'roaringbitmap'
-            ) THEN 'roaringbit'
-            WHEN EXISTS (
-                SELECT 1 FROM information_schema.columns
-                WHERE table_name = v_cache_table
-                AND column_name = 'partition_keys'
-                AND data_type IN ('bit', 'bit varying')
-            ) THEN 'bit'
-            WHEN EXISTS (
-                SELECT 1 FROM information_schema.columns
-                WHERE table_name = v_cache_table
-                AND column_name = 'partition_keys'
-                AND (data_type LIKE '%[]' OR data_type = 'ARRAY')
-            ) THEN 'array'
-            WHEN EXISTS (
-                SELECT 1 FROM information_schema.tables
-                WHERE table_name = v_cache_table
-            ) THEN 'unknown'
-            ELSE NULL -- Table doesn't exist yet
-        END INTO v_cache_backend;
-        
-        -- If cache table doesn't exist, bootstrap it %TODO: Make this more robust
-        IF v_cache_backend IS NULL THEN
-            -- Determine backend type from table prefix or default to array
-            IF p_table_prefix LIKE '%_roaringbit%' THEN
-                v_cache_backend := 'roaringbit';
-            ELSIF p_table_prefix LIKE '%_bit%' THEN
-                v_cache_backend := 'bit';
-            ELSE
-                v_cache_backend := 'array';
-            END IF;
-            
-            -- Bootstrap the partition
-            PERFORM partitioncache_bootstrap_partition(p_table_prefix, v_queue_item.partition_key, v_datatype, v_cache_backend);
+        -- Bootstrap partition if it doesn't exist yet. The cache backend is now an explicit parameter.
+        IF NOT EXISTS (SELECT 1 FROM pg_tables WHERE tablename = v_cache_table) THEN
+            DECLARE
+                v_bitsize_for_bootstrap INTEGER;
+            BEGIN
+                IF p_cache_backend = 'bit' THEN
+                    -- For bit cache, try to get bitsize from metadata, or use a default
+                    EXECUTE format('SELECT bitsize FROM %I WHERE partition_key = %L', v_metadata_table, v_queue_item.partition_key)
+                    INTO v_bitsize_for_bootstrap;
+                    IF v_bitsize_for_bootstrap IS NULL THEN
+                       v_bitsize_for_bootstrap := 1000; -- Default bitsize
+                    END IF;
+                END IF;
+
+                PERFORM partitioncache_bootstrap_partition(p_table_prefix, v_queue_item.partition_key, v_datatype, p_cache_backend, v_bitsize_for_bootstrap);
+            END;
         END IF;
         
         -- Build the INSERT query based on cache backend type
-        IF v_cache_backend = 'bit' THEN
+        IF p_cache_backend = 'bit' THEN
             -- For bit cache, we need to convert the result set to a bit string
             -- Get bitsize from metadata
             EXECUTE format('SELECT bitsize FROM %I WHERE partition_key = %L', v_metadata_table, v_queue_item.partition_key)
@@ -555,7 +525,7 @@ BEGIN
                 v_queue_item.hash,
                 v_bit_query
             );
-        ELSIF v_cache_backend = 'roaringbit' THEN
+        ELSIF p_cache_backend = 'roaringbit' THEN
             -- For roaring bitmap cache
             v_insert_query := format(
                 'INSERT INTO %I (query_hash, partition_keys) 
@@ -567,7 +537,7 @@ BEGIN
                 v_queue_item.partition_key,
                 v_queue_item.query
             );
-        ELSIF v_cache_backend = 'array' THEN
+        ELSIF p_cache_backend = 'array' THEN
             -- For array cache with partition_keys column
             v_insert_query := format(
                 'INSERT INTO %I (query_hash, partition_keys) 
@@ -580,7 +550,7 @@ BEGIN
                 v_queue_item.query
             );
         ELSE
-            RAISE EXCEPTION 'Unsupported cache table structure for table %. Expected partition_keys column with bit, roaringbit, or array datatype.', v_cache_table;
+            RAISE EXCEPTION 'Unsupported cache_backend type: %. Expected ''bit'', ''roaringbit'', or ''array''.', p_cache_backend;
         END IF;
         
         -- Execute the insert query
@@ -630,7 +600,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 -- Main processor function that will be called by pg_cron
-CREATE OR REPLACE FUNCTION partitioncache_process_queue(p_table_prefix TEXT DEFAULT 'partitioncache', p_queue_prefix TEXT DEFAULT 'partitioncache_queue')
+CREATE OR REPLACE FUNCTION partitioncache_process_queue(p_table_prefix TEXT, p_queue_prefix TEXT, p_cache_backend TEXT)
 RETURNS TABLE(processed_count INTEGER, message TEXT) AS $$
 DECLARE
     v_processed_count INTEGER := 0;
@@ -646,7 +616,7 @@ BEGIN
     
     -- Process up to max_parallel_jobs items
     FOR i IN 1..COALESCE(v_max_iterations, 5) LOOP
-        SELECT * INTO v_result FROM partitioncache_process_queue_item(p_table_prefix, p_queue_prefix);
+        SELECT * INTO v_result FROM partitioncache_process_queue_item(p_table_prefix, p_queue_prefix, p_cache_backend);
         
         IF v_result.processed THEN
             v_processed_count := v_processed_count + 1;
@@ -659,8 +629,6 @@ BEGIN
     RETURN QUERY SELECT v_processed_count, format('Processed %s queue items', v_processed_count);
 END;
 $$ LANGUAGE plpgsql;
-
-
 
 -- Function to enable/disable the processor
 CREATE OR REPLACE FUNCTION partitioncache_set_processor_enabled(p_enabled BOOLEAN, p_queue_prefix TEXT DEFAULT 'partitioncache_queue')
@@ -700,7 +668,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 -- Helper function to manually trigger processing (useful for testing)
-CREATE OR REPLACE FUNCTION partitioncache_manual_process_queue(p_count INTEGER DEFAULT 1, p_table_prefix TEXT DEFAULT 'partitioncache', p_queue_prefix TEXT DEFAULT 'partitioncache_queue')
+CREATE OR REPLACE FUNCTION partitioncache_manual_process_queue(p_count INTEGER, p_table_prefix TEXT, p_queue_prefix TEXT, p_cache_backend TEXT)
 RETURNS TABLE(total_processed INTEGER, messages TEXT[]) AS $$
 DECLARE
     v_total INTEGER := 0;
@@ -708,7 +676,7 @@ DECLARE
     v_result RECORD;
 BEGIN
     FOR i IN 1..p_count LOOP
-        SELECT * INTO v_result FROM partitioncache_process_queue_item(p_table_prefix, p_queue_prefix);
+        SELECT * INTO v_result FROM partitioncache_process_queue_item(p_table_prefix, p_queue_prefix, p_cache_backend);
         
         IF v_result.processed THEN
             v_total := v_total + 1;

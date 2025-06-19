@@ -46,6 +46,19 @@ SQL_FILE = Path(__file__).parent.parent / "queue_handler" / "postgresql_queue_pr
 SQL_INFO_FILE = Path(__file__).parent.parent / "queue_handler" / "postgresql_queue_processor_info.sql"
 
 
+def get_cache_backend_from_env() -> str:
+    """
+    Get the cache backend type from environment variables.
+    """
+    cache_backend = os.getenv("CACHE_BACKEND", "postgresql_array")
+    supported_backends = {"postgresql_array", "postgresql_bit", "postgresql_roaringbit"}
+    if cache_backend not in supported_backends:
+        raise ValueError(f"Unsupported CACHE_BACKEND for direct processor: {cache_backend}")
+
+    # Return the simple name for the backend (e.g., 'array', 'bit')
+    return cache_backend.replace("postgresql_", "")
+
+
 def get_table_prefix_from_env() -> str:
     """
     Get the table prefix from environment variables based on the CACHE_BACKEND.
@@ -123,7 +136,6 @@ def validate_environment() -> tuple[bool, str]:
     except ValueError as e:
         return False, str(e)
 
-
     return True, "Environment validated successfully"
 
 
@@ -170,9 +182,9 @@ def setup_database_objects(conn):
     from partitioncache.cache_handler import get_cache_handler
 
     try:
-        cache_backend = os.getenv("CACHE_BACKEND", "postgresql_array")
-        logger.info(f"Initializing cache handler ({cache_backend}) to ensure metadata tables exist...")
-        cache_handler = get_cache_handler(cache_backend)
+        cache_backend_env = os.getenv("CACHE_BACKEND", "postgresql_array")
+        logger.info(f"Initializing cache handler ({cache_backend_env}) to ensure metadata tables exist...")
+        cache_handler = get_cache_handler(cache_backend_env)
         cache_handler.close()
         logger.info("Cache metadata tables verified/created successfully")
     except Exception as e:
@@ -199,9 +211,9 @@ def setup_database_objects(conn):
     logger.info("PostgreSQL queue processor database objects created successfully")
 
 
-def setup_pg_cron_job(conn, table_prefix: str, queue_prefix: str, frequency: int = 1):
+def setup_pg_cron_job(conn, table_prefix: str, queue_prefix: str, cache_backend: str, frequency: int = 1):
     """Set up pg_cron job to process the queue."""
-    logger.info(f"Setting up pg_cron job with frequency: every {frequency} second(s)")
+    logger.info(f"Setting up pg_cron job with frequency: every {frequency} second(s) for backend '{cache_backend}'")
 
     with conn.cursor() as cur:
         # Remove existing job if any
@@ -218,6 +230,10 @@ def setup_pg_cron_job(conn, table_prefix: str, queue_prefix: str, frequency: int
             # For 60+ seconds, use traditional cron format (minutes)
             schedule = f"*/{frequency // 60} * * * *"
 
+        command = sql.SQL("SELECT partitioncache_process_queue({}, {}, {})").format(
+            sql.Literal(table_prefix), sql.Literal(queue_prefix), sql.Literal(cache_backend)
+        )
+
         cur.execute(
             """
             INSERT INTO cron.job (jobname, schedule, command)
@@ -227,7 +243,7 @@ def setup_pg_cron_job(conn, table_prefix: str, queue_prefix: str, frequency: int
                 %s
             )
         """,
-            (schedule, f"SELECT partitioncache_process_queue('{table_prefix}', '{queue_prefix}');"),
+            (schedule, command.as_string(conn)),
         )
 
         conn.commit()
@@ -508,6 +524,13 @@ def main():
     # Automatically determine table prefix from environment if not explicitly provided
     auto_table_prefix = get_table_prefix_from_env()
 
+    # Automatically determine cache backend from environment
+    try:
+        auto_cache_backend = get_cache_backend_from_env()
+    except ValueError as e:
+        logger.error(f"Configuration error: {e}")
+        sys.exit(1)
+
     # Validate environment for all commands
     valid, message = validate_environment()
     if not valid:
@@ -539,7 +562,7 @@ def main():
             # Setup pg_cron job
             if not args.skip_pg_cron:
                 queue_prefix = get_queue_table_prefix_from_env()
-                setup_pg_cron_job(conn, table_prefix, queue_prefix)
+                setup_pg_cron_job(conn, table_prefix, queue_prefix, auto_cache_backend)
 
             print("\nPostgreSQL queue processor setup complete!")
             print("Use 'setup_postgresql_queue_processor.py enable' to start processing")
@@ -574,7 +597,7 @@ def main():
                 if check_pg_cron_installed(conn):
                     # Use auto-detected prefixes for pg_cron job update
                     queue_prefix = get_queue_table_prefix_from_env()
-                    setup_pg_cron_job(conn, auto_table_prefix, queue_prefix, args.frequency)
+                    setup_pg_cron_job(conn, auto_table_prefix, queue_prefix, auto_cache_backend, args.frequency)
 
             if params:
                 queue_prefix = get_queue_table_prefix_from_env()
@@ -615,10 +638,11 @@ def main():
             # Use auto-detected prefixes if not explicitly provided
             table_prefix = args.table_prefix or auto_table_prefix
             queue_prefix = get_queue_table_prefix_from_env()
+            cache_backend = auto_cache_backend
 
-            print(f"Testing PostgreSQL queue processor with table prefix: {table_prefix}, queue prefix: {queue_prefix}")
+            print(f"Testing PostgreSQL queue processor with table prefix: {table_prefix}, queue prefix: {queue_prefix}, backend: {cache_backend}")
             with conn.cursor() as cur:
-                cur.execute(sql.SQL("SELECT * FROM partitioncache_process_queue_item(%s, %s)"), [table_prefix, queue_prefix])
+                cur.execute(sql.SQL("SELECT * FROM partitioncache_process_queue_item(%s, %s, %s)"), [table_prefix, queue_prefix, cache_backend])
                 result = cur.fetchone()
                 if result:
                     processed, message = result
