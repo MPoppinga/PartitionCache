@@ -12,6 +12,7 @@ dependencies = [
     "networkx",
     "sqlglot>=25.0.0,<26.0.0",
     "bitarray",
+    "roaringbitmap",
     "python-dotenv",
     "tqdm",
 ]
@@ -61,7 +62,7 @@ pcache-observer = "partitioncache.cli.monitor_cache_queue:main"
 pcache-manage = "partitioncache.cli.manage_cache:main"
 pcache-add = "partitioncache.cli.add_to_cache:main"
 pcache-get = "partitioncache.cli.read_from_cache:main"
-pcache-direct-processor = "partitioncache.cli.setup_direct_processor:main"
+pcache-postgresql-queue-processor = "partitioncache.cli.setup_postgresql_queue_processor:main"
 
 [tool.mypy]
 mypy_path = "src"
