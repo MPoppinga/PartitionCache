@@ -50,6 +50,7 @@ def list_cache_types() -> dict[str, list[str]]:
     from partitioncache.cache_handler.rocks_dict import RocksDictCacheHandler
     from partitioncache.cache_handler.postgresql_array import PostgreSQLArrayCacheHandler
     from partitioncache.cache_handler.postgresql_bit import PostgreSQLBitCacheHandler
+    from partitioncache.cache_handler.postgresql_roaringbit import PostgreSQLRoaringBitCacheHandler
 
     handler_classes = {
         "redis": RedisCacheHandler,
@@ -57,6 +58,7 @@ def list_cache_types() -> dict[str, list[str]]:
         "rocksdict": RocksDictCacheHandler,
         "postgresql_array": PostgreSQLArrayCacheHandler,
         "postgresql_bit": PostgreSQLBitCacheHandler,
+        "postgresql_roaringbit": PostgreSQLRoaringBitCacheHandler,
     }
     
     if ROCKSDB_AVAILABLE:

@@ -48,23 +48,27 @@ SQL_INFO_FILE = Path(__file__).parent.parent / "queue_handler" / "postgresql_que
 
 def get_table_prefix_from_env() -> str:
     """
-    Automatically determine the table prefix from environment variables.
-
-    Returns the table prefix that matches what the cache handler actually uses internally.
+    Get the table prefix from environment variables based on the CACHE_BACKEND.
+    This is used to determine which cache tables the direct processor should interact with.
     """
     cache_backend = os.getenv("CACHE_BACKEND", "postgresql_array")
 
-    if cache_backend == "postgresql_array":
-        table_name = os.getenv("PG_ARRAY_CACHE_TABLE_PREFIX")
-        if table_name:
-            return table_name
-    elif cache_backend == "postgresql_bit":
-        table_name = os.getenv("PG_BIT_CACHE_TABLE_PREFIX")
-        if table_name:
-            return table_name
+    supported_backends = {
+        "postgresql_array": "PG_ARRAY_CACHE_TABLE_PREFIX",
+        "postgresql_bit": "PG_BIT_CACHE_TABLE_PREFIX",
+        "postgresql_roaringbit": "PG_ROARINGBIT_CACHE_TABLE_PREFIX",
+    }
 
-    # Fallback to default
-    return "partitioncache"
+    if cache_backend not in supported_backends:
+        raise ValueError(f"Unsupported CACHE_BACKEND for direct processor: {cache_backend}")
+
+    table_prefix_env = supported_backends[cache_backend]
+    table_prefix = os.getenv(table_prefix_env)
+
+    if not table_prefix:
+        raise ValueError(f"Environment variable {table_prefix_env} is not set for CACHE_BACKEND {cache_backend}")
+
+    return table_prefix
 
 
 def get_queue_table_prefix_from_env() -> str:
@@ -114,10 +118,11 @@ def validate_environment() -> tuple[bool, str]:
             f"Cache: {cache_config['host']}:{cache_config['port']}/{cache_config['db']}"
         )
 
-    # Check cache type
-    cache_type = os.getenv("CACHE_BACKEND", "postgresql_array")
-    if cache_type not in ["postgresql_array", "postgresql_bit"]:
-        return False, f"PostgreSQL queue processor only supports postgresql_array or postgresql_bit cache backends, got: {cache_type}"
+    try:
+        get_table_prefix_from_env()
+    except ValueError as e:
+        return False, str(e)
+
 
     return True, "Environment validated successfully"
 

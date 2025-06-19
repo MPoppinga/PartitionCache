@@ -141,7 +141,9 @@ BEGIN
     v_queries_table := partitioncache_get_queries_table_name(p_table_prefix);
     
     -- Determine cache backend type from table prefix
-    IF p_table_prefix LIKE '%_bit%' THEN
+    IF p_table_prefix LIKE '%_roaringbit%' THEN
+        v_cache_backend := 'roaringbit';
+    ELSIF p_table_prefix LIKE '%_bit%' THEN
         v_cache_backend := 'bit';
     ELSE
         v_cache_backend := 'array';
@@ -154,6 +156,13 @@ BEGIN
                 partition_key TEXT PRIMARY KEY,
                 datatype TEXT NOT NULL CHECK (datatype IN (''integer'', ''float'', ''text'', ''timestamp'')),
                 bitsize INTEGER NOT NULL DEFAULT 1000,
+                created_at TIMESTAMP DEFAULT now()
+            )', v_metadata_table);
+    ELSIF v_cache_backend = 'roaringbit' THEN
+        EXECUTE format('
+            CREATE TABLE IF NOT EXISTS %I (
+                partition_key TEXT PRIMARY KEY,
+                datatype TEXT NOT NULL CHECK (datatype = ''integer''),
                 created_at TIMESTAMP DEFAULT now()
             )', v_metadata_table);
     ELSE
@@ -221,6 +230,21 @@ BEGIN
                 partition_keys BIT VARYING,
                 partition_keys_count INTEGER NOT NULL GENERATED ALWAYS AS (length(replace(partition_keys::text, ''0'', ''''))) STORED
             )', v_cache_table);
+    ELSIF v_backend = 'roaringbit' THEN
+        -- For roaring bit cache
+        EXECUTE format(
+            'INSERT INTO %I (partition_key, datatype) VALUES (%L, %L)',
+            v_metadata_table, p_partition_key, p_datatype
+        );
+        
+        -- Create roaring bitmap cache table (enable extension first)
+        EXECUTE 'CREATE EXTENSION IF NOT EXISTS roaringbitmap';
+        EXECUTE format('
+            CREATE TABLE IF NOT EXISTS %I (
+                query_hash TEXT PRIMARY KEY,
+                partition_keys roaringbitmap,
+                partition_keys_count INTEGER NOT NULL GENERATED ALWAYS AS (rb_cardinality(partition_keys)) STORED
+            )', v_cache_table);
     ELSE
         -- For array cache
         EXECUTE format(
@@ -232,8 +256,8 @@ BEGIN
         EXECUTE format('
             CREATE TABLE IF NOT EXISTS %I (
                 query_hash TEXT PRIMARY KEY,
-                partition_keys %s[]
-                partition_keys_count integer NOT NULL GENERATED ALWAYS AS length(partition_keys) STORED
+                partition_keys %s[],
+                partition_keys_count integer NOT NULL GENERATED ALWAYS AS (array_length(partition_keys, 1)) STORED
             )', v_cache_table, 
             CASE p_datatype 
                 WHEN 'integer' THEN 'INTEGER'
@@ -440,21 +464,27 @@ BEGIN
         
         -- Bootstrap partition if it doesn't exist yet
         -- Determine cache backend type from environment variables or existing table structure
-        SELECT CASE 
+        SELECT CASE
             WHEN EXISTS (
-                SELECT 1 FROM information_schema.columns 
-                WHERE table_name = v_cache_table 
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = v_cache_table
+                AND column_name = 'partition_keys'
+                AND data_type = 'roaringbitmap'
+            ) THEN 'roaringbit'
+            WHEN EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = v_cache_table
                 AND column_name = 'partition_keys'
                 AND data_type IN ('bit', 'bit varying')
             ) THEN 'bit'
             WHEN EXISTS (
-                SELECT 1 FROM information_schema.columns 
-                WHERE table_name = v_cache_table 
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = v_cache_table
                 AND column_name = 'partition_keys'
                 AND (data_type LIKE '%[]' OR data_type = 'ARRAY')
             ) THEN 'array'
             WHEN EXISTS (
-                SELECT 1 FROM information_schema.tables 
+                SELECT 1 FROM information_schema.tables
                 WHERE table_name = v_cache_table
             ) THEN 'unknown'
             ELSE NULL -- Table doesn't exist yet
@@ -463,7 +493,9 @@ BEGIN
         -- If cache table doesn't exist, bootstrap it %TODO: Make this more robust
         IF v_cache_backend IS NULL THEN
             -- Determine backend type from table prefix or default to array
-            IF p_table_prefix LIKE '%_bit%' THEN
+            IF p_table_prefix LIKE '%_roaringbit%' THEN
+                v_cache_backend := 'roaringbit';
+            ELSIF p_table_prefix LIKE '%_bit%' THEN
                 v_cache_backend := 'bit';
             ELSE
                 v_cache_backend := 'array';
@@ -523,6 +555,18 @@ BEGIN
                 v_queue_item.hash,
                 v_bit_query
             );
+        ELSIF v_cache_backend = 'roaringbit' THEN
+            -- For roaring bitmap cache
+            v_insert_query := format(
+                'INSERT INTO %I (query_hash, partition_keys) 
+                 SELECT %L, rb_build_agg(%s::INTEGER)
+                 FROM (%s) AS query_result
+                 ON CONFLICT (query_hash) DO UPDATE SET partition_keys = EXCLUDED.partition_keys',
+                v_cache_table,
+                v_queue_item.hash,
+                v_queue_item.partition_key,
+                v_queue_item.query
+            );
         ELSIF v_cache_backend = 'array' THEN
             -- For array cache with partition_keys column
             v_insert_query := format(
@@ -536,7 +580,7 @@ BEGIN
                 v_queue_item.query
             );
         ELSE
-            RAISE EXCEPTION 'Unsupported cache table structure for table %. Expected partition_keys column with bit or array datatype.', v_cache_table;
+            RAISE EXCEPTION 'Unsupported cache table structure for table %. Expected partition_keys column with bit, roaringbit, or array datatype.', v_cache_table;
         END IF;
         
         -- Execute the insert query

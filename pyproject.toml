@@ -12,7 +12,7 @@ dependencies = [
     "networkx",
     "sqlglot>=25.0.0,<26.0.0",
     "bitarray",
-    "roaringbitmap",
+    "pyroaring",
     "python-dotenv",
     "tqdm",
 ]

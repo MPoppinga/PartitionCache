@@ -93,6 +93,7 @@ BEGIN
                     CASE 
                         WHEN NOT ci.cache_exists THEN ''not_created''
                         WHEN ci.cache_column_type LIKE ''bit%%'' THEN ''bit''
+                        WHEN ci.cache_column_type = ''roaringbitmap'' THEN ''roaringbit''
                         WHEN ci.cache_column_type LIKE ''%%[]'' OR ci.cache_column_type = ''ARRAY'' THEN ''array''
                         ELSE ''unknown''
                     END as cache_architecture,
@@ -150,6 +151,7 @@ BEGIN
                     CASE 
                         WHEN NOT ci.cache_exists THEN ''not_created''
                         WHEN ci.cache_column_type LIKE ''bit%%'' THEN ''bit''
+                        WHEN ci.cache_column_type = ''roaringbitmap'' THEN ''roaringbit''
                         WHEN ci.cache_column_type LIKE ''%%[]'' OR ci.cache_column_type = ''ARRAY'' THEN ''array''
                         ELSE ''unknown''
                     END as cache_architecture,
@@ -207,6 +209,7 @@ BEGIN
                 CASE 
                     WHEN NOT ci.cache_exists THEN ''not_created''
                     WHEN ci.cache_column_type LIKE ''bit%%'' THEN ''bit''
+                    WHEN ci.cache_column_type = ''roaringbitmap'' THEN ''roaringbit''
                     WHEN ci.cache_column_type LIKE ''%%[]'' OR ci.cache_column_type = ''ARRAY'' THEN ''array''
                     ELSE ''unknown''
                 END as cache_architecture,
@@ -270,6 +273,7 @@ BEGIN
                     CASE 
                         WHEN NOT ci.cache_exists THEN ''not_created''
                         WHEN ci.cache_column_type LIKE ''bit%%'' THEN ''bit''
+                        WHEN ci.cache_column_type = ''roaringbitmap'' THEN ''roaringbit''
                         WHEN ci.cache_column_type LIKE ''%%[]'' OR ci.cache_column_type = ''ARRAY'' THEN ''array''
                         ELSE ''unknown''
                     END as cache_architecture,
@@ -325,6 +329,7 @@ BEGIN
                     CASE 
                         WHEN NOT ci.cache_exists THEN ''not_created''
                         WHEN ci.cache_column_type LIKE ''bit%%'' THEN ''bit''
+                        WHEN ci.cache_column_type = ''roaringbitmap'' THEN ''roaringbit''
                         WHEN ci.cache_column_type LIKE ''%%[]'' OR ci.cache_column_type = ''ARRAY'' THEN ''array''
                         ELSE ''unknown''
                     END as cache_architecture,

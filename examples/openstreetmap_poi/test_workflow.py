@@ -203,18 +203,18 @@ def main():
     print("🔧 Step 2: Setting up PostgreSQL Direct Processor")
     print("=" * 60)
 
-    run_command(["pcache-direct-processor", "setup"], "Setting up direct processor with pg_cron")
+    run_command(["pcache-postgresql-queue-processor", "setup"], "Setting up direct processor with pg_cron")
 
-    run_command(["pcache-direct-processor", "enable"], "Enabling the direct processor")
+    run_command(["pcache-postgresql-queue-processor", "enable"], "Enabling the direct processor")
 
-    run_command(["pcache-direct-processor", "config", "--max-jobs", "5", "--frequency", "2"], "Configuring processor for 5 parallel jobs every 2 seconds")
+    run_command(["pcache-postgresql-queue-processor", "config", "--max-jobs", "5", "--frequency", "2"], "Configuring processor for 5 parallel jobs every 2 seconds")
 
     # Step 3: Check initial status
     print("\n" + "=" * 60)
     print("📊 Step 3: Checking initial status")
     print("=" * 60)
 
-    run_command(["pcache-direct-processor", "status"], "Checking direct processor status")
+    run_command(["pcache-postgresql-queue-processor", "status"], "Checking direct processor status")
 
     run_command(["pcache-manage", "queue", "count"], "Checking initial queue length")
 
@@ -276,13 +276,13 @@ def main():
     print("=" * 60)
 
     run_command(
-        ["pcache-direct-processor", "status-detailed"],
+        ["pcache-postgresql-queue-processor", "status-detailed"],
         "Checking detailed processor status",
         check=False,  # Don't fail if this command has issues
     )
 
     run_command(
-        ["pcache-direct-processor", "logs", "--limit", "10"],
+        ["pcache-postgresql-queue-processor", "logs", "--limit", "10"],
         "Checking recent processor logs",
         check=False,  # Don't fail if this command has issues
     )
@@ -316,7 +316,7 @@ def main():
     print("=" * 60)
 
     run_command(
-        ["pcache-direct-processor", "queue-info"],
+        ["pcache-postgresql-queue-processor", "queue-info"],
         "Checking detailed queue and cache architecture info",
         check=False,  # Don't fail if this command has issues
     )
@@ -341,9 +341,9 @@ def main():
     print("✅ Cache effectiveness demonstration")
     print("\nNext steps:")
     print("- Add more queries to the queue for automatic processing")
-    print("- Monitor processor status: pcache-direct-processor status")
+    print("- Monitor processor status: pcache-postgresql-queue-processor status")
     print("- Check cache statistics: pcache-manage cache count")
-    print("- View processor logs: pcache-direct-processor logs")
+    print("- View processor logs: pcache-postgresql-queue-processor logs")
 
     return 0
 
