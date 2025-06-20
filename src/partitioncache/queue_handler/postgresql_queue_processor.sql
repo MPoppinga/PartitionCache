@@ -112,6 +112,8 @@ RETURNS TRIGGER AS $$
 DECLARE
     v_command TEXT;
     v_job_base TEXT;
+    v_timeout_seconds INTEGER;
+    v_timeout_statement TEXT;
 BEGIN
     v_job_base := NEW.job_name; -- base name, e.g. partitioncache_process_queue
 
@@ -121,8 +123,17 @@ BEGIN
         RETURN OLD;
     END IF;
 
-    -- Build the command string executed by every worker
-    v_command := format('SELECT * FROM partitioncache_run_single_job(%L)', v_job_base);
+    -- Get timeout from the config row being inserted/updated
+    v_timeout_seconds := NEW.timeout_seconds;
+    IF v_timeout_seconds IS NULL THEN v_timeout_seconds := 1800; END IF;
+
+    -- Set a local timeout for this specific transaction
+    -- The timeout is specified in milliseconds.
+    v_timeout_statement := 'SET LOCAL statement_timeout = ' || (v_timeout_seconds * 1000)::TEXT;
+    
+
+    -- Build the command string executed by every worker , with the timeout set in transaction
+    v_command := format('BEGIN; %s; SELECT * FROM partitioncache_run_single_job(%L); COMMIT;', v_timeout_statement, v_job_base);
 
     -- Remove existing worker jobs and recreate to match max_parallel_jobs
     DELETE FROM cron.job WHERE jobname LIKE v_job_base || '_%';
@@ -361,8 +372,13 @@ BEGIN
     -- Get configuration for this job
     BEGIN
         EXECUTE format('SELECT * FROM %I WHERE job_name = %L', v_config_table, p_job_name) INTO STRICT v_config;
+        -- Log to console
+        RAISE NOTICE 'Job name: %', p_job_name;
+        RAISE NOTICE 'Config: %', v_config;
+
     EXCEPTION 
         WHEN NO_DATA_FOUND THEN
+            RAISE NOTICE 'No data found for job %', p_job_name;
             -- This can happen if the trigger creates jobs before config is committed. Exit gracefully.
             RETURN;
         WHEN TOO_MANY_ROWS THEN
@@ -372,7 +388,7 @@ BEGIN
     END;
     
     IF NOT v_config.enabled THEN
-        RETURN;
+        RAISE WARNING 'Job % is executed even though it is disabled', p_job_name;
     END IF;
 
     v_queue_table := v_config.queue_prefix || '_query_fragment_queue';
@@ -414,6 +430,7 @@ BEGIN
                 v_log_table, 'job_' || v_queue_item.id, v_queue_item.hash, v_queue_item.partition_key, 'skipped', 'Query already processed', 'cron');
             
             dispatched_job_id := 'job_' || v_queue_item.id;
+            RAISE NOTICE 'Skipping job %', dispatched_job_id;
             status := 'skipped';
             RETURN NEXT;
             RETURN;
@@ -430,6 +447,7 @@ BEGIN
                 v_log_table, 'job_' || v_queue_item.id, v_queue_item.hash, v_queue_item.partition_key, 'skipped', 'Query in processing', 'cron');
       
         dispatched_job_id := 'job_' || v_queue_item.id;
+        RAISE NOTICE 'Skipping job %', dispatched_job_id;
         status := 'skipped';
         RETURN NEXT;
         RETURN;
@@ -438,7 +456,7 @@ BEGIN
     -- Log job start
     EXECUTE format('INSERT INTO %I (job_id, query_hash, partition_key, status, execution_source) VALUES (%L, %L, %L, %L, %L)', 
         v_log_table, 'job_' || v_queue_item.id, v_queue_item.hash, v_queue_item.partition_key, 'started', 'cron');
-
+    RAISE NOTICE 'Job started %', dispatched_job_id;
     -- Process the item directly
     DECLARE
         is_success BOOLEAN;
@@ -454,6 +472,7 @@ BEGIN
             v_config.cache_backend,
             'cron'
         );
+        RAISE NOTICE 'Job processed %', dispatched_job_id;
     END;
     dispatched_job_id := 'job_' || v_queue_item.id;
     status := 'processed';
@@ -493,20 +512,13 @@ DECLARE
 BEGIN
     v_job_id := 'job_' || p_item_id;
     v_start_time := clock_timestamp(); -- Use clock_timestamp() for better precision
+    RAISE NOTICE 'Job started at %', v_start_time;
     
     -- Set table names
     v_active_jobs_table := p_queue_prefix || '_active_jobs';
     v_log_table := p_queue_prefix || '_processor_log';
     v_config_table := p_queue_prefix || '_processor_config';
     
-    -- Get timeout from config
-    EXECUTE format('SELECT timeout_seconds FROM %I LIMIT 1', v_config_table) INTO v_timeout_seconds;
-    IF v_timeout_seconds IS NULL THEN v_timeout_seconds := 1800; END IF;
-
-    -- Set a local timeout for this specific transaction
-    -- The timeout is specified in milliseconds.
-    EXECUTE 'SET LOCAL statement_timeout = ' || (v_timeout_seconds * 1000)::TEXT;
-
     
     BEGIN
         -- Process the item using the same logic as the background processor
@@ -625,9 +637,18 @@ BEGIN
             RAISE EXCEPTION 'Unsupported cache_backend type: %', p_cache_backend;
         END IF;
         
+        -- check what statement_timeout is set to
+        RAISE NOTICE 'Statement timeout: %', current_setting('statement_timeout');
+
+        -- check that query does not contain DELETE OR DROP
+        IF p_query LIKE '%DELETE %' OR p_query LIKE '%DROP %' THEN
+            RAISE EXCEPTION 'Query contains DELETE or DROP';
+        END IF;
+
         EXECUTE v_insert_query;
         GET DIAGNOSTICS v_rows_affected = ROW_COUNT;
         
+        RAISE NOTICE 'Query executed';
         -- Insert/update queries table with 'ok' status
         EXECUTE format('INSERT INTO %I (query_hash, partition_key, query, status, last_seen) VALUES (%L, %L, %L, ''ok'', now()) ON CONFLICT (query_hash, partition_key) DO UPDATE SET status = ''ok'', last_seen = now()', v_queries_table, p_query_hash, p_partition_key, p_query);
         
@@ -643,6 +664,7 @@ BEGIN
         
     EXCEPTION 
         WHEN query_canceled THEN
+            RAISE NOTICE 'Query canceled';
             -- Clean up active job
             EXECUTE format('DELETE FROM %I WHERE job_id = %L', v_active_jobs_table, v_job_id);
 
@@ -653,6 +675,7 @@ BEGIN
         
             RETURN false;
         WHEN OTHERS THEN
+            RAISE NOTICE 'Query failed: %', SQLERRM;
             -- Clean up active job
             EXECUTE format('DELETE FROM %I WHERE job_id = %L', v_active_jobs_table, v_job_id);
             
