@@ -512,13 +512,15 @@ DECLARE
 BEGIN
     v_job_id := 'job_' || p_item_id;
     v_start_time := clock_timestamp(); -- Use clock_timestamp() for better precision
-    RAISE NOTICE 'Job started at %', v_start_time;
     
     -- Set table names
     v_active_jobs_table := p_queue_prefix || '_active_jobs';
     v_log_table := p_queue_prefix || '_processor_log';
     v_config_table := p_queue_prefix || '_processor_config';
+    v_queries_table := partitioncache_get_queries_table_name(p_table_prefix);
     
+    -- Get timeout from config
+    EXECUTE format('SELECT timeout_seconds FROM %I LIMIT 1', v_config_table) INTO v_timeout_seconds;
     
     BEGIN
         -- Process the item using the same logic as the background processor
@@ -668,6 +670,9 @@ BEGIN
             -- Clean up active job
             EXECUTE format('DELETE FROM %I WHERE job_id = %L', v_active_jobs_table, v_job_id);
 
+            -- Mark query as timed out to prevent re-processing
+            EXECUTE format('INSERT INTO %I (query_hash, partition_key, query, status, last_seen) VALUES (%L, %L, %L, ''timeout'', now()) ON CONFLICT (query_hash, partition_key) DO UPDATE SET status = ''timeout'', last_seen = now()', v_queries_table, p_query_hash, p_partition_key, p_query);
+
             -- Log timeout
             EXECUTE format('INSERT INTO %I (job_id, query_hash, partition_key, status, error_message, execution_time_ms, execution_source) VALUES (%L, %L, %L, %L, %L, %L, %L)', 
                 v_log_table, v_job_id, p_query_hash, p_partition_key, 'timeout', 'Query timed out after ' || v_timeout_seconds || ' seconds.', 
@@ -679,6 +684,9 @@ BEGIN
             -- Clean up active job
             EXECUTE format('DELETE FROM %I WHERE job_id = %L', v_active_jobs_table, v_job_id);
             
+            -- Mark query as failed to prevent re-processing
+            EXECUTE format('INSERT INTO %I (query_hash, partition_key, query, status, last_seen) VALUES (%L, %L, %L, ''failed'', now()) ON CONFLICT (query_hash, partition_key) DO UPDATE SET status = ''failed'', last_seen = now()', v_queries_table, p_query_hash, p_partition_key, p_query);
+
             -- Log failure
             EXECUTE format('INSERT INTO %I (job_id, query_hash, partition_key, status, error_message, execution_time_ms, execution_source) VALUES (%L, %L, %L, %L, %L, %L, %L)', 
                 v_log_table, v_job_id, p_query_hash, p_partition_key, 'failed', SQLERRM, 
