@@ -126,8 +126,8 @@ BEGIN
 
     -- Remove existing worker jobs and recreate to match max_parallel_jobs
     DELETE FROM cron.job WHERE jobname LIKE v_job_base || '_%';
-    -- Remove existing timeout job
-    DELETE FROM cron.job WHERE jobname = v_job_base || '_timeouts';
+    
+
 
     FOR i IN 1..NEW.max_parallel_jobs LOOP
         INSERT INTO cron.job (jobname, schedule, command, active)
@@ -138,15 +138,6 @@ BEGIN
             NEW.enabled
         );
     END LOOP;
-
-    -- Timeout/cleanup job (runs every frequency_seconds as well)
-    INSERT INTO cron.job (jobname, schedule, command, active)
-    VALUES (
-        v_job_base || '_timeouts',
-        CONCAT(NEW.frequency_seconds, ' seconds'),
-        format('SELECT partitioncache_handle_timeouts(%L, %L, %s); SELECT partitioncache_cleanup_stale_jobs(%L, %s);', NEW.queue_prefix, NEW.table_prefix, NEW.timeout_seconds, NEW.queue_prefix, NEW.stale_after_seconds),
-        NEW.enabled
-    );
 
     RETURN NEW;
 END;
@@ -353,118 +344,6 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- Function to handle timed out jobs (cancel running queries and mark as timeout)
-CREATE OR REPLACE FUNCTION partitioncache_handle_timeouts(
-    p_queue_prefix TEXT,
-    p_table_prefix TEXT,
-    p_timeout_seconds INTEGER
-)
-RETURNS INTEGER AS $$
-DECLARE
-    v_active_jobs_table TEXT;
-    v_processor_log_table TEXT;
-    v_queries_table TEXT;
-    v_timed_out_job RECORD;
-    v_cache_table TEXT;
-    v_cache_exists BOOLEAN;
-    v_status TEXT;
-    v_timeout_count INTEGER := 0;
-BEGIN
-    v_active_jobs_table := p_queue_prefix || '_active_jobs';
-    v_processor_log_table := p_queue_prefix || '_processor_log';
-    v_queries_table := partitioncache_get_queries_table_name(p_table_prefix);
-    
-    -- Find jobs that have exceeded timeout
-    FOR v_timed_out_job IN 
-        EXECUTE format('
-            SELECT job_id, query_hash, partition_key, pid, query, partition_datatype
-            FROM %I
-            WHERE started_at < NOW() - INTERVAL ''%s seconds''
-        ', v_active_jobs_table, p_timeout_seconds)
-    LOOP
-        -- Try to cancel the backend process if it has a PID
-        IF v_timed_out_job.pid IS NOT NULL THEN
-            PERFORM pg_cancel_backend(v_timed_out_job.pid);
-        END IF;
-        
-        -- Check if the cache entry exists to determine if it completed successfully
-        v_cache_table := partitioncache_get_cache_table_name(p_table_prefix, v_timed_out_job.partition_key);
-        
-        -- First check if table exists, then check for the entry
-        EXECUTE format('
-            SELECT EXISTS(
-                SELECT 1 FROM information_schema.tables 
-                WHERE table_name = %L
-            )', v_cache_table) INTO v_cache_exists;
-            
-        IF v_cache_exists THEN
-            -- Table exists, now check if the query result is cached
-            EXECUTE format('
-                SELECT EXISTS(SELECT 1 FROM %I WHERE query_hash = %L)
-            ', v_cache_table, v_timed_out_job.query_hash) INTO v_cache_exists;
-        END IF;
-        
-        -- Determine status based on cache existence
-        v_status := CASE WHEN v_cache_exists THEN 'ok' ELSE 'timeout' END;
-        
-        -- Update or insert into queries table with appropriate status
-        EXECUTE format('
-            INSERT INTO %I (query_hash, partition_key, query, status, last_seen) 
-            VALUES (%L, %L, %L, %L, NOW())
-            ON CONFLICT (query_hash, partition_key) 
-            DO UPDATE SET status = %L, last_seen = NOW()
-        ', v_queries_table, v_timed_out_job.query_hash, v_timed_out_job.partition_key, 
-           v_timed_out_job.query, v_status, v_status);
-        
-        -- Log the timeout
-        EXECUTE format('
-            INSERT INTO %I (job_id, query_hash, partition_key, status, error_message)
-            VALUES (%L, %L, %L, ''timeout'', ''Job exceeded timeout of %s seconds (status: %s)'')
-        ', v_processor_log_table, v_timed_out_job.job_id, v_timed_out_job.query_hash, 
-           v_timed_out_job.partition_key, p_timeout_seconds, v_status);
-        
-        -- Remove from active jobs
-        EXECUTE format('DELETE FROM %I WHERE job_id = %L', v_active_jobs_table, v_timed_out_job.job_id);
-        
-        v_timeout_count := v_timeout_count + 1;
-    END LOOP;
-    
-    RETURN v_timeout_count;
-END;
-$$ LANGUAGE plpgsql;
-
--- Function to clean up stale active jobs (crashed/abandoned without proper cleanup)
-CREATE OR REPLACE FUNCTION partitioncache_cleanup_stale_jobs(
-    p_queue_prefix TEXT,
-    p_stale_after_seconds INTEGER
-)
-RETURNS INTEGER AS $$
-DECLARE
-    v_deleted INTEGER;
-    v_active_jobs_table TEXT;
-    v_processor_log_table TEXT;
-BEGIN
-    v_active_jobs_table := p_queue_prefix || '_active_jobs';
-    v_processor_log_table := p_queue_prefix || '_processor_log';
-    
-    -- Clean up jobs that are stale (much older than timeout, likely crashed)
-    -- These are jobs where the process died without cleanup
-    EXECUTE format('
-        INSERT INTO %I (job_id, query_hash, partition_key, status, error_message)
-        SELECT job_id, query_hash, partition_key, ''failed'', ''Job abandoned/crashed after %s seconds''
-        FROM %I
-        WHERE started_at < NOW() - INTERVAL ''%s seconds''
-    ', v_processor_log_table, p_stale_after_seconds, v_active_jobs_table, p_stale_after_seconds);
-    
-    -- Delete stale jobs
-    EXECUTE format('DELETE FROM %I WHERE started_at < NOW() - INTERVAL ''%s seconds''', 
-        v_active_jobs_table, p_stale_after_seconds);
-    GET DIAGNOSTICS v_deleted = ROW_COUNT;
-    
-    RETURN v_deleted;
-END;
-$$ LANGUAGE plpgsql;
-
 -- Main dispatcher function that will be called by pg_cron
 CREATE OR REPLACE FUNCTION partitioncache_run_single_job(p_job_name TEXT)
 RETURNS TABLE(dispatched_job_id TEXT, status TEXT) AS $$
@@ -543,19 +422,15 @@ BEGIN
 
     -- Try to acquire a lock for this job by inserting into active jobs
     BEGIN
-        EXECUTE format('INSERT INTO %I (query_hash, partition_key, job_id, started_at, query, partition_datatype) VALUES (%L, %L, %L, NOW(), %L, %L)', 
-            v_active_jobs_table, v_queue_item.hash, v_queue_item.partition_key, 'job_' || v_queue_item.id, v_queue_item.query, v_queue_item.partition_datatype);
+        EXECUTE format('INSERT INTO %I (query_hash, partition_key, job_id, started_at, query, partition_datatype, pid) VALUES (%L, %L, %L, NOW(), %L, %L, %s)', 
+            v_active_jobs_table, v_queue_item.hash, v_queue_item.partition_key, 'job_' || v_queue_item.id, v_queue_item.query, v_queue_item.partition_datatype, pg_backend_pid());
     EXCEPTION WHEN unique_violation THEN
-        -- This query/partition combo is already running, requeue for later
+        -- This query/partition combo is already running, also skipping the job
         EXECUTE format('INSERT INTO %I (job_id, query_hash, partition_key, status, error_message, execution_source) VALUES (%L, %L, %L, %L, %L, %L)', 
-            v_log_table, 'job_' || v_queue_item.id, v_queue_item.hash, v_queue_item.partition_key, 'requeued', 'Job already active', 'cron');
-        
-        -- Put item back in queue
-        EXECUTE format('INSERT INTO %I (id, query, hash, partition_key, partition_datatype) VALUES (%L, %L, %L, %L, %L)', 
-            v_queue_table, v_queue_item.id, v_queue_item.query, v_queue_item.hash, v_queue_item.partition_key, v_queue_item.partition_datatype);
-        
+                v_log_table, 'job_' || v_queue_item.id, v_queue_item.hash, v_queue_item.partition_key, 'skipped', 'Query in processing', 'cron');
+      
         dispatched_job_id := 'job_' || v_queue_item.id;
-        status := 'requeued';
+        status := 'skipped';
         RETURN NEXT;
         RETURN;
     END;
@@ -565,17 +440,21 @@ BEGIN
         v_log_table, 'job_' || v_queue_item.id, v_queue_item.hash, v_queue_item.partition_key, 'started', 'cron');
 
     -- Process the item directly
-    PERFORM _partitioncache_execute_job(
-        v_queue_item.id::INTEGER,
-        v_queue_item.query,
-        v_queue_item.hash,
-        v_queue_item.partition_key,
-        v_queue_item.partition_datatype,
-        v_config.queue_prefix,
-        v_config.table_prefix,
-        v_config.cache_backend,
-        'cron'
-    );
+    DECLARE
+        is_success BOOLEAN;
+    BEGIN
+        is_success := _partitioncache_execute_job(
+            v_queue_item.id::INTEGER,
+            v_queue_item.query,
+            v_queue_item.hash,
+            v_queue_item.partition_key,
+            v_queue_item.partition_datatype,
+            v_config.queue_prefix,
+            v_config.table_prefix,
+            v_config.cache_backend,
+            'cron'
+        );
+    END;
     dispatched_job_id := 'job_' || v_queue_item.id;
     status := 'processed';
     RETURN NEXT;
@@ -606,9 +485,11 @@ DECLARE
     v_queries_table TEXT;
     v_active_jobs_table TEXT;
     v_log_table TEXT;
+    v_config_table TEXT;
     v_bitsize INTEGER;
     v_bit_query TEXT;
     v_already_processed BOOLEAN;
+    v_timeout_seconds INTEGER;
 BEGIN
     v_job_id := 'job_' || p_item_id;
     v_start_time := clock_timestamp(); -- Use clock_timestamp() for better precision
@@ -616,23 +497,16 @@ BEGIN
     -- Set table names
     v_active_jobs_table := p_queue_prefix || '_active_jobs';
     v_log_table := p_queue_prefix || '_processor_log';
+    v_config_table := p_queue_prefix || '_processor_config';
     
-    -- Check if this query has already been processed (exists in queries table)
-    v_queries_table := partitioncache_get_queries_table_name(p_table_prefix);
-    EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I WHERE query_hash = %L AND partition_key = %L)', 
-        v_queries_table, p_query_hash, p_partition_key) INTO v_already_processed;
-    
-    IF v_already_processed THEN
-        -- Clean up active job
-        EXECUTE format('DELETE FROM %I WHERE job_id = %L', v_active_jobs_table, v_job_id);
-        
-        -- Log as skipped
-        EXECUTE format('INSERT INTO %I (job_id, query_hash, partition_key, status, error_message, execution_time_ms, execution_source) VALUES (%L, %L, %L, %L, %L, %L, %L)', 
-            v_log_table, v_job_id, p_query_hash, p_partition_key, 'skipped', 'Query already processed', 
-            ROUND(extract(epoch from (clock_timestamp() - v_start_time)) * 1000, 3), p_execution_source);
-        
-        RETURN true;
-    END IF;
+    -- Get timeout from config
+    EXECUTE format('SELECT timeout_seconds FROM %I LIMIT 1', v_config_table) INTO v_timeout_seconds;
+    IF v_timeout_seconds IS NULL THEN v_timeout_seconds := 1800; END IF;
+
+    -- Set a local timeout for this specific transaction
+    -- The timeout is specified in milliseconds.
+    EXECUTE 'SET LOCAL statement_timeout = ' || (v_timeout_seconds * 1000)::TEXT;
+
     
     BEGIN
         -- Process the item using the same logic as the background processor
@@ -767,16 +641,27 @@ BEGIN
         
         RETURN true;
         
-    EXCEPTION WHEN OTHERS THEN
-        -- Clean up active job
-        EXECUTE format('DELETE FROM %I WHERE job_id = %L', v_active_jobs_table, v_job_id);
+    EXCEPTION 
+        WHEN query_canceled THEN
+            -- Clean up active job
+            EXECUTE format('DELETE FROM %I WHERE job_id = %L', v_active_jobs_table, v_job_id);
+
+            -- Log timeout
+            EXECUTE format('INSERT INTO %I (job_id, query_hash, partition_key, status, error_message, execution_time_ms, execution_source) VALUES (%L, %L, %L, %L, %L, %L, %L)', 
+                v_log_table, v_job_id, p_query_hash, p_partition_key, 'timeout', 'Query timed out after ' || v_timeout_seconds || ' seconds.', 
+                ROUND(extract(epoch from (clock_timestamp() - v_start_time)) * 1000, 3), p_execution_source);
         
-        -- Log failure
-        EXECUTE format('INSERT INTO %I (job_id, query_hash, partition_key, status, error_message, execution_time_ms, execution_source) VALUES (%L, %L, %L, %L, %L, %L, %L)', 
-            v_log_table, v_job_id, p_query_hash, p_partition_key, 'failed', SQLERRM, 
-            ROUND(extract(epoch from (clock_timestamp() - v_start_time)) * 1000, 3), p_execution_source);
+            RETURN false;
+        WHEN OTHERS THEN
+            -- Clean up active job
+            EXECUTE format('DELETE FROM %I WHERE job_id = %L', v_active_jobs_table, v_job_id);
+            
+            -- Log failure
+            EXECUTE format('INSERT INTO %I (job_id, query_hash, partition_key, status, error_message, execution_time_ms, execution_source) VALUES (%L, %L, %L, %L, %L, %L, %L)', 
+                v_log_table, v_job_id, p_query_hash, p_partition_key, 'failed', SQLERRM, 
+                ROUND(extract(epoch from (clock_timestamp() - v_start_time)) * 1000, 3), p_execution_source);
         
-        RETURN false;
+            RETURN false;
     END;
 END;
 $$ LANGUAGE plpgsql;
