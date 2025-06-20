@@ -79,7 +79,10 @@ BEGIN
                             ) THEN true
                             ELSE false
                         END as cache_exists,
-                        (SELECT data_type 
+                        (SELECT CASE 
+                                    WHEN data_type = ''USER-DEFINED'' THEN udt_name
+                                    ELSE data_type
+                                END
                          FROM information_schema.columns 
                          WHERE table_name = partitioncache_get_cache_table_name(%L, pi.partition_key)
                          AND column_name = ''partition_keys''
@@ -137,7 +140,10 @@ BEGIN
                             ) THEN true
                             ELSE false
                         END as cache_exists,
-                        (SELECT data_type 
+                        (SELECT CASE 
+                                    WHEN data_type = ''USER-DEFINED'' THEN udt_name
+                                    ELSE data_type
+                                END
                          FROM information_schema.columns 
                          WHERE table_name = partitioncache_get_cache_table_name(%L, pi.partition_key)
                          AND column_name = ''partition_keys''
@@ -195,7 +201,10 @@ BEGIN
                         ) THEN true
                         ELSE false
                     END as cache_exists,
-                    (SELECT data_type 
+                    (SELECT CASE 
+                                WHEN data_type = ''USER-DEFINED'' THEN udt_name
+                                ELSE data_type
+                            END
                      FROM information_schema.columns 
                      WHERE table_name = partitioncache_get_cache_table_name(%L, pi.partition_key)
                      AND column_name = ''partition_keys''
@@ -259,7 +268,10 @@ BEGIN
                             ) THEN true
                             ELSE false
                         END as cache_exists,
-                        (SELECT data_type 
+                        (SELECT CASE 
+                                    WHEN data_type = ''USER-DEFINED'' THEN udt_name
+                                    ELSE data_type
+                                END
                          FROM information_schema.columns 
                          WHERE table_name = partitioncache_get_cache_table_name(%L, pi.partition_key)
                          AND column_name = ''partition_keys''
@@ -315,7 +327,10 @@ BEGIN
                             ) THEN true
                             ELSE false
                         END as cache_exists,
-                        (SELECT data_type 
+                        (SELECT CASE 
+                                    WHEN data_type = ''USER-DEFINED'' THEN udt_name
+                                    ELSE data_type
+                                END
                          FROM information_schema.columns 
                          WHERE table_name = partitioncache_get_cache_table_name(%L, pi.partition_key)
                          AND column_name = ''partition_keys''
@@ -350,200 +365,149 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- Enhanced processor status function with queue and cache information
-CREATE OR REPLACE FUNCTION partitioncache_get_processor_status_detailed(p_table_prefix TEXT DEFAULT 'partitioncache', p_queue_prefix TEXT DEFAULT 'partitioncache_queue')
+-- Function to get basic processor status
+CREATE OR REPLACE FUNCTION partitioncache_get_processor_status(p_queue_prefix TEXT, p_job_name TEXT DEFAULT 'partitioncache_process_queue')
 RETURNS TABLE(
-    -- Basic processor status
+    job_name TEXT,
     enabled BOOLEAN,
     max_parallel_jobs INTEGER,
     frequency_seconds INTEGER,
-    active_jobs INTEGER,
-    queue_length INTEGER,
-    recent_successes INTEGER,
-    recent_failures INTEGER,
-    -- Queue and cache summary
-    total_partitions INTEGER,
-    partitions_with_cache INTEGER,
-    bit_cache_partitions INTEGER,
-    array_cache_partitions INTEGER,
-    uncreated_cache_partitions INTEGER
+    timeout_seconds INTEGER,
+    table_prefix TEXT,
+    queue_prefix TEXT,
+    cache_backend TEXT,
+    updated_at TIMESTAMP,
+    job_is_active BOOLEAN,
+    job_schedule TEXT,
+    job_command TEXT,
+    active_jobs_count INTEGER
 ) AS $$
 DECLARE
-    v_queue_table TEXT;
-    v_queue_length INTEGER;
-    v_processor_config_table TEXT;
-    v_processor_log_table TEXT;
-    v_active_jobs_table TEXT;
-    v_config_enabled BOOLEAN := false;
-    v_config_max_jobs INTEGER := 5;
-    v_config_frequency INTEGER := 1;
-    v_active_jobs_count INTEGER := 0;
-    v_recent_successes INTEGER := 0;
-    v_recent_failures INTEGER := 0;
-    v_total_partitions INTEGER := 0;
-    v_partitions_with_cache INTEGER := 0;
-    v_bit_cache_partitions INTEGER := 0;
-    v_array_cache_partitions INTEGER := 0;
-    v_uncreated_cache_partitions INTEGER := 0;
+    v_config_table TEXT;
 BEGIN
-    v_queue_table := p_queue_prefix || '_query_fragment_queue';
-    v_processor_config_table := p_queue_prefix || '_processor_config';
-    v_processor_log_table := p_queue_prefix || '_processor_log';
-    v_active_jobs_table := p_queue_prefix || '_active_jobs';
-    
-    -- Get queue length dynamically
-    BEGIN
-        EXECUTE format('SELECT COUNT(*) FROM %I', v_queue_table) INTO v_queue_length;
-    EXCEPTION WHEN OTHERS THEN
-        v_queue_length := 0;
-    END;
-    
-    -- Get processor config
-    BEGIN
-        EXECUTE format('SELECT enabled, max_parallel_jobs, frequency_seconds FROM %I LIMIT 1', v_processor_config_table)
-        INTO v_config_enabled, v_config_max_jobs, v_config_frequency;
-    EXCEPTION WHEN OTHERS THEN
-        -- Use defaults if table doesn't exist
-        v_config_enabled := false;
-        v_config_max_jobs := 5;
-        v_config_frequency := 1;
-    END;
-    
-    -- Get active jobs count
-    BEGIN
-        EXECUTE format('SELECT COUNT(*) FROM %I', v_active_jobs_table) INTO v_active_jobs_count;
-    EXCEPTION WHEN OTHERS THEN
-        v_active_jobs_count := 0;
-    END;
-    
-    -- Get recent successes and failures
-    BEGIN
-        EXECUTE format('SELECT COUNT(*) FROM %I WHERE status = ''success'' AND created_at > NOW() - INTERVAL ''5 minutes''', v_processor_log_table)
-        INTO v_recent_successes;
-    EXCEPTION WHEN OTHERS THEN
-        v_recent_successes := 0;
-    END;
-    
-    BEGIN
-        EXECUTE format('SELECT COUNT(*) FROM %I WHERE status = ''failed'' AND created_at > NOW() - INTERVAL ''5 minutes''', v_processor_log_table)
-        INTO v_recent_failures;
-    EXCEPTION WHEN OTHERS THEN
-        v_recent_failures := 0;
-    END;
-    
-    -- Get cache summary using simpler approach
-    BEGIN
-        SELECT 
-            COALESCE(COUNT(*), 0),
-            COALESCE(COUNT(*) FILTER (WHERE cache_exists), 0),
-            COALESCE(COUNT(*) FILTER (WHERE cache_architecture = 'bit'), 0),
-            COALESCE(COUNT(*) FILTER (WHERE cache_architecture = 'array'), 0),
-            COALESCE(COUNT(*) FILTER (WHERE cache_architecture = 'not_created'), 0)
-        INTO v_total_partitions, v_partitions_with_cache, v_bit_cache_partitions, v_array_cache_partitions, v_uncreated_cache_partitions
-        FROM partitioncache_get_queue_and_cache_info(p_table_prefix, p_queue_prefix);
-    EXCEPTION WHEN OTHERS THEN
-        -- Use zero values when function fails
-        v_total_partitions := 0;
-        v_partitions_with_cache := 0;
-        v_bit_cache_partitions := 0;
-        v_array_cache_partitions := 0;
-        v_uncreated_cache_partitions := 0;
-    END;
-    
+    v_config_table := p_queue_prefix || '_processor_config';
+
     RETURN QUERY
-    SELECT 
-        v_config_enabled,
-        v_config_max_jobs,
-        v_config_frequency,
-        v_active_jobs_count,
-        v_queue_length,
-        v_recent_successes,
-        v_recent_failures,
-        v_total_partitions,
-        v_partitions_with_cache,
-        v_bit_cache_partitions,
-        v_array_cache_partitions,
-        v_uncreated_cache_partitions;
+    EXECUTE format(
+        'WITH cron_jobs AS (
+            SELECT
+                active,
+                schedule,
+                command
+            FROM cron.job
+            WHERE jobname LIKE %L || ''_%''
+        )
+        SELECT
+            conf.job_name,
+            conf.enabled,
+            conf.max_parallel_jobs,
+            conf.frequency_seconds,
+            conf.timeout_seconds,
+            conf.table_prefix,
+            conf.queue_prefix,
+            conf.cache_backend,
+            conf.updated_at,
+            (SELECT bool_or(active) FROM cron_jobs) as job_is_active,
+            (SELECT schedule FROM cron_jobs LIMIT 1) as job_schedule,
+            (SELECT command FROM cron_jobs LIMIT 1) as job_command,
+            (SELECT COUNT(*)::INTEGER FROM partitioncache_get_active_jobs_info(%L))
+        FROM
+            %I conf
+        WHERE
+            conf.job_name = %L',
+        p_job_name, p_queue_prefix, v_config_table, p_job_name
+    );
 END;
 $$ LANGUAGE plpgsql;
 
--- Helper function to get processor status
-CREATE OR REPLACE FUNCTION partitioncache_get_processor_status(p_table_prefix TEXT DEFAULT 'partitioncache', p_queue_prefix TEXT DEFAULT 'partitioncache_queue')
+-- Enhanced processor status function with queue and cache information
+CREATE OR REPLACE FUNCTION partitioncache_get_processor_status_detailed(p_table_prefix TEXT, p_queue_prefix TEXT, p_job_name TEXT DEFAULT 'partitioncache_process_queue')
 RETURNS TABLE(
+    -- Basic processor status
+    job_name TEXT,
     enabled BOOLEAN,
     max_parallel_jobs INTEGER,
     frequency_seconds INTEGER,
-    active_jobs INTEGER,
+    job_is_active BOOLEAN,
+    job_schedule TEXT,
+    -- Queue stats
+    active_jobs_count INTEGER,
     queue_length INTEGER,
-    recent_successes INTEGER,
-    recent_failures INTEGER
+    recent_successes_5m INTEGER,
+    recent_failures_5m INTEGER,
+    -- Cache architecture summary
+    total_partitions INTEGER,
+    partitions_with_cache INTEGER,
+    roaringbit_partitions INTEGER,
+    bit_cache_partitions INTEGER,
+    array_cache_partitions INTEGER,
+    uncreated_cache_partitions INTEGER,
+    -- Details
+    recent_logs JSON,
+    active_job_details JSON
 ) AS $$
 DECLARE
     v_queue_table TEXT;
-    v_queue_length INTEGER;
-    v_processor_config_table TEXT;
-    v_processor_log_table TEXT;
-    v_active_jobs_table TEXT;
-    v_config_enabled BOOLEAN := false;
-    v_config_max_jobs INTEGER := 5;
-    v_config_frequency INTEGER := 1;
-    v_active_jobs_count INTEGER := 0;
-    v_recent_successes INTEGER := 0;
-    v_recent_failures INTEGER := 0;
+    v_config_table TEXT;
 BEGIN
     v_queue_table := p_queue_prefix || '_query_fragment_queue';
-    v_processor_config_table := p_queue_prefix || '_processor_config';
-    v_processor_log_table := p_queue_prefix || '_processor_log';
-    v_active_jobs_table := p_queue_prefix || '_active_jobs';
-    
-    -- Get queue length dynamically
-    BEGIN
-        EXECUTE format('SELECT COUNT(*) FROM %I', v_queue_table) INTO v_queue_length;
-    EXCEPTION WHEN OTHERS THEN
-        v_queue_length := 0;
-    END;
-    
-    -- Get processor config
-    BEGIN
-        EXECUTE format('SELECT enabled, max_parallel_jobs, frequency_seconds FROM %I LIMIT 1', v_processor_config_table)
-        INTO v_config_enabled, v_config_max_jobs, v_config_frequency;
-    EXCEPTION WHEN OTHERS THEN
-        -- Use defaults if table doesn't exist
-        v_config_enabled := false;
-        v_config_max_jobs := 5;
-        v_config_frequency := 1;
-    END;
-    
-    -- Get active jobs count
-    BEGIN
-        EXECUTE format('SELECT COUNT(*) FROM %I', v_active_jobs_table) INTO v_active_jobs_count;
-    EXCEPTION WHEN OTHERS THEN
-        v_active_jobs_count := 0;
-    END;
-    
-    -- Get recent successes and failures
-    BEGIN
-        EXECUTE format('SELECT COUNT(*) FROM %I WHERE status = ''success'' AND created_at > NOW() - INTERVAL ''5 minutes''', v_processor_log_table)
-        INTO v_recent_successes;
-    EXCEPTION WHEN OTHERS THEN
-        v_recent_successes := 0;
-    END;
-    
-    BEGIN
-        EXECUTE format('SELECT COUNT(*) FROM %I WHERE status = ''failed'' AND created_at > NOW() - INTERVAL ''5 minutes''', v_processor_log_table)
-        INTO v_recent_failures;
-    EXCEPTION WHEN OTHERS THEN
-        v_recent_failures := 0;
-    END;
-    
+    v_config_table := p_queue_prefix || '_processor_config';
+
     RETURN QUERY
-    SELECT 
-        v_config_enabled,
-        v_config_max_jobs,
-        v_config_frequency,
-        v_active_jobs_count,
-        v_queue_length,
-        v_recent_successes,
-        v_recent_failures;
+    SELECT
+        s.job_name,
+        s.enabled,
+        s.max_parallel_jobs,
+        s.frequency_seconds,
+        s.job_is_active,
+        s.job_schedule,
+        s.active_jobs_count,
+        (SELECT COUNT(*)::INTEGER FROM public.partitioncache_queue_query_fragment_queue),
+        (SELECT COUNT(*)::INTEGER FROM partitioncache_get_log_info(p_queue_prefix) WHERE status = 'success' AND created_at > NOW() - INTERVAL '5 minutes'),
+        (SELECT COUNT(*)::INTEGER FROM partitioncache_get_log_info(p_queue_prefix) WHERE status = 'failed' AND created_at > NOW() - INTERVAL '5 minutes'),
+        COALESCE(ca.total_partitions, 0),
+        COALESCE(ca.partitions_with_cache, 0),
+        COALESCE(ca.roaringbit_partitions, 0),
+        COALESCE(ca.bit_partitions, 0),
+        COALESCE(ca.array_partitions, 0),
+        COALESCE(ca.uncreated_partitions, 0),
+        (SELECT json_agg(log_info) FROM (SELECT * FROM partitioncache_get_log_info(p_queue_prefix) LIMIT 10) log_info),
+        (SELECT json_agg(active_jobs_info) FROM (SELECT * FROM partitioncache_get_active_jobs_info(p_queue_prefix)) active_jobs_info)
+    FROM
+        partitioncache_get_processor_status(p_queue_prefix, p_job_name) s,
+        LATERAL (
+            SELECT
+                COUNT(*)::INTEGER AS total_partitions,
+                COUNT(*) FILTER (WHERE cache_exists)::INTEGER AS partitions_with_cache,
+                COUNT(*) FILTER (WHERE cache_architecture = 'roaringbit')::INTEGER AS roaringbit_partitions,
+                COUNT(*) FILTER (WHERE cache_architecture = 'bit')::INTEGER AS bit_partitions,
+                COUNT(*) FILTER (WHERE cache_architecture = 'array')::INTEGER AS array_partitions,
+                COUNT(*) FILTER (WHERE cache_architecture = 'not_created')::INTEGER AS uncreated_partitions
+            FROM partitioncache_get_queue_and_cache_info(p_table_prefix, p_queue_prefix)
+        ) ca;
+END;
+
+$$ LANGUAGE plpgsql;
+
+-- Function to get active jobs (for status checks)
+CREATE OR REPLACE FUNCTION partitioncache_get_active_jobs_info(p_queue_prefix TEXT)
+RETURNS TABLE(job_id TEXT, query_hash TEXT, partition_key TEXT, started_at TIMESTAMP) AS $$
+DECLARE
+    v_active_jobs_table TEXT;
+BEGIN
+    v_active_jobs_table := p_queue_prefix || '_active_jobs';
+    RETURN QUERY EXECUTE format('SELECT job_id, query_hash, partition_key, started_at FROM %I', v_active_jobs_table);
 END;
 $$ LANGUAGE plpgsql;
+
+-- Function to get log info (for status checks)
+CREATE OR REPLACE FUNCTION partitioncache_get_log_info(p_queue_prefix TEXT)
+RETURNS TABLE(job_id TEXT, query_hash TEXT, partition_key TEXT, status TEXT, error_message TEXT, rows_affected INTEGER, execution_time_ms NUMERIC, execution_source TEXT, created_at TIMESTAMP) AS $$
+DECLARE
+    v_log_table TEXT;
+BEGIN
+    v_log_table := p_queue_prefix || '_processor_log';
+    RETURN QUERY EXECUTE format('SELECT job_id, query_hash, partition_key, status, error_message, rows_affected, execution_time_ms, execution_source, created_at FROM %I ORDER BY created_at DESC', v_log_table);
+END;
+$$ LANGUAGE plpgsql;
+

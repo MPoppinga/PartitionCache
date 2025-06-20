@@ -45,6 +45,7 @@ class PostgreSQLRoaringBitCacheHandler(PostgreSQLAbstractCacheHandler):
             query_hash TEXT NOT NULL,
             query TEXT NOT NULL,
             partition_key TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'ok' CHECK (status IN ('ok', 'timeout', 'failed')),
             last_seen TIMESTAMP NOT NULL DEFAULT now(),
             PRIMARY KEY (query_hash, partition_key)
         );""").format(sql.Identifier(self.tableprefix + "_queries"))
@@ -161,7 +162,7 @@ class PostgreSQLRoaringBitCacheHandler(PostgreSQLAbstractCacheHandler):
 
         table_name = f"{self.tableprefix}_cache_{partition_key}"
         self.cursor.execute(
-            sql.SQL("SELECT partition_keys FROM {0} WHERE query_hash = %s").format(sql.Identifier(table_name)),
+            sql.SQL("SELECT partition_keys::bytea FROM {0} WHERE query_hash = %s").format(sql.Identifier(table_name)),
             (key,),
         )
         result = self.cursor.fetchone()
@@ -201,7 +202,7 @@ class PostgreSQLRoaringBitCacheHandler(PostgreSQLAbstractCacheHandler):
     def get_intersected_sql(self, partition_key: str = "partition_key") -> sql.Composed:
         """Get intersection SQL for partition-specific table."""
         table_name = f"{self.tableprefix}_cache_{partition_key}"
-        return sql.SQL("SELECT rb_and_agg(partition_keys) FROM (SELECT partition_keys FROM {0} WHERE query_hash = ANY(%s)) AS selected").format(
+        return sql.SQL("SELECT rb_and_agg(partition_keys)::bytea FROM (SELECT partition_keys FROM {0} WHERE query_hash = ANY(%s)) AS selected").format(
             sql.Identifier(table_name)
         )
 

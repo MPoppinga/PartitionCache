@@ -206,457 +206,487 @@ def setup_database_objects(conn):
     queue_prefix = get_queue_table_prefix_from_env()
     with conn.cursor() as cur:
         cur.execute("SELECT partitioncache_initialize_processor_tables(%s)", [queue_prefix])
+        cur.execute("SELECT partitioncache_create_config_trigger(%s)", [queue_prefix])
 
     conn.commit()
     logger.info("PostgreSQL queue processor database objects created successfully")
 
 
-def setup_pg_cron_job(conn, table_prefix: str, queue_prefix: str, cache_backend: str, frequency: int = 1):
-    """Set up pg_cron job to process the queue."""
-    logger.info(f"Setting up pg_cron job with frequency: every {frequency} second(s) for backend '{cache_backend}'")
+def insert_initial_config(conn, job_name: str, table_prefix: str, queue_prefix: str, cache_backend: str, frequency: int, enabled: bool, timeout: int):
+    """Insert the initial configuration row which will trigger the cron job creation."""
+    logger.info(f"Inserting initial config for job '{job_name}'")
+    config_table = f"{queue_prefix}_processor_config"
 
     with conn.cursor() as cur:
-        # Remove existing job if any
-        cur.execute("""
-            DELETE FROM cron.job 
-            WHERE jobname = 'partitioncache_process_queue'
-        """)
-
-        # Use modern pg_cron syntax for second-level scheduling
-        if frequency < 60:
-            # Use the new "X seconds" syntax for frequencies under 60 seconds
-            schedule = f"{frequency} seconds"
-        else:
-            # For 60+ seconds, use traditional cron format (minutes)
-            schedule = f"*/{frequency // 60} * * * *"
-
-        command = sql.SQL("SELECT partitioncache_process_queue({}, {}, {})").format(
-            sql.Literal(table_prefix), sql.Literal(queue_prefix), sql.Literal(cache_backend)
+        # This will either insert a new config or do nothing if it already exists.
+        # The trigger will handle creating/updating the cron.job.
+        cur.execute(
+            sql.SQL(
+                """
+                INSERT INTO {} (job_name, table_prefix, queue_prefix, cache_backend, frequency_seconds, enabled, timeout_seconds)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (job_name) DO NOTHING
+                """
+            ).format(sql.Identifier(config_table)),
+            (job_name, table_prefix, queue_prefix, cache_backend, frequency, enabled, timeout),
         )
+    conn.commit()
+    logger.info("Initial configuration inserted successfully. Cron job should be synced.")
 
+
+def remove_all_processor_objects(conn, queue_prefix: str):
+    """Remove all processor-related tables, cron job and PartitionCache functions."""
+    logger.info("Removing all PostgreSQL queue processor objects and functions...")
+    config_table = f"{queue_prefix}_processor_config"
+    log_table = f"{queue_prefix}_processor_log"
+    active_jobs_table = f"{queue_prefix}_active_jobs"
+
+    with conn.cursor() as cur:
+        # Drop processor-specific tables first. The DELETE trigger on the config
+        # table will unschedule the cron job automatically.
+        cur.execute(sql.SQL("DROP TABLE IF EXISTS {} CASCADE").format(sql.Identifier(config_table)))
+        logger.info(f"Dropped table '{config_table}' (cron job should be removed by trigger if present).")
+        cur.execute(sql.SQL("DROP TABLE IF EXISTS {} CASCADE").format(sql.Identifier(log_table)))
+        logger.info(f"Dropped table '{log_table}'")
+        cur.execute(sql.SQL("DROP TABLE IF EXISTS {} CASCADE").format(sql.Identifier(active_jobs_table)))
+        logger.info(f"Dropped table '{active_jobs_table}'")
+
+        # Explicitly remove any remaining cron.job entry (in case trigger wasn't present)
+        cur.execute("DELETE FROM cron.job WHERE jobname = %s", ["partitioncache_process_queue"])  # best-effort
+
+        # Dynamically drop all functions beginning with 'partitioncache_'
+        logger.info("Dropping all functions with prefix 'partitioncache_' …")
         cur.execute(
             """
-            INSERT INTO cron.job (jobname, schedule, command)
-            VALUES (
-                'partitioncache_process_queue',
-                %s,
-                %s
-            )
-        """,
-            (schedule, command.as_string(conn)),
+            DO $$
+            DECLARE
+                rec RECORD;
+            BEGIN
+                FOR rec IN
+                    SELECT p.oid::regprocedure AS func_ident
+                    FROM pg_proc p
+                    JOIN pg_namespace n ON n.oid = p.pronamespace
+                    WHERE n.nspname = 'public' AND p.proname LIKE 'partitioncache_%'
+                LOOP
+                    EXECUTE format('DROP FUNCTION IF EXISTS %s CASCADE', rec.func_ident);
+                END LOOP;
+            END;$$;
+            """
         )
+        logger.info("All PartitionCache functions dropped.")
 
-        conn.commit()
-        logger.info(f"pg_cron job created successfully with schedule: {schedule}")
+    conn.commit()
+    logger.info("All processor objects and functions removed.")
 
 
-def remove_pg_cron_job(conn):
-    """Remove the pg_cron job."""
-    logger.info("Removing pg_cron job...")
-
+def enable_processor(conn, queue_prefix: str):
+    """Enable the queue processor job."""
+    logger.info("Enabling queue processor...")
     with conn.cursor() as cur:
-        cur.execute("""
-            DELETE FROM cron.job 
-            WHERE jobname = 'partitioncache_process_queue'
-        """)
-
-        rows_deleted = cur.rowcount
-        conn.commit()
-
-        if rows_deleted > 0:
-            logger.info("pg_cron job removed successfully")
-        else:
-            logger.info("No pg_cron job found to remove")
+        cur.execute("SELECT partitioncache_set_processor_enabled(true, %s, 'partitioncache_process_queue')", [queue_prefix])
+    conn.commit()
+    logger.info("Queue processor enabled.")
 
 
-def get_processor_status(conn, table_prefix: str, queue_prefix: str):
-    """Get the current status of the processor."""
+def disable_processor(conn, queue_prefix: str):
+    """Disable the queue processor job."""
+    logger.info("Disabling queue processor...")
     with conn.cursor() as cur:
-        cur.execute("SELECT * FROM partitioncache_get_processor_status(%s, %s)", [table_prefix, queue_prefix])
-        result = cur.fetchone()
+        cur.execute("SELECT partitioncache_set_processor_enabled(false, %s, 'partitioncache_process_queue')", [queue_prefix])
+    conn.commit()
+    logger.info("Queue processor disabled.")
 
-        if result:
-            return {
-                "enabled": result[0],
-                "max_parallel_jobs": result[1],
-                "frequency_seconds": result[2],
-                "active_jobs": result[3],
-                "queue_length": result[4],
-                "recent_successes": result[5],
-                "recent_failures": result[6],
-            }
-        return None
+
+def update_processor_config(
+    conn,
+    enabled: bool | None = None,
+    max_parallel_jobs: int | None = None,
+    frequency: int | None = None,
+    timeout: int | None = None,
+    table_prefix: str | None = None,
+    queue_prefix: str | None = None,
+):
+    """Update processor configuration."""
+    if all(arg is None for arg in [enabled, max_parallel_jobs, frequency, timeout, table_prefix]):
+        logger.warning("No configuration options provided to update.")
+        return
+
+    if queue_prefix is None:
+        queue_prefix = get_queue_table_prefix_from_env()
+
+    job_name = "partitioncache_process_queue"
+    logger.info(f"Updating processor configuration for job '{job_name}'...")
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT partitioncache_update_processor_config(%s, %s, %s, %s, %s, %s, %s)",
+            (job_name, enabled, max_parallel_jobs, frequency, timeout, table_prefix, queue_prefix),
+        )
+    conn.commit()
+    logger.info("Processor configuration updated successfully.")
+
+
+def handle_setup(conn, table_prefix: str, queue_prefix: str, cache_backend: str, frequency: int, enabled: bool, timeout: int):
+    """Handle the main setup logic."""
+    logger.info("Starting PostgreSQL queue processor setup...")
+    if not check_pg_cron_installed(conn):
+        logger.error("pg_cron extension is not installed. Please install it first.")
+        sys.exit(1)
+
+    setup_database_objects(conn)
+
+    job_name = "partitioncache_process_queue"
+    insert_initial_config(conn, job_name, table_prefix, queue_prefix, cache_backend, frequency, enabled, timeout)
+
+    logger.info("Setup complete. The processor job is created and configured via the config table.")
+
+
+def get_processor_status(conn, queue_prefix: str):
+    """Get basic processor status."""
+    logger.info("Fetching processor status...")
+    with conn.cursor() as cur:
+        cur.execute("SELECT * FROM partitioncache_get_processor_status(%s, %s)", [queue_prefix, "partitioncache_process_queue"])
+        status = cur.fetchone()
+        if status:
+            columns = [desc[0] for desc in cur.description]
+            return dict(zip(columns, status))
+    return None
 
 
 def get_processor_status_detailed(conn, table_prefix: str, queue_prefix: str):
-    """Get detailed processor status including queue and cache information."""
+    """Get detailed processor status."""
+    logger.info("Fetching detailed processor status...")
     with conn.cursor() as cur:
-        cur.execute("SELECT * FROM partitioncache_get_processor_status_detailed(%s, %s)", [table_prefix, queue_prefix])
-        result = cur.fetchone()
-
-        if result:
-            return {
-                "enabled": result[0],
-                "max_parallel_jobs": result[1],
-                "frequency_seconds": result[2],
-                "active_jobs": result[3],
-                "queue_length": result[4],
-                "recent_successes": result[5],
-                "recent_failures": result[6],
-                "total_partitions": result[7],
-                "partitions_with_cache": result[8],
-                "bit_cache_partitions": result[9],
-                "array_cache_partitions": result[10],
-                "uncreated_cache_partitions": result[11],
-            }
-        return None
+        cur.execute("SELECT * FROM partitioncache_get_processor_status_detailed(%s, %s, %s)", [table_prefix, queue_prefix, "partitioncache_process_queue"])
+        status = cur.fetchone()
+        if status:
+            columns = [desc[0] for desc in cur.description]
+            return dict(zip(columns, status))
+    return None
 
 
 def get_queue_and_cache_info(conn, table_prefix: str, queue_prefix: str):
-    """Get detailed information about queues and cache architecture."""
+    """Get detailed queue and cache info for all partitions."""
+    logger.info("Fetching queue and cache info...")
     with conn.cursor() as cur:
         cur.execute("SELECT * FROM partitioncache_get_queue_and_cache_info(%s, %s)", [table_prefix, queue_prefix])
         results = cur.fetchall()
-
-        return [
-            {
-                "partition_key": row[0],
-                "cache_table_name": row[1],
-                "cache_architecture": row[2],
-                "cache_column_type": row[3],
-                "bitsize": row[4],
-                "partition_datatype": row[5],
-                "queue_items": row[6],
-                "last_cache_update": row[7],
-                "cache_exists": row[8],
-            }
-            for row in results
-        ]
+        columns = [desc[0] for desc in cur.description]
+        return [dict(zip(columns, row)) for row in results]
 
 
 def print_status(status):
-    """Print PostgreSQL queue processor status in a readable format."""
+    """Print basic processor status."""
     if not status:
-        print("Processor not initialized")
+        print("Processor status not available. Is it set up?")
         return
 
-    print("\n=== PartitionCache PostgreSQL Queue Processor Status ===")
-    print(f"Enabled: {'Yes' if status['enabled'] else 'No'}")
-    print(f"Max Parallel Jobs: {status['max_parallel_jobs']}")
-    print(f"Frequency: Every {status['frequency_seconds']} second(s)")
-    print("\nCurrent State:")
-    print(f"  Active Jobs: {status['active_jobs']}")
-    print(f"  Queue Length: {status['queue_length']}")
-    print(f"  Recent Successes (5 min): {status['recent_successes']}")
-    print(f"  Recent Failures (5 min): {status['recent_failures']}")
+    print("--- PostgreSQL Processor Status ---")
+    print(f"  Job Name:           {status.get('job_name', 'N/A')}")
+    print(f"  Enabled:            {status.get('enabled', 'N/A')}")
+    print(f"  Cron Job Active:    {status.get('job_is_active', 'N/A')}")
+    print(f"  Cron Schedule:      {status.get('job_schedule', 'N/A')}")
+    print(f"  Max Parallel Jobs:  {status.get('max_parallel_jobs', 'N/A')}")
+    print(f"  Frequency (sec):    {status.get('frequency_seconds', 'N/A')}")
+    print(f"  Timeout (sec):      {status.get('timeout_seconds', 'N/A')}")
+    print(f"  Active Jobs:        {status.get('active_jobs_count', 'N/A')}")
+    print(f"  Cache Backend:      {status.get('cache_backend', 'N/A')}")
+    print(f"  Table Prefix:       {status.get('table_prefix', 'N/A')}")
+    print(f"  Queue Prefix:       {status.get('queue_prefix', 'N/A')}")
+    print(f"  Last Config Update: {status.get('updated_at', 'N/A')}")
+    print(f"  Command:            {status.get('job_command', 'N/A')}")
+    print("-----------------------------------")
 
 
 def print_detailed_status(status):
-    """Print detailed PostgreSQL queue processor status including queue and cache information."""
+    """Print detailed processor status."""
     if not status:
-        print("Processor not initialized")
+        print("Detailed processor status not available. Is it set up?")
         return
 
-    print("\n=== PartitionCache PostgreSQL Queue Processor - Detailed Status ===")
-    print(f"Enabled: {'Yes' if status['enabled'] else 'No'}")
-    print(f"Max Parallel Jobs: {status['max_parallel_jobs']}")
-    print(f"Frequency: Every {status['frequency_seconds']} second(s)")
+    print("--- PostgreSQL Processor Status (Detailed) ---")
+    print("\n[Processor Configuration]")
+    print(f"  Job Name:           {status.get('job_name', 'N/A')}")
+    print(f"  Enabled (in DB):    {status.get('enabled', 'N/A')}")
+    print(f"  Cron Job Active:    {status.get('job_is_active', 'N/A')}")
+    print(f"  Max Parallel Jobs:  {status.get('max_parallel_jobs', 'N/A')}")
+    print(f"  Frequency (sec):    {status.get('frequency_seconds', 'N/A')}")
+    print(f"  Cron Schedule:      {status.get('job_schedule', 'N/A')}")
 
-    print("\nCurrent Processing State:")
-    print(f"  Active Jobs: {status['active_jobs']}")
-    print(f"  Queue Length: {status['queue_length']}")
-    print(f"  Recent Successes (5 min): {status['recent_successes']}")
-    print(f"  Recent Failures (5 min): {status['recent_failures']}")
+    print("\n[Live Status]")
+    print(f"  Active Jobs:        {status.get('active_jobs_count', 'N/A')}")
+    print(f"  Queue Length:       {status.get('queue_length', 'N/A')}")
+    print(f"  Success (last 5m):  {status.get('recent_successes_5m', 'N/A')}")
+    print(f"  Failures (last 5m): {status.get('recent_failures_5m', 'N/A')}")
 
-    print("\nCache Architecture Overview:")
-    print(f"  Total Partitions: {status['total_partitions']}")
-    print(f"  Partitions with Cache: {status['partitions_with_cache']}")
-    print(f"  Bit Cache Partitions: {status['bit_cache_partitions']}")
-    print(f"  Array Cache Partitions: {status['array_cache_partitions']}")
-    print(f"  Uncreated Cache Partitions: {status['uncreated_cache_partitions']}")
+    print("\n[Cache Architecture Summary]")
+    print(f"  Total Partitions:      {status.get('total_partitions', 'N/A')}")
+    print(f"  Created Caches:        {status.get('partitions_with_cache', 'N/A')}")
+    print(f"    - RoaringBit:        {status.get('roaringbit_partitions', 'N/A')}")
+    print(f"    - Bit:               {status.get('bit_cache_partitions', 'N/A')}")
+    print(f"    - Array:             {status.get('array_cache_partitions', 'N/A')}")
+    print(f"  Uncreated Caches:      {status.get('uncreated_cache_partitions', 'N/A')}")
+
+    print("\n[Recent Logs (limit 10)]")
+    recent_logs = status.get("recent_logs")
+    if recent_logs:
+        for log in recent_logs:
+            execution_source = log.get("execution_source", "unknown")
+            execution_time = log.get("execution_time_ms", "N/A")
+            print(f"  - Job: {log.get('job_id')}, Status: {log.get('status')}, Source: {execution_source}, Time: {execution_time}ms")
+            print(f"    Created: {log.get('created_at')}")
+            if log.get("error_message"):
+                print(f"    Error: {log.get('error_message')}")
+    else:
+        print("  No recent logs found.")
+
+    print("\n[Active Job Details]")
+    active_jobs = status.get("active_job_details")
+    if active_jobs:
+        for job in active_jobs:
+            print(f"  - Job: {job.get('job_id')}, Hash: {job.get('query_hash')}, Partition: {job.get('partition_key')}, Started: {job.get('started_at')}")
+    else:
+        print("  No jobs currently active.")
+    print("--------------------------------------------")
 
 
 def print_queue_and_cache_info(queue_info):
-    """Print detailed queue and cache information."""
+    """Print detailed queue and cache info in a structured table."""
     if not queue_info:
-        print("No partition information found")
+        print("No partition information found.")
         return
 
-    print("\n=== Queue and Cache Architecture Details ===")
-    print(f"{'Partition Key':<20} {'Architecture':<12} {'Queue Items':<12} {'Cache Table':<25} {'Last Update':<20}")
-    print("-" * 100)
+    # Determine column widths
+    max_pk = max(len(r["partition_key"]) for r in queue_info) if queue_info else 13
+    max_ct = max(len(r["cache_table_name"]) for r in queue_info) if queue_info else 16
 
-    for info in queue_info:
-        partition_key = info["partition_key"] or "unknown"
-        architecture = info["cache_architecture"]
-        queue_items = info["queue_items"]
-        cache_table = info["cache_table_name"]
-        last_update = info["last_cache_update"].strftime("%Y-%m-%d %H:%M:%S") if info["last_cache_update"] else "never"
+    # Header
+    print(
+        f"{'Partition Key':<{max_pk}} | {'Queue Items':>12} | {'Cache Table':<{max_ct}} | {'Architecture':>14} | {'Datatype':>10} | {'Bitsize':>7} | {'Last Update':<26} | {'Exists'}"
+    )
+    print(f"{'-' * max_pk}-+-{'-' * 12}-+-{'-' * max_ct}-+-{'-' * 14}-+-{'-' * 10}-+-{'-' * 7}-+-{'-' * 26}-+--------")
 
-        # Color coding for architecture
-        arch_display = architecture
-        if architecture == "bit":
-            arch_display = f"bit({info['bitsize'] or 'unknown'})"
-        elif architecture == "not_created":
-            arch_display = "not created"
-
-        print(f"{partition_key:<20} {arch_display:<12} {queue_items:<12} {cache_table:<25} {last_update:<20}")
-
-    # Summary by architecture type
-    print("\n=== Architecture Summary ===")
-    arch_counts = {}
-    total_queue_items = 0
-
-    for info in queue_info:
-        arch = info["cache_architecture"]
-        arch_counts[arch] = arch_counts.get(arch, 0) + 1
-        total_queue_items += info["queue_items"]
-
-    for arch, count in arch_counts.items():
-        print(f"{arch.replace('_', ' ').title()}: {count} partition(s)")
-
-    print(f"Total Queue Items: {total_queue_items}")
-
-    # Show partition datatypes
-    datatypes = set(info["partition_datatype"] for info in queue_info if info["partition_datatype"])
-    if datatypes:
-        print(f"Partition Data Types: {', '.join(sorted(datatypes))}")
+    # Rows
+    for r in queue_info:
+        pk = r.get("partition_key", "N/A")
+        qi = r.get("queue_items", "N/A")
+        ct = r.get("cache_table_name", "N/A")
+        ca = r.get("cache_architecture", "N/A")
+        dt = r.get("partition_datatype", "N/A")
+        bs = r.get("bitsize", "N/A") or "-"
+        lu = r.get("last_cache_update", "N/A") or "N/A"
+        ce = "Yes" if r.get("cache_exists") else "No"
+        print(f"{pk:<{max_pk}} | {qi:>12} | {ct:<{max_ct}} | {ca:>14} | {dt:>10} | {bs:>7} | {str(lu):<26} | {ce}")
 
 
 def view_logs(conn, limit: int = 20, status_filter: str | None = None, queue_prefix: str | None = None):
-    """View recent processor logs."""
+    """View processor logs."""
     if queue_prefix is None:
         queue_prefix = get_queue_table_prefix_from_env()
 
     log_table = f"{queue_prefix}_processor_log"
-
-    query = sql.SQL("""
-        SELECT job_id, query_hash, partition_key, status, 
-               error_message, rows_affected, execution_time_ms, created_at
-        FROM {}
-        {}
-        ORDER BY created_at DESC
-        LIMIT %s
-    """)
-
-    where_clause = sql.SQL("")
-    params = [limit]
-
-    if status_filter:
-        where_clause = sql.SQL("WHERE status = %s")
-        params = [status_filter] + params
+    logger.info(f"Fetching logs from {log_table} (limit: {limit}, status: {status_filter or 'any'})")
 
     with conn.cursor() as cur:
-        cur.execute(query.format(sql.Identifier(log_table), where_clause), params)
-        logs = cur.fetchall()
+        query = sql.SQL("SELECT * FROM {}").format(sql.Identifier(log_table))
+        params = []
+        if status_filter:
+            query += sql.SQL(" WHERE status = %s")
+            params.append(status_filter)
+        query += sql.SQL(" ORDER BY created_at DESC LIMIT %s")
+        params.append(limit)
 
-        if not logs:
-            print("No logs found")
-            return
+        try:
+            cur.execute(query, params)
+            logs = cur.fetchall()
+            if not logs:
+                print("No logs found.")
+                return
 
-        print(f"\n=== Recent Processor Logs (limit: {limit}) ===")
-        for log in logs:
-            job_id, query_hash, partition_key, status, error_msg, rows, exec_time, created_at = log
-            print(f"\n[{created_at}] Job: {job_id}")
-            print(f"  Query Hash: {query_hash}, Partition: {partition_key}")
-            print(f"  Status: {status}")
-            if exec_time is not None:
-                print(f"  Execution Time: {exec_time}ms")
-            if rows is not None:
-                print(f"  Rows Affected: {rows}")
-            if error_msg:
-                print(f"  Error: {error_msg}")
+            columns = [desc[0] for desc in cur.description]
+            for log in logs:
+                log_dict = dict(zip(columns, log))
+                execution_source = log_dict.get("execution_source", "unknown")
+                execution_time = log_dict.get("execution_time_ms", "N/A")
+                print(
+                    f"[{log_dict['created_at']}] Job: {log_dict['job_id']} | Status: {log_dict['status']} | Source: {execution_source} | Time: {execution_time}ms | Partition: {log_dict.get('partition_key', 'N/A')}"
+                )
+                if log_dict.get("error_message"):
+                    print(f"  Error: {log_dict['error_message']}")
+
+        except psycopg.errors.UndefinedTable:
+            print(f"Error: Log table '{log_table}' not found. Please run setup first.")
+
+
+def manual_process_queue(conn, count: int):
+    """Manually process a number of items from the queue."""
+    logger.info(f"Manually processing up to {count} items from the queue...")
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT * FROM partitioncache_manual_process_queue(%s)",
+            (count,),
+        )
+        result = cur.fetchone()
+        if result:
+            print(f"Result: {result[1]} (Attempted to process: {result[0]})")
+        else:
+            print("No result from manual processing.")
+    conn.commit()
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Setup and manage PostgreSQL queue processor")
+    """Main function to handle CLI commands."""
+    # A parent parser for global options like --env that we need to process early
+    env_parser = argparse.ArgumentParser(add_help=False)
+    env_parser.add_argument("--env", default=".env", help="Path to the .env file to load.")
 
-    parser.add_argument("--env", type=str, help="Path to .env file", default=".env")
+    # Parse the --env argument first, ignoring other args
+    env_args, _ = env_parser.parse_known_args()
 
-    subparsers = parser.add_subparsers(dest="command", help="Command to run")
+    # Load .env file if specified and it exists
+    env_path = Path(env_args.env)
+    if env_path.is_file():
+        logger.info(f"Loading environment variables from {env_path}")
+        dotenv.load_dotenv(dotenv_path=env_path)
+    elif env_args.env != ".env":
+        # Only warn if a non-default path was given and not found
+        logger.warning(f"Specified environment file not found: {env_path}")
 
-    # Setup command
-    setup_parser = subparsers.add_parser("setup", help="Initialize the PostgreSQL queue processor")
-    setup_parser.add_argument("--table-prefix", default=None, help="Table prefix for cache tables (default: Based on Env Vars)")
-    setup_parser.add_argument("--skip-pg-cron", action="store_true", help="Skip pg_cron job creation (manual execution only)")
-
-    # Enable/disable commands
-    subparsers.add_parser("enable", help="Enable the processor")
-    subparsers.add_parser("disable", help="Disable the processor")
-
-    # Config command
-    config_parser = subparsers.add_parser("config", help="Update processor configuration")
-    config_parser.add_argument("--max-jobs", type=int, help="Maximum parallel jobs (1-20)")
-    config_parser.add_argument("--frequency", type=int, help="Execution frequency in seconds")
-
-    # Status command
-    subparsers.add_parser("status", help="Show processor status")
-
-    # Detailed status command
-    detailed_status_parser = subparsers.add_parser("status-detailed", help="Show detailed processor status with cache architecture info")
-    detailed_status_parser.add_argument("--table-prefix", default=None, help="Table prefix for cache tables (default: Based on Env Vars)")
-
-    # Queue info command
-    queue_info_parser = subparsers.add_parser("queue-info", help="Show detailed queue and cache architecture information")
-    queue_info_parser.add_argument("--table-prefix", default=None, help="Table prefix for cache tables (default: Based on Env Vars)")
-
-    # Logs command
-    logs_parser = subparsers.add_parser("logs", help="View processor logs")
-    logs_parser.add_argument("--limit", type=int, default=20, help="Number of log entries to show")
-    logs_parser.add_argument("--status", choices=["started", "success", "failed", "timeout"], help="Filter logs by status")
-
-    # Remove command
-    subparsers.add_parser("remove", help="Remove pg_cron job")
-
-    # Test command
-    test_parser = subparsers.add_parser("test", help="Test process a single item from queue")
-    test_parser.add_argument("--table-prefix", default=None, help="Table prefix for cache tables")
-
-    args = parser.parse_args()
-
-    if not args.command:
-        parser.print_help()
-        return
-
-    # Load environment
-    dotenv.load_dotenv(args.env)
-
-    # Automatically determine table prefix from environment if not explicitly provided
-    auto_table_prefix = get_table_prefix_from_env()
-
-    # Automatically determine cache backend from environment
-    try:
-        auto_cache_backend = get_cache_backend_from_env()
-    except ValueError as e:
-        logger.error(f"Configuration error: {e}")
+    # Validate environment after loading .env
+    is_valid, message = validate_environment()
+    if not is_valid:
+        logger.error(f"Environment validation failed: {message}")
         sys.exit(1)
 
-    # Validate environment for all commands
-    valid, message = validate_environment()
-    if not valid:
-        logger.error(f"Environment validation failed:\n{message}")
-        sys.exit(1)
+    # Main parser that inherits the --env option for help messages
+    parser = argparse.ArgumentParser(
+        description="Manage PostgreSQL queue processor for PartitionCache.",
+        parents=[env_parser],
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
 
-    # Get database connection
+    # setup command
+    setup_parser = subparsers.add_parser("setup", help="Setup database objects and pg_cron job")
+    setup_parser.add_argument("--frequency", type=int, default=1, help="Frequency in seconds to run the processor job (default: 1)")
+    setup_parser.add_argument("--timeout", type=int, default=1800, help="Timeout in seconds for processing jobs (default: 1800 = 30 minutes)")
+    setup_parser.add_argument(
+        "--enable-after-setup",
+        action="store_true",
+        help="Enable the processor immediately after setup (by default it is disabled)",
+    )
+    setup_parser.add_argument("--table-prefix", default=None, help="Table prefix for cache tables (default: based on env vars)")
+    setup_parser.set_defaults(
+        func=lambda args: handle_setup(
+            get_db_connection(),
+            args.table_prefix or get_table_prefix_from_env(),
+            get_queue_table_prefix_from_env(),
+            get_cache_backend_from_env(),
+            args.frequency,
+            args.enable_after_setup,
+            args.timeout,
+        )
+    )
+
+    # remove command
+    parser_remove = subparsers.add_parser("remove", help="Remove the pg_cron job and all processor tables")
+    parser_remove.set_defaults(func=lambda args: remove_all_processor_objects(get_db_connection(), get_queue_table_prefix_from_env()))
+
+    # enable command
+    parser_enable = subparsers.add_parser("enable", help="Enable the queue processor job")
+    parser_enable.set_defaults(func=lambda args: enable_processor(get_db_connection(), get_queue_table_prefix_from_env()))
+
+    # disable command
+    parser_disable = subparsers.add_parser("disable", help="Disable the queue processor job")
+    parser_disable.set_defaults(func=lambda args: disable_processor(get_db_connection(), get_queue_table_prefix_from_env()))
+
+    # update-config command
+    parser_update = subparsers.add_parser("update-config", help="Update processor configuration")
+    parser_update.add_argument("--enable", action=argparse.BooleanOptionalAction, help="Enable or disable the processor")
+    parser_update.add_argument("--max-parallel-jobs", type=int, help="New max parallel jobs limit")
+    parser_update.add_argument("--frequency", type=int, help="New frequency in seconds for the processor job")
+    parser_update.add_argument("--timeout", type=int, help="New timeout in seconds for processing jobs")
+    parser_update.add_argument("--table-prefix", type=str, help="New table prefix for the cache tables")
+    parser_update.set_defaults(
+        func=lambda args: update_processor_config(
+            get_db_connection(),
+            enabled=args.enable,
+            max_parallel_jobs=args.max_parallel_jobs,
+            frequency=args.frequency,
+            timeout=args.timeout,
+            table_prefix=args.table_prefix,
+            queue_prefix=get_queue_table_prefix_from_env(),
+        )
+    )
+
+    # status command
+    parser_status = subparsers.add_parser("status", help="Show basic processor status")
+    parser_status.set_defaults(
+        func=lambda args: print_status(
+            get_processor_status(
+                get_db_connection(),
+                get_queue_table_prefix_from_env(),
+            )
+        )
+    )
+
+    # status-detailed command
+    parser_status_detailed = subparsers.add_parser("status-detailed", help="Show detailed processor status")
+    parser_status_detailed.set_defaults(
+        func=lambda args: print_detailed_status(
+            get_processor_status_detailed(
+                get_db_connection(),
+                get_table_prefix_from_env(),
+                get_queue_table_prefix_from_env(),
+            )
+        )
+    )
+
+    # queue-info command
+    parser_queue_info = subparsers.add_parser("queue-info", help="Show detailed queue and cache info for each partition")
+    parser_queue_info.add_argument("--table-prefix", default=None, help="Table prefix for cache tables (default: based on env vars)")
+    parser_queue_info.set_defaults(
+        func=lambda args: print_queue_and_cache_info(
+            get_queue_and_cache_info(
+                get_db_connection(),
+                args.table_prefix or get_table_prefix_from_env(),
+                get_queue_table_prefix_from_env(),
+            )
+        )
+    )
+
+    # logs command
+    parser_logs = subparsers.add_parser("logs", help="View processor logs")
+    parser_logs.add_argument("-n", "--limit", type=int, default=20, help="Number of log entries to show")
+    parser_logs.add_argument("--status", type=str, help="Filter logs by status (e.g., success, failed)")
+    parser_logs.set_defaults(
+        func=lambda args: view_logs(
+            get_db_connection(),
+            limit=args.limit,
+            status_filter=args.status,
+            queue_prefix=get_queue_table_prefix_from_env(),
+        )
+    )
+
+    # manual-process command
+    parser_manual = subparsers.add_parser("manual-process", help="Manually trigger processing of queue items for testing")
+    parser_manual.add_argument("count", type=int, help="Number of items to process")
+    parser_manual.add_argument("--table-prefix", default=None, help="Table prefix for cache tables (default: based on env vars)")
+    parser_manual.set_defaults(
+        func=lambda args: manual_process_queue(
+            get_db_connection(),
+            args.count,
+        )
+    )
+
     try:
-        conn = get_db_connection()
+        # Parse all arguments and execute the corresponding function
+        args = parser.parse_args()
+        if hasattr(args, "func"):
+            args.func(args)
+        else:
+            parser.print_help()
     except Exception as e:
-        logger.error(f"Failed to connect to database: {e}")
+        logger.error(f"An error occurred: {e}", exc_info=True)
         sys.exit(1)
-
-    try:
-        if args.command == "setup":
-            # Use auto-detected table prefix if default was not changed
-            table_prefix = auto_table_prefix if args.table_prefix is None else args.table_prefix
-
-            print(f"Using table prefix: {table_prefix}")
-
-            # Check pg_cron
-            if not args.skip_pg_cron and not check_pg_cron_installed(conn):
-                logger.error("pg_cron extension not installed. Install it or use --skip-pg-cron for manual execution.")
-                sys.exit(1)
-
-            # Setup database objects
-            setup_database_objects(conn)
-
-            # Setup pg_cron job
-            if not args.skip_pg_cron:
-                queue_prefix = get_queue_table_prefix_from_env()
-                setup_pg_cron_job(conn, table_prefix, queue_prefix, auto_cache_backend)
-
-            print("\nPostgreSQL queue processor setup complete!")
-            print("Use 'setup_postgresql_queue_processor.py enable' to start processing")
-
-        elif args.command == "enable":
-            queue_prefix = get_queue_table_prefix_from_env()
-            with conn.cursor() as cur:
-                cur.execute("SELECT partitioncache_set_processor_enabled(true, %s)", [queue_prefix])
-                conn.commit()
-            print("Processor enabled")
-
-        elif args.command == "disable":
-            queue_prefix = get_queue_table_prefix_from_env()
-            with conn.cursor() as cur:
-                cur.execute("SELECT partitioncache_set_processor_enabled(false, %s)", [queue_prefix])
-                conn.commit()
-            print("Processor disabled")
-
-        elif args.command == "config":
-            params = []
-            values = []
-
-            if args.max_jobs is not None:
-                params.append("p_max_parallel_jobs => %s")
-                values.append(args.max_jobs)
-
-            if args.frequency is not None:
-                params.append("p_frequency_seconds => %s")
-                values.append(args.frequency)
-
-                # Update pg_cron job if frequency changed
-                if check_pg_cron_installed(conn):
-                    # Use auto-detected prefixes for pg_cron job update
-                    queue_prefix = get_queue_table_prefix_from_env()
-                    setup_pg_cron_job(conn, auto_table_prefix, queue_prefix, auto_cache_backend, args.frequency)
-
-            if params:
-                queue_prefix = get_queue_table_prefix_from_env()
-                params.append("p_queue_prefix => %s")
-                values.append(queue_prefix)
-
-                with conn.cursor() as cur:
-                    query = f"SELECT partitioncache_update_processor_config({', '.join(params)})"
-                    cur.execute(query, values)
-                    conn.commit()
-                print("Configuration updated")
-            else:
-                print("No configuration changes specified")
-
-        elif args.command == "status":
-            queue_prefix = get_queue_table_prefix_from_env()
-            status = get_processor_status(conn, auto_table_prefix, queue_prefix)
-            print_status(status)
-
-        elif args.command == "status-detailed":
-            queue_prefix = get_queue_table_prefix_from_env()
-            status = get_processor_status_detailed(conn, args.table_prefix or auto_table_prefix, queue_prefix)
-            print_detailed_status(status)
-
-        elif args.command == "queue-info":
-            queue_prefix = get_queue_table_prefix_from_env()
-            queue_info = get_queue_and_cache_info(conn, args.table_prefix or auto_table_prefix, queue_prefix)
-            print_queue_and_cache_info(queue_info)
-
-        elif args.command == "logs":
-            queue_prefix = get_queue_table_prefix_from_env()
-            view_logs(conn, args.limit, args.status, queue_prefix)
-
-        elif args.command == "remove":
-            remove_pg_cron_job(conn)
-
-        elif args.command == "test":
-            # Use auto-detected prefixes if not explicitly provided
-            table_prefix = args.table_prefix or auto_table_prefix
-            queue_prefix = get_queue_table_prefix_from_env()
-            cache_backend = auto_cache_backend
-
-            print(f"Testing PostgreSQL queue processor with table prefix: {table_prefix}, queue prefix: {queue_prefix}, backend: {cache_backend}")
-            with conn.cursor() as cur:
-                cur.execute(sql.SQL("SELECT * FROM partitioncache_process_queue_item(%s, %s, %s)"), [table_prefix, queue_prefix, cache_backend])
-                result = cur.fetchone()
-                if result:
-                    processed, message = result
-                    print(f"Processed: {processed}")
-                    print(f"Message: {message}")
-                else:
-                    print("No result from test")
-                conn.commit()
-
-    except Exception as e:
-        logger.error(f"Error: {e}")
-        sys.exit(1)
-    finally:
-        conn.close()
 
 
 if __name__ == "__main__":

@@ -1,9 +1,11 @@
 FROM postgis/postgis:16-3.4
 
-# Install build dependencies and pg_cron
+# 1. Install pg_cron and build dependencies.
 RUN apt-get update && \
-    apt-get install -y \
+    apt-get install -y --no-install-recommends \
+        # pg_cron
         postgresql-16-cron \
+        # Build dependencies
         build-essential \
         git \
         postgresql-server-dev-16 \
@@ -13,14 +15,25 @@ RUN apt-get update && \
         && \
     rm -rf /var/lib/apt/lists/*
 
-# Install pg_roaringbitmaps from source
+# 2. Build extensions from source.
 RUN cd /tmp && \
     git clone https://github.com/ChenHuajun/pg_roaringbitmap.git && \
     cd pg_roaringbitmap && \
     make && \
-    make install && \
-    cd / && \
-    rm -rf /tmp/pg_roaringbitmap
+    make install
 
-# Ensure the extensions are available in the default database
-# (You still need to run CREATE EXTENSION pg_cron; and CREATE EXTENSION roaringbitmap; in your DB)
+# 3. Clean up build dependencies and temporary build files.
+RUN apt-get purge -y --auto-remove \
+        build-essential \
+        git \
+        postgresql-server-dev-16 \
+        libc6-dev \
+        llvm-13 \
+        clang-13 \
+        libkrb5-dev && \
+    rm -rf /tmp/*
+
+# Copy the initialization script to be run by the official postgres entrypoint.
+COPY init-db.sh /docker-entrypoint-initdb.d/
+
+
