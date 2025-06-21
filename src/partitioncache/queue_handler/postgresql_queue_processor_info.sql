@@ -395,7 +395,7 @@ BEGIN
                 schedule,
                 command
             FROM cron.job
-            WHERE jobname LIKE %L || ''_%''
+            WHERE jobname LIKE %L || %L
         )
         SELECT
             conf.job_name,
@@ -415,7 +415,7 @@ BEGIN
             %I conf
         WHERE
             conf.job_name = %L',
-        p_job_name, p_queue_prefix, v_config_table, p_job_name
+        p_job_name, '_%', p_queue_prefix, v_config_table, p_job_name
     );
 END;
 $$ LANGUAGE plpgsql;
@@ -454,37 +454,47 @@ BEGIN
     v_config_table := p_queue_prefix || '_processor_config';
 
     RETURN QUERY
-    SELECT
-        s.job_name,
-        s.enabled,
-        s.max_parallel_jobs,
-        s.frequency_seconds,
-        s.job_is_active,
-        s.job_schedule,
-        s.active_jobs_count,
-        (SELECT COUNT(*)::INTEGER FROM public.partitioncache_queue_query_fragment_queue),
-        (SELECT COUNT(*)::INTEGER FROM partitioncache_get_log_info(p_queue_prefix) WHERE status = 'success' AND created_at > NOW() - INTERVAL '5 minutes'),
-        (SELECT COUNT(*)::INTEGER FROM partitioncache_get_log_info(p_queue_prefix) WHERE status = 'failed' AND created_at > NOW() - INTERVAL '5 minutes'),
-        COALESCE(ca.total_partitions, 0),
-        COALESCE(ca.partitions_with_cache, 0),
-        COALESCE(ca.roaringbit_partitions, 0),
-        COALESCE(ca.bit_partitions, 0),
-        COALESCE(ca.array_partitions, 0),
-        COALESCE(ca.uncreated_partitions, 0),
-        (SELECT json_agg(log_info) FROM (SELECT * FROM partitioncache_get_log_info(p_queue_prefix) LIMIT 10) log_info),
-        (SELECT json_agg(active_jobs_info) FROM (SELECT * FROM partitioncache_get_active_jobs_info(p_queue_prefix)) active_jobs_info)
-    FROM
-        partitioncache_get_processor_status(p_queue_prefix, p_job_name) s,
-        LATERAL (
-            SELECT
-                COUNT(*)::INTEGER AS total_partitions,
-                COUNT(*) FILTER (WHERE cache_exists)::INTEGER AS partitions_with_cache,
-                COUNT(*) FILTER (WHERE cache_architecture = 'roaringbit')::INTEGER AS roaringbit_partitions,
-                COUNT(*) FILTER (WHERE cache_architecture = 'bit')::INTEGER AS bit_partitions,
-                COUNT(*) FILTER (WHERE cache_architecture = 'array')::INTEGER AS array_partitions,
-                COUNT(*) FILTER (WHERE cache_architecture = 'not_created')::INTEGER AS uncreated_partitions
-            FROM partitioncache_get_queue_and_cache_info(p_table_prefix, p_queue_prefix)
-        ) ca;
+    EXECUTE format(
+        'SELECT
+            s.job_name,
+            s.enabled,
+            s.max_parallel_jobs,
+            s.frequency_seconds,
+            s.job_is_active,
+            s.job_schedule,
+            s.active_jobs_count,
+            (SELECT COUNT(*)::INTEGER FROM %I) as queue_length,
+            (SELECT COUNT(*)::INTEGER FROM partitioncache_get_log_info(%L) WHERE status = %L AND created_at > NOW() - INTERVAL %L) as recent_successes_5m,
+            (SELECT COUNT(*)::INTEGER FROM partitioncache_get_log_info(%L) WHERE status = %L AND created_at > NOW() - INTERVAL %L) as recent_failures_5m,
+            COALESCE(ca.total_partitions, 0),
+            COALESCE(ca.partitions_with_cache, 0),
+            COALESCE(ca.roaringbit_partitions, 0),
+            COALESCE(ca.bit_partitions, 0),
+            COALESCE(ca.array_partitions, 0),
+            COALESCE(ca.uncreated_partitions, 0),
+            (SELECT json_agg(log_info) FROM (SELECT * FROM partitioncache_get_log_info(%L) LIMIT 10) log_info) as recent_logs,
+            (SELECT json_agg(active_jobs_info) FROM (SELECT * FROM partitioncache_get_active_jobs_info(%L)) active_jobs_info) as active_job_details
+        FROM
+            partitioncache_get_processor_status(%L, %L) s,
+            LATERAL (
+                SELECT
+                    COUNT(*)::INTEGER AS total_partitions,
+                    COUNT(*) FILTER (WHERE cache_exists)::INTEGER AS partitions_with_cache,
+                    COUNT(*) FILTER (WHERE cache_architecture = %L)::INTEGER AS roaringbit_partitions,
+                    COUNT(*) FILTER (WHERE cache_architecture = %L)::INTEGER AS bit_partitions,
+                    COUNT(*) FILTER (WHERE cache_architecture = %L)::INTEGER AS array_partitions,
+                    COUNT(*) FILTER (WHERE cache_architecture = %L)::INTEGER AS uncreated_partitions
+                FROM partitioncache_get_queue_and_cache_info(%L, %L)
+            ) ca',
+        v_queue_table, 
+        p_queue_prefix, 'success', '5 minutes',
+        p_queue_prefix, 'failed', '5 minutes',
+        p_queue_prefix, 
+        p_queue_prefix, 
+        p_queue_prefix, p_job_name, 
+        'roaringbit', 'bit', 'array', 'not_created',
+        p_table_prefix, p_queue_prefix
+    );
 END;
 
 $$ LANGUAGE plpgsql;

@@ -61,7 +61,7 @@ class TestEnvironmentValidation:
         with patch.dict(os.environ, env, clear=True):
             valid, message = validate_environment()
             assert not valid
-            assert "only supports postgresql_array or postgresql_bit" in message
+            assert "Unsupported CACHE_BACKEND for direct processor" in message
 
     def test_validate_environment_success(self):
         """Test validation succeeds with correct configuration."""
@@ -77,6 +77,7 @@ class TestEnvironmentValidation:
             "DB_PASSWORD": "pass",
             "DB_NAME": "testdb",
             "CACHE_BACKEND": "postgresql_array",
+            "PG_ARRAY_CACHE_TABLE_PREFIX": "partitioncache",
         }
         with patch.dict(os.environ, env, clear=True):
             valid, message = validate_environment()
@@ -134,8 +135,17 @@ class TestProcessorStatus:
             50,  # recent_successes
             3,  # recent_failures
         )
+        mock_cursor.description = [
+            ("enabled",),
+            ("max_parallel_jobs",),
+            ("frequency_seconds",),
+            ("active_jobs",),
+            ("queue_length",),
+            ("recent_successes",),
+            ("recent_failures",),
+        ]
 
-        status = get_processor_status(mock_conn, "partitioncache", "partitioncache_queue")
+        status = get_processor_status(mock_conn, "partitioncache_queue")
 
         assert status is not None
         assert status["enabled"] is True
@@ -154,7 +164,7 @@ class TestProcessorStatus:
         mock_conn.cursor.return_value.__exit__ = Mock(return_value=None)
         mock_cursor.fetchone.return_value = None
 
-        status = get_processor_status(mock_conn, "partitioncache", "partitioncache_queue")
+        status = get_processor_status(mock_conn, "partitioncache_queue")
         assert status is None
 
 
@@ -208,11 +218,12 @@ class TestDatabaseOperations:
         mock_get_cache_handler.assert_called_once_with("postgresql_array")
         mock_cache_handler.close.assert_called_once()
 
-        # Verify SQL execution - should be called three times:
+        # Verify SQL execution - should be called four times:
         # 1. Main SQL file content
         # 2. Info SQL file content
         # 3. partitioncache_initialize_processor_tables function call
-        assert mock_cursor.execute.call_count == 3
+        # 4. partitioncache_create_config_trigger function call
+        assert mock_cursor.execute.call_count == 4
 
         # Check the first call (main SQL content)
         first_call = mock_cursor.execute.call_args_list[0]
@@ -227,28 +238,30 @@ class TestDatabaseOperations:
         assert "SELECT partitioncache_initialize_processor_tables(%s)" in third_call[0][0]
         assert third_call[0][1] == ["partitioncache_queue"]
 
+        # Check the fourth call (partitioncache_create_config_trigger)
+        fourth_call = mock_cursor.execute.call_args_list[3]
+        assert "SELECT partitioncache_create_config_trigger(%s)" in fourth_call[0][0]
+        assert fourth_call[0][1] == ["partitioncache_queue"]
+
         mock_conn.commit.assert_called_once()
 
-    def test_setup_pg_cron_job(self):
-        """Test setting up pg_cron job."""
-        from partitioncache.cli.setup_postgresql_queue_processor import setup_pg_cron_job
+    def test_insert_initial_config(self):
+        """Test inserting initial configuration."""
+        from partitioncache.cli.setup_postgresql_queue_processor import insert_initial_config
 
         mock_conn = Mock()
         mock_cursor = Mock()
         mock_conn.cursor.return_value.__enter__ = Mock(return_value=mock_cursor)
         mock_conn.cursor.return_value.__exit__ = Mock(return_value=None)
 
-        # Test with 1 second frequency
-        setup_pg_cron_job(mock_conn, "partitioncache", "partitioncache_queue", 1)
+        # Test inserting configuration
+        insert_initial_config(mock_conn, "partitioncache_process_queue", "partitioncache", "partitioncache_queue", "array", 1, True, 1800)
 
-        # Should delete existing job and create new one
-        assert mock_cursor.execute.call_count == 2
-        delete_call = mock_cursor.execute.call_args_list[0]
-        assert "DELETE FROM cron.job" in delete_call[0][0]
-
-        insert_call = mock_cursor.execute.call_args_list[1]
-        assert "INSERT INTO cron.job" in insert_call[0][0]
-        assert "partitioncache_process_queue" in str(insert_call)
+        # Should execute INSERT statement
+        assert mock_cursor.execute.call_count == 1
+        insert_call = mock_cursor.execute.call_args_list[0]
+        assert "INSERT INTO" in str(insert_call[0][0])
+        assert "partitioncache_queue_processor_config" in str(insert_call[0][0])
 
         mock_conn.commit.assert_called_once()
 
@@ -256,15 +269,19 @@ class TestDatabaseOperations:
 class TestCLIIntegration:
     """Test CLI integration points."""
 
+    @patch("partitioncache.cli.setup_postgresql_queue_processor.get_queue_table_prefix_from_env")
     @patch("partitioncache.cli.setup_postgresql_queue_processor.get_db_connection")
     @patch("partitioncache.cli.setup_postgresql_queue_processor.validate_environment")
     @patch("partitioncache.cli.setup_postgresql_queue_processor.dotenv.load_dotenv")
-    def test_main_status_command(self, mock_load_env, mock_validate, mock_get_conn):
+    def test_main_status_command(self, mock_load_env, mock_validate, mock_get_conn, mock_get_queue_prefix):
         """Test the status command."""
         from partitioncache.cli.setup_postgresql_queue_processor import main
 
         # Mock environment validation
         mock_validate.return_value = (True, "OK")
+
+        # Mock environment functions
+        mock_get_queue_prefix.return_value = "partitioncache_queue"
 
         # Mock database connection
         mock_conn = Mock()
@@ -273,14 +290,24 @@ class TestCLIIntegration:
         mock_conn.cursor.return_value.__enter__ = Mock(return_value=mock_cursor)
         mock_conn.cursor.return_value.__exit__ = Mock(return_value=None)
         mock_cursor.fetchone.return_value = (True, 5, 1, 0, 0, 0, 0)
+        mock_cursor.description = [
+            ("enabled",),
+            ("max_parallel_jobs",),
+            ("frequency_seconds",),
+            ("active_jobs",),
+            ("queue_length",),
+            ("recent_successes",),
+            ("recent_failures",),
+        ]
 
         # Mock command line arguments
         with patch("sys.argv", ["setup_postgresql_queue_processor.py", "status"]):
             main()
 
-        # Should execute status query with both prefixes
-        mock_cursor.execute.assert_called_with("SELECT * FROM partitioncache_get_processor_status(%s, %s)", ["partitioncache", "partitioncache_queue"])
-        mock_conn.close.assert_called_once()
+        # Should execute status query with queue prefix only
+        mock_cursor.execute.assert_called_with(
+            "SELECT * FROM partitioncache_get_processor_status(%s, %s)", ["partitioncache_queue", "partitioncache_process_queue"]
+        )
 
     @patch("partitioncache.cli.setup_postgresql_queue_processor.get_db_connection")
     @patch("partitioncache.cli.setup_postgresql_queue_processor.validate_environment")
