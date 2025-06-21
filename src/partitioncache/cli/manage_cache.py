@@ -184,7 +184,7 @@ def copy_cache(from_cache_type: str, to_cache_type: str):
 
     for key in tqdm(all_keys, desc="Copying cache", unit="key"):
         # Skip prefixed entries
-        if key.find("_LIMIT_") == 0 or key.find("_TIMEOUT_") == 0:
+        if key.startswith("_LIMIT_") or key.startswith("_TIMEOUT_"):
             prefixed_skipped += 1
             continue
 
