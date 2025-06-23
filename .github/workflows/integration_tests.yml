@@ -1,0 +1,144 @@
+name: Integration Tests
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  integration-test:
+    runs-on: ubuntu-latest
+    
+    services:
+      postgres:
+        # Use our custom PostgreSQL + pg_cron container
+        image: postgres-with-pgcron:latest
+        options: >-
+          --build .github/docker/postgres-cron
+          --health-cmd "pg_isready -U test_user -d test_db"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        env:
+          POSTGRES_DB: test_db
+          POSTGRES_USER: test_user
+          POSTGRES_PASSWORD: test_password
+        ports:
+          - 5432:5432
+          
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -e ".[testing,db]"
+
+    - name: Set up test environment
+      env:
+        PG_HOST: localhost
+        PG_PORT: 5432
+        PG_USER: test_user
+        PG_PASSWORD: test_password
+        PG_DBNAME: test_db
+        REDIS_HOST: localhost
+        REDIS_PORT: 6379
+        CACHE_BACKEND: postgresql_array
+        QUERY_QUEUE_PROVIDER: postgresql
+      run: |
+        # Verify database connectivity
+        python -c "import psycopg; psycopg.connect('postgresql://test_user:test_password@localhost:5432/test_db')"
+        
+        # Setup PartitionCache tables
+        python -m partitioncache.cli.manage_cache setup all
+
+    - name: Run unit tests
+      env:
+        PG_HOST: localhost
+        PG_PORT: 5432
+        PG_USER: test_user
+        PG_PASSWORD: test_password
+        PG_DBNAME: test_db
+        REDIS_HOST: localhost
+        REDIS_PORT: 6379
+        CACHE_BACKEND: postgresql_array
+        QUERY_QUEUE_PROVIDER: postgresql
+        CI: true
+      run: |
+        python -m pytest tests/pytest/ -v --tb=short --timeout=60
+        
+    - name: Run integration tests (core)
+      env:
+        PG_HOST: localhost
+        PG_PORT: 5432
+        PG_USER: test_user
+        PG_PASSWORD: test_password
+        PG_DBNAME: test_db
+        REDIS_HOST: localhost
+        REDIS_PORT: 6379
+        CACHE_BACKEND: postgresql_array
+        QUERY_QUEUE_PROVIDER: postgresql
+        PYTEST_TIMEOUT: 300
+        CI: true
+      run: |
+        python -m pytest tests/integration/test_cache_backends.py tests/integration/test_cli.py -v --tb=short --timeout=300
+        
+    - name: Run integration tests (queue & workflows)
+      env:
+        PG_HOST: localhost
+        PG_PORT: 5432
+        PG_USER: test_user
+        PG_PASSWORD: test_password
+        PG_DBNAME: test_db
+        REDIS_HOST: localhost
+        REDIS_PORT: 6379
+        CACHE_BACKEND: postgresql_array
+        QUERY_QUEUE_PROVIDER: postgresql
+        PYTEST_TIMEOUT: 600
+        CI: true
+      run: |
+        python -m pytest tests/integration/test_queue_processor.py tests/integration/test_end_to_end_workflows.py -v --tb=short --timeout=600
+        
+    - name: Run performance & stress tests
+      if: github.event_name == 'push'  # Only on push, not PR
+      env:
+        PG_HOST: localhost
+        PG_PORT: 5432
+        PG_USER: test_user
+        PG_PASSWORD: test_password
+        PG_DBNAME: test_db
+        REDIS_HOST: localhost
+        REDIS_PORT: 6379
+        CACHE_BACKEND: postgresql_array
+        QUERY_QUEUE_PROVIDER: postgresql
+        PYTEST_TIMEOUT: 900
+        CI: true
+      run: |
+        python -m pytest tests/integration/test_cache_performance.py tests/integration/test_error_recovery.py -v --tb=short --timeout=900 -m "not slow"
+        
+    - name: Upload test results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: test-results
+        path: |
+          pytest-results.xml
+          coverage.xml
+        retention-days: 30

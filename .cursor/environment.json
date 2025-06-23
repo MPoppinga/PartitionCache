@@ -1,0 +1,6 @@
+{
+  "snapshot": "POPULATED_FROM_SETTINGS",
+  "install": "pip install -e '.[testing,db]'",
+  "start": "",
+  "terminals": []
+}
