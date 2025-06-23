@@ -206,7 +206,7 @@ def export_cache(cache_type: str, archive_file: str):
     all_keys = get_all_keys(cache)
 
     # skip prefixed entries
-    all_keys = [key for key in all_keys if not (key.find("_LIMIT_") == 0 or key.find("_TIMEOUT_") == 0)]
+    all_keys = [key for key in all_keys if not (key.startswith("_LIMIT_") or key.startswith("_TIMEOUT_"))]
 
     with open(archive_file, "wb") as file:
         for key in tqdm(all_keys, desc="Exporting cache", unit="key"):
