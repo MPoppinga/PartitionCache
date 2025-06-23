@@ -207,14 +207,16 @@ class PostgreSQLRoaringBitCacheHandler(PostgreSQLAbstractCacheHandler):
         )
 
     def get_intersected_sql_wk(self, keys, partition_key: str = "partition_key") -> str:
-        """Get intersection SQL with keys for partition-specific table. Using IN clause."""
+        """Get intersection SQL with keys for partition-specific table. Using ANY with properly escaped literals."""
         table_name = f"{self.tableprefix}_cache_{partition_key}"
-        in_part = "','".join(list(keys))
+        # Use sql.Literal for each key to properly escape them and build array
+        escaped_keys = [sql.Literal(key) for key in keys]
+        keys_part = sql.SQL("ARRAY[{}]").format(sql.SQL(", ").join(escaped_keys))
         return (
-            sql.SQL("SELECT rb_and_agg(partition_keys) AS rb_result FROM (SELECT partition_keys FROM {0} WHERE query_hash IN ('{1}')) AS selected")
+            sql.SQL("SELECT rb_and_agg(partition_keys) AS rb_result FROM (SELECT partition_keys FROM {0} WHERE query_hash = ANY({1})) AS selected")
             .format(
                 sql.Identifier(table_name),
-                sql.SQL(in_part),
+                keys_part,
             )
             .as_string()
         )

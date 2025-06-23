@@ -13,6 +13,8 @@ logger = getLogger("PartitionCache")
 
 
 class PostgreSQLArrayCacheHandler(PostgreSQLAbstractCacheHandler):
+    USE_AGGREGATES = True
+
     @classmethod
     def get_supported_datatypes(cls) -> Set[str]:
         """PostgreSQL array handler supports all datatypes."""
@@ -24,12 +26,45 @@ class PostgreSQLArrayCacheHandler(PostgreSQLAbstractCacheHandler):
     def __init__(self, db_name, db_host, db_user, db_password, db_port, db_tableprefix) -> None:
         super().__init__(db_name, db_host, db_user, db_password, db_port, db_tableprefix)
 
-        # Try to create intarray extension safely
+        # Ensure intarray extension is present for integer-specific operators and indexes.
         try:
             self.cursor.execute("CREATE EXTENSION IF NOT EXISTS intarray;")
             self.db.commit()
         except Exception as e:
-            logger.warning(f"Failed to create intarray extension (this is optional): {e}")
+            logger.warning(f"Failed to create intarray extension (this is optional but recommended for integer intersections): {e}")
+
+        self.array_intersect_agg_available = False
+
+        # Create custom aggregate for array intersection if it doesn't exist.
+        try:
+            self.cursor.execute(
+                """
+                CREATE OR REPLACE FUNCTION _array_intersect(anyarray, anyarray)
+                RETURNS anyarray AS $$
+                    SELECT CASE 
+                        WHEN $1 IS NULL THEN $2
+                        WHEN $2 IS NULL THEN $1
+                        ELSE ARRAY(SELECT unnest($1) INTERSECT SELECT unnest($2) ORDER BY 1)
+                    END;
+                $$ LANGUAGE sql IMMUTABLE;
+            """
+            )
+            # Drop aggregate if it exists to recreate it, as CREATE AGGREGATE IF NOT EXISTS is not available.
+            self.cursor.execute("DROP AGGREGATE IF EXISTS array_intersect_agg(anyarray);")
+            self.cursor.execute(
+                """
+                CREATE AGGREGATE array_intersect_agg(anyarray) (
+                    SFUNC = _array_intersect,
+                    STYPE = anyarray
+                );
+            """
+            )
+            self.db.commit()
+            self.array_intersect_agg_available = True
+        except Exception as e:
+            logger.warning(f"Failed to create custom array_intersect_agg. Performance for non-integer arrays might be suboptimal. Error: {e}")
+            if self.db.closed is False:
+                self.db.rollback()
 
         try:
             self.cursor.execute(
@@ -228,7 +263,7 @@ class PostgreSQLArrayCacheHandler(PostgreSQLAbstractCacheHandler):
 
             t = time.time()
             query: sql.Composed = self.get_intersected_sql(filtered_keys, partition_key, datatype)
-            logger.debug(query.as_string())
+            logger.debug(query.as_string(self.cursor))
             self.cursor.execute(query)
 
             result = self.cursor.fetchone()
@@ -265,6 +300,12 @@ class PostgreSQLArrayCacheHandler(PostgreSQLAbstractCacheHandler):
         table_name = f"{self.tableprefix}_cache_{partition_key}"
         keys_list = list(keys)
 
+        if self.USE_AGGREGATES and self.array_intersect_agg_available:
+            return sql.SQL("SELECT array_intersect_agg(partition_keys) FROM {0} WHERE query_hash = ANY({1})").format(
+                sql.Identifier(table_name), sql.Literal(keys_list)
+            )
+
+        # Fallback to original implementation
         if datatype == "integer":
             # Use intarray intersection for integers
             select_parts = [sql.SQL("({})").format(sql.SQL(" & ").join(sql.Identifier(f"k{i}", "partition_keys") for i in range(len(keys_list))))]
