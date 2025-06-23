@@ -112,6 +112,8 @@ def generate_tuples(
     if follow_graph:
         # Gett all variants with are connected to each other
         g = nx.Graph(edges)
+        # Add all table aliases as nodes, even if there are no edges
+        g.add_nodes_from(table_aliases)
         result = all_connected_subgraphs(g, min_component_size, 15)
     else:
         # Get all Permuations

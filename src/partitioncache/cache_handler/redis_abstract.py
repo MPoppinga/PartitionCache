@@ -125,7 +125,7 @@ class RedisAbstractCacheHandler(AbstractCacheHandler):
             query_data = {"query": querytext, "partition_key": partition_key, "last_seen": str(datetime.now())}
             self.db.hset(query_key, mapping=query_data)
             return True
-        except Exception as e:
+        except Exception:
             return False
 
     def close(self) -> None:

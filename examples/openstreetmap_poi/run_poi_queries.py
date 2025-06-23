@@ -125,14 +125,14 @@ def test_partition_key(conn, partition_key: str, datatype: str = "integer"):
                             f"{elapsed_cached:.3f} seconds (cache hash matches: {nr_used_hashes})"
                         )
 
-                        # Test full integration with apply_cache_lazy
+                        # Test apply_cache_lazy (regular - no p0 table)
                         start_cache = time.perf_counter()
                         sql_cached, stats = partitioncache.apply_cache_lazy(
                             query=sql_query,
                             cache_handler=cache.underlying_handler,
                             partition_key=partition_key,
                             method="TMP_TABLE_IN",
-                            p0_alias="p1",
+                            p0_alias="p1",  # Specify which table to apply cache restrictions to
                             min_component_size=1,
                         )
                         elapsed_cache_get = time.perf_counter() - start_cache
@@ -142,6 +142,28 @@ def test_partition_key(conn, partition_key: str, datatype: str = "integer"):
                             f"With apply_cache_lazy: {len(rows_cached)} results in {elapsed_cache_get:.3f} + "
                             f"{elapsed_cached:.3f} seconds (generated: {stats['generated_variants']}, "
                             f"hits: {stats['cache_hits']}, enhanced: {stats['enhanced']})"
+                        )
+
+                        # Test apply_cache_lazy with p0 table (star-schema pattern)
+                        # Cache restrictions automatically target the p0 table when use_p0_table=True
+                        start_cache = time.perf_counter()
+                        sql_cached, stats = partitioncache.apply_cache_lazy(
+                            query=sql_query,
+                            cache_handler=cache.underlying_handler,
+                            partition_key=partition_key,
+                            method="TMP_TABLE_IN",
+                            min_component_size=1,
+                            use_p0_table=True,
+                            p0_alias="p0",
+                        )
+                        print(sql_cached)
+                        elapsed_cache_get = time.perf_counter() - start_cache
+                        rows_cached, elapsed_cached = run_query(conn, sql_cached)
+
+                        print(
+                            f"With apply_cache_lazy + p0 table: {len(rows_cached)} results in {elapsed_cache_get:.3f} + "
+                            f"{elapsed_cached:.3f} seconds (generated: {stats['generated_variants']}, "
+                            f"hits: {stats['cache_hits']}, enhanced: {stats['enhanced']}, p0: {stats['p0_rewritten']})"
                         )
 
     except ValueError as e:

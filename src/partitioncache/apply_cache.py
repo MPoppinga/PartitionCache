@@ -99,15 +99,130 @@ def get_partition_keys_lazy(
     return lazy_cache_subquery, len(hashses), used_hashes
 
 
-def find_p0_alias(query: str) -> str:
+def find_p0_alias(query: str, partition_key: str) -> str:
     """
-    Find the alias of the first table in the query.
+    Find the appropriate table alias for cache restrictions.
+
+    If a p0 table exists (e.g., partition_key_mv as p0), use that.
+    Otherwise, use the first table in the query.
     """
-    x = sqlglot.parse_one(query)
-    table = x.find(exp.Table)
-    if table is None:
+    parsed_query = sqlglot.parse_one(query)
+
+    # First check for p0 table (star-schema pattern)
+    for table in parsed_query.find_all(exp.Table):
+        alias = table.alias if table.alias else table.name
+        table_name = table.name if hasattr(table, "name") else str(table.this)
+
+        # Check if this is a p0 table (ends with _mv and matches partition_key)
+        if table_name == f"{partition_key}_mv" or alias == "p0":
+            return alias
+
+    # Fallback to first table
+    first_table = parsed_query.find(exp.Table)
+    if first_table is None:
         raise ValueError("No table found in query")
-    return table.alias_or_name
+    return first_table.alias_or_name
+
+
+def rewrite_query_with_p0_table(
+    query: str,
+    partition_key: str,
+    mv_table_name: str | None = None,
+    p0_alias: str = "p0",
+) -> str:
+    """
+    Rewrite a query to use a star-schema pattern with a p0 table for better optimizer decisions.
+
+    Transforms multi-table queries to use a central p0 table, converting:
+    SELECT * FROM tt AS t1, tt AS t2 WHERE t1.partition_key = t2.partition_key
+
+    Into:
+    SELECT * FROM tt AS t1, tt AS t2, partition_key_mv AS p0
+    WHERE t1.partition_key = p0.partition_key AND t2.partition_key = p0.partition_key
+
+    Args:
+        query (str): The original SQL query to rewrite.
+        partition_key (str): The identifier for the partition.
+        mv_table_name (str | None): Name of the materialized view table. Defaults to {partition_key}_mv.
+        p0_alias (str): Alias name for the p0 table. Defaults to "p0".
+
+    Returns:
+        str: The rewritten query with star-schema p0 table integration.
+    """
+    if mv_table_name is None:
+        mv_table_name = f"{partition_key}_mv"
+
+    parsed_query = sqlglot.parse_one(query)
+
+    # Check if p0 table already exists
+    existing_tables = [table.name for table in parsed_query.find_all(exp.Table)]
+    if mv_table_name in existing_tables:
+        return query
+
+    # Find all table aliases that have partition_key joins
+    table_aliases_with_partition_key = []
+    for table in parsed_query.find_all(exp.Table):
+        alias = table.alias if table.alias else table.name
+        table_aliases_with_partition_key.append(alias)
+
+    if not table_aliases_with_partition_key:
+        return query
+
+    # Add p0 table to FROM clause
+    from_clause = parsed_query.find(exp.From)
+    if from_clause is None:
+        return query
+
+    # Convert to comma-separated tables format including p0
+    current_table = from_clause.this
+    from_clause.set("this", exp.Table(this=f"{current_table.sql()}, {mv_table_name} AS {p0_alias}"))
+
+    # Remove existing partition_key join conditions and replace with star-schema joins
+    where_clause = parsed_query.find(exp.Where)
+    if where_clause:
+        # Collect all conditions
+        conditions = []
+
+        def collect_conditions(node):
+            if isinstance(node, exp.And):
+                collect_conditions(node.left)
+                collect_conditions(node.right)
+            else:
+                conditions.append(node)
+
+        collect_conditions(where_clause.this)
+
+        # Filter out partition_key join conditions and add star-schema joins
+        new_conditions = []
+        for condition in conditions:
+            condition_sql = condition.sql()
+            # Skip existing partition_key joins between tables
+            is_partition_join = False
+            for alias1 in table_aliases_with_partition_key:
+                for alias2 in table_aliases_with_partition_key:
+                    if alias1 != alias2:
+                        if f"{alias1}.{partition_key} = {alias2}.{partition_key}" in condition_sql:
+                            is_partition_join = True
+                            break
+                if is_partition_join:
+                    break
+
+            if not is_partition_join:
+                new_conditions.append(condition)
+
+        # Add star-schema joins through p0
+        for alias in table_aliases_with_partition_key:
+            p0_join = exp.EQ(this=exp.Identifier(this=f"{alias}.{partition_key}"), expression=exp.Identifier(this=f"{p0_alias}.{partition_key}"))
+            new_conditions.append(p0_join)
+
+        # Rebuild WHERE clause with simpler structure
+        if new_conditions:
+            new_where = new_conditions[0]
+            for condition in new_conditions[1:]:
+                new_where = exp.And(this=new_where, expression=condition)
+            where_clause.set("this", new_where)
+
+    return parsed_query.sql()
 
 
 def _format_partition_key_for_sql(pk: int | str | float | datetime) -> str:
@@ -169,7 +284,7 @@ def extend_query_with_partition_keys(
         partition_keys (set[int] | set[str]| set[float] | set[datetime]): The set of partition keys to extend the query with.
         partition_key (str): The identifier for the partition.
         method (Literal["IN", "VALUES", "TMP_TABLE_IN", "TMP_TABLE_JOIN"]): The method to use to extend the query.
-        p0_alias (str | None): The alias of the table to use for the partition key. If not set for JOIN methods, it will JOIN on all tables.
+        p0_alias (str | None): The alias of the table to use for the partition key.
         analyze_tmp_table (bool): Whether to create index and analyze. (only for temporary table methods)
 
     Returns:
@@ -180,7 +295,7 @@ def extend_query_with_partition_keys(
 
     if p0_alias is None and method != "TMP_TABLE_JOIN":
         # No alias provided, try to find it (TMP_TABLE_JOIN does join on all tables)
-        p0_alias = find_p0_alias(query)
+        p0_alias = find_p0_alias(query, partition_key)
 
     parsed_query = sqlglot.parse_one(query)
 
@@ -272,7 +387,8 @@ def extend_query_with_partition_keys_lazy(
         lazy_subquery (str): The SQL subquery that returns partition keys.
         partition_key (str): The identifier for the partition.
         method (Literal["IN_SUBQUERY", "TMP_TABLE_IN", "TMP_TABLE_JOIN"]): The method to use to extend the query.
-        p0_alias (str | None): The alias of the table to use for the partition key. If not set for JOIN methods, it will JOIN on all tables.
+        p0_alias (str | None): The alias of the table to use for the partition key. If None, will be auto-detected.
+            When use_p0_table=True, cache restrictions automatically target the p0 table regardless of this parameter.
         analyze_tmp_table (bool): Whether to create index and analyze. (only for temporary table methods)
 
     Returns:
@@ -283,7 +399,7 @@ def extend_query_with_partition_keys_lazy(
 
     if p0_alias is None and method != "TMP_TABLE_JOIN":
         # No alias provided, try to find it (TMP_TABLE_JOIN does join on all tables)
-        p0_alias = find_p0_alias(query)
+        p0_alias = find_p0_alias(query, partition_key)
 
     parsed_query = sqlglot.parse_one(query)
 
@@ -349,61 +465,30 @@ def apply_cache_lazy(
     canonicalize_queries: bool = False,
     follow_graph: bool = True,
     analyze_tmp_table: bool = True,
+    use_p0_table: bool = False,
+    p0_table_name: str | None = None,
 ) -> tuple[str, dict[str, int]]:
     """
     Complete wrapper function that applies partition cache to a query using lazy intersection.
-
-    This is the "whole package" function that:
-    1. Generates all query variants/hashes from the original query
-    2. Gets the lazy SQL subquery from the cache based on those hashes
-    3. Combines the original query with the lazy SQL subquery
-    4. Returns the complete enhanced query ready for execution
-
-    This function replaces the manual pattern commonly used in examples:
-    ```python
-    # Manual approach (replaced by this function)
-    lazy_subquery, generated_variants, nr_hashes = get_partition_keys_lazy(query, cache_handler, partition_key)
-    if lazy_subquery:
-        enhanced_query = extend_query_with_partition_keys_lazy(query, lazy_subquery, partition_key)
-    ```
 
     Args:
         query (str): The original SQL query to be enhanced with cache functionality.
         cache_handler (AbstractCacheHandler_Lazy): The lazy cache handler instance.
         partition_key (str): The identifier for the partition.
         method (Literal["IN_SUBQUERY", "TMP_TABLE_IN", "TMP_TABLE_JOIN"]): The method to use for query extension.
-        p0_alias (str | None): The alias of the table to use for the partition key. If None, will be auto-detected.
+        p0_alias (str | None): For regular queries: table alias for cache restrictions.
+                               For p0 queries: alias name for the p0 table (defaults to "p0").
         min_component_size (int): Minimum size of query components to consider for cache lookup.
         canonicalize_queries (bool): Whether to canonicalize queries before hashing.
         follow_graph (bool): Whether to follow the query graph for generating variants.
         analyze_tmp_table (bool): Whether to create index and analyze for temporary table methods.
+        use_p0_table (bool): Whether to rewrite the query to use a p0 table (star-schema).
+        p0_table_name (str | None): Name of the p0 table. Defaults to {partition_key}_mv.
 
     Returns:
-        tuple[str, dict[str, int]]: A tuple containing:
-            - Enhanced SQL query string (original query if no cache hits)
-            - Cache statistics dictionary with keys:
-                - 'generated_variants': Total number of query variant hashes generated
-                - 'cache_hits': Number of cache hits (hashes found in cache)
-                - 'enhanced': 1 if query was enhanced, 0 if returned unchanged
-
-    Raises:
-        ValueError: If cache handler does not support lazy intersection.
-
-    Example:
-        ```python
-        enhanced_query, stats = partitioncache.apply_cache_lazy(
-            "SELECT * FROM poi AS p1 WHERE ST_DWithin(p1.geom, ST_Point(1, 2), 1000)",
-            cache_handler,
-            partition_key="zipcode",
-            method="TMP_TABLE_IN",
-            p0_alias="p1"
-        )
-
-        print(f"Enhanced query: {enhanced_query}")
-        print(f"Cache hits: {stats['cache_hits']}/{stats['generated_variants']}")
-        ```
+        tuple[str, dict[str, int]]: Enhanced query and statistics.
     """
-    # Generate all query variants and get lazy subquery from cache
+    # Step 1: Generate query variants from original query
     lazy_cache_subquery, generated_variants, used_hashes = get_partition_keys_lazy(
         query=query,
         cache_handler=cache_handler,
@@ -413,27 +498,44 @@ def apply_cache_lazy(
         follow_graph=follow_graph,
     )
 
-    # Create statistics dictionary
-    stats = {"generated_variants": generated_variants, "cache_hits": used_hashes, "enhanced": 0}
+    # Step 2: Optionally rewrite with p0 table
+    working_query = query
+    p0_rewritten = 0
+    if use_p0_table:
+        p0_table_alias = p0_alias if p0_alias else "p0"
+        working_query = rewrite_query_with_p0_table(
+            query=query,
+            partition_key=partition_key,
+            mv_table_name=p0_table_name,
+            p0_alias=p0_table_alias,
+        )
+        p0_rewritten = 1 if working_query != query else 0
 
-    # If no cache hits, return original query
+    # Create statistics
+    stats = {"generated_variants": generated_variants, "cache_hits": used_hashes, "enhanced": 0, "p0_rewritten": p0_rewritten}
+
+    # If no cache hits, return working query
     if not lazy_cache_subquery or not lazy_cache_subquery.strip():
-        logger.info(f"No cache hits found for query. Generated {generated_variants} subqueries, {used_hashes} cache hits")
-        return query, stats
+        return working_query, stats
 
-    # Apply the lazy cache subquery to enhance the original query
+    # Step 3: Apply cache restrictions
+    if use_p0_table and p0_rewritten:
+        # Target p0 table for cache restrictions
+        cache_target_alias = p0_alias if p0_alias else "p0"
+    else:
+        # Regular query - use provided alias or auto-detect
+        cache_target_alias = p0_alias
+
     enhanced_query = extend_query_with_partition_keys_lazy(
-        query=query,
+        query=working_query,
         lazy_subquery=lazy_cache_subquery,
         partition_key=partition_key,
         method=method,
-        p0_alias=p0_alias,
+        p0_alias=cache_target_alias,
         analyze_tmp_table=analyze_tmp_table,
     )
 
     stats["enhanced"] = 1
-    logger.info(f"Successfully enhanced query with cache. Generated {generated_variants} subqueries, {used_hashes} cache hits")
-
     return enhanced_query, stats
 
 
@@ -446,6 +548,8 @@ def apply_cache(
     min_component_size: int = 2,
     canonicalize_queries: bool = False,
     analyze_tmp_table: bool = True,
+    use_p0_table: bool = False,
+    p0_table_name: str | None = None,
 ) -> tuple[str, dict[str, int]]:
     """
     Complete wrapper function that applies partition cache to a query using regular cache handlers.
@@ -453,26 +557,23 @@ def apply_cache(
     This is the "whole package" function that:
     1. Generates all query variants/hashes from the original query
     2. Gets the partition keys from the cache based on those hashes
-    3. Combines the original query with the partition key constraints
-    4. Returns the complete enhanced query ready for execution
-
-    This function replaces the manual pattern commonly used in examples:
-    ```python
-    # Manual approach (replaced by this function)
-    partition_keys, generated_variants, nr_hashes = get_partition_keys(query, cache_handler, partition_key)
-    if partition_keys:
-        enhanced_query = extend_query_with_partition_keys(query, partition_keys, partition_key)
-    ```
+    3. Optionally rewrites the original query to use a p0 table for optimizer hints
+    4. Combines the working query (original or p0-rewritten) with the partition key constraints
+    5. Returns the complete enhanced query ready for execution
 
     Args:
         query (str): The original SQL query to be enhanced with cache functionality.
         cache_handler (AbstractCacheHandler): The cache handler instance.
         partition_key (str): The identifier for the partition.
         method (Literal["IN", "VALUES", "TMP_TABLE_JOIN", "TMP_TABLE_IN"]): The method to use for query extension.
-        p0_alias (str | None): The alias of the table to use for the partition key. If None, will be auto-detected.
+        p0_alias (str | None): The alias of the table to use for cache restrictions in regular queries.
+            Ignored when use_p0_table=True (cache targets p0 table automatically).
         min_component_size (int): Minimum size of query components to consider for cache lookup.
         canonicalize_queries (bool): Whether to canonicalize queries before hashing.
         analyze_tmp_table (bool): Whether to create index and analyze for temporary table methods.
+        use_p0_table (bool): Whether to rewrite the query to use a p0 table for optimizer hints.
+        p0_table_name (str | None): Name of the p0 table. Defaults to {partition_key}_mv.
+        p0_method (Literal["JOIN", "IN"]): The method to use for p0 table rewriting.
 
     Returns:
         tuple[str, dict[str, int]]: A tuple containing:
@@ -481,6 +582,7 @@ def apply_cache(
                 - 'generated_variants': Total number of query variant hashes generated
                 - 'cache_hits': Number of cache hits (hashes found in cache)
                 - 'enhanced': 1 if query was enhanced, 0 if returned unchanged
+                - 'p0_rewritten': 1 if query was rewritten with p0 table, 0 otherwise
 
     Example:
         ```python
@@ -489,14 +591,11 @@ def apply_cache(
             cache_handler,
             partition_key="zipcode",
             method="TMP_TABLE_IN",
-            p0_alias="p1"
+            use_p0_table=True,
         )
-
-        print(f"Enhanced query: {enhanced_query}")
-        print(f"Cache hits: {stats['cache_hits']}/{stats['generated_variants']}")
         ```
     """
-    # Generate all query variants and get partition keys from cache
+    # Step 1: Generate all query variants from ORIGINAL query (not p0-rewritten)
     partition_keys, generated_variants, used_hashes = get_partition_keys(
         query=query,
         cache_handler=cache_handler,
@@ -505,21 +604,42 @@ def apply_cache(
         canonicalize_queries=canonicalize_queries,
     )
 
-    # Create statistics dictionary
-    stats = {"generated_variants": generated_variants, "cache_hits": used_hashes, "enhanced": 0}
+    # Step 2: Optionally rewrite original query with p0 table
+    working_query = query
+    p0_rewritten = 0
+    if use_p0_table:
+        p0_table_alias = p0_alias if p0_alias else "p0"
+        working_query = rewrite_query_with_p0_table(
+            query=query,
+            partition_key=partition_key,
+            mv_table_name=p0_table_name,
+            p0_alias=p0_table_alias,
+        )
+        p0_rewritten = 1 if working_query != query else 0
 
-    # If no cache hits, return original query
+    # Create statistics dictionary
+    stats = {"generated_variants": generated_variants, "cache_hits": used_hashes, "enhanced": 0, "p0_rewritten": p0_rewritten}
+
+    # If no cache hits, return working query (potentially p0-rewritten)
     if not partition_keys:
         logger.info(f"No cache hits found for query. Generated {generated_variants} subqueries, {used_hashes} cache hits")
-        return query, stats
+        return working_query, stats
 
-    # Apply the partition keys to enhance the original query
+    # Step 3: Apply the partition keys to the working query
+    # Determine the correct alias for cache restrictions
+    if use_p0_table and p0_rewritten:
+        # P0 table was added, target the p0 table for cache restrictions
+        cache_target_alias = p0_alias if p0_alias else "p0"
+    else:
+        # Regular query, use the provided p0_alias or auto-detect
+        cache_target_alias = p0_alias
+
     enhanced_query = extend_query_with_partition_keys(
-        query=query,
+        query=working_query,
         partition_keys=partition_keys,
         partition_key=partition_key,
         method=method,
-        p0_alias=p0_alias,
+        p0_alias=cache_target_alias,
         analyze_tmp_table=analyze_tmp_table,
     )
 
