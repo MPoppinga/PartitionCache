@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "partitioncache"
-version = "0.4.1"
+version = "0.5.0"
 description = "A partition cache implementation"
 requires-python = ">=3.9"
 license = { text = "LGPL-3.0-or-later" }
@@ -12,6 +12,7 @@ dependencies = [
     "networkx",
     "sqlglot>=25.0.0,<26.0.0",
     "bitarray",
+    "pyroaring",
     "python-dotenv",
     "tqdm",
 ]
@@ -56,12 +57,12 @@ license-files = ["COPYING", "COPYING.LESSER"]
 testpaths = ["tests"]
 
 [project.scripts]
-
-pcache-observer = "partitioncache.cli.monitor_cache_queue:main"
 pcache-manage = "partitioncache.cli.manage_cache:main"
 pcache-add = "partitioncache.cli.add_to_cache:main"
-pcache-get = "partitioncache.cli.read_from_cache:main"
-pcache-direct-processor = "partitioncache.cli.setup_direct_processor:main"
+pcache-read = "partitioncache.cli.read_from_cache:main"
+pcache-monitor = "partitioncache.cli.monitor_cache_queue:main"
+pcache-postgresql-queue-processor = "partitioncache.cli.setup_postgresql_queue_processor:main"
+pcache-postgresql-eviction-manager = "partitioncache.cli.postgresql_cache_eviction:main"
 
 [tool.mypy]
 mypy_path = "src"

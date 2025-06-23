@@ -11,9 +11,11 @@ from typing import Union
 from partitioncache.apply_cache import extend_query_with_partition_keys, get_partition_keys, get_partition_keys_lazy
 from partitioncache.cache_handler import get_cache_handler
 from partitioncache.cache_handler.helper import PartitionCacheHelper, create_partitioncache_helper
+
 try:
     from partitioncache.cache_handler.rocks_db_set import RocksDBCacheHandler
     from partitioncache.cache_handler.rocks_db_bit import RocksDBBitCacheHandler
+
     ROCKSDB_AVAILABLE = True
 except ImportError:
     RocksDBCacheHandler = None
@@ -30,11 +32,10 @@ def create_cache_helper(cache_type: str, partition_key: str, datatype: str | Non
     """
     Create a partition cache handler
     """
-    
+
     # Create the underlying cache handler first
-    cache_handler = get_cache_handler(cache_type, singleton=True)   
+    cache_handler = get_cache_handler(cache_type, singleton=True)
     return create_partitioncache_helper(cache_handler, partition_key, datatype)
-    
 
 
 def list_cache_types() -> dict[str, list[str]]:
@@ -50,6 +51,7 @@ def list_cache_types() -> dict[str, list[str]]:
     from partitioncache.cache_handler.rocks_dict import RocksDictCacheHandler
     from partitioncache.cache_handler.postgresql_array import PostgreSQLArrayCacheHandler
     from partitioncache.cache_handler.postgresql_bit import PostgreSQLBitCacheHandler
+    from partitioncache.cache_handler.postgresql_roaringbit import PostgreSQLRoaringBitCacheHandler
 
     handler_classes = {
         "redis": RedisCacheHandler,
@@ -57,6 +59,7 @@ def list_cache_types() -> dict[str, list[str]]:
         "rocksdict": RocksDictCacheHandler,
         "postgresql_array": PostgreSQLArrayCacheHandler,
         "postgresql_bit": PostgreSQLBitCacheHandler,
+        "postgresql_roaringbit": PostgreSQLRoaringBitCacheHandler,
     }
     
     if ROCKSDB_AVAILABLE:

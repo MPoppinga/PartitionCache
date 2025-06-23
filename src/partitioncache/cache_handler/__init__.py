@@ -175,6 +175,45 @@ def get_cache_handler(cache_type: str, singleton: bool = False) -> AbstractCache
                 db_path=db_path,
                 bitsize=int(bitsize),
             )
+    elif cache_type == "postgresql_roaringbit":
+        from partitioncache.cache_handler.postgresql_roaringbit import PostgreSQLRoaringBitCacheHandler
+
+        db_name = os.getenv("DB_NAME")
+        if not db_name:
+            raise ValueError("DB_NAME environment variable not set")
+        db_host = os.getenv("DB_HOST")
+        if not db_host:
+            raise ValueError("DB_HOST environment variable not set")
+        db_user = os.getenv("DB_USER")
+        if not db_user:
+            raise ValueError("DB_USER environment variable not set")
+        db_password = os.getenv("DB_PASSWORD")
+        if not db_password:
+            raise ValueError("DB_PASSWORD environment variable not set")
+        db_port = os.getenv("DB_PORT")
+        if not db_port:
+            raise ValueError("DB_PORT environment variable not set")
+        db_table = os.getenv("PG_ROARINGBIT_CACHE_TABLE_PREFIX")
+        if not db_table:
+            raise ValueError("PG_ROARINGBIT_CACHE_TABLE_PREFIX environment variable not set")
+        if singleton:
+            return PostgreSQLRoaringBitCacheHandler.get_instance(
+                db_name=db_name,
+                db_host=db_host,
+                db_user=db_user,
+                db_password=db_password,
+                db_port=db_port,
+                db_tableprefix=db_table,
+            )
+        else:
+            return PostgreSQLRoaringBitCacheHandler(
+                db_name=db_name,
+                db_host=db_host,
+                db_user=db_user,
+                db_password=db_password,
+                db_port=db_port,
+                db_tableprefix=db_table,
+            )
     elif cache_type == "rocksdict":
         from partitioncache.cache_handler.rocks_dict import RocksDictCacheHandler
 

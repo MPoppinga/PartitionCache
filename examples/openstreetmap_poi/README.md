@@ -81,25 +81,25 @@ Expected output shows timing comparisons and cache effectiveness for each partit
 ```bash
 # Add query directly to cache
 pcache-add --direct \
-  --query-file testqueries_examples/q1.sql \
+  --query-file testqueries_examples/zipcode/q1.sql \
   --partition-key zipcode \
-  --partition-datatype integer \ # integer is the default
+  --partition-datatype integer \
   --cache-backend postgresql_array \
   --env .env
 
 # Add to queue for async processing
 pcache-add --queue-original \
-  --query-file testqueries_examples/q1.sql \
+  --query-file testqueries_examples/zipcode/q1.sql \
   --partition-key zipcode \
-  --partition-datatype integer \ # integer is the default
+  --partition-datatype integer \
   --env .env
 
 # Add all test queries for zipcode
-for query in testqueries_examples/*.sql; do
+for query in testqueries_examples/zipcode/*.sql; do
   pcache-add --direct \
     --query-file "$query" \
     --partition-key zipcode \
-    --partition-datatype integer \ # integer is the default
+    --partition-datatype integer \
     --cache-backend postgresql_array \
     --env .env
 done
@@ -110,7 +110,7 @@ done
 ```bash
 # Add query directly to cache
 pcache-add --direct \
-  --query-file testqueries_examples/q1.sql \
+  --query-file testqueries_examples/landkreis/q1.sql \
   --partition-key landkreis \
   --partition-datatype text \
   --cache-backend postgresql_array \
@@ -118,13 +118,13 @@ pcache-add --direct \
 
 # Add to queue for async processing
 pcache-add --queue-original \
-  --query-file testqueries_examples/q1.sql \
+  --query-file testqueries_examples/landkreis/q1.sql \
   --partition-key landkreis \
   --partition-datatype text \
   --env .env
 
 # Add all test queries for landkreis
-for query in testqueries_examples/*.sql; do
+for query in testqueries_examples/landkreis/*.sql; do
   pcache-add --direct \
     --query-file "$query" \
     --partition-key landkreis \
@@ -139,7 +139,7 @@ done
 ```bash
 # Read zipcode partition keys for a query
 pcache-get \
-  --query-file testqueries_examples/q1.sql \
+  --query-file testqueries_examples/zipcode/q1.sql \
   --partition-key zipcode \
   --partition-datatype integer \
   --cache-backend postgresql_array \
@@ -147,7 +147,7 @@ pcache-get \
 
 # Read landkreis partition keys for a query
 pcache-get \
-  --query-file testqueries_examples/q1.sql \
+  --query-file testqueries_examples/landkreis/q1.sql \
   --partition-key landkreis \
   --partition-datatype text \
   --cache-backend postgresql_array \
@@ -168,16 +168,14 @@ pcache-observer \
 ### Cache Management
 
 ```bash
-# Count cache entries
-pcache-manage --count --cache postgresql_array --env .env
+# Count cache entries (uses CACHE_BACKEND from environment)
+pcache-manage cache count --env .env
 
 # Count queue entries
-pcache-manage --count-queue --env .env
+pcache-manage queue count --env .env
 
-# Clear specific partition
-pcache-manage --delete-partition \
-  --cache postgresql_array \
-  --partition-key zipcode \
+# Clear specific partition (uses CACHE_BACKEND from environment)
+pcache-manage maintenance partition --delete zipcode \
   --env .env
 ```
 

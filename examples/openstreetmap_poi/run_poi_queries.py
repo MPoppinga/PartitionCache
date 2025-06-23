@@ -21,8 +21,6 @@ CACHE_BACKEND = os.getenv("CACHE_BACKEND", "postgresql_array")
 # TODO allow option to add query to queue
 
 
-
-
 def run_query(conn, query, params=None):
     with conn.cursor() as cur:
         start = time.perf_counter()
@@ -37,22 +35,22 @@ def run_query(conn, query, params=None):
 
 def test_partition_key(conn, partition_key: str, datatype: str = "integer"):
     """Test queries with a specific partition key."""
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"Running with partition key: {partition_key} (datatype: {datatype})")
     print(f"Cache backend: {CACHE_BACKEND}")
-    print(f"{'='*60}")
-    
+    print(f"{'=' * 60}")
+
     queries = []
     for file in sorted(os.listdir(os.path.join("testqueries_examples", partition_key))):
         with open(os.path.join("testqueries_examples", partition_key, file), "r") as f:
             queries.append((file, f.read()))
-    
+
     # Create cache handler using the API with context manager
     try:
         with partitioncache.create_cache_helper(CACHE_BACKEND, partition_key, datatype) as cache:
             for description, sql_query in queries:
                 print(f"\n---\nQuery: {description}\n")
-                
+
                 # Run without cache
                 rows, elapsed = run_query(conn, sql_query)
                 print(f"Without PartitionCache: {len(rows)} results in {elapsed:.3f} seconds")
@@ -65,7 +63,7 @@ def test_partition_key(conn, partition_key: str, datatype: str = "integer"):
                     partition_key=partition_key,
                     min_component_size=1,
                 )
-                
+
                 if partition_keys:
                     # Extend the query to restrict to cached partition keys
                     sql_cached = partitioncache.extend_query_with_partition_keys(
@@ -77,19 +75,18 @@ def test_partition_key(conn, partition_key: str, datatype: str = "integer"):
                     )
                     elapsed_cache_get = time.perf_counter() - start_cache
                     rows_cached, elapsed_cached = run_query(conn, sql_cached)
-                    print(
-                        f"With PartitionCache: {len(rows_cached)} results in {elapsed_cache_get:.3f} + "
-                        f"{elapsed_cached:.3f} seconds (cache hits: {num_hits})"
-                    )
+                    print(f"With PartitionCache: {len(rows_cached)} results in {elapsed_cache_get:.3f} + {elapsed_cached:.3f} seconds (cache hits: {num_hits})")
                 else:
                     print("No partition keys found in cache. Hint: Add queries to cache using:")
-                    print(f"  pcache-add --direct --query-file testqueries_examples/{partition_key}/{description} --partition-key {partition_key} --partition-datatype {datatype} --cache-backend {CACHE_BACKEND}")
+                    print(
+                        f"  pcache-add --direct --query-file testqueries_examples/{partition_key}/{description} --partition-key {partition_key} --partition-datatype {datatype} --cache-backend {CACHE_BACKEND}"
+                    )
                     print("  or use queue with direct processor (recommended):")
                     print("  pcache-direct-processor setup && pcache-direct-processor enable # Setup and enable direct processor")
                     print(f"  pcache-add --queue --query-file testqueries_examples/{partition_key}/{description} --partition-key {partition_key}")
 
                 # Test lazy intersection if supported
-                if hasattr(cache.underlying_handler, 'get_intersected_lazy'):
+                if hasattr(cache.underlying_handler, "get_intersected_lazy"):
                     start_cache = time.perf_counter()
                     lazy_cache_subquery, nr_used_hashes = partitioncache.get_partition_keys_lazy(
                         query=sql_query,
@@ -115,10 +112,10 @@ def main():
     conn = psycopg2.connect(dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD, host=DB_HOST, port=DB_PORT)
 
     print(f"Initializing PartitionCache backend: {CACHE_BACKEND}")
-    
+
     # Test with zipcode partition key (integer)
     test_partition_key(conn, "zipcode", "integer")
-    
+
     # Test with landkreis partition key (text)
     test_partition_key(conn, "landkreis", "text")
 

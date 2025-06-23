@@ -1,7 +1,9 @@
 from logging import getLogger
 from datetime import datetime
+from typing import Union
 
 from bitarray import bitarray
+from pyroaring import BitMap
 from psycopg import sql
 
 from partitioncache.cache_handler.postgresql_abstract import PostgreSQLAbstractCacheHandler
@@ -9,26 +11,32 @@ from partitioncache.cache_handler.postgresql_abstract import PostgreSQLAbstractC
 logger = getLogger("PartitionCache")
 
 
-class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
+class PostgreSQLRoaringBitCacheHandler(PostgreSQLAbstractCacheHandler):
     def __repr__(self) -> str:
-        return "postgresql_bit"
+        return "postgresql_roaringbit"
 
-    def __init__(self, db_name: str, db_host: str, db_user: str, db_password: str, db_port: str | int, db_tableprefix: str, bitsize: int) -> None:
+    def __init__(self, db_name: str, db_host: str, db_user: str, db_password: str, db_port: str | int, db_tableprefix: str) -> None:
         """
         Initialize the cache handler with the given db name.
-        This handler supports multiple partition keys but only integer datatypes (for bit arrays).
+        This handler supports multiple partition keys but only integer datatypes (for roaring bitmaps).
         """
         super().__init__(db_name, db_host, db_user, db_password, db_port, db_tableprefix)
 
-        self.default_bitsize = bitsize  # Bitsize should be configured correctly by user (bitsize=1001 to store values 0-1000)
-        # Create metadata table to track partition keys with bitsize per partition
+        # Enable roaringbitmap extension if not already enabled
+        try:
+            self.cursor.execute("CREATE EXTENSION IF NOT EXISTS roaringbitmap;")
+            self.db.commit()
+        except Exception as e:
+            logger.warning(f"Failed to create roaringbitmap extension: {e}")
+            # Continue anyway - extension might already exist
+
+        # Create metadata table to track partition keys (no bitsize needed for roaring bitmaps)
         self.cursor.execute(
             sql.SQL("""CREATE TABLE IF NOT EXISTS {0} (
                 partition_key TEXT PRIMARY KEY,
                 datatype TEXT NOT NULL CHECK (datatype = 'integer'),
-                bitsize INTEGER NOT NULL DEFAULT {1},
                 created_at TIMESTAMP DEFAULT now()
-            );""").format(sql.Identifier(self.tableprefix + "_partition_metadata"), sql.Literal(self.default_bitsize))
+            );""").format(sql.Identifier(self.tableprefix + "_partition_metadata"))
         )
 
         # Create queries table (shared across all partition keys)
@@ -45,60 +53,51 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
 
         self.db.commit()
 
-    def _get_partition_bitsize(self, partition_key: str) -> int | None:
-        """Get the bitsize for a partition key from metadata."""
-        self.cursor.execute(
-            sql.SQL("SELECT bitsize FROM {0} WHERE partition_key = %s").format(sql.Identifier(self.tableprefix + "_partition_metadata")), (partition_key,)
-        )
-        result = self.cursor.fetchone()
-        return result[0] if result else None
-
-    def _set_partition_bitsize(self, partition_key: str, bitsize: int) -> None:
-        """Update the bitsize for a partition key in metadata."""
-        self.cursor.execute(
-            sql.SQL("UPDATE {0} SET bitsize = %s WHERE partition_key = %s").format(sql.Identifier(self.tableprefix + "_partition_metadata")),
-            (bitsize, partition_key),
-        )
-        self.db.commit()
-
-    def _create_partition_table(self, partition_key: str, bitsize: int | None = None) -> None:
+    def _create_partition_table(self, partition_key: str) -> None:
         """Create a cache table for a specific partition key."""
-        if bitsize is None:
-            bitsize = self.default_bitsize
-
         table_name = f"{self.tableprefix}_cache_{partition_key}"
 
-        # Create the cache table for bit arrays
+        # Create the cache table for roaring bitmaps
         self.cursor.execute(
             sql.SQL("""CREATE TABLE IF NOT EXISTS {0} (
                 query_hash TEXT PRIMARY KEY,
-                partition_keys BIT VARYING,
-                partition_keys_count integer NOT NULL GENERATED ALWAYS AS (length(replace(partition_keys::text, '0','')) ) STORED
+                partition_keys roaringbitmap,
+                partition_keys_count integer NOT NULL GENERATED ALWAYS AS (rb_cardinality(partition_keys)) STORED
             );""").format(sql.Identifier(table_name))
         )
 
         # Insert metadata
         self.cursor.execute(
-            sql.SQL("INSERT INTO {0} (partition_key, datatype, bitsize) VALUES (%s, %s, %s) ON CONFLICT (partition_key) DO NOTHING").format(
+            sql.SQL("INSERT INTO {0} (partition_key, datatype) VALUES (%s, %s) ON CONFLICT (partition_key) DO NOTHING").format(
                 sql.Identifier(self.tableprefix + "_partition_metadata")
             ),
-            (partition_key, "integer", bitsize),
+            (partition_key, "integer"),
         )
 
         self.db.commit()
 
-    def _ensure_partition_table(self, partition_key: str, bitsize: int | None = None) -> None:
+    def _ensure_partition_table(self, partition_key: str) -> None:
         """Ensure a partition table exists."""
         existing_datatype = self._get_partition_datatype(partition_key)
 
         if existing_datatype is None:
             # Create new table
-            self._create_partition_table(partition_key, bitsize)
+            self._create_partition_table(partition_key)
 
-    def set_set(self, key: str, value: set[int] | set[str] | set[float] | set[datetime], partition_key: str = "partition_key") -> bool:
+    def set_set(
+        self,
+        key: str,
+        value: Union[set[int], set[str], set[float], set[datetime], BitMap, bitarray, list],
+        partition_key: str = "partition_key",
+    ) -> bool:
         """
         Set the value of the given key in the cache for a specific partition key.
-        Only integer values are supported for bit arrays.
+        Only integer values are supported for roaring bitmaps.
+
+        Args:
+            key: The cache key
+            value: Can be a set of integers, a BitMap, a bitarray, or a list of integers
+            partition_key: The partition key identifier
         """
         if not value:
             return True
@@ -107,29 +106,54 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
             # Ensure partition table exists
             self._ensure_partition_table(partition_key)
 
-            # Get the bitsize for this partition
-            bitsize = self._get_partition_bitsize(partition_key)
-            if bitsize is None:
-                bitsize = self.default_bitsize
-            bitsize = int(bitsize)
-            val = bitarray(bitsize)
-            val.setall(0)
-            for k in value:
-                if isinstance(k, int):
-                    val[k] = 1
-                elif isinstance(k, str):
-                    val[int(k)] = 1
-                else:
-                    raise ValueError(f"Only integer values are supported for bit arrays: {k} : {value}")
+            # Convert input to roaring bitmap
+            if isinstance(value, BitMap):
+                rb = value
+            elif isinstance(value, bitarray):
+                # Convert bitarray to roaring bitmap
+                rb = BitMap()
+                for pos in value.search(bitarray("1")):
+                    rb.add(pos)
+            elif isinstance(value, (list, set)):
+                rb = BitMap()
+                for item in value:
+                    if isinstance(item, int):
+                        rb.add(item)
+                    elif isinstance(item, str):
+                        rb.add(int(item))
+                    else:
+                        raise ValueError(f"Only integer values are supported for roaring bitmaps: {item} : {value}")
+            else:
+                raise ValueError(f"Unsupported value type for roaring bitmap: {type(value)}")
+
+            # Convert roaring bitmap to bytes for storage
+            if isinstance(rb, BitMap):
+                rb_bytes = rb.serialize()
+            else:
+                # This path should not be reached due to the checks above, but it satisfies the type checker
+                raise ValueError("Could not create BitMap instance")
+
             table_name = f"{self.tableprefix}_cache_{partition_key}"
-            self.cursor.execute(sql.SQL("INSERT INTO {0} (query_hash, partition_keys) VALUES (%s, %s)").format(sql.Identifier(table_name)), (key, val.to01()))
+            self.cursor.execute(
+                sql.SQL(
+                    "INSERT INTO {0} (query_hash, partition_keys) VALUES (%s, %s) ON CONFLICT (query_hash) DO UPDATE SET partition_keys = EXCLUDED.partition_keys"
+                ).format(sql.Identifier(table_name)),
+                (key, rb_bytes),
+            )
             self.db.commit()
             return True
+        except ValueError as e:
+            logger.error(f"Invalid value for key {key} in partition {partition_key}: {e}")
+            raise e
         except Exception as e:
-            logger.error(f"Failed to set value for key {key} in partition {partition_key}: {e}")
+            logger.error("Failed to set value for key %s in partition %s: %s", key, partition_key, e)
+            try:
+                self.db.rollback()
+            except Exception as rollback_error:
+                logger.error("Failed to rollback transaction: %s", rollback_error)
             return False
 
-    def get(self, key: str, partition_key: str = "partition_key") -> set[int] | None:
+    def get(self, key: str, partition_key: str = "partition_key") -> BitMap | None:  # type: ignore
         """Get value from partition-specific cache table."""
 
         datatype = self._get_partition_datatype(partition_key)
@@ -138,17 +162,18 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
 
         table_name = f"{self.tableprefix}_cache_{partition_key}"
         self.cursor.execute(
-            sql.SQL("SELECT partition_keys FROM {0} WHERE query_hash = %s").format(sql.Identifier(table_name)),
+            sql.SQL("SELECT partition_keys::bytea FROM {0} WHERE query_hash = %s").format(sql.Identifier(table_name)),
             (key,),
         )
         result = self.cursor.fetchone()
-        if result is None:
+        if result is None or result[0] is None:
             return None
-        bitarray_result = bitarray(result[0])
 
-        return set(bitarray_result.search(bitarray("1")))
+        # Deserialize roaring bitmap from bytes
+        rb = BitMap.deserialize(result[0])
+        return rb
 
-    def get_intersected(self, keys: set[str], partition_key: str = "partition_key") -> tuple[set[int] | set[str] | None, int]:
+    def get_intersected(self, keys: set[str], partition_key: str = "partition_key") -> tuple[BitMap | None, int]:  # type: ignore
         """Get intersection from partition-specific table."""
         datatype = self._get_partition_datatype(partition_key)
         if datatype is None:
@@ -167,27 +192,29 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
         self.cursor.execute(q, (list(keys_set),))
 
         result = self.cursor.fetchone()
-        if result is None:
+        if result is None or result[0] is None:
             return None, 0
-        r = set(bitarray(result[0]).search(bitarray("1")))
-        return r, len(keys_set)
+
+        # Deserialize the intersected roaring bitmap
+        rb = BitMap.deserialize(result[0])
+        return rb, len(keys_set)
 
     def get_intersected_sql(self, partition_key: str = "partition_key") -> sql.Composed:
         """Get intersection SQL for partition-specific table."""
         table_name = f"{self.tableprefix}_cache_{partition_key}"
-        return sql.SQL("SELECT BIT_AND(partition_keys) FROM (SELECT partition_keys FROM {0} WHERE query_hash = ANY(%s)) AS selected").format(
+        return sql.SQL("SELECT rb_and_agg(partition_keys)::bytea FROM (SELECT partition_keys FROM {0} WHERE query_hash = ANY(%s)) AS selected").format(
             sql.Identifier(table_name)
         )
 
     def get_intersected_sql_wk(self, keys, partition_key: str = "partition_key") -> str:
         """Get intersection SQL with keys for partition-specific table. Using IN clause."""
         table_name = f"{self.tableprefix}_cache_{partition_key}"
-        in_part = "', '".join(list(keys))
+        in_part = "','".join(list(keys))
         return (
-            sql.SQL("SELECT BIT_AND(partition_keys) AS bit_result FROM (SELECT partition_keys FROM {0} WHERE query_hash IN ({1})) AS selected")
+            sql.SQL("SELECT rb_and_agg(partition_keys) AS rb_result FROM (SELECT partition_keys FROM {0} WHERE query_hash IN ('{1}')) AS selected")
             .format(
                 sql.Identifier(table_name),
-                sql.Literal(in_part),
+                sql.SQL(in_part),
             )
             .as_string()
         )
@@ -201,30 +228,17 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
 
         intersect_sql_str = self.get_intersected_sql_wk(filtered_keys, partition_key)
 
-        # Get the bitsize for this partition
-        bitsize = self._get_partition_bitsize(partition_key)
-        if bitsize is None:
-            bitsize = self.default_bitsize
-        bitsize = int(bitsize)
-
         r = (
             sql.SQL("""(
-       WITH bit_result AS (
+        WITH rb_result AS (
             {0}
-        ),
-        numbered_bits AS (
-            SELECT
-                bit_result,
-                generate_series(0, {1} - 1) AS bit_index
-            FROM bit_result
         )
-        SELECT unnest(array_agg(bit_index)) AS {2}
-        FROM numbered_bits
-        WHERE get_bit(bit_result, bit_index) = 1)
+        SELECT unnest(rb_to_array(rb_result)) AS {1}
+        FROM rb_result
+        WHERE rb_result IS NOT NULL)
         """)
             .format(
                 sql.SQL(intersect_sql_str),  # type: ignore
-                sql.Literal(bitsize),
                 sql.Identifier(partition_key),
             )
             .as_string()
@@ -234,7 +248,7 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
 
     @classmethod
     def get_supported_datatypes(cls) -> set[str]:
-        """PostgreSQL bit handler supports only integer datatype."""
+        """PostgreSQL roaring bit handler supports only integer datatype."""
         return {"integer"}
 
     def get_datatype(self, partition_key: str) -> str | None:
@@ -244,9 +258,5 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
     def register_partition_key(self, partition_key: str, datatype: str, **kwargs) -> None:
         """Register a partition key with the cache handler."""
         if datatype != "integer":
-            raise ValueError("PostgreSQL bit handler supports only integer datatype")
-        if "bitsize" in kwargs:
-            bitsize = kwargs["bitsize"]
-        else:
-            bitsize = self.default_bitsize
-        self._ensure_partition_table(partition_key, bitsize)
+            raise ValueError("PostgreSQL roaring bit handler supports only integer datatype")
+        self._ensure_partition_table(partition_key)

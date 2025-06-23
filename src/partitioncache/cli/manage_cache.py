@@ -34,15 +34,15 @@ def setup_queue_tables() -> None:
     try:
         provider = os.getenv("QUERY_QUEUE_PROVIDER", "postgresql")
         logger.info(f"Setting up queue tables for provider: {provider}")
-        
+
         # Initialize queue handler - this creates all tables
         queue_handler = get_queue_handler(provider)
-        
+
         logger.info("Queue tables setup completed successfully")
-        
+
         # Close the handler to free resources
         queue_handler.close()
-        
+
     except Exception as e:
         logger.error(f"Failed to setup queue tables: {e}")
         raise
@@ -56,15 +56,15 @@ def setup_cache_metadata_tables() -> None:
     try:
         cache_backend = os.getenv("CACHE_BACKEND", "postgresql_array")
         logger.info(f"Setting up cache metadata tables for backend: {cache_backend}")
-        
+
         # Initialize cache handler - this creates metadata tables
         cache_handler = get_cache_handler(cache_backend)
-        
+
         logger.info("Cache metadata tables setup completed successfully")
-        
+
         # Close the handler to free resources
         cache_handler.close()
-        
+
     except Exception as e:
         logger.error(f"Failed to setup cache metadata tables: {e}")
         raise
@@ -75,17 +75,17 @@ def setup_all_tables() -> None:
     Set up both queue and cache metadata tables.
     """
     logger.info("Setting up PartitionCache tables...")
-    
+
     try:
         # Setup queue tables first
         setup_queue_tables()
-        
+
         # Setup cache metadata tables
         setup_cache_metadata_tables()
-        
+
         logger.info("PartitionCache setup completed successfully!")
         logger.info("Your project is now ready to use PartitionCache.")
-        
+
     except Exception as e:
         logger.error(f"Failed to setup PartitionCache tables: {e}")
         raise
@@ -96,7 +96,7 @@ def validate_environment() -> bool:
     Validate that the environment is properly configured for PartitionCache.
     """
     issues = []
-    
+
     # Check cache backend configuration
     cache_backend = os.getenv("CACHE_BACKEND")
     if not cache_backend:
@@ -109,7 +109,7 @@ def validate_environment() -> bool:
             logger.info(f"✓ Cache backend '{cache_backend}' configuration is valid")
         except Exception as e:
             issues.append(f"Cache backend '{cache_backend}' configuration error: {e}")
-    
+
     # Check queue provider configuration
     queue_provider = os.getenv("QUERY_QUEUE_PROVIDER", "postgresql")
     try:
@@ -119,7 +119,7 @@ def validate_environment() -> bool:
         logger.info(f"✓ Queue provider '{queue_provider}' configuration is valid")
     except Exception as e:
         issues.append(f"Queue provider '{queue_provider}' configuration error: {e}")
-    
+
     if issues:
         logger.error("Environment validation failed:")
         for issue in issues:
@@ -135,27 +135,27 @@ def check_table_status() -> None:
     Check the status of PartitionCache tables and provide setup guidance.
     """
     logger.info("Checking PartitionCache table status...")
-    
+
     # Check queue tables
     try:
         queue_provider = os.getenv("QUERY_QUEUE_PROVIDER", "postgresql")
         queue_handler = get_queue_handler(queue_provider)
         lengths = queue_handler.get_queue_lengths()
         queue_handler.close()
-        
+
         logger.info(f"✓ Queue tables ({queue_provider}) are accessible")
         logger.info(f"  - Original query queue: {lengths.get('original_query_queue', 0)} items")
         logger.info(f"  - Query fragment queue: {lengths.get('query_fragment_queue', 0)} items")
-        
+
     except Exception as e:
         logger.warning(f"⚠ Queue tables may need setup: {e}")
         logger.info("  Run: python -m partitioncache.cli.manage_cache setup queue")
-    
+
     # Check cache metadata tables
     try:
         cache_backend = os.getenv("CACHE_BACKEND", "postgresql_array")
         cache_handler = get_cache_handler(cache_backend)
-        
+
         # Try to access metadata functionality
         try:
             partitions = cache_handler.get_partition_keys()  # type: ignore
@@ -163,9 +163,9 @@ def check_table_status() -> None:
             logger.info(f"  - Found {len(partitions)} partition keys")
         except AttributeError:
             logger.info(f"✓ Cache backend ({cache_backend}) is accessible")
-            
+
         cache_handler.close()
-        
+
     except Exception as e:
         logger.warning(f"⚠ Cache metadata tables may need setup: {e}")
         logger.info("  Run: python -m partitioncache.cli.manage_cache setup cache")
@@ -206,7 +206,7 @@ def export_cache(cache_type: str, archive_file: str):
     all_keys = get_all_keys(cache)
 
     # skip prefixed entries
-    all_keys = [key for key in all_keys if not key.startswith("_LIMIT_") and not key.startswith("_TIMEOUT_")]
+    all_keys = [key for key in all_keys if not (key.startswith("_LIMIT_") or key.startswith("_TIMEOUT_"))]
 
     with open(archive_file, "wb") as file:
         for key in tqdm(all_keys, desc="Exporting cache", unit="key"):
@@ -260,7 +260,7 @@ def get_all_keys(cache: AbstractCacheHandler) -> list[str]:
     try:
         # Get partition keys using the cache handler's method
         partitions = cache.get_partition_keys()
-        
+
         if partitions:
             for partition_info in partitions:
                 try:
@@ -269,10 +269,10 @@ def get_all_keys(cache: AbstractCacheHandler) -> list[str]:
                         partition_key = partition_info[0]
                     else:
                         partition_key = str(partition_info)
-                    
+
                     keys = cache.get_all_keys(partition_key)
                     all_keys.extend(keys)
-                    
+
                 except Exception as e:
                     logger.debug(f"Error getting keys for partition {partition_info}: {e}")
                     continue
@@ -285,26 +285,26 @@ def get_all_keys(cache: AbstractCacheHandler) -> list[str]:
 
 def count_cache(cache_type: str) -> None:
     """Count cache entries with improved PostgreSQL support."""
-    if cache_type.startswith('postgresql'):
+    if cache_type.startswith("postgresql"):
         # Use PostgreSQL-specific counting for better accuracy
         partitions = get_partition_overview(cache_type)
-        
+
         if not partitions:
             logger.info(f"No partitions found for cache type: {cache_type}")
             return
-            
-        total_entries = sum(p['total_entries'] for p in partitions)
-        valid_entries = sum(p['valid_entries'] for p in partitions)
-        limit_entries = sum(p['limit_entries'] for p in partitions)
-        timeout_entries = sum(p['timeout_entries'] for p in partitions)
-        
+
+        total_entries = sum(p["total_entries"] for p in partitions)
+        valid_entries = sum(p["valid_entries"] for p in partitions)
+        limit_entries = sum(p["limit_entries"] for p in partitions)
+        timeout_entries = sum(p["timeout_entries"] for p in partitions)
+
         logger.info(f"Cache statistics for {cache_type}:")
         logger.info(f"  Total keys: {total_entries}")
         logger.info(f"  Valid entries: {valid_entries}")
         logger.info(f"  Limit entries: {limit_entries}")
         logger.info(f"  Timeout entries: {timeout_entries}")
         logger.info(f"  Partitions: {len(partitions)}")
-        
+
     else:
         # For other cache types
         cache = get_cache_handler(cache_type)
@@ -315,9 +315,9 @@ def count_cache(cache_type: str) -> None:
         valid_count = 0
 
         for key in all_keys:
-            if key.startswith("_LIMIT_"):
+            if key.find("_LIMIT_") == 0:
                 limit_count += 1
-            elif key.startswith("_TIMEOUT_"):
+            elif key.find("_TIMEOUT_") == 0:
                 timeout_count += 1
             else:
                 valid_count += 1
@@ -507,7 +507,7 @@ def remove_termination_entries(cache_type: str):
     removed = 0
 
     for key in tqdm(all_keys, desc="Removing termination entries", unit="key"):
-        if key.startswith("_LIMIT_") or key.startswith("_TIMEOUT_"):
+        if key.find("_LIMIT_") == 0 or key.find("_TIMEOUT_") == 0:
             cache.delete(key)
             removed += 1
 
@@ -533,17 +533,134 @@ def remove_large_entries(cache_type: str, max_entries: int):
     cache.close()
 
 
+def evict_cache_manual(cache_type: str, strategy: str, threshold: int):
+    """
+    Manually evict cache entries based on a given strategy and threshold.
+    This function contains Python-based logic and does not depend on the
+    pg_cron SQL functions.
+    """
+    logger.info(f"Starting manual eviction for cache '{cache_type}' with strategy '{strategy}' and threshold {threshold}")
+    cache = get_cache_handler(cache_type)
+
+    if not hasattr(cache, "get_partition_keys"):
+        logger.error(f"Cache type {cache_type} does not support partitions, eviction not supported.")
+        return
+
+    partition_keys = cache.get_partition_keys()
+    total_removed = 0
+
+    for partition_info in tqdm(partition_keys, desc="Processing partitions"):
+        partition_key = partition_info[0] if isinstance(partition_info, tuple) else str(partition_info)
+
+        try:
+            all_cache_keys = cache.get_all_keys(partition_key)
+            current_count = len(all_cache_keys)
+
+            if current_count <= threshold:
+                continue
+
+            to_remove_count = current_count - threshold
+
+            if cache_type.find("postgresql") == 0:
+                import psycopg
+                from psycopg import sql
+
+                conn = psycopg.connect(
+                    host=os.getenv("DB_HOST"),
+                    port=int(os.getenv("DB_PORT", "5432")),
+                    user=os.getenv("DB_USER"),
+                    password=os.getenv("DB_PASSWORD"),
+                    dbname=os.getenv("DB_NAME"),
+                )
+
+                if cache_type == "postgresql_array":
+                    table_prefix = os.getenv("PG_ARRAY_CACHE_TABLE_PREFIX", "partitioncache")
+                elif cache_type == "postgresql_bit":
+                    table_prefix = os.getenv("PG_BIT_CACHE_TABLE_PREFIX", "partitioncache")
+                else:  # roaringbit
+                    table_prefix = os.getenv("PG_ROARINGBIT_CACHE_TABLE_PREFIX", "partitioncache")
+
+                queries_table = f"{table_prefix}_queries"
+                cache_table = f"{table_prefix}_cache_{partition_key}"
+
+                removed_hashes = []
+                with conn.cursor() as cur:
+                    if strategy == "oldest":
+                        cur.execute(
+                            sql.SQL("""
+                            SELECT query_hash FROM {}
+                            WHERE partition_key = %s AND status = 'ok'
+                            ORDER BY last_seen ASC
+                            LIMIT %s
+                        """).format(sql.Identifier(queries_table)),
+                            (partition_key, to_remove_count),
+                        )
+                        removed_hashes = [row[0] for row in cur.fetchall()]
+
+                    elif strategy == "largest":
+                        # This assumes the cache table has a _count column, which is standard for postgres backends
+                        cur.execute(
+                            sql.SQL("""
+                            SELECT t1.query_hash
+                            FROM {} t1 JOIN {} t2 ON t1.query_hash = t2.query_hash AND t2.partition_key = %s
+                            WHERE t2.status = 'ok'
+                            ORDER BY t1.partition_keys_count DESC
+                            LIMIT %s
+                        """).format(sql.Identifier(cache_table), sql.Identifier(queries_table)),
+                            (partition_key, to_remove_count),
+                        )
+                        removed_hashes = [row[0] for row in cur.fetchall()]
+
+                    if removed_hashes:
+                        cur.execute(sql.SQL("DELETE FROM {} WHERE query_hash = ANY(%s)").format(sql.Identifier(cache_table)), (removed_hashes,))
+                        cur.execute(
+                            sql.SQL("DELETE FROM {} WHERE query_hash = ANY(%s) AND partition_key = %s").format(sql.Identifier(queries_table)),
+                            (removed_hashes, partition_key),
+                        )
+                        total_removed += len(removed_hashes)
+                conn.commit()
+                conn.close()
+
+            else:  # For non-postgresql caches
+                if strategy == "oldest":
+                    logger.warning(f"Strategy 'oldest' is not supported for non-PostgreSQL cache '{cache_type}'. Skipping partition '{partition_key}'.")
+                    continue
+
+                elif strategy == "largest":
+                    # This can be slow as it fetches all values for a partition
+                    key_sizes = []
+                    for key in all_cache_keys:
+                        if key.find("_") == 0:
+                            continue  # Skip internal keys
+                        value = cache.get(key)
+                        if value and hasattr(value, "__len__"):
+                            key_sizes.append((key, len(value)))
+
+                    key_sizes.sort(key=lambda x: x[1], reverse=True)
+
+                    for i in range(min(to_remove_count, len(key_sizes))):
+                        key_to_delete = key_sizes[i][0]
+                        cache.delete(key_to_delete)
+                        total_removed += 1
+
+        except Exception as e:
+            logger.error(f"Failed to evict from partition {partition_key}: {e}")
+
+    logger.info(f"Manual eviction completed. Total entries removed: {total_removed}")
+    cache.close()
+
+
 def get_partition_overview(cache_type: str) -> list[dict[str, Any]]:
     """
     Get comprehensive overview of all partitions and their statistics.
     """
     cache = get_cache_handler(cache_type)
     partitions = []
-    
+
     try:
         # Get partition metadata
         partition_data = cache.get_partition_keys()
-        
+
         for partition_info in partition_data:
             if isinstance(partition_info, tuple) and len(partition_info) >= 2:
                 partition_key, datatype = partition_info[0], partition_info[1]
@@ -551,46 +668,48 @@ def get_partition_overview(cache_type: str) -> list[dict[str, Any]]:
                 # Handle case where partition_info is just a string
                 partition_key = str(partition_info)
                 datatype = "unknown"
-            
+
             # Get cache statistics for this partition
             try:
                 cache_keys = cache.get_all_keys(partition_key)
                 total_entries = len(cache_keys)
-                
+
                 # Count different types of entries
-                limit_count = sum(1 for k in cache_keys if k.startswith("_LIMIT_"))
-                timeout_count = sum(1 for k in cache_keys if k.startswith("_TIMEOUT_"))
+                limit_count = sum(1 for k in cache_keys if k.find("_LIMIT_") == 0)
+                timeout_count = sum(1 for k in cache_keys if k.find("_TIMEOUT_") == 0)
                 valid_count = total_entries - limit_count - timeout_count
-                
+
             except Exception as e:
                 logger.debug(f"Error getting keys for partition {partition_key}: {e}")
                 total_entries = 0
                 valid_count = 0
                 limit_count = 0
                 timeout_count = 0
-            
-            partitions.append({
-                'partition_key': partition_key,
-                'datatype': datatype,
-                'total_entries': total_entries,
-                'valid_entries': valid_count,
-                'limit_entries': limit_count,
-                'timeout_entries': timeout_count
-            })
-        
+
+            partitions.append(
+                {
+                    "partition_key": partition_key,
+                    "datatype": datatype,
+                    "total_entries": total_entries,
+                    "valid_entries": valid_count,
+                    "limit_entries": limit_count,
+                    "timeout_entries": timeout_count,
+                }
+            )
+
         # For PostgreSQL backends, also try to get direct table counts
-        if cache_type.startswith('postgresql'):
+        if cache_type.find("postgresql") == 0:
             partitions = _get_postgresql_partition_overview(cache_type, partitions)
-            
+
     except Exception as e:
         logger.debug(f"Error getting partition overview: {e}")
         # Fallback: try to find partitions by examining available cache tables
-        if cache_type.startswith('postgresql'):
+        if cache_type.find("postgresql") == 0:
             partitions = _get_postgresql_partition_overview(cache_type, [])
-    
+
     finally:
         cache.close()
-    
+
     return partitions
 
 
@@ -600,7 +719,7 @@ def _get_postgresql_partition_overview(cache_type: str, existing_partitions: lis
     """
     import psycopg
     from psycopg import sql
-    
+
     try:
         # Get database connection parameters from environment
         conn = psycopg.connect(
@@ -610,72 +729,76 @@ def _get_postgresql_partition_overview(cache_type: str, existing_partitions: lis
             password=os.getenv("DB_PASSWORD"),
             dbname=os.getenv("DB_NAME"),
         )
-        
+
         # Determine table prefix
         if cache_type == "postgresql_array":
             table_prefix = os.getenv("PG_ARRAY_CACHE_TABLE_PREFIX", "partitioncache")
         else:
             table_prefix = os.getenv("PG_BIT_CACHE_TABLE_PREFIX", "partitioncache")
-        
+
         with conn.cursor() as cur:
             # Find all cache tables
-            cur.execute("""
+            cur.execute(
+                """
                 SELECT tablename FROM pg_tables 
                 WHERE tablename LIKE %s AND tablename LIKE %s
                 ORDER BY tablename
-            """, [f"{table_prefix}_%", r"%cache_%"])
-            
+            """,
+                [f"{table_prefix}_%", r"%cache_%"],
+            )
+
             cache_tables = cur.fetchall()
             partitions = []
-            
+
             for (table_name,) in cache_tables:
                 # Extract partition key from table name
                 # Format: prefix_cache_partitionkey
                 cache_prefix = f"{table_prefix}_cache_"
-                if table_name.startswith(cache_prefix):
-                    partition_key = table_name[len(cache_prefix):]
-                    
+                if table_name.find(cache_prefix) == 0:
+                    partition_key = table_name[len(cache_prefix) :]
+
                     # Get table row count
-                    cur.execute(sql.SQL('SELECT COUNT(*) FROM {}').format(sql.Identifier(table_name)))
+                    cur.execute(sql.SQL("SELECT COUNT(*) FROM {}").format(sql.Identifier(table_name)))
                     result = cur.fetchone()
                     total_entries = result[0] if result else 0
-                    
+
                     # Get datatype from metadata if available
                     metadata_table = f"{table_prefix}_partition_metadata"
                     try:
-                        cur.execute(sql.SQL('SELECT datatype FROM {} WHERE partition_key = %s').format(
-                            sql.Identifier(metadata_table)), [partition_key])
+                        cur.execute(sql.SQL("SELECT datatype FROM {} WHERE partition_key = %s").format(sql.Identifier(metadata_table)), [partition_key])
                         result = cur.fetchone()
                         datatype = result[0] if result else "unknown"
                     except Exception:
                         datatype = "unknown"
-                    
+
                     # For detailed entry analysis, we'd need to query the actual table
                     # For now, assume all entries are valid (no _LIMIT_ or _TIMEOUT_ in PostgreSQL cache)
-                    partitions.append({
-                        'partition_key': partition_key,
-                        'datatype': datatype,
-                        'total_entries': total_entries,
-                        'valid_entries': total_entries,
-                        'limit_entries': 0,
-                        'timeout_entries': 0,
-                        'table_name': table_name
-                    })
-            
+                    partitions.append(
+                        {
+                            "partition_key": partition_key,
+                            "datatype": datatype,
+                            "total_entries": total_entries,
+                            "valid_entries": total_entries,
+                            "limit_entries": 0,
+                            "timeout_entries": 0,
+                            "table_name": table_name,
+                        }
+                    )
+
             # If we found tables but no existing partitions, use our findings
             if partitions and not existing_partitions:
                 return partitions
-            
+
             # Otherwise, enhance existing partitions with table data
             for partition in existing_partitions:
                 for pg_partition in partitions:
-                    if partition['partition_key'] == pg_partition['partition_key']:
+                    if partition["partition_key"] == pg_partition["partition_key"]:
                         partition.update(pg_partition)
                         break
-        
+
         conn.close()
         return existing_partitions if existing_partitions else partitions
-        
+
     except Exception as e:
         logger.debug(f"Error getting PostgreSQL partition overview: {e}")
         return existing_partitions
@@ -686,40 +809,40 @@ def show_partition_overview(cache_type: str) -> None:
     Display comprehensive partition overview.
     """
     partitions = get_partition_overview(cache_type)
-    
+
     if not partitions:
         logger.info(f"No partitions found for cache type: {cache_type}")
         return
-    
+
     logger.info(f"\n=== Partition Overview for {cache_type} ===")
     logger.info(f"{'Partition Key':<20} {'Data Type':<12} {'Total':<8} {'Valid':<8} {'Limit':<8} {'Timeout':<8}")
     logger.info("-" * 70)
-    
+
     total_entries = 0
     total_valid = 0
     total_limit = 0
     total_timeout = 0
-    
+
     for partition in partitions:
-        partition_key = partition['partition_key']
-        datatype = partition['datatype']
-        total = partition['total_entries']
-        valid = partition['valid_entries']
-        limit = partition['limit_entries']
-        timeout = partition['timeout_entries']
-        
+        partition_key = partition["partition_key"]
+        datatype = partition["datatype"]
+        total = partition["total_entries"]
+        valid = partition["valid_entries"]
+        limit = partition["limit_entries"]
+        timeout = partition["timeout_entries"]
+
         logger.info(f"{partition_key:<20} {datatype:<12} {total:<8} {valid:<8} {limit:<8} {timeout:<8}")
-        
+
         total_entries += total
         total_valid += valid
         total_limit += limit
         total_timeout += timeout
-    
+
     logger.info("-" * 70)
     logger.info(f"{'TOTAL':<20} {'':<12} {total_entries:<8} {total_valid:<8} {total_limit:<8} {total_timeout:<8}")
-    
+
     # Additional information
-    if 'table_name' in partitions[0]:
+    if "table_name" in partitions[0]:
         logger.info("\nTable Details:")
         for partition in partitions:
             logger.info(f"  {partition['partition_key']}: {partition.get('table_name', 'N/A')}")
@@ -754,7 +877,7 @@ Examples:
 Note: Cache type parameters are optional for most commands and will use 
 the CACHE_BACKEND environment variable when not specified. Use --env 
 to load configuration from a custom environment file.
-        """
+        """,
     )
 
     parser.add_argument(
@@ -818,7 +941,7 @@ to load configuration from a custom environment file.
     queue_parser = subparsers.add_parser("queue", help="Queue operations")
     queue_subparsers = queue_parser.add_subparsers(dest="queue_command", help="Queue operations")
     queue_subparsers.add_parser("count", help="Count queue entries")
-    
+
     queue_clear_parser = queue_subparsers.add_parser("clear", help="Clear queue entries")
     queue_clear_parser.add_argument("--original", action="store_true", help="Clear only original query queue")
     queue_clear_parser.add_argument("--fragment", action="store_true", help="Clear only fragment query queue")
@@ -831,6 +954,12 @@ to load configuration from a custom environment file.
     prune_parser = maintenance_subparsers.add_parser("prune", help="Prune old queries")
     prune_parser.add_argument("--days", type=int, default=30, help="Remove queries older than this many days")
     prune_parser.add_argument("--type", dest="cache_type", help="Specific cache type to prune (default: all)")
+
+    # Evict command
+    evict_parser = maintenance_subparsers.add_parser("evict", help="Evict cache entries based on a strategy")
+    evict_parser.add_argument("--type", dest="cache_type", help="Cache type to evict from (default: from CACHE_BACKEND env var)")
+    evict_parser.add_argument("--strategy", choices=["oldest", "largest"], required=True, help="Eviction strategy")
+    evict_parser.add_argument("--threshold", type=int, required=True, help="Cache size threshold to trigger eviction")
 
     # Cleanup commands
     cleanup_parser = maintenance_subparsers.add_parser("cleanup", help="Clean up cache entries")
@@ -858,7 +987,7 @@ to load configuration from a custom environment file.
             if not args.setup_command:
                 setup_parser.print_help()
                 return
-            
+
             if args.setup_command == "all":
                 setup_all_tables()
             elif args.setup_command == "queue":
@@ -872,7 +1001,7 @@ to load configuration from a custom environment file.
                 validate_environment()
                 check_table_status()
                 return
-            
+
             if args.status_command == "env":
                 validate_environment()
             elif args.status_command == "tables":
@@ -882,7 +1011,7 @@ to load configuration from a custom environment file.
             if not args.cache_command:
                 cache_parser.print_help()
                 return
-            
+
             if args.cache_command == "count":
                 if args.all:
                     count_all_caches()
@@ -911,7 +1040,7 @@ to load configuration from a custom environment file.
             if not args.queue_command:
                 queue_parser.print_help()
                 return
-            
+
             if args.queue_command == "count":
                 count_queue()
             elif args.queue_command == "clear":
@@ -926,7 +1055,7 @@ to load configuration from a custom environment file.
             if not args.maintenance_command:
                 maintenance_parser.print_help()
                 return
-            
+
             if args.maintenance_command == "prune":
                 if args.cache_type:
                     prune_old_queries(args.cache_type, args.days)
@@ -940,6 +1069,9 @@ to load configuration from a custom environment file.
                     remove_large_entries(cache_type, args.remove_large)
                 else:
                     cleanup_parser.print_help()
+            elif args.maintenance_command == "evict":
+                cache_type = args.cache_type or get_cache_type_from_env()
+                evict_cache_manual(cache_type, args.strategy, args.threshold)
             elif args.maintenance_command == "partition":
                 cache_type = args.cache_type or get_cache_type_from_env()
                 if args.partition_key:
@@ -952,7 +1084,7 @@ to load configuration from a custom environment file.
         sys.exit(1)
 
     # Cleanup for RocksDB
-    if hasattr(args, 'cache_type') and args.cache_type and ("rocksdb" in args.cache_type):
+    if hasattr(args, "cache_type") and args.cache_type and ("rocksdb" in args.cache_type):
         try:
             cache = get_cache_handler(args.cache_type)
             cache.compact()
