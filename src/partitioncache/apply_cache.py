@@ -9,6 +9,7 @@ It utilizes the given cache to extend the SQL query with the set of possible par
 from logging import getLogger
 from typing import Literal
 from datetime import datetime
+import random
 
 import sqlglot
 import sqlglot.expressions as exp
@@ -60,7 +61,7 @@ def get_partition_keys_lazy(
     min_component_size=2,
     canonicalize_queries=False,
     follow_graph=True,
-) -> tuple[str, int, int]:
+) -> tuple[str | None, int, int]:
     """
     Gets the lazy intersection representation of the partition keys for the given query.
 
@@ -239,15 +240,17 @@ def extend_query_with_partition_keys(
         return tmp_table_setup + parsed_query.sql()
 
 
-def _create_tmp_table_setup_from_subquery(lazy_subquery: str, partition_key: str, analyze_tmp_table: bool) -> str:
+def _create_tmp_table_setup_from_subquery(lazy_subquery: str, partition_key: str, analyze_tmp_table: bool) -> tuple[str, str]:
     """Create the SQL for temporary table setup from a lazy subquery."""
-    setup_sql = f"CREATE TEMPORARY TABLE tmp_cache_keys AS ({lazy_subquery});\n"
+
+    table_name = f"tmp_cache_keys_{random.randint(100000, 999999)}"
+    setup_sql = f"CREATE TEMPORARY TABLE {table_name} AS ({lazy_subquery});\n"
 
     if analyze_tmp_table:
-        setup_sql += f"CREATE INDEX tmp_cache_keys_idx ON tmp_cache_keys ({partition_key});\n"
-        setup_sql += "ANALYZE tmp_cache_keys;\n"
+        setup_sql += f"CREATE INDEX {table_name}_idx ON {table_name} ({partition_key});\n"
+        setup_sql += f"ANALYZE {table_name};\n"
 
-    return setup_sql
+    return setup_sql, table_name
 
 
 def extend_query_with_partition_keys_lazy(
@@ -292,14 +295,14 @@ def extend_query_with_partition_keys_lazy(
 
     elif method == "TMP_TABLE_IN":
         # Create temporary table from lazy subquery, then use IN with SELECT
-        tmp_table_setup = _create_tmp_table_setup_from_subquery(lazy_subquery, partition_key, analyze_tmp_table)
-        partition_expr = sqlglot.parse_one(f"{p0_alias}.{partition_key} IN (SELECT {partition_key} FROM tmp_cache_keys)")
+        tmp_table_setup, table_name = _create_tmp_table_setup_from_subquery(lazy_subquery, partition_key, analyze_tmp_table)
+        partition_expr = sqlglot.parse_one(f"{p0_alias}.{partition_key} IN (SELECT {partition_key} FROM {table_name})")
         _add_where_condition(parsed_query, partition_expr)
         return tmp_table_setup + parsed_query.sql()
 
     elif method == "TMP_TABLE_JOIN":
         # Create temporary table from lazy subquery, then JOIN
-        tmp_table_setup = _create_tmp_table_setup_from_subquery(lazy_subquery, partition_key, analyze_tmp_table)
+        tmp_table_setup, table_name = _create_tmp_table_setup_from_subquery(lazy_subquery, partition_key, analyze_tmp_table)
 
         # Add as inner join to all tables
         from_clauses: list[exp.Join | exp.From] = list(parsed_query.find_all(exp.Join))
@@ -321,7 +324,7 @@ def extend_query_with_partition_keys_lazy(
                 from_clause.this.sql()  # Original table
                 + " "  # Space between tables
                 + exp.Join(
-                    this=exp.Identifier(this=f"tmp_cache_keys AS tmp_{table_alias}"),
+                    this=exp.Identifier(this=f"{table_name} AS tmp_{table_alias}"),
                     on=exp.EQ(
                         this=exp.Identifier(this=f"tmp_{table_alias}.{partition_key}"),
                         expression=exp.Identifier(this=f"{table_alias}.{partition_key}"),
@@ -422,6 +425,98 @@ def apply_cache_lazy(
     enhanced_query = extend_query_with_partition_keys_lazy(
         query=query,
         lazy_subquery=lazy_cache_subquery,
+        partition_key=partition_key,
+        method=method,
+        p0_alias=p0_alias,
+        analyze_tmp_table=analyze_tmp_table,
+    )
+
+    stats["enhanced"] = 1
+    logger.info(f"Successfully enhanced query with cache. Generated {generated_variants} subqueries, {used_hashes} cache hits")
+
+    return enhanced_query, stats
+
+
+def apply_cache(
+    query: str,
+    cache_handler: AbstractCacheHandler,
+    partition_key: str,
+    method: Literal["IN", "VALUES", "TMP_TABLE_JOIN", "TMP_TABLE_IN"] = "IN",
+    p0_alias: str | None = None,
+    min_component_size: int = 2,
+    canonicalize_queries: bool = False,
+    analyze_tmp_table: bool = True,
+) -> tuple[str, dict[str, int]]:
+    """
+    Complete wrapper function that applies partition cache to a query using regular cache handlers.
+
+    This is the "whole package" function that:
+    1. Generates all query variants/hashes from the original query
+    2. Gets the partition keys from the cache based on those hashes
+    3. Combines the original query with the partition key constraints
+    4. Returns the complete enhanced query ready for execution
+
+    This function replaces the manual pattern commonly used in examples:
+    ```python
+    # Manual approach (replaced by this function)
+    partition_keys, generated_variants, nr_hashes = get_partition_keys(query, cache_handler, partition_key)
+    if partition_keys:
+        enhanced_query = extend_query_with_partition_keys(query, partition_keys, partition_key)
+    ```
+
+    Args:
+        query (str): The original SQL query to be enhanced with cache functionality.
+        cache_handler (AbstractCacheHandler): The cache handler instance.
+        partition_key (str): The identifier for the partition.
+        method (Literal["IN", "VALUES", "TMP_TABLE_JOIN", "TMP_TABLE_IN"]): The method to use for query extension.
+        p0_alias (str | None): The alias of the table to use for the partition key. If None, will be auto-detected.
+        min_component_size (int): Minimum size of query components to consider for cache lookup.
+        canonicalize_queries (bool): Whether to canonicalize queries before hashing.
+        analyze_tmp_table (bool): Whether to create index and analyze for temporary table methods.
+
+    Returns:
+        tuple[str, dict[str, int]]: A tuple containing:
+            - Enhanced SQL query string (original query if no cache hits)
+            - Cache statistics dictionary with keys:
+                - 'generated_variants': Total number of query variant hashes generated
+                - 'cache_hits': Number of cache hits (hashes found in cache)
+                - 'enhanced': 1 if query was enhanced, 0 if returned unchanged
+
+    Example:
+        ```python
+        enhanced_query, stats = partitioncache.apply_cache(
+            "SELECT * FROM poi AS p1 WHERE ST_DWithin(p1.geom, ST_Point(1, 2), 1000)",
+            cache_handler,
+            partition_key="zipcode",
+            method="TMP_TABLE_IN",
+            p0_alias="p1"
+        )
+
+        print(f"Enhanced query: {enhanced_query}")
+        print(f"Cache hits: {stats['cache_hits']}/{stats['generated_variants']}")
+        ```
+    """
+    # Generate all query variants and get partition keys from cache
+    partition_keys, generated_variants, used_hashes = get_partition_keys(
+        query=query,
+        cache_handler=cache_handler,
+        partition_key=partition_key,
+        min_component_size=min_component_size,
+        canonicalize_queries=canonicalize_queries,
+    )
+
+    # Create statistics dictionary
+    stats = {"generated_variants": generated_variants, "cache_hits": used_hashes, "enhanced": 0}
+
+    # If no cache hits, return original query
+    if not partition_keys:
+        logger.info(f"No cache hits found for query. Generated {generated_variants} subqueries, {used_hashes} cache hits")
+        return query, stats
+
+    # Apply the partition keys to enhance the original query
+    enhanced_query = extend_query_with_partition_keys(
+        query=query,
+        partition_keys=partition_keys,
         partition_key=partition_key,
         method=method,
         p0_alias=p0_alias,

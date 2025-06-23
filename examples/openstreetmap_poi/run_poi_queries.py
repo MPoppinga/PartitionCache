@@ -4,6 +4,7 @@ import time
 from dotenv import load_dotenv
 
 import partitioncache
+from partitioncache.cache_handler.abstract import AbstractCacheHandler_Lazy
 
 # Load environment variables
 load_dotenv(".env", override=True)
@@ -92,7 +93,7 @@ def test_partition_key(conn, partition_key: str, datatype: str = "integer"):
                     print(f"  pcache-add --queue --query-file testqueries_examples/{partition_key}/{description} --partition-key {partition_key}")
 
                 # Test lazy intersection if supported
-                if hasattr(cache.underlying_handler, "get_intersected_lazy"):
+                if isinstance(cache.underlying_handler, AbstractCacheHandler_Lazy):
                     start_cache = time.perf_counter()
                     lazy_cache_subquery, nr_generated_variants, nr_used_hashes = partitioncache.get_partition_keys_lazy(
                         query=sql_query,
@@ -122,6 +123,25 @@ def test_partition_key(conn, partition_key: str, datatype: str = "integer"):
                         print(
                             f"With PartitionCache (lazy optimized): {len(rows_cached)} results in {elapsed_cache_get:.3f} + "
                             f"{elapsed_cached:.3f} seconds (cache hash matches: {nr_used_hashes})"
+                        )
+
+                        # Test full integration with apply_cache_lazy
+                        start_cache = time.perf_counter()
+                        sql_cached, stats = partitioncache.apply_cache_lazy(
+                            query=sql_query,
+                            cache_handler=cache.underlying_handler,
+                            partition_key=partition_key,
+                            method="TMP_TABLE_IN",
+                            p0_alias="p1",
+                            min_component_size=1,
+                        )
+                        elapsed_cache_get = time.perf_counter() - start_cache
+                        rows_cached, elapsed_cached = run_query(conn, sql_cached)
+
+                        print(
+                            f"With apply_cache_lazy: {len(rows_cached)} results in {elapsed_cache_get:.3f} + "
+                            f"{elapsed_cached:.3f} seconds (generated: {stats['generated_variants']}, "
+                            f"hits: {stats['cache_hits']}, enhanced: {stats['enhanced']})"
                         )
 
     except ValueError as e:
