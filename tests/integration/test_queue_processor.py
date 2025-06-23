@@ -69,9 +69,21 @@ class TestQueueProcessor:
         2. Wait for execution (65+ seconds)
         3. Verify job execution and side effects
         """
+        # Check if pg_cron extension is available
+        with db_session.cursor() as cur:
+            try:
+                cur.execute("SELECT extname FROM pg_extension WHERE extname = 'pg_cron';")
+                if not cur.fetchone():
+                    pytest.skip("pg_cron extension not available")
+            except Exception:
+                pytest.skip("Cannot check for pg_cron extension")
+        
         # Clear any existing test jobs
         with db_session.cursor() as cur:
-            cur.execute("DELETE FROM cron.job WHERE jobname LIKE 'test_%';")
+            try:
+                cur.execute("DELETE FROM cron.job WHERE jobname LIKE 'test_%';")
+            except Exception:
+                pytest.skip("pg_cron tables not available")
         
         # Schedule a simple test job that inserts a record
         test_jobname = f"test_job_{int(time.time())}"

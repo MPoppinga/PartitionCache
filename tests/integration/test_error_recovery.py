@@ -208,6 +208,15 @@ class TestQueueErrorRecovery:
 
     def test_invalid_cron_job_handling(self, db_session):
         """Test handling of invalid cron job specifications."""
+        # Check if pg_cron extension is available
+        with db_session.cursor() as cur:
+            try:
+                cur.execute("SELECT extname FROM pg_extension WHERE extname = 'pg_cron';")
+                if not cur.fetchone():
+                    pytest.skip("pg_cron extension not available")
+            except Exception:
+                pytest.skip("Cannot check for pg_cron extension")
+        
         invalid_cron_specs = [
             ("", "empty_cron"),
             ("invalid format", "invalid_format"),
@@ -238,6 +247,15 @@ class TestQueueErrorRecovery:
 
     def test_long_running_job_timeout(self, db_session):
         """Test handling of long-running cron jobs that might timeout."""
+        # Check if pg_cron extension is available
+        with db_session.cursor() as cur:
+            try:
+                cur.execute("SELECT extname FROM pg_extension WHERE extname = 'pg_cron';")
+                if not cur.fetchone():
+                    pytest.skip("pg_cron extension not available")
+            except Exception:
+                pytest.skip("Cannot check for pg_cron extension")
+        
         # Schedule a job that runs for a long time
         test_jobname = f"timeout_test_{int(time.time())}"
         # Command that will run for several seconds

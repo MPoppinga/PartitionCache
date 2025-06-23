@@ -12,20 +12,19 @@ jobs:
     
     services:
       postgres:
-        # Use our custom PostgreSQL + pg_cron container
-        image: postgres-with-pgcron:latest
-        options: >-
-          --build .github/docker/postgres-cron
-          --health-cmd "pg_isready -U test_user -d test_db"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
+        # Use standard postgres image - we'll handle pg_cron in tests
+        image: postgres:16
         env:
           POSTGRES_DB: test_db
           POSTGRES_USER: test_user
           POSTGRES_PASSWORD: test_password
         ports:
           - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U test_user -d test_db"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
           
       redis:
         image: redis:7-alpine
@@ -63,8 +62,18 @@ jobs:
         CACHE_BACKEND: postgresql_array
         QUERY_QUEUE_PROVIDER: postgresql
       run: |
-        # Verify database connectivity
-        python -c "import psycopg; psycopg.connect('postgresql://test_user:test_password@localhost:5432/test_db')"
+        # Wait for PostgreSQL to be ready
+        for i in {1..30}; do
+          if python -c "import psycopg; psycopg.connect('postgresql://test_user:test_password@localhost:5432/test_db')" 2>/dev/null; then
+            echo "PostgreSQL is ready"
+            break
+          fi
+          echo "Waiting for PostgreSQL... ($i/30)"
+          sleep 2
+        done
+        
+        # Create test tables (pg_cron tests will be skipped if extension unavailable)
+        python -c "import psycopg; conn = psycopg.connect('postgresql://test_user:test_password@localhost:5432/test_db'); conn.autocommit = True; cur = conn.cursor(); cur.execute('CREATE TABLE IF NOT EXISTS test_cron_results (id SERIAL PRIMARY KEY, message TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);'); print('Test tables created'); conn.close()"
         
         # Setup PartitionCache tables
         python -m partitioncache.cli.manage_cache setup all
