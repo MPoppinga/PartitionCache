@@ -4,9 +4,10 @@ Tests for the apply_cache module, specifically extend_query_with_partition_keys 
 
 import pytest
 from datetime import datetime
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 
-from partitioncache.apply_cache import extend_query_with_partition_keys, find_p0_alias, extend_query_with_partition_keys_lazy
+from partitioncache.apply_cache import extend_query_with_partition_keys, find_p0_alias, extend_query_with_partition_keys_lazy, apply_cache_lazy
+from partitioncache.cache_handler.abstract import AbstractCacheHandler_Lazy
 
 
 class TestFindP0Alias:
@@ -488,3 +489,221 @@ class TestExtendQueryWithPartitionKeysLazy:
         assert "CREATE TEMPORARY TABLE tmp_cache_keys AS" in result
         # Should only join to the specified table (u)
         assert "tmp_u" in result
+
+
+class TestApplyCacheLazy:
+    """Test the apply_cache_lazy wrapper function."""
+
+    def create_mock_cache_handler(self, lazy_subquery: str = None, used_hashes: int = 5):
+        """Create a mock cache handler for testing."""
+        mock_handler = Mock(spec=AbstractCacheHandler_Lazy)
+
+        # Mock get_intersected_lazy method
+        mock_handler.get_intersected_lazy.return_value = (lazy_subquery, used_hashes)
+
+        return mock_handler
+
+    def test_no_cache_hits_returns_original_query(self):
+        """Test that function returns original query when no cache hits."""
+        query = "SELECT * FROM users AS u WHERE u.active = true"
+        mock_handler = self.create_mock_cache_handler(lazy_subquery=None, used_hashes=0)
+
+        enhanced_query, stats = apply_cache_lazy(query, mock_handler, "zipcode")
+
+        assert enhanced_query == query
+        assert stats["enhanced"] == 0
+        assert stats["cache_hits"] == 0
+        assert stats["generated_variants"] > 0  # Should have generated some subqueries
+
+    def test_empty_lazy_subquery_returns_original(self):
+        """Test that function returns original query when lazy subquery is empty."""
+        query = "SELECT * FROM users AS u WHERE u.active = true"
+        mock_handler = self.create_mock_cache_handler(lazy_subquery="", used_hashes=0)
+
+        enhanced_query, stats = apply_cache_lazy(query, mock_handler, "zipcode")
+
+        assert enhanced_query == query
+        assert stats["enhanced"] == 0
+
+    def test_whitespace_lazy_subquery_returns_original(self):
+        """Test that function returns original query when lazy subquery is whitespace."""
+        query = "SELECT * FROM users AS u WHERE u.active = true"
+        mock_handler = self.create_mock_cache_handler(lazy_subquery="   \n\t  ", used_hashes=0)
+
+        enhanced_query, stats = apply_cache_lazy(query, mock_handler, "zipcode")
+
+        assert enhanced_query == query
+        assert stats["enhanced"] == 0
+
+    def test_successful_cache_enhancement_in_subquery(self):
+        """Test successful cache enhancement with IN_SUBQUERY method."""
+        query = "SELECT * FROM users AS u WHERE u.active = true"
+        lazy_subquery = "SELECT zipcode FROM cache_data WHERE query_hash = 'abc123'"
+        mock_handler = self.create_mock_cache_handler(lazy_subquery=lazy_subquery, used_hashes=3)
+
+        enhanced_query, stats = apply_cache_lazy(query, mock_handler, "zipcode", method="IN_SUBQUERY", p0_alias="u")
+
+        assert enhanced_query != query
+        assert "u.zipcode IN (SELECT zipcode FROM cache_data" in enhanced_query
+        assert "u.active = TRUE" in enhanced_query or "u.active = true" in enhanced_query
+        assert "AND" in enhanced_query
+        assert stats["enhanced"] == 1
+        assert stats["cache_hits"] == 3
+        assert stats["generated_variants"] > 0
+
+    def test_successful_cache_enhancement_tmp_table_in(self):
+        """Test successful cache enhancement with TMP_TABLE_IN method."""
+        query = "SELECT * FROM poi AS p1 WHERE ST_DWithin(p1.geom, ST_Point(1, 2), 1000)"
+        lazy_subquery = "SELECT zipcode FROM cache_zipcode_table WHERE active = true"
+        mock_handler = self.create_mock_cache_handler(lazy_subquery=lazy_subquery, used_hashes=5)
+
+        enhanced_query, stats = apply_cache_lazy(query, mock_handler, "zipcode", method="TMP_TABLE_IN", p0_alias="p1")
+
+        assert enhanced_query != query
+        assert "CREATE TEMPORARY TABLE tmp_cache_keys AS" in enhanced_query
+        assert "p1.zipcode IN (SELECT zipcode FROM tmp_cache_keys)" in enhanced_query
+        assert "ST_DWITHIN" in enhanced_query or "ST_DWithin" in enhanced_query
+        assert stats["enhanced"] == 1
+        assert stats["cache_hits"] == 5
+
+    def test_successful_cache_enhancement_tmp_table_join(self):
+        """Test successful cache enhancement with TMP_TABLE_JOIN method."""
+        query = "SELECT * FROM users AS u JOIN orders AS o ON u.id = o.user_id"
+        lazy_subquery = "SELECT region_id FROM cache_regions"
+        mock_handler = self.create_mock_cache_handler(lazy_subquery=lazy_subquery, used_hashes=2)
+
+        enhanced_query, stats = apply_cache_lazy(query, mock_handler, "region_id", method="TMP_TABLE_JOIN", p0_alias="u")
+
+        assert enhanced_query != query
+        assert "CREATE TEMPORARY TABLE tmp_cache_keys AS" in enhanced_query
+        assert "INNER JOIN" in enhanced_query
+        assert "tmp_cache_keys AS tmp_u" in enhanced_query
+        assert stats["enhanced"] == 1
+        assert stats["cache_hits"] == 2
+
+    def test_auto_alias_detection(self):
+        """Test that p0_alias is automatically detected when not provided."""
+        query = "SELECT * FROM users AS u WHERE u.active = true"
+        lazy_subquery = "SELECT zipcode FROM cache_data"
+        mock_handler = self.create_mock_cache_handler(lazy_subquery=lazy_subquery, used_hashes=1)
+
+        enhanced_query, stats = apply_cache_lazy(query, mock_handler, "zipcode", method="IN_SUBQUERY")
+
+        assert enhanced_query != query
+        assert "u.zipcode IN" in enhanced_query
+        assert stats["enhanced"] == 1
+
+    def test_complex_query_preservation(self):
+        """Test that complex query features are preserved during enhancement."""
+        query = """
+        SELECT u.name, COUNT(o.id) as order_count
+        FROM users AS u
+        LEFT JOIN orders AS o ON u.id = o.user_id AND o.status = 'complete'
+        WHERE u.created_at > '2023-01-01'
+        GROUP BY u.id, u.name
+        HAVING COUNT(o.id) > 0
+        ORDER BY order_count DESC
+        """
+        lazy_subquery = "SELECT region_id FROM cache_regions WHERE active = true"
+        mock_handler = self.create_mock_cache_handler(lazy_subquery=lazy_subquery, used_hashes=4)
+
+        enhanced_query, stats = apply_cache_lazy(query, mock_handler, "region_id", method="IN_SUBQUERY", p0_alias="u")
+
+        assert enhanced_query != query
+        assert "u.region_id IN" in enhanced_query
+        assert "LEFT JOIN orders" in enhanced_query
+        assert "GROUP BY" in enhanced_query
+        assert "HAVING" in enhanced_query
+        assert "ORDER BY" in enhanced_query
+        assert stats["enhanced"] == 1
+
+    def test_analyze_tmp_table_false(self):
+        """Test that analyze_tmp_table=False is passed through correctly."""
+        query = "SELECT * FROM users AS u"
+        lazy_subquery = "SELECT zipcode FROM cache_data"
+        mock_handler = self.create_mock_cache_handler(lazy_subquery=lazy_subquery, used_hashes=1)
+
+        enhanced_query, stats = apply_cache_lazy(query, mock_handler, "zipcode", method="TMP_TABLE_IN", p0_alias="u", analyze_tmp_table=False)
+
+        assert enhanced_query != query
+        assert "CREATE TEMPORARY TABLE tmp_cache_keys AS" in enhanced_query
+        assert "CREATE INDEX tmp_cache_keys_idx" not in enhanced_query
+        assert "ANALYZE tmp_cache_keys" not in enhanced_query
+
+    def test_analyze_tmp_table_true(self):
+        """Test that analyze_tmp_table=True is passed through correctly."""
+        query = "SELECT * FROM users AS u"
+        lazy_subquery = "SELECT zipcode FROM cache_data"
+        mock_handler = self.create_mock_cache_handler(lazy_subquery=lazy_subquery, used_hashes=1)
+
+        enhanced_query, stats = apply_cache_lazy(query, mock_handler, "zipcode", method="TMP_TABLE_IN", p0_alias="u", analyze_tmp_table=True)
+
+        assert enhanced_query != query
+        assert "CREATE INDEX tmp_cache_keys_idx ON tmp_cache_keys (zipcode)" in enhanced_query
+        assert "ANALYZE tmp_cache_keys" in enhanced_query
+
+    def test_custom_parameters_forwarded(self):
+        """Test that custom parameters are forwarded to underlying functions."""
+        query = "SELECT * FROM users AS u"
+        lazy_subquery = "SELECT zipcode FROM cache_data"
+        mock_handler = self.create_mock_cache_handler(lazy_subquery=lazy_subquery, used_hashes=1)
+
+        enhanced_query, stats = apply_cache_lazy(query, mock_handler, "zipcode", min_component_size=1, canonicalize_queries=True, follow_graph=False)
+
+        # Verify the mock was called with the correct parameters
+        mock_handler.get_intersected_lazy.assert_called_once()
+        assert stats["enhanced"] == 1
+
+    def test_statistics_accuracy(self):
+        """Test that returned statistics are accurate."""
+        query = "SELECT * FROM users AS u WHERE u.active = true"
+        lazy_subquery = "SELECT zipcode FROM cache_data"
+        mock_handler = self.create_mock_cache_handler(lazy_subquery=lazy_subquery, used_hashes=7)
+
+        enhanced_query, stats = apply_cache_lazy(query, mock_handler, "zipcode")
+
+        assert isinstance(stats, dict)
+        assert "generated_variants" in stats
+        assert "cache_hits" in stats
+        assert "enhanced" in stats
+        assert stats["cache_hits"] == 7
+        assert stats["enhanced"] == 1
+        assert stats["generated_variants"] > 0
+
+    def test_non_lazy_cache_handler_raises_error(self):
+        """Test that non-lazy cache handler raises appropriate error."""
+        query = "SELECT * FROM users AS u"
+        non_lazy_handler = Mock()  # Not a lazy handler
+
+        with pytest.raises(ValueError, match="Cache handler does not support lazy intersection"):
+            apply_cache_lazy(query, non_lazy_handler, "zipcode")
+
+    def test_realistic_postgresql_bit_scenario(self):
+        """Test with realistic PostgreSQL bit cache handler scenario."""
+        query = "SELECT * FROM poi AS p1 WHERE ST_DWithin(p1.geom, ST_Point(1, 2), 1000)"
+        # Realistic lazy subquery from PostgreSQL bit cache handler
+        lazy_subquery = """(
+       WITH bit_result AS (
+            SELECT BIT_AND(partition_keys) AS bit_result FROM (SELECT partition_keys FROM cache_zipcode WHERE query_hash = ANY(ARRAY['hash1', 'hash2'])) AS selected
+        ),
+        numbered_bits AS (
+            SELECT
+                bit_result,
+                generate_series(0, 99) AS bit_index
+            FROM bit_result
+        )
+        SELECT unnest(array_agg(bit_index)) AS zipcode
+        FROM numbered_bits
+        WHERE get_bit(bit_result, bit_index) = 1)
+        """
+        mock_handler = self.create_mock_cache_handler(lazy_subquery=lazy_subquery, used_hashes=3)
+
+        enhanced_query, stats = apply_cache_lazy(query, mock_handler, "zipcode", method="TMP_TABLE_IN", p0_alias="p1")
+
+        assert enhanced_query != query
+        assert "CREATE TEMPORARY TABLE tmp_cache_keys AS" in enhanced_query
+        assert "WITH bit_result AS" in enhanced_query
+        assert "p1.zipcode IN (SELECT zipcode FROM tmp_cache_keys)" in enhanced_query
+        assert "ST_DWITHIN" in enhanced_query or "ST_DWithin" in enhanced_query
+        assert stats["enhanced"] == 1
+        assert stats["cache_hits"] == 3

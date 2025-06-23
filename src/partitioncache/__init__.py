@@ -8,7 +8,13 @@ with automatic datatype validation and consistent interfaces.
 from datetime import datetime
 from typing import Union
 
-from partitioncache.apply_cache import extend_query_with_partition_keys, extend_query_with_partition_keys_lazy, get_partition_keys, get_partition_keys_lazy
+from partitioncache.apply_cache import (
+    extend_query_with_partition_keys,
+    extend_query_with_partition_keys_lazy,
+    get_partition_keys,
+    get_partition_keys_lazy,
+    apply_cache_lazy,
+)
 from partitioncache.cache_handler import get_cache_handler
 from partitioncache.cache_handler.helper import PartitionCacheHelper, create_partitioncache_helper
 
@@ -75,6 +81,7 @@ __all__ = [
     "get_partition_keys_lazy",
     "extend_query_with_partition_keys",
     "extend_query_with_partition_keys_lazy",
+    "apply_cache_lazy",
     "push_to_original_query_queue",
     "push_to_query_fragment_queue",
     "get_queue_lengths",

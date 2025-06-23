@@ -94,7 +94,7 @@ def test_partition_key(conn, partition_key: str, datatype: str = "integer"):
                 # Test lazy intersection if supported
                 if hasattr(cache.underlying_handler, "get_intersected_lazy"):
                     start_cache = time.perf_counter()
-                    lazy_cache_subquery, nr_used_hashes = partitioncache.get_partition_keys_lazy(
+                    lazy_cache_subquery, nr_generated_variants, nr_used_hashes = partitioncache.get_partition_keys_lazy(
                         query=sql_query,
                         cache_handler=cache.underlying_handler,
                         partition_key=partition_key,

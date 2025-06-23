@@ -60,9 +60,26 @@ def get_partition_keys_lazy(
     min_component_size=2,
     canonicalize_queries=False,
     follow_graph=True,
-) -> tuple:
+) -> tuple[str, int, int]:
     """
-    Gets the lazy intersection representation of the partition keys for the given query and the number of hashes used.
+    Gets the lazy intersection representation of the partition keys for the given query.
+
+    Args:
+        query (str): The SQL query to be checked in the cache.
+        cache_handler (AbstractCacheHandler): The cache handler object that supports lazy intersection.
+        partition_key (str): The identifier for the partition.
+        min_component_size (int): Minimum size of query components to consider for cache lookup.
+        canonicalize_queries (bool): Whether to canonicalize queries before hashing.
+        follow_graph (bool): Whether to follow the query graph for generating variants.
+
+    Returns:
+        tuple[str, int, int]: A tuple containing:
+            - Lazy SQL subquery string (empty if no cache hits)
+            - Total number of query variant hashes generated
+            - Number of cache hits (hashes found in cache)
+
+    Raises:
+        ValueError: If cache handler does not support lazy intersection.
     """
     hashses = generate_all_hashes(
         query=query,
@@ -73,13 +90,12 @@ def get_partition_keys_lazy(
         follow_graph=follow_graph,
     )
 
-    # -> tuple[sql.Composed | None , int]
     if not isinstance(cache_handler, AbstractCacheHandler_Lazy):
         raise ValueError("Cache handler does not support lazy intersection")
 
     lazy_cache_subquery, used_hashes = cache_handler.get_intersected_lazy(set(hashses), partition_key=partition_key)
 
-    return lazy_cache_subquery, used_hashes
+    return lazy_cache_subquery, len(hashses), used_hashes
 
 
 def find_p0_alias(query: str) -> str:
@@ -318,3 +334,101 @@ def extend_query_with_partition_keys_lazy(
             from_clause.this.replace(join_expr)
 
         return tmp_table_setup + parsed_query.sql()
+
+
+def apply_cache_lazy(
+    query: str,
+    cache_handler: AbstractCacheHandler_Lazy,
+    partition_key: str,
+    method: Literal["IN_SUBQUERY", "TMP_TABLE_IN", "TMP_TABLE_JOIN"] = "IN_SUBQUERY",
+    p0_alias: str | None = None,
+    min_component_size: int = 2,
+    canonicalize_queries: bool = False,
+    follow_graph: bool = True,
+    analyze_tmp_table: bool = True,
+) -> tuple[str, dict[str, int]]:
+    """
+    Complete wrapper function that applies partition cache to a query using lazy intersection.
+
+    This is the "whole package" function that:
+    1. Generates all query variants/hashes from the original query
+    2. Gets the lazy SQL subquery from the cache based on those hashes
+    3. Combines the original query with the lazy SQL subquery
+    4. Returns the complete enhanced query ready for execution
+
+    This function replaces the manual pattern commonly used in examples:
+    ```python
+    # Manual approach (replaced by this function)
+    lazy_subquery, generated_variants, nr_hashes = get_partition_keys_lazy(query, cache_handler, partition_key)
+    if lazy_subquery:
+        enhanced_query = extend_query_with_partition_keys_lazy(query, lazy_subquery, partition_key)
+    ```
+
+    Args:
+        query (str): The original SQL query to be enhanced with cache functionality.
+        cache_handler (AbstractCacheHandler_Lazy): The lazy cache handler instance.
+        partition_key (str): The identifier for the partition.
+        method (Literal["IN_SUBQUERY", "TMP_TABLE_IN", "TMP_TABLE_JOIN"]): The method to use for query extension.
+        p0_alias (str | None): The alias of the table to use for the partition key. If None, will be auto-detected.
+        min_component_size (int): Minimum size of query components to consider for cache lookup.
+        canonicalize_queries (bool): Whether to canonicalize queries before hashing.
+        follow_graph (bool): Whether to follow the query graph for generating variants.
+        analyze_tmp_table (bool): Whether to create index and analyze for temporary table methods.
+
+    Returns:
+        tuple[str, dict[str, int]]: A tuple containing:
+            - Enhanced SQL query string (original query if no cache hits)
+            - Cache statistics dictionary with keys:
+                - 'generated_variants': Total number of query variant hashes generated
+                - 'cache_hits': Number of cache hits (hashes found in cache)
+                - 'enhanced': 1 if query was enhanced, 0 if returned unchanged
+
+    Raises:
+        ValueError: If cache handler does not support lazy intersection.
+
+    Example:
+        ```python
+        enhanced_query, stats = partitioncache.apply_cache_lazy(
+            "SELECT * FROM poi AS p1 WHERE ST_DWithin(p1.geom, ST_Point(1, 2), 1000)",
+            cache_handler,
+            partition_key="zipcode",
+            method="TMP_TABLE_IN",
+            p0_alias="p1"
+        )
+
+        print(f"Enhanced query: {enhanced_query}")
+        print(f"Cache hits: {stats['cache_hits']}/{stats['generated_variants']}")
+        ```
+    """
+    # Generate all query variants and get lazy subquery from cache
+    lazy_cache_subquery, generated_variants, used_hashes = get_partition_keys_lazy(
+        query=query,
+        cache_handler=cache_handler,
+        partition_key=partition_key,
+        min_component_size=min_component_size,
+        canonicalize_queries=canonicalize_queries,
+        follow_graph=follow_graph,
+    )
+
+    # Create statistics dictionary
+    stats = {"generated_variants": generated_variants, "cache_hits": used_hashes, "enhanced": 0}
+
+    # If no cache hits, return original query
+    if not lazy_cache_subquery or not lazy_cache_subquery.strip():
+        logger.info(f"No cache hits found for query. Generated {generated_variants} subqueries, {used_hashes} cache hits")
+        return query, stats
+
+    # Apply the lazy cache subquery to enhance the original query
+    enhanced_query = extend_query_with_partition_keys_lazy(
+        query=query,
+        lazy_subquery=lazy_cache_subquery,
+        partition_key=partition_key,
+        method=method,
+        p0_alias=p0_alias,
+        analyze_tmp_table=analyze_tmp_table,
+    )
+
+    stats["enhanced"] = 1
+    logger.info(f"Successfully enhanced query with cache. Generated {generated_variants} subqueries, {used_hashes} cache hits")
+
+    return enhanced_query, stats
