@@ -285,7 +285,7 @@ def get_all_keys(cache: AbstractCacheHandler) -> list[str]:
 
 def count_cache(cache_type: str) -> None:
     """Count cache entries with improved PostgreSQL support."""
-    if cache_type.find("postgresql") == 0:
+    if cache_type.startswith("postgresql"):
         # Use PostgreSQL-specific counting for better accuracy
         partitions = get_partition_overview(cache_type)
 
