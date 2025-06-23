@@ -22,4 +22,4 @@ jobs:
         pip install .[db]
     - name: Run tests
       run: |
-        pytest
+        pytest tests/pytest/
