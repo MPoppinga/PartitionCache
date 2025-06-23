@@ -83,7 +83,7 @@ class PostgreSQLArrayCacheHandler(PostgreSQLAbstractCacheHandler):
                 sql.SQL("""CREATE TABLE IF NOT EXISTS {0} (
                     query_hash TEXT PRIMARY KEY,
                     partition_keys {1},
-                    partition_keys_count integer NOT NULL GENERATED ALWAYS AS length(partition_keys) STORED
+                    partition_keys_count integer NOT NULL GENERATED ALWAYS AS (cardinality(partition_keys)) STORED
                 );""").format(sql.Identifier(table_name), sql.SQL(sql_datatype))
             )
 

@@ -22,16 +22,8 @@ RUN cd /tmp && \
     make && \
     make install
 
-# 3. Clean up build dependencies and temporary build files.
-RUN apt-get purge -y --auto-remove \
-        build-essential \
-        git \
-        postgresql-server-dev-16 \
-        libc6-dev \
-        llvm-13 \
-        clang-13 \
-        libkrb5-dev && \
-    rm -rf /tmp/*
+# 3. Clean up build
+RUN rm -rf /tmp/*
 
 # Copy the initialization script to be run by the official postgres entrypoint.
 COPY init-db.sh /docker-entrypoint-initdb.d/
