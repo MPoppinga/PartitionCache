@@ -63,7 +63,7 @@ jobs:
       id: meta
       uses: docker/metadata-action@v5
       with:
-        images: ghcr.io/${{ github.repository_owner }}/postgres-test-extensions
+        images: ghcr.io/mpoppinga/postgres-test-extensions
         tags: |
           type=ref,event=branch
           type=ref,event=pr
@@ -92,7 +92,7 @@ jobs:
     
     services:
       postgres:
-        image: ghcr.io/${{ github.repository_owner }}/postgres-test-extensions:latest
+        image: ghcr.io/mpoppinga/postgres-test-extensions:latest
         env:
           POSTGRES_DB: test_db
           POSTGRES_USER: test_user
@@ -239,7 +239,7 @@ jobs:
 
     services:
       postgres:
-        image: ghcr.io/${{ github.repository_owner }}/postgres-test-extensions:latest
+        image: ghcr.io/mpoppinga/postgres-test-extensions:latest
         env:
           POSTGRES_DB: test_db
           POSTGRES_USER: test_user
@@ -421,7 +421,7 @@ jobs:
     
     services:
       postgres:
-        image: ghcr.io/${{ github.repository_owner }}/postgres-test-extensions:latest
+        image: ghcr.io/mpoppinga/postgres-test-extensions:latest
         env:
           POSTGRES_DB: test_db
           POSTGRES_USER: test_user
@@ -494,7 +494,7 @@ jobs:
     
     services:
       postgres:
-        image: ghcr.io/${{ github.repository_owner }}/postgres-test-extensions:latest
+        image: ghcr.io/mpoppinga/postgres-test-extensions:latest
         env:
           POSTGRES_DB: test_db
           POSTGRES_USER: test_user

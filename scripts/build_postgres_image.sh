@@ -67,6 +67,13 @@ Environment Variables:
     GITHUB_TOKEN            Required for pushing to GHCR (private repos)
     DOCKER_BUILDKIT         Enable Docker BuildKit (recommended)
 
+Examples for this repository:
+    # Build locally
+    $0
+    
+    # Build and push to GHCR for mpoppinga
+    $0 --push --owner mpoppinga
+
 EOF
 }
 
@@ -126,7 +133,9 @@ fi
 
 # Set full image name
 if [[ "$PUSH_TO_GHCR" == "true" ]]; then
-    FULL_IMAGE_NAME="ghcr.io/${GITHUB_OWNER}/${IMAGE_NAME}:${TAG}"
+    # Convert owner to lowercase for Docker registry compatibility
+    GITHUB_OWNER_LOWER=$(echo "$GITHUB_OWNER" | tr '[:upper:]' '[:lower:]')
+    FULL_IMAGE_NAME="ghcr.io/${GITHUB_OWNER_LOWER}/${IMAGE_NAME}:${TAG}"
 else
     FULL_IMAGE_NAME="${IMAGE_NAME}:${TAG}"
 fi
