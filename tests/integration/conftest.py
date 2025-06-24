@@ -1,11 +1,11 @@
 import os
 import time
-import pytest
-import psycopg
-from typing import Generator, Any
 
-import partitioncache
+import psycopg
+import pytest
+
 from partitioncache.cache_handler import get_cache_handler
+
 
 # Configure pytest markers
 def pytest_configure(config):
@@ -30,7 +30,7 @@ SAMPLE_TEST_DATA = {
     },
     "region": {
         "northeast": {"cities": 4, "total_pop": 72000},
-        "west": {"cities": 1, "total_pop": 32000}, 
+        "west": {"cities": 1, "total_pop": 32000},
         "southeast": {"cities": 2, "total_pop": 28000},
     }
 }
@@ -50,15 +50,15 @@ def db_connection():
         "password": os.getenv("PG_PASSWORD", "test_password"),
         "dbname": os.getenv("PG_DBNAME", "test_db"),
     }
-    
+
     conn = psycopg.connect(**conn_params)
     conn.autocommit = True
-    
+
     # Create test tables with sample data
     with conn.cursor() as cur:
         # Create pg_cron extension if not exists
         cur.execute("CREATE EXTENSION IF NOT EXISTS pg_cron;")
-        
+
         # Create test tables based on OSM pattern
         cur.execute("""
             CREATE TABLE IF NOT EXISTS test_locations (
@@ -70,7 +70,7 @@ def db_connection():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
-        
+
         # Insert sample data
         cur.execute("TRUNCATE test_locations;")
         for zipcode, data in SAMPLE_TEST_DATA["zipcode"].items():
@@ -78,23 +78,23 @@ def db_connection():
             if zipcode < 20000:
                 region = "northeast"
             elif zipcode < 80000:
-                region = "southeast"  
+                region = "southeast"
             else:
                 region = "west"
-                
+
             cur.execute("""
                 INSERT INTO test_locations (zipcode, region, name, population)
                 VALUES (%s, %s, %s, %s);
             """, (zipcode, region, data["name"], data["population"]))
-    
+
     yield conn
-    
+
     # Cleanup
     with conn.cursor() as cur:
         cur.execute("DROP TABLE IF EXISTS test_locations CASCADE;")
         # Clean up any test cron jobs
         cur.execute("DELETE FROM cron.job WHERE jobname LIKE 'test_%';")
-    
+
     conn.close()
 
 
@@ -105,7 +105,7 @@ def db_session(db_connection):
     Ensures test isolation by cleaning up data between tests.
     """
     conn = db_connection
-    
+
     # Start fresh transaction
     with conn.cursor() as cur:
         # Clean up any existing test cache data
@@ -114,15 +114,15 @@ def db_session(db_connection):
             WHERE tablename LIKE 'partitioncache_%' AND schemaname = 'public';
         """)
         cache_tables = cur.fetchall()
-        
+
         for (table_name,) in cache_tables:
             try:
                 cur.execute(f"TRUNCATE {table_name} CASCADE;")
             except Exception:
                 pass  # Table might not exist or have dependencies
-    
+
     yield conn
-    
+
     # Cleanup after test
     with conn.cursor() as cur:
         # Remove any test cron jobs
@@ -134,9 +134,6 @@ CACHE_BACKENDS = [
     "postgresql_array",
     "postgresql_bit", 
     "postgresql_roaringbit",
-    # Redis backends - only if Redis is available
-    # "redis_set",
-    # "redis_bit",
 ]
 
 # Add Redis backends if available
@@ -151,25 +148,25 @@ def cache_client(request, db_session):
     Each test using this fixture will run once per cache backend.
     """
     cache_backend = request.param
-    
+
     # Set environment variables for cache backend
     original_backend = os.getenv("CACHE_BACKEND")
     os.environ["CACHE_BACKEND"] = cache_backend
-    
+
     try:
         # Create cache handler
         cache_handler = get_cache_handler(cache_backend)
-        
+
         # Setup partition keys for testing
         for partition_key, datatype in TEST_PARTITION_KEYS:
             try:
                 cache_handler.register_partition_key(partition_key, datatype)
-            except Exception as e:
+            except Exception:
                 # Some backends might not need explicit registration
                 pass
-        
+
         yield cache_handler
-        
+
     finally:
         # Cleanup
         try:
@@ -181,11 +178,11 @@ def cache_client(request, db_session):
                         cache_handler.delete(key, partition_key)
                 except Exception:
                     pass
-                    
+
             cache_handler.close()
         except Exception:
             pass
-            
+
         # Restore original environment
         if original_backend:
             os.environ["CACHE_BACKEND"] = original_backend
