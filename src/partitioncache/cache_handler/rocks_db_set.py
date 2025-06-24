@@ -2,7 +2,6 @@ import struct
 from datetime import datetime
 from logging import getLogger
 
-
 from partitioncache.cache_handler.rocks_db_abstract import RocksDBAbstractCacheHandler
 
 logger = getLogger("PartitionCache")

@@ -6,7 +6,6 @@ implementation to specific queue handlers via the factory pattern.
 """
 
 import os
-from typing import List, Tuple, Optional
 from logging import getLogger
 
 from partitioncache.queue_handler import get_queue_handler
@@ -64,13 +63,13 @@ def push_to_original_query_queue(
 
 
 def push_to_query_fragment_queue(
-    query_hash_pairs: List[Tuple[str, str]], partition_key: str = "partition_key", partition_datatype: str = "integer", queue_provider: str | None = None
+    query_hash_pairs: list[tuple[str, str]], partition_key: str = "partition_key", partition_datatype: str = "integer", queue_provider: str | None = None
 ) -> bool:
     """
     Push query fragments (as query-hash pairs) directly to the query fragment queue.
 
     Args:
-        query_hash_pairs (List[Tuple[str, str]]): List of (query, hash) tuples to push to query fragment queue.
+        query_hash_pairs (list[tuple[str, str]]): List of (query, hash) tuples to push to query fragment queue.
         partition_key (str): The partition key for these query fragments (default: "partition_key").
         partition_datatype (str): The datatype of the partition key (default: "integer").
         queue_provider (str): The queue provider to use (default: None, which uses the environment variable QUERY_QUEUE_PROVIDER).
@@ -85,7 +84,7 @@ def push_to_query_fragment_queue(
         return False
 
 
-def pop_from_original_query_queue(queue_provider: str | None = None) -> Optional[Tuple[str, str, str]]:
+def pop_from_original_query_queue(queue_provider: str | None = None) -> tuple[str, str, str] | None:
     """
     Pop an original query from the original query queue.
 
@@ -100,7 +99,7 @@ def pop_from_original_query_queue(queue_provider: str | None = None) -> Optional
         return None
 
 
-def pop_from_original_query_queue_blocking(timeout: int = 60, queue_provider: str | None = None) -> Optional[Tuple[str, str, str]]:
+def pop_from_original_query_queue_blocking(timeout: int = 60, queue_provider: str | None = None) -> tuple[str, str, str] | None:
     """
     Pop an original query from the original query queue with blocking wait.
     Uses provider-specific blocking mechanisms when available.
@@ -125,7 +124,7 @@ def pop_from_original_query_queue_blocking(timeout: int = 60, queue_provider: st
         return None
 
 
-def pop_from_query_fragment_queue(queue_provider: str | None = None) -> Optional[Tuple[str, str, str, str]]:
+def pop_from_query_fragment_queue(queue_provider: str | None = None) -> tuple[str, str, str, str] | None:
     """
     Pop a query fragment from the query fragment queue.
 
@@ -140,7 +139,7 @@ def pop_from_query_fragment_queue(queue_provider: str | None = None) -> Optional
         return None
 
 
-def pop_from_query_fragment_queue_blocking(timeout: int = 60, queue_provider: str | None = None) -> Optional[Tuple[str, str, str, str]]:
+def pop_from_query_fragment_queue_blocking(timeout: int = 60, queue_provider: str | None = None) -> tuple[str, str, str, str] | None:
     """
     Pop a query fragment from the query fragment queue with blocking wait.
     Uses provider-specific blocking mechanisms when available.
@@ -210,7 +209,7 @@ def clear_query_fragment_queue(queue_provider: str | None = None) -> int:
         return 0
 
 
-def clear_all_queues(queue_provider: str | None = None) -> Tuple[int, int]:
+def clear_all_queues(queue_provider: str | None = None) -> tuple[int, int]:
     """
     Clear both original query and query fragment queues.
 

@@ -1,10 +1,9 @@
-from logging import getLogger
 from datetime import datetime
-from typing import Union
+from logging import getLogger
 
 from bitarray import bitarray
-from pyroaring import BitMap
 from psycopg import sql
+from pyroaring import BitMap
 
 from partitioncache.cache_handler.postgresql_abstract import PostgreSQLAbstractCacheHandler
 
@@ -87,7 +86,7 @@ class PostgreSQLRoaringBitCacheHandler(PostgreSQLAbstractCacheHandler):
     def set_set(
         self,
         key: str,
-        value: Union[set[int], set[str], set[float], set[datetime], BitMap, bitarray, list],
+        value: set[int] | set[str] | set[float] | set[datetime] | BitMap | bitarray | list,
         partition_key: str = "partition_key",
     ) -> bool:
         """
@@ -114,7 +113,7 @@ class PostgreSQLRoaringBitCacheHandler(PostgreSQLAbstractCacheHandler):
                 rb = BitMap()
                 for pos in value.search(bitarray("1")):
                     rb.add(pos)
-            elif isinstance(value, (list, set)):
+            elif isinstance(value, list | set):
                 rb = BitMap()
                 for item in value:
                     if isinstance(item, int):
@@ -183,7 +182,7 @@ class PostgreSQLRoaringBitCacheHandler(PostgreSQLAbstractCacheHandler):
         table_name = f"{self.tableprefix}_cache_{partition_key}"
         query = sql.SQL("SELECT query_hash FROM {0} WHERE query_hash = ANY(%s) AND partition_keys IS NOT NULL").format(sql.Identifier(table_name))
         self.cursor.execute(query, (list(keys),))
-        keys_set = set(x[0] for x in self.cursor.fetchall())
+        keys_set = {x[0] for x in self.cursor.fetchall()}
 
         if not keys_set:
             return None, 0

@@ -206,12 +206,6 @@ class AbstractCacheHandler(ABC):
         """
         raise NotImplementedError
 
-    def compact(self):
-        """
-        Compact the cache to optimize storage as recommended for some cache handlers.
-        """
-        pass
-
     @abstractmethod
     def get_datatype(self, partition_key: str) -> str | None:
         """
@@ -234,7 +228,7 @@ class AbstractCacheHandler(ABC):
         Close the cache handler and release any resources allocated by the cache handler.
         """
         raise NotImplementedError
-    
+
     @abstractmethod
     def get_partition_keys(self) -> list[tuple[str, str]]:
         """

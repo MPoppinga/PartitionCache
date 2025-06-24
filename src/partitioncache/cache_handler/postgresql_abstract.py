@@ -1,8 +1,9 @@
+from logging import getLogger
+
 import psycopg
 from psycopg import sql
-from functools import cache
+
 from partitioncache.cache_handler.abstract import AbstractCacheHandler_Lazy
-from logging import getLogger
 
 logger = getLogger("PartitionCache")
 
@@ -10,6 +11,7 @@ logger = getLogger("PartitionCache")
 class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
     _instance = None
     _refcount = 0
+    _cached_datatype: dict[str, str] = {}
 
     @classmethod
     def get_instance(cls, *args, **kwargs):
@@ -28,13 +30,17 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
         self.tableprefix = db_tableprefix
         self.cursor = self.db.cursor()
 
-    @cache
     def _get_partition_datatype(self, partition_key: str) -> str | None:
         """Get the datatype for a partition key from metadata."""
+        if partition_key in self._cached_datatype:
+            return self._cached_datatype[partition_key]
+
         self.cursor.execute(
             sql.SQL("SELECT datatype FROM {0} WHERE partition_key = %s").format(sql.Identifier(self.tableprefix + "_partition_metadata")), (partition_key,)
         )
         result = self.cursor.fetchone()
+        if result:
+            self._cached_datatype[partition_key] = result[0]
         return result[0] if result else None
 
     def close(self):
@@ -112,7 +118,7 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
         result = self.cursor.fetchone()
         if result == [None] or result == (None,) or result is None:
             return True
-        if isinstance(result, (tuple, list)) and len(result) > 0 and result[0] is None:
+        if isinstance(result, tuple | list) and len(result) > 0 and result[0] is None:
             return True
         return False
 
@@ -143,7 +149,7 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
                 sql.SQL("SELECT query_hash FROM {0} WHERE query_hash = ANY(%s) AND partition_keys IS NOT NULL").format(sql.Identifier(table_name)),
                 [list(keys)],
             )
-            keys_set = set(x[0] for x in self.cursor.fetchall())
+            keys_set = {x[0] for x in self.cursor.fetchall()}
             logger.info(f"Found {len(keys_set)} existing hashkeys for partition {partition_key}")
             return keys_set
         except Exception as e:

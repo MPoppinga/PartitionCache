@@ -1,13 +1,10 @@
 import time
-from logging import getLogger
 from datetime import datetime
-from typing import Set
-
+from logging import getLogger
 
 from psycopg import sql
 
 from partitioncache.cache_handler.postgresql_abstract import PostgreSQLAbstractCacheHandler
-
 
 logger = getLogger("PartitionCache")
 
@@ -16,7 +13,7 @@ class PostgreSQLArrayCacheHandler(PostgreSQLAbstractCacheHandler):
     USE_AGGREGATES = True
 
     @classmethod
-    def get_supported_datatypes(cls) -> Set[str]:
+    def get_supported_datatypes(cls) -> set[str]:
         """PostgreSQL array handler supports all datatypes."""
         return {"integer", "float", "text", "timestamp"}
 
@@ -41,7 +38,7 @@ class PostgreSQLArrayCacheHandler(PostgreSQLAbstractCacheHandler):
                 """
                 CREATE OR REPLACE FUNCTION _array_intersect(anyarray, anyarray)
                 RETURNS anyarray AS $$
-                    SELECT CASE 
+                    SELECT CASE
                         WHEN $1 IS NULL THEN $2
                         WHEN $2 IS NULL THEN $1
                         ELSE ARRAY(SELECT unnest($1) INTERSECT SELECT unnest($2) ORDER BY 1)

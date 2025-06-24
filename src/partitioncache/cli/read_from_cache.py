@@ -4,10 +4,10 @@ CLI tool to read partition keys from the cache for a given query.
 
 import argparse
 import sys
-
-from logging import getLogger, WARNING
+from logging import WARNING, getLogger
 
 import dotenv
+
 import partitioncache
 
 logger = getLogger("PartitionCache")
@@ -84,7 +84,7 @@ def main(file=sys.stdout):
             if args.output_format == "json":
                 import json
 
-                print(json.dumps(sorted(list(partition_keys))), file=file)
+                print(json.dumps(sorted(partition_keys)), file=file)
 
             elif args.output_format == "lines":
                 for key in sorted(partition_keys):

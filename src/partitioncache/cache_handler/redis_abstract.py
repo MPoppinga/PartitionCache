@@ -1,6 +1,6 @@
-from functools import cache
-import redis
 from datetime import datetime
+
+import redis
 
 from partitioncache.cache_handler.abstract import AbstractCacheHandler
 
@@ -13,6 +13,7 @@ class RedisAbstractCacheHandler(AbstractCacheHandler):
 
     _instance = None
     _refcount = 0
+    _cached_datatype: dict[str, str] = {}
 
     @classmethod
     def get_instance(cls, *args, **kwargs):
@@ -28,21 +29,26 @@ class RedisAbstractCacheHandler(AbstractCacheHandler):
         """
         self.db = redis.Redis(host=db_host, port=db_port, db=db_name, password=db_password)
 
-    @cache
     def _get_partition_datatype(self, partition_key: str) -> str | None:
         """Get the datatype for a partition key from metadata."""
         metadata_key = f"_partition_metadata:{partition_key}"
+
+        if partition_key in self._cached_datatype:
+            return self._cached_datatype[partition_key]
+
         # Check if it's the old format (just a string) or new format (hash)
         key_type = self.db.type(metadata_key)
         if key_type == b"string":
             # Old format - just return the datatype
             datatype = self.db.get(metadata_key)
             if datatype is not None and isinstance(datatype, bytes):
+                self._cached_datatype[partition_key] = datatype.decode()
                 return datatype.decode()
         elif key_type == b"hash":
             # New format - get datatype from hash
             datatype = self.db.hget(metadata_key, "datatype")
             if datatype is not None and isinstance(datatype, bytes):
+                self._cached_datatype[partition_key] = datatype.decode()
                 return datatype.decode()
         return None
 

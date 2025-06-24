@@ -10,7 +10,6 @@ Usage:
     result = partition_handler.get("key1")
 """
 
-from typing import Set, Union, Optional, Tuple
 from datetime import datetime
 from logging import getLogger
 
@@ -18,7 +17,7 @@ from .abstract import AbstractCacheHandler, AbstractCacheHandler_Lazy
 
 logger = getLogger("PartitionCache")
 
-DataSet = Union[set[int], set[str], set[float], set[datetime]]
+DataSet = set[int] | set[str] | set[float] | set[datetime]
 
 
 class PartitionCacheHelper:
@@ -100,7 +99,7 @@ class PartitionCacheHelper:
             logger.error(f"Failed to set_set for key {key}: {e}")
             return False
 
-    def get(self, key: str) -> Optional[DataSet]:
+    def get(self, key: str) -> DataSet | None:
         """
         Retrieve a set from the cache.
 
@@ -201,7 +200,7 @@ class PartitionCacheHelper:
             logger.error(f"Failed to set_query for key {key}: {e}")
             return False
 
-    def get_intersected(self, keys: Set[str]) -> Tuple[Optional[DataSet], int]:
+    def get_intersected(self, keys: set[str]) -> tuple[DataSet | None, int]:
         """
         Get intersection of multiple cache entries.
 
@@ -217,7 +216,7 @@ class PartitionCacheHelper:
             logger.error(f"Failed to get_intersected for keys {keys}: {e}")
             return None, 0
 
-    def filter_existing_keys(self, keys: Set[str]) -> Set[str]:
+    def filter_existing_keys(self, keys: set[str]) -> set[str]:
         """
         Filter keys to only those that exist in cache.
 
@@ -310,7 +309,7 @@ class LazyPartitionCacheHelper(PartitionCacheHelper):
 
         self._cache_handler = cache_handler
 
-    def get_intersected_lazy(self, keys: Set[str]) -> Tuple[Optional[str], int]:
+    def get_intersected_lazy(self, keys: set[str]) -> tuple[str | None, int]:
         """
         Get lazy intersection representation.
 

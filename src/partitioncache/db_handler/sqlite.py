@@ -1,6 +1,6 @@
 import sqlite3
-from typing import List
 from logging import getLogger
+
 from partitioncache.db_handler.abstract import AbstractDBHandler
 
 logger = getLogger("PartitionCache")
@@ -15,7 +15,7 @@ class SQLiteDBHandler(AbstractDBHandler):
             logger.error(f"Error connecting to SQLite database at {db_path}: {e}")
             raise
 
-    def execute(self, query: str) -> List:
+    def execute(self, query: str) -> list:
         try:
             self.cur.execute(query)
             self.conn.commit()  # Ensure changes are committed

@@ -1,9 +1,9 @@
 import argparse
+import logging
 import os
 import pickle
-from logging import getLogger
-import logging
 import sys
+from logging import getLogger
 from typing import Any
 
 from dotenv import load_dotenv
@@ -740,7 +740,7 @@ def _get_postgresql_partition_overview(cache_type: str, existing_partitions: lis
             # Find all cache tables
             cur.execute(
                 """
-                SELECT tablename FROM pg_tables 
+                SELECT tablename FROM pg_tables
                 WHERE tablename LIKE %s AND tablename LIKE %s
                 ORDER BY tablename
             """,
@@ -874,8 +874,8 @@ Examples:
   pcache-manage maintenance prune --days 30
   pcache-manage maintenance cleanup --remove-termination
 
-Note: Cache type parameters are optional for most commands and will use 
-the CACHE_BACKEND environment variable when not specified. Use --env 
+Note: Cache type parameters are optional for most commands and will use
+the CACHE_BACKEND environment variable when not specified. Use --env
 to load configuration from a custom environment file.
         """,
     )

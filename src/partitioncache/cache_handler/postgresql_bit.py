@@ -1,5 +1,5 @@
-from logging import getLogger
 from datetime import datetime
+from logging import getLogger
 
 from bitarray import bitarray
 from psycopg import sql
@@ -158,7 +158,7 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
         table_name = f"{self.tableprefix}_cache_{partition_key}"
         query = sql.SQL("SELECT query_hash FROM {0} WHERE query_hash = ANY(%s) AND partition_keys IS NOT NULL").format(sql.Identifier(table_name))
         self.cursor.execute(query, (list(keys),))
-        keys_set = set(x[0] for x in self.cursor.fetchall())
+        keys_set = {x[0] for x in self.cursor.fetchall()}
 
         if not keys_set:
             return None, 0

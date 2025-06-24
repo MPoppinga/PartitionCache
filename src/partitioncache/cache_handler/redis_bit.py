@@ -1,4 +1,3 @@
-from functools import cache
 import uuid
 from datetime import datetime
 from logging import getLogger
@@ -86,7 +85,7 @@ class RedisBitCacheHandler(RedisAbstractCacheHandler):
         key_types = pipe.execute()
 
         existing_keys = set()
-        for key, key_type in zip(keys, key_types):
+        for key, key_type in zip(keys, key_types, strict=False):
             if key_type == b"string":
                 existing_keys.add(key)
         return existing_keys
@@ -106,7 +105,7 @@ class RedisBitCacheHandler(RedisAbstractCacheHandler):
             pipe.type(cache_key)
         key_types = pipe.execute()
 
-        valid_cache_keys: list[str] = [cache_key for cache_key, key_type in zip(cache_keys, key_types) if key_type == b"string"]
+        valid_cache_keys: list[str] = [cache_key for cache_key, key_type in zip(cache_keys, key_types, strict=False) if key_type == b"string"]
         valid_keys_count = len(valid_cache_keys)
 
         randuuid = str(uuid.uuid4())
@@ -115,7 +114,7 @@ class RedisBitCacheHandler(RedisAbstractCacheHandler):
             return None, 0
         elif len(valid_cache_keys) == 1:
             # Get the original key for the single valid cache key
-            original_key = next(key for key, cache_key in zip(keys, cache_keys) if cache_key in valid_cache_keys)
+            original_key = next(key for key, cache_key in zip(keys, cache_keys, strict=False) if cache_key in valid_cache_keys)
             return self.get(original_key, partition_key=partition_key), 1
         else:
             temp_key = f"temp_{randuuid}"
@@ -140,7 +139,7 @@ class RedisBitCacheHandler(RedisAbstractCacheHandler):
                 else:
                     raise ValueError("Only integer values are supported")
         except (IndexError, ValueError):
-            raise ValueError(f"Value {value} is out of range for bitarray of size {self._get_partition_bitsize(partition_key)}")
+            raise ValueError(f"Value {value} is out of range for bitarray of size {self._get_partition_bitsize(partition_key)}") from None
         try:
             cache_key = self._get_cache_key(key, partition_key)
             self.db.set(cache_key, val.to01())

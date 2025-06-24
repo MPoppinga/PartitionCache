@@ -2,7 +2,6 @@
 Handles the connection to a PostgreSQL database
 """
 
-from typing import Any, List
 
 import psycopg
 
@@ -15,7 +14,7 @@ class PostgresDBHandler(AbstractDBHandler):
         self.conn = conn
         self.cur = conn.cursor()
 
-    def execute(self, query) -> List:
+    def execute(self, query) -> list:
         self.cur.execute(query)
 
         # return first column of all rows if not empty

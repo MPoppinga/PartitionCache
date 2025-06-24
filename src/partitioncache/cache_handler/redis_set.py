@@ -42,9 +42,9 @@ class RedisCacheHandler(RedisAbstractCacheHandler):
         members = self.db.smembers(cache_key)
 
         if datatype == "integer":
-            return set(int(member) for member in members)  # type: ignore
+            return {int(member) for member in members}  # type: ignore
         elif datatype == "text":
-            return set(member.decode() for member in members)  # type: ignore
+            return {member.decode() for member in members}  # type: ignore
         else:
             raise ValueError(f"Unsupported datatype: {datatype}")
 
@@ -64,7 +64,7 @@ class RedisCacheHandler(RedisAbstractCacheHandler):
         key_types = pipe.execute()
 
         existing_keys = set()
-        for key, key_type in zip(keys, key_types):
+        for key, key_type in zip(keys, key_types, strict=False):
             if key_type == b"set":
                 existing_keys.add(key)
         return existing_keys
@@ -84,14 +84,14 @@ class RedisCacheHandler(RedisAbstractCacheHandler):
             pipe.type(cache_key)
         key_types = pipe.execute()
 
-        valid_cache_keys: list[str] = [cache_key for cache_key, key_type in zip(cache_keys, key_types) if key_type == b"set"]
+        valid_cache_keys: list[str] = [cache_key for cache_key, key_type in zip(cache_keys, key_types, strict=False) if key_type == b"set"]
         valid_keys_count = len(valid_cache_keys)
 
         if not valid_cache_keys:
             return None, 0
         elif len(valid_cache_keys) == 1:
             # Get the original key for the single valid cache key
-            original_key = next(key for key, cache_key in zip(keys, cache_keys) if cache_key in valid_cache_keys)
+            original_key = next(key for key, cache_key in zip(keys, cache_keys, strict=False) if cache_key in valid_cache_keys)
             return self.get(original_key, partition_key), 1
         else:
             intersected = self.db.sinter(*valid_cache_keys)  # type: ignore
@@ -107,9 +107,9 @@ class RedisCacheHandler(RedisAbstractCacheHandler):
                 raise ValueError(f"Unsupported datatype: {datatype}")
 
             if settype is int:
-                return set(int(member) for member in intersected), valid_keys_count  # type: ignore
+                return {int(member) for member in intersected}, valid_keys_count  # type: ignore
             elif settype is str:
-                return set(member.decode() for member in intersected), valid_keys_count  # type: ignore
+                return {member.decode() for member in intersected}, valid_keys_count  # type: ignore
             else:
                 raise ValueError(f"Unsupported set type: {settype}")
         return None, 0

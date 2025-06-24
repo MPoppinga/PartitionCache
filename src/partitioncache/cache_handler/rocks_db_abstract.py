@@ -1,5 +1,5 @@
 from datetime import datetime
-from bitarray import bitarray
+
 from rocksdb import (  # type: ignore
     DB,  # type: ignore
     Options,  # type: ignore
