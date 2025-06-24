@@ -307,7 +307,7 @@ class LazyPartitionCacheHelper(PartitionCacheHelper):
         """
         super().__init__(cache_handler, partition_key, settype)
 
-        self._cache_handler = cache_handler
+        self._cache_handler: AbstractCacheHandler_Lazy = cache_handler
 
     def get_intersected_lazy(self, keys: set[str]) -> tuple[str | None, int]:
         """

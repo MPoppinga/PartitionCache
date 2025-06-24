@@ -213,7 +213,7 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
                 sql.SQL("DELETE FROM {0} WHERE partition_key = %s").format(sql.Identifier(self.tableprefix + "_partition_metadata")), (partition_key,)
             )
 
-            self._get_partition_datatype.cache_clear()
+            self._cached_datatype.pop(partition_key, None)  # Remove from cached datatypes
 
             self.db.commit()
             logger.info(f"Deleted partition {partition_key}")

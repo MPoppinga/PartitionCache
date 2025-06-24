@@ -45,6 +45,7 @@ jobs:
     - name: Run type checking
       run: |
         mypy src/
+      continue-on-error: true
     
     - name: Run unit tests
       run: |

@@ -117,7 +117,8 @@ class RocksDBAbstractCacheHandler(AbstractCacheHandler):
             return False
 
         cache_key = self._get_cache_key(key, partition_key)
-        return self.db.get(cache_key.encode()) == b"\x00"
+        ret: bool = self.db.get(cache_key.encode()) == b"\x00"
+        return ret
 
     def delete(self, key: str, partition_key: str = "partition_key") -> bool:
         """Delete from partition-specific cache."""
