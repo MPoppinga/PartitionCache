@@ -9,21 +9,28 @@ on:
 env:
   CI: true
   PYTHON_VERSION: "3.12"
-  # Global database settings
+  # Global database settings (for cache)
+  DB_HOST: localhost
+  DB_PORT: 5432
+  DB_USER: test_user
+  DB_PASSWORD: test_password
+  DB_NAME: test_db
+  # Legacy PG variables (for some tests that may still use them)
   PG_HOST: localhost
   PG_PORT: 5432
   PG_USER: test_user
   PG_PASSWORD: test_password
   PG_DBNAME: test_db
+  # Redis settings
   REDIS_HOST: localhost
   REDIS_PORT: 6379
-  # Global queue settings
+  # Queue settings
   QUERY_QUEUE_PROVIDER: postgresql
   PG_QUEUE_HOST: localhost
   PG_QUEUE_PORT: 5432
   PG_QUEUE_USER: test_user
   PG_QUEUE_PASSWORD: test_password
-  PG_QUEUE_DBNAME: test_db
+  PG_QUEUE_DB: test_db
   # Test timeout settings
   PYTEST_TIMEOUT: 300
 
@@ -323,7 +330,18 @@ jobs:
           --health-retries 10
 
     env:
+      DB_HOST: localhost
+      DB_PORT: 5432
+      DB_USER: test_user
+      DB_PASSWORD: test_password
+      DB_NAME: test_db
       CACHE_BACKEND: postgresql_array
+      QUERY_QUEUE_PROVIDER: postgresql
+      PG_QUEUE_HOST: localhost
+      PG_QUEUE_PORT: 5432
+      PG_QUEUE_USER: test_user
+      PG_QUEUE_PASSWORD: test_password
+      PG_QUEUE_DB: test_db
       PYTEST_TIMEOUT: 900
 
     steps:
@@ -374,7 +392,18 @@ jobs:
           --health-retries 10
 
     env:
+      DB_HOST: localhost
+      DB_PORT: 5432
+      DB_USER: test_user
+      DB_PASSWORD: test_password
+      DB_NAME: test_db
       CACHE_BACKEND: postgresql_array
+      QUERY_QUEUE_PROVIDER: postgresql
+      PG_QUEUE_HOST: localhost
+      PG_QUEUE_PORT: 5432
+      PG_QUEUE_USER: test_user
+      PG_QUEUE_PASSWORD: test_password
+      PG_QUEUE_DB: test_db
       PYTEST_TIMEOUT: 600
 
     steps:
