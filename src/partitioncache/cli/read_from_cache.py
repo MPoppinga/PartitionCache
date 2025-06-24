@@ -21,7 +21,7 @@ def main(file=sys.stdout):
 
     parser.add_argument("--query", type=str, required=True, help="SQL query to look up in cache")
 
-    parser.add_argument("--cache-backend", type=str, default="rocksdb", help="Cache backend to use")
+    parser.add_argument("--cache-backend", type=str, default="rocksdb_set", help="Cache backend to use")
 
     parser.add_argument("--partition-key", type=str, default="partition_key", help="Name of the partition key column")
 

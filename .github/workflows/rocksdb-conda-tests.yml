@@ -49,8 +49,8 @@ jobs:
       matrix:
         cache-handler:
           - name: "rocksdb-set"
-            backend: "rocksdb"
-            table_prefix: "pcache_rocks_test"
+            backend: "rocksdb_set"
+            requires_postgres: false
             path: "/tmp/rocksdb_test_set"
           - name: "rocksdb-bit"
             backend: "rocksdb_bit"

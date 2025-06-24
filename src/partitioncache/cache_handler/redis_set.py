@@ -14,8 +14,12 @@ class RedisCacheHandler(RedisAbstractCacheHandler):
         """Redis supports integer and text datatypes only."""
         return {"integer", "text"}
 
+    @classmethod
+    def get_name(cls) -> str:
+        return "redis_set"
+
     def __repr__(self) -> str:
-        return "redis"
+        return "redis_set"
 
     def get(self, key: str, partition_key: str = "partition_key") -> set[int] | set[str] | set[float] | set[datetime] | None:
         """Get value from partition-specific cache namespace."""

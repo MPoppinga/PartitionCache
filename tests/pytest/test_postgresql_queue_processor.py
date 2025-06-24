@@ -56,7 +56,7 @@ class TestEnvironmentValidation:
             "DB_USER": "user",
             "DB_PASSWORD": "pass",
             "DB_NAME": "testdb",
-            "CACHE_BACKEND": "redis",  # Not supported
+            "CACHE_BACKEND": "redis_set",  # Not supported
         }
         with patch.dict(os.environ, env, clear=True):
             valid, message = validate_environment()

@@ -230,7 +230,7 @@ jobs:
             requires_postgres: true
             requires_redis: false
           - name: "redis-set"
-            backend: "redis"
+            backend: "redis_set"
             table_prefix: "pcache_redis"
             requires_postgres: true
             requires_redis: true

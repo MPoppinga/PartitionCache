@@ -434,7 +434,7 @@ def prune_old_queries(cache_type: str, days_old: int):
 
 def prune_all_caches(days_old: int):
     """Remove old queries from all cache types."""
-    cache_types = ["postgresql_array", "postgresql_bit", "redis", "redis_bit", "rocksdb", "rocksdb_bit", "rocksdict"]
+    cache_types = ["postgresql_array", "postgresql_bit", "redis_set", "redis_bit", "rocksdb_set", "rocksdb_bit", "rocksdict"]
 
     total_removed = 0
     for cache_type in cache_types:
@@ -459,9 +459,9 @@ def delete_all_caches():
         cache_types = [
             "postgresql_array",
             "postgresql_bit",
-            "redis",
+            "redis_set",
             "redis_bit",
-            "rocksdb",
+            "rocksdb_set",
             "rocksdb_bit",
         ]
         for cache_type in cache_types:
@@ -481,9 +481,9 @@ def count_all_caches():
     cache_types = [
         "postgresql_array",
         "postgresql_bit",
-        "redis",
+        "redis_set",
         "redis_bit",
-        "rocksdb",
+        "rocksdb_set",
         "rocksdb_bit",
     ]
     total = 0
@@ -864,7 +864,7 @@ Examples:
   # Cache operations (uses CACHE_BACKEND from environment)
   pcache-manage cache count
   pcache-manage cache export --file backup.pkl
-  pcache-manage cache copy --from redis --to postgresql_array
+  pcache-manage cache copy --from redis_set --to postgresql_array
 
   # Queue operations
   pcache-manage queue count
@@ -1083,14 +1083,15 @@ to load configuration from a custom environment file.
         logger.error(f"Command failed: {e}")
         sys.exit(1)
 
-    # Cleanup for RocksDB
+    # Cleanup for RocksDB - Handle for all rocksdb cache types
     if hasattr(args, "cache_type") and args.cache_type and ("rocksdb" in args.cache_type):
         try:
             cache = get_cache_handler(args.cache_type)
-            cache.compact()
+            if hasattr(cache, "compact"):
+                cache.compact()  # type: ignore
             cache.close()
-        except Exception:
-            pass  # Ignore cleanup errors
+        except Exception as e:
+            logger.error(f"Error compacting {args.cache_type}: {e}")
 
 
 if __name__ == "__main__":

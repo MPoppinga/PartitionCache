@@ -18,8 +18,12 @@ class RocksDBCacheHandler(RocksDBAbstractCacheHandler):
         """RocksDB supports integer and text datatypes only."""
         return {"integer", "text"}
 
+    @classmethod
+    def get_name(cls) -> str:
+        return "rocksdb_set"
+
     def __repr__(self) -> str:
-        return "rocksdb"
+        return "rocksdb_set"
 
     def get(self, key: str, partition_key: str = "partition_key") -> set[int] | set[str] | set[float] | set[datetime] | None:
         """Get value from partition-specific cache namespace."""
@@ -40,8 +44,7 @@ class RocksDBCacheHandler(RocksDBAbstractCacheHandler):
         else:
             raise ValueError(f"Unsupported datatype: {datatype}")
 
-    def get_intersected(
-        self, keys: set[str], partition_key: str = "partition_key") -> tuple[set[int] | set[str] | set[float] | set[datetime] | None, int]:
+    def get_intersected(self, keys: set[str], partition_key: str = "partition_key") -> tuple[set[int] | set[str] | set[float] | set[datetime] | None, int]:
         """
         RocksDB has no native intersection operation, so we have to do it manually.
         Returns the intersection of all sets in the cache that are associated with the given keys.
