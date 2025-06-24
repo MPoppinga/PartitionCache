@@ -1,11 +1,14 @@
--- Initialize pg_cron extension for integration testing
+-- Initialize pg_cron and roaringbitmap extensions for integration testing
 -- This script runs automatically when the PostgreSQL container starts
 
 -- Create the pg_cron extension in the test database
 CREATE EXTENSION IF NOT EXISTS pg_cron;
 
--- Verify the extension is properly installed
-SELECT extname, extversion FROM pg_extension WHERE extname = 'pg_cron';
+-- Create the roaringbitmap extension in the test database
+CREATE EXTENSION IF NOT EXISTS roaringbitmap;
+
+-- Verify the extensions are properly installed
+SELECT extname, extversion FROM pg_extension WHERE extname IN ('pg_cron', 'roaringbitmap');
 
 -- Grant necessary permissions for testing
 -- Allow the test user to schedule and manage cron jobs

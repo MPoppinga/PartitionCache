@@ -35,16 +35,41 @@ env:
   PYTEST_TIMEOUT: 300
 
 jobs:
+  # Build custom PostgreSQL image with required extensions
+  build-postgres-image:
+    name: Build PostgreSQL Image with Extensions
+    runs-on: ubuntu-latest
+    outputs:
+      image-id: ${{ steps.build.outputs.imageid }}
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Build PostgreSQL image with pg_cron and roaringbitmap
+      id: build
+      uses: docker/build-push-action@v5
+      with:
+        context: .github/docker/postgres-cron
+        load: true
+        tags: postgres-test-extensions:latest
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
   # Setup job for preparing test data
   setup-data:
     name: Setup Test Data
     runs-on: ubuntu-latest
+    needs: build-postgres-image
     outputs:
       data-ready: ${{ steps.setup.outputs.ready }}
     
     services:
       postgres:
-        image: postgres:16
+        image: postgres-test-extensions:latest
         env:
           POSTGRES_DB: test_db
           POSTGRES_USER: test_user
@@ -83,6 +108,27 @@ jobs:
           echo "Waiting for PostgreSQL... ($i/30)"
           sleep 2
         done
+        
+        # Verify extensions are available
+        python -c "
+        import psycopg
+        conn = psycopg.connect('postgresql://test_user:test_password@localhost:5432/test_db')
+        conn.autocommit = True
+        cur = conn.cursor()
+        
+        # Check pg_cron extension
+        cur.execute('SELECT extname FROM pg_extension WHERE extname = %s', ('pg_cron',))
+        if not cur.fetchone():
+            raise Exception('pg_cron extension not found')
+        
+        # Check roaringbitmap extension  
+        cur.execute('SELECT extname FROM pg_extension WHERE extname = %s', ('roaringbitmap',))
+        if not cur.fetchone():
+            raise Exception('roaringbitmap extension not found')
+            
+        print('✅ Both pg_cron and roaringbitmap extensions are available')
+        conn.close()
+        "
         
         # Create test tables and load sample data
         python -c "
@@ -129,7 +175,7 @@ jobs:
   integration-tests:
     name: Integration Tests (${{ matrix.cache-handler }})
     runs-on: ubuntu-latest
-    needs: setup-data
+    needs: [build-postgres-image, setup-data]
     if: needs.setup-data.outputs.data-ready == 'true'
     
     strategy:
@@ -170,7 +216,7 @@ jobs:
 
     services:
       postgres:
-        image: postgres:16
+        image: postgres-test-extensions:latest
         env:
           POSTGRES_DB: test_db
           POSTGRES_USER: test_user
@@ -267,29 +313,36 @@ jobs:
           done
         fi
 
-    - name: Install PostgreSQL extensions (if needed)
+    - name: Verify PostgreSQL extensions are available
       run: |
-        # Install required PostgreSQL extensions for specific backends
-        if [[ "${{ matrix.cache-handler.backend }}" == "postgresql_roaringbit" ]]; then
-          echo "Installing roaringbitmap extension for postgresql_roaringbit backend..."
-          
-          # Make script executable
-          chmod +x ./scripts/install_pg_extensions.sh
-          
-          # Install the extension
-          ./scripts/install_pg_extensions.sh postgresql_roaringbit
-          
-          echo "Extension installation completed, testing..."
-          
-          # Test the extension installation
-          sudo -u postgres psql -d test_db -c "CREATE EXTENSION IF NOT EXISTS roaringbitmap;" || {
-            echo "❌ Failed to create roaringbitmap extension"
-            exit 1
-          }
-          
-          echo "✅ roaringbitmap extension successfully installed and tested"
-        fi
-    
+        # Verify that both required extensions are available in the custom image
+        echo "Verifying PostgreSQL extensions..."
+        
+        python -c "
+        import psycopg
+        conn = psycopg.connect('postgresql://test_user:test_password@localhost:5432/test_db')
+        conn.autocommit = True
+        cur = conn.cursor()
+        
+        # Check pg_cron extension
+        cur.execute('SELECT extname FROM pg_extension WHERE extname = %s', ('pg_cron',))
+        if cur.fetchone():
+            print('✅ pg_cron extension is available')
+        else:
+            raise Exception('❌ pg_cron extension not found')
+        
+        # Check roaringbitmap extension  
+        cur.execute('SELECT extname FROM pg_extension WHERE extname = %s', ('roaringbitmap',))
+        if cur.fetchone():
+            print('✅ roaringbitmap extension is available')
+        else:
+            raise Exception('❌ roaringbitmap extension not found')
+            
+        conn.close()
+        "
+        
+        echo "✅ All required PostgreSQL extensions are available"
+
     - name: Setup PartitionCache tables
       run: |
         # Setup cache tables for the specific backend
@@ -340,12 +393,12 @@ jobs:
   performance-tests:
     name: Performance Tests
     runs-on: ubuntu-latest
-    needs: [setup-data, integration-tests]
+    needs: [build-postgres-image, setup-data, integration-tests]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     
     services:
       postgres:
-        image: postgres:16
+        image: postgres-test-extensions:latest
         env:
           POSTGRES_DB: test_db
           POSTGRES_USER: test_user
@@ -414,11 +467,11 @@ jobs:
   queue-processor-tests:
     name: Queue Processor Tests
     runs-on: ubuntu-latest
-    needs: setup-data
+    needs: [build-postgres-image, setup-data]
     
     services:
       postgres:
-        image: postgres:16
+        image: postgres-test-extensions:latest
         env:
           POSTGRES_DB: test_db
           POSTGRES_USER: test_user
@@ -464,8 +517,8 @@ jobs:
     - name: Setup PartitionCache and Queue Processor
       run: |
         python -m partitioncache.cli.manage_cache setup all
-        # Try to setup queue processor (may fail if pg_cron not available)
-        python -m partitioncache.cli.setup_postgresql_queue_processor setup || echo "pg_cron not available, skipping some tests"
+        # Setup queue processor with pg_cron (now available in custom image)
+        python -m partitioncache.cli.setup_postgresql_queue_processor setup
 
     - name: Run queue processor tests
       run: |
