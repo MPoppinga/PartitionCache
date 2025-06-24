@@ -49,11 +49,11 @@ jobs:
       matrix:
         cache-handler:
           - name: "rocksdb-set"
-            backend: "rocks_db_set"
+            backend: "rocksdb"
             table_prefix: "pcache_rocks_test"
             path: "/tmp/rocksdb_test_set"
           - name: "rocksdb-bit"
-            backend: "rocks_db_bit"
+            backend: "rocksdb_bit"
             table_prefix: "pcache_rocks_bit_test"
             path: "/tmp/rocksdb_test_bit"
 
@@ -74,7 +74,11 @@ jobs:
 
     env:
       CACHE_BACKEND: ${{ matrix.cache-handler.backend }}
+      # RocksDB environment variables (all variants for compatibility)
       ROCKS_DB_PATH: ${{ matrix.cache-handler.path }}
+      ROCKSDB_PATH: ${{ matrix.cache-handler.path }}
+      ROCKSDB_BIT_PATH: ${{ matrix.cache-handler.path }}
+      ROCKSDB_BIT_BITSIZE: "10000"
 
     steps:
     - name: Checkout repository

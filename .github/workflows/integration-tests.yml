@@ -152,7 +152,7 @@ jobs:
             requires_postgres: true
             requires_redis: false
           - name: "redis-set"
-            backend: "redis_set"
+            backend: "redis"
             table_prefix: "pcache_redis"
             requires_postgres: true
             requires_redis: true
@@ -162,7 +162,7 @@ jobs:
             requires_postgres: true
             requires_redis: true
           - name: "rocksdict"
-            backend: "rocks_dict"
+            backend: "rocksdict"
             table_prefix: "pcache_rocksdict"
             requires_postgres: true
             requires_redis: false
@@ -196,12 +196,25 @@ jobs:
     env:
       # Cache-specific environment variables
       CACHE_BACKEND: ${{ matrix.cache-handler.backend }}
+      # PostgreSQL cache variables
       PG_ARRAY_CACHE_TABLE_PREFIX: ${{ matrix.cache-handler.table_prefix }}
       PG_BIT_CACHE_TABLE_PREFIX: ${{ matrix.cache-handler.table_prefix }}
+      PG_BIT_CACHE_BITSIZE: "10000"
       PG_ROARINGBIT_CACHE_TABLE_PREFIX: ${{ matrix.cache-handler.table_prefix }}
+      # Redis cache variables
+      REDIS_HOST: localhost
+      REDIS_PORT: 6379
+      REDIS_CACHE_DB: "0"
+      REDIS_BIT_DB: "1"
+      REDIS_BIT_BITSIZE: "10000"
       REDIS_CACHE_KEY_PREFIX: ${{ matrix.cache-handler.table_prefix }}
+      # RocksDB variables
       ROCKS_DB_PATH: "/tmp/rocksdb_${{ matrix.cache-handler.name }}"
+      ROCKSDB_PATH: "/tmp/rocksdb_${{ matrix.cache-handler.name }}"
+      ROCKSDB_BIT_PATH: "/tmp/rocksdb_bit_${{ matrix.cache-handler.name }}"
+      ROCKSDB_BIT_BITSIZE: "10000"
       ROCKS_DICT_PATH: "/tmp/rocksdict_${{ matrix.cache-handler.name }}"
+      ROCKSDB_DICT_PATH: "/tmp/rocksdict_${{ matrix.cache-handler.name }}"
 
     steps:
     - name: Checkout repository
@@ -336,6 +349,7 @@ jobs:
       DB_PASSWORD: test_password
       DB_NAME: test_db
       CACHE_BACKEND: postgresql_array
+      PG_ARRAY_CACHE_TABLE_PREFIX: partitioncache_perf_test
       QUERY_QUEUE_PROVIDER: postgresql
       PG_QUEUE_HOST: localhost
       PG_QUEUE_PORT: 5432
@@ -398,6 +412,7 @@ jobs:
       DB_PASSWORD: test_password
       DB_NAME: test_db
       CACHE_BACKEND: postgresql_array
+      PG_ARRAY_CACHE_TABLE_PREFIX: partitioncache_queue_test
       QUERY_QUEUE_PROVIDER: postgresql
       PG_QUEUE_HOST: localhost
       PG_QUEUE_PORT: 5432

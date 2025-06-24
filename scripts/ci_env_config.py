@@ -59,6 +59,7 @@ class CIEnvironmentConfig:
                 env_vars={
                     'CACHE_BACKEND': 'postgresql_bit',
                     'PG_BIT_CACHE_TABLE_PREFIX': 'pcache_bit_test',
+                    'PG_BIT_CACHE_BITSIZE': '10000',
                 },
                 test_timeout=300
             ),
@@ -77,13 +78,16 @@ class CIEnvironmentConfig:
             ),
             'redis-set': CacheHandlerConfig(
                 name='redis-set',
-                backend='redis_set',
+                backend='redis',  # Factory uses "redis" not "redis_set"
                 table_prefix='pcache_redis_test',
                 requires_postgres=True,  # Still need PostgreSQL for queue
                 requires_redis=True,
                 requires_rocksdb=False,
                 env_vars={
-                    'CACHE_BACKEND': 'redis_set',
+                    'CACHE_BACKEND': 'redis',
+                    'REDIS_HOST': 'localhost',
+                    'REDIS_PORT': '6379',
+                    'REDIS_CACHE_DB': '0',
                     'REDIS_CACHE_KEY_PREFIX': 'pcache_redis_test:',
                 },
                 test_timeout=300
@@ -97,6 +101,10 @@ class CIEnvironmentConfig:
                 requires_rocksdb=False,
                 env_vars={
                     'CACHE_BACKEND': 'redis_bit',
+                    'REDIS_HOST': 'localhost',
+                    'REDIS_PORT': '6379',
+                    'REDIS_BIT_DB': '1',
+                    'REDIS_BIT_BITSIZE': '10000',
                     'REDIS_CACHE_KEY_PREFIX': 'pcache_redis_bit_test:',
                 },
                 test_timeout=300
@@ -106,14 +114,15 @@ class CIEnvironmentConfig:
             # For local testing with full RocksDB: conda install -c conda-forge rocksdb
             'rocksdict': CacheHandlerConfig(
                 name='rocksdict',
-                backend='rocks_dict',
+                backend='rocksdict',  # Factory uses "rocksdict" not "rocks_dict"
                 table_prefix='pcache_rocksdict_test',
                 requires_postgres=True,  # Still need PostgreSQL for queue
                 requires_redis=False,
                 requires_rocksdb=False,  # RocksDict doesn't require full RocksDB
                 env_vars={
-                    'CACHE_BACKEND': 'rocks_dict',
+                    'CACHE_BACKEND': 'rocksdict',
                     'ROCKS_DICT_PATH': '/tmp/rocksdict_test',
+                    'ROCKSDB_DICT_PATH': '/tmp/rocksdict_test',
                 },
                 test_timeout=300
             ),
@@ -124,7 +133,13 @@ class CIEnvironmentConfig:
         return {
             'CI': 'true',
             'PYTHON_VERSION': '3.12',
-            # Database settings
+            # Database settings (for cache)
+            'DB_HOST': 'localhost',
+            'DB_PORT': '5432',
+            'DB_USER': 'test_user',
+            'DB_PASSWORD': 'test_password',
+            'DB_NAME': 'test_db',
+            # Legacy PG variables (for compatibility)
             'PG_HOST': 'localhost',
             'PG_PORT': '5432',
             'PG_USER': 'test_user',
@@ -139,7 +154,7 @@ class CIEnvironmentConfig:
             'PG_QUEUE_PORT': '5432',
             'PG_QUEUE_USER': 'test_user',
             'PG_QUEUE_PASSWORD': 'test_password',
-            'PG_QUEUE_DBNAME': 'test_db',
+            'PG_QUEUE_DB': 'test_db',
             # Test settings
             'PYTEST_TIMEOUT': '300',
         }
