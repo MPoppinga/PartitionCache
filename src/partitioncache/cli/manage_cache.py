@@ -998,12 +998,16 @@ to load configuration from a custom environment file.
         elif args.command == "status":
             if not args.status_command:
                 # Default: check both environment and tables
-                validate_environment()
+                env_valid = validate_environment()
                 check_table_status()
+                if not env_valid:
+                    sys.exit(1)
                 return
 
             if args.status_command == "env":
-                validate_environment()
+                env_valid = validate_environment()
+                if not env_valid:
+                    sys.exit(1)
             elif args.status_command == "tables":
                 check_table_status()
 

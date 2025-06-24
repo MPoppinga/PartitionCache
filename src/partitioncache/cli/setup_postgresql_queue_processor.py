@@ -552,12 +552,6 @@ def main():
         # Only warn if a non-default path was given and not found
         logger.warning(f"Specified environment file not found: {env_path}")
 
-    # Validate environment after loading .env
-    is_valid, message = validate_environment()
-    if not is_valid:
-        logger.error(f"Environment validation failed: {message}")
-        sys.exit(1)
-
     # Main parser that inherits the --env option for help messages
     parser = argparse.ArgumentParser(
         description="Manage PostgreSQL queue processor for PartitionCache.",
@@ -681,7 +675,14 @@ def main():
     try:
         # Parse all arguments and execute the corresponding function
         args = parser.parse_args()
+
+        # Only validate environment for non-help commands
         if hasattr(args, "func"):
+            # Validate environment after loading .env
+            is_valid, message = validate_environment()
+            if not is_valid:
+                logger.error(f"Environment validation failed: {message}")
+                sys.exit(1)
             args.func(args)
         else:
             parser.print_help()

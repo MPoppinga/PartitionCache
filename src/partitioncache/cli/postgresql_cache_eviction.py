@@ -329,6 +329,7 @@ def main():
     # Load .env file
     dotenv.load_dotenv(dotenv_path=args.env)
 
+    # Only validate environment for actual commands, not help
     is_valid, message = validate_environment()
     if not is_valid:
         logger.error(f"Environment validation failed: {message}")

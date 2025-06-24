@@ -6,6 +6,3 @@ dependencies:
   - python=3.12
   - pip
   - rocksdb
-  - pip:
-    # Python dependencies will be installed via pip install -e ".[testing,db]"
-    # This env file only specifies conda packages that can't be installed via pip
