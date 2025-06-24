@@ -33,11 +33,12 @@ The new commands provide information about:
 import argparse
 import os
 import sys
-from pathlib import Path
 from logging import getLogger
+from pathlib import Path
+
+import dotenv
 import psycopg
 from psycopg import sql
-import dotenv
 
 logger = getLogger("PartitionCache.PostgreSQLQueueProcessor")
 
@@ -348,7 +349,7 @@ def get_processor_status(conn, queue_prefix: str):
         status = cur.fetchone()
         if status:
             columns = [desc[0] for desc in cur.description]
-            return dict(zip(columns, status))
+            return dict(zip(columns, status, strict=False))
     return None
 
 
@@ -360,7 +361,7 @@ def get_processor_status_detailed(conn, table_prefix: str, queue_prefix: str):
         status = cur.fetchone()
         if status:
             columns = [desc[0] for desc in cur.description]
-            return dict(zip(columns, status))
+            return dict(zip(columns, status, strict=False))
     return None
 
 
@@ -371,7 +372,7 @@ def get_queue_and_cache_info(conn, table_prefix: str, queue_prefix: str):
         cur.execute("SELECT * FROM partitioncache_get_queue_and_cache_info(%s, %s)", [table_prefix, queue_prefix])
         results = cur.fetchall()
         columns = [desc[0] for desc in cur.description]
-        return [dict(zip(columns, row)) for row in results]
+        return [dict(zip(columns, row, strict=False)) for row in results]
 
 
 def print_status(status):
@@ -504,7 +505,7 @@ def view_logs(conn, limit: int = 20, status_filter: str | None = None, queue_pre
 
             columns = [desc[0] for desc in cur.description]
             for log in logs:
-                log_dict = dict(zip(columns, log))
+                log_dict = dict(zip(columns, log, strict=False))
                 execution_source = log_dict.get("execution_source", "unknown")
                 execution_time = log_dict.get("execution_time_ms", "N/A")
                 print(
