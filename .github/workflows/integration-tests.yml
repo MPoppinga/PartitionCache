@@ -35,12 +35,15 @@ env:
   PYTEST_TIMEOUT: 300
 
 jobs:
-  # Build custom PostgreSQL image with required extensions
+  # Build and push custom PostgreSQL image with required extensions
   build-postgres-image:
     name: Build PostgreSQL Image with Extensions
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     outputs:
-      image-id: ${{ steps.build.outputs.imageid }}
+      image-digest: ${{ steps.build.outputs.digest }}
     
     steps:
     - name: Checkout repository
@@ -49,15 +52,35 @@ jobs:
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
 
-    - name: Build PostgreSQL image with pg_cron and roaringbitmap
+    - name: Log in to GitHub Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ghcr.io/${{ github.repository_owner }}/postgres-test-extensions
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=sha,prefix=sha-
+          type=raw,value=latest,enable={{is_default_branch}}
+
+    - name: Build and push PostgreSQL image with pg_cron and roaringbitmap
       id: build
       uses: docker/build-push-action@v5
       with:
         context: .github/docker/postgres-cron
-        load: true
-        tags: postgres-test-extensions:latest
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
         cache-from: type=gha
         cache-to: type=gha,mode=max
+        platforms: linux/amd64
 
   # Setup job for preparing test data
   setup-data:
@@ -69,7 +92,7 @@ jobs:
     
     services:
       postgres:
-        image: postgres-test-extensions:latest
+        image: ghcr.io/${{ github.repository_owner }}/postgres-test-extensions:latest
         env:
           POSTGRES_DB: test_db
           POSTGRES_USER: test_user
@@ -216,7 +239,7 @@ jobs:
 
     services:
       postgres:
-        image: postgres-test-extensions:latest
+        image: ghcr.io/${{ github.repository_owner }}/postgres-test-extensions:latest
         env:
           POSTGRES_DB: test_db
           POSTGRES_USER: test_user
@@ -398,7 +421,7 @@ jobs:
     
     services:
       postgres:
-        image: postgres-test-extensions:latest
+        image: ghcr.io/${{ github.repository_owner }}/postgres-test-extensions:latest
         env:
           POSTGRES_DB: test_db
           POSTGRES_USER: test_user
@@ -471,7 +494,7 @@ jobs:
     
     services:
       postgres:
-        image: postgres-test-extensions:latest
+        image: ghcr.io/${{ github.repository_owner }}/postgres-test-extensions:latest
         env:
           POSTGRES_DB: test_db
           POSTGRES_USER: test_user
