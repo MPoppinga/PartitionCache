@@ -77,8 +77,10 @@ jobs:
       # RocksDB environment variables (all variants for compatibility)
       ROCKS_DB_PATH: ${{ matrix.cache-handler.path }}
       ROCKSDB_PATH: ${{ matrix.cache-handler.path }}
+      ROCKSDB_SET_PATH: ${{ matrix.cache-handler.path }}
       ROCKSDB_BIT_PATH: ${{ matrix.cache-handler.path }}
       ROCKSDB_BIT_BITSIZE: "10000"
+      ROCKSDB_DICT_PATH: ${{ matrix.cache-handler.path }}
 
     steps:
     - name: Checkout repository
@@ -97,11 +99,22 @@ jobs:
     - name: Install Python dependencies
       shell: micromamba-shell {0}
       run: |
+        # RocksDB should already be installed from environment file
         pip install -e ".[testing,db]"
-        # Install RocksDB from conda-forge
-        micromamba install -c conda-forge rocksdb
+
+    - name: Verify environment setup
+      shell: micromamba-shell {0}
+      run: |
+        echo "Python version: $(python --version)"
+        echo "Conda environment: $CONDA_DEFAULT_ENV"
+        echo "Cache backend: $CACHE_BACKEND"
+        echo "RocksDB path: $ROCKSDB_PATH"
+        python -c "import rocksdb; print('RocksDB Python bindings available')"
+        python -c "import partitioncache; print('PartitionCache package available')"
+        python -c "from partitioncache.cache_handler import get_cache_handler; print('Cache handler factory working')"
 
     - name: Wait for PostgreSQL
+      shell: micromamba-shell {0}
       run: |
         for i in {1..30}; do
           if python -c "import psycopg; psycopg.connect('postgresql://test_user:test_password@localhost:5432/test_db')" 2>/dev/null; then
