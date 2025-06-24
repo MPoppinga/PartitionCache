@@ -129,16 +129,41 @@ def db_session(db_connection):
         cur.execute("DELETE FROM cron.job WHERE jobname LIKE 'test_%';")
 
 
-# Parameterized cache client fixture covering all backends
+# Base backends that should always be available
 CACHE_BACKENDS = [
     "postgresql_array",
-    "postgresql_bit", 
+    "postgresql_bit",
     "postgresql_roaringbit",
 ]
 
 # Add Redis backends if available
 if os.getenv("REDIS_HOST"):
     CACHE_BACKENDS.extend(["redis_set", "redis_bit"])
+
+# Add RocksDB backends if available
+def _is_rocksdb_available():
+    """Check if RocksDB is available for testing."""
+    try:
+        import rocksdb
+        return True
+    except ImportError:
+        return False
+
+def _is_rocksdict_available():
+    """Check if rocksdict is available for testing."""
+    try:
+        import rocksdict
+        return True
+    except ImportError:
+        return False
+
+# Add RocksDB backends if the module is available
+if _is_rocksdb_available():
+    CACHE_BACKENDS.extend(["rocksdb_set", "rocksdb_bit"])
+
+# Add rocksdict backend if available (should always be available via pip)
+if _is_rocksdict_available():
+    CACHE_BACKENDS.append("rocksdict")
 
 
 @pytest.fixture(params=CACHE_BACKENDS)
@@ -151,11 +176,37 @@ def cache_client(request, db_session):
 
     # Set environment variables for cache backend
     original_backend = os.getenv("CACHE_BACKEND")
+    original_env_vars = {}
+
     os.environ["CACHE_BACKEND"] = cache_backend
+
+    # Set up backend-specific environment variables
+    if cache_backend == "rocksdb_set":
+        import tempfile
+        temp_dir = tempfile.mkdtemp(prefix="rocksdb_test_")
+        original_env_vars["ROCKSDB_PATH"] = os.getenv("ROCKSDB_PATH")
+        os.environ["ROCKSDB_PATH"] = temp_dir
+    elif cache_backend == "rocksdb_bit":
+        import tempfile
+        temp_dir = tempfile.mkdtemp(prefix="rocksdb_bit_test_")
+        original_env_vars["ROCKSDB_BIT_PATH"] = os.getenv("ROCKSDB_BIT_PATH")
+        original_env_vars["ROCKSDB_BIT_BITSIZE"] = os.getenv("ROCKSDB_BIT_BITSIZE")
+        os.environ["ROCKSDB_BIT_PATH"] = temp_dir
+        os.environ["ROCKSDB_BIT_BITSIZE"] = "10000"
+    elif cache_backend == "rocksdict":
+        import tempfile
+        temp_dir = tempfile.mkdtemp(prefix="rocksdict_test_")
+        # rocksdict uses the db_path parameter directly, no env vars needed
 
     try:
         # Create cache handler
-        cache_handler = get_cache_handler(cache_backend)
+        if cache_backend == "rocksdict":
+            # rocksdict needs the path passed directly
+            temp_dir = tempfile.mkdtemp(prefix="rocksdict_test_")
+            from partitioncache.cache_handler.rocks_dict import RocksDictCacheHandler
+            cache_handler = RocksDictCacheHandler(temp_dir)
+        else:
+            cache_handler = get_cache_handler(cache_backend)
 
         # Setup partition keys for testing
         for partition_key, datatype in TEST_PARTITION_KEYS:
@@ -183,11 +234,34 @@ def cache_client(request, db_session):
         except Exception:
             pass
 
-        # Restore original environment
+        # Restore original environment variables
         if original_backend:
             os.environ["CACHE_BACKEND"] = original_backend
         elif "CACHE_BACKEND" in os.environ:
             del os.environ["CACHE_BACKEND"]
+
+        # Restore RocksDB-specific environment variables
+        for env_var, original_value in original_env_vars.items():
+            if original_value is not None:
+                os.environ[env_var] = original_value
+            elif env_var in os.environ:
+                del os.environ[env_var]
+
+        # Clean up temporary directories for RocksDB backends
+        if cache_backend in ["rocksdb_set", "rocksdb_bit", "rocksdict"]:
+            try:
+                import shutil
+                if cache_backend == "rocksdb_set" and "ROCKSDB_PATH" in os.environ:
+                    shutil.rmtree(os.environ["ROCKSDB_PATH"], ignore_errors=True)
+                elif cache_backend == "rocksdb_bit" and "ROCKSDB_BIT_PATH" in os.environ:
+                    shutil.rmtree(os.environ["ROCKSDB_BIT_PATH"], ignore_errors=True)
+                elif cache_backend == "rocksdict" and hasattr(cache_handler, 'db') and hasattr(cache_handler.db, 'name'):
+                    # For rocksdict, clean up the temp directory created for testing
+                    db_path = getattr(cache_handler.db, 'name', None)
+                    if db_path and os.path.exists(os.path.dirname(db_path)):
+                        shutil.rmtree(os.path.dirname(db_path), ignore_errors=True)
+            except Exception:
+                pass  # Ignore cleanup errors
 
 
 @pytest.fixture

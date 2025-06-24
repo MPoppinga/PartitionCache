@@ -272,10 +272,10 @@ def extract_and_group_query_conditions(
 def generate_partial_queries(
     query: str,
     partition_key: str,
-    min_component_size,
-    follow_graph=True,
-    keep_all_attributes=True,
-    other_functions_as_distance_conditions=True,
+    min_component_size: int = 1,
+    follow_graph: bool = True,
+    keep_all_attributes: bool = True,
+    other_functions_as_distance_conditions: bool = True,
 ) -> list[str]:
     """
     This function takes a query and returns the list of all possible partial queries.
@@ -562,12 +562,12 @@ def normalize_distance_conditions(original_query: str, bucket_steps: float = 1.0
 def generate_all_query_hash_pairs(
     query: str,
     partition_key: str,
-    min_component_size,
-    follow_graph=True,
-    keep_all_attributes=True,
-    canonicalize_queries=False,
+    min_component_size: int = 1,
+    follow_graph: bool = True,
+    keep_all_attributes: bool = True,
+    canonicalize_queries: bool = False,
 ) -> list[tuple[str, str]]:
-    query_set = set()
+    query_set: set[str] = set()
 
     # Clean the query
     query = clean_query(query)
@@ -622,7 +622,7 @@ def hash_query(query: str) -> str:
 def generate_all_hashes(
     query: str,
     partition_key: str,
-    min_component_size,
+    min_component_size = 1,
     follow_graph=True,
     fix_attributes=True,
     canonicalize_queries=False,
