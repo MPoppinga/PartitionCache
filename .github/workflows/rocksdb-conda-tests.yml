@@ -87,7 +87,7 @@ jobs:
     - name: Setup micromamba
       uses: mamba-org/setup-micromamba@v1
       with:
-        micromamba-version: '1.5.8'
+        micromamba-version: 'latest'
         environment-file: .github/micromamba-env.yml
         init-shell: >-
           bash
