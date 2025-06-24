@@ -267,9 +267,34 @@ jobs:
           done
         fi
 
+    - name: Install PostgreSQL extensions (if needed)
+      run: |
+        # Install required PostgreSQL extensions for specific backends
+        if [[ "${{ matrix.cache-handler.backend }}" == "postgresql_roaringbit" ]]; then
+          echo "Installing roaringbitmap extension for postgresql_roaringbit backend..."
+          
+          # Make script executable
+          chmod +x ./scripts/install_pg_extensions.sh
+          
+          # Install the extension
+          ./scripts/install_pg_extensions.sh postgresql_roaringbit
+          
+          echo "Extension installation completed, testing..."
+          
+          # Test the extension installation
+          sudo -u postgres psql -d test_db -c "CREATE EXTENSION IF NOT EXISTS roaringbitmap;" || {
+            echo "❌ Failed to create roaringbitmap extension"
+            exit 1
+          }
+          
+          echo "✅ roaringbitmap extension successfully installed and tested"
+        fi
+    
     - name: Setup PartitionCache tables
       run: |
         # Setup cache tables for the specific backend
+        echo "Setting up PartitionCache tables for backend: ${{ matrix.cache-handler.backend }}"
+        
         python -m partitioncache.cli.manage_cache setup all
         
         # Verify setup
@@ -282,10 +307,11 @@ jobs:
 
     - name: Run integration tests - Spatial cache functionality
       run: |
+        echo "Running spatial cache tests for backend: ${{ matrix.cache-handler.backend }}"
+        
         python -m pytest tests/integration/test_spatial_cache.py \
           -v --tb=short --timeout=${{ env.PYTEST_TIMEOUT }} \
-          -k "not performance" || true
-          # Allow individual handler tests to fail without stopping the matrix
+          -k "not performance"
 
     - name: Run integration tests - CLI tools
       run: |

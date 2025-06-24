@@ -40,7 +40,7 @@ jobs:
     
     - name: Run linting
       run: |
-        flake8 src/
+        ruff check src/
     
     - name: Run type checking
       run: |

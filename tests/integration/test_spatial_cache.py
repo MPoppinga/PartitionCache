@@ -279,6 +279,21 @@ class TestSpatialCache:
         """Test that the current cache backend works with spatial data."""
         backend = self._get_cache_backend()
         
+        # Special handling for postgresql_roaringbit backend
+        if backend == "postgresql_roaringbit":
+            # Check if roaringbitmap extension is available
+            try:
+                import psycopg
+                conn = psycopg.connect(self.conn_str)
+                cur = conn.cursor()
+                cur.execute("SELECT 1 FROM pg_extension WHERE extname = 'roaringbitmap'")
+                if not cur.fetchone():
+                    pytest.skip("roaringbitmap extension not available")
+                conn.close()
+                print("✅ roaringbitmap extension is available")
+            except Exception as e:
+                pytest.skip(f"Cannot check roaringbitmap extension: {e}")
+        
         # Simple test to ensure backend can handle our data types
         try:
             with partitioncache.create_cache_helper(backend, "region_id", "integer") as cache:
@@ -291,7 +306,11 @@ class TestSpatialCache:
                 print(f"Cache backend {backend} is compatible with spatial data")
                 
         except Exception as e:
-            pytest.fail(f"Cache backend {backend} failed: {e}")
+            # For roaringbit backend, provide more specific error info
+            if backend == "postgresql_roaringbit":
+                pytest.fail(f"postgresql_roaringbit backend failed - this should work since extension was installed: {e}")
+            else:
+                pytest.fail(f"Cache backend {backend} failed: {e}")
     
     def test_distance_calculation_accuracy(self):
         """Test that our distance calculations are reasonable."""
@@ -312,6 +331,34 @@ class TestSpatialCache:
             assert 0.01 < dist2 < 0.1, f"Distance calculation seems wrong: {dist2}"
             
             print(f"Distance calculations look reasonable: {dist1:.6f}, {dist2:.6f}")
+    
+    def test_roaringbitmap_functionality(self):
+        """Test roaringbitmap extension functionality if backend is postgresql_roaringbit."""
+        backend = self._get_cache_backend()
+        
+        if backend != "postgresql_roaringbit":
+            pytest.skip("This test only runs for postgresql_roaringbit backend")
+        
+        # Test that roaringbitmap extension functions work
+        with self.conn.cursor() as cur:
+            # Test basic roaringbitmap operations
+            cur.execute("SELECT rb_build(ARRAY[1,2,3,4,5])")
+            result = cur.fetchone()
+            assert result is not None, "rb_build function should work"
+            
+            # Test roaringbitmap with actual cache data
+            cur.execute("""
+                SELECT COUNT(*) FROM (
+                    SELECT rb_build(ARRAY[region_id]) as rb 
+                    FROM test_spatial_points 
+                    WHERE region_id IS NOT NULL 
+                    LIMIT 10
+                ) t
+            """)
+            count = cur.fetchone()[0]
+            assert count > 0, "Should be able to create roaring bitmaps from spatial data"
+            
+            print("✅ RoaringBitmap extension functions work correctly with spatial data")
 
 
 class TestSpatialCacheIntegration:
