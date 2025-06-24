@@ -150,11 +150,11 @@ class TestPostgreSQLRoaringBitCacheHandler:
         rb = BitMap([1, 2, 3, 10, 100])
         serialized_rb = rb.serialize()
 
-        # Update mock to return real serialized data
-        mock_cursor.fetchone.side_effect = [
-            ("integer",),  # For datatype check
-            (serialized_rb,),  # Real serialized roaring bitmap
-        ]
+        # Mock the _get_partition_datatype method directly
+        cache_handler._get_partition_datatype = MagicMock(return_value="integer")
+
+        # Mock the cursor fetchone to return the serialized roaring bitmap
+        mock_cursor.fetchone.return_value = (serialized_rb,)
 
         result = cache_handler.get("test_key", "test_partition")
 
@@ -163,11 +163,11 @@ class TestPostgreSQLRoaringBitCacheHandler:
 
     def test_get_nonexistent_key(self, cache_handler, mock_cursor):
         """Test getting a non-existent key."""
-        # Mock partition datatype exists but key doesn't exist
-        mock_cursor.fetchone.side_effect = [
-            ("integer",),  # For datatype check
-            None,  # Key doesn't exist
-        ]
+        # Mock the _get_partition_datatype method directly
+        cache_handler._get_partition_datatype = MagicMock(return_value="integer")
+
+        # Mock that the key doesn't exist
+        mock_cursor.fetchone.return_value = None
 
         result = cache_handler.get("nonexistent_key", "test_partition")
         assert result is None
@@ -189,13 +189,14 @@ class TestPostgreSQLRoaringBitCacheHandler:
         # Expected intersection
         rb_intersection = rb1 & rb2
 
-        mock_cursor.fetchall.return_value = [("key1",), ("key2",)]  # Both keys exist
+        # Mock the _get_partition_datatype method directly
+        cache_handler._get_partition_datatype = MagicMock(return_value="integer")
 
-        # Mock the intersection query result
-        mock_cursor.fetchone.side_effect = [
-            ("integer",),  # For datatype check
-            (rb_intersection.serialize(),),
-        ]
+        # Mock that both keys exist in the fetchall call
+        mock_cursor.fetchall.return_value = [("key1",), ("key2",)]
+
+        # Mock the intersection query result with proper serialized data
+        mock_cursor.fetchone.return_value = (rb_intersection.serialize(),)
 
         result, count = cache_handler.get_intersected({"key1", "key2"}, "test_partition")
 
