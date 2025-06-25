@@ -41,9 +41,13 @@ class TestPostgreSQLRoaringBitCacheHandler:
     def cache_handler(self, mock_db_config, mock_db, mock_cursor):
         """Create a cache handler instance with mocked database."""
         with patch("psycopg.connect", return_value=mock_db):
+            # Simulate that the roaringbitmap extension exists
+            mock_cursor.fetchone.return_value = (1,)
             handler = PostgreSQLRoaringBitCacheHandler(**mock_db_config)
             handler.cursor = mock_cursor
             handler.db = mock_db
+            # Reset mock after initialization to have a clean slate for tests
+            mock_cursor.reset_mock()
             return handler
 
     def test_repr(self, cache_handler):

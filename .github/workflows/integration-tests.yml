@@ -68,32 +68,37 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        test-pattern:
+        include:
           - name: "PostgreSQL Backends"
             pattern: "postgresql"
             suffix: "pg"
             parallel: true
             requires_redis: false
+            job_index: 0
           - name: "Redis Backends"
             pattern: "redis"
             suffix: "redis"
             parallel: true
             requires_redis: true
+            job_index: 1
           - name: "RocksDB Backends"
             pattern: "rocksdb"
             suffix: "rocksdb"
             parallel: false
             requires_redis: false
+            job_index: 2
           - name: "Queue Processing"
             pattern: "queue"
             suffix: "queue"
             parallel: false
             requires_redis: false
+            job_index: 3
           - name: "CLI Tools"
             pattern: "test_cli"
             suffix: "cli"
             parallel: true
             requires_redis: false
+            job_index: 4
 
     services:
       postgres:
@@ -123,7 +128,7 @@ jobs:
     env:
       # Define a unique database name for each job
       UNIQUE_DB_NAME: partitioncache_integration_${{ matrix.test-pattern.suffix }}_${{ github.run_id }}
-      TEMPLATE_DB_NAME: partitioncache_integration
+      TEMPLATE_DB_NAME: partitioncache_integration_${{ matrix.test-pattern.suffix }}
       
       # PostgreSQL configuration
       PG_HOST: localhost
@@ -144,27 +149,27 @@ jobs:
       PG_QUEUE_PASSWORD: integration_password
       QUERY_QUEUE_PROVIDER: postgresql
       
-      # Redis configuration
+      # Redis configuration - isolated per job to prevent conflicts
       REDIS_HOST: localhost
       REDIS_PORT: 6379
-      REDIS_CACHE_DB: 0
-      REDIS_BIT_DB: 1
+      REDIS_CACHE_DB: ${{ matrix.test-pattern.job_index }}
+      REDIS_BIT_DB: ${{ matrix.test-pattern.job_index + 10 }}
       REDIS_BIT_BITSIZE: 200000
       REDIS_SET_HOST: localhost
       REDIS_SET_PORT: 6379
-      REDIS_SET_DB: 0
+      REDIS_SET_DB: ${{ matrix.test-pattern.job_index }}
       
-      # Cache backend configuration
-      PG_ARRAY_CACHE_TABLE_PREFIX: ci_array_cache
-      PG_BIT_CACHE_TABLE_PREFIX: ci_bit_cache
+      # Cache backend configuration with job-specific prefixes
+      PG_ARRAY_CACHE_TABLE_PREFIX: ci_array_cache_${{ matrix.test-pattern.suffix }}
+      PG_BIT_CACHE_TABLE_PREFIX: ci_bit_cache_${{ matrix.test-pattern.suffix }}
       PG_BIT_CACHE_BITSIZE: 200000
-      PG_ROARINGBIT_CACHE_TABLE_PREFIX: ci_roaring_cache
+      PG_ROARINGBIT_CACHE_TABLE_PREFIX: ci_roaring_cache_${{ matrix.test-pattern.suffix }}
       
-      # RocksDB configuration
-      ROCKSDB_PATH: /tmp/ci_rocksdb
-      ROCKSDB_BIT_PATH: /tmp/ci_rocksdb_bit
+      # RocksDB configuration - isolated per job to prevent file conflicts
+      ROCKSDB_PATH: /tmp/ci_rocksdb_${{ matrix.test-pattern.suffix }}_${{ github.run_id }}
+      ROCKSDB_BIT_PATH: /tmp/ci_rocksdb_bit_${{ matrix.test-pattern.suffix }}_${{ github.run_id }}
       ROCKSDB_BIT_BITSIZE: 200000
-      ROCKSDB_DICT_PATH: /tmp/ci_rocksdict
+      ROCKSDB_DICT_PATH: /tmp/ci_rocksdict_${{ matrix.test-pattern.suffix }}_${{ github.run_id }}
 
     steps:
     - name: Checkout repository
@@ -191,12 +196,24 @@ jobs:
       run: |
         echo "Waiting for PostgreSQL..."
         for i in {1..30}; do
-          if python -c "import psycopg; psycopg.connect('postgresql://integration_user:integration_password@localhost:5432/$TEMPLATE_DB_NAME')" 2>/dev/null; then
+          if python -c "import psycopg; psycopg.connect('postgresql://integration_user:integration_password@localhost:5432/partitioncache_integration')" 2>/dev/null; then
             echo "PostgreSQL ready"
             break
           fi
           sleep 2
         done
+
+        echo "Creating template database: $TEMPLATE_DB_NAME"
+        python -c "
+        import os
+        import psycopg
+        from psycopg import sql
+        db_name = os.environ['TEMPLATE_DB_NAME']
+        conn_str = f'postgresql://integration_user:integration_password@localhost:5432/postgres'
+        with psycopg.connect(conn_str, autocommit=True) as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql.SQL('CREATE DATABASE {} TEMPLATE partitioncache_integration').format(sql.Identifier(db_name)))
+        "
 
         echo "Creating test database: $UNIQUE_DB_NAME from template $TEMPLATE_DB_NAME"
         python -c "
@@ -316,7 +333,7 @@ jobs:
 
     env:
       UNIQUE_DB_NAME: partitioncache_e2e_${{ github.run_id }}
-      TEMPLATE_DB_NAME: partitioncache_integration
+      TEMPLATE_DB_NAME: partitioncache_integration_e2e
       CACHE_BACKEND: postgresql_array
       PG_HOST: localhost
       PG_PORT: 5432
@@ -357,12 +374,24 @@ jobs:
       run: |
         echo "Waiting for PostgreSQL..."
         for i in {1..30}; do
-          if python -c "import psycopg; psycopg.connect('postgresql://integration_user:integration_password@localhost:5432/$TEMPLATE_DB_NAME')" 2>/dev/null; then
+          if python -c "import psycopg; psycopg.connect('postgresql://integration_user:integration_password@localhost:5432/partitioncache_integration')" 2>/dev/null; then
             echo "PostgreSQL ready"
             break
           fi
           sleep 2
         done
+
+        echo "Creating template database: $TEMPLATE_DB_NAME"
+        python -c "
+        import os
+        import psycopg
+        from psycopg import sql
+        db_name = os.environ['TEMPLATE_DB_NAME']
+        conn_str = f'postgresql://integration_user:integration_password@localhost:5432/postgres'
+        with psycopg.connect(conn_str, autocommit=True) as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql.SQL('CREATE DATABASE {} TEMPLATE partitioncache_integration').format(sql.Identifier(db_name)))
+        "
 
         echo "Creating test database: $UNIQUE_DB_NAME from template $TEMPLATE_DB_NAME"
         python -c "
@@ -429,7 +458,7 @@ jobs:
 
     env:
       UNIQUE_DB_NAME: partitioncache_perf_${{ github.run_id }}
-      TEMPLATE_DB_NAME: partitioncache_integration
+      TEMPLATE_DB_NAME: partitioncache_integration_perf
       CACHE_BACKEND: postgresql_array
       PG_HOST: localhost
       PG_PORT: 5432
@@ -465,12 +494,24 @@ jobs:
       run: |
         echo "Waiting for PostgreSQL..."
         for i in {1..30}; do
-          if python -c "import psycopg; psycopg.connect('postgresql://integration_user:integration_password@localhost:5432/$TEMPLATE_DB_NAME')" 2>/dev/null; then
+          if python -c "import psycopg; psycopg.connect('postgresql://integration_user:integration_password@localhost:5432/partitioncache_integration')" 2>/dev/null; then
             echo "PostgreSQL ready"
             break
           fi
           sleep 2
         done
+
+        echo "Creating template database: $TEMPLATE_DB_NAME"
+        python -c "
+        import os
+        import psycopg
+        from psycopg import sql
+        db_name = os.environ['TEMPLATE_DB_NAME']
+        conn_str = f'postgresql://integration_user:integration_password@localhost:5432/postgres'
+        with psycopg.connect(conn_str, autocommit=True) as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql.SQL('CREATE DATABASE {} TEMPLATE partitioncache_integration').format(sql.Identifier(db_name)))
+        "
 
         echo "Creating test database: $UNIQUE_DB_NAME from template $TEMPLATE_DB_NAME"
         python -c "
