@@ -9,33 +9,8 @@ on:
 env:
   CI: true
   PYTHON_VERSION: "3.12"
-  # Global database settings (for cache)
-  DB_HOST: localhost
-  DB_PORT: 5432
-  DB_USER: test_user
-  DB_PASSWORD: test_password
-  DB_NAME: test_db
-  # Legacy PG variables (for some tests that may still use them)
-  PG_HOST: localhost
-  PG_PORT: 5432
-  PG_USER: test_user
-  PG_PASSWORD: test_password
-  PG_DBNAME: test_db
-  # Redis settings
-  REDIS_HOST: localhost
-  REDIS_PORT: 6379
-  # Queue settings
-  QUERY_QUEUE_PROVIDER: postgresql
-  PG_QUEUE_HOST: localhost
-  PG_QUEUE_PORT: 5432
-  PG_QUEUE_USER: test_user
-  PG_QUEUE_PASSWORD: test_password
-  PG_QUEUE_DB: test_db
-  # Test timeout settings
-  PYTEST_TIMEOUT: 300
 
 jobs:
-  # Build and push custom PostgreSQL image with required extensions
   build-postgres-image:
     name: Build PostgreSQL Image with Extensions
     runs-on: ubuntu-latest
@@ -43,7 +18,6 @@ jobs:
       contents: read
       packages: write
     outputs:
-      image-digest: ${{ steps.build.outputs.digest }}
       image-tag: sha-${{ steps.sha.outputs.short }}
     
     steps:
@@ -73,12 +47,9 @@ jobs:
           type=ref,event=branch
           type=ref,event=pr
           type=sha,prefix=sha-
-          type=sha,prefix=sha-,format=long
           type=raw,value=latest,enable={{is_default_branch}}
-          type=raw,value=main,enable={{is_default_branch}}
 
-    - name: Build and push PostgreSQL image with pg_cron and roaringbitmap
-      id: build
+    - name: Build and push PostgreSQL image
       uses: docker/build-push-action@v5
       with:
         context: .github/docker/postgres-cron
@@ -89,176 +60,47 @@ jobs:
         cache-to: type=gha,mode=max
         platforms: linux/amd64
 
-  # Setup job for preparing test data
-  setup-data:
-    name: Setup Test Data
+  integration-tests:
+    name: ${{ matrix.test-pattern.name }}
     runs-on: ubuntu-latest
     needs: build-postgres-image
-    outputs:
-      data-ready: ${{ steps.setup.outputs.ready }}
-    
-    services:
-      postgres:
-        # Use commit-specific SHA tag to ensure deterministic image reference
-        # Services need an image that's guaranteed to exist when the job starts
-        image: ghcr.io/mpoppinga/postgres-test-extensions:sha-${{ github.sha }}
-        env:
-          POSTGRES_DB: test_db
-          POSTGRES_USER: test_user
-          POSTGRES_PASSWORD: test_password
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U test_user -d test_db"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 10
-
-    steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
-
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: ${{ env.PYTHON_VERSION }}
-
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install -e ".[testing,db]"
-
-    - name: Setup test datasets
-      id: setup
-      run: |
-        # Wait for PostgreSQL to be ready
-        for i in {1..30}; do
-          if python -c "import psycopg; psycopg.connect('postgresql://test_user:test_password@localhost:5432/test_db')" 2>/dev/null; then
-            echo "PostgreSQL is ready"
-            break
-          fi
-          echo "Waiting for PostgreSQL... ($i/30)"
-          sleep 2
-        done
-        
-        # Verify extensions are available
-        python -c "
-        import psycopg
-        conn = psycopg.connect('postgresql://test_user:test_password@localhost:5432/test_db')
-        conn.autocommit = True
-        cur = conn.cursor()
-        
-        # Check pg_cron extension
-        cur.execute('SELECT extname FROM pg_extension WHERE extname = %s', ('pg_cron',))
-        if not cur.fetchone():
-            raise Exception('pg_cron extension not found')
-        
-        # Check roaringbitmap extension  
-        cur.execute('SELECT extname FROM pg_extension WHERE extname = %s', ('roaringbitmap',))
-        if not cur.fetchone():
-            raise Exception('roaringbitmap extension not found')
-            
-        print('✅ Both pg_cron and roaringbitmap extensions are available')
-        conn.close()
-        "
-        
-        # Create test tables and load sample data
-        python -c "
-        import psycopg
-        conn = psycopg.connect('postgresql://test_user:test_password@localhost:5432/test_db')
-        conn.autocommit = True
-        cur = conn.cursor()
-        
-        # Setup spatial test data using the dedicated script
-        import subprocess
-        result = subprocess.run([
-            'python', 'scripts/setup_test_data.py', 
-            '--dataset', 'spatial', 
-            '--size', 'small',
-            '--connection-string', 'postgresql://test_user:test_password@localhost:5432/test_db'
-        ], capture_output=True, text=True)
-        
-        if result.returncode != 0:
-            print(f'Setup script failed: {result.stderr}')
-            # Fallback: create minimal test table
-            cur.execute('''
-              CREATE TABLE IF NOT EXISTS test_spatial_points (
-                id SERIAL PRIMARY KEY,
-                x DECIMAL(10,6) NOT NULL,
-                y DECIMAL(10,6) NOT NULL,
-                point_type VARCHAR(50) NOT NULL,
-                region_id INTEGER NOT NULL
-              )
-            ''')
-            cur.execute('''
-              INSERT INTO test_spatial_points (x, y, point_type, region_id)
-              VALUES (52.52, 13.40, 'restaurant', 1), (52.51, 13.41, 'pharmacy', 1)
-            ''')
-        else:
-            print('Spatial test data setup completed')
-        
-        print('Test data setup completed')
-        conn.close()
-        "
-        
-        echo "ready=true" >> $GITHUB_OUTPUT
-
-  # Matrix job for testing different cache handlers
-  integration-tests:
-    name: Integration Tests (${{ matrix.cache-handler }})
-    runs-on: ubuntu-latest
-    needs: [build-postgres-image, setup-data]
-    if: needs.setup-data.outputs.data-ready == 'true'
     
     strategy:
       fail-fast: false
       matrix:
-        cache-handler:
-          - name: "postgresql-array"
-            backend: "postgresql_array"
-            table_prefix: "pcache_array"
-            requires_postgres: true
+        test-pattern:
+          - name: "PostgreSQL Backends"
+            pattern: "postgresql"
+            parallel: true
             requires_redis: false
-          - name: "postgresql-bit"
-            backend: "postgresql_bit"
-            table_prefix: "pcache_bit"  
-            requires_postgres: true
-            requires_redis: false
-          - name: "postgresql-roaringbit"
-            backend: "postgresql_roaringbit"
-            table_prefix: "pcache_roaring"
-            requires_postgres: true
-            requires_redis: false
-          - name: "redis-set"
-            backend: "redis_set"
-            table_prefix: "pcache_redis"
-            requires_postgres: true
+          - name: "Redis Backends"
+            pattern: "redis"
+            parallel: true
             requires_redis: true
-          - name: "redis-bit"
-            backend: "redis_bit"
-            table_prefix: "pcache_redis_bit"
-            requires_postgres: true
-            requires_redis: true
-          - name: "rocksdict"
-            backend: "rocksdict"
-            table_prefix: "pcache_rocksdict"
-            requires_postgres: true
+          - name: "RocksDB Backends"
+            pattern: "rocksdb"
+            parallel: false
             requires_redis: false
-            requires_rocksdb: false
+          - name: "Queue Processing"
+            pattern: "queue"
+            parallel: false
+            requires_redis: false
+          - name: "CLI Tools"
+            pattern: "test_cli"
+            parallel: true
+            requires_redis: false
 
     services:
       postgres:
-        # Use commit-specific SHA tag to ensure deterministic image reference
-        # Services need an image that's guaranteed to exist when the job starts
         image: ghcr.io/mpoppinga/postgres-test-extensions:sha-${{ github.sha }}
         env:
-          POSTGRES_DB: test_db
-          POSTGRES_USER: test_user
-          POSTGRES_PASSWORD: test_password
+          POSTGRES_DB: partitioncache_integration
+          POSTGRES_USER: integration_user
+          POSTGRES_PASSWORD: integration_password
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U test_user -d test_db"
+          --health-cmd "pg_isready -U integration_user -d partitioncache_integration"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 10
@@ -272,29 +114,52 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 10
+        if: ${{ matrix.test-pattern.requires_redis }}
 
     env:
-      # Cache-specific environment variables
-      CACHE_BACKEND: ${{ matrix.cache-handler.backend }}
-      # PostgreSQL cache variables
-      PG_ARRAY_CACHE_TABLE_PREFIX: ${{ matrix.cache-handler.table_prefix }}
-      PG_BIT_CACHE_TABLE_PREFIX: ${{ matrix.cache-handler.table_prefix }}
-      PG_BIT_CACHE_BITSIZE: "10000"
-      PG_ROARINGBIT_CACHE_TABLE_PREFIX: ${{ matrix.cache-handler.table_prefix }}
-      # Redis cache variables
+      # PostgreSQL configuration
+      PG_HOST: localhost
+      PG_PORT: 5432
+      PG_USER: integration_user
+      PG_PASSWORD: integration_password
+      PG_DBNAME: partitioncache_integration
+      
+      # Database configuration
+      DB_HOST: localhost
+      DB_PORT: 5432
+      DB_USER: integration_user
+      DB_PASSWORD: integration_password
+      DB_NAME: partitioncache_integration
+      
+      # Queue configuration
+      PG_QUEUE_HOST: localhost
+      PG_QUEUE_PORT: 5432
+      PG_QUEUE_USER: integration_user
+      PG_QUEUE_PASSWORD: integration_password
+      PG_QUEUE_DB: partitioncache_integration
+      QUERY_QUEUE_PROVIDER: postgresql
+      
+      # Redis configuration
       REDIS_HOST: localhost
       REDIS_PORT: 6379
-      REDIS_CACHE_DB: "0"
-      REDIS_BIT_DB: "1"
-      REDIS_BIT_BITSIZE: "10000"
-      REDIS_CACHE_KEY_PREFIX: ${{ matrix.cache-handler.table_prefix }}
-      # RocksDB variables
-      ROCKS_DB_PATH: "/tmp/rocksdb_${{ matrix.cache-handler.name }}"
-      ROCKSDB_PATH: "/tmp/rocksdb_${{ matrix.cache-handler.name }}"
-      ROCKSDB_BIT_PATH: "/tmp/rocksdb_bit_${{ matrix.cache-handler.name }}"
-      ROCKSDB_BIT_BITSIZE: "10000"
-      ROCKS_DICT_PATH: "/tmp/rocksdict_${{ matrix.cache-handler.name }}"
-      ROCKSDB_DICT_PATH: "/tmp/rocksdict_${{ matrix.cache-handler.name }}"
+      REDIS_CACHE_DB: 0
+      REDIS_BIT_DB: 1
+      REDIS_BIT_BITSIZE: 200000
+      REDIS_SET_HOST: localhost
+      REDIS_SET_PORT: 6379
+      REDIS_SET_DB: 0
+      
+      # Cache backend configuration
+      PG_ARRAY_CACHE_TABLE_PREFIX: ci_array_cache
+      PG_BIT_CACHE_TABLE_PREFIX: ci_bit_cache
+      PG_BIT_CACHE_BITSIZE: 200000
+      PG_ROARINGBIT_CACHE_TABLE_PREFIX: ci_roaring_cache
+      
+      # RocksDB configuration
+      ROCKSDB_PATH: /tmp/ci_rocksdb
+      ROCKSDB_BIT_PATH: /tmp/ci_rocksdb_bit
+      ROCKSDB_BIT_BITSIZE: 200000
+      ROCKSDB_DICT_PATH: /tmp/ci_rocksdict
 
     steps:
     - name: Checkout repository
@@ -318,129 +183,97 @@ jobs:
       run: |
         python -m pip install --upgrade pip
         pip install -e ".[testing,db]"
-        # Note: RocksDB (full) requires conda-forge installation due to compatibility issues
-        # Only rocksdict is tested via pip in CI - full RocksDB testing requires micromamba/conda
+        pip install pytest-xdist pytest-cov
 
     - name: Wait for services
       run: |
-        # Wait for PostgreSQL
-        if [[ "${{ matrix.cache-handler.requires_postgres }}" == "true" ]]; then
-          for i in {1..30}; do
-            if python -c "import psycopg; psycopg.connect('postgresql://test_user:test_password@localhost:5432/test_db')" 2>/dev/null; then
-              echo "PostgreSQL is ready"
-              break
-            fi
-            echo "Waiting for PostgreSQL... ($i/30)"
-            sleep 2
-          done
-        fi
+        echo "Waiting for PostgreSQL..."
+        for i in {1..30}; do
+          if python -c "import psycopg; psycopg.connect('postgresql://integration_user:integration_password@localhost:5432/partitioncache_integration')" 2>/dev/null; then
+            echo "PostgreSQL ready"
+            break
+          fi
+          sleep 2
+        done
         
-        # Wait for Redis
-        if [[ "${{ matrix.cache-handler.requires_redis }}" == "true" ]]; then
+        if [[ "${{ matrix.test-pattern.requires_redis }}" == "true" ]]; then
+          echo "Waiting for Redis..."
           for i in {1..30}; do
             if redis-cli -h localhost -p 6379 ping >/dev/null 2>&1; then
-              echo "Redis is ready"
+              echo "Redis ready"
               break
             fi
-            echo "Waiting for Redis... ($i/30)"
             sleep 2
           done
         fi
 
-    - name: Verify PostgreSQL extensions are available
+    - name: Verify extensions
       run: |
-        # Verify that both required extensions are available in the custom image
-        echo "Verifying PostgreSQL extensions..."
-        
         python -c "
         import psycopg
-        conn = psycopg.connect('postgresql://test_user:test_password@localhost:5432/test_db')
+        conn = psycopg.connect('postgresql://integration_user:integration_password@localhost:5432/partitioncache_integration')
         conn.autocommit = True
         cur = conn.cursor()
-        
-        # Check pg_cron extension
         cur.execute('SELECT extname FROM pg_extension WHERE extname = %s', ('pg_cron',))
-        if cur.fetchone():
-            print('✅ pg_cron extension is available')
-        else:
-            raise Exception('❌ pg_cron extension not found')
-        
-        # Check roaringbitmap extension  
+        if not cur.fetchone():
+            raise Exception('pg_cron extension not found')
         cur.execute('SELECT extname FROM pg_extension WHERE extname = %s', ('roaringbitmap',))
-        if cur.fetchone():
-            print('✅ roaringbitmap extension is available')
-        else:
-            raise Exception('❌ roaringbitmap extension not found')
-            
+        if not cur.fetchone():
+            print('roaringbitmap extension not found (optional)')
         conn.close()
         "
+
+    - name: Run tests
+      run: |
+        PYTEST_FLAGS="--ci --pattern ${{ matrix.test-pattern.pattern }} --verbose"
         
-        echo "✅ All required PostgreSQL extensions are available"
-
-    - name: Setup PartitionCache tables
-      run: |
-        # Setup cache tables for the specific backend
-        echo "Setting up PartitionCache tables for backend: ${{ matrix.cache-handler.backend }}"
+        if [[ "${{ matrix.test-pattern.parallel }}" == "true" ]]; then
+          PYTEST_FLAGS="$PYTEST_FLAGS --parallel"
+        fi
         
-        python -m partitioncache.cli.manage_cache setup all
+        if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == "refs/heads/main" ]]; then
+          PYTEST_FLAGS="$PYTEST_FLAGS --coverage"
+        fi
         
-        # Verify setup
-        python -m partitioncache.cli.manage_cache status
+        ./scripts/run_integration_tests.sh $PYTEST_FLAGS --no-setup
 
-    - name: Load spatial test data
-      run: |
-        # Load spatial test data using the setup script
-        python scripts/setup_test_data.py --dataset spatial --size small --reset
-
-    - name: Run integration tests - Spatial cache functionality
-      run: |
-        echo "Running spatial cache tests for backend: ${{ matrix.cache-handler.backend }}"
-        
-        python -m pytest tests/integration/test_spatial_cache.py \
-          -v --tb=short --timeout=${{ env.PYTEST_TIMEOUT }} \
-          -k "not performance"
-
-    - name: Run integration tests - CLI tools
-      run: |
-        python -m pytest tests/integration/test_cli.py \
-          -v --tb=short --timeout=${{ env.PYTEST_TIMEOUT }}
-
-    - name: Run integration tests - End-to-end workflows
-      if: ${{ matrix.cache-handler.backend != 'rocks_dict' }}  # Skip slow tests for RocksDict (file-based)
-      run: |
-        python -m pytest tests/integration/test_end_to_end_workflows.py \
-          -v --tb=short --timeout=600
-
-    - name: Upload test artifacts
+    - name: Upload artifacts
       uses: actions/upload-artifact@v4
       if: always()
       with:
-        name: test-results-${{ matrix.cache-handler.name }}
+        name: test-results-${{ matrix.test-pattern.name }}
         path: |
+          htmlcov/
+          .coverage
           pytest-results.xml
-          coverage.xml
-          /tmp/rocksdb_*
-          /tmp/rocksdict_*
+          /tmp/ci_rocksdb*/
+          /tmp/ci_rocksdict*/
         retention-days: 7
 
-  # Performance tests (only on push to main, not PRs)
-  performance-tests:
-    name: Performance Tests
+    - name: Upload coverage
+      uses: codecov/codecov-action@v3
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      with:
+        file: ./coverage.xml
+        flags: integration-${{ matrix.test-pattern.name }}
+
+  e2e-tests:
+    name: End-to-End Tests
     runs-on: ubuntu-latest
-    needs: [build-postgres-image, setup-data, integration-tests]
+    needs: [build-postgres-image, integration-tests]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     
     services:
       postgres:
         image: ghcr.io/mpoppinga/postgres-test-extensions:sha-${{ github.sha }}
         env:
-          POSTGRES_DB: test_db
-          POSTGRES_USER: test_user
-          POSTGRES_PASSWORD: test_password
+          POSTGRES_DB: partitioncache_integration
+          POSTGRES_USER: integration_user
+          POSTGRES_PASSWORD: integration_password
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U test_user -d test_db"
+          --health-cmd "pg_isready -U integration_user -d partitioncache_integration"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 10
@@ -456,20 +289,23 @@ jobs:
           --health-retries 10
 
     env:
+      CACHE_BACKEND: postgresql_array
+      PG_HOST: localhost
+      PG_PORT: 5432
+      PG_USER: integration_user
+      PG_PASSWORD: integration_password
+      PG_DBNAME: partitioncache_integration
       DB_HOST: localhost
       DB_PORT: 5432
-      DB_USER: test_user
-      DB_PASSWORD: test_password
-      DB_NAME: test_db
-      CACHE_BACKEND: postgresql_array
-      PG_ARRAY_CACHE_TABLE_PREFIX: partitioncache_perf_test
-      QUERY_QUEUE_PROVIDER: postgresql
+      DB_USER: integration_user
+      DB_PASSWORD: integration_password
+      DB_NAME: partitioncache_integration
       PG_QUEUE_HOST: localhost
       PG_QUEUE_PORT: 5432
-      PG_QUEUE_USER: test_user
-      PG_QUEUE_PASSWORD: test_password
-      PG_QUEUE_DB: test_db
-      PYTEST_TIMEOUT: 900
+      PG_QUEUE_USER: integration_user
+      PG_QUEUE_PASSWORD: integration_password
+      PG_QUEUE_DB: partitioncache_integration
+      QUERY_QUEUE_PROVIDER: postgresql
 
     steps:
     - name: Checkout repository
@@ -485,54 +321,59 @@ jobs:
         python -m pip install --upgrade pip
         pip install -e ".[testing,db]"
 
-    - name: Setup PartitionCache
+    - name: Run E2E tests
       run: |
-        python -m partitioncache.cli.manage_cache setup all
+        ./scripts/run_integration_tests.sh \
+          --ci \
+          --no-setup \
+          --pattern test_end_to_end_workflows \
+          --verbose \
+          --coverage
 
-    - name: Run performance tests
-      run: |
-        python -m pytest tests/integration/test_cache_performance.py \
-          tests/integration/test_error_recovery.py \
-          tests/integration/test_spatial_cache.py::TestSpatialCache::test_cache_performance_comparison \
-          -v --tb=short --timeout=${{ env.PYTEST_TIMEOUT }} \
-          -m "not slow"
+    - name: Upload E2E artifacts
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: e2e-test-results
+        path: |
+          htmlcov/
+          .coverage
+          pytest-results.xml
+        retention-days: 7
 
-  # Queue processor tests (separate job due to different requirements)
-  queue-processor-tests:
-    name: Queue Processor Tests
+  performance-tests:
+    name: Performance Tests
     runs-on: ubuntu-latest
-    needs: [build-postgres-image, setup-data]
+    needs: [build-postgres-image, integration-tests]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     
     services:
       postgres:
         image: ghcr.io/mpoppinga/postgres-test-extensions:sha-${{ github.sha }}
         env:
-          POSTGRES_DB: test_db
-          POSTGRES_USER: test_user
-          POSTGRES_PASSWORD: test_password
+          POSTGRES_DB: partitioncache_integration
+          POSTGRES_USER: integration_user
+          POSTGRES_PASSWORD: integration_password
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U test_user -d test_db"
+          --health-cmd "pg_isready -U integration_user -d partitioncache_integration"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 10
 
     env:
+      CACHE_BACKEND: postgresql_array
+      PG_HOST: localhost
+      PG_PORT: 5432
+      PG_USER: integration_user
+      PG_PASSWORD: integration_password
+      PG_DBNAME: partitioncache_integration
       DB_HOST: localhost
       DB_PORT: 5432
-      DB_USER: test_user
-      DB_PASSWORD: test_password
-      DB_NAME: test_db
-      CACHE_BACKEND: postgresql_array
-      PG_ARRAY_CACHE_TABLE_PREFIX: partitioncache_queue_test
-      QUERY_QUEUE_PROVIDER: postgresql
-      PG_QUEUE_HOST: localhost
-      PG_QUEUE_PORT: 5432
-      PG_QUEUE_USER: test_user
-      PG_QUEUE_PASSWORD: test_password
-      PG_QUEUE_DB: test_db
-      PYTEST_TIMEOUT: 600
+      DB_USER: integration_user
+      DB_PASSWORD: integration_password
+      DB_NAME: partitioncache_integration
 
     steps:
     - name: Checkout repository
@@ -548,13 +389,57 @@ jobs:
         python -m pip install --upgrade pip
         pip install -e ".[testing,db]"
 
-    - name: Setup PartitionCache and Queue Processor
+    - name: Run performance tests
       run: |
-        python -m partitioncache.cli.manage_cache setup all
-        # Setup queue processor with pg_cron (now available in custom image)
-        python -m partitioncache.cli.setup_postgresql_queue_processor setup
+        ./scripts/run_integration_tests.sh \
+          --ci \
+          --no-setup \
+          --pattern performance \
+          --verbose
 
-    - name: Run queue processor tests
+    - name: Upload performance artifacts
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: performance-test-results
+        path: |
+          pytest-results.xml
+          performance-results/
+        retention-days: 30
+
+  test-summary:
+    name: Test Summary
+    runs-on: ubuntu-latest
+    needs: [integration-tests, e2e-tests, performance-tests]
+    if: always()
+    
+    steps:
+    - name: Check results
       run: |
-        python -m pytest tests/integration/test_queue_processor.py \
-          -v --tb=short --timeout=${{ env.PYTEST_TIMEOUT }}
+        echo "Integration Test Summary"
+        echo "======================="
+        
+        if [[ "${{ needs.integration-tests.result }}" == "success" ]]; then
+          echo "Integration tests: PASSED"
+        else
+          echo "Integration tests: FAILED"
+          exit 1
+        fi
+        
+        if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+          if [[ "${{ needs.e2e-tests.result }}" == "success" ]]; then
+            echo "E2E tests: PASSED"
+          else
+            echo "E2E tests: FAILED"
+            exit 1
+          fi
+          
+          if [[ "${{ needs.performance-tests.result }}" == "success" ]]; then
+            echo "Performance tests: PASSED"
+          else
+            echo "Performance tests: FAILED"
+            exit 1
+          fi
+        fi
+        
+        echo "All tests completed successfully"

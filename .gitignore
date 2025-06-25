@@ -4,7 +4,7 @@ data
 
 *.sqlite
 *.png
-*.env
+.env
 *.txt
 *.osm.pbf
 

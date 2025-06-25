@@ -11,10 +11,10 @@ CREATE EXTENSION IF NOT EXISTS roaringbitmap;
 SELECT extname, extversion FROM pg_extension WHERE extname IN ('pg_cron', 'roaringbitmap');
 
 -- Grant necessary permissions for testing
--- Allow the test user to schedule and manage cron jobs
-GRANT USAGE ON SCHEMA cron TO test_user;
-GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA cron TO test_user;
-GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA cron TO test_user;
+-- Allow the integration user to schedule and manage cron jobs
+GRANT USAGE ON SCHEMA cron TO integration_user;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA cron TO integration_user;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA cron TO integration_user;
 
 -- Create a simple test table for validation
 CREATE TABLE IF NOT EXISTS test_cron_results (
@@ -24,5 +24,5 @@ CREATE TABLE IF NOT EXISTS test_cron_results (
 );
 
 -- Grant permissions on test table
-GRANT ALL PRIVILEGES ON test_cron_results TO test_user;
-GRANT USAGE, SELECT ON SEQUENCE test_cron_results_id_seq TO test_user;
+GRANT ALL PRIVILEGES ON test_cron_results TO integration_user;
+GRANT USAGE, SELECT ON SEQUENCE test_cron_results_id_seq TO integration_user;

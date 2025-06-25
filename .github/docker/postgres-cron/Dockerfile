@@ -22,7 +22,7 @@ RUN cd /tmp && \
 # Configure PostgreSQL for pg_cron
 # These settings are critical for pg_cron to function correctly
 RUN echo "shared_preload_libraries = 'pg_cron'" >> /usr/share/postgresql/postgresql.conf.sample
-RUN echo "cron.database_name = 'test_db'" >> /usr/share/postgresql/postgresql.conf.sample
+RUN echo "cron.database_name = 'partitioncache_integration'" >> /usr/share/postgresql/postgresql.conf.sample
 RUN echo "cron.host = '/var/run/postgresql'" >> /usr/share/postgresql/postgresql.conf.sample
 
 # Create initialization script to set up both extensions
