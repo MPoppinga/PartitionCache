@@ -123,6 +123,7 @@ jobs:
     env:
       # Define a unique database name for each job
       UNIQUE_DB_NAME: partitioncache_integration_${{ matrix.test-pattern.suffix }}_${{ github.run_id }}
+      TEMPLATE_DB_NAME: partitioncache_integration
       
       # PostgreSQL configuration
       PG_HOST: localhost
@@ -190,23 +191,27 @@ jobs:
       run: |
         echo "Waiting for PostgreSQL..."
         for i in {1..30}; do
-          if python -c "import psycopg; psycopg.connect('postgresql://integration_user:integration_password@localhost:5432/partitioncache_integration')" 2>/dev/null; then
+          if python -c "import psycopg; psycopg.connect('postgresql://integration_user:integration_password@localhost:5432/$TEMPLATE_DB_NAME')" 2>/dev/null; then
             echo "PostgreSQL ready"
             break
           fi
           sleep 2
         done
 
-        echo "Creating test database: $UNIQUE_DB_NAME"
+        echo "Creating test database: $UNIQUE_DB_NAME from template $TEMPLATE_DB_NAME"
         python -c "
         import os
         import psycopg
         from psycopg import sql
         db_name = os.environ['UNIQUE_DB_NAME']
-        conn_str = 'postgresql://integration_user:integration_password@localhost:5432/partitioncache_integration'
+        template_db = os.environ['TEMPLATE_DB_NAME']
+        conn_str = f'postgresql://integration_user:integration_password@localhost:5432/{template_db}'
         with psycopg.connect(conn_str, autocommit=True) as conn:
             with conn.cursor() as cur:
-                cur.execute(sql.SQL('CREATE DATABASE {}').format(sql.Identifier(db_name)))
+                cur.execute(sql.SQL('CREATE DATABASE {} TEMPLATE {}').format(
+                    sql.Identifier(db_name),
+                    sql.Identifier(template_db)
+                ))
         "
 
         # Set the database name for subsequent steps
@@ -311,6 +316,7 @@ jobs:
 
     env:
       UNIQUE_DB_NAME: partitioncache_e2e_${{ github.run_id }}
+      TEMPLATE_DB_NAME: partitioncache_integration
       CACHE_BACKEND: postgresql_array
       PG_HOST: localhost
       PG_PORT: 5432
@@ -351,23 +357,27 @@ jobs:
       run: |
         echo "Waiting for PostgreSQL..."
         for i in {1..30}; do
-          if python -c "import psycopg; psycopg.connect('postgresql://integration_user:integration_password@localhost:5432/partitioncache_integration')" 2>/dev/null; then
+          if python -c "import psycopg; psycopg.connect('postgresql://integration_user:integration_password@localhost:5432/$TEMPLATE_DB_NAME')" 2>/dev/null; then
             echo "PostgreSQL ready"
             break
           fi
           sleep 2
         done
 
-        echo "Creating test database: $UNIQUE_DB_NAME"
+        echo "Creating test database: $UNIQUE_DB_NAME from template $TEMPLATE_DB_NAME"
         python -c "
         import os
         import psycopg
         from psycopg import sql
         db_name = os.environ['UNIQUE_DB_NAME']
-        conn_str = 'postgresql://integration_user:integration_password@localhost:5432/partitioncache_integration'
+        template_db = os.environ['TEMPLATE_DB_NAME']
+        conn_str = f'postgresql://integration_user:integration_password@localhost:5432/{template_db}'
         with psycopg.connect(conn_str, autocommit=True) as conn:
             with conn.cursor() as cur:
-                cur.execute(sql.SQL('CREATE DATABASE {}').format(sql.Identifier(db_name)))
+                cur.execute(sql.SQL('CREATE DATABASE {} TEMPLATE {}').format(
+                    sql.Identifier(db_name),
+                    sql.Identifier(template_db)
+                ))
         "
 
         # Set the database name for subsequent steps
@@ -419,6 +429,7 @@ jobs:
 
     env:
       UNIQUE_DB_NAME: partitioncache_perf_${{ github.run_id }}
+      TEMPLATE_DB_NAME: partitioncache_integration
       CACHE_BACKEND: postgresql_array
       PG_HOST: localhost
       PG_PORT: 5432
@@ -454,23 +465,27 @@ jobs:
       run: |
         echo "Waiting for PostgreSQL..."
         for i in {1..30}; do
-          if python -c "import psycopg; psycopg.connect('postgresql://integration_user:integration_password@localhost:5432/partitioncache_integration')" 2>/dev/null; then
+          if python -c "import psycopg; psycopg.connect('postgresql://integration_user:integration_password@localhost:5432/$TEMPLATE_DB_NAME')" 2>/dev/null; then
             echo "PostgreSQL ready"
             break
           fi
           sleep 2
         done
 
-        echo "Creating test database: $UNIQUE_DB_NAME"
+        echo "Creating test database: $UNIQUE_DB_NAME from template $TEMPLATE_DB_NAME"
         python -c "
         import os
         import psycopg
         from psycopg import sql
         db_name = os.environ['UNIQUE_DB_NAME']
-        conn_str = 'postgresql://integration_user:integration_password@localhost:5432/partitioncache_integration'
+        template_db = os.environ['TEMPLATE_DB_NAME']
+        conn_str = f'postgresql://integration_user:integration_password@localhost:5432/{template_db}'
         with psycopg.connect(conn_str, autocommit=True) as conn:
             with conn.cursor() as cur:
-                cur.execute(sql.SQL('CREATE DATABASE {}').format(sql.Identifier(db_name)))
+                cur.execute(sql.SQL('CREATE DATABASE {} TEMPLATE {}').format(
+                    sql.Identifier(db_name),
+                    sql.Identifier(template_db)
+                ))
         "
 
         # Set the database name for subsequent steps
