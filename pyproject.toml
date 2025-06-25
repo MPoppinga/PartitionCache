@@ -26,6 +26,7 @@ testing = [
     "pytest-cov",
     "pytest-mock",
     "mypy",
+    "filelock",
 ]
 
 db = [

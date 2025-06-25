@@ -40,13 +40,26 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
         if partition_key in self._cached_datatype:
             return self._cached_datatype[partition_key]
 
-        self.cursor.execute(
-            sql.SQL("SELECT datatype FROM {0} WHERE partition_key = %s").format(sql.Identifier(self.tableprefix + "_partition_metadata")), (partition_key,)
-        )
-        result = self.cursor.fetchone()
-        if result:
-            self._cached_datatype[partition_key] = result[0]
-        return result[0] if result else None
+        try:
+            self.cursor.execute(
+                sql.SQL("SELECT datatype FROM {0} WHERE partition_key = %s").format(sql.Identifier(self.tableprefix + "_partition_metadata")), (partition_key,)
+            )
+            result = self.cursor.fetchone()
+            if result:
+                self._cached_datatype[partition_key] = result[0]
+            return result[0] if result else None
+        except Exception as e:
+            # Metadata table might not exist - rollback and return None
+            try:
+                if "does not exist" in str(e).lower() or "relation" in str(e).lower():
+                    self.db.rollback()
+                    return None
+                else:
+                    logger.error(f"Failed to get datatype for partition {partition_key}: {e}")
+                    self.db.rollback()
+                    return None
+            except Exception:
+                return None
 
     def close(self):
         self._refcount -= 1
@@ -146,8 +159,20 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
             result = self.cursor.fetchone()
             return result is not None
         except Exception as e:
-            logger.error(f"Failed to check existence for key {key} in partition {partition_key}: {e}")
-            return False
+            # If table doesn't exist or other error, rollback to prevent transaction abort
+            try:
+                if "does not exist" in str(e).lower() or "relation" in str(e).lower():
+                    # Table doesn't exist - rollback and return False
+                    self.db.rollback()
+                    return False
+                else:
+                    # Other error - log and rollback
+                    logger.error(f"Failed to check existence for key {key} in partition {partition_key}: {e}")
+                    self.db.rollback()
+                    return False
+            except Exception:
+                # Rollback failed - return False anyway
+                return False
 
     def filter_existing_keys(self, keys: set, partition_key: str = "partition_key") -> set:
         """Return the set of keys that exist in the partition-specific cache."""

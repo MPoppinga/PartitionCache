@@ -358,7 +358,7 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
                         if result is not None:
                             return result
 
-                except (OSError, psycopg.Error) as e:
+                except (OSError, psycopg.Error, psycopg.OperationalError) as e:
                     logger.debug(f"LISTEN/NOTIFY error, falling back to polling: {e}")
                     # Fall back to polling for remainder of timeout
                     break
@@ -384,6 +384,8 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
         finally:
             if listen_conn:
                 try:
+                    cursor = listen_conn.cursor()
+                    cursor.execute("UNLISTEN original_query_available")
                     listen_conn.close()
                 except Exception:
                     pass
@@ -492,7 +494,7 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
                         if result is not None:
                             return result
 
-                except (OSError, psycopg.Error) as e:
+                except (OSError, psycopg.Error, psycopg.OperationalError) as e:
                     logger.debug(f"LISTEN/NOTIFY error, falling back to polling: {e}")
                     # Fall back to polling for remainder of timeout
                     break
@@ -518,6 +520,8 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
         finally:
             if listen_conn:
                 try:
+                    cursor = listen_conn.cursor()
+                    cursor.execute("UNLISTEN query_fragment_available")
                     listen_conn.close()
                 except Exception:
                     pass

@@ -6,6 +6,32 @@ import partitioncache
 from partitioncache.cache_handler.abstract import AbstractCacheHandler_Lazy
 
 
+def _compare_cache_values(retrieved, expected):
+    """
+    Helper function to compare cache values across different backend types.
+    
+    Args:
+        retrieved: Value returned from cache backend (could be set, BitMap, etc.)
+        expected: Expected set value
+    
+    Returns:
+        bool: True if values are equivalent
+    """
+    # Handle BitMap objects from roaringbit backend
+    try:
+        from pyroaring import BitMap
+        if isinstance(retrieved, BitMap):
+            return set(retrieved) == expected
+    except ImportError:
+        pass
+
+    # Handle regular sets and other types
+    if hasattr(retrieved, '__iter__') and not isinstance(retrieved, (str, bytes)):
+        return set(retrieved) == expected
+
+    return retrieved == expected
+
+
 class TestEndToEndWorkflows:
     """
     End-to-end integration tests that validate complete workflows
@@ -525,7 +551,7 @@ class TestEndToEndWorkflows:
 
         # Step 3: Verify consistency
         for i in range(len(consistency_queries)):
-            assert cached_results[i] == expected_results[i], \
+            assert _compare_cache_values(cached_results[i], expected_results[i]), \
                 f"Inconsistent results for query {i}: cache={cached_results[i]}, expected={expected_results[i]}"
 
         print(f"Data consistency verified across {len(consistency_queries)} queries")

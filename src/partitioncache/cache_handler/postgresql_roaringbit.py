@@ -29,64 +29,98 @@ class PostgreSQLRoaringBitCacheHandler(PostgreSQLAbstractCacheHandler):
             logger.warning(f"Failed to create roaringbitmap extension: {e}")
             # Continue anyway - extension might already exist
 
-        # Create metadata table to track partition keys (no bitsize needed for roaring bitmaps)
-        self.cursor.execute(
-            sql.SQL("""CREATE TABLE IF NOT EXISTS {0} (
-                partition_key TEXT PRIMARY KEY,
-                datatype TEXT NOT NULL CHECK (datatype = 'integer'),
-                created_at TIMESTAMP DEFAULT now()
-            );""").format(sql.Identifier(self.tableprefix + "_partition_metadata"))
-        )
+        self._recreate_metadata_table()
 
-        # Create queries table (shared across all partition keys)
-        self.cursor.execute(
-            sql.SQL("""CREATE TABLE IF NOT EXISTS {0} (
-            query_hash TEXT NOT NULL,
-            query TEXT NOT NULL,
-            partition_key TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'ok' CHECK (status IN ('ok', 'timeout', 'failed')),
-            last_seen TIMESTAMP NOT NULL DEFAULT now(),
-            PRIMARY KEY (query_hash, partition_key)
-        );""").format(sql.Identifier(self.tableprefix + "_queries"))
-        )
+    def _recreate_metadata_table(self) -> None:
+        """Recreate metadata table if it was dropped during cleanup."""
+        try:
+            # Enable roaringbitmap extension again if needed
+            self.cursor.execute("CREATE EXTENSION IF NOT EXISTS roaringbitmap;")
 
-        self.db.commit()
+            # Recreate metadata table
+            self.cursor.execute(
+                sql.SQL("""CREATE TABLE IF NOT EXISTS {0} (
+                    partition_key TEXT PRIMARY KEY,
+                    datatype TEXT NOT NULL CHECK (datatype = 'integer'),
+                    created_at TIMESTAMP DEFAULT now()
+                );""").format(sql.Identifier(self.tableprefix + "_partition_metadata"))
+            )
+
+            # Recreate queries table
+            self.cursor.execute(
+                sql.SQL("""CREATE TABLE IF NOT EXISTS {0} (
+                query_hash TEXT NOT NULL,
+                query TEXT NOT NULL,
+                partition_key TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'ok' CHECK (status IN ('ok', 'timeout', 'failed')),
+                last_seen TIMESTAMP NOT NULL DEFAULT now(),
+                PRIMARY KEY (query_hash, partition_key)
+            );""").format(sql.Identifier(self.tableprefix + "_queries"))
+            )
+
+            self.db.commit()
+        except Exception as e:
+            logger.error(f"Failed to recreate roaringbit metadata table: {e}")
+            raise
 
     def _create_partition_table(self, partition_key: str) -> None:
         """Create a cache table for a specific partition key."""
         table_name = f"{self.tableprefix}_cache_{partition_key}"
 
-        # Create the cache table for roaring bitmaps
-        self.cursor.execute(
-            sql.SQL("""CREATE TABLE IF NOT EXISTS {0} (
-                query_hash TEXT PRIMARY KEY,
-                partition_keys roaringbitmap,
-                partition_keys_count integer GENERATED ALWAYS AS (
-                    CASE 
-                        WHEN partition_keys IS NULL THEN NULL
-                        ELSE rb_cardinality(partition_keys)
-                    END
-                ) STORED
-            );""").format(sql.Identifier(table_name))
-        )
+        try:
+            # Check if roaringbitmap extension is available
+            self.cursor.execute("SELECT 1 FROM pg_extension WHERE extname = 'roaringbitmap';")
+            if not self.cursor.fetchone():
+                logger.error("roaringbitmap extension not found - cannot create roaringbitmap tables")
+                raise RuntimeError("roaringbitmap extension required but not available")
 
-        # Insert metadata
-        self.cursor.execute(
-            sql.SQL("INSERT INTO {0} (partition_key, datatype) VALUES (%s, %s) ON CONFLICT (partition_key) DO NOTHING").format(
-                sql.Identifier(self.tableprefix + "_partition_metadata")
-            ),
-            (partition_key, "integer"),
-        )
+            # Create the cache table for roaring bitmaps with improved error handling
+            self.cursor.execute(
+                sql.SQL("""CREATE TABLE IF NOT EXISTS {0} (
+                    query_hash TEXT PRIMARY KEY,
+                    partition_keys roaringbitmap,
+                    partition_keys_count integer GENERATED ALWAYS AS (
+                        CASE 
+                            WHEN partition_keys IS NULL THEN NULL
+                            ELSE rb_cardinality(partition_keys)
+                        END
+                    ) STORED
+                );""").format(sql.Identifier(table_name))
+            )
 
-        self.db.commit()
+            # Insert metadata
+            self.cursor.execute(
+                sql.SQL("INSERT INTO {0} (partition_key, datatype) VALUES (%s, %s) ON CONFLICT (partition_key) DO NOTHING").format(
+                    sql.Identifier(self.tableprefix + "_partition_metadata")
+                ),
+                (partition_key, "integer"),
+            )
+
+            self.db.commit()
+
+        except Exception as e:
+            logger.error(f"Failed to create roaringbitmap table {table_name}: {e}")
+            self.db.rollback()
+            raise
 
     def _ensure_partition_table(self, partition_key: str) -> None:
         """Ensure a partition table exists."""
-        existing_datatype = self._get_partition_datatype(partition_key)
+        try:
+            existing_datatype = self._get_partition_datatype(partition_key)
 
-        if existing_datatype is None:
-            # Create new table
-            self._create_partition_table(partition_key)
+            if existing_datatype is None:
+                # Create new table
+                self._create_partition_table(partition_key)
+        except Exception as e:
+            logger.error(f"Failed to ensure roaringbit partition table for {partition_key}: {e}")
+            # Rollback and recreate metadata table if needed
+            try:
+                self.db.rollback()
+                self._recreate_metadata_table()
+                self._create_partition_table(partition_key)
+            except Exception as recreate_error:
+                logger.error(f"Failed to recreate roaringbit partition table for {partition_key}: {recreate_error}")
+                raise
 
     def set_set(
         self,

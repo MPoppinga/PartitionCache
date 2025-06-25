@@ -7,6 +7,32 @@ import pytest
 from partitioncache.cache_handler.abstract import AbstractCacheHandler
 
 
+def _compare_cache_values(retrieved, expected):
+    """
+    Helper function to compare cache values across different backend types.
+    
+    Args:
+        retrieved: Value returned from cache backend (could be set, BitMap, etc.)
+        expected: Expected set value
+    
+    Returns:
+        bool: True if values are equivalent
+    """
+    # Handle BitMap objects from roaringbit backend
+    try:
+        from pyroaring import BitMap
+        if isinstance(retrieved, BitMap):
+            return set(retrieved) == expected
+    except ImportError:
+        pass
+
+    # Handle regular sets and other types
+    if hasattr(retrieved, '__iter__') and not isinstance(retrieved, (str, bytes)):
+        return set(retrieved) == expected
+
+    return retrieved == expected
+
+
 class TestErrorRecovery:
     """
     Tests for error recovery and fault tolerance in various scenarios.
@@ -97,7 +123,7 @@ class TestErrorRecovery:
 
         # Verify that valid data is still accessible after corruption attempts
         retrieved = cache_client.get(valid_key, partition_key)
-        assert retrieved == valid_set, "Valid data corrupted by error scenarios"
+        assert _compare_cache_values(retrieved, valid_set), "Valid data corrupted by error scenarios"
 
     def test_resource_exhaustion_handling(self, cache_client: AbstractCacheHandler):
         """Test behavior under resource exhaustion conditions."""

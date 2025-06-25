@@ -1,12 +1,15 @@
+import logging
 import os
-import signal
 import tempfile
 import time
 
+import filelock
 import psycopg
 import pytest
 
 from partitioncache.cache_handler import get_cache_handler
+
+logger = logging.getLogger("PartitionCache")
 
 
 # Configure pytest markers
@@ -15,6 +18,7 @@ def pytest_configure(config):
     config.addinivalue_line("markers", "performance: marks tests as performance-related")
     config.addinivalue_line("markers", "stress: marks tests as stress tests")
     config.addinivalue_line("markers", "concurrent: marks tests as concurrency tests")
+    config.addinivalue_line("markers", "serial: marks tests that should run serially to avoid concurrency issues")
 
 
 # Test data based on OSM example pattern but simplified (no PostGIS)
@@ -34,88 +38,117 @@ SAMPLE_TEST_DATA = {
         "northeast": {"cities": 4, "total_pop": 72000},
         "west": {"cities": 1, "total_pop": 32000},
         "southeast": {"cities": 2, "total_pop": 28000},
-    }
+    },
 }
 
 
 @pytest.fixture(scope="session")
-def db_connection():
+def db_connection(tmp_path_factory):
     """
     Session-scoped database connection fixture.
     Sets up PostgreSQL connection and creates test schema.
+    Handles parallel execution with pytest-xdist by using a file lock.
     """
     # Get connection parameters from environment
     conn_params = {
         "host": os.getenv("PG_HOST", "localhost"),
         "port": int(os.getenv("PG_PORT", "5432")),
-        "user": os.getenv("PG_USER", "test_user"),
+        "user": os.getenv("PG_USER", "integration_user"),
         "password": os.getenv("PG_PASSWORD", "test_password"),
-        "dbname": os.getenv("PG_DBNAME", "test_db"),
+        "dbname": os.getenv("PG_DBNAME", "partitioncache_integration"),
     }
 
+    # Use a file lock to ensure that the session setup is only performed by one worker
+    # in a parallel testing environment. tmp_path_factory is session-scoped.
+    lock_path = tmp_path_factory.getbasetemp().parent / "db_setup.lock"
+
+    with filelock.FileLock(str(lock_path)):
+        # The first worker acquires the lock and sets up the database.
+        # Other workers will block until this is complete.
+        conn_setup = None
+        try:
+            conn_setup = psycopg.connect(**conn_params, connect_timeout=10)
+            conn_setup.autocommit = True
+            with conn_setup.cursor() as cur:
+                # Check if setup has already been done to avoid re-running
+                cur.execute("SELECT EXISTS (SELECT FROM pg_tables WHERE schemaname = 'public' AND tablename = 'test_locations');")
+                row = cur.fetchone()
+                if row and not row[0]:
+                    cur.execute("CREATE EXTENSION IF NOT EXISTS pg_cron;")
+
+                    # Use DROP/CREATE instead of IF NOT EXISTS to avoid sequence conflicts
+                    cur.execute("DROP TABLE IF EXISTS test_locations CASCADE;")
+                    cur.execute("""
+                        CREATE TABLE test_locations (
+                            id SERIAL PRIMARY KEY,
+                            zipcode INTEGER,
+                            region TEXT,
+                            name TEXT,
+                            population INTEGER,
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        );
+                    """)
+
+                    # Create table for cron job testing
+                    cur.execute("DROP TABLE IF EXISTS test_cron_results CASCADE;")
+                    cur.execute("""
+                        CREATE TABLE test_cron_results (
+                            id SERIAL PRIMARY KEY,
+                            message TEXT,
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        );
+                    """)
+
+                    # Create table for spatial cache testing
+                    cur.execute("DROP TABLE IF EXISTS test_businesses CASCADE;")
+                    cur.execute("""
+                        CREATE TABLE test_businesses (
+                            id SERIAL PRIMARY KEY,
+                            name TEXT NOT NULL,
+                            business_type TEXT NOT NULL,
+                            region_id INTEGER NOT NULL,
+                            city_id INTEGER NOT NULL,
+                            x DECIMAL(10,6) NOT NULL,  -- longitude-like coordinate
+                            y DECIMAL(10,6) NOT NULL,  -- latitude-like coordinate  
+                            rating DECIMAL(2,1) DEFAULT 3.0,
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        );
+                    """)
+
+                    # Insert sample spatial test data
+                    sample_businesses = [
+                        ("Pizza Palace", "restaurant", 1, 101, -74.0060, 40.7128, 4.2),
+                        ("Corner Pharmacy", "pharmacy", 1, 101, -74.0050, 40.7130, 3.8),
+                        ("Joe's Diner", "restaurant", 1, 102, -74.0070, 40.7125, 3.9),
+                        ("Health Plus", "pharmacy", 2, 201, -118.2437, 34.0522, 4.1),
+                        ("Sunset Bistro", "restaurant", 2, 201, -118.2440, 34.0520, 4.5),
+                        ("Metro Drugs", "pharmacy", 2, 202, -118.2430, 34.0525, 3.7),
+                    ]
+
+                    for name, btype, region_id, city_id, x, y, rating in sample_businesses:
+                        cur.execute("""
+                            INSERT INTO test_businesses (name, business_type, region_id, city_id, x, y, rating)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s);
+                        """, (name, btype, region_id, city_id, x, y, rating))
+        except Exception as e:
+            pytest.skip(f"DB setup failed: {e}")
+        finally:
+            if conn_setup and not conn_setup.closed:
+                conn_setup.close()
+
+    # Now all workers can connect to the initialized database.
     try:
         conn = psycopg.connect(**conn_params, connect_timeout=10)
     except Exception as e:
         pytest.skip(f"Cannot connect to PostgreSQL database: {e}")
-        return None  # This won't be reached due to skip, but helps with type hints
+        return None
+
     conn.autocommit = True
-
-    # Create test tables with sample data
-    with conn.cursor() as cur:
-        # Create pg_cron extension if not exists
-        cur.execute("CREATE EXTENSION IF NOT EXISTS pg_cron;")
-
-        # Create test tables based on OSM pattern
-        # Use DROP/CREATE instead of IF NOT EXISTS to avoid sequence conflicts
-        cur.execute("DROP TABLE IF EXISTS test_locations CASCADE;")
-        cur.execute("""
-            CREATE TABLE test_locations (
-                id SERIAL PRIMARY KEY,
-                zipcode INTEGER,
-                region TEXT,
-                name TEXT,
-                population INTEGER,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-        """)
-
-        # Create table for cron job testing
-        cur.execute("DROP TABLE IF EXISTS test_cron_results CASCADE;")
-        cur.execute("""
-            CREATE TABLE test_cron_results (
-                id SERIAL PRIMARY KEY,
-                message TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-        """)
-
-        # Insert sample data (no need to truncate as table was just created)
-        for zipcode, data in SAMPLE_TEST_DATA["zipcode"].items():
-            # Determine region based on zipcode
-            if zipcode < 20000:
-                region = "northeast"
-            elif zipcode < 80000:
-                region = "southeast"
-            else:
-                region = "west"
-
-            cur.execute("""
-                INSERT INTO test_locations (zipcode, region, name, population)
-                VALUES (%s, %s, %s, %s);
-            """, (zipcode, region, data["name"], data["population"]))
-
     yield conn
 
-    # Cleanup
-    with conn.cursor() as cur:
-        cur.execute("DROP TABLE IF EXISTS test_locations CASCADE;")
-        cur.execute("DROP TABLE IF EXISTS test_cron_results CASCADE;")
-        # Clean up any test cron jobs
-        try:
-            cur.execute("DELETE FROM cron.job WHERE jobname LIKE 'test_%';")
-        except Exception:
-            pass  # pg_cron might not be available
-
+    # The teardown part of a session-scoped fixture runs in each worker.
+    # To avoid issues, we don't clean up the database here.
+    # The setup of the next test session will handle it with DROP TABLE.
     conn.close()
 
 
@@ -129,22 +162,69 @@ def db_session(db_connection):
 
     # Start fresh transaction
     with conn.cursor() as cur:
-        # Clean up any existing test cache data
-        cur.execute("""
-            SELECT tablename FROM pg_tables 
-            WHERE tablename LIKE 'partitioncache_%' AND schemaname = 'public';
-        """)
-        cache_tables = cur.fetchall()
+        # Complete cleanup of all cache tables (handle all possible prefixes)
+        cache_prefixes = ['partitioncache_%', '%_cache_%', '%queue%']
+        all_cache_tables = set()
 
-        for (table_name,) in cache_tables:
+        for prefix in cache_prefixes:
+            cur.execute("""
+                SELECT tablename FROM pg_tables 
+                WHERE tablename LIKE %s AND schemaname = 'public';
+            """, (prefix,))
+            tables = cur.fetchall()
+            all_cache_tables.update(table[0] for table in tables)
+
+        # Clean cache tables (truncate instead of drop to preserve schema)
+        for table_name in all_cache_tables:
             try:
-                cur.execute(f"TRUNCATE {table_name} CASCADE;")
-            except Exception:
-                pass  # Table might not exist or have dependencies
+                # Try truncate first to preserve schema
+                cur.execute(f"TRUNCATE TABLE {table_name} RESTART IDENTITY CASCADE;")
+            except Exception as e:
+                try:
+                    # If truncate fails, try drop as fallback
+                    cur.execute(f"DROP TABLE IF EXISTS {table_name} CASCADE;")
+                except Exception:
+                    logger.warning(f"Failed to clean table {table_name}: {e}")
 
-        # Reset test table data to ensure clean state
-        cur.execute("TRUNCATE test_locations RESTART IDENTITY CASCADE;")
-        cur.execute("TRUNCATE test_cron_results RESTART IDENTITY CASCADE;")
+        # Reset test table data to ensure clean state - handle missing tables gracefully
+        for table_name in ["test_locations", "test_cron_results", "test_businesses"]:
+            try:
+                cur.execute(f"TRUNCATE {table_name} RESTART IDENTITY CASCADE;")
+            except Exception:
+                # Table might not exist - recreate if needed
+                if table_name == "test_businesses":
+                    cur.execute("""
+                        CREATE TABLE test_businesses (
+                            id SERIAL PRIMARY KEY,
+                            name TEXT NOT NULL,
+                            business_type TEXT NOT NULL,
+                            region_id INTEGER NOT NULL,
+                            city_id INTEGER NOT NULL,
+                            x DECIMAL(10,6) NOT NULL,
+                            y DECIMAL(10,6) NOT NULL,  
+                            rating DECIMAL(2,1) DEFAULT 3.0,
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        );
+                    """)
+                elif table_name == "test_locations":
+                    cur.execute("""
+                        CREATE TABLE test_locations (
+                            id SERIAL PRIMARY KEY,
+                            zipcode INTEGER,
+                            region TEXT,
+                            name TEXT,
+                            population INTEGER,
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        );
+                    """)
+                elif table_name == "test_cron_results":
+                    cur.execute("""
+                        CREATE TABLE test_cron_results (
+                            id SERIAL PRIMARY KEY,
+                            message TEXT,
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        );
+                    """)
 
         # Re-insert sample data for consistent test state
         for zipcode, data in SAMPLE_TEST_DATA["zipcode"].items():
@@ -156,14 +236,41 @@ def db_session(db_connection):
             else:
                 region = "west"
 
-            cur.execute("""
+            cur.execute(
+                """
                 INSERT INTO test_locations (zipcode, region, name, population)
                 VALUES (%s, %s, %s, %s);
-            """, (zipcode, region, data["name"], data["population"]))
+            """,
+                (zipcode, region, data["name"], data["population"]),
+            )
+
+        # Re-insert sample spatial test data
+        sample_businesses = [
+            ("Pizza Palace", "restaurant", 1, 101, -74.0060, 40.7128, 4.2),
+            ("Corner Pharmacy", "pharmacy", 1, 101, -74.0050, 40.7130, 3.8),
+            ("Joe's Diner", "restaurant", 1, 102, -74.0070, 40.7125, 3.9),
+            ("Health Plus", "pharmacy", 2, 201, -118.2437, 34.0522, 4.1),
+            ("Sunset Bistro", "restaurant", 2, 201, -118.2440, 34.0520, 4.5),
+            ("Metro Drugs", "pharmacy", 2, 202, -118.2430, 34.0525, 3.7),
+        ]
+
+        for name, btype, region_id, city_id, x, y, rating in sample_businesses:
+            cur.execute("""
+                INSERT INTO test_businesses (name, business_type, region_id, city_id, x, y, rating)
+                VALUES (%s, %s, %s, %s, %s, %s, %s);
+            """, (name, btype, region_id, city_id, x, y, rating))
 
     yield conn
 
     # Cleanup after test
+    # Reset queue handler singleton to avoid connection leaks
+    try:
+        from partitioncache.queue import reset_queue_handler
+
+        reset_queue_handler()
+    except Exception:
+        pass
+
     with conn.cursor() as cur:
         # Remove any test cron jobs
         try:
@@ -183,22 +290,27 @@ CACHE_BACKENDS = [
 if os.getenv("REDIS_HOST"):
     CACHE_BACKENDS.extend(["redis_set", "redis_bit"])
 
+
 # Add RocksDB backends if available
 def _is_rocksdb_available():
     """Check if RocksDB is available for testing."""
     try:
         import rocksdb
+
         return True
     except ImportError:
         return False
+
 
 def _is_rocksdict_available():
     """Check if rocksdict is available for testing."""
     try:
         import rocksdict
+
         return True
     except ImportError:
         return False
+
 
 # Add RocksDB backends if the module is available
 if _is_rocksdb_available():
@@ -248,6 +360,7 @@ def cache_client(request, db_session):
             # rocksdict needs the path passed directly
             temp_dir = tempfile.mkdtemp(prefix="rocksdict_test_")
             from partitioncache.cache_handler.rocks_dict import RocksDictCacheHandler
+
             cache_handler = RocksDictCacheHandler(temp_dir)
         else:
             cache_handler = get_cache_handler(cache_backend)
@@ -265,23 +378,45 @@ def cache_client(request, db_session):
     except Exception as e:
         pytest.skip(f"Cannot create cache handler for {cache_backend}: {e}")
     finally:
-        # Cleanup
+        # Cleanup - Force complete cleanup for test isolation
         try:
-            # Clear all test data with timeout protection
+            # Clear ALL test data completely (not limited to 50 keys)
             for partition_key, _ in TEST_PARTITION_KEYS:
                 try:
+                    # Check if partition exists before attempting cleanup
+                    if hasattr(cache_handler, '_get_partition_datatype'):
+                        # For PostgreSQL backends, check if partition exists
+                        if cache_handler._get_partition_datatype(partition_key) is None:
+                            continue  # Skip non-existent partitions
+
+                    # Get all keys and delete them all
                     keys = cache_handler.get_all_keys(partition_key)
-                    # Limit key cleanup to prevent hanging
-                    for key in list(keys)[:50]:  # Process max 50 keys to avoid infinite loops
-                        cache_handler.delete(key, partition_key)
-                except Exception:
-                    pass
+                    if keys:
+                        # Delete all keys without limit for proper test isolation
+                        for key in list(keys):
+                            try:
+                                cache_handler.delete(key, partition_key)
+                            except Exception:
+                                pass  # Continue deleting other keys
+
+                        # Double-check deletion worked (only if partition still exists)
+                        try:
+                            remaining_keys = cache_handler.get_all_keys(partition_key)
+                            if remaining_keys:
+                                logger.warning(f"Failed to delete all keys for {partition_key}: {len(remaining_keys)} remaining")
+                        except Exception:
+                            # Partition might have been deleted during cleanup - this is OK
+                            pass
+                except Exception as e:
+                    # Only log warnings for unexpected errors, not missing tables
+                    if "does not exist" not in str(e).lower() and "relation" not in str(e).lower():
+                        logger.warning(f"Cache cleanup failed for {partition_key}: {e}")
 
             # Properly close cache handler
-            if hasattr(cache_handler, 'close'):
+            if hasattr(cache_handler, "close"):
                 cache_handler.close()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Cache handler cleanup failed: {e}")
 
         # Restore original environment variables
         if original_backend:
@@ -300,13 +435,14 @@ def cache_client(request, db_session):
         if cache_backend in ["rocksdb_set", "rocksdb_bit", "rocksdict"]:
             try:
                 import shutil
+
                 if cache_backend == "rocksdb_set" and "ROCKSDB_PATH" in os.environ:
                     shutil.rmtree(os.environ["ROCKSDB_PATH"], ignore_errors=True)
                 elif cache_backend == "rocksdb_bit" and "ROCKSDB_BIT_PATH" in os.environ:
                     shutil.rmtree(os.environ["ROCKSDB_BIT_PATH"], ignore_errors=True)
-                elif cache_backend == "rocksdict" and hasattr(cache_handler, 'db') and hasattr(cache_handler.db, 'name'):
+                elif cache_backend == "rocksdict" and hasattr(cache_handler, "db") and hasattr(cache_handler.db, "name"):
                     # For rocksdict, clean up the temp directory created for testing
-                    db_path = getattr(cache_handler.db, 'name', None)
+                    db_path = getattr(cache_handler.db, "name", None)
                     if db_path and os.path.exists(os.path.dirname(db_path)):
                         shutil.rmtree(os.path.dirname(db_path), ignore_errors=True)
             except Exception:
@@ -332,7 +468,9 @@ def sample_queries():
 @pytest.fixture
 def wait_for_cron():
     """Utility fixture for waiting on cron job execution."""
+
     def _wait(seconds=70):
         """Wait for cron job to execute (default just over 1 minute)."""
         time.sleep(seconds)
+
     return _wait

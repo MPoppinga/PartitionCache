@@ -254,6 +254,20 @@ def close_queue_handler() -> None:
             _queue_handler = None
 
 
+def reset_queue_handler() -> None:
+    """
+    Reset the queue handler singleton for testing.
+    Forces creation of a new handler on next access.
+    """
+    global _queue_handler
+    if _queue_handler is not None:
+        try:
+            _queue_handler.close()
+        except Exception:
+            pass  # Ignore errors during cleanup
+        _queue_handler = None
+
+
 def get_queue_provider_name() -> str:
     """
     Get the current queue provider type.

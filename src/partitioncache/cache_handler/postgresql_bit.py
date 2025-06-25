@@ -22,28 +22,36 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
 
         self.default_bitsize = bitsize  # Bitsize should be configured correctly by user (bitsize=1001 to store values 0-1000)
         # Create metadata table to track partition keys with bitsize per partition
-        self.cursor.execute(
-            sql.SQL("""CREATE TABLE IF NOT EXISTS {0} (
-                partition_key TEXT PRIMARY KEY,
-                datatype TEXT NOT NULL CHECK (datatype = 'integer'),
-                bitsize INTEGER NOT NULL DEFAULT {1},
-                created_at TIMESTAMP DEFAULT now()
-            );""").format(sql.Identifier(self.tableprefix + "_partition_metadata"), sql.Literal(self.default_bitsize))
-        )
+        self._recreate_metadata_table()
 
-        # Create queries table (shared across all partition keys)
-        self.cursor.execute(
-            sql.SQL("""CREATE TABLE IF NOT EXISTS {0} (
-            query_hash TEXT NOT NULL,
-            query TEXT NOT NULL,
-            partition_key TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'ok' CHECK (status IN ('ok', 'timeout', 'failed')),
-            last_seen TIMESTAMP NOT NULL DEFAULT now(),
-            PRIMARY KEY (query_hash, partition_key)
-        );""").format(sql.Identifier(self.tableprefix + "_queries"))
-        )
+    def _recreate_metadata_table(self) -> None:
+        """Recreate metadata table if it was dropped during cleanup."""
+        try:
+            self.cursor.execute(
+                sql.SQL("""CREATE TABLE IF NOT EXISTS {0} (
+                    partition_key TEXT PRIMARY KEY,
+                    datatype TEXT NOT NULL CHECK (datatype = 'integer'),
+                    bitsize INTEGER NOT NULL DEFAULT {1},
+                    created_at TIMESTAMP DEFAULT now()
+                );""").format(sql.Identifier(self.tableprefix + "_partition_metadata"), sql.Literal(self.default_bitsize))
+            )
 
-        self.db.commit()
+            # Also recreate queries table
+            self.cursor.execute(
+                sql.SQL("""CREATE TABLE IF NOT EXISTS {0} (
+                query_hash TEXT NOT NULL,
+                query TEXT NOT NULL,
+                partition_key TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'ok' CHECK (status IN ('ok', 'timeout', 'failed')),
+                last_seen TIMESTAMP NOT NULL DEFAULT now(),
+                PRIMARY KEY (query_hash, partition_key)
+            );""").format(sql.Identifier(self.tableprefix + "_queries"))
+            )
+
+            self.db.commit()
+        except Exception as e:
+            logger.error(f"Failed to recreate metadata table: {e}")
+            raise
 
     def _get_partition_bitsize(self, partition_key: str) -> int | None:
         """Get the bitsize for a partition key from metadata."""
@@ -94,11 +102,22 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
 
     def _ensure_partition_table(self, partition_key: str, bitsize: int | None = None) -> None:
         """Ensure a partition table exists."""
-        existing_datatype = self._get_partition_datatype(partition_key)
+        try:
+            existing_datatype = self._get_partition_datatype(partition_key)
 
-        if existing_datatype is None:
-            # Create new table
-            self._create_partition_table(partition_key, bitsize)
+            if existing_datatype is None:
+                # Create new table
+                self._create_partition_table(partition_key, bitsize)
+        except Exception as e:
+            logger.error(f"Failed to ensure partition table for {partition_key}: {e}")
+            # Rollback and recreate metadata table if needed
+            try:
+                self.db.rollback()
+                self._recreate_metadata_table()
+                self._create_partition_table(partition_key, bitsize)
+            except Exception as recreate_error:
+                logger.error(f"Failed to recreate partition table for {partition_key}: {recreate_error}")
+                raise
 
     def set_set(self, key: str, value: set[int] | set[str] | set[float] | set[datetime], partition_key: str = "partition_key") -> bool:
         """
@@ -128,8 +147,10 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
                     raise ValueError(f"Only integer values are supported for bit arrays: {k} : {value}")
             table_name = f"{self.tableprefix}_cache_{partition_key}"
             self.cursor.execute(
-                sql.SQL("INSERT INTO {0} (query_hash, partition_keys) VALUES (%s, %s) ON CONFLICT (query_hash) DO UPDATE SET partition_keys = EXCLUDED.partition_keys").format(sql.Identifier(table_name)),
-                (key, val.to01())
+                sql.SQL(
+                    "INSERT INTO {0} (query_hash, partition_keys) VALUES (%s, %s) ON CONFLICT (query_hash) DO UPDATE SET partition_keys = EXCLUDED.partition_keys"
+                ).format(sql.Identifier(table_name)),
+                (key, val.to01()),
             )
             self.db.commit()
             return True
