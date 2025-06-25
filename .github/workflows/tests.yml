@@ -40,7 +40,7 @@ jobs:
     
     - name: Run linting
       run: |
-        ruff check src/
+        ruff check src/ --fix
     
     - name: Run type checking
       run: |

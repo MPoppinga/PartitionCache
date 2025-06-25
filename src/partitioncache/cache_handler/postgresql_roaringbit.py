@@ -80,7 +80,7 @@ class PostgreSQLRoaringBitCacheHandler(PostgreSQLAbstractCacheHandler):
                     query_hash TEXT PRIMARY KEY,
                     partition_keys roaringbitmap,
                     partition_keys_count integer GENERATED ALWAYS AS (
-                        CASE 
+                        CASE
                             WHEN partition_keys IS NULL THEN NULL
                             ELSE rb_cardinality(partition_keys)
                         END
@@ -155,7 +155,7 @@ class PostgreSQLRoaringBitCacheHandler(PostgreSQLAbstractCacheHandler):
                 for item in value:
                     if not isinstance(item, int) and isinstance(item, float) and not item.is_integer():
                         raise ValueError("Only integer values are supported for roaring bitmaps")
-                    value_list.append(int(item))
+                    value_list.append(int(item))  # type: ignore
             else:
                 raise ValueError(f"Unsupported value type for roaring bitmap: {type(value)}")
 
