@@ -71,22 +71,27 @@ jobs:
         test-pattern:
           - name: "PostgreSQL Backends"
             pattern: "postgresql"
+            suffix: "pg"
             parallel: true
             requires_redis: false
           - name: "Redis Backends"
             pattern: "redis"
+            suffix: "redis"
             parallel: true
             requires_redis: true
           - name: "RocksDB Backends"
             pattern: "rocksdb"
+            suffix: "rocksdb"
             parallel: false
             requires_redis: false
           - name: "Queue Processing"
             pattern: "queue"
+            suffix: "queue"
             parallel: false
             requires_redis: false
           - name: "CLI Tools"
             pattern: "test_cli"
+            suffix: "cli"
             parallel: true
             requires_redis: false
 
@@ -116,26 +121,26 @@ jobs:
           --health-retries 10
 
     env:
+      # Define a unique database name for each job
+      UNIQUE_DB_NAME: partitioncache_integration_${{ matrix.test-pattern.suffix }}_${{ github.run_id }}
+      
       # PostgreSQL configuration
       PG_HOST: localhost
       PG_PORT: 5432
       PG_USER: integration_user
       PG_PASSWORD: integration_password
-      PG_DBNAME: partitioncache_integration
       
       # Database configuration
       DB_HOST: localhost
       DB_PORT: 5432
       DB_USER: integration_user
       DB_PASSWORD: integration_password
-      DB_NAME: partitioncache_integration
       
       # Queue configuration
       PG_QUEUE_HOST: localhost
       PG_QUEUE_PORT: 5432
       PG_QUEUE_USER: integration_user
       PG_QUEUE_PASSWORD: integration_password
-      PG_QUEUE_DB: partitioncache_integration
       QUERY_QUEUE_PROVIDER: postgresql
       
       # Redis configuration
@@ -180,7 +185,7 @@ jobs:
         pip install -e ".[testing,db]"
         pip install pytest-xdist  # Additional for parallel execution
 
-    - name: Wait for services
+    - name: Create and configure test database
       shell: micromamba-shell {0}
       run: |
         echo "Waiting for PostgreSQL..."
@@ -191,7 +196,24 @@ jobs:
           fi
           sleep 2
         done
-        
+
+        echo "Creating test database: $UNIQUE_DB_NAME"
+        python -c "
+        import os
+        import psycopg
+        from psycopg import sql
+        db_name = os.environ['UNIQUE_DB_NAME']
+        conn_str = 'postgresql://integration_user:integration_password@localhost:5432/partitioncache_integration'
+        with psycopg.connect(conn_str, autocommit=True) as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql.SQL('CREATE DATABASE {}').format(sql.Identifier(db_name)))
+        "
+
+        # Set the database name for subsequent steps
+        echo "PG_DBNAME=$UNIQUE_DB_NAME" >> $GITHUB_ENV
+        echo "DB_NAME=$UNIQUE_DB_NAME" >> $GITHUB_ENV
+        echo "PG_QUEUE_DB=$UNIQUE_DB_NAME" >> $GITHUB_ENV
+
         if [[ "${{ matrix.test-pattern.requires_redis }}" == "true" ]]; then
           echo "Waiting for Redis..."
           for i in {1..30}; do
@@ -207,17 +229,18 @@ jobs:
       shell: micromamba-shell {0}
       run: |
         python -c "
+        import os
         import psycopg
-        conn = psycopg.connect('postgresql://integration_user:integration_password@localhost:5432/partitioncache_integration')
-        conn.autocommit = True
-        cur = conn.cursor()
-        cur.execute('SELECT extname FROM pg_extension WHERE extname = %s', ('pg_cron',))
-        if not cur.fetchone():
-            raise Exception('pg_cron extension not found')
-        cur.execute('SELECT extname FROM pg_extension WHERE extname = %s', ('roaringbitmap',))
-        if not cur.fetchone():
-            print('roaringbitmap extension not found (optional)')
-        conn.close()
+        db_name = os.environ['PG_DBNAME']
+        conn_str = f'postgresql://integration_user:integration_password@localhost:5432/{db_name}'
+        with psycopg.connect(conn_str, autocommit=True) as conn:
+            with conn.cursor() as cur:
+                cur.execute('SELECT extname FROM pg_extension WHERE extname = %s', ('pg_cron',))
+                if not cur.fetchone():
+                    raise Exception('pg_cron extension not found')
+                cur.execute('SELECT extname FROM pg_extension WHERE extname = %s', ('roaringbitmap',))
+                if not cur.fetchone():
+                    print('roaringbitmap extension not found (optional)')
         "
 
     - name: Run tests
@@ -287,22 +310,20 @@ jobs:
           --health-retries 10
 
     env:
+      UNIQUE_DB_NAME: partitioncache_e2e_${{ github.run_id }}
       CACHE_BACKEND: postgresql_array
       PG_HOST: localhost
       PG_PORT: 5432
       PG_USER: integration_user
       PG_PASSWORD: integration_password
-      PG_DBNAME: partitioncache_integration
       DB_HOST: localhost
       DB_PORT: 5432
       DB_USER: integration_user
       DB_PASSWORD: integration_password
-      DB_NAME: partitioncache_integration
       PG_QUEUE_HOST: localhost
       PG_QUEUE_PORT: 5432
       PG_QUEUE_USER: integration_user
       PG_QUEUE_PASSWORD: integration_password
-      PG_QUEUE_DB: partitioncache_integration
       QUERY_QUEUE_PROVIDER: postgresql
 
     steps:
@@ -324,6 +345,35 @@ jobs:
       run: |
         pip install -e ".[testing,db]"
         pip install pytest-xdist  # Additional for parallel execution
+
+    - name: Create and configure test database
+      shell: micromamba-shell {0}
+      run: |
+        echo "Waiting for PostgreSQL..."
+        for i in {1..30}; do
+          if python -c "import psycopg; psycopg.connect('postgresql://integration_user:integration_password@localhost:5432/partitioncache_integration')" 2>/dev/null; then
+            echo "PostgreSQL ready"
+            break
+          fi
+          sleep 2
+        done
+
+        echo "Creating test database: $UNIQUE_DB_NAME"
+        python -c "
+        import os
+        import psycopg
+        from psycopg import sql
+        db_name = os.environ['UNIQUE_DB_NAME']
+        conn_str = 'postgresql://integration_user:integration_password@localhost:5432/partitioncache_integration'
+        with psycopg.connect(conn_str, autocommit=True) as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql.SQL('CREATE DATABASE {}').format(sql.Identifier(db_name)))
+        "
+
+        # Set the database name for subsequent steps
+        echo "PG_DBNAME=$UNIQUE_DB_NAME" >> $GITHUB_ENV
+        echo "DB_NAME=$UNIQUE_DB_NAME" >> $GITHUB_ENV
+        echo "PG_QUEUE_DB=$UNIQUE_DB_NAME" >> $GITHUB_ENV
 
     - name: Run E2E tests
       shell: micromamba-shell {0}
@@ -368,17 +418,16 @@ jobs:
           --health-retries 10
 
     env:
+      UNIQUE_DB_NAME: partitioncache_perf_${{ github.run_id }}
       CACHE_BACKEND: postgresql_array
       PG_HOST: localhost
       PG_PORT: 5432
       PG_USER: integration_user
       PG_PASSWORD: integration_password
-      PG_DBNAME: partitioncache_integration
       DB_HOST: localhost
       DB_PORT: 5432
       DB_USER: integration_user
       DB_PASSWORD: integration_password
-      DB_NAME: partitioncache_integration
 
     steps:
     - name: Checkout repository
@@ -399,6 +448,34 @@ jobs:
       run: |
         pip install -e ".[testing,db]"
         pip install pytest-xdist  # Additional for parallel execution
+
+    - name: Create and configure test database
+      shell: micromamba-shell {0}
+      run: |
+        echo "Waiting for PostgreSQL..."
+        for i in {1..30}; do
+          if python -c "import psycopg; psycopg.connect('postgresql://integration_user:integration_password@localhost:5432/partitioncache_integration')" 2>/dev/null; then
+            echo "PostgreSQL ready"
+            break
+          fi
+          sleep 2
+        done
+
+        echo "Creating test database: $UNIQUE_DB_NAME"
+        python -c "
+        import os
+        import psycopg
+        from psycopg import sql
+        db_name = os.environ['UNIQUE_DB_NAME']
+        conn_str = 'postgresql://integration_user:integration_password@localhost:5432/partitioncache_integration'
+        with psycopg.connect(conn_str, autocommit=True) as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql.SQL('CREATE DATABASE {}').format(sql.Identifier(db_name)))
+        "
+
+        # Set the database name for subsequent steps
+        echo "PG_DBNAME=$UNIQUE_DB_NAME" >> $GITHUB_ENV
+        echo "DB_NAME=$UNIQUE_DB_NAME" >> $GITHUB_ENV
 
     - name: Run performance tests
       shell: micromamba-shell {0}
