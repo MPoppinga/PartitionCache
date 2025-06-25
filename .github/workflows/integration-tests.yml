@@ -92,7 +92,7 @@ jobs:
 
     services:
       postgres:
-        image: ghcr.io/mpoppinga/postgres-test-extensions:sha-${{ github.sha }}
+        image: ghcr.io/mpoppinga/postgres-test-extensions:${{ needs.build-postgres-image.outputs.image-tag }}
         env:
           POSTGRES_DB: partitioncache_integration
           POSTGRES_USER: integration_user
@@ -263,7 +263,7 @@ jobs:
     
     services:
       postgres:
-        image: ghcr.io/mpoppinga/postgres-test-extensions:sha-${{ github.sha }}
+        image: ghcr.io/mpoppinga/postgres-test-extensions:${{ needs.build-postgres-image.outputs.image-tag }}
         env:
           POSTGRES_DB: partitioncache_integration
           POSTGRES_USER: integration_user
@@ -354,7 +354,7 @@ jobs:
     
     services:
       postgres:
-        image: ghcr.io/mpoppinga/postgres-test-extensions:sha-${{ github.sha }}
+        image: ghcr.io/mpoppinga/postgres-test-extensions:${{ needs.build-postgres-image.outputs.image-tag }}
         env:
           POSTGRES_DB: partitioncache_integration
           POSTGRES_USER: integration_user
