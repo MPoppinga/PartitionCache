@@ -41,13 +41,21 @@ class RedisBitCacheHandler(RedisAbstractCacheHandler):
     def _ensure_partition_exists(self, partition_key: str, bitsize: int | None = None) -> None:
         """Ensure partition exists with correct datatype and bitsize."""
         existing_datatype = self._get_partition_datatype(partition_key)
+
+        # Determine the bitsize to use
+        if bitsize is None:
+            bitsize = self.default_bitsize
+
         if existing_datatype is None:
             # Create new partition with bitsize
-            if bitsize is None:
-                bitsize = self.default_bitsize
             self._set_partition_metadata(partition_key, "integer", bitsize)
         elif existing_datatype != "integer":
             raise ValueError(f"Partition key '{partition_key}' already exists with datatype '{existing_datatype}', cannot use datatype 'integer'")
+        else:
+            # If the partition already exists, still ensure the bitsize is set
+            current_bitsize = self._get_partition_bitsize(partition_key)
+            if current_bitsize is None:
+                self._set_partition_metadata(partition_key, "integer", bitsize)
 
     def get(self, key: str, partition_key: str = "partition_key") -> set[int] | set[str] | set[float] | set[datetime] | None:
         """Get value from partition-specific cache namespace."""

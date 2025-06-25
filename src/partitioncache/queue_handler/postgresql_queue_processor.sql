@@ -311,7 +311,7 @@ BEGIN
             CREATE TABLE IF NOT EXISTS %I (
                 query_hash TEXT PRIMARY KEY,
                 partition_keys BIT VARYING,
-                partition_keys_count INTEGER NOT NULL GENERATED ALWAYS AS (length(replace(partition_keys::text, ''0'', ''''))) STORED
+                partition_keys_count INTEGER GENERATED ALWAYS AS (length(replace(partition_keys::text, ''0'', ''''))) STORED
             )', v_cache_table);
     ELSIF p_cache_backend = 'roaringbit' THEN
         -- For roaring bit cache
@@ -326,7 +326,7 @@ BEGIN
             CREATE TABLE IF NOT EXISTS %I (
                 query_hash TEXT PRIMARY KEY,
                 partition_keys roaringbitmap,
-                partition_keys_count INTEGER NOT NULL GENERATED ALWAYS AS (rb_cardinality(partition_keys)) STORED
+                partition_keys_count INTEGER GENERATED ALWAYS AS (rb_cardinality(partition_keys)) STORED
             )', v_cache_table);
     ELSE -- 'array'
         -- For array cache
@@ -340,7 +340,7 @@ BEGIN
             CREATE TABLE IF NOT EXISTS %I (
                 query_hash TEXT PRIMARY KEY,
                 partition_keys %s[],
-                partition_keys_count integer NOT NULL GENERATED ALWAYS AS (array_length(partition_keys, 1)) STORED
+                partition_keys_count integer GENERATED ALWAYS AS (array_length(partition_keys, 1)) STORED
             )', v_cache_table, 
             CASE p_datatype 
                 WHEN 'integer' THEN 'INTEGER'

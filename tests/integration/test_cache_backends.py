@@ -1,5 +1,5 @@
-
 import pytest
+from pyroaring import BitMap
 
 import partitioncache
 from partitioncache.cache_handler.abstract import AbstractCacheHandler
@@ -27,12 +27,17 @@ class TestCacheLifecycle:
 
         # Retrieve values from cache
         retrieved = cache_client.get(cache_key, partition_key)
+
+        # Convert BitMap to set for comparison if necessary
+        if isinstance(retrieved, BitMap):
+            retrieved = set(retrieved)
+
         assert retrieved == test_values, f"Retrieved {retrieved}, expected {test_values}"
 
     def test_set_and_get_text_partition(self, cache_client: AbstractCacheHandler):
         """Test basic set and get operations with text partition keys."""
         # Skip test for backends that only support integer values
-        if hasattr(cache_client, 'get_supported_datatypes'):
+        if hasattr(cache_client, "get_supported_datatypes"):
             supported_datatypes = cache_client.get_supported_datatypes()
             if "text" not in supported_datatypes:
                 pytest.skip(f"Backend {cache_client.__class__.__name__} does not support text datatypes. Supported: {supported_datatypes}")
@@ -47,6 +52,11 @@ class TestCacheLifecycle:
 
         # Retrieve values from cache
         retrieved = cache_client.get(cache_key, partition_key)
+
+        # Convert BitMap to set for comparison if necessary
+        if isinstance(retrieved, BitMap):
+            retrieved = set(retrieved)
+
         assert retrieved == test_values, f"Retrieved {retrieved}, expected {test_values}"
 
     def test_get_miss(self, cache_client: AbstractCacheHandler):
@@ -81,11 +91,21 @@ class TestCacheLifecycle:
         # Set initial values
         cache_client.set_set(cache_key, initial_values, partition_key)
         retrieved_initial = cache_client.get(cache_key, partition_key)
+
+        # Convert BitMap to set for comparison if necessary
+        if isinstance(retrieved_initial, BitMap):
+            retrieved_initial = set(retrieved_initial)
+
         assert retrieved_initial == initial_values
 
         # Update with new values
         cache_client.set_set(cache_key, updated_values, partition_key)
         retrieved_updated = cache_client.get(cache_key, partition_key)
+
+        # Convert BitMap to set for comparison if necessary
+        if isinstance(retrieved_updated, BitMap):
+            retrieved_updated = set(retrieved_updated)
+
         assert retrieved_updated == updated_values
 
     def test_delete_value(self, cache_client: AbstractCacheHandler):
@@ -135,6 +155,10 @@ class TestCacheLifecycle:
         intersection, hit_count = cache_client.get_intersected(keys_to_intersect, partition_key)
         expected_intersection = {1001, 90210}  # Common values between hash_1 and hash_2
 
+        # Convert BitMap to set for comparison if necessary
+        if isinstance(intersection, BitMap):
+            intersection = set(intersection)
+
         assert intersection == expected_intersection
         assert hit_count == 2  # Both keys found
 
@@ -142,6 +166,10 @@ class TestCacheLifecycle:
         all_keys = {"hash_1", "hash_2", "hash_3"}
         intersection_all, hit_count_all = cache_client.get_intersected(all_keys, partition_key)
         expected_all = {90210}  # Only value common to all three
+
+        # Convert BitMap to set for comparison if necessary
+        if isinstance(intersection_all, BitMap):
+            intersection_all = set(intersection_all)
 
         assert intersection_all == expected_all
         assert hit_count_all == 3
@@ -188,6 +216,11 @@ class TestCacheLifecycle:
             success = cache_client.set_set(cache_key, empty_set, partition_key)
             if success:
                 retrieved = cache_client.get(cache_key, partition_key)
+
+                # Convert BitMap to set for comparison if necessary
+                if isinstance(retrieved, BitMap):
+                    retrieved = set(retrieved)
+
                 assert retrieved == empty_set or retrieved is None
         except Exception:
             # Some backends might not support empty sets
@@ -207,6 +240,7 @@ class TestCacheIntegration:
 
         # Generate query hashes
         from partitioncache.query_processor import generate_all_hashes
+
         hashes = generate_all_hashes(query, partition_key)
 
         assert len(hashes) > 0, "Should generate at least one hash"
@@ -218,11 +252,12 @@ class TestCacheIntegration:
 
         # Use PartitionCache API to get partition keys
         partition_keys, num_subqueries, num_hits = partitioncache.get_partition_keys(
-            query=query,
-            cache_handler=cache_client,
-            partition_key=partition_key,
-            min_component_size=1
+            query=query, cache_handler=cache_client, partition_key=partition_key, min_component_size=1
         )
+
+        # Convert BitMap to set for comparison if necessary
+        if isinstance(partition_keys, BitMap):
+            partition_keys = set(partition_keys)
 
         assert partition_keys == test_partition_values
         assert num_hits > 0
@@ -232,6 +267,7 @@ class TestCacheIntegration:
         """Test apply_cache_lazy integration with actual database."""
         # Skip if cache handler doesn't support lazy operations
         from partitioncache.cache_handler.abstract import AbstractCacheHandler_Lazy
+
         if not isinstance(cache_client, AbstractCacheHandler_Lazy):
             pytest.skip("Cache handler does not support lazy operations")
 
@@ -240,6 +276,7 @@ class TestCacheIntegration:
 
         # Generate and populate cache
         from partitioncache.query_processor import generate_all_hashes
+
         hashes = generate_all_hashes(query, partition_key)
         test_values = {1001, 1002}
 
@@ -248,11 +285,7 @@ class TestCacheIntegration:
 
         # Apply cache using lazy method
         enhanced_query, stats = partitioncache.apply_cache_lazy(
-            query=query,
-            cache_handler=cache_client,
-            partition_key=partition_key,
-            method="TMP_TABLE_IN",
-            min_component_size=1
+            query=query, cache_handler=cache_client, partition_key=partition_key, method="TMP_TABLE_IN", min_component_size=1
         )
 
         assert enhanced_query is not None

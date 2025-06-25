@@ -61,7 +61,7 @@ class PostgreSQLRoaringBitCacheHandler(PostgreSQLAbstractCacheHandler):
             sql.SQL("""CREATE TABLE IF NOT EXISTS {0} (
                 query_hash TEXT PRIMARY KEY,
                 partition_keys roaringbitmap,
-                partition_keys_count integer NOT NULL GENERATED ALWAYS AS (rb_cardinality(partition_keys)) STORED
+                partition_keys_count integer GENERATED ALWAYS AS (rb_cardinality(partition_keys)) STORED
             );""").format(sql.Identifier(table_name))
         )
 
@@ -105,39 +105,27 @@ class PostgreSQLRoaringBitCacheHandler(PostgreSQLAbstractCacheHandler):
             # Ensure partition table exists
             self._ensure_partition_table(partition_key)
 
-            # Convert input to roaring bitmap
+            # Convert input to a list of integers for rb_build
             if isinstance(value, BitMap):
-                rb = value
+                value_list = list(value)
             elif isinstance(value, bitarray):
-                # Convert bitarray to roaring bitmap
-                rb = BitMap()
-                for pos in value.search(bitarray("1")):
-                    rb.add(pos)
-            elif isinstance(value, list | set):
-                rb = BitMap()
+                value_list = [i for i, bit in enumerate(value) if bit]
+            elif isinstance(value, (list, set)):
+                # Validate that all items can be converted to integers without loss
+                value_list = []
                 for item in value:
-                    if isinstance(item, int):
-                        rb.add(item)
-                    elif isinstance(item, str):
-                        rb.add(int(item))
-                    else:
-                        raise ValueError(f"Only integer values are supported for roaring bitmaps: {item} : {value}")
+                    if not isinstance(item, int) and isinstance(item, float) and not item.is_integer():
+                        raise ValueError("Only integer values are supported for roaring bitmaps")
+                    value_list.append(int(item))
             else:
                 raise ValueError(f"Unsupported value type for roaring bitmap: {type(value)}")
-
-            # Convert roaring bitmap to bytes for storage
-            if isinstance(rb, BitMap):
-                rb_bytes = rb.serialize()
-            else:
-                # This path should not be reached due to the checks above, but it satisfies the type checker
-                raise ValueError("Could not create BitMap instance")
 
             table_name = f"{self.tableprefix}_cache_{partition_key}"
             self.cursor.execute(
                 sql.SQL(
-                    "INSERT INTO {0} (query_hash, partition_keys) VALUES (%s, %s) ON CONFLICT (query_hash) DO UPDATE SET partition_keys = EXCLUDED.partition_keys"
+                    "INSERT INTO {0} (query_hash, partition_keys) VALUES (%s, rb_build(%s)) ON CONFLICT (query_hash) DO UPDATE SET partition_keys = EXCLUDED.partition_keys"
                 ).format(sql.Identifier(table_name)),
-                (key, rb_bytes),
+                (key, value_list),
             )
             self.db.commit()
             return True
@@ -168,7 +156,7 @@ class PostgreSQLRoaringBitCacheHandler(PostgreSQLAbstractCacheHandler):
         if result is None or result[0] is None:
             return None
 
-        # Deserialize roaring bitmap from bytes
+        # Deserialize roaring bitmap from bytes and return as BitMap
         rb = BitMap.deserialize(result[0])
         return rb
 
@@ -194,7 +182,7 @@ class PostgreSQLRoaringBitCacheHandler(PostgreSQLAbstractCacheHandler):
         if result is None or result[0] is None:
             return None, 0
 
-        # Deserialize the intersected roaring bitmap
+        # Deserialize the intersected roaring bitmap and return as BitMap
         rb = BitMap.deserialize(result[0])
         return rb, len(keys_set)
 

@@ -20,6 +20,7 @@ CI_MODE=false
 SERVICES="postgres-integration redis-integration"
 PARALLEL=false
 COVERAGE=false
+PYTEST_ARGS=""
 
 # Function to show help
 show_help() {
@@ -39,6 +40,7 @@ show_help() {
     echo "  --coverage           Generate coverage report"
     echo "  --ci                 Run in CI mode (uses different setup)"
     echo "  --list-backends      List all available cache backends"
+    echo "  --pytest-args ARGS   Pass additional arguments to pytest"
     echo "  --help, -h           Show this help message"
     echo ""
     echo "Test Patterns:"
@@ -165,6 +167,11 @@ run_tests() {
     # Add coverage
     if [ "$COVERAGE" = true ]; then
         PYTEST_CMD="$PYTEST_CMD --cov=partitioncache --cov-report=html --cov-report=term-missing"
+    fi
+    
+    # Add extra pytest args
+    if [ -n "$PYTEST_ARGS" ]; then
+        PYTEST_CMD="$PYTEST_CMD $PYTEST_ARGS"
     fi
     
     # Show environment info
@@ -347,6 +354,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --list-backends)
             list_backends
+            ;;
+        --pytest-args)
+            PYTEST_ARGS="$2"
+            shift 2
             ;;
         --help|-h)
             show_help

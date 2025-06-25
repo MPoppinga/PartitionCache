@@ -81,6 +81,12 @@ start_services() {
     
     cd "$(dirname "$0")/.."
     
+    # Build postgres image if it doesn't exist
+    if [[ -z "$(docker images -q partitioncache-postgres:latest 2> /dev/null)" ]]; then
+        echo -e "${YELLOW}🛠️ Building partitioncache-postgres image...${NC}"
+        docker build -t partitioncache-postgres:latest ./.github/docker/postgres-cron
+    fi
+
     # Pull images first
     echo -e "${YELLOW}📥 Pulling container images...${NC}"
     $DOCKER_COMPOSE -f $COMPOSE_FILE pull $services
@@ -106,7 +112,12 @@ wait_for_services() {
         healthy=true
         
         for service in $services; do
-            local health_status=$($DOCKER_COMPOSE -f $COMPOSE_FILE ps --format json $service 2>/dev/null | jq -r '.[0].Health // "unknown"' 2>/dev/null || echo "unknown")
+            local container_id=$($DOCKER_COMPOSE -f $COMPOSE_FILE ps -q $service)
+            if [ -z "$container_id" ]; then
+                healthy=false
+                break
+            fi
+            local health_status=$(docker inspect --format '{{.State.Health.Status}}' $container_id)
             
             if [ "$health_status" != "healthy" ]; then
                 healthy=false

@@ -258,7 +258,7 @@ class TestQueueErrorRecovery:
         # Schedule a job that runs for a long time
         test_jobname = f"timeout_test_{int(time.time())}"
         # Command that will run for several seconds
-        test_command = "SELECT pg_sleep(30);"  # 30 second sleep
+        test_command = "SELECT pg_sleep(30);"  # 30 second sleep for timeout testing
 
         with db_session.cursor() as cur:
             try:

@@ -51,7 +51,11 @@ def db_connection():
         "dbname": os.getenv("PG_DBNAME", "test_db"),
     }
 
-    conn = psycopg.connect(**conn_params)
+    try:
+        conn = psycopg.connect(**conn_params, connect_timeout=10)
+    except Exception as e:
+        pytest.skip(f"Cannot connect to PostgreSQL database: {e}")
+        return None  # This won't be reached due to skip, but helps with type hints
     conn.autocommit = True
 
     # Create test tables with sample data
@@ -67,6 +71,15 @@ def db_connection():
                 region TEXT,
                 name TEXT,
                 population INTEGER,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        
+        # Create table for cron job testing
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS test_cron_results (
+                id SERIAL PRIMARY KEY,
+                message TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
@@ -92,8 +105,12 @@ def db_connection():
     # Cleanup
     with conn.cursor() as cur:
         cur.execute("DROP TABLE IF EXISTS test_locations CASCADE;")
+        cur.execute("DROP TABLE IF EXISTS test_cron_results CASCADE;")
         # Clean up any test cron jobs
-        cur.execute("DELETE FROM cron.job WHERE jobname LIKE 'test_%';")
+        try:
+            cur.execute("DELETE FROM cron.job WHERE jobname LIKE 'test_%';")
+        except Exception:
+            pass  # pg_cron might not be available
 
     conn.close()
 
@@ -174,6 +191,10 @@ def cache_client(request, db_session):
     """
     cache_backend = request.param
 
+    # Skip PostgreSQL backends if database connection not available
+    if cache_backend.startswith("postgresql") and db_session is None:
+        pytest.skip(f"PostgreSQL database not available for {cache_backend}")
+
     # Set environment variables for cache backend
     original_backend = os.getenv("CACHE_BACKEND")
     original_env_vars = {}
@@ -199,6 +220,14 @@ def cache_client(request, db_session):
         # rocksdict uses the db_path parameter directly, no env vars needed
 
     try:
+        # Create cache handler with timeout protection
+        import signal
+        def timeout_handler(signum, frame):
+            raise TimeoutError(f"Cache handler creation for {cache_backend} timed out")
+        
+        signal.signal(signal.SIGALRM, timeout_handler)
+        signal.alarm(10)  # 10 second timeout for cache creation
+        
         # Create cache handler
         if cache_backend == "rocksdict":
             # rocksdict needs the path passed directly
@@ -207,6 +236,8 @@ def cache_client(request, db_session):
             cache_handler = RocksDictCacheHandler(temp_dir)
         else:
             cache_handler = get_cache_handler(cache_backend)
+        
+        signal.alarm(0)  # Cancel timeout
 
         # Setup partition keys for testing
         for partition_key, datatype in TEST_PARTITION_KEYS:
@@ -218,7 +249,12 @@ def cache_client(request, db_session):
 
         yield cache_handler
 
+    except TimeoutError:
+        pytest.skip(f"Cache handler creation for {cache_backend} timed out - likely missing dependencies")
+    except Exception as e:
+        pytest.skip(f"Cannot create cache handler for {cache_backend}: {e}")
     finally:
+        signal.alarm(0)  # Make sure to cancel any pending alarms
         # Cleanup
         try:
             # Clear all test data

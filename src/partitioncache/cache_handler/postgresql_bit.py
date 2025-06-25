@@ -73,7 +73,7 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
             sql.SQL("""CREATE TABLE IF NOT EXISTS {0} (
                 query_hash TEXT PRIMARY KEY,
                 partition_keys BIT VARYING,
-                partition_keys_count integer NOT NULL GENERATED ALWAYS AS (length(replace(partition_keys::text, '0','')) ) STORED
+                partition_keys_count integer GENERATED ALWAYS AS (length(replace(partition_keys::text, '0','')) ) STORED
             );""").format(sql.Identifier(table_name))
         )
 
