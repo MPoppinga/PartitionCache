@@ -31,6 +31,12 @@ class TestCacheLifecycle:
 
     def test_set_and_get_text_partition(self, cache_client: AbstractCacheHandler):
         """Test basic set and get operations with text partition keys."""
+        # Skip test for backends that only support integer values
+        if hasattr(cache_client, 'get_supported_datatypes'):
+            supported_datatypes = cache_client.get_supported_datatypes()
+            if "text" not in supported_datatypes:
+                pytest.skip(f"Backend {cache_client.__class__.__name__} does not support text datatypes. Supported: {supported_datatypes}")
+
         partition_key = "region"
         cache_key = "test_query_hash_002"
         test_values = {"northeast", "west", "southeast"}

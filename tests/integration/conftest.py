@@ -192,7 +192,7 @@ def cache_client(request, db_session):
         original_env_vars["ROCKSDB_BIT_PATH"] = os.getenv("ROCKSDB_BIT_PATH")
         original_env_vars["ROCKSDB_BIT_BITSIZE"] = os.getenv("ROCKSDB_BIT_BITSIZE")
         os.environ["ROCKSDB_BIT_PATH"] = temp_dir
-        os.environ["ROCKSDB_BIT_BITSIZE"] = "10000"
+        os.environ["ROCKSDB_BIT_BITSIZE"] = "200000"
     elif cache_backend == "rocksdict":
         import tempfile
         temp_dir = tempfile.mkdtemp(prefix="rocksdict_test_")

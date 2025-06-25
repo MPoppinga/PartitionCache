@@ -114,7 +114,6 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 10
-        if: ${{ matrix.test-pattern.requires_redis }}
 
     env:
       # PostgreSQL configuration

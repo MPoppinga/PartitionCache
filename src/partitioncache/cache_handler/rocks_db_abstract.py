@@ -86,10 +86,15 @@ class RocksDBAbstractCacheHandler(AbstractCacheHandler):
 
     def _set_partition_datatype(self, partition_key: str, datatype: str) -> None:
         """Set the datatype for a partition key in metadata."""
-        if datatype != "integer":
-            raise ValueError("RocksDB bit handler only supports integer datatype")
+        self._validate_datatype(datatype)
         metadata_key = f"_partition_metadata:{partition_key}"
         self.db.put(metadata_key.encode(), datatype.encode(), sync=True)
+
+    def _validate_datatype(self, datatype: str) -> None:
+        """Validate datatype for this handler. Override in concrete classes."""
+        supported_datatypes = self.get_supported_datatypes()
+        if datatype not in supported_datatypes:
+            raise ValueError(f"Datatype '{datatype}' not supported by {self.__class__.__name__}. Supported: {supported_datatypes}")
 
     def _get_cache_key(self, key: str, partition_key: str) -> str:
         """Get the RocksDB key for a cache entry with partition key namespace."""
