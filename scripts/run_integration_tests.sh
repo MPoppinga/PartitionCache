@@ -94,11 +94,11 @@ setup_integration_env() {
         echo -e "${BLUE}🤖 CI Mode: Using service containers${NC}"
         # In CI mode, services are typically provided by the CI system
         # Set up environment variables for CI
-        export PG_HOST=${PG_HOST:-localhost}
-        export PG_PORT=${PG_PORT:-5432}
-        export PG_USER=${PG_USER:-postgres}
-        export PG_PASSWORD=${PG_PASSWORD:-postgres}
-        export PG_DBNAME=${PG_DBNAME:-postgres}
+        export PG_HOST=${PG_HOST}
+        export PG_PORT=${PG_PORT}
+        export PG_USER=${PG_USER}
+        export PG_PASSWORD=${PG_PASSWORD}
+        export PG_DBNAME=${PG_DBNAME}
         
         export REDIS_HOST=${REDIS_HOST:-localhost}
         export REDIS_PORT=${REDIS_PORT:-6379}
