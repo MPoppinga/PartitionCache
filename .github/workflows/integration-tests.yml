@@ -164,27 +164,24 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
 
-    - name: Set up Python
-      uses: actions/setup-python@v5
+    - name: Setup micromamba
+      uses: mamba-org/setup-micromamba@v1
       with:
-        python-version: ${{ env.PYTHON_VERSION }}
+        micromamba-version: 'latest'
+        environment-file: .github/micromamba-env.yml
+        init-shell: >-
+          bash
+        cache-environment: true
+        post-cleanup: 'all'
 
-    - name: Cache pip dependencies
-      uses: actions/cache@v4
-      with:
-        path: ~/.cache/pip
-        key: ${{ runner.os }}-pip-integration-${{ hashFiles('pyproject.toml') }}
-        restore-keys: |
-          ${{ runner.os }}-pip-integration-
-          ${{ runner.os }}-pip-
-
-    - name: Install dependencies
+    - name: Install PartitionCache
+      shell: micromamba-shell {0}
       run: |
-        python -m pip install --upgrade pip
         pip install -e ".[testing,db]"
-        pip install pytest-xdist pytest-cov
+        pip install pytest-xdist  # Additional for parallel execution
 
     - name: Wait for services
+      shell: micromamba-shell {0}
       run: |
         echo "Waiting for PostgreSQL..."
         for i in {1..30}; do
@@ -207,6 +204,7 @@ jobs:
         fi
 
     - name: Verify extensions
+      shell: micromamba-shell {0}
       run: |
         python -c "
         import psycopg
@@ -223,6 +221,7 @@ jobs:
         "
 
     - name: Run tests
+      shell: micromamba-shell {0}
       run: |
         PYTEST_FLAGS="--ci --pattern ${{ matrix.test-pattern.pattern }} --verbose"
         
@@ -310,17 +309,24 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
 
-    - name: Set up Python
-      uses: actions/setup-python@v5
+    - name: Setup micromamba
+      uses: mamba-org/setup-micromamba@v1
       with:
-        python-version: ${{ env.PYTHON_VERSION }}
+        micromamba-version: 'latest'
+        environment-file: .github/micromamba-env.yml
+        init-shell: >-
+          bash
+        cache-environment: true
+        post-cleanup: 'all'
 
-    - name: Install dependencies
+    - name: Install PartitionCache
+      shell: micromamba-shell {0}
       run: |
-        python -m pip install --upgrade pip
         pip install -e ".[testing,db]"
+        pip install pytest-xdist  # Additional for parallel execution
 
     - name: Run E2E tests
+      shell: micromamba-shell {0}
       run: |
         ./scripts/run_integration_tests.sh \
           --ci \
@@ -378,17 +384,24 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
 
-    - name: Set up Python
-      uses: actions/setup-python@v5
+    - name: Setup micromamba
+      uses: mamba-org/setup-micromamba@v1
       with:
-        python-version: ${{ env.PYTHON_VERSION }}
+        micromamba-version: 'latest'
+        environment-file: .github/micromamba-env.yml
+        init-shell: >-
+          bash
+        cache-environment: true
+        post-cleanup: 'all'
 
-    - name: Install dependencies
+    - name: Install PartitionCache
+      shell: micromamba-shell {0}
       run: |
-        python -m pip install --upgrade pip
         pip install -e ".[testing,db]"
+        pip install pytest-xdist  # Additional for parallel execution
 
     - name: Run performance tests
+      shell: micromamba-shell {0}
       run: |
         ./scripts/run_integration_tests.sh \
           --ci \

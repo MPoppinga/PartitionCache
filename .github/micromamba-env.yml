@@ -1,8 +1,8 @@
-name: partitioncache-rocksdb
+name: partitioncache-integration
 channels:
   - conda-forge
   - defaults
 dependencies:
   - python=3.12
   - pip
-  - python-rocksdb
+  - python-rocksdb  # Only conda-specific dependency for reliable RocksDB builds
