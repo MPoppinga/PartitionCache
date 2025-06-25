@@ -1,4 +1,6 @@
 import os
+import signal
+import tempfile
 import time
 
 import psycopg
@@ -64,8 +66,10 @@ def db_connection():
         cur.execute("CREATE EXTENSION IF NOT EXISTS pg_cron;")
 
         # Create test tables based on OSM pattern
+        # Use DROP/CREATE instead of IF NOT EXISTS to avoid sequence conflicts
+        cur.execute("DROP TABLE IF EXISTS test_locations CASCADE;")
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS test_locations (
+            CREATE TABLE test_locations (
                 id SERIAL PRIMARY KEY,
                 zipcode INTEGER,
                 region TEXT,
@@ -74,18 +78,18 @@ def db_connection():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
-        
+
         # Create table for cron job testing
+        cur.execute("DROP TABLE IF EXISTS test_cron_results CASCADE;")
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS test_cron_results (
+            CREATE TABLE test_cron_results (
                 id SERIAL PRIMARY KEY,
                 message TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
 
-        # Insert sample data
-        cur.execute("TRUNCATE test_locations;")
+        # Insert sample data (no need to truncate as table was just created)
         for zipcode, data in SAMPLE_TEST_DATA["zipcode"].items():
             # Determine region based on zipcode
             if zipcode < 20000:
@@ -138,12 +142,34 @@ def db_session(db_connection):
             except Exception:
                 pass  # Table might not exist or have dependencies
 
+        # Reset test table data to ensure clean state
+        cur.execute("TRUNCATE test_locations RESTART IDENTITY CASCADE;")
+        cur.execute("TRUNCATE test_cron_results RESTART IDENTITY CASCADE;")
+
+        # Re-insert sample data for consistent test state
+        for zipcode, data in SAMPLE_TEST_DATA["zipcode"].items():
+            # Determine region based on zipcode
+            if zipcode < 20000:
+                region = "northeast"
+            elif zipcode < 80000:
+                region = "southeast"
+            else:
+                region = "west"
+
+            cur.execute("""
+                INSERT INTO test_locations (zipcode, region, name, population)
+                VALUES (%s, %s, %s, %s);
+            """, (zipcode, region, data["name"], data["population"]))
+
     yield conn
 
     # Cleanup after test
     with conn.cursor() as cur:
         # Remove any test cron jobs
-        cur.execute("DELETE FROM cron.job WHERE jobname LIKE 'test_%';")
+        try:
+            cur.execute("DELETE FROM cron.job WHERE jobname LIKE 'test_%';")
+        except Exception:
+            pass  # pg_cron might not be available
 
 
 # Base backends that should always be available
@@ -203,31 +229,20 @@ def cache_client(request, db_session):
 
     # Set up backend-specific environment variables
     if cache_backend == "rocksdb_set":
-        import tempfile
         temp_dir = tempfile.mkdtemp(prefix="rocksdb_test_")
         original_env_vars["ROCKSDB_PATH"] = os.getenv("ROCKSDB_PATH")
         os.environ["ROCKSDB_PATH"] = temp_dir
     elif cache_backend == "rocksdb_bit":
-        import tempfile
         temp_dir = tempfile.mkdtemp(prefix="rocksdb_bit_test_")
         original_env_vars["ROCKSDB_BIT_PATH"] = os.getenv("ROCKSDB_BIT_PATH")
         original_env_vars["ROCKSDB_BIT_BITSIZE"] = os.getenv("ROCKSDB_BIT_BITSIZE")
         os.environ["ROCKSDB_BIT_PATH"] = temp_dir
         os.environ["ROCKSDB_BIT_BITSIZE"] = "200000"
     elif cache_backend == "rocksdict":
-        import tempfile
         temp_dir = tempfile.mkdtemp(prefix="rocksdict_test_")
         # rocksdict uses the db_path parameter directly, no env vars needed
 
     try:
-        # Create cache handler with timeout protection
-        import signal
-        def timeout_handler(signum, frame):
-            raise TimeoutError(f"Cache handler creation for {cache_backend} timed out")
-        
-        signal.signal(signal.SIGALRM, timeout_handler)
-        signal.alarm(10)  # 10 second timeout for cache creation
-        
         # Create cache handler
         if cache_backend == "rocksdict":
             # rocksdict needs the path passed directly
@@ -236,8 +251,6 @@ def cache_client(request, db_session):
             cache_handler = RocksDictCacheHandler(temp_dir)
         else:
             cache_handler = get_cache_handler(cache_backend)
-        
-        signal.alarm(0)  # Cancel timeout
 
         # Setup partition keys for testing
         for partition_key, datatype in TEST_PARTITION_KEYS:
@@ -249,24 +262,24 @@ def cache_client(request, db_session):
 
         yield cache_handler
 
-    except TimeoutError:
-        pytest.skip(f"Cache handler creation for {cache_backend} timed out - likely missing dependencies")
     except Exception as e:
         pytest.skip(f"Cannot create cache handler for {cache_backend}: {e}")
     finally:
-        signal.alarm(0)  # Make sure to cancel any pending alarms
         # Cleanup
         try:
-            # Clear all test data
+            # Clear all test data with timeout protection
             for partition_key, _ in TEST_PARTITION_KEYS:
                 try:
                     keys = cache_handler.get_all_keys(partition_key)
-                    for key in keys:
+                    # Limit key cleanup to prevent hanging
+                    for key in list(keys)[:50]:  # Process max 50 keys to avoid infinite loops
                         cache_handler.delete(key, partition_key)
                 except Exception:
                     pass
 
-            cache_handler.close()
+            # Properly close cache handler
+            if hasattr(cache_handler, 'close'):
+                cache_handler.close()
         except Exception:
             pass
 

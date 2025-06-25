@@ -42,6 +42,7 @@ class TestEndToEndWorkflows:
             from partitioncache.query_processor import generate_all_hashes
             hashes = generate_all_hashes(query, partition_key)
 
+            partition_values = set()
             # Execute query to get actual partition values
             with db_session.cursor() as cur:
                 cur.execute(query)
@@ -108,10 +109,17 @@ class TestEndToEndWorkflows:
                 print(f"Enhanced query: {enhanced_query[:100]}...")
                 print(f"Stats: {stats}")
 
-                # Execute enhanced query
+                # Execute enhanced query (may be multiple statements)
                 with db_session.cursor() as cur:
-                    cur.execute(enhanced_query)
-                    enhanced_results = cur.fetchall()
+                    # Split multi-statement queries and execute them
+                    statements = [stmt.strip() for stmt in enhanced_query.split(';') if stmt.strip()]
+                    enhanced_results = []
+
+                    for stmt in statements:
+                        cur.execute(stmt)
+                        # Only fetch results from SELECT statements
+                        if stmt.upper().strip().startswith('SELECT'):
+                            enhanced_results = cur.fetchall()
 
                 # Results should match or be subset of baseline
                 assert len(enhanced_results) <= len(baseline_results), \

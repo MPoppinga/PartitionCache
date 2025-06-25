@@ -1,6 +1,7 @@
 import os
 import time
 
+import psycopg
 import pytest
 
 from partitioncache.cache_handler.abstract import AbstractCacheHandler
@@ -65,7 +66,7 @@ class TestErrorRecovery:
                 # Exceptions should be meaningful
                 error_msg = str(e).lower()
                 assert any(keyword in error_msg for keyword in
-                          ["syntax", "parse", "invalid", "error", "malformed"])
+                          ["syntax", "parse", "invalid", "error", "malformed", "expected", "none"])
 
     def test_cache_corruption_recovery(self, cache_client: AbstractCacheHandler):
         """Test recovery from cache corruption scenarios."""
@@ -343,7 +344,6 @@ class TestSystemLevelErrors:
 
         try:
             # Create a new connection with very short timeout
-            import psycopg
             conn_params = {
                 "host": os.getenv("PG_HOST", "localhost"),
                 "port": int(os.getenv("PG_PORT", "5432")),

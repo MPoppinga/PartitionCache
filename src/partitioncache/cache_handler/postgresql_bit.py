@@ -73,7 +73,12 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
             sql.SQL("""CREATE TABLE IF NOT EXISTS {0} (
                 query_hash TEXT PRIMARY KEY,
                 partition_keys BIT VARYING,
-                partition_keys_count integer GENERATED ALWAYS AS (length(replace(partition_keys::text, '0','')) ) STORED
+                partition_keys_count integer GENERATED ALWAYS AS (
+                    CASE
+                        WHEN partition_keys IS NULL THEN NULL
+                        ELSE length(replace(partition_keys::text, '0',''))
+                    END
+                ) STORED
             );""").format(sql.Identifier(table_name))
         )
 
@@ -122,11 +127,19 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
                 else:
                     raise ValueError(f"Only integer values are supported for bit arrays: {k} : {value}")
             table_name = f"{self.tableprefix}_cache_{partition_key}"
-            self.cursor.execute(sql.SQL("INSERT INTO {0} (query_hash, partition_keys) VALUES (%s, %s)").format(sql.Identifier(table_name)), (key, val.to01()))
+            self.cursor.execute(
+                sql.SQL("INSERT INTO {0} (query_hash, partition_keys) VALUES (%s, %s) ON CONFLICT (query_hash) DO UPDATE SET partition_keys = EXCLUDED.partition_keys").format(sql.Identifier(table_name)),
+                (key, val.to01())
+            )
             self.db.commit()
             return True
         except Exception as e:
             logger.error(f"Failed to set value for key {key} in partition {partition_key}: {e}")
+            # Rollback the transaction to prevent "current transaction is aborted" error
+            try:
+                self.db.rollback()
+            except Exception as rollback_error:
+                logger.error(f"Failed to rollback transaction: {rollback_error}")
             return False
 
     def get(self, key: str, partition_key: str = "partition_key") -> set[int] | None:
@@ -144,8 +157,12 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
         result = self.cursor.fetchone()
         if result is None:
             return None
-        bitarray_result = bitarray(result[0])
 
+        # Handle NULL values stored via set_null()
+        if result[0] is None:
+            return None
+
+        bitarray_result = bitarray(result[0])
         return set(bitarray_result.search(bitarray("1")))
 
     def get_intersected(self, keys: set[str], partition_key: str = "partition_key") -> tuple[set[int] | set[str] | None, int]:

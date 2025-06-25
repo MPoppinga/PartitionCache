@@ -333,7 +333,14 @@ class TestCacheRealWorldScenarios:
         cache_key = "isolation_test"
 
         zipcode_values = {1001, 1002}
-        region_values = {"northeast", "west"}
+
+        # For bit backends that only support integers, use integer region values
+        supported_datatypes = cache_client.get_supported_datatypes()
+        if "text" not in supported_datatypes:
+            # Use integer values for bit backends
+            region_values = {101, 102}  # northeast=101, west=102
+        else:
+            region_values = {"northeast", "west"}
 
         # Store same cache key with different partition keys
         cache_client.set_set(cache_key, zipcode_values, zipcode_key)

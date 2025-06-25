@@ -61,7 +61,12 @@ class PostgreSQLRoaringBitCacheHandler(PostgreSQLAbstractCacheHandler):
             sql.SQL("""CREATE TABLE IF NOT EXISTS {0} (
                 query_hash TEXT PRIMARY KEY,
                 partition_keys roaringbitmap,
-                partition_keys_count integer GENERATED ALWAYS AS (rb_cardinality(partition_keys)) STORED
+                partition_keys_count integer GENERATED ALWAYS AS (
+                    CASE 
+                        WHEN partition_keys IS NULL THEN NULL
+                        ELSE rb_cardinality(partition_keys)
+                    END
+                ) STORED
             );""").format(sql.Identifier(table_name))
         )
 
@@ -110,7 +115,7 @@ class PostgreSQLRoaringBitCacheHandler(PostgreSQLAbstractCacheHandler):
                 value_list = list(value)
             elif isinstance(value, bitarray):
                 value_list = [i for i, bit in enumerate(value) if bit]
-            elif isinstance(value, (list, set)):
+            elif isinstance(value, list | set):
                 # Validate that all items can be converted to integers without loss
                 value_list = []
                 for item in value:

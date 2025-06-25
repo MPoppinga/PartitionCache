@@ -206,8 +206,8 @@ class TestQueueProcessor:
         partition_key = "zipcode"
         test_query = """
             SELECT zipcode, COUNT(*) as location_count
-            FROM test_locations 
-            WHERE zipcode BETWEEN 1000 AND 2000
+            FROM test_locations
+            WHERE zipcode BETWEEN 1000 AND 11000
             GROUP BY zipcode;
         """
 

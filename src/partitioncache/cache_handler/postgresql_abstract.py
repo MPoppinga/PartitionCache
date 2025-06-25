@@ -1,3 +1,4 @@
+import threading
 from logging import getLogger
 
 import psycopg
@@ -15,6 +16,10 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
 
     @classmethod
     def get_instance(cls, *args, **kwargs):
+        # If externally threaded, skip singleton pattern and always create new instances
+        if hasattr(threading.current_thread(), 'ident') and threading.active_count() > 1:
+            return cls(*args, **kwargs)
+
         if cls._instance is None:
             cls._instance = cls(*args, **kwargs)
         cls._refcount += 1
@@ -84,7 +89,14 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
             # Ensure partition exists with default datatype
             datatype = self._get_partition_datatype(partition_key)
             if datatype is None:
-                return False
+                # For handlers that only support one datatype, create partition with that datatype
+                supported_datatypes = self.get_supported_datatypes()
+                if len(supported_datatypes) == 1:
+                    datatype = next(iter(supported_datatypes))
+                    self.register_partition_key(partition_key, datatype)
+                else:
+                    # For multi-datatype handlers, we can't determine datatype automatically
+                    return False
 
             table_name = f"{self.tableprefix}_cache_{partition_key}"
             self.cursor.execute(

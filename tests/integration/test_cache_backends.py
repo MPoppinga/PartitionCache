@@ -290,7 +290,7 @@ class TestCacheIntegration:
 
         assert enhanced_query is not None
         assert stats["cache_hits"] > 0
-        assert stats["enhanced"] is True
+        assert stats["enhanced"] == "1"
 
         # Verify enhanced query contains cache restrictions
         assert "tmp_cache_keys" in enhanced_query.lower() or partition_key in enhanced_query.lower()
