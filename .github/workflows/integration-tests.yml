@@ -235,12 +235,21 @@ jobs:
         conn_str = f'postgresql://integration_user:integration_password@localhost:5432/{db_name}'
         with psycopg.connect(conn_str, autocommit=True) as conn:
             with conn.cursor() as cur:
-                cur.execute('SELECT extname FROM pg_extension WHERE extname = %s', ('pg_cron',))
-                if not cur.fetchone():
-                    raise Exception('pg_cron extension not found')
+                # Check for roaringbitmap extension (should be available in all test databases)
                 cur.execute('SELECT extname FROM pg_extension WHERE extname = %s', ('roaringbitmap',))
-                if not cur.fetchone():
-                    print('roaringbitmap extension not found (optional)')
+                if cur.fetchone():
+                    print('roaringbitmap extension verified')
+                else:
+                    print('roaringbitmap extension not found (warning)')
+                
+                # Check for pg_cron extension (only available in designated cron database)
+                cur.execute('SELECT extname FROM pg_extension WHERE extname = %s', ('pg_cron',))
+                if cur.fetchone():
+                    print('pg_cron extension verified (cron-enabled database)')
+                else:
+                    print('pg_cron extension not found (expected for regular test databases)')
+                
+                print(f'Database {db_name} extension verification completed')
         "
 
     - name: Run tests
