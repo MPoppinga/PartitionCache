@@ -9,24 +9,25 @@ from partitioncache.cache_handler.abstract import AbstractCacheHandler_Lazy
 def _compare_cache_values(retrieved, expected):
     """
     Helper function to compare cache values across different backend types.
-    
+
     Args:
         retrieved: Value returned from cache backend (could be set, BitMap, etc.)
         expected: Expected set value
-    
+
     Returns:
         bool: True if values are equivalent
     """
     # Handle BitMap objects from roaringbit backend
     try:
         from pyroaring import BitMap
+
         if isinstance(retrieved, BitMap):
             return set(retrieved) == expected
     except ImportError:
         pass
 
     # Handle regular sets and other types
-    if hasattr(retrieved, '__iter__') and not isinstance(retrieved, (str, bytes)):
+    if hasattr(retrieved, "__iter__") and not isinstance(retrieved, (str, bytes)):
         return set(retrieved) == expected
 
     return retrieved == expected
@@ -66,6 +67,7 @@ class TestEndToEndWorkflows:
 
             # Step 2: Generate cache fragments and populate cache
             from partitioncache.query_processor import generate_all_hashes
+
             hashes = generate_all_hashes(query, partition_key)
 
             partition_values = set()
@@ -138,33 +140,36 @@ class TestEndToEndWorkflows:
                 # Execute enhanced query (may be multiple statements)
                 with db_session.cursor() as cur:
                     # Split multi-statement queries and execute them
-                    statements = [stmt.strip() for stmt in enhanced_query.split(';') if stmt.strip()]
+                    statements = [stmt.strip() for stmt in enhanced_query.split(";") if stmt.strip()]
                     enhanced_results = []
 
                     for stmt in statements:
                         cur.execute(stmt)
                         # Only fetch results from SELECT statements
-                        if stmt.upper().strip().startswith('SELECT'):
+                        if stmt.upper().strip().startswith("SELECT"):
                             enhanced_results = cur.fetchall()
 
                 # Results should match or be subset of baseline
-                assert len(enhanced_results) <= len(baseline_results), \
-                    "Enhanced query returned more results than baseline"
+                assert len(enhanced_results) <= len(baseline_results), "Enhanced query returned more results than baseline"
 
-                results.append({
-                    "query": query,
-                    "baseline_rows": len(baseline_results),
-                    "enhanced_rows": len(enhanced_results),
-                    "cache_hits": num_hits,
-                    "enhanced": stats.get("enhanced", False)
-                })
+                results.append(
+                    {
+                        "query": query,
+                        "baseline_rows": len(baseline_results),
+                        "enhanced_rows": len(enhanced_results),
+                        "cache_hits": num_hits,
+                        "enhanced": stats.get("enhanced", False),
+                    }
+                )
             else:
-                results.append({
-                    "query": query,
-                    "baseline_rows": len(baseline_results),
-                    "cache_hits": num_hits,
-                    "partition_keys": len(cached_partition_keys) if cached_partition_keys else 0
-                })
+                results.append(
+                    {
+                        "query": query,
+                        "baseline_rows": len(baseline_results),
+                        "cache_hits": num_hits,
+                        "partition_keys": len(cached_partition_keys) if cached_partition_keys else 0,
+                    }
+                )
 
         # Verify overall workflow success
         assert len(results) == len(test_queries), "Not all queries processed"
@@ -175,8 +180,14 @@ class TestEndToEndWorkflows:
 
     def test_multi_partition_workflow(self, db_session, cache_client):
         """Test workflow with multiple partition keys."""
-        # Test using both zipcode and region partition keys
+        # Skip bit backends for text datatype tests
+        import pytest
 
+        cache_backend_name = getattr(cache_client, "backend_type", str(cache_client.__class__.__name__))
+        if "bit" in cache_backend_name.lower() and any(config[1] == "text" for config in [("zipcode", "integer"), ("region", "text")]):
+            pytest.skip(f"Bit backend {cache_backend_name} only supports integer datatypes")
+
+        # Test using both zipcode and region partition keys
         partition_configs = [
             ("zipcode", "integer"),
             ("region", "text"),
@@ -191,7 +202,7 @@ class TestEndToEndWorkflows:
             "region": [
                 "SELECT * FROM test_locations WHERE region = 'northeast';",
                 "SELECT zipcode FROM test_locations WHERE region IN ('northeast', 'west');",
-            ]
+            ],
         }
 
         workflow_results = {}
@@ -215,6 +226,7 @@ class TestEndToEndWorkflows:
 
                 # Generate cache entries
                 from partitioncache.query_processor import generate_all_hashes
+
                 hashes = generate_all_hashes(query, partition_key)
 
                 # Determine partition values based on query and partition type
@@ -249,12 +261,7 @@ class TestEndToEndWorkflows:
                     min_component_size=1,
                 )
 
-                partition_results.append({
-                    "query": query,
-                    "hits": hits,
-                    "cached_keys": cached_keys,
-                    "baseline_rows": len(baseline_results)
-                })
+                partition_results.append({"query": query, "hits": hits, "cached_keys": cached_keys, "baseline_rows": len(baseline_results)})
 
             workflow_results[partition_key] = partition_results
 
@@ -280,11 +287,7 @@ class TestEndToEndWorkflows:
         # Step 1: Add queries to queue
         queued_queries = []
         for query in test_queries:
-            success = push_to_original_query_queue(
-                query=query,
-                partition_key=partition_key,
-                partition_datatype="integer"
-            )
+            success = push_to_original_query_queue(query=query, partition_key=partition_key, partition_datatype="integer")
             if success:
                 queued_queries.append(query)
 
@@ -295,6 +298,7 @@ class TestEndToEndWorkflows:
         for query in queued_queries:
             # Generate fragments (simulate queue processor)
             from partitioncache.query_processor import generate_all_hashes
+
             hashes = generate_all_hashes(query, partition_key)
 
             # Execute query to get results (simulate fragment execution)
@@ -348,55 +352,57 @@ class TestEndToEndWorkflows:
 
         # Set up environment for CLI commands
         env = os.environ.copy()
-        env.update({
-            "PG_HOST": os.getenv("PG_HOST", "localhost"),
-            "PG_PORT": os.getenv("PG_PORT", "5432"),
-            "PG_USER": os.getenv("PG_USER", "test_user"),
-            "PG_PASSWORD": os.getenv("PG_PASSWORD", "test_password"),
-            "PG_DBNAME": os.getenv("PG_DBNAME", "test_db"),
-            "CACHE_BACKEND": "postgresql_array",
-        })
+        env.update(
+            {
+                "PG_HOST": os.getenv("PG_HOST", "localhost"),
+                "PG_PORT": os.getenv("PG_PORT", "5432"),
+                "PG_USER": os.getenv("PG_USER", "test_user"),
+                "PG_PASSWORD": os.getenv("PG_PASSWORD", "test_password"),
+                "PG_DBNAME": os.getenv("PG_DBNAME", "test_db"),
+                "CACHE_BACKEND": "postgresql_array",
+            }
+        )
 
         # Step 1: Setup via CLI
-        setup_result = subprocess.run(
-            ["python", "-m", "partitioncache.cli.manage_cache", "setup", "all"],
-            capture_output=True,
-            text=True,
-            env=env,
-            timeout=60
-        )
+        setup_result = subprocess.run(["python", "-m", "partitioncache.cli.manage_cache", "setup", "all"], capture_output=True, text=True, env=env, timeout=60)
 
         # Setup should succeed or already exist
         assert setup_result.returncode == 0 or "exist" in setup_result.stderr.lower()
 
         # Step 2: Add query via CLI
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.sql', delete=False) as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".sql", delete=False) as f:
             test_query = "SELECT * FROM test_locations WHERE zipcode = 1001;"
             f.write(test_query)
             query_file = f.name
 
         try:
-            add_result = subprocess.run([
-                "python", "-m", "partitioncache.cli.add_to_cache",
-                "--direct",
-                "--query-file", query_file,
-                "--partition-key", "zipcode",
-                "--partition-datatype", "integer",
-            ], capture_output=True, text=True, env=env, timeout=120)
+            add_result = subprocess.run(
+                [
+                    "python",
+                    "-m",
+                    "partitioncache.cli.add_to_cache",
+                    "--direct",
+                    "--query-file",
+                    query_file,
+                    "--partition-key",
+                    "zipcode",
+                    "--partition-datatype",
+                    "integer",
+                ],
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=120,
+            )
 
             # May succeed or fail with configuration issues
             if add_result.returncode != 0:
                 # Check if it's a configuration issue
-                assert any(keyword in add_result.stderr.lower() for keyword in
-                          ["configuration", "connection", "setup"])
+                assert any(keyword in add_result.stderr.lower() for keyword in ["configuration", "connection", "setup"])
 
             # Step 3: Check cache status via CLI
             count_result = subprocess.run(
-                ["python", "-m", "partitioncache.cli.manage_cache", "cache", "count"],
-                capture_output=True,
-                text=True,
-                env=env,
-                timeout=60
+                ["python", "-m", "partitioncache.cli.manage_cache", "cache", "count"], capture_output=True, text=True, env=env, timeout=60
             )
 
             # Should provide some information about cache status
@@ -421,12 +427,15 @@ class TestEndToEndWorkflows:
             ("simple", "SELECT * FROM test_locations WHERE zipcode = 1001;"),
             ("range", "SELECT * FROM test_locations WHERE zipcode BETWEEN 1000 AND 2000;"),
             ("in_list", "SELECT * FROM test_locations WHERE zipcode IN (1001, 1002, 90210);"),
-            ("complex", """
+            (
+                "complex",
+                """
                 SELECT l1.name, l1.population 
                 FROM test_locations l1 
                 JOIN test_locations l2 ON l1.region = l2.region 
                 WHERE l1.zipcode = 1001;
-            """),
+            """,
+            ),
         ]
 
         performance_results = []
@@ -443,6 +452,7 @@ class TestEndToEndWorkflows:
 
             # Populate cache
             from partitioncache.query_processor import generate_all_hashes
+
             hashes = generate_all_hashes(query, partition_key)
 
             # Use test data partition values
@@ -477,19 +487,22 @@ class TestEndToEndWorkflows:
                     cur.fetchall()  # Execute query but don't store results
                 enhanced_time = time.time() - start_time
 
-            performance_results.append({
-                "query_type": query_type,
-                "baseline_time": baseline_time,
-                "cache_lookup_time": cache_lookup_time,
-                "enhanced_time": enhanced_time,
-                "cache_hits": hits,
-                "baseline_rows": len(baseline_results),
-            })
+            performance_results.append(
+                {
+                    "query_type": query_type,
+                    "baseline_time": baseline_time,
+                    "cache_lookup_time": cache_lookup_time,
+                    "enhanced_time": enhanced_time,
+                    "cache_hits": hits,
+                    "baseline_rows": len(baseline_results),
+                }
+            )
 
         # Analyze performance results
         for result in performance_results:
-            print(f"{result['query_type']}: baseline={result['baseline_time']:.3f}s, "
-                  f"cache_lookup={result['cache_lookup_time']:.3f}s, hits={result['cache_hits']}")
+            print(
+                f"{result['query_type']}: baseline={result['baseline_time']:.3f}s, cache_lookup={result['cache_lookup_time']:.3f}s, hits={result['cache_hits']}"
+            )
 
         # Verify performance characteristics
         total_hits = sum(r["cache_hits"] for r in performance_results)
@@ -499,8 +512,7 @@ class TestEndToEndWorkflows:
         avg_cache_time = sum(r["cache_lookup_time"] for r in performance_results) / len(performance_results)
         assert avg_cache_time < 1.0, f"Average cache lookup too slow: {avg_cache_time:.3f}s"
 
-        print(f"Performance monitoring: {len(performance_results)} queries, "
-              f"avg cache lookup: {avg_cache_time:.3f}s")
+        print(f"Performance monitoring: {len(performance_results)} queries, avg cache lookup: {avg_cache_time:.3f}s")
 
     def test_data_consistency_workflow(self, db_session, cache_client):
         """Test workflow ensuring data consistency across operations."""
@@ -532,6 +544,7 @@ class TestEndToEndWorkflows:
         # Step 2: Populate cache and test consistency
         for i, query in enumerate(consistency_queries):
             from partitioncache.query_processor import generate_all_hashes
+
             hashes = generate_all_hashes(query, partition_key)
 
             # Use expected results as cache data
@@ -551,8 +564,9 @@ class TestEndToEndWorkflows:
 
         # Step 3: Verify consistency
         for i in range(len(consistency_queries)):
-            assert _compare_cache_values(cached_results[i], expected_results[i]), \
+            assert _compare_cache_values(cached_results[i], expected_results[i]), (
                 f"Inconsistent results for query {i}: cache={cached_results[i]}, expected={expected_results[i]}"
+            )
 
         print(f"Data consistency verified across {len(consistency_queries)} queries")
 

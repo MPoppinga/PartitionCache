@@ -157,7 +157,7 @@ jobs:
       REDIS_PORT: 6379
       REDIS_CACHE_DB: ${{ matrix.job_index }}
       REDIS_BIT_DB: ${{ matrix.redis_bit_db }}
-      REDIS_BIT_BITSIZE: 200000
+      REDIS_BIT_BITSIZE: 300000
       REDIS_SET_HOST: localhost
       REDIS_SET_PORT: 6379
       REDIS_SET_DB: ${{ matrix.job_index }}
@@ -165,13 +165,13 @@ jobs:
       # Cache backend configuration with job-specific prefixes
       PG_ARRAY_CACHE_TABLE_PREFIX: ci_array_cache_${{ matrix.suffix }}
       PG_BIT_CACHE_TABLE_PREFIX: ci_bit_cache_${{ matrix.suffix }}
-      PG_BIT_CACHE_BITSIZE: 200000
+      PG_BIT_CACHE_BITSIZE: 300000
       PG_ROARINGBIT_CACHE_TABLE_PREFIX: ci_roaring_cache_${{ matrix.suffix }}
       
       # RocksDB configuration - isolated per job to prevent file conflicts
       ROCKSDB_PATH: /tmp/ci_rocksdb_${{ matrix.suffix }}_${{ github.run_id }}
       ROCKSDB_BIT_PATH: /tmp/ci_rocksdb_bit_${{ matrix.suffix }}_${{ github.run_id }}
-      ROCKSDB_BIT_BITSIZE: 200000
+      ROCKSDB_BIT_BITSIZE: 300000
       ROCKSDB_DICT_PATH: /tmp/ci_rocksdict_${{ matrix.suffix }}_${{ github.run_id }}
 
     steps:
@@ -581,92 +581,8 @@ jobs:
           sleep 2
         done
 
-        echo "Creating isolated test database: $UNIQUE_DB_NAME from base template: $BASE_TEMPLATE_DB"
-        python -c "
-        import os
-        import psycopg
-        import time
-        import random
-        from psycopg import sql
-        
-        unique_db = os.environ['UNIQUE_DB_NAME']
-        base_template = os.environ['BASE_TEMPLATE_DB']
-        conn_str = f'postgresql://integration_user:integration_password@localhost:5432/postgres'
-        
-        def create_database_with_retry(max_retries=5):
-            for attempt in range(max_retries):
-                try:
-                    with psycopg.connect(conn_str, autocommit=True) as conn:
-                        with conn.cursor() as cur:
-                            # Check if database already exists and drop it to ensure clean state
-                            cur.execute(sql.SQL('SELECT 1 FROM pg_database WHERE datname = %s'), (unique_db,))
-                            if cur.fetchone():
-                                print(f'Dropping existing database: {unique_db}')
-                                cur.execute(sql.SQL('DROP DATABASE {}').format(sql.Identifier(unique_db)))
-                            
-                            # Create new isolated database from base template
-                            print(f'Creating database: {unique_db} from template: {base_template} (attempt {attempt + 1})')
-                            cur.execute(sql.SQL('CREATE DATABASE {} TEMPLATE {}').format(
-                                sql.Identifier(unique_db),
-                                sql.Identifier(base_template)
-                            ))
-                            print(f'Successfully created database: {unique_db}')
-                            return True
-                            
-                except psycopg.errors.ObjectInUse as e:
-                    if attempt < max_retries - 1:
-                        # Add random jitter to prevent thundering herd
-                        wait_time = (2 ** attempt) + random.uniform(0, 1)
-                        print(f'Template database in use, retrying in {wait_time:.1f}s (attempt {attempt + 1}/{max_retries})')
-                        time.sleep(wait_time)
-                    else:
-                        print(f'Failed to create database after {max_retries} attempts: {e}')
-                        # Fallback: wait for template to be available then retry
-                        return create_fallback_database()
-                except Exception as e:
-                    print(f'Unexpected error creating database: {e}')
-                    if attempt == max_retries - 1:
-                        raise
-                    time.sleep(1)
-            
-            return False
-        
-        def create_fallback_database():
-            '''Fallback: wait for template to be available then retry'''
-            try:
-                print(f'Fallback: Template database is busy, waiting before final retry...')
-                # Wait a longer time to let other jobs finish with the template
-                wait_time = 10 + random.uniform(0, 5)
-                print(f'Waiting {wait_time:.1f}s for template database to become available')
-                time.sleep(wait_time)
-                
-                # Try one more time with the template
-                with psycopg.connect(conn_str, autocommit=True) as conn:
-                    with conn.cursor() as cur:
-                        # Check if database already exists and drop it
-                        cur.execute(sql.SQL('SELECT 1 FROM pg_database WHERE datname = %s'), (unique_db,))
-                        if cur.fetchone():
-                            print(f'Dropping existing database: {unique_db}')
-                            cur.execute(sql.SQL('DROP DATABASE {}').format(sql.Identifier(unique_db)))
-                        
-                        # Create from template (extensions are already in template)
-                        print(f'Final attempt: Creating database {unique_db} from template {base_template}')
-                        cur.execute(sql.SQL('CREATE DATABASE {} TEMPLATE {}').format(
-                            sql.Identifier(unique_db),
-                            sql.Identifier(base_template)
-                        ))
-                        print(f'Successfully created database from template on final attempt')
-                        return True
-            except Exception as e:
-                print(f'Final attempt failed: {e}')
-                # As a last resort, we could skip the test with a clear error
-                print(f'ERROR: Unable to create test database after all attempts')
-                print(f'This is likely due to high concurrency in CI environment')
-                return False
-        
-        if not create_database_with_retry():
-            exit(1)
-        "
+        echo "Creating clean isolated test database: $UNIQUE_DB_NAME"
+        python scripts/create_clean_test_database.py
 
         # Set the database name for subsequent steps
         echo "PG_DBNAME=$UNIQUE_DB_NAME" >> $GITHUB_ENV
