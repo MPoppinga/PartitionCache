@@ -21,6 +21,7 @@ SERVICES="postgres-integration redis-integration"
 PARALLEL=false
 COVERAGE=false
 PYTEST_ARGS=""
+IGNORE_PATHS=""
 
 # Function to show help
 show_help() {
@@ -39,6 +40,7 @@ show_help() {
     echo "  --parallel, -n       Run tests in parallel (using pytest-xdist)"
     echo "  --coverage           Generate coverage report"
     echo "  --ci                 Run in CI mode (uses different setup)"
+    echo "  --ignore PATH        Ignore path/file from tests (can be used multiple times)"
     echo "  --list-backends      List all available cache backends"
     echo "  --pytest-args ARGS   Pass additional arguments to pytest"
     echo "  --help, -h           Show this help message"
@@ -59,6 +61,7 @@ show_help() {
     echo "  $0 --cleanup --coverage         # Run tests with cleanup and coverage"
     echo "  $0 --no-setup --pattern queue   # Run queue tests assuming services are running"
     echo "  $0 --ci --parallel              # Run in CI mode with parallel execution"
+    echo "  $0 --ignore=tests/integration/test_pg_cron_integration.py # Exclude pg_cron tests"
 }
 
 # Function to list available backends
@@ -167,6 +170,11 @@ run_tests() {
     # Add coverage
     if [ "$COVERAGE" = true ]; then
         PYTEST_CMD="$PYTEST_CMD --cov=partitioncache --cov-report=html --cov-report=term-missing"
+    fi
+    
+    # Add ignore paths
+    if [ -n "$IGNORE_PATHS" ]; then
+        PYTEST_CMD="$PYTEST_CMD $IGNORE_PATHS"
     fi
     
     # Add extra pytest args
@@ -350,6 +358,23 @@ while [[ $# -gt 0 ]]; do
             ;;
         --ci)
             CI_MODE=true
+            shift
+            ;;
+        --ignore)
+            if [ -n "$IGNORE_PATHS" ]; then
+                IGNORE_PATHS="$IGNORE_PATHS --ignore=$2"
+            else
+                IGNORE_PATHS="--ignore=$2"
+            fi
+            shift 2
+            ;;
+        --ignore=*)
+            IGNORE_PATH="${1#*=}"
+            if [ -n "$IGNORE_PATHS" ]; then
+                IGNORE_PATHS="$IGNORE_PATHS --ignore=$IGNORE_PATH"
+            else
+                IGNORE_PATHS="--ignore=$IGNORE_PATH"
+            fi
             shift
             ;;
         --list-backends)
