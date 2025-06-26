@@ -61,7 +61,7 @@ jobs:
         platforms: linux/amd64
 
   integration-tests:
-    name: ${{ matrix.test-pattern.name }}
+    name: ${{ matrix.name }}
     runs-on: ubuntu-latest
     needs: build-postgres-image
     
@@ -75,30 +75,35 @@ jobs:
             parallel: true
             requires_redis: false
             job_index: 0
+            redis_bit_db: 10
           - name: "Redis Backends"
             pattern: "redis"
             suffix: "redis"
             parallel: true
             requires_redis: true
             job_index: 1
+            redis_bit_db: 11
           - name: "RocksDB Backends"
             pattern: "rocksdb"
             suffix: "rocksdb"
             parallel: false
             requires_redis: false
             job_index: 2
+            redis_bit_db: 12
           - name: "Queue Processing"
             pattern: "queue"
             suffix: "queue"
             parallel: false
             requires_redis: false
             job_index: 3
+            redis_bit_db: 13
           - name: "CLI Tools"
             pattern: "test_cli"
             suffix: "cli"
             parallel: true
             requires_redis: false
             job_index: 4
+            redis_bit_db: 14
 
     services:
       postgres:
@@ -127,7 +132,7 @@ jobs:
 
     env:
       # Define a unique database name for each job
-      UNIQUE_DB_NAME: partitioncache_integration_${{ matrix.test-pattern.suffix }}_${{ github.run_id }}
+      UNIQUE_DB_NAME: partitioncache_integration_${{ matrix.suffix }}_${{ github.run_id }}
       BASE_TEMPLATE_DB: partitioncache_integration
       
       # PostgreSQL configuration
@@ -152,24 +157,24 @@ jobs:
       # Redis configuration - isolated per job to prevent conflicts
       REDIS_HOST: localhost
       REDIS_PORT: 6379
-      REDIS_CACHE_DB: ${{ matrix.test-pattern.job_index }}
-      REDIS_BIT_DB: ${{ matrix.test-pattern.job_index + 10 }}
+      REDIS_CACHE_DB: ${{ matrix.job_index }}
+      REDIS_BIT_DB: ${{ matrix.redis_bit_db }}
       REDIS_BIT_BITSIZE: 200000
       REDIS_SET_HOST: localhost
       REDIS_SET_PORT: 6379
-      REDIS_SET_DB: ${{ matrix.test-pattern.job_index }}
+      REDIS_SET_DB: ${{ matrix.job_index }}
       
       # Cache backend configuration with job-specific prefixes
-      PG_ARRAY_CACHE_TABLE_PREFIX: ci_array_cache_${{ matrix.test-pattern.suffix }}
-      PG_BIT_CACHE_TABLE_PREFIX: ci_bit_cache_${{ matrix.test-pattern.suffix }}
+      PG_ARRAY_CACHE_TABLE_PREFIX: ci_array_cache_${{ matrix.suffix }}
+      PG_BIT_CACHE_TABLE_PREFIX: ci_bit_cache_${{ matrix.suffix }}
       PG_BIT_CACHE_BITSIZE: 200000
-      PG_ROARINGBIT_CACHE_TABLE_PREFIX: ci_roaring_cache_${{ matrix.test-pattern.suffix }}
+      PG_ROARINGBIT_CACHE_TABLE_PREFIX: ci_roaring_cache_${{ matrix.suffix }}
       
       # RocksDB configuration - isolated per job to prevent file conflicts
-      ROCKSDB_PATH: /tmp/ci_rocksdb_${{ matrix.test-pattern.suffix }}_${{ github.run_id }}
-      ROCKSDB_BIT_PATH: /tmp/ci_rocksdb_bit_${{ matrix.test-pattern.suffix }}_${{ github.run_id }}
+      ROCKSDB_PATH: /tmp/ci_rocksdb_${{ matrix.suffix }}_${{ github.run_id }}
+      ROCKSDB_BIT_PATH: /tmp/ci_rocksdb_bit_${{ matrix.suffix }}_${{ github.run_id }}
       ROCKSDB_BIT_BITSIZE: 200000
-      ROCKSDB_DICT_PATH: /tmp/ci_rocksdict_${{ matrix.test-pattern.suffix }}_${{ github.run_id }}
+      ROCKSDB_DICT_PATH: /tmp/ci_rocksdict_${{ matrix.suffix }}_${{ github.run_id }}
 
     steps:
     - name: Checkout repository
@@ -234,7 +239,7 @@ jobs:
         echo "DB_NAME=$UNIQUE_DB_NAME" >> $GITHUB_ENV
         echo "PG_QUEUE_DB=$UNIQUE_DB_NAME" >> $GITHUB_ENV
 
-        if [[ "${{ matrix.test-pattern.requires_redis }}" == "true" ]]; then
+        if [[ "${{ matrix.requires_redis }}" == "true" ]]; then
           echo "Waiting for Redis..."
           for i in {1..30}; do
             if redis-cli -h localhost -p 6379 ping >/dev/null 2>&1; then
@@ -266,9 +271,9 @@ jobs:
     - name: Run tests
       shell: micromamba-shell {0}
       run: |
-        PYTEST_FLAGS="--ci --pattern ${{ matrix.test-pattern.pattern }} --verbose"
+        PYTEST_FLAGS="--ci --pattern ${{ matrix.pattern }} --verbose"
         
-        if [[ "${{ matrix.test-pattern.parallel }}" == "true" ]]; then
+        if [[ "${{ matrix.parallel }}" == "true" ]]; then
           PYTEST_FLAGS="$PYTEST_FLAGS --parallel"
         fi
         
@@ -282,7 +287,7 @@ jobs:
       uses: actions/upload-artifact@v4
       if: always()
       with:
-        name: test-results-${{ matrix.test-pattern.name }}
+        name: test-results-${{ matrix.name }}
         path: |
           htmlcov/
           .coverage
@@ -296,7 +301,7 @@ jobs:
       if: github.event_name == 'push' && github.ref == 'refs/heads/main'
       with:
         file: ./coverage.xml
-        flags: integration-${{ matrix.test-pattern.name }}
+        flags: integration-${{ matrix.name }}
 
   e2e-tests:
     name: End-to-End Tests
