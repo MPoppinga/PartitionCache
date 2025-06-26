@@ -220,13 +220,13 @@ class TestPostgreSQLRoaringBitCacheHandler:
 
     def test_register_partition_key_valid(self, cache_handler, mock_cursor):
         """Test registering a valid partition key."""
-        # Mock that partition doesn't exist yet
-        mock_cursor.fetchone.return_value = None
+        # Mock sequence: metadata check returns None (new partition), extension check returns 1
+        mock_cursor.fetchone.side_effect = [None, (1,)]
 
         cache_handler.register_partition_key("new_partition", "integer")
 
-        # Should have called table creation
-        assert mock_cursor.execute.call_count >= 1
+        # Should have called table creation and metadata insertion
+        assert mock_cursor.execute.call_count >= 3
 
     def test_register_partition_key_invalid_datatype(self, cache_handler):
         """Test registering with invalid datatype raises error."""
@@ -282,13 +282,13 @@ class TestPostgreSQLRoaringBitCacheHandler:
 
     def test_ensure_partition_table_new_partition(self, cache_handler, mock_cursor):
         """Test ensuring partition table for new partition."""
-        # Mock partition doesn't exist
-        mock_cursor.fetchone.return_value = None
+        # Mock sequence: metadata check returns None (new partition), extension check returns 1
+        mock_cursor.fetchone.side_effect = [None, (1,)]
 
         cache_handler._ensure_partition_table("new_partition")
 
-        # Should have created the table
-        assert mock_cursor.execute.call_count >= 2
+        # Should have created the table (metadata check + extension check + create table)
+        assert mock_cursor.execute.call_count >= 3
 
     def test_ensure_partition_table_existing_partition(self, cache_handler, mock_cursor):
         """Test ensuring partition table for existing partition."""
