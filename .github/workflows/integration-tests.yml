@@ -523,7 +523,7 @@ jobs:
           --health-retries 10
 
     env:
-      UNIQUE_DB_NAME: partitioncache_pgcron_${{ github.run_id }}
+      UNIQUE_DB_NAME: partitioncache_integration
       CACHE_BACKEND: postgresql_array
       PG_HOST: localhost
       PG_PORT: 5432

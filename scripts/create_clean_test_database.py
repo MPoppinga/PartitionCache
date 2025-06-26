@@ -34,14 +34,21 @@ def setup_database_extensions_and_tables(unique_db: str) -> None:
     with psycopg.connect(db_conn_str, autocommit=True) as conn:
         with conn.cursor() as cur:
             print("Setting up extensions...")
-            # Create required extensions
-            cur.execute("CREATE EXTENSION IF NOT EXISTS pg_cron;")
+            # Create roaringbitmap extension (always available)
             cur.execute("CREATE EXTENSION IF NOT EXISTS roaringbitmap;")
 
-            # Grant necessary permissions for pg_cron
-            cur.execute("GRANT USAGE ON SCHEMA cron TO integration_user;")
-            cur.execute("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA cron TO integration_user;")
-            cur.execute("GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA cron TO integration_user;")
+            # Try to create pg_cron extension (may fail if not the designated cron database)
+            try:
+                cur.execute("CREATE EXTENSION IF NOT EXISTS pg_cron;")
+                print("pg_cron extension created successfully")
+
+                # Grant necessary permissions for pg_cron only if extension was created
+                cur.execute("GRANT USAGE ON SCHEMA cron TO integration_user;")
+                cur.execute("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA cron TO integration_user;")
+                cur.execute("GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA cron TO integration_user;")
+            except Exception as e:
+                print(f"pg_cron extension not created (this may be expected): {e}")
+                print("Note: pg_cron can only be created in the database specified by cron.database_name")
 
             print("Creating test tables...")
             # Create test tables needed for integration tests
