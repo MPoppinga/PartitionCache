@@ -212,26 +212,76 @@ jobs:
         python -c "
         import os
         import psycopg
+        import time
+        import random
         from psycopg import sql
         
         unique_db = os.environ['UNIQUE_DB_NAME']
         base_template = os.environ['BASE_TEMPLATE_DB']
         conn_str = f'postgresql://integration_user:integration_password@localhost:5432/postgres'
         
-        with psycopg.connect(conn_str, autocommit=True) as conn:
-            with conn.cursor() as cur:
-                # Check if database already exists and drop it to ensure clean state
-                cur.execute(sql.SQL('SELECT 1 FROM pg_database WHERE datname = %s'), (unique_db,))
-                if cur.fetchone():
-                    print(f'Dropping existing database: {unique_db}')
-                    cur.execute(sql.SQL('DROP DATABASE {}').format(sql.Identifier(unique_db)))
+        def create_database_with_retry(max_retries=5):
+            for attempt in range(max_retries):
+                try:
+                    with psycopg.connect(conn_str, autocommit=True) as conn:
+                        with conn.cursor() as cur:
+                            # Check if database already exists and drop it to ensure clean state
+                            cur.execute(sql.SQL('SELECT 1 FROM pg_database WHERE datname = %s'), (unique_db,))
+                            if cur.fetchone():
+                                print(f'Dropping existing database: {unique_db}')
+                                cur.execute(sql.SQL('DROP DATABASE {}').format(sql.Identifier(unique_db)))
+                            
+                            # Create new isolated database from base template
+                            print(f'Creating database: {unique_db} from template: {base_template} (attempt {attempt + 1})')
+                            cur.execute(sql.SQL('CREATE DATABASE {} TEMPLATE {}').format(
+                                sql.Identifier(unique_db),
+                                sql.Identifier(base_template)
+                            ))
+                            print(f'Successfully created database: {unique_db}')
+                            return True
+                            
+                except psycopg.errors.ObjectInUse as e:
+                    if attempt < max_retries - 1:
+                        # Add random jitter to prevent thundering herd
+                        wait_time = (2 ** attempt) + random.uniform(0, 1)
+                        print(f'Template database in use, retrying in {wait_time:.1f}s (attempt {attempt + 1}/{max_retries})')
+                        time.sleep(wait_time)
+                    else:
+                        print(f'Failed to create database after {max_retries} attempts: {e}')
+                        # Fallback: create empty database and set up manually
+                        return create_fallback_database()
+                except Exception as e:
+                    print(f'Unexpected error creating database: {e}')
+                    if attempt == max_retries - 1:
+                        raise
+                    time.sleep(1)
+            
+            return False
+        
+        def create_fallback_database():
+            '''Fallback: create empty database and set up required extensions'''
+            try:
+                print(f'Fallback: Creating empty database {unique_db} without template')
+                with psycopg.connect(conn_str, autocommit=True) as conn:
+                    with conn.cursor() as cur:
+                        # Create empty database
+                        cur.execute(sql.SQL('CREATE DATABASE {}').format(sql.Identifier(unique_db)))
                 
-                # Create new isolated database from base template
-                print(f'Creating database: {unique_db} from template: {base_template}')
-                cur.execute(sql.SQL('CREATE DATABASE {} TEMPLATE {}').format(
-                    sql.Identifier(unique_db),
-                    sql.Identifier(base_template)
-                ))
+                # Connect to new database and set up extensions
+                fallback_conn_str = f'postgresql://integration_user:integration_password@localhost:5432/{unique_db}'
+                with psycopg.connect(fallback_conn_str, autocommit=True) as conn:
+                    with conn.cursor() as cur:
+                        # Create extensions
+                        cur.execute('CREATE EXTENSION IF NOT EXISTS pg_cron')
+                        cur.execute('CREATE EXTENSION IF NOT EXISTS roaringbitmap')
+                        print(f'Successfully created fallback database: {unique_db} with extensions')
+                        return True
+            except Exception as e:
+                print(f'Fallback database creation failed: {e}')
+                return False
+        
+        if not create_database_with_retry():
+            exit(1)
         "
 
         # Set the database name for subsequent steps
@@ -388,26 +438,76 @@ jobs:
         python -c "
         import os
         import psycopg
+        import time
+        import random
         from psycopg import sql
         
         unique_db = os.environ['UNIQUE_DB_NAME']
         base_template = os.environ['BASE_TEMPLATE_DB']
         conn_str = f'postgresql://integration_user:integration_password@localhost:5432/postgres'
         
-        with psycopg.connect(conn_str, autocommit=True) as conn:
-            with conn.cursor() as cur:
-                # Check if database already exists and drop it to ensure clean state
-                cur.execute(sql.SQL('SELECT 1 FROM pg_database WHERE datname = %s'), (unique_db,))
-                if cur.fetchone():
-                    print(f'Dropping existing database: {unique_db}')
-                    cur.execute(sql.SQL('DROP DATABASE {}').format(sql.Identifier(unique_db)))
+        def create_database_with_retry(max_retries=5):
+            for attempt in range(max_retries):
+                try:
+                    with psycopg.connect(conn_str, autocommit=True) as conn:
+                        with conn.cursor() as cur:
+                            # Check if database already exists and drop it to ensure clean state
+                            cur.execute(sql.SQL('SELECT 1 FROM pg_database WHERE datname = %s'), (unique_db,))
+                            if cur.fetchone():
+                                print(f'Dropping existing database: {unique_db}')
+                                cur.execute(sql.SQL('DROP DATABASE {}').format(sql.Identifier(unique_db)))
+                            
+                            # Create new isolated database from base template
+                            print(f'Creating database: {unique_db} from template: {base_template} (attempt {attempt + 1})')
+                            cur.execute(sql.SQL('CREATE DATABASE {} TEMPLATE {}').format(
+                                sql.Identifier(unique_db),
+                                sql.Identifier(base_template)
+                            ))
+                            print(f'Successfully created database: {unique_db}')
+                            return True
+                            
+                except psycopg.errors.ObjectInUse as e:
+                    if attempt < max_retries - 1:
+                        # Add random jitter to prevent thundering herd
+                        wait_time = (2 ** attempt) + random.uniform(0, 1)
+                        print(f'Template database in use, retrying in {wait_time:.1f}s (attempt {attempt + 1}/{max_retries})')
+                        time.sleep(wait_time)
+                    else:
+                        print(f'Failed to create database after {max_retries} attempts: {e}')
+                        # Fallback: create empty database and set up manually
+                        return create_fallback_database()
+                except Exception as e:
+                    print(f'Unexpected error creating database: {e}')
+                    if attempt == max_retries - 1:
+                        raise
+                    time.sleep(1)
+            
+            return False
+        
+        def create_fallback_database():
+            '''Fallback: create empty database and set up required extensions'''
+            try:
+                print(f'Fallback: Creating empty database {unique_db} without template')
+                with psycopg.connect(conn_str, autocommit=True) as conn:
+                    with conn.cursor() as cur:
+                        # Create empty database
+                        cur.execute(sql.SQL('CREATE DATABASE {}').format(sql.Identifier(unique_db)))
                 
-                # Create new isolated database from base template
-                print(f'Creating database: {unique_db} from template: {base_template}')
-                cur.execute(sql.SQL('CREATE DATABASE {} TEMPLATE {}').format(
-                    sql.Identifier(unique_db),
-                    sql.Identifier(base_template)
-                ))
+                # Connect to new database and set up extensions
+                fallback_conn_str = f'postgresql://integration_user:integration_password@localhost:5432/{unique_db}'
+                with psycopg.connect(fallback_conn_str, autocommit=True) as conn:
+                    with conn.cursor() as cur:
+                        # Create extensions
+                        cur.execute('CREATE EXTENSION IF NOT EXISTS pg_cron')
+                        cur.execute('CREATE EXTENSION IF NOT EXISTS roaringbitmap')
+                        print(f'Successfully created fallback database: {unique_db} with extensions')
+                        return True
+            except Exception as e:
+                print(f'Fallback database creation failed: {e}')
+                return False
+        
+        if not create_database_with_retry():
+            exit(1)
         "
 
         # Set the database name for subsequent steps

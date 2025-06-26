@@ -126,10 +126,13 @@ def db_connection(tmp_path_factory):
                     ]
 
                     for name, btype, region_id, city_id, x, y, rating in sample_businesses:
-                        cur.execute("""
+                        cur.execute(
+                            """
                             INSERT INTO test_businesses (name, business_type, region_id, city_id, x, y, rating)
                             VALUES (%s, %s, %s, %s, %s, %s, %s);
-                        """, (name, btype, region_id, city_id, x, y, rating))
+                        """,
+                            (name, btype, region_id, city_id, x, y, rating),
+                        )
         except Exception as e:
             pytest.skip(f"DB setup failed: {e}")
         finally:
@@ -163,14 +166,17 @@ def db_session(db_connection):
     # Start fresh transaction
     with conn.cursor() as cur:
         # Complete cleanup of all cache tables (handle all possible prefixes)
-        cache_prefixes = ['partitioncache_%', '%_cache_%', '%queue%']
+        cache_prefixes = ["partitioncache_%", "%_cache_%", "%queue%"]
         all_cache_tables = set()
 
         for prefix in cache_prefixes:
-            cur.execute("""
+            cur.execute(
+                """
                 SELECT tablename FROM pg_tables 
                 WHERE tablename LIKE %s AND schemaname = 'public';
-            """, (prefix,))
+            """,
+                (prefix,),
+            )
             tables = cur.fetchall()
             all_cache_tables.update(table[0] for table in tables)
 
@@ -255,10 +261,13 @@ def db_session(db_connection):
         ]
 
         for name, btype, region_id, city_id, x, y, rating in sample_businesses:
-            cur.execute("""
+            cur.execute(
+                """
                 INSERT INTO test_businesses (name, business_type, region_id, city_id, x, y, rating)
                 VALUES (%s, %s, %s, %s, %s, %s, %s);
-            """, (name, btype, region_id, city_id, x, y, rating))
+            """,
+                (name, btype, region_id, city_id, x, y, rating),
+            )
 
     yield conn
 
@@ -352,7 +361,7 @@ def cache_client(request, db_session):
             os.environ["DB_USER"] = os.getenv("PG_USER", "integration_user")
         if not os.getenv("DB_PASSWORD"):
             os.environ["DB_PASSWORD"] = os.getenv("PG_PASSWORD", "integration_password")
-            
+
         # Set backend-specific table prefixes
         if cache_backend == "postgresql_array" and not os.getenv("PG_ARRAY_CACHE_TABLE_PREFIX"):
             os.environ["PG_ARRAY_CACHE_TABLE_PREFIX"] = "integration_array_cache"
@@ -362,7 +371,7 @@ def cache_client(request, db_session):
                 os.environ["PG_BIT_CACHE_BITSIZE"] = "200000"
         elif cache_backend == "postgresql_roaringbit" and not os.getenv("PG_ROARINGBIT_CACHE_TABLE_PREFIX"):
             os.environ["PG_ROARINGBIT_CACHE_TABLE_PREFIX"] = "integration_roaring_cache"
-            
+
     elif cache_backend.startswith("redis"):
         # Set Redis connection variables if not already set
         if not os.getenv("REDIS_CACHE_DB"):
@@ -373,7 +382,7 @@ def cache_client(request, db_session):
             os.environ["REDIS_SET_DB"] = "0"
         if not os.getenv("REDIS_BIT_BITSIZE"):
             os.environ["REDIS_BIT_BITSIZE"] = "200000"
-            
+
     elif cache_backend == "rocksdb_set":
         temp_dir = tempfile.mkdtemp(prefix="rocksdb_test_")
         original_env_vars["ROCKSDB_PATH"] = os.getenv("ROCKSDB_PATH")
@@ -418,7 +427,7 @@ def cache_client(request, db_session):
             for partition_key, _ in TEST_PARTITION_KEYS:
                 try:
                     # Check if partition exists before attempting cleanup
-                    if hasattr(cache_handler, '_get_partition_datatype'):
+                    if hasattr(cache_handler, "_get_partition_datatype"):
                         # For PostgreSQL backends, check if partition exists
                         if cache_handler._get_partition_datatype(partition_key) is None:
                             continue  # Skip non-existent partitions
