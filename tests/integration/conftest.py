@@ -340,7 +340,41 @@ def cache_client(request, db_session):
     os.environ["CACHE_BACKEND"] = cache_backend
 
     # Set up backend-specific environment variables
-    if cache_backend == "rocksdb_set":
+    if cache_backend.startswith("postgresql"):
+        # Set PostgreSQL database connection variables if not already set
+        if not os.getenv("DB_NAME"):
+            os.environ["DB_NAME"] = os.getenv("PG_DBNAME", "partitioncache_integration")
+        if not os.getenv("DB_HOST"):
+            os.environ["DB_HOST"] = os.getenv("PG_HOST", "localhost")
+        if not os.getenv("DB_PORT"):
+            os.environ["DB_PORT"] = os.getenv("PG_PORT", "5432")
+        if not os.getenv("DB_USER"):
+            os.environ["DB_USER"] = os.getenv("PG_USER", "integration_user")
+        if not os.getenv("DB_PASSWORD"):
+            os.environ["DB_PASSWORD"] = os.getenv("PG_PASSWORD", "integration_password")
+            
+        # Set backend-specific table prefixes
+        if cache_backend == "postgresql_array" and not os.getenv("PG_ARRAY_CACHE_TABLE_PREFIX"):
+            os.environ["PG_ARRAY_CACHE_TABLE_PREFIX"] = "integration_array_cache"
+        elif cache_backend == "postgresql_bit" and not os.getenv("PG_BIT_CACHE_TABLE_PREFIX"):
+            os.environ["PG_BIT_CACHE_TABLE_PREFIX"] = "integration_bit_cache"
+            if not os.getenv("PG_BIT_CACHE_BITSIZE"):
+                os.environ["PG_BIT_CACHE_BITSIZE"] = "200000"
+        elif cache_backend == "postgresql_roaringbit" and not os.getenv("PG_ROARINGBIT_CACHE_TABLE_PREFIX"):
+            os.environ["PG_ROARINGBIT_CACHE_TABLE_PREFIX"] = "integration_roaring_cache"
+            
+    elif cache_backend.startswith("redis"):
+        # Set Redis connection variables if not already set
+        if not os.getenv("REDIS_CACHE_DB"):
+            os.environ["REDIS_CACHE_DB"] = "0"
+        if not os.getenv("REDIS_BIT_DB"):
+            os.environ["REDIS_BIT_DB"] = "1"
+        if not os.getenv("REDIS_SET_DB"):
+            os.environ["REDIS_SET_DB"] = "0"
+        if not os.getenv("REDIS_BIT_BITSIZE"):
+            os.environ["REDIS_BIT_BITSIZE"] = "200000"
+            
+    elif cache_backend == "rocksdb_set":
         temp_dir = tempfile.mkdtemp(prefix="rocksdb_test_")
         original_env_vars["ROCKSDB_PATH"] = os.getenv("ROCKSDB_PATH")
         os.environ["ROCKSDB_PATH"] = temp_dir
