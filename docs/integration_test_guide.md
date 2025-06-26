@@ -190,6 +190,42 @@ psql -h localhost -p 5434 -U integration_user -d partitioncache_integration
 redis-cli -h localhost -p 6381 ping
 ```
 
+## Queue Processing Testing
+
+### Manual vs pg_cron Processing
+
+Integration tests use two different approaches for queue processing:
+
+1. **Manual Processing (Default)**
+   - Used by most integration tests to avoid concurrency issues
+   - Calls `partitioncache_manual_process_queue()` directly
+   - Provides deterministic, immediate processing
+   - No job name conflicts in parallel CI runs
+
+2. **pg_cron Processing (Production)**
+   - Used by dedicated `test_pg_cron_integration.py`
+   - Tests real pg_cron scheduling and execution
+   - Uses database-specific job name prefixes for isolation
+   - Validates production queue processing behavior
+
+### Manual Processing Usage
+
+```python
+# In tests, process queue manually
+with db_session.cursor() as cur:
+    cur.execute("SELECT * FROM partitioncache_manual_process_queue(10)")
+    result = cur.fetchone()
+    processed_count, message = result
+```
+
+### pg_cron Isolation Strategy
+
+For tests that must use pg_cron:
+- Job names include database name prefix: `{db_name}_test_{timestamp}`
+- Each test creates unique job names to avoid conflicts
+- Tests clean up their jobs after completion
+- Only one test class uses pg_cron to minimize conflicts
+
 ## Performance Expectations
 
 - **Basic Operations**: < 10ms per operation

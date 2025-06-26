@@ -334,6 +334,9 @@ jobs:
       run: |
         PYTEST_FLAGS="--ci --pattern ${{ matrix.pattern }} --verbose"
         
+        # Exclude pg_cron tests from regular runs (they run in dedicated job)
+        PYTEST_FLAGS="$PYTEST_FLAGS --ignore=tests/integration/test_pg_cron_integration.py"
+        
         if [[ "${{ matrix.parallel }}" == "true" ]]; then
           PYTEST_FLAGS="$PYTEST_FLAGS --parallel"
         fi
@@ -673,10 +676,207 @@ jobs:
           performance-results/
         retention-days: 30
 
+  pg-cron-tests:
+    name: pg_cron Integration Tests
+    runs-on: ubuntu-latest
+    needs: [build-postgres-image, integration-tests]
+    if: always() && needs.integration-tests.result == 'success'
+    
+    services:
+      postgres:
+        image: ghcr.io/mpoppinga/postgres-test-extensions:${{ needs.build-postgres-image.outputs.image-tag }}
+        env:
+          POSTGRES_DB: partitioncache_integration
+          POSTGRES_USER: integration_user
+          POSTGRES_PASSWORD: integration_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U integration_user -d partitioncache_integration"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      UNIQUE_DB_NAME: partitioncache_pgcron_${{ github.run_id }}
+      BASE_TEMPLATE_DB: partitioncache_integration
+      CACHE_BACKEND: postgresql_array
+      PG_HOST: localhost
+      PG_PORT: 5432
+      PG_USER: integration_user
+      PG_PASSWORD: integration_password
+      DB_HOST: localhost
+      DB_PORT: 5432
+      DB_USER: integration_user
+      DB_PASSWORD: integration_password
+      PG_QUEUE_HOST: localhost
+      PG_QUEUE_PORT: 5432
+      PG_QUEUE_USER: integration_user
+      PG_QUEUE_PASSWORD: integration_password
+      QUERY_QUEUE_PROVIDER: postgresql
+      PG_ARRAY_CACHE_TABLE_PREFIX: ci_array_cache_pgcron
+      PG_QUEUE_TABLE_PREFIX: ci_queue_pgcron
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Setup micromamba
+      uses: mamba-org/setup-micromamba@v1
+      with:
+        micromamba-version: 'latest'
+        environment-file: .github/micromamba-env.yml
+        init-shell: >-
+          bash
+        cache-environment: true
+        post-cleanup: 'all'
+
+    - name: Install PartitionCache
+      shell: micromamba-shell {0}
+      run: |
+        pip install -e ".[testing,db]"
+
+    - name: Create and configure test database
+      shell: micromamba-shell {0}
+      run: |
+        echo "Waiting for PostgreSQL..."
+        for i in {1..30}; do
+          if python -c "import psycopg; psycopg.connect('postgresql://integration_user:integration_password@localhost:5432/partitioncache_integration')" 2>/dev/null; then
+            echo "PostgreSQL ready"
+            break
+          fi
+          sleep 2
+        done
+
+        echo "Creating isolated test database: $UNIQUE_DB_NAME from base template: $BASE_TEMPLATE_DB"
+        python -c "
+        import os
+        import psycopg
+        import time
+        import random
+        from psycopg import sql
+        
+        unique_db = os.environ['UNIQUE_DB_NAME']
+        base_template = os.environ['BASE_TEMPLATE_DB']
+        conn_str = f'postgresql://integration_user:integration_password@localhost:5432/postgres'
+        
+        def create_database_with_retry(max_retries=5):
+            for attempt in range(max_retries):
+                try:
+                    with psycopg.connect(conn_str, autocommit=True) as conn:
+                        with conn.cursor() as cur:
+                            # Check if database already exists and drop it to ensure clean state
+                            cur.execute(sql.SQL('SELECT 1 FROM pg_database WHERE datname = %s'), (unique_db,))
+                            if cur.fetchone():
+                                print(f'Dropping existing database: {unique_db}')
+                                cur.execute(sql.SQL('DROP DATABASE {}').format(sql.Identifier(unique_db)))
+                            
+                            # Create new isolated database from base template
+                            print(f'Creating database: {unique_db} from template: {base_template} (attempt {attempt + 1})')
+                            cur.execute(sql.SQL('CREATE DATABASE {} TEMPLATE {}').format(
+                                sql.Identifier(unique_db),
+                                sql.Identifier(base_template)
+                            ))
+                            print(f'Successfully created database: {unique_db}')
+                            return True
+                            
+                except psycopg.errors.ObjectInUse as e:
+                    if attempt < max_retries - 1:
+                        # Add random jitter to prevent thundering herd
+                        wait_time = (2 ** attempt) + random.uniform(0, 1)
+                        print(f'Template database in use, retrying in {wait_time:.1f}s (attempt {attempt + 1}/{max_retries})')
+                        time.sleep(wait_time)
+                    else:
+                        print(f'Failed to create database after {max_retries} attempts: {e}')
+                        # Fallback: wait for template to be available then retry
+                        return create_fallback_database()
+                except Exception as e:
+                    print(f'Unexpected error creating database: {e}')
+                    if attempt == max_retries - 1:
+                        raise
+                    time.sleep(1)
+            
+            return False
+        
+        def create_fallback_database():
+            '''Fallback: wait for template to be available then retry'''
+            try:
+                print(f'Fallback: Template database is busy, waiting before final retry...')
+                # Wait a longer time to let other jobs finish with the template
+                wait_time = 10 + random.uniform(0, 5)
+                print(f'Waiting {wait_time:.1f}s for template database to become available')
+                time.sleep(wait_time)
+                
+                # Try one more time with the template
+                with psycopg.connect(conn_str, autocommit=True) as conn:
+                    with conn.cursor() as cur:
+                        # Check if database already exists and drop it
+                        cur.execute(sql.SQL('SELECT 1 FROM pg_database WHERE datname = %s'), (unique_db,))
+                        if cur.fetchone():
+                            print(f'Dropping existing database: {unique_db}')
+                            cur.execute(sql.SQL('DROP DATABASE {}').format(sql.Identifier(unique_db)))
+                        
+                        # Create from template (extensions are already in template)
+                        print(f'Final attempt: Creating database {unique_db} from template {base_template}')
+                        cur.execute(sql.SQL('CREATE DATABASE {} TEMPLATE {}').format(
+                            sql.Identifier(unique_db),
+                            sql.Identifier(base_template)
+                        ))
+                        print(f'Successfully created database from template on final attempt')
+                        return True
+            except Exception as e:
+                print(f'Final attempt failed: {e}')
+                # As a last resort, we could skip the test with a clear error
+                print(f'ERROR: Unable to create test database after all attempts')
+                print(f'This is likely due to high concurrency in CI environment')
+                return False
+        
+        if not create_database_with_retry():
+            exit(1)
+        "
+
+        # Set the database name for subsequent steps
+        echo "PG_DBNAME=$UNIQUE_DB_NAME" >> $GITHUB_ENV
+        echo "DB_NAME=$UNIQUE_DB_NAME" >> $GITHUB_ENV
+        echo "PG_QUEUE_DB=$UNIQUE_DB_NAME" >> $GITHUB_ENV
+
+    - name: Verify pg_cron extension
+      shell: micromamba-shell {0}
+      run: |
+        python -c "
+        import os
+        import psycopg
+        db_name = os.environ['PG_DBNAME']
+        conn_str = f'postgresql://integration_user:integration_password@localhost:5432/{db_name}'
+        with psycopg.connect(conn_str, autocommit=True) as conn:
+            with conn.cursor() as cur:
+                cur.execute('SELECT extname FROM pg_extension WHERE extname = %s', ('pg_cron',))
+                if not cur.fetchone():
+                    raise Exception('pg_cron extension not found')
+                print('pg_cron extension verified')
+        "
+
+    - name: Run pg_cron integration tests
+      shell: micromamba-shell {0}
+      run: |
+        # Run only the pg_cron integration tests
+        python -m pytest tests/integration/test_pg_cron_integration.py -v
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: pg-cron-test-results
+        path: |
+          htmlcov/
+          .coverage
+          pytest-results.xml
+        retention-days: 7
+
   test-summary:
     name: Test Summary
     runs-on: ubuntu-latest
-    needs: [integration-tests, e2e-tests, performance-tests]
+    needs: [integration-tests, e2e-tests, performance-tests, pg-cron-tests]
     if: always()
     
     steps:
