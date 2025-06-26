@@ -109,13 +109,12 @@ jobs:
       postgres:
         image: ghcr.io/mpoppinga/postgres-test-extensions:${{ needs.build-postgres-image.outputs.image-tag }}
         env:
-          POSTGRES_DB: partitioncache_integration
           POSTGRES_USER: integration_user
           POSTGRES_PASSWORD: integration_password
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U integration_user -d partitioncache_integration"
+          --health-cmd "pg_isready -U integration_user -d postgres"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 10
@@ -133,7 +132,6 @@ jobs:
     env:
       # Define a unique database name for each job
       UNIQUE_DB_NAME: partitioncache_integration_${{ matrix.suffix }}_${{ github.run_id }}
-      BASE_TEMPLATE_DB: partitioncache_integration
       
       # PostgreSQL configuration
       PG_HOST: localhost
@@ -201,99 +199,15 @@ jobs:
       run: |
         echo "Waiting for PostgreSQL..."
         for i in {1..30}; do
-          if python -c "import psycopg; psycopg.connect('postgresql://integration_user:integration_password@localhost:5432/partitioncache_integration')" 2>/dev/null; then
+          if python -c "import psycopg; psycopg.connect('postgresql://integration_user:integration_password@localhost:5432/postgres')" 2>/dev/null; then
             echo "PostgreSQL ready"
             break
           fi
           sleep 2
         done
 
-        echo "Creating isolated test database: $UNIQUE_DB_NAME from base template: $BASE_TEMPLATE_DB"
-        python -c "
-        import os
-        import psycopg
-        import time
-        import random
-        from psycopg import sql
-        
-        unique_db = os.environ['UNIQUE_DB_NAME']
-        base_template = os.environ['BASE_TEMPLATE_DB']
-        conn_str = f'postgresql://integration_user:integration_password@localhost:5432/postgres'
-        
-        def create_database_with_retry(max_retries=5):
-            for attempt in range(max_retries):
-                try:
-                    with psycopg.connect(conn_str, autocommit=True) as conn:
-                        with conn.cursor() as cur:
-                            # Check if database already exists and drop it to ensure clean state
-                            cur.execute(sql.SQL('SELECT 1 FROM pg_database WHERE datname = %s'), (unique_db,))
-                            if cur.fetchone():
-                                print(f'Dropping existing database: {unique_db}')
-                                cur.execute(sql.SQL('DROP DATABASE {}').format(sql.Identifier(unique_db)))
-                            
-                            # Create new isolated database from base template
-                            print(f'Creating database: {unique_db} from template: {base_template} (attempt {attempt + 1})')
-                            cur.execute(sql.SQL('CREATE DATABASE {} TEMPLATE {}').format(
-                                sql.Identifier(unique_db),
-                                sql.Identifier(base_template)
-                            ))
-                            print(f'Successfully created database: {unique_db}')
-                            return True
-                            
-                except psycopg.errors.ObjectInUse as e:
-                    if attempt < max_retries - 1:
-                        # Add random jitter to prevent thundering herd
-                        wait_time = (2 ** attempt) + random.uniform(0, 1)
-                        print(f'Template database in use, retrying in {wait_time:.1f}s (attempt {attempt + 1}/{max_retries})')
-                        time.sleep(wait_time)
-                    else:
-                        print(f'Failed to create database after {max_retries} attempts: {e}')
-                        # Fallback: create empty database and set up manually
-                        return create_fallback_database()
-                except Exception as e:
-                    print(f'Unexpected error creating database: {e}')
-                    if attempt == max_retries - 1:
-                        raise
-                    time.sleep(1)
-            
-            return False
-        
-        def create_fallback_database():
-            '''Fallback: wait for template to be available then retry'''
-            try:
-                print(f'Fallback: Template database is busy, waiting before final retry...')
-                # Wait a longer time to let other jobs finish with the template
-                wait_time = 10 + random.uniform(0, 5)
-                print(f'Waiting {wait_time:.1f}s for template database to become available')
-                time.sleep(wait_time)
-                
-                # Try one more time with the template
-                with psycopg.connect(conn_str, autocommit=True) as conn:
-                    with conn.cursor() as cur:
-                        # Check if database already exists and drop it
-                        cur.execute(sql.SQL('SELECT 1 FROM pg_database WHERE datname = %s'), (unique_db,))
-                        if cur.fetchone():
-                            print(f'Dropping existing database: {unique_db}')
-                            cur.execute(sql.SQL('DROP DATABASE {}').format(sql.Identifier(unique_db)))
-                        
-                        # Create from template (extensions are already in template)
-                        print(f'Final attempt: Creating database {unique_db} from template {base_template}')
-                        cur.execute(sql.SQL('CREATE DATABASE {} TEMPLATE {}').format(
-                            sql.Identifier(unique_db),
-                            sql.Identifier(base_template)
-                        ))
-                        print(f'Successfully created database from template on final attempt')
-                        return True
-            except Exception as e:
-                print(f'Final attempt failed: {e}')
-                # As a last resort, we could skip the test with a clear error
-                print(f'ERROR: Unable to create test database after all attempts')
-                print(f'This is likely due to high concurrency in CI environment')
-                return False
-        
-        if not create_database_with_retry():
-            exit(1)
-        "
+        echo "Creating clean isolated test database: $UNIQUE_DB_NAME"
+        python scripts/create_clean_test_database.py
 
         # Set the database name for subsequent steps
         echo "PG_DBNAME=$UNIQUE_DB_NAME" >> $GITHUB_ENV
@@ -377,13 +291,12 @@ jobs:
       postgres:
         image: ghcr.io/mpoppinga/postgres-test-extensions:${{ needs.build-postgres-image.outputs.image-tag }}
         env:
-          POSTGRES_DB: partitioncache_integration
           POSTGRES_USER: integration_user
           POSTGRES_PASSWORD: integration_password
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U integration_user -d partitioncache_integration"
+          --health-cmd "pg_isready -U integration_user -d postgres"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 10
@@ -400,7 +313,6 @@ jobs:
 
     env:
       UNIQUE_DB_NAME: partitioncache_e2e_${{ github.run_id }}
-      BASE_TEMPLATE_DB: partitioncache_integration
       CACHE_BACKEND: postgresql_array
       PG_HOST: localhost
       PG_PORT: 5432
@@ -441,99 +353,15 @@ jobs:
       run: |
         echo "Waiting for PostgreSQL..."
         for i in {1..30}; do
-          if python -c "import psycopg; psycopg.connect('postgresql://integration_user:integration_password@localhost:5432/partitioncache_integration')" 2>/dev/null; then
+          if python -c "import psycopg; psycopg.connect('postgresql://integration_user:integration_password@localhost:5432/postgres')" 2>/dev/null; then
             echo "PostgreSQL ready"
             break
           fi
           sleep 2
         done
 
-        echo "Creating isolated test database: $UNIQUE_DB_NAME from base template: $BASE_TEMPLATE_DB"
-        python -c "
-        import os
-        import psycopg
-        import time
-        import random
-        from psycopg import sql
-        
-        unique_db = os.environ['UNIQUE_DB_NAME']
-        base_template = os.environ['BASE_TEMPLATE_DB']
-        conn_str = f'postgresql://integration_user:integration_password@localhost:5432/postgres'
-        
-        def create_database_with_retry(max_retries=5):
-            for attempt in range(max_retries):
-                try:
-                    with psycopg.connect(conn_str, autocommit=True) as conn:
-                        with conn.cursor() as cur:
-                            # Check if database already exists and drop it to ensure clean state
-                            cur.execute(sql.SQL('SELECT 1 FROM pg_database WHERE datname = %s'), (unique_db,))
-                            if cur.fetchone():
-                                print(f'Dropping existing database: {unique_db}')
-                                cur.execute(sql.SQL('DROP DATABASE {}').format(sql.Identifier(unique_db)))
-                            
-                            # Create new isolated database from base template
-                            print(f'Creating database: {unique_db} from template: {base_template} (attempt {attempt + 1})')
-                            cur.execute(sql.SQL('CREATE DATABASE {} TEMPLATE {}').format(
-                                sql.Identifier(unique_db),
-                                sql.Identifier(base_template)
-                            ))
-                            print(f'Successfully created database: {unique_db}')
-                            return True
-                            
-                except psycopg.errors.ObjectInUse as e:
-                    if attempt < max_retries - 1:
-                        # Add random jitter to prevent thundering herd
-                        wait_time = (2 ** attempt) + random.uniform(0, 1)
-                        print(f'Template database in use, retrying in {wait_time:.1f}s (attempt {attempt + 1}/{max_retries})')
-                        time.sleep(wait_time)
-                    else:
-                        print(f'Failed to create database after {max_retries} attempts: {e}')
-                        # Fallback: create empty database and set up manually
-                        return create_fallback_database()
-                except Exception as e:
-                    print(f'Unexpected error creating database: {e}')
-                    if attempt == max_retries - 1:
-                        raise
-                    time.sleep(1)
-            
-            return False
-        
-        def create_fallback_database():
-            '''Fallback: wait for template to be available then retry'''
-            try:
-                print(f'Fallback: Template database is busy, waiting before final retry...')
-                # Wait a longer time to let other jobs finish with the template
-                wait_time = 10 + random.uniform(0, 5)
-                print(f'Waiting {wait_time:.1f}s for template database to become available')
-                time.sleep(wait_time)
-                
-                # Try one more time with the template
-                with psycopg.connect(conn_str, autocommit=True) as conn:
-                    with conn.cursor() as cur:
-                        # Check if database already exists and drop it
-                        cur.execute(sql.SQL('SELECT 1 FROM pg_database WHERE datname = %s'), (unique_db,))
-                        if cur.fetchone():
-                            print(f'Dropping existing database: {unique_db}')
-                            cur.execute(sql.SQL('DROP DATABASE {}').format(sql.Identifier(unique_db)))
-                        
-                        # Create from template (extensions are already in template)
-                        print(f'Final attempt: Creating database {unique_db} from template {base_template}')
-                        cur.execute(sql.SQL('CREATE DATABASE {} TEMPLATE {}').format(
-                            sql.Identifier(unique_db),
-                            sql.Identifier(base_template)
-                        ))
-                        print(f'Successfully created database from template on final attempt')
-                        return True
-            except Exception as e:
-                print(f'Final attempt failed: {e}')
-                # As a last resort, we could skip the test with a clear error
-                print(f'ERROR: Unable to create test database after all attempts')
-                print(f'This is likely due to high concurrency in CI environment')
-                return False
-        
-        if not create_database_with_retry():
-            exit(1)
-        "
+        echo "Creating clean isolated test database: $UNIQUE_DB_NAME"
+        python scripts/create_clean_test_database.py
 
         # Set the database name for subsequent steps
         echo "PG_DBNAME=$UNIQUE_DB_NAME" >> $GITHUB_ENV
@@ -571,20 +399,18 @@ jobs:
       postgres:
         image: ghcr.io/mpoppinga/postgres-test-extensions:${{ needs.build-postgres-image.outputs.image-tag }}
         env:
-          POSTGRES_DB: partitioncache_integration
           POSTGRES_USER: integration_user
           POSTGRES_PASSWORD: integration_password
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U integration_user -d partitioncache_integration"
+          --health-cmd "pg_isready -U integration_user -d postgres"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 10
 
     env:
       UNIQUE_DB_NAME: partitioncache_perf_${{ github.run_id }}
-      BASE_TEMPLATE_DB: partitioncache_integration
       CACHE_BACKEND: postgresql_array
       PG_HOST: localhost
       PG_PORT: 5432
@@ -620,7 +446,7 @@ jobs:
       run: |
         echo "Waiting for PostgreSQL..."
         for i in {1..30}; do
-          if python -c "import psycopg; psycopg.connect('postgresql://integration_user:integration_password@localhost:5432/partitioncache_integration')" 2>/dev/null; then
+          if python -c "import psycopg; psycopg.connect('postgresql://integration_user:integration_password@localhost:5432/postgres')" 2>/dev/null; then
             echo "PostgreSQL ready"
             break
           fi
@@ -686,20 +512,18 @@ jobs:
       postgres:
         image: ghcr.io/mpoppinga/postgres-test-extensions:${{ needs.build-postgres-image.outputs.image-tag }}
         env:
-          POSTGRES_DB: partitioncache_integration
           POSTGRES_USER: integration_user
           POSTGRES_PASSWORD: integration_password
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U integration_user -d partitioncache_integration"
+          --health-cmd "pg_isready -U integration_user -d postgres"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 10
 
     env:
       UNIQUE_DB_NAME: partitioncache_pgcron_${{ github.run_id }}
-      BASE_TEMPLATE_DB: partitioncache_integration
       CACHE_BACKEND: postgresql_array
       PG_HOST: localhost
       PG_PORT: 5432
@@ -741,7 +565,7 @@ jobs:
       run: |
         echo "Waiting for PostgreSQL..."
         for i in {1..30}; do
-          if python -c "import psycopg; psycopg.connect('postgresql://integration_user:integration_password@localhost:5432/partitioncache_integration')" 2>/dev/null; then
+          if python -c "import psycopg; psycopg.connect('postgresql://integration_user:integration_password@localhost:5432/postgres')" 2>/dev/null; then
             echo "PostgreSQL ready"
             break
           fi
