@@ -259,25 +259,36 @@ jobs:
             return False
         
         def create_fallback_database():
-            '''Fallback: create empty database and set up required extensions'''
+            '''Fallback: wait for template to be available then retry'''
             try:
-                print(f'Fallback: Creating empty database {unique_db} without template')
+                print(f'Fallback: Template database is busy, waiting before final retry...')
+                # Wait a longer time to let other jobs finish with the template
+                wait_time = 10 + random.uniform(0, 5)
+                print(f'Waiting {wait_time:.1f}s for template database to become available')
+                time.sleep(wait_time)
+                
+                # Try one more time with the template
                 with psycopg.connect(conn_str, autocommit=True) as conn:
                     with conn.cursor() as cur:
-                        # Create empty database
-                        cur.execute(sql.SQL('CREATE DATABASE {}').format(sql.Identifier(unique_db)))
-                
-                # Connect to new database and set up extensions
-                fallback_conn_str = f'postgresql://integration_user:integration_password@localhost:5432/{unique_db}'
-                with psycopg.connect(fallback_conn_str, autocommit=True) as conn:
-                    with conn.cursor() as cur:
-                        # Create extensions
-                        cur.execute('CREATE EXTENSION IF NOT EXISTS pg_cron')
-                        cur.execute('CREATE EXTENSION IF NOT EXISTS roaringbitmap')
-                        print(f'Successfully created fallback database: {unique_db} with extensions')
+                        # Check if database already exists and drop it
+                        cur.execute(sql.SQL('SELECT 1 FROM pg_database WHERE datname = %s'), (unique_db,))
+                        if cur.fetchone():
+                            print(f'Dropping existing database: {unique_db}')
+                            cur.execute(sql.SQL('DROP DATABASE {}').format(sql.Identifier(unique_db)))
+                        
+                        # Create from template (extensions are already in template)
+                        print(f'Final attempt: Creating database {unique_db} from template {base_template}')
+                        cur.execute(sql.SQL('CREATE DATABASE {} TEMPLATE {}').format(
+                            sql.Identifier(unique_db),
+                            sql.Identifier(base_template)
+                        ))
+                        print(f'Successfully created database from template on final attempt')
                         return True
             except Exception as e:
-                print(f'Fallback database creation failed: {e}')
+                print(f'Final attempt failed: {e}')
+                # As a last resort, we could skip the test with a clear error
+                print(f'ERROR: Unable to create test database after all attempts')
+                print(f'This is likely due to high concurrency in CI environment')
                 return False
         
         if not create_database_with_retry():
@@ -485,25 +496,36 @@ jobs:
             return False
         
         def create_fallback_database():
-            '''Fallback: create empty database and set up required extensions'''
+            '''Fallback: wait for template to be available then retry'''
             try:
-                print(f'Fallback: Creating empty database {unique_db} without template')
+                print(f'Fallback: Template database is busy, waiting before final retry...')
+                # Wait a longer time to let other jobs finish with the template
+                wait_time = 10 + random.uniform(0, 5)
+                print(f'Waiting {wait_time:.1f}s for template database to become available')
+                time.sleep(wait_time)
+                
+                # Try one more time with the template
                 with psycopg.connect(conn_str, autocommit=True) as conn:
                     with conn.cursor() as cur:
-                        # Create empty database
-                        cur.execute(sql.SQL('CREATE DATABASE {}').format(sql.Identifier(unique_db)))
-                
-                # Connect to new database and set up extensions
-                fallback_conn_str = f'postgresql://integration_user:integration_password@localhost:5432/{unique_db}'
-                with psycopg.connect(fallback_conn_str, autocommit=True) as conn:
-                    with conn.cursor() as cur:
-                        # Create extensions
-                        cur.execute('CREATE EXTENSION IF NOT EXISTS pg_cron')
-                        cur.execute('CREATE EXTENSION IF NOT EXISTS roaringbitmap')
-                        print(f'Successfully created fallback database: {unique_db} with extensions')
+                        # Check if database already exists and drop it
+                        cur.execute(sql.SQL('SELECT 1 FROM pg_database WHERE datname = %s'), (unique_db,))
+                        if cur.fetchone():
+                            print(f'Dropping existing database: {unique_db}')
+                            cur.execute(sql.SQL('DROP DATABASE {}').format(sql.Identifier(unique_db)))
+                        
+                        # Create from template (extensions are already in template)
+                        print(f'Final attempt: Creating database {unique_db} from template {base_template}')
+                        cur.execute(sql.SQL('CREATE DATABASE {} TEMPLATE {}').format(
+                            sql.Identifier(unique_db),
+                            sql.Identifier(base_template)
+                        ))
+                        print(f'Successfully created database from template on final attempt')
                         return True
             except Exception as e:
-                print(f'Fallback database creation failed: {e}')
+                print(f'Final attempt failed: {e}')
+                # As a last resort, we could skip the test with a clear error
+                print(f'ERROR: Unable to create test database after all attempts')
+                print(f'This is likely due to high concurrency in CI environment')
                 return False
         
         if not create_database_with_retry():
