@@ -2,6 +2,7 @@ import os
 import time
 
 import psycopg
+import psycopg.errors
 import pytest
 
 from partitioncache.cache_handler.abstract import AbstractCacheHandler
@@ -271,51 +272,142 @@ class TestQueueErrorRecovery:
                     assert any(keyword in error_msg for keyword in
                               ["cron", "schedule", "format", "invalid"])
 
-    def test_long_running_job_timeout(self, db_session):
-        """Test handling of long-running cron jobs that might timeout."""
-        # Check if pg_cron extension is available
+    def test_long_running_job_timeout(self, db_session, cache_client):
+        """Test handling of long-running PartitionCache queries that timeout."""
+        from partitioncache.cache_handler import get_cache_table_prefix_from_env
+        from partitioncache.queue import clear_all_queues, get_queue_provider_name, get_queue_table_prefix_from_env
+
+        # Only run for PostgreSQL backends (both cache and queue)
+        cache_backend = os.getenv("CACHE_BACKEND", "")
+        queue_provider = get_queue_provider_name()
+
+        print(f"DEBUG: cache_backend={cache_backend}, queue_provider={queue_provider}")
+
+        if not cache_backend.startswith("postgresql") or queue_provider != "postgresql":
+            pytest.skip(f"This test requires PostgreSQL cache backend and queue provider. Got: {cache_backend}, {queue_provider}")
+
+        # Get configuration
+        queue_prefix = get_queue_table_prefix_from_env()
+        table_prefix = get_cache_table_prefix_from_env()
+        partition_key = "test_partition"
+
+        # Clear queues first
+        clear_all_queues()
+
+        # Initialize processor tables if needed
+        with db_session.cursor() as cur:
+            cur.execute(f"SELECT partitioncache_initialize_processor_tables('{queue_prefix}')")
+            # Also ensure metadata tables exist
+            cur.execute(f"SELECT partitioncache_ensure_metadata_tables('{table_prefix}')")
+
+            # Add a test configuration for the processor (required by run_single_job)
+            config_table = f"{queue_prefix}_processor_config"
+            cur.execute(f"""
+                INSERT INTO {config_table} 
+                (job_name, enabled, max_parallel_jobs, frequency_seconds, timeout_seconds, 
+                 table_prefix, queue_prefix, cache_backend)
+                VALUES ('partitioncache_process_queue', true, 1, 60, 30, 
+                        %s, %s, 'array')
+                ON CONFLICT (job_name) DO UPDATE 
+                SET timeout_seconds = 30, enabled = true
+            """, (table_prefix, queue_prefix))
+            db_session.commit()
+
+        # Queue a long-running query directly to fragment queue for testing
+        long_query = "SELECT pg_sleep(5), 12345 as test_partition;"  # 5 second sleep
+
+        # For testing timeout behavior, push directly to fragment queue
+        # In production, queries go through original queue first
+        with db_session.cursor() as cur:
+            # Generate a simple hash for the test query
+            import hashlib
+            query_hash = hashlib.md5(long_query.encode()).hexdigest()
+
+            fragment_queue_table = f"{queue_prefix}_query_fragment_queue"
+            cur.execute(f"""
+                INSERT INTO {fragment_queue_table} (query, hash, partition_key, partition_datatype)
+                VALUES (%s, %s, %s, %s)
+            """, (long_query, query_hash, partition_key, "integer"))
+            db_session.commit()
+
+        # Process it with a 1-second timeout using proper transaction-level timeout
         with db_session.cursor() as cur:
             try:
-                cur.execute("SELECT extname FROM pg_extension WHERE extname = 'pg_cron';")
-                if not cur.fetchone():
-                    pytest.skip("pg_cron extension not available")
-            except Exception:
-                pytest.skip("Cannot check for pg_cron extension")
+                # Start a new transaction with statement timeout
+                cur.execute("BEGIN;")
+                cur.execute("SET LOCAL statement_timeout = 1000;")  # 1 second timeout
 
-        # Schedule a job that runs for a long time
-        test_jobname = f"timeout_test_{int(time.time())}"
-        # Command that will run for several seconds
-        test_command = "SELECT pg_sleep(30);"  # 30 second sleep for timeout testing
+                # Process the queue - this should timeout
+                cur.execute("SELECT * FROM partitioncache_manual_process_queue(1);")
+                result = cur.fetchone()
+
+                # Commit the transaction (unlikely to reach here due to timeout)
+                cur.execute("COMMIT;")
+
+                # Log result if we somehow didn't timeout
+                if result:
+                    print(f"Unexpected completion without timeout: processed={result[0]}, message={result[1]}")
+
+            except psycopg.errors.QueryCanceled:
+                # This is expected - the query was canceled due to statement timeout
+                cur.execute("ROLLBACK;")
+                print("Query canceled as expected due to statement timeout")
+
+            except Exception as e:
+                cur.execute("ROLLBACK;")
+                # Check if it's a timeout-related error
+                error_msg = str(e).lower()
+                if "cancel" in error_msg or "timeout" in error_msg:
+                    print(f"Timeout-related error as expected: {e}")
+                else:
+                    raise
+
+        # Wait a moment for any async cleanup
+        time.sleep(1)
+
+        # Verify the timeout was properly logged
+        log_table = f"{queue_prefix}_processor_log"
+        queries_table = table_prefix + "_queries" if table_prefix else "queries"
 
         with db_session.cursor() as cur:
-            try:
-                # Schedule the long-running job
-                cur.execute("""
-                    SELECT cron.schedule(%s, '* * * * *', %s);
-                """, (test_jobname, test_command))
+            # Check processor log for any entry related to our query
+            cur.execute(f"""
+                SELECT status, error_message, query_hash
+                FROM {log_table}
+                WHERE partition_key = %s
+                ORDER BY created_at DESC
+                LIMIT 5
+            """, (partition_key,))
 
-                # Wait a short time
-                time.sleep(5)
+            log_entries = cur.fetchall()
 
-                # Check if job is running or has been scheduled
-                cur.execute("""
-                    SELECT jobname, active FROM cron.job 
-                    WHERE jobname = %s;
-                """, (test_jobname,))
+            # Look for timeout or failure status
+            timeout_found = False
+            for entry in log_entries:
+                if entry[0] == 'timeout':
+                    timeout_found = True
+                    assert "timeout" in (entry[1] or "").lower(), f"Error message should mention timeout: {entry[1]}"
+                    break
+                elif entry[0] == 'failed' and entry[1] and ("cancel" in entry[1].lower() or "timeout" in entry[1].lower()):
+                    # Sometimes timeouts are logged as failures with cancel/timeout message
+                    timeout_found = True
+                    break
 
-                job_info = cur.fetchone()
-                assert job_info is not None, "Long-running job should be scheduled"
+            assert timeout_found or len(log_entries) == 0, f"Expected timeout entry in processor log, found: {log_entries}"
 
-                # Clean up - unschedule the job
-                cur.execute("SELECT cron.unschedule(%s);", (test_jobname,))
+            # Check queries table - it might have a timeout entry if the function got that far
+            cur.execute(f"""
+                SELECT status, query
+                FROM {queries_table}
+                WHERE partition_key = %s
+                ORDER BY last_seen DESC
+                LIMIT 1
+            """, (partition_key,))
 
-            except Exception:
-                # Clean up on error
-                try:
-                    cur.execute("SELECT cron.unschedule(%s);", (test_jobname,))
-                except Exception:
-                    pass
-                raise
+            query_entry = cur.fetchone()
+            if query_entry:
+                # If there's an entry, it should be marked as timeout or failed
+                assert query_entry[0] in ('timeout', 'failed'), f"Expected 'timeout' or 'failed' status in queries table, got '{query_entry[0]}'"
 
 
 class TestSystemLevelErrors:

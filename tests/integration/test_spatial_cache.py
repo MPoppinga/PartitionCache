@@ -25,11 +25,11 @@ class TestSpatialCache:
     def setup_connection(self):
         """Setup database connection for tests."""
         self.conn_str = (
-            f"postgresql://{os.getenv('PG_USER', 'test_user')}:"
-            f"{os.getenv('PG_PASSWORD', 'test_password')}@"
+            f"postgresql://{os.getenv('PG_USER', 'integration_user')}:"
+            f"{os.getenv('PG_PASSWORD', 'integration_password')}@"
             f"{os.getenv('PG_HOST', 'localhost')}:"
-            f"{os.getenv('PG_PORT', '5432')}/"
-            f"{os.getenv('PG_DBNAME', 'test_db')}"
+            f"{os.getenv('PG_PORT', '5434')}/"
+            f"{os.getenv('PG_DBNAME', 'partitioncache_integration')}"
         )
 
         self.conn = psycopg.connect(self.conn_str)
@@ -39,7 +39,7 @@ class TestSpatialCache:
 
     def _get_cache_backend(self) -> str:
         """Get the cache backend from environment."""
-        return os.getenv('CACHE_BACKEND', 'postgresql_array')
+        return os.getenv("CACHE_BACKEND", "postgresql_array")
 
     def _execute_query(self, query: str) -> tuple[list, float]:
         """Execute a query and return results with timing."""
@@ -63,8 +63,7 @@ class TestSpatialCache:
         with open(query_path) as f:
             return f.read().strip()
 
-    def _test_cache_effectiveness(self, query: str, partition_key: str,
-                                partition_datatype: str = "integer") -> dict:
+    def _test_cache_effectiveness(self, query: str, partition_key: str, partition_datatype: str = "integer") -> dict:
         """Test cache effectiveness for a given query."""
         # Execute without cache
         results_no_cache, time_no_cache = self._execute_query(query)
@@ -73,11 +72,10 @@ class TestSpatialCache:
         backend = self._get_cache_backend()
 
         try:
-            with partitioncache.create_cache_helper(
-                backend, partition_key, partition_datatype
-            ) as cache:
+            with partitioncache.create_cache_helper(backend, partition_key, partition_datatype) as cache:
                 # Get partition keys (this may be empty for first run)
                 import time
+
                 start_time = time.perf_counter()
 
                 partition_keys, num_subqueries, num_hits = partitioncache.get_partition_keys(
@@ -103,29 +101,28 @@ class TestSpatialCache:
                     total_cache_time = cache_lookup_time + time_with_cache
 
                     # Verify results are consistent
-                    assert len(results_no_cache) >= len(results_with_cache), \
-                        "Cache should not return more results than full query"
+                    assert len(results_no_cache) >= len(results_with_cache), "Cache should not return more results than full query"
 
                     return {
-                        'results_count': len(results_no_cache),
-                        'cached_results_count': len(results_with_cache),
-                        'time_no_cache': time_no_cache,
-                        'time_with_cache': total_cache_time,
-                        'cache_hits': num_hits,
-                        'num_subqueries': num_subqueries,
-                        'speedup': time_no_cache / total_cache_time if total_cache_time > 0 else 0,
-                        'cache_effective': num_hits > 0
+                        "results_count": len(results_no_cache),
+                        "cached_results_count": len(results_with_cache),
+                        "time_no_cache": time_no_cache,
+                        "time_with_cache": total_cache_time,
+                        "cache_hits": num_hits,
+                        "num_subqueries": num_subqueries,
+                        "speedup": time_no_cache / total_cache_time if total_cache_time > 0 else 0,
+                        "cache_effective": num_hits > 0,
                     }
                 else:
                     return {
-                        'results_count': len(results_no_cache),
-                        'cached_results_count': 0,
-                        'time_no_cache': time_no_cache,
-                        'time_with_cache': cache_lookup_time,
-                        'cache_hits': 0,
-                        'num_subqueries': num_subqueries,
-                        'speedup': 0,
-                        'cache_effective': False
+                        "results_count": len(results_no_cache),
+                        "cached_results_count": 0,
+                        "time_no_cache": time_no_cache,
+                        "time_with_cache": cache_lookup_time,
+                        "cache_hits": 0,
+                        "num_subqueries": num_subqueries,
+                        "speedup": 0,
+                        "cache_effective": False,
                     }
 
         except Exception as e:
@@ -155,7 +152,7 @@ class TestSpatialCache:
         result = self._test_cache_effectiveness(query, "region_id", "integer")
 
         # Verify basic functionality
-        assert result['results_count'] >= 0, "Query should return some results"
+        assert result["results_count"] >= 0, "Query should return some results"
 
         print("Region-based query results:")
         print(f"  Results: {result['results_count']}")
@@ -170,7 +167,7 @@ class TestSpatialCache:
 
         result = self._test_cache_effectiveness(query, "region_id", "integer")
 
-        assert result['results_count'] >= 0, "Cluster query should execute successfully"
+        assert result["results_count"] >= 0, "Cluster query should execute successfully"
 
         print("Business cluster query results:")
         print(f"  Results: {result['results_count']}")
@@ -182,7 +179,7 @@ class TestSpatialCache:
 
         result = self._test_cache_effectiveness(query, "city_id", "integer")
 
-        assert result['results_count'] >= 0, "City analysis query should execute"
+        assert result["results_count"] >= 0, "City analysis query should execute"
 
         print("City-based query results:")
         print(f"  Results: {result['results_count']}")
@@ -194,7 +191,7 @@ class TestSpatialCache:
 
         result = self._test_cache_effectiveness(query, "city_id", "integer")
 
-        assert result['results_count'] >= 0, "Nearest neighbor query should execute"
+        assert result["results_count"] >= 0, "Nearest neighbor query should execute"
 
         print("Nearest neighbor query results:")
         print(f"  Results: {result['results_count']}")
@@ -206,7 +203,7 @@ class TestSpatialCache:
 
         result = self._test_cache_effectiveness(query, "zipcode", "text")
 
-        assert result['results_count'] >= 0, "Zipcode density query should execute"
+        assert result["results_count"] >= 0, "Zipcode density query should execute"
 
         print("Zipcode-based query results:")
         print(f"  Results: {result['results_count']}")
@@ -218,7 +215,7 @@ class TestSpatialCache:
 
         result = self._test_cache_effectiveness(query, "zipcode", "text")
 
-        assert result['results_count'] >= 0, "Cross-zipcode query should execute"
+        assert result["results_count"] >= 0, "Cross-zipcode query should execute"
 
         print("Cross-zipcode query results:")
         print(f"  Results: {result['results_count']}")
@@ -230,7 +227,7 @@ class TestSpatialCache:
 
         result = self._test_cache_effectiveness(query, "region_id", "integer")
 
-        assert result['results_count'] >= 0, "Points-businesses query should execute"
+        assert result["results_count"] >= 0, "Points-businesses query should execute"
 
         print("Points near businesses query results:")
         print(f"  Results: {result['results_count']}")
@@ -251,13 +248,15 @@ class TestSpatialCache:
             query = self._load_query_from_file(query_file)
             result = self._test_cache_effectiveness(query, partition_key, datatype)
 
-            performance_results.append({
-                'query': query_file,
-                'partition_key': partition_key,
-                'speedup': result['speedup'],
-                'cache_effective': result['cache_effective'],
-                'results_count': result['results_count']
-            })
+            performance_results.append(
+                {
+                    "query": query_file,
+                    "partition_key": partition_key,
+                    "speedup": result["speedup"],
+                    "cache_effective": result["cache_effective"],
+                    "results_count": result["results_count"],
+                }
+            )
 
         print("\nPerformance Comparison:")
         print("-" * 60)
@@ -270,7 +269,7 @@ class TestSpatialCache:
             print()
 
         # At least one query should show cache effectiveness (if cache is populated)
-        effective_queries = [p for p in performance_results if p['cache_effective']]
+        effective_queries = [p for p in performance_results if p["cache_effective"]]
         if effective_queries:
             print(f"Cache was effective for {len(effective_queries)}/{len(performance_results)} queries")
         else:
@@ -285,6 +284,7 @@ class TestSpatialCache:
             # Check if roaringbitmap extension is available
             try:
                 import psycopg
+
                 conn = psycopg.connect(self.conn_str)
                 cur = conn.cursor()
                 cur.execute("SELECT 1 FROM pg_extension WHERE extname = 'roaringbitmap'")
@@ -318,7 +318,7 @@ class TestSpatialCache:
         # This is a sanity check for the spatial queries
         with self.conn.cursor() as cur:
             cur.execute("""
-                SELECT 
+                SELECT
                     SQRT(POWER(52.520008 - 52.520000, 2) + POWER(13.404954 - 13.404954, 2)) as dist1,
                     SQRT(POWER(52.520008 - 52.530000, 2) + POWER(13.404954 - 13.450000, 2)) as dist2
             """)
@@ -353,9 +353,9 @@ class TestSpatialCache:
             # Test roaringbitmap with actual cache data
             cur.execute("""
                 SELECT COUNT(*) FROM (
-                    SELECT rb_build(ARRAY[region_id]) as rb 
-                    FROM test_spatial_points 
-                    WHERE region_id IS NOT NULL 
+                    SELECT rb_build(ARRAY[region_id]) as rb
+                    FROM test_spatial_points
+                    WHERE region_id IS NOT NULL
                     LIMIT 10
                 ) t
             """)
@@ -374,9 +374,8 @@ class TestSpatialCacheIntegration:
         backends_to_test = []
 
         # Test current backend
-        current_backend = os.getenv('CACHE_BACKEND', 'postgresql_array')
+        current_backend = os.getenv("CACHE_BACKEND", "postgresql_array")
         backends_to_test.append(current_backend)
-
 
         test_cases = [
             ("region_id", "integer"),

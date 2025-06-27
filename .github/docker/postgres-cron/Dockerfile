@@ -28,7 +28,7 @@ RUN echo "cron.host = '/var/run/postgresql'" >> /usr/share/postgresql/postgresql
 # Create initialization script to set up both extensions
 RUN mkdir -p /docker-entrypoint-initdb.d
 COPY init-pg-cron.sql /docker-entrypoint-initdb.d/
-COPY ../../src/partitioncache/queue_handler/postgresql_queue_processor.sql /docker-entrypoint-initdb.d/
+COPY src/partitioncache/queue_handler/postgresql_queue_processor.sql /docker-entrypoint-initdb.d/
 
 # Expose PostgreSQL port
 EXPOSE 5432

@@ -729,6 +729,12 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+-- Note: For timeout testing, use transaction-level statement_timeout:
+-- BEGIN;
+-- SET LOCAL statement_timeout = 1000;  -- 1 second
+-- SELECT * FROM partitioncache_manual_process_queue(1);
+-- COMMIT;
+
 -- Manual processing function for partitioncache_manual_process_queue with manual execution source
 -- DEPRECATED: This function has been consolidated into _partitioncache_execute_job
 DROP FUNCTION IF EXISTS partitioncache_process_queue_item_manual(INTEGER, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT);
