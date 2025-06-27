@@ -161,6 +161,16 @@ run_tests() {
             PYTEST_CMD="$PYTEST_CMD -k 'redis_set or redis_bit'"
         elif [ "$TEST_PATTERN" = "rocksdb" ]; then
             PYTEST_CMD="$PYTEST_CMD -k 'rocksdb_set or rocksdb_bit or rocksdict'"
+        elif [ "$TEST_PATTERN" = "postgresql_array" ]; then
+            PYTEST_CMD="$PYTEST_CMD -k 'postgresql_array'"
+        elif [ "$TEST_PATTERN" = "postgresql_bit" ]; then
+            PYTEST_CMD="$PYTEST_CMD -k 'postgresql_bit'"
+        elif [ "$TEST_PATTERN" = "postgresql_roaringbit" ]; then
+            PYTEST_CMD="$PYTEST_CMD -k 'postgresql_roaringbit'"
+        elif [ "$TEST_PATTERN" = "redis_set" ]; then
+            PYTEST_CMD="$PYTEST_CMD -k 'redis_set'"
+        elif [ "$TEST_PATTERN" = "redis_bit" ]; then
+            PYTEST_CMD="$PYTEST_CMD -k 'redis_bit'"
         else
             PYTEST_CMD="$PYTEST_CMD -k $TEST_PATTERN"
         fi
