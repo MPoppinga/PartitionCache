@@ -108,6 +108,7 @@ def db_connection(tmp_path_factory):
                             business_type TEXT NOT NULL,
                             region_id INTEGER NOT NULL,
                             city_id INTEGER NOT NULL,
+                            zipcode TEXT NOT NULL,
                             x DECIMAL(10,6) NOT NULL,  -- longitude-like coordinate
                             y DECIMAL(10,6) NOT NULL,  -- latitude-like coordinate  
                             rating DECIMAL(2,1) DEFAULT 3.0,
@@ -115,23 +116,65 @@ def db_connection(tmp_path_factory):
                         );
                     """)
 
+                    # Create test_spatial_points table for spatial cache testing
+                    cur.execute("DROP TABLE IF EXISTS test_spatial_points CASCADE;")
+                    cur.execute("""
+                        CREATE TABLE test_spatial_points (
+                            id SERIAL PRIMARY KEY,
+                            name TEXT NOT NULL,
+                            point_type TEXT NOT NULL,
+                            region_id INTEGER NOT NULL,
+                            city_id INTEGER NOT NULL,
+                            zipcode TEXT NOT NULL,
+                            x DECIMAL(10,6) NOT NULL,  -- longitude-like coordinate
+                            y DECIMAL(10,6) NOT NULL,  -- latitude-like coordinate  
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        );
+                    """)
+
                     # Insert sample spatial test data
                     sample_businesses = [
-                        ("Pizza Palace", "restaurant", 1, 101, -74.0060, 40.7128, 4.2),
-                        ("Corner Pharmacy", "pharmacy", 1, 101, -74.0050, 40.7130, 3.8),
-                        ("Joe's Diner", "restaurant", 1, 102, -74.0070, 40.7125, 3.9),
-                        ("Health Plus", "pharmacy", 2, 201, -118.2437, 34.0522, 4.1),
-                        ("Sunset Bistro", "restaurant", 2, 201, -118.2440, 34.0520, 4.5),
-                        ("Metro Drugs", "pharmacy", 2, 202, -118.2430, 34.0525, 3.7),
+                        ("Pizza Palace", "restaurant", 1, 101, "10001", -74.0060, 40.7128, 4.2),
+                        ("Corner Pharmacy", "pharmacy", 1, 101, "10001", -74.0050, 40.7130, 3.8),
+                        ("Joe's Diner", "restaurant", 1, 102, "10002", -74.0070, 40.7125, 3.9),
+                        ("Health Plus", "pharmacy", 2, 201, "90210", -118.2437, 34.0522, 4.1),
+                        ("Sunset Bistro", "restaurant", 2, 201, "90210", -118.2440, 34.0520, 4.5),
+                        ("Metro Drugs", "pharmacy", 2, 202, "90211", -118.2430, 34.0525, 3.7),
+                        # Add business types expected by spatial queries
+                        ("Downtown Market", "supermarket", 1, 101, "10001", -74.0055, 40.7129, 4.0),
+                        ("City Cafe", "cafe", 1, 101, "10001", -74.0058, 40.7127, 4.3),
+                        ("First Bank", "bank", 1, 101, "10001", -74.0052, 40.7131, 3.9),
+                        ("West Market", "supermarket", 2, 201, "90210", -118.2440, 34.0523, 4.1),
+                        ("Sunset Cafe", "cafe", 2, 201, "90210", -118.2438, 34.0521, 4.2),
+                        ("Pacific Bank", "bank", 2, 201, "90210", -118.2435, 34.0524, 4.0),
                     ]
 
-                    for name, btype, region_id, city_id, x, y, rating in sample_businesses:
+                    for name, btype, region_id, city_id, zipcode, x, y, rating in sample_businesses:
                         cur.execute(
                             """
-                            INSERT INTO test_businesses (name, business_type, region_id, city_id, x, y, rating)
+                            INSERT INTO test_businesses (name, business_type, region_id, city_id, zipcode, x, y, rating)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s);
+                        """,
+                            (name, btype, region_id, city_id, zipcode, x, y, rating),
+                        )
+
+                    # Insert sample spatial points data
+                    sample_spatial_points = [
+                        ("Central Park", "park", 1, 101, "10001", -74.0059, 40.7131),
+                        ("Library Square", "library", 1, 101, "10001", -74.0055, 40.7125),
+                        ("School District 1", "school", 1, 102, "10002", -74.0065, 40.7120),
+                        ("Hospital Center", "hospital", 2, 201, "90210", -118.2435, 34.0525),
+                        ("Beach Park", "park", 2, 201, "90210", -118.2445, 34.0515),
+                        ("Metro Station", "transport", 2, 202, "90211", -118.2425, 34.0530),
+                    ]
+
+                    for name, ptype, region_id, city_id, zipcode, x, y in sample_spatial_points:
+                        cur.execute(
+                            """
+                            INSERT INTO test_spatial_points (name, point_type, region_id, city_id, zipcode, x, y)
                             VALUES (%s, %s, %s, %s, %s, %s, %s);
                         """,
-                            (name, btype, region_id, city_id, x, y, rating),
+                            (name, ptype, region_id, city_id, zipcode, x, y),
                         )
         except Exception as e:
             pytest.skip(f"DB setup failed: {e}")
@@ -193,7 +236,7 @@ def db_session(db_connection):
                     logger.warning(f"Failed to clean table {table_name}: {e}")
 
         # Reset test table data to ensure clean state - handle missing tables gracefully
-        for table_name in ["test_locations", "test_cron_results", "test_businesses"]:
+        for table_name in ["test_locations", "test_cron_results", "test_businesses", "test_spatial_points"]:
             try:
                 cur.execute(f"TRUNCATE {table_name} RESTART IDENTITY CASCADE;")
             except Exception:
@@ -206,6 +249,7 @@ def db_session(db_connection):
                             business_type TEXT NOT NULL,
                             region_id INTEGER NOT NULL,
                             city_id INTEGER NOT NULL,
+                            zipcode TEXT NOT NULL,
                             x DECIMAL(10,6) NOT NULL,
                             y DECIMAL(10,6) NOT NULL,  
                             rating DECIMAL(2,1) DEFAULT 3.0,
@@ -231,6 +275,20 @@ def db_session(db_connection):
                             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                         );
                     """)
+                elif table_name == "test_spatial_points":
+                    cur.execute("""
+                        CREATE TABLE test_spatial_points (
+                            id SERIAL PRIMARY KEY,
+                            name TEXT NOT NULL,
+                            point_type TEXT NOT NULL,
+                            region_id INTEGER NOT NULL,
+                            city_id INTEGER NOT NULL,
+                            zipcode TEXT NOT NULL,
+                            x DECIMAL(10,6) NOT NULL,
+                            y DECIMAL(10,6) NOT NULL,
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        );
+                    """)
 
         # Re-insert sample data for consistent test state
         for zipcode, data in SAMPLE_TEST_DATA["zipcode"].items():
@@ -252,21 +310,47 @@ def db_session(db_connection):
 
         # Re-insert sample spatial test data
         sample_businesses = [
-            ("Pizza Palace", "restaurant", 1, 101, -74.0060, 40.7128, 4.2),
-            ("Corner Pharmacy", "pharmacy", 1, 101, -74.0050, 40.7130, 3.8),
-            ("Joe's Diner", "restaurant", 1, 102, -74.0070, 40.7125, 3.9),
-            ("Health Plus", "pharmacy", 2, 201, -118.2437, 34.0522, 4.1),
-            ("Sunset Bistro", "restaurant", 2, 201, -118.2440, 34.0520, 4.5),
-            ("Metro Drugs", "pharmacy", 2, 202, -118.2430, 34.0525, 3.7),
+            ("Pizza Palace", "restaurant", 1, 101, "10001", -74.0060, 40.7128, 4.2),
+            ("Corner Pharmacy", "pharmacy", 1, 101, "10001", -74.0050, 40.7130, 3.8),
+            ("Joe's Diner", "restaurant", 1, 102, "10002", -74.0070, 40.7125, 3.9),
+            ("Health Plus", "pharmacy", 2, 201, "90210", -118.2437, 34.0522, 4.1),
+            ("Sunset Bistro", "restaurant", 2, 201, "90210", -118.2440, 34.0520, 4.5),
+            ("Metro Drugs", "pharmacy", 2, 202, "90211", -118.2430, 34.0525, 3.7),
+            # Add business types expected by spatial queries
+            ("Downtown Market", "supermarket", 1, 101, "10001", -74.0055, 40.7129, 4.0),
+            ("City Cafe", "cafe", 1, 101, "10001", -74.0058, 40.7127, 4.3),
+            ("First Bank", "bank", 1, 101, "10001", -74.0052, 40.7131, 3.9),
+            ("West Market", "supermarket", 2, 201, "90210", -118.2440, 34.0523, 4.1),
+            ("Sunset Cafe", "cafe", 2, 201, "90210", -118.2438, 34.0521, 4.2),
+            ("Pacific Bank", "bank", 2, 201, "90210", -118.2435, 34.0524, 4.0),
         ]
 
-        for name, btype, region_id, city_id, x, y, rating in sample_businesses:
+        for name, btype, region_id, city_id, zipcode, x, y, rating in sample_businesses:
             cur.execute(
                 """
-                INSERT INTO test_businesses (name, business_type, region_id, city_id, x, y, rating)
+                INSERT INTO test_businesses (name, business_type, region_id, city_id, zipcode, x, y, rating)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s);
+            """,
+                (name, btype, region_id, city_id, zipcode, x, y, rating),
+            )
+
+        # Re-insert sample spatial points data
+        sample_spatial_points = [
+            ("Central Park", "park", 1, 101, "10001", -74.0059, 40.7131),
+            ("Library Square", "library", 1, 101, "10001", -74.0055, 40.7125),
+            ("School District 1", "school", 1, 102, "10002", -74.0065, 40.7120),
+            ("Hospital Center", "hospital", 2, 201, "90210", -118.2435, 34.0525),
+            ("Beach Park", "park", 2, 201, "90210", -118.2445, 34.0515),
+            ("Metro Station", "transport", 2, 202, "90211", -118.2425, 34.0530),
+        ]
+
+        for name, ptype, region_id, city_id, zipcode, x, y in sample_spatial_points:
+            cur.execute(
+                """
+                INSERT INTO test_spatial_points (name, point_type, region_id, city_id, zipcode, x, y)
                 VALUES (%s, %s, %s, %s, %s, %s, %s);
             """,
-                (name, btype, region_id, city_id, x, y, rating),
+                (name, ptype, region_id, city_id, zipcode, x, y),
             )
 
     yield conn

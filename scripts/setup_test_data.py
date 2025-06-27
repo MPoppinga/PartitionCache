@@ -14,13 +14,13 @@ Options:
     --dataset: Which dataset to create (orders, tpch, osm, all) [default: orders]
 """
 
-import os
-import sys
 import argparse
+import os
 import random
-from datetime import date, timedelta, datetime
-from typing import Optional, List, Dict, Any
+import sys
+from datetime import date, timedelta
 from pathlib import Path
+from typing import Any
 
 # Add the parent directory to sys.path to import partitioncache
 sys.path.append(str(Path(__file__).parent.parent))
@@ -36,50 +36,46 @@ except ImportError as e:
 
 class TestDataSetup:
     """Setup test datasets for PartitionCache integration tests."""
-    
-    def __init__(self, connection_string: Optional[str] = None):
+
+    def __init__(self, connection_string: str | None = None):
         """Initialize with database connection."""
         if connection_string:
             self.conn_str = connection_string
         else:
             # Load from environment
             load_dotenv()
-            host = os.getenv('PG_HOST', 'localhost')
-            port = os.getenv('PG_PORT', '5432')
-            user = os.getenv('PG_USER', 'test_user')
-            password = os.getenv('PG_PASSWORD', 'test_password')
-            dbname = os.getenv('PG_DBNAME', 'test_db')
+            host = os.getenv("PG_HOST", "localhost")
+            port = os.getenv("PG_PORT", "5432")
+            user = os.getenv("PG_USER", "test_user")
+            password = os.getenv("PG_PASSWORD", "test_password")
+            dbname = os.getenv("PG_DBNAME", "test_db")
             self.conn_str = f"postgresql://{user}:{password}@{host}:{port}/{dbname}"
-        
+
         self.conn = None
-        
+
     def connect(self):
         """Connect to the database."""
         try:
             self.conn = psycopg.connect(self.conn_str)
             self.conn.autocommit = True
-            print(f"✓ Connected to database")
+            print("✓ Connected to database")
         except Exception as e:
             print(f"✗ Failed to connect to database: {e}")
             raise
-    
+
     def close(self):
         """Close database connection."""
         if self.conn:
             self.conn.close()
-            
+
     def create_orders_dataset(self, size: str = "small", reset: bool = False):
         """Create orders test dataset."""
         print(f"Creating orders dataset (size: {size})...")
-        
-        sizes = {
-            "small": 1000,
-            "medium": 10000,
-            "large": 100000
-        }
-        
+
+        sizes = {"small": 1000, "medium": 10000, "large": 100000}
+
         num_records = sizes.get(size, 1000)
-        
+
         with self.conn.cursor() as cur:
             # Create table
             cur.execute("""
@@ -93,38 +89,43 @@ class TestDataSetup:
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
-            
+
             # Reset if requested
             if reset:
                 cur.execute("TRUNCATE TABLE test_orders RESTART IDENTITY")
                 print("  ✓ Reset existing data")
-            
+
             # Insert test data
             print(f"  Inserting {num_records} orders...")
             batch_size = 1000
-            
+
             for batch_start in range(0, num_records, batch_size):
                 batch_end = min(batch_start + batch_size, num_records)
                 batch_data = []
-                
+
                 for i in range(batch_start, batch_end):
                     order_date = date(2023, 1, 1) + timedelta(days=random.randint(0, 364))
-                    batch_data.append((
-                        random.randint(1, num_records // 10),  # customer_id
-                        order_date,
-                        round(random.uniform(10.0, 1000.0), 2),  # amount
-                        random.randint(1, 5),  # region_id
-                        random.choice(['pending', 'processing', 'shipped', 'delivered'])
-                    ))
-                
-                cur.executemany("""
+                    batch_data.append(
+                        (
+                            random.randint(1, num_records // 10),  # customer_id
+                            order_date,
+                            round(random.uniform(10.0, 1000.0), 2),  # amount
+                            random.randint(1, 5),  # region_id
+                            random.choice(["pending", "processing", "shipped", "delivered"]),
+                        )
+                    )
+
+                cur.executemany(
+                    """
                     INSERT INTO test_orders (customer_id, order_date, amount, region_id, status)
                     VALUES (%s, %s, %s, %s, %s)
-                """, batch_data)
-                
+                """,
+                    batch_data,
+                )
+
                 if batch_end % 5000 == 0:
                     print(f"    Inserted {batch_end} records...")
-            
+
             # Create indexes for partition keys
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS idx_test_orders_customer_id 
@@ -142,24 +143,24 @@ class TestDataSetup:
                 CREATE INDEX IF NOT EXISTS idx_test_orders_status 
                 ON test_orders(status)
             """)
-            
+
             # Analyze for query optimization
             cur.execute("ANALYZE test_orders")
-            
+
             print(f"  ✓ Created orders dataset with {num_records} records")
-    
+
     def create_spatial_dataset(self, size: str = "small", reset: bool = False):
         """Create spatial points dataset for testing distance-based queries."""
         print(f"Creating spatial dataset (size: {size})...")
-        
+
         sizes = {
-            "small": 5000,    # 5K points
+            "small": 5000,  # 5K points
             "medium": 50000,  # 50K points
-            "large": 500000   # 500K points
+            "large": 500000,  # 500K points
         }
-        
+
         num_points = sizes.get(size, 5000)
-        
+
         with self.conn.cursor() as cur:
             # Create spatial points table
             cur.execute("""
@@ -175,7 +176,7 @@ class TestDataSetup:
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
-            
+
             # Create business locations table
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS test_businesses (
@@ -191,118 +192,119 @@ class TestDataSetup:
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
-            
+
             if reset:
                 cur.execute("TRUNCATE TABLE test_spatial_points, test_businesses RESTART IDENTITY")
                 print("  ✓ Reset existing spatial data")
-            
+
             # Generate spatial points with realistic geographic distribution
             print(f"  Inserting {num_points} spatial points...")
-            
+
             # Define regions (simplified city-like areas)
             regions = [
                 {"id": 1, "name": "Downtown", "center_x": 52.520008, "center_y": 13.404954, "cities": [1, 2]},
                 {"id": 2, "name": "Westside", "center_x": 52.500000, "center_y": 13.350000, "cities": [3, 4]},
                 {"id": 3, "name": "Eastside", "center_x": 52.530000, "center_y": 13.450000, "cities": [5, 6]},
                 {"id": 4, "name": "Northside", "center_x": 52.550000, "center_y": 13.400000, "cities": [7, 8]},
-                {"id": 5, "name": "Southside", "center_x": 52.480000, "center_y": 13.380000, "cities": [9, 10]}
+                {"id": 5, "name": "Southside", "center_x": 52.480000, "center_y": 13.380000, "cities": [9, 10]},
             ]
-            
-            point_types = [
-                "restaurant", "cafe", "shop", "park", "school", 
-                "hospital", "bank", "hotel", "station", "landmark"
-            ]
-            
+
+            point_types = ["restaurant", "cafe", "shop", "park", "school", "hospital", "bank", "hotel", "station", "landmark"]
+
             batch_size = 1000
             for batch_start in range(0, num_points, batch_size):
                 batch_end = min(batch_start + batch_size, num_points)
                 batch_data = []
-                
+
                 for i in range(batch_start, batch_end):
                     # Choose random region
                     region = random.choice(regions)
-                    
+
                     # Add some randomness around region center (±0.02 degrees ≈ ±2km)
                     x = region["center_x"] + random.uniform(-0.02, 0.02)
                     y = region["center_y"] + random.uniform(-0.02, 0.02)
-                    
+
                     # Choose random city within region
                     city_id = random.choice(region["cities"])
-                    
+
                     # Generate zipcode based on city
                     zipcode = f"{10000 + city_id * 100 + random.randint(1, 99):05d}"
-                    
-                    batch_data.append((
-                        x, y,
-                        random.choice(point_types),
-                        f"{random.choice(point_types).title()} {i+1}",
-                        region["id"],
-                        city_id,
-                        zipcode
-                    ))
-                
-                cur.executemany("""
+
+                    batch_data.append((x, y, random.choice(point_types), f"{random.choice(point_types).title()} {i + 1}", region["id"], city_id, zipcode))
+
+                cur.executemany(
+                    """
                     INSERT INTO test_spatial_points (x, y, point_type, name, region_id, city_id, zipcode)
                     VALUES (%s, %s, %s, %s, %s, %s, %s)
-                """, batch_data)
-                
+                """,
+                    batch_data,
+                )
+
                 if batch_end % 5000 == 0:
                     print(f"    Inserted {batch_end} points...")
-            
+
             # Generate businesses with similar distribution
             num_businesses = int(num_points * 0.3)  # 30% of points are businesses
             print(f"  Inserting {num_businesses} businesses...")
-            
-            business_types = [
-                "pharmacy", "supermarket", "restaurant", "cafe", "bakery",
-                "gas_station", "bank", "hotel", "bookstore", "electronics"
-            ]
-            
+
+            business_types = ["pharmacy", "supermarket", "restaurant", "cafe", "bakery", "gas_station", "bank", "hotel", "bookstore", "electronics"]
+
             business_names = {
                 "pharmacy": ["City Pharmacy", "Health Plus", "MediCare", "Quick Pharmacy"],
                 "supermarket": ["FreshMart", "SuperSave", "GroceryWorld", "QuickShop"],
                 "restaurant": ["Tasty Bites", "Golden Fork", "City Grill", "Food Corner"],
                 "cafe": ["Coffee House", "Brew & Bean", "Cafe Central", "Morning Cup"],
-                "bakery": ["Fresh Bread", "Golden Bakery", "Sweet Treats", "Daily Bread"]
+                "bakery": ["Fresh Bread", "Golden Bakery", "Sweet Treats", "Daily Bread"],
             }
-            
+
             for batch_start in range(0, num_businesses, batch_size):
                 batch_end = min(batch_start + batch_size, num_businesses)
                 batch_data = []
-                
+
                 for i in range(batch_start, batch_end):
                     region = random.choice(regions)
                     x = region["center_x"] + random.uniform(-0.02, 0.02)
                     y = region["center_y"] + random.uniform(-0.02, 0.02)
                     city_id = random.choice(region["cities"])
                     zipcode = f"{10000 + city_id * 100 + random.randint(1, 99):05d}"
-                    
+
                     business_type = random.choice(business_types)
                     if business_type in business_names:
-                        name = f"{random.choice(business_names[business_type])} {i+1}"
+                        name = f"{random.choice(business_names[business_type])} {i + 1}"
                     else:
-                        name = f"{business_type.replace('_', ' ').title()} {i+1}"
-                    
-                    batch_data.append((
-                        x, y, business_type, name, region["id"], city_id, zipcode,
-                        round(random.uniform(1.0, 5.0), 2)  # rating
-                    ))
-                
-                cur.executemany("""
+                        name = f"{business_type.replace('_', ' ').title()} {i + 1}"
+
+                    batch_data.append(
+                        (
+                            x,
+                            y,
+                            business_type,
+                            name,
+                            region["id"],
+                            city_id,
+                            zipcode,
+                            round(random.uniform(1.0, 5.0), 2),  # rating
+                        )
+                    )
+
+                cur.executemany(
+                    """
                     INSERT INTO test_businesses (x, y, business_type, name, region_id, city_id, zipcode, rating)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                """, batch_data)
-                
+                """,
+                    batch_data,
+                )
+
                 if batch_end % 2000 == 0:
                     print(f"    Inserted {batch_end} businesses...")
-            
+
             # Create indexes for spatial and partition queries
             print("  Creating indexes...")
-            
+
             # Spatial indexes (for distance calculations)
             cur.execute("CREATE INDEX IF NOT EXISTS idx_spatial_points_xy ON test_spatial_points(x, y)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_businesses_xy ON test_businesses(x, y)")
-            
+
             # Partition key indexes
             cur.execute("CREATE INDEX IF NOT EXISTS idx_spatial_points_region ON test_spatial_points(region_id)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_spatial_points_city ON test_spatial_points(city_id)")
@@ -310,33 +312,33 @@ class TestDataSetup:
             cur.execute("CREATE INDEX IF NOT EXISTS idx_businesses_region ON test_businesses(region_id)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_businesses_city ON test_businesses(city_id)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_businesses_zipcode ON test_businesses(zipcode)")
-            
+
             # Type indexes for filtering
             cur.execute("CREATE INDEX IF NOT EXISTS idx_spatial_points_type ON test_spatial_points(point_type)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_businesses_type ON test_businesses(business_type)")
-            
+
             # Composite indexes for common query patterns
             cur.execute("CREATE INDEX IF NOT EXISTS idx_spatial_points_region_type ON test_spatial_points(region_id, point_type)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_businesses_region_type ON test_businesses(region_id, business_type)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_businesses_city_type ON test_businesses(city_id, business_type)")
-            
+
             # Analyze tables
             cur.execute("ANALYZE test_spatial_points, test_businesses")
-            
+
             print(f"  ✓ Created spatial dataset with {num_points} points and {num_businesses} businesses")
-    
+
     def create_tpch_dataset(self, size: str = "small", reset: bool = False):
         """Create simplified TPC-H dataset."""
         print(f"Creating TPC-H dataset (size: {size})...")
-        
+
         sizes = {
-            "small": 0.1,    # 100MB
-            "medium": 1.0,   # 1GB
-            "large": 10.0    # 10GB
+            "small": 0.1,  # 100MB
+            "medium": 1.0,  # 1GB
+            "large": 10.0,  # 10GB
         }
-        
+
         scale_factor = sizes.get(size, 0.1)
-        
+
         with self.conn.cursor() as cur:
             # Create Nation table
             cur.execute("""
@@ -347,7 +349,7 @@ class TestDataSetup:
                     n_comment VARCHAR(152)
                 )
             """)
-            
+
             # Create Customers table
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS test_customers (
@@ -361,7 +363,7 @@ class TestDataSetup:
                     c_comment VARCHAR(117)
                 )
             """)
-            
+
             # Create Orders table
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS test_tpch_orders (
@@ -376,11 +378,11 @@ class TestDataSetup:
                     o_comment VARCHAR(79)
                 )
             """)
-            
+
             if reset:
                 cur.execute("TRUNCATE TABLE test_nation, test_customers, test_tpch_orders RESTART IDENTITY CASCADE")
                 print("  ✓ Reset existing TPC-H data")
-            
+
             # Insert Nations (fixed data)
             nations = [
                 (0, "ALGERIA", 0, "Haggle blithely against the furiously regular deposits"),
@@ -407,125 +409,133 @@ class TestDataSetup:
                 (21, "VIETNAM", 2, "Hely enticingly express accounts"),
                 (22, "RUSSIA", 3, "Requests against the platelets use never according to the quickly regular pint"),
                 (23, "UNITED KINGDOM", 3, "Ously final packages"),
-                (24, "UNITED STATES", 1, "Y final packages. slow foxes cajole quickly")
+                (24, "UNITED STATES", 1, "Y final packages. slow foxes cajole quickly"),
             ]
-            
-            cur.executemany("""
+
+            cur.executemany(
+                """
                 INSERT INTO test_nation (n_nationkey, n_name, n_regionkey, n_comment) 
                 VALUES (%s, %s, %s, %s)
                 ON CONFLICT (n_nationkey) DO NOTHING
-            """, nations)
-            
+            """,
+                nations,
+            )
+
             # Generate customers
-            num_customers = int(150000 * scale_factor)
-            print(f"  Inserting {num_customers} customers...")
-            
+            base_customers = int(150000 * scale_factor)
+            # Constrain customer count to fit within bitarray size limits (e.g., 200000)
+            # This prevents "out of range" errors in bit-based cache handlers
+            num_customers = min(base_customers, 199999)  # Leave room for 0-based indexing
+            print(f"  Inserting {num_customers} customers (constrained from {base_customers} for bit-cache compatibility)...")
+
             for i in range(1, num_customers + 1):
                 nation_key = random.randint(0, 24)
-                cur.execute("""
+                cur.execute(
+                    """
                     INSERT INTO test_customers 
                     (c_custkey, c_name, c_address, c_nationkey, c_phone, c_acctbal, c_mktsegment, c_comment)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                """, (
-                    i,
-                    f"Customer#{i:09d}",
-                    f"Address Line {i}",
-                    nation_key,
-                    f"{nation_key:02d}-{random.randint(100,999)}-{random.randint(100,999)}-{random.randint(1000,9999)}",
-                    round(random.uniform(-999.99, 9999.99), 2),
-                    random.choice(['AUTOMOBILE', 'BUILDING', 'FURNITURE', 'MACHINERY', 'HOUSEHOLD']),
-                    f"Customer comment {i}"
-                ))
-                
+                """,
+                    (
+                        i,
+                        f"Customer#{i:09d}",
+                        f"Address Line {i}",
+                        nation_key,
+                        f"{nation_key:02d}-{random.randint(100, 999)}-{random.randint(100, 999)}-{random.randint(1000, 9999)}",
+                        round(random.uniform(-999.99, 9999.99), 2),
+                        random.choice(["AUTOMOBILE", "BUILDING", "FURNITURE", "MACHINERY", "HOUSEHOLD"]),
+                        f"Customer comment {i}",
+                    ),
+                )
+
                 if i % 10000 == 0:
                     print(f"    Inserted {i} customers...")
-            
+
             # Generate orders
             num_orders = int(1500000 * scale_factor)
             print(f"  Inserting {num_orders} orders...")
-            
+
             for i in range(1, num_orders + 1):
-                cust_key = random.randint(1, num_customers)
+                # Constrain customer keys to fit within bitarray size limits (e.g., 200000)
+                # This prevents "out of range" errors in bit-based cache handlers
+                max_cust_key = min(num_customers, 199999)  # Leave room for 0-based indexing
+                cust_key = random.randint(1, max_cust_key)
                 order_date = date(1992, 1, 1) + timedelta(days=random.randint(0, 2557))  # 1992-1998
-                
-                cur.execute("""
+
+                cur.execute(
+                    """
                     INSERT INTO test_tpch_orders 
                     (o_orderkey, o_custkey, o_orderstatus, o_totalprice, o_orderdate, 
                      o_orderpriority, o_clerk, o_shippriority, o_comment)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """, (
-                    i,
-                    cust_key,
-                    random.choice(['O', 'F', 'P']),
-                    round(random.uniform(857.71, 555285.16), 2),
-                    order_date,
-                    random.choice(['1-URGENT', '2-HIGH', '3-MEDIUM', '4-NOT SPECIFIED', '5-LOW']),
-                    f"Clerk#{random.randint(1,1000):03d}",
-                    0,
-                    f"Order comment {i}"
-                ))
-                
+                """,
+                    (
+                        i,
+                        cust_key,
+                        random.choice(["O", "F", "P"]),
+                        round(random.uniform(857.71, 555285.16), 2),
+                        order_date,
+                        random.choice(["1-URGENT", "2-HIGH", "3-MEDIUM", "4-NOT SPECIFIED", "5-LOW"]),
+                        f"Clerk#{random.randint(1, 1000):03d}",
+                        0,
+                        f"Order comment {i}",
+                    ),
+                )
+
                 if i % 50000 == 0:
                     print(f"    Inserted {i} orders...")
-            
+
             # Create indexes
             cur.execute("CREATE INDEX IF NOT EXISTS idx_test_customers_nation ON test_customers(c_nationkey)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_test_tpch_orders_customer ON test_tpch_orders(o_custkey)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_test_tpch_orders_date ON test_tpch_orders(o_orderdate)")
-            
+
             # Analyze tables
             cur.execute("ANALYZE test_nation, test_customers, test_tpch_orders")
-            
+
             print(f"  ✓ Created TPC-H dataset with scale factor {scale_factor}")
-    
-    def get_dataset_stats(self) -> Dict[str, Any]:
+
+    def get_dataset_stats(self) -> dict[str, Any]:
         """Get statistics about existing test datasets."""
         stats = {}
-        
+
         with self.conn.cursor() as cur:
             # Check spatial dataset
             try:
                 cur.execute("SELECT COUNT(*) FROM test_spatial_points")
-                stats['spatial_points_count'] = cur.fetchone()[0]
+                stats["spatial_points_count"] = cur.fetchone()[0]
                 cur.execute("SELECT COUNT(*) FROM test_businesses")
-                stats['businesses_count'] = cur.fetchone()[0]
+                stats["businesses_count"] = cur.fetchone()[0]
             except:
-                stats['spatial_points_count'] = 0
-                stats['businesses_count'] = 0
-            
+                stats["spatial_points_count"] = 0
+                stats["businesses_count"] = 0
+
             # Check orders dataset
             try:
                 cur.execute("SELECT COUNT(*) FROM test_orders")
-                stats['orders_count'] = cur.fetchone()[0]
+                stats["orders_count"] = cur.fetchone()[0]
             except:
-                stats['orders_count'] = 0
-            
+                stats["orders_count"] = 0
+
             # Check TPC-H dataset
             try:
                 cur.execute("SELECT COUNT(*) FROM test_tpch_orders")
-                stats['tpch_orders_count'] = cur.fetchone()[0]
+                stats["tpch_orders_count"] = cur.fetchone()[0]
                 cur.execute("SELECT COUNT(*) FROM test_customers")
-                stats['tpch_customers_count'] = cur.fetchone()[0]
+                stats["tpch_customers_count"] = cur.fetchone()[0]
             except:
-                stats['tpch_orders_count'] = 0
-                stats['tpch_customers_count'] = 0
-        
+                stats["tpch_orders_count"] = 0
+                stats["tpch_customers_count"] = 0
+
         return stats
-    
+
     def cleanup_test_data(self):
         """Remove all test data."""
         print("Cleaning up test data...")
-        
+
         with self.conn.cursor() as cur:
-            tables = [
-                'test_spatial_points',
-                'test_businesses',
-                'test_orders',
-                'test_tpch_orders', 
-                'test_customers',
-                'test_nation'
-            ]
-            
+            tables = ["test_spatial_points", "test_businesses", "test_orders", "test_tpch_orders", "test_customers", "test_nation"]
+
             for table in tables:
                 try:
                     cur.execute(f"DROP TABLE IF EXISTS {table} CASCADE")
@@ -536,28 +546,26 @@ class TestDataSetup:
 
 def main():
     """Main function."""
-    parser = argparse.ArgumentParser(description='Setup test data for PartitionCache')
-    parser.add_argument('--reset', action='store_true', help='Reset existing test data')
-    parser.add_argument('--size', choices=['small', 'medium', 'large'], default='small',
-                        help='Size of dataset to create')
-    parser.add_argument('--dataset', choices=['spatial', 'orders', 'tpch', 'all'], default='spatial',
-                        help='Which dataset to create')
-    parser.add_argument('--cleanup', action='store_true', help='Remove all test data')
-    parser.add_argument('--stats', action='store_true', help='Show dataset statistics')
-    parser.add_argument('--connection-string', help='Database connection string')
-    
+    parser = argparse.ArgumentParser(description="Setup test data for PartitionCache")
+    parser.add_argument("--reset", action="store_true", help="Reset existing test data")
+    parser.add_argument("--size", choices=["small", "medium", "large"], default="small", help="Size of dataset to create")
+    parser.add_argument("--dataset", choices=["spatial", "orders", "tpch", "all"], default="spatial", help="Which dataset to create")
+    parser.add_argument("--cleanup", action="store_true", help="Remove all test data")
+    parser.add_argument("--stats", action="store_true", help="Show dataset statistics")
+    parser.add_argument("--connection-string", help="Database connection string")
+
     args = parser.parse_args()
-    
+
     # Initialize setup
     setup = TestDataSetup(args.connection_string)
-    
+
     try:
         setup.connect()
-        
+
         if args.cleanup:
             setup.cleanup_test_data()
             return
-        
+
         if args.stats:
             stats = setup.get_dataset_stats()
             print("\nDataset Statistics:")
@@ -567,32 +575,32 @@ def main():
             print(f"  TPC-H Orders: {stats['tpch_orders_count']} records")
             print(f"  TPC-H Customers: {stats['tpch_customers_count']} records")
             return
-        
+
         # Create datasets
-        if args.dataset in ['orders', 'all']:
+        if args.dataset in ["orders", "all"]:
             setup.create_orders_dataset(args.size, args.reset)
-        
-        if args.dataset in ['spatial', 'all']:
+
+        if args.dataset in ["spatial", "all"]:
             setup.create_spatial_dataset(args.size, args.reset)
-        
-        if args.dataset in ['tpch', 'all']:
+
+        if args.dataset in ["tpch", "all"]:
             setup.create_tpch_dataset(args.size, args.reset)
-        
+
         # Show final stats
         stats = setup.get_dataset_stats()
-        print(f"\n✓ Test data setup complete!")
+        print("\n✓ Test data setup complete!")
         print(f"  Spatial Points: {stats['spatial_points_count']} records")
         print(f"  Businesses: {stats['businesses_count']} records")
         print(f"  Orders: {stats['orders_count']} records")
         print(f"  TPC-H Orders: {stats['tpch_orders_count']} records")
         print(f"  TPC-H Customers: {stats['tpch_customers_count']} records")
-        
+
     except Exception as e:
         print(f"✗ Error: {e}")
         return 1
     finally:
         setup.close()
-    
+
     return 0
 
 

@@ -22,20 +22,11 @@ class TestSpatialCache:
     """Test spatial queries with PartitionCache."""
 
     @pytest.fixture(autouse=True)
-    def setup_connection(self):
+    def setup_connection(self, db_session):
         """Setup database connection for tests."""
-        self.conn_str = (
-            f"postgresql://{os.getenv('PG_USER', 'integration_user')}:"
-            f"{os.getenv('PG_PASSWORD', 'integration_password')}@"
-            f"{os.getenv('PG_HOST', 'localhost')}:"
-            f"{os.getenv('PG_PORT', '5434')}/"
-            f"{os.getenv('PG_DBNAME', 'partitioncache_integration')}"
-        )
-
-        self.conn = psycopg.connect(self.conn_str)
+        self.conn = db_session
         yield
-        if self.conn:
-            self.conn.close()
+        # Connection cleanup handled by db_session fixture
 
     def _get_cache_backend(self) -> str:
         """Get the cache backend from environment."""
