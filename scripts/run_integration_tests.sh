@@ -117,11 +117,29 @@ setup_integration_env() {
 load_env() {
     if [ "$CI_MODE" = true ]; then
         echo -e "${YELLOW}📝 Using CI environment variables${NC}"
+        # In CI mode, most variables are set by GitHub Actions, but we might need some from .env.integration
+        # for specific backend configurations
+        if [ -f ".env.integration" ]; then
+            # Load helper functions
+            if [ -f "scripts/load_env.sh" ]; then
+                source scripts/load_env.sh
+                load_and_export_env .env.integration
+            else
+                echo -e "${YELLOW}⚠️  Helper script not found, using simple loading${NC}"
+                export $(grep -v '^#' .env.integration | grep '=' | xargs)
+            fi
+        fi
     else
         if [ -f ".env.integration" ]; then
             echo -e "${YELLOW}📝 Loading integration environment variables...${NC}"
-            # Export all non-comment lines from .env.integration
-            export $(grep -v '^#' .env.integration | grep '=' | xargs)
+            # Use helper script for proper environment loading
+            if [ -f "scripts/load_env.sh" ]; then
+                source scripts/load_env.sh
+                load_and_export_env .env.integration
+            else
+                echo -e "${YELLOW}⚠️  Helper script not found, using simple loading${NC}"
+                export $(grep -v '^#' .env.integration | grep '=' | xargs)
+            fi
         else
             echo -e "${YELLOW}⚠️  No .env.integration file found, using defaults${NC}"
         fi
