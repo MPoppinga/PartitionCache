@@ -124,14 +124,6 @@ class TestCachePerformance:
 
     def test_cache_memory_efficiency(self, cache_client: AbstractCacheHandler):
         """Test memory efficiency with duplicate data."""
-        import pytest
-        import os
-        
-        # Skip PostgreSQL bit/roaringbit backends in CI due to table creation issues
-        backend_name = getattr(cache_client, '__class__', type(cache_client)).__name__.lower()
-        if os.getenv('CI') and 'postgresql' in backend_name and ('bit' in backend_name or 'roaring' in backend_name):
-            pytest.skip(f"Skipping {backend_name} due to CI table creation issues")
-        
         partition_key = "zipcode"
         common_values = {1001, 1002, 1003}
 
@@ -159,14 +151,6 @@ class TestCacheConcurrency:
     @pytest.mark.slow
     def test_concurrent_writes(self, cache_client: AbstractCacheHandler):
         """Test concurrent write operations from multiple threads."""
-        import pytest
-        import os
-        
-        # Skip PostgreSQL bit/roaringbit backends in CI due to table creation issues
-        backend_name = getattr(cache_client, '__class__', type(cache_client)).__name__.lower()
-        if os.getenv('CI') and 'postgresql' in backend_name and ('bit' in backend_name or 'roaring' in backend_name):
-            pytest.skip(f"Skipping {backend_name} due to CI table creation issues")
-        
         partition_key = "zipcode"
         num_threads = 10
         operations_per_thread = 50
@@ -197,14 +181,6 @@ class TestCacheConcurrency:
     @pytest.mark.slow
     def test_concurrent_read_write(self, cache_client: AbstractCacheHandler):
         """Test mixed concurrent read and write operations."""
-        import pytest
-        import os
-        
-        # Skip PostgreSQL bit/roaringbit backends in CI due to table creation issues
-        backend_name = getattr(cache_client, '__class__', type(cache_client)).__name__.lower()
-        if os.getenv('CI') and 'postgresql' in backend_name and ('bit' in backend_name or 'roaring' in backend_name):
-            pytest.skip(f"Skipping {backend_name} due to CI table creation issues")
-        
         partition_key = "zipcode"
         shared_keys = [f"shared_{i}" for i in range(20)]
 
@@ -301,14 +277,6 @@ class TestCacheStress:
     @pytest.mark.slow
     def test_rapid_operations(self, cache_client: AbstractCacheHandler):
         """Test rapid succession of cache operations."""
-        import pytest
-        import os
-        
-        # Skip PostgreSQL bit/roaringbit backends in CI due to table creation issues
-        backend_name = getattr(cache_client, '__class__', type(cache_client)).__name__.lower()
-        if os.getenv('CI') and 'postgresql' in backend_name and ('bit' in backend_name or 'roaring' in backend_name):
-            pytest.skip(f"Skipping {backend_name} due to CI table creation issues")
-        
         partition_key = "zipcode"
         num_rapid_ops = 500
 

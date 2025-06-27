@@ -1,8 +1,11 @@
+import logging
 from datetime import datetime
 
 import redis
 
 from partitioncache.cache_handler.abstract import AbstractCacheHandler
+
+logger = logging.getLogger("PartitionCache")
 
 
 class RedisAbstractCacheHandler(AbstractCacheHandler):
@@ -176,6 +179,36 @@ class RedisAbstractCacheHandler(AbstractCacheHandler):
             # Fallback for Redis typing issues
             return []
 
+    def clear_all_cache_data(self) -> int:
+        """Clear all cache-related data from this Redis database.
+        
+        Returns:
+            Number of keys deleted
+        """
+        deleted_count = 0
+        try:
+            # Find all cache-related keys using patterns
+            patterns = [
+                "cache:*",      # Cache data keys
+                "query:*",      # Query tracking keys
+                "_partition_metadata:*"  # Partition metadata
+            ]
+            
+            for pattern in patterns:
+                # Use SCAN to find keys matching pattern (safer than KEYS for large datasets)
+                cursor = 0
+                while True:
+                    cursor, keys = self.db.scan(cursor, match=pattern, count=100)
+                    if keys:
+                        deleted_count += self.db.delete(*keys)
+                    if cursor == 0:
+                        break
+                        
+            return deleted_count
+        except Exception as e:
+            logger.error(f"Failed to clear cache data: {e}")
+            return deleted_count
+    
     def get_datatype(self, partition_key: str) -> str | None:
         """Get the datatype of the cache handler. If the partition key is not set, return None."""
         return self._get_partition_datatype(partition_key)

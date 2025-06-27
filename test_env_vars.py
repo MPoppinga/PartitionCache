@@ -54,7 +54,7 @@ def check_env_vars():
         backend_specific_vars = {
             "REDIS_HOST": os.getenv("REDIS_HOST"),
             "REDIS_PORT": os.getenv("REDIS_PORT"),
-            "REDIS_CACHE_DB": os.getenv("REDIS_CACHE_DB"),
+            "REDIS_SET_DB": os.getenv("REDIS_SET_DB") or os.getenv("REDIS_CACHE_DB"),
         }
     elif backend == "redis_bit":
         backend_specific_vars = {

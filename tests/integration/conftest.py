@@ -458,13 +458,13 @@ def cache_client(request, db_session):
             os.environ["PG_ROARINGBIT_CACHE_TABLE_PREFIX"] = "integration_roaring_cache"
 
     elif cache_backend.startswith("redis"):
-        # Set Redis connection variables if not already set
+        # Set Redis connection variables if not already set, using separate databases for isolation
         if not os.getenv("REDIS_CACHE_DB"):
             os.environ["REDIS_CACHE_DB"] = "0"
         if not os.getenv("REDIS_BIT_DB"):
             os.environ["REDIS_BIT_DB"] = "1"
         if not os.getenv("REDIS_SET_DB"):
-            os.environ["REDIS_SET_DB"] = "0"
+            os.environ["REDIS_SET_DB"] = "2"  # Use different database for redis_set
         if not os.getenv("REDIS_BIT_BITSIZE"):
             os.environ["REDIS_BIT_BITSIZE"] = "200000"
 
@@ -508,37 +508,42 @@ def cache_client(request, db_session):
     finally:
         # Cleanup - Force complete cleanup for test isolation
         try:
-            # Clear ALL test data completely (not limited to 50 keys)
-            for partition_key, _ in TEST_PARTITION_KEYS:
-                try:
-                    # Check if partition exists before attempting cleanup
-                    if hasattr(cache_handler, "_get_partition_datatype"):
-                        # For PostgreSQL backends, check if partition exists
-                        if cache_handler._get_partition_datatype(partition_key) is None:
-                            continue  # Skip non-existent partitions
+            # Special cleanup for Redis backends - use bulk clear method
+            if cache_backend.startswith("redis") and hasattr(cache_handler, "clear_all_cache_data"):
+                deleted_count = cache_handler.clear_all_cache_data()
+                logger.info(f"Cleared {deleted_count} Redis cache keys")
+            else:
+                # Clear ALL test data completely (not limited to 50 keys)
+                for partition_key, _ in TEST_PARTITION_KEYS:
+                    try:
+                        # Check if partition exists before attempting cleanup
+                        if hasattr(cache_handler, "_get_partition_datatype"):
+                            # For PostgreSQL backends, check if partition exists
+                            if cache_handler._get_partition_datatype(partition_key) is None:
+                                continue  # Skip non-existent partitions
 
-                    # Get all keys and delete them all
-                    keys = cache_handler.get_all_keys(partition_key)
-                    if keys:
-                        # Delete all keys without limit for proper test isolation
-                        for key in list(keys):
+                        # Get all keys and delete them all
+                        keys = cache_handler.get_all_keys(partition_key)
+                        if keys:
+                            # Delete all keys without limit for proper test isolation
+                            for key in list(keys):
+                                try:
+                                    cache_handler.delete(key, partition_key)
+                                except Exception:
+                                    pass  # Continue deleting other keys
+
+                            # Double-check deletion worked (only if partition still exists)
                             try:
-                                cache_handler.delete(key, partition_key)
+                                remaining_keys = cache_handler.get_all_keys(partition_key)
+                                if remaining_keys:
+                                    logger.warning(f"Failed to delete all keys for {partition_key}: {len(remaining_keys)} remaining")
                             except Exception:
-                                pass  # Continue deleting other keys
-
-                        # Double-check deletion worked (only if partition still exists)
-                        try:
-                            remaining_keys = cache_handler.get_all_keys(partition_key)
-                            if remaining_keys:
-                                logger.warning(f"Failed to delete all keys for {partition_key}: {len(remaining_keys)} remaining")
-                        except Exception:
-                            # Partition might have been deleted during cleanup - this is OK
-                            pass
-                except Exception as e:
-                    # Only log warnings for unexpected errors, not missing tables
-                    if "does not exist" not in str(e).lower() and "relation" not in str(e).lower():
-                        logger.warning(f"Cache cleanup failed for {partition_key}: {e}")
+                                # Partition might have been deleted during cleanup - this is OK
+                                pass
+                    except Exception as e:
+                        # Only log warnings for unexpected errors, not missing tables
+                        if "does not exist" not in str(e).lower() and "relation" not in str(e).lower():
+                            logger.warning(f"Cache cleanup failed for {partition_key}: {e}")
 
             # Properly close cache handler
             if hasattr(cache_handler, "close"):
