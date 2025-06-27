@@ -181,7 +181,7 @@ class RedisAbstractCacheHandler(AbstractCacheHandler):
 
     def clear_all_cache_data(self) -> int:
         """Clear all cache-related data from this Redis database.
-        
+
         Returns:
             Number of keys deleted
         """
@@ -189,11 +189,11 @@ class RedisAbstractCacheHandler(AbstractCacheHandler):
         try:
             # Find all cache-related keys using patterns
             patterns = [
-                "cache:*",      # Cache data keys
-                "query:*",      # Query tracking keys
-                "_partition_metadata:*"  # Partition metadata
+                "cache:*",  # Cache data keys
+                "query:*",  # Query tracking keys
+                "_partition_metadata:*",  # Partition metadata
             ]
-            
+
             for pattern in patterns:
                 # Use SCAN to find keys matching pattern (safer than KEYS for large datasets)
                 cursor = 0
@@ -203,12 +203,12 @@ class RedisAbstractCacheHandler(AbstractCacheHandler):
                         deleted_count += self.db.delete(*keys)
                     if cursor == 0:
                         break
-                        
+
             return deleted_count
         except Exception as e:
             logger.error(f"Failed to clear cache data: {e}")
             return deleted_count
-    
+
     def get_datatype(self, partition_key: str) -> str | None:
         """Get the datatype of the cache handler. If the partition key is not set, return None."""
         return self._get_partition_datatype(partition_key)
