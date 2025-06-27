@@ -30,7 +30,7 @@ def create_clean_database(unique_db: str, conn_str: str) -> None:
 def setup_database_extensions_and_tables(unique_db: str) -> None:
     """Set up extensions and tables in the newly created database."""
     # Connect to the new database and set up extensions and tables
-    db_conn_str = f"postgresql://integration_user:integration_password@localhost:5432/{unique_db}"
+    db_conn_str = f"postgresql://integration_user:integration_password@localhost:{os.getenv('PG_PORT', '5432')}/{unique_db}"
     with psycopg.connect(db_conn_str, autocommit=True) as conn:
         with conn.cursor() as cur:
             print("Setting up extensions...")
@@ -131,7 +131,7 @@ def main():
         print("ERROR: UNIQUE_DB_NAME environment variable not set")
         sys.exit(1)
 
-    conn_str = "postgresql://integration_user:integration_password@localhost:5432/postgres"
+    conn_str = f"postgresql://integration_user:integration_password@localhost:{os.getenv('PG_PORT', '5432')}/postgres"
 
     try:
         create_clean_database(unique_db, conn_str)

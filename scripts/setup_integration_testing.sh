@@ -361,6 +361,9 @@ main() {
     start_services "$SERVICES"
     create_env_config "$SERVICES"
     test_connections "$SERVICES"
+    echo -e "${YELLOW}🔨 Creating clean test database...${NC}"
+    export UNIQUE_DB_NAME=partitioncache_integration
+    python3 scripts/create_clean_test_database.py
     show_service_status
     show_summary "$SERVICES"
 }

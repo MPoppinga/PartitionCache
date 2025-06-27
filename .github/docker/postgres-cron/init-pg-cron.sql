@@ -60,6 +60,5 @@ GRANT USAGE, SELECT ON SEQUENCE test_locations_id_seq TO integration_user;
 GRANT ALL PRIVILEGES ON test_businesses TO integration_user;
 GRANT USAGE, SELECT ON SEQUENCE test_businesses_id_seq TO integration_user;
 
--- Install PartitionCache queue processor functions for manual testing
--- Load the complete PostgreSQL queue processor SQL file
-\ir /docker-entrypoint-initdb.d/postgresql_queue_processor.sql
+-- Note: PartitionCache queue processor functions are loaded at test runtime
+-- via the setup_postgresql_queue_processor.py CLI tool
