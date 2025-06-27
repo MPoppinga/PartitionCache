@@ -375,6 +375,15 @@ jobs:
       PG_QUEUE_USER: integration_user
       PG_QUEUE_PASSWORD: integration_password
       QUERY_QUEUE_PROVIDER: postgresql
+      
+      # Cache backend configuration with E2E-specific prefixes for isolation
+      PG_ARRAY_CACHE_TABLE_PREFIX: e2e_array_cache_${{ github.run_id }}
+      PG_BIT_CACHE_TABLE_PREFIX: e2e_bit_cache_${{ github.run_id }}
+      PG_BIT_CACHE_BITSIZE: 300000
+      PG_ROARINGBIT_CACHE_TABLE_PREFIX: e2e_roaring_cache_${{ github.run_id }}
+      
+      # Queue configuration with E2E-specific prefixes
+      PG_QUEUE_TABLE_PREFIX: e2e_queue_${{ github.run_id }}
 
     steps:
     - name: Checkout repository
@@ -419,7 +428,7 @@ jobs:
     - name: Run E2E tests
       shell: micromamba-shell {0}
       run: |
-        PYTEST_FLAGS="--ci --no-setup --pattern test_end_to_end_workflows --verbose"
+        PYTEST_FLAGS="--ci --pattern test_end_to_end_workflows --verbose"
         if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == "refs/heads/main" ]]; then
           PYTEST_FLAGS="$PYTEST_FLAGS --coverage"
         fi
@@ -467,6 +476,15 @@ jobs:
       DB_PORT: 5432
       DB_USER: integration_user
       DB_PASSWORD: integration_password
+      
+      # Cache backend configuration with Performance-specific prefixes for isolation
+      PG_ARRAY_CACHE_TABLE_PREFIX: perf_array_cache_${{ github.run_id }}
+      PG_BIT_CACHE_TABLE_PREFIX: perf_bit_cache_${{ github.run_id }}
+      PG_BIT_CACHE_BITSIZE: 300000
+      PG_ROARINGBIT_CACHE_TABLE_PREFIX: perf_roaring_cache_${{ github.run_id }}
+      
+      # Queue configuration with Performance-specific prefixes  
+      PG_QUEUE_TABLE_PREFIX: perf_queue_${{ github.run_id }}
 
     steps:
     - name: Checkout repository
@@ -535,7 +553,6 @@ jobs:
       run: |
         ./scripts/run_integration_tests.sh \
           --ci \
-          --no-setup \
           --pattern performance \
           --verbose
 
