@@ -78,9 +78,25 @@ def setup_database_extensions_and_tables(unique_db: str) -> None:
                     business_type TEXT NOT NULL,
                     region_id INTEGER NOT NULL,
                     city_id INTEGER NOT NULL,
+                    zipcode TEXT NOT NULL,
                     x DECIMAL(10,6) NOT NULL,
                     y DECIMAL(10,6) NOT NULL,
                     rating DECIMAL(2,1) DEFAULT 3.0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+
+            # Create test_spatial_points table for spatial cache testing
+            cur.execute("""
+                CREATE TABLE test_spatial_points (
+                    id SERIAL PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    point_type TEXT NOT NULL,
+                    region_id INTEGER NOT NULL,
+                    city_id INTEGER NOT NULL,
+                    zipcode TEXT NOT NULL,
+                    x DECIMAL(10,6) NOT NULL,
+                    y DECIMAL(10,6) NOT NULL,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
             """)
@@ -92,6 +108,8 @@ def setup_database_extensions_and_tables(unique_db: str) -> None:
             cur.execute("GRANT USAGE, SELECT ON SEQUENCE test_locations_id_seq TO integration_user;")
             cur.execute("GRANT ALL PRIVILEGES ON test_businesses TO integration_user;")
             cur.execute("GRANT USAGE, SELECT ON SEQUENCE test_businesses_id_seq TO integration_user;")
+            cur.execute("GRANT ALL PRIVILEGES ON test_spatial_points TO integration_user;")
+            cur.execute("GRANT USAGE, SELECT ON SEQUENCE test_spatial_points_id_seq TO integration_user;")
 
             # Install PartitionCache queue processor functions for manual testing
             print("Installing PartitionCache queue processor functions...")
