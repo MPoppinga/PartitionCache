@@ -446,11 +446,12 @@ def cache_client(request, db_session):
         if not os.getenv("DB_PASSWORD"):
             os.environ["DB_PASSWORD"] = os.getenv("PG_PASSWORD", "integration_password")
 
-        # Set backend-specific table prefixes
+        # Set backend-specific table prefixes (only if not already set by CI)
         if cache_backend == "postgresql_array" and not os.getenv("PG_ARRAY_CACHE_TABLE_PREFIX"):
             os.environ["PG_ARRAY_CACHE_TABLE_PREFIX"] = "integration_array_cache"
-        elif cache_backend == "postgresql_bit" and not os.getenv("PG_BIT_CACHE_TABLE_PREFIX"):
-            os.environ["PG_BIT_CACHE_TABLE_PREFIX"] = "integration_bit_cache"
+        elif cache_backend == "postgresql_bit":
+            if not os.getenv("PG_BIT_CACHE_TABLE_PREFIX"):
+                os.environ["PG_BIT_CACHE_TABLE_PREFIX"] = "integration_bit_cache"
             if not os.getenv("PG_BIT_CACHE_BITSIZE"):
                 os.environ["PG_BIT_CACHE_BITSIZE"] = "200000"
         elif cache_backend == "postgresql_roaringbit" and not os.getenv("PG_ROARINGBIT_CACHE_TABLE_PREFIX"):
