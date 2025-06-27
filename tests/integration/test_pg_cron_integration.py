@@ -22,9 +22,13 @@ class TestPgCronIntegration:
         """
         from partitioncache.queue import clear_all_queues, get_queue_lengths, get_queue_provider_name, push_to_original_query_queue, reset_queue_handler
 
-        # Only run for PostgreSQL
+        # Only run for PostgreSQL queue provider
         if get_queue_provider_name() != "postgresql":
             pytest.skip("This test is specific to PostgreSQL with pg_cron")
+        
+        # Only run for PostgreSQL cache backends (pg_cron processes PostgreSQL cache tables)
+        if not str(cache_client).startswith("postgresql"):
+            pytest.skip("pg_cron tests only compatible with PostgreSQL cache backends")
 
         reset_queue_handler()
 
