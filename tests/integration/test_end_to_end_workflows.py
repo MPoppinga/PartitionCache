@@ -293,6 +293,14 @@ class TestEndToEndWorkflows:
 
         assert len(queued_queries) > 0, "No queries successfully queued"
 
+        # Ensure partition key is registered for PostgreSQL backends
+        backend_name = getattr(cache_client, '__class__', type(cache_client)).__name__.lower()
+        if 'postgresql' in backend_name:
+            try:
+                cache_client.register_partition_key(partition_key, "integer")
+            except Exception:
+                pass  # May already be registered
+
         # Step 2: Simulate queue processing
         # In real workflow, queue processor would handle this
         for query in queued_queries:

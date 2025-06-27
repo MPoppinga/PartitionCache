@@ -130,7 +130,10 @@ class TestCachePerformance:
             cache_key = f"duplicate_{i}"
             assert cache_client.exists(cache_key, partition_key)
             retrieved = cache_client.get(cache_key, partition_key)
-            assert _compare_cache_values(retrieved, common_values)
+            # Use utility function for backend-agnostic comparison
+            from .test_utils import normalize_cache_result
+            normalized_retrieved = normalize_cache_result(retrieved)
+            assert normalized_retrieved == common_values, f"Cached value mismatch for duplicate_{i}: {normalized_retrieved} != {common_values}"
 
 
 class TestCacheConcurrency:
@@ -255,7 +258,10 @@ class TestCacheStress:
             # Verify we can still retrieve previously stored sets
             for cache_key, expected_set in large_sets:
                 retrieved = cache_client.get(cache_key, partition_key)
-                assert retrieved == expected_set, f"Failed to retrieve {cache_key}"
+                # Use utility function for backend-agnostic comparison
+                from .test_utils import normalize_cache_result
+                normalized_retrieved = normalize_cache_result(retrieved)
+                assert normalized_retrieved == expected_set, f"Failed to retrieve {cache_key}: {normalized_retrieved} != {expected_set}"
 
         except Exception as e:
             # Some backends may have memory limits
@@ -277,7 +283,10 @@ class TestCacheStress:
             # Set, verify, delete
             cache_client.set_set(cache_key, test_set, partition_key)
             retrieved = cache_client.get(cache_key, partition_key)
-            if retrieved == test_set:
+            # Use utility function for backend-agnostic comparison
+            from .test_utils import normalize_cache_result
+            normalized_retrieved = normalize_cache_result(retrieved)
+            if normalized_retrieved == test_set:
                 cache_client.delete(cache_key, partition_key)
 
         total_time = time.time() - start_time

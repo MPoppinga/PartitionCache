@@ -292,6 +292,14 @@ class TestQueueProcessor:
         reset_queue_handler()
         clear_all_queues()
 
+        # Ensure partition key is registered for PostgreSQL backends
+        backend_name = getattr(cache_client, '__class__', type(cache_client)).__name__.lower()
+        if 'postgresql' in backend_name:
+            try:
+                cache_client.register_partition_key(partition_key, "integer")
+            except Exception:
+                pass  # May already be registered
+
         # Clear cache for this partition (with timeout protection)
         try:
             existing_keys = cache_client.get_all_keys(partition_key)
