@@ -272,45 +272,21 @@ class TestQueueErrorRecovery:
                     assert any(keyword in error_msg for keyword in
                               ["cron", "schedule", "format", "invalid"])
 
-    def test_long_running_job_timeout(self, db_session, cache_client):
+    def test_long_running_job_timeout(self, db_session, cache_client, postgresql_queue_processor):
         """Test handling of long-running PartitionCache queries that timeout."""
-        from partitioncache.cache_handler import get_cache_table_prefix_from_env
-        from partitioncache.queue import clear_all_queues, get_queue_provider_name, get_queue_table_prefix_from_env
+        from partitioncache.queue import clear_all_queues
 
-        # Only run for PostgreSQL backends (both cache and queue)
-        cache_backend = os.getenv("CACHE_BACKEND", "")
-        queue_provider = get_queue_provider_name()
-
-        print(f"DEBUG: cache_backend={cache_backend}, queue_provider={queue_provider}")
-
-        if not cache_backend.startswith("postgresql") or queue_provider != "postgresql":
-            pytest.skip(f"This test requires PostgreSQL cache backend and queue provider. Got: {cache_backend}, {queue_provider}")
-
-        # Get configuration
-        queue_prefix = get_queue_table_prefix_from_env()
-        table_prefix = get_cache_table_prefix_from_env()
+        # Get configuration from the fixture
+        queue_prefix = postgresql_queue_processor["queue_prefix"]
+        table_prefix = postgresql_queue_processor["table_prefix"]
         partition_key = "test_partition"
 
         # Clear queues first
         clear_all_queues()
 
-        # Initialize processor tables if needed
+        # Ensure metadata tables exist
         with db_session.cursor() as cur:
-            cur.execute(f"SELECT partitioncache_initialize_processor_tables('{queue_prefix}')")
-            # Also ensure metadata tables exist
             cur.execute(f"SELECT partitioncache_ensure_metadata_tables('{table_prefix}')")
-
-            # Add a test configuration for the processor (required by run_single_job)
-            config_table = f"{queue_prefix}_processor_config"
-            cur.execute(f"""
-                INSERT INTO {config_table} 
-                (job_name, enabled, max_parallel_jobs, frequency_seconds, timeout_seconds, 
-                 table_prefix, queue_prefix, cache_backend)
-                VALUES ('partitioncache_process_queue', true, 1, 60, 30, 
-                        %s, %s, 'array')
-                ON CONFLICT (job_name) DO UPDATE 
-                SET timeout_seconds = 30, enabled = true
-            """, (table_prefix, queue_prefix))
             db_session.commit()
 
         # Queue a long-running query directly to fragment queue for testing

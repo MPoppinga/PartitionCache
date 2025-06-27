@@ -517,3 +517,77 @@ def wait_for_cron():
         time.sleep(seconds)
 
     return _wait
+
+
+@pytest.fixture(scope="session")
+def postgresql_queue_functions(db_connection):
+    """
+    Session-scoped fixture that ensures PostgreSQL queue processor functions are loaded.
+
+    This fixture:
+    1. Checks if PostgreSQL queue provider is configured
+    2. Loads the queue processor SQL functions into the database
+    3. Only runs once per test session
+    4. Skips gracefully if PostgreSQL is not available
+    """
+    # Check if PostgreSQL queue provider is configured
+    queue_provider = os.getenv("QUERY_QUEUE_PROVIDER", "").lower()
+    if queue_provider != "postgresql":
+        pytest.skip("PostgreSQL queue functions not needed for non-PostgreSQL queue provider")
+
+    if db_connection is None:
+        pytest.skip("PostgreSQL database connection not available")
+
+    try:
+        # Import the setup function
+        from partitioncache.cli.setup_postgresql_queue_processor import setup_database_objects
+        from partitioncache.queue import get_queue_table_prefix_from_env
+
+        # Load the SQL functions into the database
+        setup_database_objects(db_connection)
+
+        logger.info("PostgreSQL queue processor functions loaded successfully")
+        return True
+
+    except ImportError as e:
+        pytest.skip(f"Could not import PostgreSQL queue processor setup: {e}")
+    except Exception as e:
+        logger.error(f"Failed to load PostgreSQL queue processor functions: {e}")
+        pytest.fail(f"PostgreSQL queue function setup failed: {e}")
+
+
+@pytest.fixture
+def postgresql_queue_processor(postgresql_queue_functions, db_session):
+    """
+    Function-scoped fixture that provides a configured PostgreSQL queue processor.
+
+    Depends on postgresql_queue_functions to ensure SQL functions are loaded.
+    Sets up processor tables and configuration for the current test.
+    """
+    from partitioncache.cache_handler import get_cache_table_prefix_from_env
+    from partitioncache.queue import get_queue_table_prefix_from_env
+
+    queue_prefix = get_queue_table_prefix_from_env()
+    table_prefix = get_cache_table_prefix_from_env()
+
+    # Initialize processor tables
+    with db_session.cursor() as cur:
+        cur.execute(f"SELECT partitioncache_initialize_processor_tables('{queue_prefix}')")
+
+        # Add a test configuration for the processor
+        config_table = f"{queue_prefix}_processor_config"
+        cur.execute(
+            f"""
+            INSERT INTO {config_table} 
+            (job_name, enabled, max_parallel_jobs, frequency_seconds, timeout_seconds, 
+             table_prefix, queue_prefix, cache_backend)
+            VALUES ('partitioncache_process_queue', true, 1, 60, 30, 
+                    %s, %s, 'array')
+            ON CONFLICT (job_name) DO UPDATE 
+            SET timeout_seconds = 30, enabled = true, updated_at = NOW()
+        """,
+            (table_prefix, queue_prefix),
+        )
+        db_session.commit()
+
+    return {"queue_prefix": queue_prefix, "table_prefix": table_prefix, "config_table": config_table}
