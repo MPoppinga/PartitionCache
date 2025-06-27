@@ -2,6 +2,7 @@ import time
 from datetime import datetime
 from logging import getLogger
 
+import psycopg
 from psycopg import sql
 
 from partitioncache.cache_handler.postgresql_abstract import PostgreSQLAbstractCacheHandler
@@ -62,36 +63,6 @@ class PostgreSQLArrayCacheHandler(PostgreSQLAbstractCacheHandler):
             logger.warning(f"Failed to create custom array_intersect_agg. Performance for non-integer arrays might be suboptimal. Error: {e}")
             if self.db.closed is False:
                 self.db.rollback()
-
-        try:
-            self.cursor.execute(
-                sql.SQL("""CREATE TABLE IF NOT EXISTS {0} (
-                    partition_key TEXT PRIMARY KEY,
-                    datatype TEXT NOT NULL CHECK (datatype IN ('integer', 'float', 'text', 'timestamp')),
-                    created_at TIMESTAMP DEFAULT now()
-                );""").format(sql.Identifier(self.tableprefix + "_partition_metadata"))
-            )
-
-            # Shared queries table
-            self.cursor.execute(
-                sql.SQL("""CREATE TABLE IF NOT EXISTS {0} (
-                    query_hash TEXT NOT NULL,
-                    partition_key TEXT NOT NULL,
-                    query TEXT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'ok' CHECK (status IN ('ok', 'timeout', 'failed')),
-                    last_seen TIMESTAMP NOT NULL DEFAULT now(),
-                    PRIMARY KEY (query_hash, partition_key)
-                );""").format(sql.Identifier(self.tableprefix + "_queries"))
-            )
-
-            self.db.commit()
-        except Exception as e:
-            logger.error(f"Failed to create metadata tables: {e}")
-            try:
-                self.db.rollback()
-            except Exception as rollback_error:
-                logger.error(f"Failed to rollback after metadata table creation error: {rollback_error}")
-            raise
 
     def _create_partition_table(self, partition_key: str, datatype: str) -> None:
         """Create a cache table for a specific partition key with appropriate datatype."""

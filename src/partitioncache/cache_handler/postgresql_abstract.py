@@ -1,4 +1,5 @@
 import threading
+from abc import abstractmethod
 from logging import getLogger
 
 import psycopg
@@ -34,6 +35,67 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
         self.db = psycopg.connect(dbname=db_name, host=db_host, password=db_password, port=db_port, user=db_user)
         self.tableprefix = db_tableprefix
         self.cursor = self.db.cursor()
+        
+        # Create metadata tables with supported datatypes
+        self._recreate_metadata_table(self.get_supported_datatypes())
+
+    def _recreate_metadata_table(self, supported_datatypes: set[str]) -> None:
+        """
+        Recreate metadata table if it was dropped during cleanup.
+        
+        Args:
+            supported_datatypes: Set of supported datatype strings (e.g., {'integer', 'float', 'text', 'timestamp'})
+        """
+        try:
+            # Create datatype constraint based on supported datatypes
+            datatype_constraint = sql.SQL("CHECK (datatype IN ({}))").format(
+                sql.SQL(", ").join(sql.Literal(dt) for dt in sorted(supported_datatypes))
+            )
+
+            # Create metadata table with datatype constraint
+            self.cursor.execute(
+                sql.SQL("""CREATE TABLE IF NOT EXISTS {0} (
+                    partition_key TEXT PRIMARY KEY,
+                    datatype TEXT NOT NULL {1},
+                    created_at TIMESTAMP DEFAULT now()
+                );""").format(
+                    sql.Identifier(self.tableprefix + "_partition_metadata"),
+                    datatype_constraint
+                )
+            )
+
+            # Create queries table
+            self.cursor.execute(
+                sql.SQL("""CREATE TABLE IF NOT EXISTS {0} (
+                    query_hash TEXT NOT NULL,
+                    query TEXT NOT NULL,
+                    partition_key TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'ok' CHECK (status IN ('ok', 'timeout', 'failed')),
+                    last_seen TIMESTAMP NOT NULL DEFAULT now(),
+                    PRIMARY KEY (query_hash, partition_key)
+                );""").format(sql.Identifier(self.tableprefix + "_queries"))
+            )
+
+            self.db.commit()
+        except Exception as e:
+            logger.error(f"Failed to recreate metadata table: {e}")
+            try:
+                self.db.rollback()
+            except Exception as rollback_error:
+                logger.error(f"Failed to rollback after metadata table creation error: {rollback_error}")
+            raise
+
+    def _ensure_metadata_table_exists(self) -> None:
+        """Ensure the metadata table exists, create it if it doesn't."""
+        try:
+            # Test if metadata table exists by trying to query it
+            self.cursor.execute(
+                sql.SQL("SELECT 1 FROM {0} LIMIT 1").format(sql.Identifier(self.tableprefix + "_partition_metadata"))
+            )
+        except Exception:
+            # Metadata table doesn't exist, create it
+            logger.info(f"Creating metadata table: {self.tableprefix}_partition_metadata")
+            self._recreate_metadata_table(self.get_supported_datatypes())
 
     def _get_partition_datatype(self, partition_key: str) -> str | None:
         """Get the datatype for a partition key from metadata."""
@@ -313,3 +375,9 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
         except Exception as e:
             logger.error(f"Failed to get partition keys: {e}")
             return []
+
+    @classmethod
+    @abstractmethod
+    def get_supported_datatypes(cls) -> set[str]:
+        """Return the set of supported datatypes for this cache handler."""
+        pass

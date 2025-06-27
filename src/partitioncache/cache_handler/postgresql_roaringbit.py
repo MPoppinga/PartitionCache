@@ -2,6 +2,7 @@ from datetime import datetime
 from logging import getLogger
 
 from bitarray import bitarray
+import psycopg
 from psycopg import sql
 from pyroaring import BitMap
 
@@ -29,39 +30,6 @@ class PostgreSQLRoaringBitCacheHandler(PostgreSQLAbstractCacheHandler):
             logger.warning(f"Failed to create roaringbitmap extension: {e}")
             # Continue anyway - extension might already exist
 
-        self._recreate_metadata_table()
-
-    def _recreate_metadata_table(self) -> None:
-        """Recreate metadata table if it was dropped during cleanup."""
-        try:
-            # Enable roaringbitmap extension again if needed
-            self.cursor.execute("CREATE EXTENSION IF NOT EXISTS roaringbitmap;")
-
-            # Recreate metadata table
-            self.cursor.execute(
-                sql.SQL("""CREATE TABLE IF NOT EXISTS {0} (
-                    partition_key TEXT PRIMARY KEY,
-                    datatype TEXT NOT NULL CHECK (datatype = 'integer'),
-                    created_at TIMESTAMP DEFAULT now()
-                );""").format(sql.Identifier(self.tableprefix + "_partition_metadata"))
-            )
-
-            # Recreate queries table
-            self.cursor.execute(
-                sql.SQL("""CREATE TABLE IF NOT EXISTS {0} (
-                query_hash TEXT NOT NULL,
-                query TEXT NOT NULL,
-                partition_key TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'ok' CHECK (status IN ('ok', 'timeout', 'failed')),
-                last_seen TIMESTAMP NOT NULL DEFAULT now(),
-                PRIMARY KEY (query_hash, partition_key)
-            );""").format(sql.Identifier(self.tableprefix + "_queries"))
-            )
-
-            self.db.commit()
-        except Exception as e:
-            logger.error(f"Failed to recreate roaringbit metadata table: {e}")
-            raise
 
     def _create_partition_table(self, partition_key: str) -> None:
         """Create a cache table for a specific partition key."""
@@ -112,6 +80,9 @@ class PostgreSQLRoaringBitCacheHandler(PostgreSQLAbstractCacheHandler):
     def _ensure_partition_table(self, partition_key: str) -> None:
         """Ensure a partition table exists."""
         try:
+            # First ensure metadata table exists before trying to query it
+            self._ensure_metadata_table_exists()
+            
             existing_datatype = self._get_partition_datatype(partition_key)
 
             if existing_datatype is None:
@@ -130,6 +101,7 @@ class PostgreSQLRoaringBitCacheHandler(PostgreSQLAbstractCacheHandler):
                 # Avoid infinite retry loops
                 self.db.rollback()
                 raise
+
 
     def set_set(
         self,

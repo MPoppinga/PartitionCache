@@ -630,8 +630,7 @@ def postgresql_queue_functions(db_connection):
 
     try:
         # Import the setup function
-        from partitioncache.cli.setup_postgresql_queue_processor import setup_database_objects
-        from partitioncache.queue import get_queue_table_prefix_from_env
+        from partitioncache.cli.setup_postgresql_queue_processor import setup_database_objects, get_queue_table_prefix_from_env
 
         # Load the SQL functions into the database
         setup_database_objects(db_connection)
@@ -654,11 +653,10 @@ def postgresql_queue_processor(postgresql_queue_functions, db_session):
     Depends on postgresql_queue_functions to ensure SQL functions are loaded.
     Sets up processor tables and configuration for the current test.
     """
-    from partitioncache.cache_handler import get_cache_table_prefix_from_env
-    from partitioncache.queue import get_queue_table_prefix_from_env
+    from partitioncache.cli.setup_postgresql_queue_processor import get_table_prefix_from_env, get_queue_table_prefix_from_env
 
     queue_prefix = get_queue_table_prefix_from_env()
-    table_prefix = get_cache_table_prefix_from_env()
+    table_prefix = get_table_prefix_from_env()
 
     # Initialize processor tables
     with db_session.cursor() as cur:

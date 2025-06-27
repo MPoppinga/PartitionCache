@@ -18,39 +18,47 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
         Initialize the cache handler with the given db name.
         This handler supports multiple partition keys but only integer datatypes (for bit arrays).
         """
+        self.default_bitsize = bitsize  # Bitsize should be configured correctly by user (bitsize=1001 to store values 0-1000)
         super().__init__(db_name, db_host, db_user, db_password, db_port, db_tableprefix)
 
-        self.default_bitsize = bitsize  # Bitsize should be configured correctly by user (bitsize=1001 to store values 0-1000)
-        # Create metadata table to track partition keys with bitsize per partition
-        self._recreate_metadata_table()
-
-    def _recreate_metadata_table(self) -> None:
-        """Recreate metadata table if it was dropped during cleanup."""
+    def _recreate_metadata_table(self, supported_datatypes: set[str]) -> None:
+        """
+        Recreate metadata table with bitsize column for bit arrays.
+        Extends the base metadata table functionality.
+        """
         try:
+            # Create metadata table with bitsize column for bit arrays
             self.cursor.execute(
                 sql.SQL("""CREATE TABLE IF NOT EXISTS {0} (
                     partition_key TEXT PRIMARY KEY,
                     datatype TEXT NOT NULL CHECK (datatype = 'integer'),
                     bitsize INTEGER NOT NULL DEFAULT {1},
                     created_at TIMESTAMP DEFAULT now()
-                );""").format(sql.Identifier(self.tableprefix + "_partition_metadata"), sql.Literal(self.default_bitsize))
+                );""").format(
+                    sql.Identifier(self.tableprefix + "_partition_metadata"), 
+                    sql.Literal(self.default_bitsize)
+                )
             )
 
-            # Also recreate queries table
+            # Create queries table (same as base implementation)
             self.cursor.execute(
                 sql.SQL("""CREATE TABLE IF NOT EXISTS {0} (
-                query_hash TEXT NOT NULL,
-                query TEXT NOT NULL,
-                partition_key TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'ok' CHECK (status IN ('ok', 'timeout', 'failed')),
-                last_seen TIMESTAMP NOT NULL DEFAULT now(),
-                PRIMARY KEY (query_hash, partition_key)
-            );""").format(sql.Identifier(self.tableprefix + "_queries"))
+                    query_hash TEXT NOT NULL,
+                    query TEXT NOT NULL,
+                    partition_key TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'ok' CHECK (status IN ('ok', 'timeout', 'failed')),
+                    last_seen TIMESTAMP NOT NULL DEFAULT now(),
+                    PRIMARY KEY (query_hash, partition_key)
+                );""").format(sql.Identifier(self.tableprefix + "_queries"))
             )
 
             self.db.commit()
         except Exception as e:
-            logger.error(f"Failed to recreate metadata table: {e}")
+            logger.error(f"Failed to recreate bit metadata table: {e}")
+            try:
+                self.db.rollback()
+            except Exception as rollback_error:
+                logger.error(f"Failed to rollback after metadata table creation error: {rollback_error}")
             raise
 
     def _get_partition_bitsize(self, partition_key: str) -> int | None:
@@ -103,6 +111,9 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
     def _ensure_partition_table(self, partition_key: str, bitsize: int | None = None) -> None:
         """Ensure a partition table exists."""
         try:
+            # First ensure metadata table exists before trying to query it
+            self._ensure_metadata_table_exists()
+            
             existing_datatype = self._get_partition_datatype(partition_key)
 
             if existing_datatype is None:
@@ -121,6 +132,7 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
                 # Avoid infinite retry loops
                 self.db.rollback()
                 raise
+
 
     def set_set(self, key: str, value: set[int] | set[str] | set[float] | set[datetime], partition_key: str = "partition_key") -> bool:
         """
