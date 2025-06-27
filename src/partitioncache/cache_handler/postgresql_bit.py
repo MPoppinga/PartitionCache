@@ -113,10 +113,13 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
             # Rollback and recreate metadata table if needed
             try:
                 self.db.rollback()
+                logger.warning(f"Attempting to recreate metadata table after error: {e}")
                 self._recreate_metadata_table()
                 self._create_partition_table(partition_key, bitsize)
             except Exception as recreate_error:
                 logger.error(f"Failed to recreate partition table for {partition_key}: {recreate_error}")
+                # Avoid infinite retry loops
+                self.db.rollback()
                 raise
 
     def set_set(self, key: str, value: set[int] | set[str] | set[float] | set[datetime], partition_key: str = "partition_key") -> bool:

@@ -71,8 +71,14 @@ class PostgreSQLRoaringBitCacheHandler(PostgreSQLAbstractCacheHandler):
             # Check if roaringbitmap extension is available
             self.cursor.execute("SELECT 1 FROM pg_extension WHERE extname = 'roaringbitmap';")
             if not self.cursor.fetchone():
-                logger.error("roaringbitmap extension not found - cannot create roaringbitmap tables")
-                raise RuntimeError("roaringbitmap extension required but not available")
+                # Try to create the extension first
+                try:
+                    self.cursor.execute("CREATE EXTENSION IF NOT EXISTS roaringbitmap;")
+                    self.db.commit()
+                    logger.info("Successfully created roaringbitmap extension")
+                except Exception as ext_error:
+                    logger.error(f"roaringbitmap extension not found and cannot be created: {ext_error}")
+                    raise RuntimeError("roaringbitmap extension required but not available") from ext_error
 
             # Create the cache table for roaring bitmaps with improved error handling
             self.cursor.execute(
@@ -116,10 +122,13 @@ class PostgreSQLRoaringBitCacheHandler(PostgreSQLAbstractCacheHandler):
             # Rollback and recreate metadata table if needed
             try:
                 self.db.rollback()
+                logger.warning(f"Attempting to recreate roaringbit metadata table after error: {e}")
                 self._recreate_metadata_table()
                 self._create_partition_table(partition_key)
             except Exception as recreate_error:
                 logger.error(f"Failed to recreate roaringbit partition table for {partition_key}: {recreate_error}")
+                # Avoid infinite retry loops
+                self.db.rollback()
                 raise
 
     def set_set(
