@@ -117,7 +117,7 @@ def setup_database_extensions_and_tables(unique_db: str) -> None:
                 # Read and execute the PostgreSQL queue processor SQL file
                 sql_file_path = os.path.join(os.path.dirname(__file__), "..", "src", "partitioncache", "queue_handler", "postgresql_queue_processor.sql")
                 if os.path.exists(sql_file_path):
-                    with open(sql_file_path, "r") as f:
+                    with open(sql_file_path) as f:
                         sql_content = f.read()
 
                     # Execute the entire SQL content (PostgreSQL can handle multiple statements)
@@ -128,7 +128,7 @@ def setup_database_extensions_and_tables(unique_db: str) -> None:
                     # Try alternative path (in case we're in different directory structure)
                     alt_path = os.path.join(os.getcwd(), "src", "partitioncache", "queue_handler", "postgresql_queue_processor.sql")
                     if os.path.exists(alt_path):
-                        with open(alt_path, "r") as f:
+                        with open(alt_path) as f:
                             sql_content = f.read()
                         cur.execute(sql_content)
                         print(f"Queue processor functions installed successfully from: {alt_path}")

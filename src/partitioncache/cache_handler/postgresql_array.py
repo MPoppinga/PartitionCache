@@ -2,7 +2,6 @@ import time
 from datetime import datetime
 from logging import getLogger
 
-import psycopg
 from psycopg import sql
 
 from partitioncache.cache_handler.postgresql_abstract import PostgreSQLAbstractCacheHandler

@@ -198,9 +198,9 @@ class RedisAbstractCacheHandler(AbstractCacheHandler):
                 # Use SCAN to find keys matching pattern (safer than KEYS for large datasets)
                 cursor = 0
                 while True:
-                    cursor, keys = self.db.scan(cursor, match=pattern, count=100)
+                    cursor, keys = self.db.scan(cursor, match=pattern, count=100)  # type: ignore
                     if keys:
-                        deleted_count += self.db.delete(*keys)
+                        deleted_count += self.db.delete(*keys)  # type: ignore
                     if cursor == 0:
                         break
 

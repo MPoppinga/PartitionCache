@@ -34,10 +34,7 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
                     datatype TEXT NOT NULL CHECK (datatype = 'integer'),
                     bitsize INTEGER NOT NULL DEFAULT {1},
                     created_at TIMESTAMP DEFAULT now()
-                );""").format(
-                    sql.Identifier(self.tableprefix + "_partition_metadata"), 
-                    sql.Literal(self.default_bitsize)
-                )
+                );""").format(sql.Identifier(self.tableprefix + "_partition_metadata"), sql.Literal(self.default_bitsize))
             )
 
             # Create queries table (same as base implementation)
@@ -113,7 +110,7 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
         try:
             # First ensure metadata table exists before trying to query it
             self._ensure_metadata_table_exists()
-            
+
             existing_datatype = self._get_partition_datatype(partition_key)
 
             if existing_datatype is None:
@@ -125,14 +122,13 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
             try:
                 self.db.rollback()
                 logger.warning(f"Attempting to recreate metadata table after error: {e}")
-                self._recreate_metadata_table()
+                self._recreate_metadata_table(self.get_supported_datatypes())
                 self._create_partition_table(partition_key, bitsize)
             except Exception as recreate_error:
                 logger.error(f"Failed to recreate partition table for {partition_key}: {recreate_error}")
                 # Avoid infinite retry loops
                 self.db.rollback()
                 raise
-
 
     def set_set(self, key: str, value: set[int] | set[str] | set[float] | set[datetime], partition_key: str = "partition_key") -> bool:
         """

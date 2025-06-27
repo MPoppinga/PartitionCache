@@ -18,7 +18,7 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
     @classmethod
     def get_instance(cls, *args, **kwargs):
         # If externally threaded, skip singleton pattern and always create new instances
-        if hasattr(threading.current_thread(), 'ident') and threading.active_count() > 1:
+        if hasattr(threading.current_thread(), "ident") and threading.active_count() > 1:
             return cls(*args, **kwargs)
 
         if cls._instance is None:
@@ -35,22 +35,20 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
         self.db = psycopg.connect(dbname=db_name, host=db_host, password=db_password, port=db_port, user=db_user)
         self.tableprefix = db_tableprefix
         self.cursor = self.db.cursor()
-        
+
         # Create metadata tables with supported datatypes
         self._recreate_metadata_table(self.get_supported_datatypes())
 
     def _recreate_metadata_table(self, supported_datatypes: set[str]) -> None:
         """
         Recreate metadata table if it was dropped during cleanup.
-        
+
         Args:
             supported_datatypes: Set of supported datatype strings (e.g., {'integer', 'float', 'text', 'timestamp'})
         """
         try:
             # Create datatype constraint based on supported datatypes
-            datatype_constraint = sql.SQL("CHECK (datatype IN ({}))").format(
-                sql.SQL(", ").join(sql.Literal(dt) for dt in sorted(supported_datatypes))
-            )
+            datatype_constraint = sql.SQL("CHECK (datatype IN ({}))").format(sql.SQL(", ").join(sql.Literal(dt) for dt in sorted(supported_datatypes)))
 
             # Create metadata table with datatype constraint
             self.cursor.execute(
@@ -58,10 +56,7 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
                     partition_key TEXT PRIMARY KEY,
                     datatype TEXT NOT NULL {1},
                     created_at TIMESTAMP DEFAULT now()
-                );""").format(
-                    sql.Identifier(self.tableprefix + "_partition_metadata"),
-                    datatype_constraint
-                )
+                );""").format(sql.Identifier(self.tableprefix + "_partition_metadata"), datatype_constraint)
             )
 
             # Create queries table
@@ -89,9 +84,7 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
         """Ensure the metadata table exists, create it if it doesn't."""
         try:
             # Test if metadata table exists by trying to query it
-            self.cursor.execute(
-                sql.SQL("SELECT 1 FROM {0} LIMIT 1").format(sql.Identifier(self.tableprefix + "_partition_metadata"))
-            )
+            self.cursor.execute(sql.SQL("SELECT 1 FROM {0} LIMIT 1").format(sql.Identifier(self.tableprefix + "_partition_metadata")))
         except Exception:
             # Metadata table doesn't exist, create it
             logger.info(f"Creating metadata table: {self.tableprefix}_partition_metadata")

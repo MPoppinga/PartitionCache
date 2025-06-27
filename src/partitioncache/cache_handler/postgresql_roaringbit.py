@@ -2,7 +2,6 @@ from datetime import datetime
 from logging import getLogger
 
 from bitarray import bitarray
-import psycopg
 from psycopg import sql
 from pyroaring import BitMap
 
@@ -29,7 +28,6 @@ class PostgreSQLRoaringBitCacheHandler(PostgreSQLAbstractCacheHandler):
         except Exception as e:
             logger.warning(f"Failed to create roaringbitmap extension: {e}")
             # Continue anyway - extension might already exist
-
 
     def _create_partition_table(self, partition_key: str) -> None:
         """Create a cache table for a specific partition key."""
@@ -82,7 +80,7 @@ class PostgreSQLRoaringBitCacheHandler(PostgreSQLAbstractCacheHandler):
         try:
             # First ensure metadata table exists before trying to query it
             self._ensure_metadata_table_exists()
-            
+
             existing_datatype = self._get_partition_datatype(partition_key)
 
             if existing_datatype is None:
@@ -94,14 +92,13 @@ class PostgreSQLRoaringBitCacheHandler(PostgreSQLAbstractCacheHandler):
             try:
                 self.db.rollback()
                 logger.warning(f"Attempting to recreate roaringbit metadata table after error: {e}")
-                self._recreate_metadata_table()
+                self._recreate_metadata_table(self.get_supported_datatypes())
                 self._create_partition_table(partition_key)
             except Exception as recreate_error:
                 logger.error(f"Failed to recreate roaringbit partition table for {partition_key}: {recreate_error}")
                 # Avoid infinite retry loops
                 self.db.rollback()
                 raise
-
 
     def set_set(
         self,
