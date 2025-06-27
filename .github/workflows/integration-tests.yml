@@ -77,7 +77,6 @@ jobs:
             parallel: false
             requires_redis: false
             job_index: 0
-            redis_bit_db: 10
           - name: "PostgreSQL Bit Backend"
             pattern: "postgresql_bit"
             suffix: "pg_bit"
@@ -86,7 +85,6 @@ jobs:
             parallel: false
             requires_redis: false
             job_index: 1
-            redis_bit_db: 11
           - name: "PostgreSQL RoaringBit Backend"
             pattern: "postgresql_roaringbit"
             suffix: "pg_roaring"
@@ -95,7 +93,6 @@ jobs:
             parallel: false
             requires_redis: false
             job_index: 2
-            redis_bit_db: 12
           - name: "Redis Set Backend"
             pattern: "redis_set"
             suffix: "redis_set"
@@ -103,8 +100,8 @@ jobs:
             database_suffix: "redis_set"
             parallel: false
             requires_redis: true
-            job_index: 3
-            redis_bit_db: 13
+            job_index: 0
+            redis_set_db: 0
           - name: "Redis Bit Backend"
             pattern: "redis_bit"
             suffix: "redis_bit"
@@ -112,8 +109,8 @@ jobs:
             database_suffix: "redis_bit"
             parallel: false
             requires_redis: true
-            job_index: 4
-            redis_bit_db: 14
+            job_index: 1
+            redis_bit_db: 1
           - name: "RocksDB Backends"
             pattern: "rocksdb"
             suffix: "rocksdb"
@@ -121,8 +118,7 @@ jobs:
             database_suffix: "rocksdb"
             parallel: false
             requires_redis: false
-            job_index: 5
-            redis_bit_db: 15
+            job_index: 3
           - name: "Queue Processing"
             pattern: "queue"
             suffix: "queue"
@@ -130,8 +126,7 @@ jobs:
             database_suffix: "queue"
             parallel: false
             requires_redis: false
-            job_index: 6
-            redis_bit_db: 16
+            job_index: 4
           - name: "CLI Tools"
             pattern: "test_cli"
             suffix: "cli"
@@ -139,8 +134,7 @@ jobs:
             database_suffix: "cli"
             parallel: false
             requires_redis: false
-            job_index: 7
-            redis_bit_db: 17
+            job_index: 5
 
     services:
       postgres:
@@ -192,21 +186,17 @@ jobs:
       PG_QUEUE_PASSWORD: integration_password
       QUERY_QUEUE_PROVIDER: postgresql
       
-      # Redis configuration - isolated per backend and job to prevent conflicts  
-      REDIS_HOST: localhost
-      REDIS_PORT: 6379
-      REDIS_CACHE_DB: ${{ matrix.job_index }}
-      REDIS_BIT_DB: ${{ matrix.redis_bit_db }}
-      REDIS_BIT_BITSIZE: 300000
-      REDIS_SET_HOST: localhost
-      REDIS_SET_PORT: 6379
-      REDIS_SET_DB: ${{ matrix.job_index }}
-      
-      # Backend-specific Redis configuration
-      REDIS_BIT_HOST: localhost
-      REDIS_BIT_PORT: 6379
-      REDIS_SET_PASSWORD: ""
-      REDIS_BIT_PASSWORD: ""
+      # Redis configuration - only set for Redis backends
+      ${{ matrix.requires_redis && 'REDIS_HOST' || 'REDIS_HOST_DISABLED' }}: ${{ matrix.requires_redis && 'localhost' || 'disabled' }}
+      ${{ matrix.requires_redis && 'REDIS_PORT' || 'REDIS_PORT_DISABLED' }}: ${{ matrix.requires_redis && '6379' || 'disabled' }}
+      ${{ matrix.redis_set_db != null && 'REDIS_CACHE_DB' || 'REDIS_CACHE_DB_DISABLED' }}: ${{ matrix.redis_set_db || 'disabled' }}
+      ${{ matrix.redis_set_db != null && 'REDIS_SET_DB' || 'REDIS_SET_DB_DISABLED' }}: ${{ matrix.redis_set_db || 'disabled' }}
+      ${{ matrix.redis_bit_db != null && 'REDIS_BIT_DB' || 'REDIS_BIT_DB_DISABLED' }}: ${{ matrix.redis_bit_db || 'disabled' }}
+      ${{ matrix.requires_redis && 'REDIS_BIT_BITSIZE' || 'REDIS_BIT_BITSIZE_DISABLED' }}: ${{ matrix.requires_redis && '300000' || 'disabled' }}
+      ${{ matrix.requires_redis && 'REDIS_SET_HOST' || 'REDIS_SET_HOST_DISABLED' }}: ${{ matrix.requires_redis && 'localhost' || 'disabled' }}
+      ${{ matrix.requires_redis && 'REDIS_SET_PORT' || 'REDIS_SET_PORT_DISABLED' }}: ${{ matrix.requires_redis && '6379' || 'disabled' }}
+      ${{ matrix.requires_redis && 'REDIS_BIT_HOST' || 'REDIS_BIT_HOST_DISABLED' }}: ${{ matrix.requires_redis && 'localhost' || 'disabled' }}
+      ${{ matrix.requires_redis && 'REDIS_BIT_PORT' || 'REDIS_BIT_PORT_DISABLED' }}: ${{ matrix.requires_redis && '6379' || 'disabled' }}
       
       # Cache backend configuration with backend-specific prefixes for complete isolation
       PG_ARRAY_CACHE_TABLE_PREFIX: ci_array_${{ matrix.database_suffix }}
