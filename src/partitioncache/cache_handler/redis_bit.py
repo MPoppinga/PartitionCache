@@ -137,7 +137,12 @@ class RedisBitCacheHandler(RedisAbstractCacheHandler):
             return True
         # Ensure partition exists with correct datatype and bitsize
         self._ensure_partition_exists(partition_key)
-        val = bitarray(self._get_partition_bitsize(partition_key))
+        bitsize = self._get_partition_bitsize(partition_key)
+        if bitsize is None:
+            # Fallback to default bitsize if metadata is corrupted or missing
+            bitsize = self.default_bitsize
+            self._set_partition_metadata(partition_key, "integer", bitsize)
+        val = bitarray(bitsize)
         try:
             for k in value:
                 if isinstance(k, int):
@@ -147,7 +152,7 @@ class RedisBitCacheHandler(RedisAbstractCacheHandler):
                 else:
                     raise ValueError("Only integer values are supported")
         except (IndexError, ValueError):
-            raise ValueError(f"Value {value} is out of range for bitarray of size {self._get_partition_bitsize(partition_key)}") from None
+            raise ValueError(f"Value {value} is out of range for bitarray of size {bitsize}") from None
         try:
             cache_key = self._get_cache_key(key, partition_key)
             self.db.set(cache_key, val.to01())
