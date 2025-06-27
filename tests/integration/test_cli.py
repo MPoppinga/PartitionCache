@@ -84,10 +84,17 @@ class TestCLICommands:
         env.update({
             "PG_HOST": os.getenv("PG_HOST", "localhost"),
             "PG_PORT": os.getenv("PG_PORT", "5432"),
-            "PG_USER": os.getenv("PG_USER", "test_user"),
-            "PG_PASSWORD": os.getenv("PG_PASSWORD", "test_password"),
-            "PG_DBNAME": os.getenv("PG_DBNAME", "test_db"),
-            "CACHE_BACKEND": "postgresql_array",
+            "PG_USER": os.getenv("PG_USER", "integration_user"),
+            "PG_PASSWORD": os.getenv("PG_PASSWORD", "integration_password"),
+            "PG_DBNAME": os.getenv("PG_DBNAME", "partitioncache_integration"),
+            "CACHE_BACKEND": os.getenv("CACHE_BACKEND", "postgresql_array"),
+            # Ensure all required environment variables are inherited
+            "DB_HOST": os.getenv("DB_HOST", "localhost"),
+            "DB_PORT": os.getenv("DB_PORT", "5432"),
+            "DB_USER": os.getenv("DB_USER", "integration_user"),
+            "DB_PASSWORD": os.getenv("DB_PASSWORD", "integration_password"),
+            "DB_NAME": os.getenv("DB_NAME", os.getenv("PG_DBNAME", "partitioncache_integration")),
+            "PG_ARRAY_CACHE_TABLE_PREFIX": os.getenv("PG_ARRAY_CACHE_TABLE_PREFIX", "integration_array_cache"),
         })
 
         result = subprocess.run(
@@ -99,11 +106,10 @@ class TestCLICommands:
         )
 
         # Should succeed and show count information
-        assert result.returncode == 0 or "partitions" in result.stderr.lower()
-        # Should contain numerical information (may be in stdout or stderr)
-        if result.returncode == 0:
-            output_text = result.stdout + result.stderr
-            assert any(char.isdigit() for char in output_text)
+        assert result.returncode == 0 or "partitions" in result.stderr.lower(), f"Command failed: {result.stderr}"
+        # Should contain count information (may be in stdout or stderr)
+        output_text = result.stdout + result.stderr
+        assert any(word in output_text.lower() for word in ["total", "keys", "partitions", "count", "statistics"]), f"No count information in output: {output_text}"
 
     def test_pcache_add_help(self):
         """Test pcache-add help command."""
