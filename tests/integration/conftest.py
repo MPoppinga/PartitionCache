@@ -659,19 +659,87 @@ def postgresql_queue_functions(db_connection):
 
 
 @pytest.fixture
-def postgresql_queue_processor(postgresql_queue_functions, db_session):
+def manual_queue_processor(db_session, db_connection, cache_client):
+    """
+    Fixture for manual queue processing tests.
+    Sets up processor infrastructure without pg_cron.
+    """
+    from partitioncache.queue import get_queue_provider_name
+
+    # Only setup for PostgreSQL queue provider
+    if get_queue_provider_name() != "postgresql" or not db_session:
+        pytest.skip("Manual queue processor only works with PostgreSQL queue provider")
+
+    # Skip non-PostgreSQL cache backends as direct processor only supports PostgreSQL backends
+    cache_backend = os.getenv("CACHE_BACKEND", "postgresql_array")
+    if not cache_backend.startswith("postgresql"):
+        pytest.skip(f"Manual queue processor only works with PostgreSQL cache backends, not {cache_backend}")
+
+    # Check if SQL functions exist
+    with db_session.cursor() as cur:
+        cur.execute("""
+            SELECT EXISTS (
+                SELECT 1 FROM pg_proc 
+                WHERE proname = 'partitioncache_manual_process_queue'
+            )
+        """)
+        functions_exist = cur.fetchone()[0]
+
+    # Load functions if needed (without pg_cron)
+    if not functions_exist and db_connection:
+        from partitioncache.cli.setup_postgresql_queue_processor import setup_database_objects
+
+        setup_database_objects(db_connection, include_pg_cron_trigger=False)
+
+    # Setup processor tables and config
+    from partitioncache.cli.setup_postgresql_queue_processor import get_queue_table_prefix_from_env, get_table_prefix_from_env
+
+    queue_prefix = get_queue_table_prefix_from_env()
+    table_prefix = get_table_prefix_from_env()
+
+    with db_session.cursor() as cur:
+        # Initialize processor tables
+        cur.execute("SELECT partitioncache_initialize_processor_tables(%s)", [queue_prefix])
+
+        # Add processor configuration
+        config_table = f"{queue_prefix}_processor_config"
+        cur.execute(
+            f"""
+            INSERT INTO {config_table} 
+            (job_name, enabled, max_parallel_jobs, frequency_seconds, timeout_seconds, 
+             table_prefix, queue_prefix, cache_backend)
+            VALUES ('partitioncache_process_queue', true, 1, 60, 30, 
+                    %s, %s, 'array')
+            ON CONFLICT (job_name) DO UPDATE 
+            SET enabled = true, updated_at = NOW()
+        """,
+            (table_prefix, queue_prefix),
+        )
+
+        db_session.commit()
+
+    return {"queue_prefix": queue_prefix, "table_prefix": table_prefix, "config_table": config_table}
+
+
+@pytest.fixture
+def postgresql_queue_processor(postgresql_queue_functions, db_session, cache_client):
     """
     Function-scoped fixture that provides a configured PostgreSQL queue processor.
 
     Depends on postgresql_queue_functions to ensure SQL functions are loaded.
     Sets up processor tables and configuration for the current test.
-    
+
     Returns dict with:
         - table_prefix: Cache table prefix
-        - queue_prefix: Queue table prefix  
+        - queue_prefix: Queue table prefix
         - config_table: Processor config table name
         - pg_cron_available: Whether pg_cron is available
     """
+    # Skip non-PostgreSQL cache backends as direct processor only supports PostgreSQL backends
+    cache_backend = os.getenv("CACHE_BACKEND", "postgresql_array")
+    if not cache_backend.startswith("postgresql"):
+        pytest.skip(f"PostgreSQL queue processor only works with PostgreSQL cache backends, not {cache_backend}")
+
     from partitioncache.cli.setup_postgresql_queue_processor import get_table_prefix_from_env, get_queue_table_prefix_from_env
 
     queue_prefix = get_queue_table_prefix_from_env()
@@ -698,9 +766,4 @@ def postgresql_queue_processor(postgresql_queue_functions, db_session):
         )
         db_session.commit()
 
-    return {
-        "queue_prefix": queue_prefix, 
-        "table_prefix": table_prefix, 
-        "config_table": config_table,
-        "pg_cron_available": pg_cron_available
-    }
+    return {"queue_prefix": queue_prefix, "table_prefix": table_prefix, "config_table": config_table, "pg_cron_available": pg_cron_available}

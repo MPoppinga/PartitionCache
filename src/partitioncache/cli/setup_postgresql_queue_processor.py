@@ -165,7 +165,7 @@ def check_pg_cron_installed(conn) -> bool:
 
 def setup_database_objects(conn, include_pg_cron_trigger=True):
     """Execute the SQL file to create all necessary database objects.
-    
+
     Args:
         conn: Database connection
         include_pg_cron_trigger: Whether to create pg_cron trigger (default True for backwards compatibility)
@@ -212,7 +212,7 @@ def setup_database_objects(conn, include_pg_cron_trigger=True):
     queue_prefix = get_queue_table_prefix_from_env()
     with conn.cursor() as cur:
         cur.execute("SELECT partitioncache_initialize_processor_tables(%s)", [queue_prefix])
-        
+
         if include_pg_cron_trigger:
             logger.info("Creating pg_cron config trigger...")
             cur.execute("SELECT partitioncache_create_config_trigger(%s)", [queue_prefix])

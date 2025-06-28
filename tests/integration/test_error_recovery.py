@@ -11,24 +11,25 @@ from partitioncache.cache_handler.abstract import AbstractCacheHandler
 def _compare_cache_values(retrieved, expected):
     """
     Helper function to compare cache values across different backend types.
-    
+
     Args:
         retrieved: Value returned from cache backend (could be set, BitMap, etc.)
         expected: Expected set value
-    
+
     Returns:
         bool: True if values are equivalent
     """
     # Handle BitMap objects from roaringbit backend
     try:
         from pyroaring import BitMap
+
         if isinstance(retrieved, BitMap):
             return set(retrieved) == expected
     except ImportError:
         pass
 
     # Handle regular sets and other types
-    if hasattr(retrieved, '__iter__') and not isinstance(retrieved, (str, bytes)):
+    if hasattr(retrieved, "__iter__") and not isinstance(retrieved, (str, bytes)):
         return set(retrieved) == expected
 
     return retrieved == expected
@@ -77,8 +78,7 @@ class TestErrorRecovery:
             except Exception as e:
                 # Exceptions should be meaningful
                 error_msg = str(e).lower()
-                assert any(keyword in error_msg for keyword in
-                          ["syntax", "parse", "invalid", "error", "malformed", "expected", "none"])
+                assert any(keyword in error_msg for keyword in ["syntax", "parse", "invalid", "error", "malformed", "expected", "none"])
 
     def test_cache_corruption_recovery(self, cache_client: AbstractCacheHandler):
         """Test recovery from cache corruption scenarios."""
@@ -203,11 +203,7 @@ class TestQueueErrorRecovery:
             get_queue_lengths()
 
             # Try to add to queue
-            success = push_to_original_query_queue(
-                query="SELECT 1;",
-                partition_key="test",
-                partition_datatype="integer"
-            )
+            success = push_to_original_query_queue(query="SELECT 1;", partition_key="test", partition_datatype="integer")
 
             # Should handle missing tables gracefully
             assert isinstance(success, bool)
@@ -215,8 +211,7 @@ class TestQueueErrorRecovery:
         except Exception as e:
             # Should provide meaningful error about missing tables
             error_msg = str(e).lower()
-            assert any(keyword in error_msg for keyword in
-                      ["table", "relation", "exist", "queue"])
+            assert any(keyword in error_msg for keyword in ["table", "relation", "exist", "queue"])
 
     def test_invalid_cron_job_handling(self, db_session):
         """Test handling of invalid cron job specifications."""
@@ -233,8 +228,8 @@ class TestQueueErrorRecovery:
             ("", "empty_cron"),
             ("invalid format", "invalid_format"),
             ("60 * * * *", "invalid_minute"),  # Minute > 59
-            ("* 25 * * *", "invalid_hour"),    # Hour > 23
-            ("* * 32 * *", "invalid_day"),     # Day > 31
+            ("* 25 * * *", "invalid_hour"),  # Hour > 23
+            ("* * 32 * *", "invalid_day"),  # Day > 31
         ]
 
         for cron_spec, description in invalid_cron_specs:
@@ -244,9 +239,12 @@ class TestQueueErrorRecovery:
                     test_jobname = f"invalid_test_{description}"
                     test_command = "SELECT 1;"
 
-                    cur.execute("""
+                    cur.execute(
+                        """
                         SELECT cron.schedule(%s, %s, %s);
-                    """, (test_jobname, cron_spec, test_command))
+                    """,
+                        (test_jobname, cron_spec, test_command),
+                    )
 
                     # If it succeeds, clean up
                     cur.execute("SELECT cron.unschedule(%s);", (test_jobname,))
@@ -254,8 +252,7 @@ class TestQueueErrorRecovery:
                 except Exception as e:
                     # Invalid cron specs should be rejected with meaningful errors
                     error_msg = str(e).lower()
-                    assert any(keyword in error_msg for keyword in
-                              ["cron", "schedule", "format", "invalid"])
+                    assert any(keyword in error_msg for keyword in ["cron", "schedule", "format", "invalid"])
 
     def test_long_running_job_timeout(self, db_session, cache_client, postgresql_queue_processor):
         """Test handling of long-running PartitionCache queries that timeout."""
@@ -275,20 +272,24 @@ class TestQueueErrorRecovery:
             db_session.commit()
 
         # Queue a long-running query directly to fragment queue for testing
-        long_query = "SELECT pg_sleep(5), 12345 as test_partition;"  # 5 second sleep
+        long_query = "SELECT pg_sleep(5), 12345 as test_partition"  # 5 second sleep (no semicolon)
 
         # For testing timeout behavior, push directly to fragment queue
         # In production, queries go through original queue first
         with db_session.cursor() as cur:
             # Generate a simple hash for the test query
             import hashlib
+
             query_hash = hashlib.md5(long_query.encode()).hexdigest()
 
             fragment_queue_table = f"{queue_prefix}_query_fragment_queue"
-            cur.execute(f"""
+            cur.execute(
+                f"""
                 INSERT INTO {fragment_queue_table} (query, hash, partition_key, partition_datatype)
                 VALUES (%s, %s, %s, %s)
-            """, (long_query, query_hash, partition_key, "integer"))
+            """,
+                (long_query, query_hash, partition_key, "integer"),
+            )
             db_session.commit()
 
         # Process it with a 1-second timeout using proper transaction-level timeout
@@ -332,24 +333,28 @@ class TestQueueErrorRecovery:
 
         with db_session.cursor() as cur:
             # Check processor log for any entry related to our query
-            cur.execute(f"""
+            cur.execute(
+                f"""
                 SELECT status, error_message, query_hash
                 FROM {log_table}
                 WHERE partition_key = %s
                 ORDER BY created_at DESC
                 LIMIT 5
-            """, (partition_key,))
+            """,
+                (partition_key,),
+            )
 
             log_entries = cur.fetchall()
 
             # Look for timeout or failure status
             timeout_found = False
             for entry in log_entries:
-                if entry[0] == 'timeout':
+                if entry[0] == "timeout":
                     timeout_found = True
-                    assert "timeout" in (entry[1] or "").lower(), f"Error message should mention timeout: {entry[1]}"
+                    # The message should mention timeout (case-insensitive)
+                    assert entry[1] and "timeout" in entry[1].lower(), f"Error message should mention timeout: {entry[1]}"
                     break
-                elif entry[0] == 'failed' and entry[1] and ("cancel" in entry[1].lower() or "timeout" in entry[1].lower()):
+                elif entry[0] == "failed" and entry[1] and ("cancel" in entry[1].lower() or "timeout" in entry[1].lower()):
                     # Sometimes timeouts are logged as failures with cancel/timeout message
                     timeout_found = True
                     break
@@ -357,18 +362,21 @@ class TestQueueErrorRecovery:
             assert timeout_found or len(log_entries) == 0, f"Expected timeout entry in processor log, found: {log_entries}"
 
             # Check queries table - it might have a timeout entry if the function got that far
-            cur.execute(f"""
+            cur.execute(
+                f"""
                 SELECT status, query
                 FROM {queries_table}
                 WHERE partition_key = %s
                 ORDER BY last_seen DESC
                 LIMIT 1
-            """, (partition_key,))
+            """,
+                (partition_key,),
+            )
 
             query_entry = cur.fetchone()
             if query_entry:
                 # If there's an entry, it should be marked as timeout or failed
-                assert query_entry[0] in ('timeout', 'failed'), f"Expected 'timeout' or 'failed' status in queries table, got '{query_entry[0]}'"
+                assert query_entry[0] in ("timeout", "failed"), f"Expected 'timeout' or 'failed' status in queries table, got '{query_entry[0]}'"
 
 
 class TestSystemLevelErrors:
@@ -379,13 +387,13 @@ class TestSystemLevelErrors:
     def test_disk_space_simulation(self, cache_client: AbstractCacheHandler):
         """Test behavior when disk space might be limited."""
         partition_key = "zipcode"
-        
+
         # Check if backend has constraints that would interfere with this test
-        supported_datatypes = getattr(cache_client, 'get_supported_datatypes', lambda: ['integer', 'text'])()
-        backend_name = getattr(cache_client, '__class__', type(cache_client)).__name__.lower()
-        
+        supported_datatypes = getattr(cache_client, "get_supported_datatypes", lambda: ["integer", "text"])()
+        backend_name = getattr(cache_client, "__class__", type(cache_client)).__name__.lower()
+
         # For bit backends, constrain values to avoid bitarray size issues
-        if 'bit' in backend_name:
+        if "bit" in backend_name:
             # Use smaller, constrained values for bit backends
             max_attempts = 20
             base_range = 1000
@@ -417,8 +425,7 @@ class TestSystemLevelErrors:
             except Exception as e:
                 # Resource limit errors are acceptable and expected
                 error_msg = str(e).lower()
-                if any(keyword in error_msg for keyword in
-                       ["space", "memory", "limit", "quota", "range", "bitarray", "out of range"]):
+                if any(keyword in error_msg for keyword in ["space", "memory", "limit", "quota", "range", "bitarray", "out of range"]):
                     break
                 else:
                     raise
@@ -463,8 +470,7 @@ class TestSystemLevelErrors:
         except Exception as e:
             # Other connection-related errors are also acceptable
             error_msg = str(e).lower()
-            assert any(keyword in error_msg for keyword in
-                      ["connection", "network", "timeout", "unreachable"])
+            assert any(keyword in error_msg for keyword in ["connection", "network", "timeout", "unreachable"])
 
     def test_permission_error_handling(self, db_session):
         """Test handling of permission-related errors."""
@@ -491,6 +497,4 @@ class TestSystemLevelErrors:
                 if not any(keyword in error_msg for keyword in expected_keywords):
                     # If it's not a permission error, it might be another valid error
                     # (e.g., extension doesn't exist)
-                    assert any(keyword in error_msg for keyword in
-                              ["exist", "available", "unknown", "invalid"])
-
+                    assert any(keyword in error_msg for keyword in ["exist", "available", "unknown", "invalid"])
