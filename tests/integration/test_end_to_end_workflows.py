@@ -2,6 +2,8 @@ import os
 import tempfile
 import time
 
+import pytest
+
 import partitioncache
 from partitioncache.cache_handler.abstract import AbstractCacheHandler_Lazy
 
@@ -27,19 +29,44 @@ def _compare_cache_values(retrieved, expected):
         pass
 
     # Handle regular sets and other types
-    if hasattr(retrieved, "__iter__") and not isinstance(retrieved, (str, bytes)):
+    if hasattr(retrieved, "__iter__") and not isinstance(retrieved, str | bytes):
         return set(retrieved) == expected
 
     return retrieved == expected
+
+
+@pytest.fixture
+def e2e_cache_client(db_session):
+    """
+    Fixture providing only postgresql_array backend for E2E tests.
+
+    E2E tests focus on testing complete workflows, not individual backend implementations.
+    Using a single backend avoids table conflicts when all tests share the same database.
+    Individual backend functionality is thoroughly tested in regular integration tests.
+    """
+    from partitioncache.cache_handler import get_cache_handler
+
+    # Only use postgresql_array for E2E workflow tests
+    cache_backend = "postgresql_array"
+    cache_handler = get_cache_handler(cache_backend)
+
+    yield cache_handler
+
+    # Cleanup
+    cache_handler.close()
 
 
 class TestEndToEndWorkflows:
     """
     End-to-end integration tests that validate complete workflows
     from query submission to cache application.
+
+    Note: These tests use only postgresql_array backend to avoid conflicts
+    when multiple backends share the same database. Individual backend
+    functionality is tested separately in backend-specific integration tests.
     """
 
-    def test_complete_osm_style_workflow(self, db_session, cache_client):
+    def test_complete_osm_style_workflow(self, db_session, e2e_cache_client):
         """Test complete workflow similar to OSM example."""
         # This test replicates the OSM example workflow but simplified
 
@@ -112,12 +139,12 @@ class TestEndToEndWorkflows:
             # Populate cache with discovered partition values
             for hash_key in hashes:
                 if partition_values:
-                    cache_client.set_set(hash_key, partition_values, partition_key)
+                    e2e_cache_client.set_set(hash_key, partition_values, partition_key)
 
             # Step 3: Test cache application
             cached_partition_keys, num_subqueries, num_hits = partitioncache.get_partition_keys(
                 query=query,
-                cache_handler=cache_client,
+                cache_handler=e2e_cache_client,
                 partition_key=partition_key,
                 min_component_size=1,
             )
@@ -125,10 +152,10 @@ class TestEndToEndWorkflows:
             print(f"Cache hits: {num_hits}, Cached partition keys: {cached_partition_keys}")
 
             # Step 4: Test query enhancement if cache handler supports lazy operations
-            if isinstance(cache_client, AbstractCacheHandler_Lazy) and cached_partition_keys:
+            if isinstance(e2e_cache_client, AbstractCacheHandler_Lazy) and cached_partition_keys:
                 enhanced_query, stats = partitioncache.apply_cache_lazy(
                     query=query,
-                    cache_handler=cache_client,
+                    cache_handler=e2e_cache_client,
                     partition_key=partition_key,
                     method="TMP_TABLE_IN",
                     min_component_size=1,
@@ -178,14 +205,9 @@ class TestEndToEndWorkflows:
 
         print(f"\nWorkflow Summary: {len(results)} queries, {cache_hits} total cache hits")
 
-    def test_multi_partition_workflow(self, db_session, cache_client):
+    def test_multi_partition_workflow(self, db_session, e2e_cache_client):
         """Test workflow with multiple partition keys."""
-        # Skip bit backends for text datatype tests
-        import pytest
-
-        cache_backend_name = getattr(cache_client, "backend_type", str(cache_client.__class__.__name__))
-        if "bit" in cache_backend_name.lower() and any(config[1] == "text" for config in [("zipcode", "integer"), ("region", "text")]):
-            pytest.skip(f"Bit backend {cache_backend_name} only supports integer datatypes")
+        # postgresql_array backend supports multiple datatypes
 
         # Test using both zipcode and region partition keys
         partition_configs = [
@@ -212,7 +234,7 @@ class TestEndToEndWorkflows:
 
             # Register partition key if needed
             try:
-                cache_client.register_partition_key(partition_key, datatype)
+                e2e_cache_client.register_partition_key(partition_key, datatype)
             except Exception:
                 pass  # May already be registered
 
@@ -251,12 +273,12 @@ class TestEndToEndWorkflows:
 
                 # Populate cache
                 for hash_key in hashes:
-                    cache_client.set_set(hash_key, partition_values, partition_key)
+                    e2e_cache_client.set_set(hash_key, partition_values, partition_key)
 
                 # Test cache retrieval
                 cached_keys, _, hits = partitioncache.get_partition_keys(
                     query=query,
-                    cache_handler=cache_client,
+                    cache_handler=e2e_cache_client,
                     partition_key=partition_key,
                     min_component_size=1,
                 )
@@ -271,15 +293,12 @@ class TestEndToEndWorkflows:
             assert total_hits > 0, f"No cache hits for partition {partition_key}"
             print(f"Partition {partition_key}: {len(results)} queries, {total_hits} hits")
 
-    def test_queue_to_cache_workflow(self, db_session, cache_client):
+    def test_queue_to_cache_workflow(self, db_session, e2e_cache_client):
         """Test complete workflow from queue processing to cache application."""
-        import pytest
-        
-        # Skip PostgreSQL bit/roaringbit backends in CI due to table creation issues
-        backend_name = getattr(cache_client, '__class__', type(cache_client)).__name__.lower()
-        if 'postgresql' in backend_name and ('bit' in backend_name or 'roaring' in backend_name):
-            pytest.skip(f"Skipping {backend_name} due to CI table creation issues")
-        
+
+        # Backend name for diagnostics
+        backend_name = getattr(e2e_cache_client, "__class__", type(e2e_cache_client)).__name__.lower()
+
         from partitioncache.queue import clear_all_queues, push_to_original_query_queue
 
         # Clear queues to start fresh
@@ -300,16 +319,12 @@ class TestEndToEndWorkflows:
 
         assert len(queued_queries) > 0, "No queries successfully queued"
 
-        # Ensure partition key is registered for PostgreSQL backends
-        if 'postgresql' in backend_name:
-            try:
-                cache_client.register_partition_key(partition_key, "integer")
-            except Exception as e:
-                # If it's a missing extension issue, skip the test
-                if "extension" in str(e).lower() or "required but not available" in str(e).lower():
-                    pytest.skip(f"Backend {backend_name} missing dependencies: {e}")
-                # Otherwise, it might already be registered
-                pass
+        # Ensure partition key is registered
+        try:
+            e2e_cache_client.register_partition_key(partition_key, "integer")
+        except Exception:
+            # Might already be registered
+            pass
 
         # Step 2: Simulate queue processing
         # In real workflow, queue processor would handle this
@@ -346,7 +361,7 @@ class TestEndToEndWorkflows:
             # Populate cache (simulate queue processor cache population)
             for hash_key in hashes:
                 if partition_values:
-                    cache_client.set_set(hash_key, partition_values, partition_key)
+                    e2e_cache_client.set_set(hash_key, partition_values, partition_key)
 
         # Step 3: Test cache application for new queries
         test_query = "SELECT population FROM test_locations WHERE zipcode = 1001;"
@@ -354,7 +369,7 @@ class TestEndToEndWorkflows:
         # Should find cache hits from previously processed queries
         cached_keys, _, hits = partitioncache.get_partition_keys(
             query=test_query,
-            cache_handler=cache_client,
+            cache_handler=e2e_cache_client,
             partition_key=partition_key,
             min_component_size=1,
         )
@@ -438,7 +453,7 @@ class TestEndToEndWorkflows:
 
         print("CLI integration workflow completed successfully")
 
-    def test_performance_monitoring_workflow(self, db_session, cache_client):
+    def test_performance_monitoring_workflow(self, db_session, e2e_cache_client):
         """Test workflow for monitoring cache performance."""
         partition_key = "zipcode"
 
@@ -478,13 +493,13 @@ class TestEndToEndWorkflows:
             # Use test data partition values
             test_partition_values = {1001, 1002, 90210}
             for hash_key in hashes:
-                cache_client.set_set(hash_key, test_partition_values, partition_key)
+                e2e_cache_client.set_set(hash_key, test_partition_values, partition_key)
 
             # Measure cache-enabled performance
             start_time = time.time()
             cached_keys, _, hits = partitioncache.get_partition_keys(
                 query=query,
-                cache_handler=cache_client,
+                cache_handler=e2e_cache_client,
                 partition_key=partition_key,
                 min_component_size=1,
             )
@@ -492,11 +507,11 @@ class TestEndToEndWorkflows:
 
             # Test enhanced query if supported
             enhanced_time = None
-            if isinstance(cache_client, AbstractCacheHandler_Lazy) and cached_keys:
+            if isinstance(e2e_cache_client, AbstractCacheHandler_Lazy) and cached_keys:
                 start_time = time.time()
                 enhanced_query, stats = partitioncache.apply_cache_lazy(
                     query=query,
-                    cache_handler=cache_client,
+                    cache_handler=e2e_cache_client,
                     partition_key=partition_key,
                     method="TMP_TABLE_IN",
                     min_component_size=1,
@@ -505,13 +520,13 @@ class TestEndToEndWorkflows:
                 with db_session.cursor() as cur:
                     # Enhanced query might be a multi-statement query (with temp tables)
                     # Split and execute each statement separately
-                    statements = [stmt.strip() for stmt in enhanced_query.split(';') if stmt.strip()]
+                    statements = [stmt.strip() for stmt in enhanced_query.split(";") if stmt.strip()]
                     for stmt in statements:
                         cur.execute(stmt)
                         # Only fetch results if this statement returns data
                         try:
                             cur.fetchall()
-                        except Exception as e:
+                        except Exception:
                             # Statement doesn't return data (e.g., CREATE TABLE, etc.)
                             pass
                 enhanced_time = time.time() - start_time
@@ -543,7 +558,7 @@ class TestEndToEndWorkflows:
 
         print(f"Performance monitoring: {len(performance_results)} queries, avg cache lookup: {avg_cache_time:.3f}s")
 
-    def test_data_consistency_workflow(self, db_session, cache_client):
+    def test_data_consistency_workflow(self, db_session, e2e_cache_client):
         """Test workflow ensuring data consistency across operations."""
         partition_key = "zipcode"
 
@@ -579,12 +594,12 @@ class TestEndToEndWorkflows:
             # Use expected results as cache data
             for hash_key in hashes:
                 if expected_results[i]:
-                    cache_client.set_set(hash_key, expected_results[i], partition_key)
+                    e2e_cache_client.set_set(hash_key, expected_results[i], partition_key)
 
             # Retrieve from cache
             cached_keys, _, hits = partitioncache.get_partition_keys(
                 query=query,
-                cache_handler=cache_client,
+                cache_handler=e2e_cache_client,
                 partition_key=partition_key,
                 min_component_size=1,
             )
