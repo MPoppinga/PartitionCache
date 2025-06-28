@@ -288,7 +288,8 @@ pcache-add --queue \
 # Read from cache
 pcache-read --cache-backend postgresql_array \
   --partition-key user_id \
-  --query-hash "abc123"
+  --partition-datatype integer \
+  --query "SELECT * FROM users WHERE age > 25"
 
 # Manage cache operations
 pcache-manage --count-cache --partition-key user_id

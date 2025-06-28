@@ -111,30 +111,31 @@ pcache-monitor \
 ```python
 from partitioncache.cache_handler import get_cache_handler
 from partitioncache.cache_handler.datatype_utils import (
-    DATATYPE_TO_PYTHON_TYPE
+    DATATYPE_TO_PYTHON_TYPE,
+    get_python_type_from_datatype
 )
 
 # Validate datatype compatibility
 cache_type = "postgresql_array"
 partition_datatype = "float"
-settype = DATATYPE_TO_PYTHON_TYPE[partition_datatype]
+
+cache_handler = get_cache_handler(cache_type)
 
 try:
-    validate_datatype_compatibility(cache_type, settype, "price")
+    cache_handler.validate_datatype_compatibility(partition_datatype)
     print("Datatype is compatible!")
 except ValueError as e:
     print(f"Incompatible datatype: {e}")
 
 # Use with cache handler
-cache_handler = get_cache_handler(cache_type)
 partition_key = "price"
 
 # Store float values
 float_values = {19.99, 29.99, 39.99}
-cache_handler.set_set("query_hash", float_values, settype, partition_key)
+cache_handler.set_set("query_hash", float_values, partition_key)
 
 # Retrieve values
-result = cache_handler.get("query_hash", settype, partition_key)
+result = cache_handler.get("query_hash", partition_key)
 print(f"Retrieved values: {result}")
 ```
 
@@ -178,4 +179,4 @@ Common errors:
 2. **Consistent Datatypes**: Keep partition key datatypes consistent across your application
 3. **Validate Early**: Use the validation functions to catch datatype issues early
 4. **Document Datatypes**: Clearly document the expected datatypes for your partition keys
-5. **Test Compatibility**: Test datatype compatibility before deploying to production 
+5. **Test Compatibility**: Test datatype compatibility before deploying to production

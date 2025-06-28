@@ -40,12 +40,40 @@ This directory contains the technical documentation for PartitionCache, a cachin
 - Installation, configuration, and troubleshooting
 - Performance optimization and best practices
 
+### Reference Documentation
+
+#### [API Reference](api_reference.md)
+**Complete API Documentation** - Comprehensive Python API reference:
+- Core functions and classes with examples
+- Cache management and query processing
+- Queue operations and error handling
+- Advanced usage patterns and best practices
+- Performance optimization techniques
+
 #### [Datatype Support](datatype_support.md)
-**Reference Guide** - Compatibility matrix and datatype information:
+**Compatibility Guide** - Datatype compatibility and usage:
 - Backend datatype support matrix
 - Conversion guidelines and recommendations
 - Performance implications of different datatypes
 - Usage examples and best practices
+
+### Operations and Deployment
+
+#### [Production Deployment](production_deployment.md)
+**Production Guide** - Complete production deployment documentation:
+- Infrastructure setup and architecture patterns
+- Security hardening and authentication
+- Monitoring, alerting, and observability
+- Backup, recovery, and scaling strategies
+- Operational procedures and maintenance
+
+#### [Migration Guide](migration_guide.md)
+**Migration Documentation** - Comprehensive migration procedures:
+- Backend migration strategies and scripts
+- Version upgrade procedures
+- External system migration patterns
+- Data validation and rollback procedures
+- Migration testing and best practices
 
 #### [Integration Test Guide](integration_test_guide.md)
 **Testing Documentation** - Comprehensive testing guide:
@@ -87,12 +115,38 @@ This documentation has been restructured to:
 - **Include Comprehensive Diagrams**: Visual representations of system architecture
 - **Maintain Accuracy**: All information reflects the current codebase state
 
+## Additional Documentation
+
+#### [Complete Workflow Example](complete_workflow_example.md)
+**End-to-End Tutorial** - Comprehensive workflow demonstration:
+- Real-world OpenStreetMap POI example
+- PostgreSQL queue processor integration
+- Performance monitoring and optimization
+- Production deployment patterns
+
+#### [Cache Management CLI](manage_cache_cli.md)
+**CLI Reference** - Complete command-line interface documentation:
+- Cache operations and management
+- Queue monitoring and control
+- Maintenance and cleanup procedures
+- Advanced configuration options
+
+#### [Cache Eviction](cache_eviction.md)
+**Eviction Management** - Automatic cache cleanup documentation:
+- Eviction strategies and algorithms
+- pg_cron integration for automation
+- Performance impact and monitoring
+- Configuration and troubleshooting
+
 ## Getting Help
 
 - **System Architecture**: See [System Overview](system_overview.md)
+- **API Usage**: See [API Reference](api_reference.md)
 - **Backend Selection**: See [Cache Handlers](cache_handlers.md) 
 - **Queue Setup**: See [Queue System](queue_system.md)
 - **PostgreSQL Queue Processor**: See [PostgreSQL Queue Processor](postgresql_queue_processor.md)
+- **Production Deployment**: See [Production Deployment](production_deployment.md)
+- **Migration Help**: See [Migration Guide](migration_guide.md)
 - **Datatype Issues**: See [Datatype Support](datatype_support.md)
 
 For examples and practical workflows, refer to the `examples/` directory in the project root.

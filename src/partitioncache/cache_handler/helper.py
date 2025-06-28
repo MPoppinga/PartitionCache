@@ -112,7 +112,6 @@ class PartitionCacheHelper:
         try:
             return self._cache_handler.get(
                 key=key,
-                settype=self._settype,  # type: ignore
                 partition_key=self._partition_key,
             )
         except Exception as e:

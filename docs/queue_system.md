@@ -20,14 +20,15 @@ PartitionCache implements a sophisticated two-queue system that separates query 
          │              └─────────────────┘              │
          ▼                       │                       ▼
 ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│ Incoming Queue  │    │ Processing      │    │ Outgoing Queue  │
-│ (PostgreSQL/    │    │ Thread          │    │ (PostgreSQL/    │
-│  Redis)         │    │                 │    │  Redis)         │
-│                 │    │ - Fragments     │    │                 │
-│ - Original SQL  │    │ - Optimization  │    │ - Query Hash    │
-│ - Partition Key │    │ - Validation    │    │ - Partition Key │
-│ - Priority*     │    │ - Partition Key │    │ - Priority*     │
-│ - User input    │    │   Management    │    │ - Ready to run  │
+│ Original Query  │    │ Processing      │    │ Query Fragment  │
+│ Queue           │    │ Thread          │    │ Queue           │
+│ (PostgreSQL/    │    │                 │    │ (PostgreSQL/    │
+│  Redis)         │    │ - Fragments     │    │  Redis)         │
+│                 │    │ - Optimization  │    │                 │
+│ - Original SQL  │    │ - Validation    │    │ - Query Hash    │
+│ - Partition Key │    │ - Partition Key │    │ - Partition Key │
+│ - Priority*     │    │   Management    │    │ - Priority*     │
+│ - User input    │    │                 │    │ - Ready to run  │
 └─────────────────┘    └─────────────────┘    └─────────────────┘
                             * PostgreSQL only
 ```
@@ -52,6 +53,7 @@ CREATE TABLE original_query_queue (
     id SERIAL PRIMARY KEY,
     query TEXT NOT NULL,
     partition_key TEXT NOT NULL,
+    partition_datatype TEXT,
     priority INTEGER NOT NULL DEFAULT 1,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -64,6 +66,7 @@ CREATE TABLE query_fragment_queue (
     query TEXT NOT NULL,
     hash TEXT NOT NULL,
     partition_key TEXT NOT NULL,
+    partition_datatype TEXT,
     priority INTEGER NOT NULL DEFAULT 1,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -86,7 +89,7 @@ See [System Overview - Configuration Management](system_overview.md#configuratio
 
 ### Core Functions
 
-#### `push_to_original_query_queue(query, partition_key="partition_key")`
+#### `push_to_original_query_queue(query: str, partition_key: str = "partition_key", partition_datatype: str | None = None, queue_provider: str | None = None)`
 Add original queries to the original query queue:
 
 ```python
@@ -95,11 +98,12 @@ import partitioncache
 # Add query with custom partition key
 partitioncache.push_to_original_query_queue(
     query="SELECT * FROM users WHERE age > 25",
-    partition_key="user_id"
+    partition_key="user_id",
+    partition_datatype="integer"
 )
 ```
 
-#### `push_to_query_fragment_queue(query_hash_pairs, partition_key="partition_key")`
+#### `push_to_query_fragment_queue(query_hash_pairs: list[tuple[str, str]], partition_key: str = "partition_key", partition_datatype: str = "integer", queue_provider: str | None = None)`
 Add processed query fragments to the query fragment queue:
 
 ```python
@@ -108,34 +112,38 @@ query_hash_pairs = [
     ("SELECT * FROM users WHERE age > 25 AND user_id = 1", "hash123"),
     ("SELECT * FROM users WHERE age > 25 AND user_id = 2", "hash456")
 ]
-partitioncache.push_to_outgoing_queue(query_hash_pairs, partition_key="user_id")
+partitioncache.push_to_query_fragment_queue(query_hash_pairs, "user_id", "integer")
 ```
 
-#### `pop_from_incoming_queue()`
+#### `pop_from_original_query_queue(queue_provider: str | None = None)`
 Retrieve original queries for processing:
 
 ```python
-# Returns (query, partition_key) tuple or (None, None)
-query, partition_key = partitioncache.pop_from_incoming_queue()
-if query:
+# Returns (query, partition_key, partition_datatype) tuple or None
+result = partitioncache.pop_from_original_query_queue()
+if result:
+    query, partition_key, partition_datatype = result
     print(f"Processing query for partition: {partition_key}")
 ```
 
-#### `pop_from_query_fragment_queue()`
+#### `pop_from_query_fragment_queue(queue_provider: str | None = None)`
 Retrieve query fragments for execution:
 
 ```python
-# Returns (query, hash, partition_key) tuple or (None, None, None)
-query, hash_val, partition_key = partitioncache.pop_from_query_fragment_queue()
-if query:
+# Returns (query, hash, partition_key, partition_datatype) tuple or None
+result = partitioncache.pop_from_query_fragment_queue()
+if result:
+    query, hash_val, partition_key, partition_datatype = result
     print(f"Executing query {hash_val} for partition: {partition_key}")
 ```
 
-#### `get_queue_lengths()`
+#### `get_queue_lengths(queue_provider: str | None = None)`
 Monitor queue status:
 
 ```python
-original_count, fragment_count = partitioncache.get_queue_lengths()
+lengths = partitioncache.get_queue_lengths()
+original_count = lengths.get("original_query_queue", 0)
+fragment_count = lengths.get("query_fragment_queue", 0)
 print(f"Original: {original_count}, Fragment: {fragment_count}")
 ```
 
@@ -146,13 +154,13 @@ print(f"Original: {original_count}, Fragment: {fragment_count}")
 The monitor implements a sophisticated two-threaded architecture:
 
 **Thread 1: Fragment Processor**
-- Consumes `(query, partition_key)` from incoming queue
+- Consumes `(query, partition_key, partition_datatype)` from original query queue
 - Uses partition key from queue (not command line)
 - Breaks down queries using `generate_all_query_hash_pairs()`
-- Pushes fragments with partition key to outgoing queue
+- Pushes fragments with partition key to query fragment queue
 
 **Thread 2: Execution Pool**
-- Consumes `(query, hash, partition_key)` from outgoing queue
+- Consumes `(query, hash, partition_key, partition_datatype)` from query fragment queue
 - Executes fragments against database
 - Stores results in cache with partition key tracking
 
@@ -174,13 +182,13 @@ The PostgreSQL provider automatically handles priority for duplicate queries:
 
 ```sql
 -- First insertion
-INSERT INTO original_query_queue (query, partition_key, priority)
+INSERT INTO original_query_queue (query, partition_key, priority) 
 VALUES ('SELECT * FROM table', 'key1', 1);
 
 -- Duplicate insertion automatically increments priority
-INSERT INTO original_query_queue (query, partition_key, priority)
-VALUES ('SELECT * FROM table', 'key1', 1)
-ON CONFLICT (query, partition_key)
+INSERT INTO original_query_queue (query, partition_key, priority) 
+VALUES ('SELECT * FROM table', 'key1', 1) 
+ON CONFLICT (query, partition_key) 
 DO UPDATE SET 
     priority = original_query_queue.priority + 1,
     updated_at = CURRENT_TIMESTAMP;
@@ -205,16 +213,16 @@ LIMIT 1;
 ### Adding Queries to Queue
 
 ```bash
-# Add to incoming queue with partition key
+# Add to original query queue with partition key
 pcache-add \
     --query "SELECT * FROM users WHERE age > 25" \
-    --queue \
+    --queue-original \
     --partition-key "user_id"
 
-# Generate fragments and add directly to outgoing queue
+# Generate fragments and add directly to query fragment queue
 pcache-add \
     --query "SELECT * FROM complex_query" \
-    --queue-fragments \
+    --queue \
     --partition-key "custom_partition_key"
 ```
 
@@ -272,14 +280,15 @@ Applications can listen for immediate processing:
 
 ```python
 import psycopg2
+import select
 
-conn = psycopg2.connect(connection_string)
+# Assume conn is a psycopg2 connection
 conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
 cur = conn.cursor()
 
 # Listen for new queue items
-cur.execute("LISTEN new_original_query;")
-cur.execute("LISTEN new_fragment_query;")
+cur.execute("LISTEN original_query_available;")
+cur.execute("LISTEN query_fragment_available;")
 
 # Process notifications
 while True:
@@ -288,7 +297,7 @@ while True:
     conn.poll()
     while conn.notifies:
         notify = conn.notifies.pop(0)
-        if notify.channel == "new_fragment_query":
+        if notify.channel == "query_fragment_available":
             # Process immediately
             process_queue_item()
 ```
@@ -329,7 +338,7 @@ while True:
 ```sql
 -- PostgreSQL: Check queue depths and priorities
 SELECT 
-    'incoming' as queue_type,
+    'original_query_queue' as queue_type,
     partition_key,
     priority,
     COUNT(*) as item_count,
@@ -339,7 +348,7 @@ FROM original_query_queue
 GROUP BY partition_key, priority
 UNION ALL
 SELECT 
-    'outgoing' as queue_type,
+    'query_fragment_queue' as queue_type,
     partition_key,
     priority,
     COUNT(*) as item_count,
@@ -367,11 +376,15 @@ import partitioncache
 
 # Monitor processing rates
 start_time = time.time()
-initial_incoming, initial_outgoing = partitioncache.get_queue_lengths()
+initial_lengths = partitioncache.get_queue_lengths()
+initial_incoming = initial_lengths.get("original_query_queue", 0)
+initial_outgoing = initial_lengths.get("query_fragment_queue", 0)
 
 # Wait and measure
 time.sleep(60)
-final_incoming, final_outgoing = partitioncache.get_queue_lengths()
+final_lengths = partitioncache.get_queue_lengths()
+final_incoming = final_lengths.get("original_query_queue", 0)
+final_outgoing = final_lengths.get("query_fragment_queue", 0)
 
 # Calculate processing rates
 elapsed = time.time() - start_time
@@ -390,7 +403,7 @@ The system includes comprehensive error handling:
 
 ```python
 try:
-    query, partition_key = partitioncache.pop_from_incoming_queue()
+    result = partitioncache.pop_from_original_query_queue()
 except Exception as e:
     logger.error(f"Queue operation failed: {e}")
     # Graceful degradation or retry logic
@@ -467,11 +480,11 @@ QUERY_QUEUE_PROVIDER=postgresql
 PG_QUEUE_HOST=database_server
 
 # Single monitor with priority processing
-pcache-monitor --priority-processing
+pcache-monitor
 ```
 
 ## Integration Notes
 
 The queue system is designed for seamless integration with existing applications. All queue operations use the configured provider transparently.
 
-This two-queue architecture provides the foundation for scalable, reliable, and high-performance query processing in PartitionCache systems. 
+This two-queue architecture provides the foundation for scalable, reliable, and high-performance query processing in PartitionCache systems.

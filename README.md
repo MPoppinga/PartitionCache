@@ -414,40 +414,80 @@ optimized = get_query("SELECT * FROM restaurants WHERE cuisine = 'italian'", "ci
 
 ## CLI Usage
 
-### Cache Population
+PartitionCache provides comprehensive CLI tools with extensive configuration options for all aspects of cache management, queue processing, and system maintenance.
+
+### Overview of CLI Tools
+
+| Command | Purpose | Key Features |
+|---------|---------|--------------|
+| `pcache-manage` | Central management | Setup, status, cache ops, maintenance with 20+ subcommands |
+| `pcache-add` | Query caching | Direct execution, queue modes, flexible processing options |
+| `pcache-read` | Cache retrieval | Multiple output formats, file output, flexible querying |
+| `pcache-monitor` | Queue processing | Multi-threaded, performance tuning, monitoring controls |
+| `pcache-postgresql-queue-processor` | PostgreSQL integration | pg_cron native processing, production-ready automation |
+| `pcache-postgresql-eviction-manager` | Cache cleanup | Automatic eviction, policy management, maintenance |
+
+### Basic Cache Population
 
 ```bash
-# Add single query directly to cache
-pcache-add \
-    --direct \
+# Direct cache population with immediate execution
+pcache-add --direct \
     --query "SELECT DISTINCT city_id FROM restaurants WHERE rating > 4.0" \
     --partition-key "city_id" \
     --partition-datatype "integer" \
     --cache-backend "postgresql_array"
 
-# Add to processing queue for background processing
-pcache-add \
-    --queue-original \
+# Queue-based processing for background execution
+pcache-add --queue-original \
     --query "SELECT DISTINCT city_id FROM restaurants WHERE rating > 4.0" \
     --partition-key "city_id" \
     --partition-datatype "integer"
 
-# Process from file
-pcache-add \
-    --direct \
+# Advanced options: Skip query decomposition for exact caching
+pcache-add --queue --no-recompose \
     --query-file "complex_queries.sql" \
     --partition-key "region_id" \
-    --partition-datatype "integer" \
-    --cache-backend "postgresql_array"
+    --partition-datatype "integer"
 ```
+
+### Advanced CLI Features
+
+```bash
+# Comprehensive cache management
+pcache-manage setup all                    # Complete infrastructure setup
+pcache-manage status env                   # Environment validation
+pcache-manage cache overview               # Detailed cache statistics
+pcache-manage cache export --file backup.pkl  # Cache backup
+pcache-manage maintenance prune --days 30  # Cleanup old entries
+
+# High-performance queue monitoring
+pcache-monitor \
+    --cache-backend postgresql_array \
+    --max-processes 8 \                     # Concurrency control
+    --disable-optimized-polling \           # Performance tuning
+    --status-log-interval 30                # Logging control
+
+# Production PostgreSQL queue processor
+pcache-postgresql-queue-processor setup
+pcache-postgresql-queue-processor enable
+pcache-postgresql-queue-processor status-detailed
+
+# Flexible cache reading with output options
+pcache-read \
+    --query "SELECT * FROM products WHERE category = 'electronics'" \
+    --partition-key "store_id" \
+    --output-format json \                  # list, json, or lines
+    --output-file "cached_stores.json"
+```
+
+**📚 Complete CLI Reference**: For comprehensive documentation of all parameters, advanced usage patterns, and performance tuning options, see the [CLI Reference Guide](docs/cli_reference.md).
 
 ### Queue Management
 
 ```bash
 # Monitor queue processing (traditional external monitor)
-pcache-observer \
-    --cache-backend "postgresql_array" \
-    --max-processes 8
+pcache-monitor \
+    --cache-backend "postgresql_array"
 
 # PostgreSQL queue processor management (recommended)
 pcache-postgresql-queue-processor status
@@ -459,7 +499,7 @@ pcache-postgresql-queue-processor config --max-jobs 15 --frequency 1
 
 ```bash
 # Retrieve cached data
-pcache-get \
+pcache-read \
     --query "SELECT * FROM restaurants WHERE rating > 4.0" \
     --partition-key "city_id" \
     --partition-datatype "integer" \
