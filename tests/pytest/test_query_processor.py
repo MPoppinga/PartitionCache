@@ -1,8 +1,8 @@
 from partitioncache.query_processor import (
-    extract_conjunctive_conditions,
-    normalize_distance_conditions,
-    generate_partial_queries,
     clean_query,
+    extract_conjunctive_conditions,
+    generate_partial_queries,
+    normalize_distance_conditions,
 )
 
 

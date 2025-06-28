@@ -1,8 +1,8 @@
+from unittest.mock import MagicMock, patch
+
 import pytest
-import os
-from pyroaring import BitMap
 from bitarray import bitarray
-from unittest.mock import patch, MagicMock
+from pyroaring import BitMap
 
 from partitioncache.cache_handler.postgresql_roaringbit import PostgreSQLRoaringBitCacheHandler
 

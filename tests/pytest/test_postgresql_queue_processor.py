@@ -1,15 +1,15 @@
 """Tests for PostgreSQL direct queue processor."""
 
 import os
+from unittest.mock import Mock, patch
+
 import pytest
-from unittest.mock import Mock, patch, MagicMock
-from pathlib import Path
 
 from partitioncache.cli.setup_postgresql_queue_processor import (
-    validate_environment,
+    SQL_FILE,
     check_pg_cron_installed,
     get_processor_status,
-    SQL_FILE,
+    validate_environment,
 )
 
 

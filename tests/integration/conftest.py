@@ -639,7 +639,7 @@ def postgresql_queue_functions(db_connection):
 
     try:
         # Import the setup function
-        from partitioncache.cli.setup_postgresql_queue_processor import setup_database_objects, get_queue_table_prefix_from_env
+        from partitioncache.cli.setup_postgresql_queue_processor import get_queue_table_prefix_from_env, setup_database_objects
 
         # Load the SQL functions into the database
         # Only create pg_cron trigger if the extension is available
@@ -740,7 +740,7 @@ def postgresql_queue_processor(postgresql_queue_functions, db_session, cache_cli
     if not cache_backend.startswith("postgresql"):
         pytest.skip(f"PostgreSQL queue processor only works with PostgreSQL cache backends, not {cache_backend}")
 
-    from partitioncache.cli.setup_postgresql_queue_processor import get_table_prefix_from_env, get_queue_table_prefix_from_env
+    from partitioncache.cli.setup_postgresql_queue_processor import get_queue_table_prefix_from_env, get_table_prefix_from_env
 
     queue_prefix = get_queue_table_prefix_from_env()
     table_prefix = get_table_prefix_from_env()
