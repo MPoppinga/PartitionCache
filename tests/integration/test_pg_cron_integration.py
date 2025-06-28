@@ -32,14 +32,9 @@ class TestPgCronIntegration:
 
         reset_queue_handler()
 
-        # Check pg_cron availability
-        with db_session.cursor() as cur:
-            try:
-                cur.execute("SELECT extname FROM pg_extension WHERE extname = 'pg_cron';")
-                if not cur.fetchone():
-                    pytest.skip("pg_cron extension not available")
-            except Exception:
-                pytest.skip("Cannot check for pg_cron extension")
+        # Check pg_cron availability from fixture
+        if not postgresql_queue_processor.get("pg_cron_available", False):
+            pytest.skip("pg_cron extension not available")
 
         # Get current database name for unique job naming
         with db_session.cursor() as cur:

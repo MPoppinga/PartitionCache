@@ -628,19 +628,32 @@ def postgresql_queue_functions(db_connection):
     if db_connection is None:
         pytest.skip("PostgreSQL database connection not available")
 
+    # Check if pg_cron extension is available
+    pg_cron_available = False
+    try:
+        with db_connection.cursor() as cur:
+            cur.execute("SELECT 1 FROM pg_extension WHERE extname = 'pg_cron'")
+            pg_cron_available = cur.fetchone() is not None
+    except Exception as e:
+        logger.info(f"Could not check for pg_cron extension: {e}")
+
     try:
         # Import the setup function
         from partitioncache.cli.setup_postgresql_queue_processor import setup_database_objects, get_queue_table_prefix_from_env
 
         # Load the SQL functions into the database
-        setup_database_objects(db_connection)
+        # Only create pg_cron trigger if the extension is available
+        setup_database_objects(db_connection, include_pg_cron_trigger=pg_cron_available)
 
-        logger.info("PostgreSQL queue processor functions loaded successfully")
-        return True
+        logger.info(f"PostgreSQL queue processor functions loaded successfully (pg_cron trigger: {pg_cron_available})")
+        return pg_cron_available  # Return whether pg_cron is available
 
     except ImportError as e:
         pytest.skip(f"Could not import PostgreSQL queue processor setup: {e}")
     except Exception as e:
+        # If setup fails due to missing pg_cron, skip the test
+        if "pg_cron" in str(e) or "cron" in str(e):
+            pytest.skip(f"pg_cron not available: {e}")
         logger.error(f"Failed to load PostgreSQL queue processor functions: {e}")
         pytest.fail(f"PostgreSQL queue function setup failed: {e}")
 
@@ -652,11 +665,18 @@ def postgresql_queue_processor(postgresql_queue_functions, db_session):
 
     Depends on postgresql_queue_functions to ensure SQL functions are loaded.
     Sets up processor tables and configuration for the current test.
+    
+    Returns dict with:
+        - table_prefix: Cache table prefix
+        - queue_prefix: Queue table prefix  
+        - config_table: Processor config table name
+        - pg_cron_available: Whether pg_cron is available
     """
     from partitioncache.cli.setup_postgresql_queue_processor import get_table_prefix_from_env, get_queue_table_prefix_from_env
 
     queue_prefix = get_queue_table_prefix_from_env()
     table_prefix = get_table_prefix_from_env()
+    pg_cron_available = postgresql_queue_functions  # This now returns whether pg_cron is available
 
     # Initialize processor tables
     with db_session.cursor() as cur:
@@ -678,4 +698,9 @@ def postgresql_queue_processor(postgresql_queue_functions, db_session):
         )
         db_session.commit()
 
-    return {"queue_prefix": queue_prefix, "table_prefix": table_prefix, "config_table": config_table}
+    return {
+        "queue_prefix": queue_prefix, 
+        "table_prefix": table_prefix, 
+        "config_table": config_table,
+        "pg_cron_available": pg_cron_available
+    }
