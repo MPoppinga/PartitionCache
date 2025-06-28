@@ -17,6 +17,7 @@ jobs:
     permissions:
       contents: read
       packages: write
+      actions: write
     outputs:
       image-tag: sha-${{ steps.sha.outputs.short }}
     
@@ -56,8 +57,8 @@ jobs:
         push: true
         tags: ${{ steps.meta.outputs.tags }}
         labels: ${{ steps.meta.outputs.labels }}
-        cache-from: type=gha
-        cache-to: type=gha,mode=max
+        cache-from: type=gha,scope=${{ github.workflow }}
+        cache-to: type=gha,mode=max,scope=${{ github.workflow }}
         platforms: linux/amd64
 
   integration-tests:
@@ -224,7 +225,7 @@ jobs:
         environment-file: .github/micromamba-env.yml
         init-shell: >-
           bash
-        cache-environment: true
+        cache-environment: false
         post-cleanup: 'all'
 
     - name: Install PartitionCache
@@ -303,10 +304,6 @@ jobs:
           PYTEST_FLAGS="$PYTEST_FLAGS --parallel"
         fi
         
-        if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == "refs/heads/main" ]]; then
-          PYTEST_FLAGS="$PYTEST_FLAGS --coverage"
-        fi
-        
         ./scripts/run_integration_tests.sh $PYTEST_FLAGS --no-setup
 
     - name: Upload artifacts
@@ -315,19 +312,11 @@ jobs:
       with:
         name: test-results-${{ matrix.name }}
         path: |
-          htmlcov/
-          .coverage
-          pytest-results.xml
           /tmp/ci_rocksdb*/
           /tmp/ci_rocksdict*/
         retention-days: 7
+        if-no-files-found: ignore
 
-    - name: Upload coverage
-      uses: codecov/codecov-action@v3
-      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-      with:
-        file: ./coverage.xml
-        flags: integration-${{ matrix.name }}
 
   e2e-tests:
     name: End-to-End Tests
@@ -396,7 +385,7 @@ jobs:
         environment-file: .github/micromamba-env.yml
         init-shell: >-
           bash
-        cache-environment: true
+        cache-environment: false
         post-cleanup: 'all'
 
     - name: Install PartitionCache
@@ -429,9 +418,6 @@ jobs:
       shell: micromamba-shell {0}
       run: |
         PYTEST_FLAGS="--ci --pattern test_end_to_end_workflows --verbose"
-        if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == "refs/heads/main" ]]; then
-          PYTEST_FLAGS="$PYTEST_FLAGS --coverage"
-        fi
         ./scripts/run_integration_tests.sh $PYTEST_FLAGS
 
     - name: Upload E2E artifacts
@@ -440,10 +426,9 @@ jobs:
       with:
         name: e2e-test-results
         path: |
-          htmlcov/
-          .coverage
-          pytest-results.xml
+          test-logs/
         retention-days: 7
+        if-no-files-found: ignore
 
   performance-tests:
     name: Performance Tests
@@ -497,7 +482,7 @@ jobs:
         environment-file: .github/micromamba-env.yml
         init-shell: >-
           bash
-        cache-environment: true
+        cache-environment: false
         post-cleanup: 'all'
 
     - name: Install PartitionCache
@@ -562,9 +547,9 @@ jobs:
       with:
         name: performance-test-results
         path: |
-          pytest-results.xml
           performance-results/
         retention-days: 30
+        if-no-files-found: ignore
 
   pg-cron-tests:
     name: pg_cron Integration Tests
@@ -616,7 +601,7 @@ jobs:
         environment-file: .github/micromamba-env.yml
         init-shell: >-
           bash
-        cache-environment: true
+        cache-environment: false
         post-cleanup: 'all'
 
     - name: Install PartitionCache
@@ -672,10 +657,9 @@ jobs:
       with:
         name: pg-cron-test-results
         path: |
-          htmlcov/
-          .coverage
-          pytest-results.xml
+          test-logs/
         retention-days: 7
+        if-no-files-found: ignore
 
   test-summary:
     name: Test Summary
