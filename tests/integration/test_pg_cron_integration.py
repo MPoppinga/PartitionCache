@@ -20,12 +20,13 @@ class TestPgCronIntegration:
         queue processing in production environments. Uses database-specific
         job names to avoid conflicts in parallel CI runs.
         """
-        from partitioncache.queue import clear_all_queues, get_queue_lengths, get_queue_provider_name, push_to_original_query_queue, reset_queue_handler
+        from partitioncache.query_processor import generate_all_query_hash_pairs
+        from partitioncache.queue import clear_all_queues, get_queue_lengths, get_queue_provider_name, push_to_query_fragment_queue, reset_queue_handler
 
         # Only run for PostgreSQL queue provider
         if get_queue_provider_name() != "postgresql":
             pytest.skip("This test is specific to PostgreSQL with pg_cron")
-        
+
         # Only run for PostgreSQL cache backends (pg_cron processes PostgreSQL cache tables)
         if not str(cache_client).startswith("postgresql"):
             pytest.skip("pg_cron tests only compatible with PostgreSQL cache backends")
@@ -98,10 +99,21 @@ class TestPgCronIntegration:
                     assert job[2] is True, f"Job {job[0]} should be active"
                     print(f"Created job: {job[0]} with schedule: {job[1]}")
 
-            # Clear queues and add test data
+            # Clear queues and add test data as fragments (direct processor only processes fragments)
             clear_all_queues()
 
-            # Add test queries
+            def _queue_query_as_fragments(query: str, partition_key: str, partition_datatype: str = "integer") -> bool:
+                """Helper to generate and queue query fragments (same as manual processor test)."""
+                query_hash_pairs = generate_all_query_hash_pairs(
+                    query,
+                    partition_key,
+                    min_component_size=1,
+                    follow_graph=True,
+                    keep_all_attributes=True,
+                )
+                return push_to_query_fragment_queue(query_hash_pairs=query_hash_pairs, partition_key=partition_key, partition_datatype=partition_datatype)
+
+            # Add test queries as fragments
             test_queries = [
                 ("SELECT * FROM test_locations WHERE zipcode = 8001;", "zipcode", "integer"),
                 ("SELECT * FROM test_locations WHERE zipcode = 8002;", "zipcode", "integer"),
@@ -109,28 +121,28 @@ class TestPgCronIntegration:
             ]
 
             for query, partition_key, datatype in test_queries:
-                success = push_to_original_query_queue(query=query, partition_key=partition_key, partition_datatype=datatype)
-                assert success, f"Failed to queue: {query}"
+                success = _queue_query_as_fragments(query, partition_key, datatype)
+                assert success, f"Failed to queue fragments for: {query}"
 
-            initial_queue_length = get_queue_lengths()["original_query_queue"]
-            assert initial_queue_length >= len(test_queries), "Not all queries queued"
+            initial_queue_length = get_queue_lengths()["query_fragment_queue"]
+            assert initial_queue_length > 0, "No fragments queued"
 
             # Wait for pg_cron to process (with timeout)
             max_wait = 30  # seconds
             check_interval = 2
             start_time = time.time()
 
-            print(f"Waiting for pg_cron to process {initial_queue_length} queries...")
+            print(f"Waiting for pg_cron to process {initial_queue_length} fragments...")
             while time.time() - start_time < max_wait:
-                current_length = get_queue_lengths()["original_query_queue"]
+                current_length = get_queue_lengths()["query_fragment_queue"]
                 if current_length < initial_queue_length:
-                    print(f"Queue reduced from {initial_queue_length} to {current_length}")
+                    print(f"Fragment queue reduced from {initial_queue_length} to {current_length}")
                     break
                 time.sleep(check_interval)
 
             # Verify processing occurred
-            final_length = get_queue_lengths()["original_query_queue"]
-            assert final_length < initial_queue_length, f"pg_cron did not process queries. Initial: {initial_queue_length}, Final: {final_length}"
+            final_length = get_queue_lengths()["query_fragment_queue"]
+            assert final_length < initial_queue_length, f"pg_cron did not process fragments. Initial: {initial_queue_length}, Final: {final_length}"
 
             print(f"pg_cron successfully processed {initial_queue_length - final_length} queries")
 

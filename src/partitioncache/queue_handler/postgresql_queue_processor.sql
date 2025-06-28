@@ -366,8 +366,23 @@ DECLARE
     v_config_table TEXT;
     v_queue_item RECORD;
 BEGIN
-    -- For job name 'partitioncache_process_queue', we need 'partitioncache_queue_processor_config'
-    v_config_table := replace(p_job_name, 'partitioncache_process_queue', 'partitioncache_queue_processor_config');
+    -- For job name 'partitioncache_process_queue', we need to find the processor config table
+    -- Try to find it by looking for tables ending with '_processor_config'
+    SELECT tablename INTO v_config_table
+    FROM pg_tables 
+    WHERE schemaname = 'public' 
+    AND tablename LIKE '%_processor_config'
+    AND EXISTS (
+        SELECT 1 FROM information_schema.columns 
+        WHERE table_name = tablename 
+        AND column_name = 'job_name'
+    )
+    LIMIT 1;
+    
+    IF v_config_table IS NULL THEN
+        -- Use default if not found
+        v_config_table := 'partitioncache_queue_processor_config';
+    END IF;
     
     -- Get configuration for this job
     BEGIN
@@ -378,7 +393,7 @@ BEGIN
 
     EXCEPTION 
         WHEN NO_DATA_FOUND THEN
-            RAISE NOTICE 'No data found for job %', p_job_name;
+            RAISE NOTICE 'No data found for job % in table %', p_job_name, v_config_table;
             -- This can happen if the trigger creates jobs before config is committed. Exit gracefully.
             RETURN;
         WHEN TOO_MANY_ROWS THEN
