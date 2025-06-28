@@ -21,13 +21,6 @@ Usage Examples:
     # Show detailed queue info with custom table prefix
     pcache-postgresql-queue-processor queue-info --table-prefix my_cache
 
-The new commands provide information about:
-- Which partition keys are being observed in the queue
-- Cache table architecture (bit vs array)
-- Cache table existence and column types
-- Queue item counts per partition
-- Last cache update timestamps
-- Partition data types and bit sizes (for bit caches)
 """
 
 import argparse

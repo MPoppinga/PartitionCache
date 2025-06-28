@@ -117,18 +117,18 @@ def check_env_vars():
     missing_backend = [var for var, value in backend_specific_vars.items() if not value]
 
     if missing_cache:
-        print(f"\n❌ Missing cache database variables: {', '.join(missing_cache)}")
+        print(f"\nMissing cache database variables: {', '.join(missing_cache)}")
         return False
 
     if missing_queue:
-        print(f"\n❌ Missing queue variables: {', '.join(missing_queue)}")
+        print(f"\nMissing queue variables: {', '.join(missing_queue)}")
         return False
 
     if missing_backend:
-        print(f"\n❌ Missing {backend} backend variables: {', '.join(missing_backend)}")
+        print(f"\nMissing {backend} backend variables: {', '.join(missing_backend)}")
         return False
 
-    print("\n✅ All required environment variables are set!")
+    print("\nAll required environment variables are set!")
     return True
 
 
@@ -145,15 +145,15 @@ def test_partitioncache_setup():
         result = subprocess.run(["python", "-m", "partitioncache.cli.manage_cache", "setup", "all"], capture_output=True, text=True, timeout=30)
 
         if result.returncode == 0:
-            print("✅ PartitionCache setup succeeded!")
+            print("PartitionCache setup succeeded!")
             print("Output:", result.stdout)
         else:
-            print("❌ PartitionCache setup failed!")
+            print("PartitionCache setup failed!")
             print("Error:", result.stderr)
             return False
 
     except Exception as e:
-        print(f"❌ Error testing setup: {e}")
+        print(f"Error testing setup: {e}")
         return False
 
     return True
@@ -171,11 +171,11 @@ if __name__ == "__main__":
         setup_ok = test_partitioncache_setup()
 
         if setup_ok:
-            print("\n🎉 Environment is correctly configured for PartitionCache!")
+            print("\nEnvironment is correctly configured for PartitionCache!")
         else:
-            print("\n⚠️ Environment variables are set but setup failed. Check logs above.")
+            print("\nEnvironment variables are set but setup failed. Check logs above.")
     else:
-        print("\n⚠️ Please set the missing environment variables before running PartitionCache.")
+        print("\nPlease set the missing environment variables before running PartitionCache.")
 
         print("\nFor local testing, you can set them like this:")
         print("export DB_HOST=localhost")
