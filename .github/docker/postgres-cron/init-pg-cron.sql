@@ -46,9 +46,22 @@ CREATE TABLE test_businesses (
     business_type TEXT NOT NULL,
     region_id INTEGER NOT NULL,
     city_id INTEGER NOT NULL,
+    zipcode TEXT NOT NULL,
     x DECIMAL(10,6) NOT NULL,
     y DECIMAL(10,6) NOT NULL,  
     rating DECIMAL(2,1) DEFAULT 3.0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE test_spatial_points (
+    id SERIAL PRIMARY KEY,
+    name TEXT NOT NULL,
+    point_type TEXT NOT NULL,
+    region_id INTEGER NOT NULL,
+    city_id INTEGER NOT NULL,
+    zipcode TEXT NOT NULL,
+    x DECIMAL(10,6) NOT NULL,
+    y DECIMAL(10,6) NOT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -59,6 +72,8 @@ GRANT ALL PRIVILEGES ON test_locations TO integration_user;
 GRANT USAGE, SELECT ON SEQUENCE test_locations_id_seq TO integration_user;
 GRANT ALL PRIVILEGES ON test_businesses TO integration_user;
 GRANT USAGE, SELECT ON SEQUENCE test_businesses_id_seq TO integration_user;
+GRANT ALL PRIVILEGES ON test_spatial_points TO integration_user;
+GRANT USAGE, SELECT ON SEQUENCE test_spatial_points_id_seq TO integration_user;
 
 -- Note: PartitionCache queue processor functions are loaded at test runtime
 -- via the setup_postgresql_queue_processor.py CLI tool
