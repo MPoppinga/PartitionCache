@@ -10,14 +10,18 @@ The test suite is organized into two main categories:
 Traditional unit tests covering individual components and functions.
 
 ### Integration Tests (`tests/integration/`)
-Comprehensive integration tests organized into six main test modules:
+Comprehensive integration tests organized into multiple test modules:
 
 - **test_cache_backends.py** - Tests all cache backend implementations and core functionality
 - **test_queue_processor.py** - Tests asynchronous queue processing and pg_cron functionality  
 - **test_cli.py** - Tests command-line interface functionality
 - **test_cache_performance.py** - Performance, concurrency, and stress tests
 - **test_error_recovery.py** - Error handling and fault tolerance tests
-- **test_end_to_end_workflows.py** - Complete workflow tests simulating real-world usage
+- **test_end_to_end_workflows.py** - Complete workflow tests simulating real-world usage (postgresql_array only)
+- **test_pg_cron_integration.py** - Dedicated pg_cron functionality tests with proper isolation
+- **test_manual_queue_processor.py** - Manual queue processing tests
+- **test_spatial_cache.py** - Spatial data caching functionality tests
+- **test_utils.py** - Utility function tests
 
 ## Cache Backend Tests (test_cache_backends.py)
 
@@ -146,6 +150,8 @@ Expected Outcome: Lazy cache application successfully enhances queries with cach
 
 ## Queue Processor Tests (test_queue_processor.py)
 
+**Testing Strategy Note**: Integration tests use manual processing by default (`partitioncache_manual_process_queue()`) instead of pg_cron to avoid concurrency issues and job name conflicts in parallel CI runs. One dedicated pg_cron test (`test_pg_cron_integration.py`) validates production behavior with proper isolation.
+
 ### TestQueueProcessor
 
 **Test: test_queue_basic_operations**
@@ -180,15 +186,15 @@ Expected Outcome: The cron job is successfully scheduled, executes within the ex
 
 **Test: test_queue_processing_integration**
 File: tests/integration/test_queue_processor.py
-Purpose: Verifies integration between queue processing and cache population workflows.
+Purpose: Verifies integration between queue processing and cache population workflows using manual processing.
 Actions:
 1. Clear queues and cache to start fresh
 2. Add a test query to the original queue
-3. Simulate query fragment generation using generate_all_hashes()
+3. Use manual queue processing (partitioncache_manual_process_queue()) instead of pg_cron to avoid concurrency issues
 4. Execute the query against the database to get actual results
 5. Populate cache with the actual results (simulating queue processor)
 6. Test cache application using get_partition_keys()
-Expected Outcome: Complete integration workflow successfully processes queued queries, populates cache with actual data, and enables successful cache application.
+Expected Outcome: Complete integration workflow successfully processes queued queries using manual processing, populates cache with actual data, and enables successful cache application.
 
 **Test: test_queue_processor_performance**
 File: tests/integration/test_queue_processor.py
@@ -504,57 +510,59 @@ Expected Outcome: Valid cache data remains accessible despite corruption attempt
 
 ### TestEndToEndWorkflows
 
+**Important Note**: E2E tests use only the `postgresql_array` backend to avoid table conflicts when multiple backends share the same database. Individual backend functionality is thoroughly tested in backend-specific integration tests.
+
 **Test: test_complete_osm_style_workflow**
 File: tests/integration/test_end_to_end_workflows.py
-Purpose: Validates complete workflow similar to the OSM example with realistic queries.
+Purpose: Validates complete workflow similar to the OSM example with realistic queries using postgresql_array backend.
 Actions:
-1. Execute baseline queries without cache
+1. Execute baseline queries without cache using postgresql_array backend
 2. Generate cache fragments and populate cache with actual query results
 3. Test cache application and query enhancement
 4. Compare baseline vs. enhanced query results
 5. Measure performance improvements
-Expected Outcome: Complete workflow processes all queries with cache hits and performance improvements.
+Expected Outcome: Complete workflow processes all queries with cache hits and performance improvements using postgresql_array backend.
 
 **Test: test_multi_partition_workflow**
 File: tests/integration/test_end_to_end_workflows.py
-Purpose: Tests workflows using multiple partition keys (zipcode and region).
+Purpose: Tests workflows using multiple partition keys (zipcode and region) with postgresql_array backend.
 Actions:
-1. Register multiple partition keys with different datatypes
+1. Register multiple partition keys with different datatypes in postgresql_array backend
 2. Process queries specific to each partition type
 3. Verify partition isolation and correct cache behavior
 4. Test cross-partition query scenarios
-Expected Outcome: Each partition key maintains isolation with successful cache hits for partition-specific queries.
+Expected Outcome: Each partition key maintains isolation with successful cache hits for partition-specific queries using postgresql_array backend.
 
 **Test: test_queue_to_cache_workflow**
 File: tests/integration/test_end_to_end_workflows.py
-Purpose: Validates complete workflow from queue processing to cache application.
+Purpose: Validates complete workflow from queue processing to cache application using postgresql_array backend.
 Actions:
 1. Clear queues and add test queries to original queue
 2. Simulate queue processor by generating fragments and executing queries
-3. Populate cache with actual query results
+3. Populate postgresql_array cache with actual query results
 4. Test cache application with new queries using populated cache
-Expected Outcome: Queued queries result in populated cache that provides hits for subsequent similar queries.
+Expected Outcome: Queued queries result in populated postgresql_array cache that provides hits for subsequent similar queries.
 
 **Test: test_cli_integration_workflow**
 File: tests/integration/test_end_to_end_workflows.py
-Purpose: Tests complete workflow using CLI commands for setup, add, and management.
+Purpose: Tests complete workflow using CLI commands for setup, add, and management with postgresql_array backend.
 Actions:
-1. Use CLI to setup all PartitionCache tables and configuration
+1. Use CLI to setup all PartitionCache tables and configuration for postgresql_array backend
 2. Add queries to cache using CLI add command with temporary files
 3. Check cache status and counts using CLI management commands
 4. Verify workflow success through CLI return codes and output
-Expected Outcome: Complete CLI workflow succeeds with proper setup, query addition, and status reporting.
+Expected Outcome: Complete CLI workflow succeeds with proper setup, query addition, and status reporting using postgresql_array backend.
 
 **Test: test_performance_monitoring_workflow**
 File: tests/integration/test_end_to_end_workflows.py
-Purpose: Validates performance monitoring across different query types and complexity levels.
+Purpose: Validates performance monitoring across different query types and complexity levels using postgresql_array backend.
 Actions:
-1. Execute various query types (simple, range, IN list, complex joins)
+1. Execute various query types (simple, range, IN list, complex joins) with postgresql_array backend
 2. Measure baseline performance without cache
-3. Populate cache and measure cache lookup performance
+3. Populate postgresql_array cache and measure cache lookup performance
 4. Test enhanced query performance where supported
 5. Analyze performance characteristics and verify reasonable response times
-Expected Outcome: Performance monitoring shows cache hits across query types with reasonable lookup times (<1s average).
+Expected Outcome: Performance monitoring shows cache hits across query types with reasonable lookup times (<1s average) using postgresql_array backend.
 
 ## Running the Tests
 
@@ -601,3 +609,43 @@ python -m pytest tests/integration/ -v -m "stress"
 # Concurrent tests only
 python -m pytest tests/integration/ -v -m "concurrent"
 ```
+
+## Test Environment Requirements
+
+### PostgreSQL Extensions
+
+The test suite requires a PostgreSQL instance with the following extensions:
+
+#### Required Extensions:
+- **pg_cron**: For database-native queue processing tests
+  - Required for: `test_queue_processor.py`, `test_end_to_end_workflows.py`
+  - Installation: `sudo apt-get install postgresql-16-cron`
+  - Configuration: `shared_preload_libraries = 'pg_cron'`
+
+- **roaringbitmap**: For roaringbitmap cache handler tests  
+  - Required for: `test_postgresql_roaringbit_cache_handler.py`, integration tests
+  - Installation: Use `./scripts/install_pg_extensions.sh postgresql_roaringbit`
+
+#### CI Environment:
+The CI uses a custom PostgreSQL Docker image that includes both extensions:
+- **Image location**: `.github/docker/postgres-cron/`
+- **Auto-built**: CI automatically builds this image before running tests
+- **Verification**: Tests verify both extensions are available before proceeding
+
+#### Local Development:
+For local testing, you can:
+1. **Use the custom Docker image** (recommended):
+   ```bash
+   cd .github/docker/postgres-cron
+   docker build -t postgres-test-extensions:latest .
+   ```
+
+2. **Install extensions manually** on existing PostgreSQL installation
+
+3. **Use example configurations**: See `examples/*/docker-compose.yml`
+
+### Software Requirements
+
+- **PostgreSQL 16** with pg_cron and roaringbitmap extensions (see above)
+- **Redis 7+** (for Redis backend tests)
+- **Python 3.12** with dependencies from `pyproject.toml[testing]`
