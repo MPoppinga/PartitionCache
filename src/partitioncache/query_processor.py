@@ -29,6 +29,9 @@ def clean_query(query: str) -> str:
     query = re.sub(r"\s+", " ", query)
     query = re.sub(r"\s*=\s*", "=", query)
 
+    # Remove trailing semicolons (they're not part of the SQL statement)
+    query = query.rstrip().rstrip(";")
+
     # Normalize the query
     sqlglot_query = sqlglot.parse_one(query)
 
@@ -622,7 +625,7 @@ def hash_query(query: str) -> str:
 def generate_all_hashes(
     query: str,
     partition_key: str,
-    min_component_size = 1,
+    min_component_size=1,
     follow_graph=True,
     fix_attributes=True,
     canonicalize_queries=False,

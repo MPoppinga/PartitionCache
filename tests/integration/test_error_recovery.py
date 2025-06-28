@@ -351,10 +351,10 @@ class TestQueueErrorRecovery:
             for entry in log_entries:
                 if entry[0] == "timeout":
                     timeout_found = True
-                    # The message should mention timeout (case-insensitive)
-                    assert entry[1] and "timeout" in entry[1].lower(), f"Error message should mention timeout: {entry[1]}"
+                    # The message should mention timeout/timed out (case-insensitive)
+                    assert entry[1] and ("timeout" in entry[1].lower() or "timed out" in entry[1].lower()), f"Error message should mention timeout: {entry[1]}"
                     break
-                elif entry[0] == "failed" and entry[1] and ("cancel" in entry[1].lower() or "timeout" in entry[1].lower()):
+                elif entry[0] == "failed" and entry[1] and ("cancel" in entry[1].lower() or "timeout" in entry[1].lower() or "timed out" in entry[1].lower()):
                     # Sometimes timeouts are logged as failures with cancel/timeout message
                     timeout_found = True
                     break

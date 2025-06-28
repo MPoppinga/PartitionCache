@@ -155,12 +155,19 @@ def check_pg_cron_installed(conn) -> bool:
     """Check if pg_cron extension is installed."""
     with conn.cursor() as cur:
         try:
+            # First check if it exists without trying to create it
+            cur.execute("SELECT 1 FROM pg_extension WHERE extname = 'pg_cron'")
+            if cur.fetchone() is not None:
+                return True
+
+            # Try to create it if not exists
             cur.execute("CREATE EXTENSION IF NOT EXISTS pg_cron")
+            conn.commit()
+            return True
         except Exception as e:
-            logger.error(f"Failed to create pg_cron extension: {e}")
+            # pg_cron not available - this is OK for manual processing
+            logger.debug(f"pg_cron extension not available: {e}")
             return False
-        cur.execute("SELECT 1 FROM pg_extension WHERE extname = 'pg_cron'")
-        return cur.fetchone() is not None
 
 
 def setup_database_objects(conn, include_pg_cron_trigger=True):
@@ -339,16 +346,28 @@ def update_processor_config(
 def handle_setup(conn, table_prefix: str, queue_prefix: str, cache_backend: str, frequency: int, enabled: bool, timeout: int):
     """Handle the main setup logic."""
     logger.info("Starting PostgreSQL queue processor setup...")
-    if not check_pg_cron_installed(conn):
-        logger.error("pg_cron extension is not installed. Please install it first.")
+
+    # Check if pg_cron is available (but don't require it)
+    pg_cron_available = check_pg_cron_installed(conn)
+
+    if enabled and not pg_cron_available:
+        logger.error("Cannot enable processor with pg_cron: extension is not installed.")
+        logger.info("You can still set up the processor infrastructure and use manual processing.")
         sys.exit(1)
 
-    setup_database_objects(conn)
+    # Setup all database objects (functions, tables, etc.)
+    # Only create pg_cron trigger if we're enabling the processor
+    setup_database_objects(conn, include_pg_cron_trigger=(enabled and pg_cron_available))
 
     job_name = "partitioncache_process_queue"
     insert_initial_config(conn, job_name, table_prefix, queue_prefix, cache_backend, frequency, enabled, timeout)
 
-    logger.info("Setup complete. The processor job is created and configured via the config table.")
+    if enabled and pg_cron_available:
+        logger.info("Setup complete. The processor job is created and scheduled via pg_cron.")
+    else:
+        logger.info("Setup complete. The processor infrastructure is ready for manual processing.")
+        if not pg_cron_available:
+            logger.info("Note: pg_cron is not available. Use 'manual-process' command or enable pg_cron for automated processing.")
 
 
 def get_processor_status(conn, queue_prefix: str):
