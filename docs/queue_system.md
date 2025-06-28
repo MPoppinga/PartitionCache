@@ -43,14 +43,7 @@ PartitionCache implements a sophisticated two-queue system that separates query 
 - Comprehensive indexing for optimal performance
 
 **Configuration:**
-```bash
-QUERY_QUEUE_PROVIDER=postgresql
-PG_QUEUE_HOST=localhost
-PG_QUEUE_PORT=5432
-PG_QUEUE_USER=queue_user
-PG_QUEUE_PASSWORD=queue_password
-PG_QUEUE_DB=partition_cache_queues
-```
+See [System Overview - Configuration Management](system_overview.md#configuration-management) for complete environment setup.
 
 **Database Schema:**
 ```sql
@@ -87,36 +80,27 @@ CREATE TABLE query_fragment_queue (
 - Lightweight for high-volume scenarios
 
 **Configuration:**
-```bash
-QUERY_QUEUE_PROVIDER=redis
-REDIS_HOST=localhost
-REDIS_PORT=6379
-QUERY_QUEUE_REDIS_DB=1
-QUERY_QUEUE_REDIS_QUEUE_KEY=partition_cache_queue
-
-# Optional Redis password
-REDIS_PASSWORD=your_password
-```
+See [System Overview - Configuration Management](system_overview.md#configuration-management) for Redis queue setup.
 
 ## Queue Operations
 
 ### Core Functions
 
-#### `push_to_incoming_queue(query, partition_key="partition_key")`
-Add original queries to the incoming queue:
+#### `push_to_original_query_queue(query, partition_key="partition_key")`
+Add original queries to the original query queue:
 
 ```python
 import partitioncache
 
 # Add query with custom partition key
-partitioncache.push_to_incoming_queue(
+partitioncache.push_to_original_query_queue(
     query="SELECT * FROM users WHERE age > 25",
     partition_key="user_id"
 )
 ```
 
-#### `push_to_outgoing_queue(query_hash_pairs, partition_key="partition_key")`
-Add processed query fragments to the outgoing queue:
+#### `push_to_query_fragment_queue(query_hash_pairs, partition_key="partition_key")`
+Add processed query fragments to the query fragment queue:
 
 ```python
 # Add query fragments with partition key
@@ -137,12 +121,12 @@ if query:
     print(f"Processing query for partition: {partition_key}")
 ```
 
-#### `pop_from_outgoing_queue()`
+#### `pop_from_query_fragment_queue()`
 Retrieve query fragments for execution:
 
 ```python
 # Returns (query, hash, partition_key) tuple or (None, None, None)
-query, hash_val, partition_key = partitioncache.pop_from_outgoing_queue()
+query, hash_val, partition_key = partitioncache.pop_from_query_fragment_queue()
 if query:
     print(f"Executing query {hash_val} for partition: {partition_key}")
 ```
@@ -151,8 +135,8 @@ if query:
 Monitor queue status:
 
 ```python
-incoming_count, outgoing_count = partitioncache.get_queue_lengths()
-print(f"Incoming: {incoming_count}, Outgoing: {outgoing_count}")
+original_count, fragment_count = partitioncache.get_queue_lengths()
+print(f"Original: {original_count}, Fragment: {fragment_count}")
 ```
 
 ## Processing Architecture
@@ -486,34 +470,8 @@ PG_QUEUE_HOST=database_server
 pcache-monitor --priority-processing
 ```
 
-## Migration and Compatibility
+## Integration Notes
 
-### From Single Queue Systems
-
-The two-queue system is backward compatible:
-
-```python
-# Old single-queue code still works
-partitioncache.add_query_to_cache(query, cache_handler, partition_key)
-
-# New two-queue code provides more control
-partitioncache.push_to_incoming_queue(query, partition_key)
-# ... processing happens ...
-partitioncache.push_to_outgoing_queue(query_hash_pairs, partition_key)
-```
-
-### Provider Migration
-
-**PostgreSQL to Redis:**
-1. Drain PostgreSQL queues
-2. Update environment variables
-3. Restart monitor processes
-4. Verify Redis connectivity
-
-**Redis to PostgreSQL:**
-1. Set up PostgreSQL tables
-2. Update environment variables
-3. Restart monitor processes
-4. Verify priority processing
+The queue system is designed for seamless integration with existing applications. All queue operations use the configured provider transparently.
 
 This two-queue architecture provides the foundation for scalable, reliable, and high-performance query processing in PartitionCache systems. 

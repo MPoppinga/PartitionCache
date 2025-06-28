@@ -99,179 +99,23 @@ For examples and practical workflows, refer to the `examples/` directory in the 
 
 ```mermaid
 graph TB
-    %% User Interface Layer
-    User[User Application]
-    CLI[CLI Tools]
+    User[Application] --> API[PartitionCache API]
+    API --> Cache[Cache System]
+    API --> Queue[Queue System]
     
-    %% Core API Layer
-    API[PartitionCache API<br/>create_cache_helper<br/>get_partition_keys<br/>extend_query_with_partition_keys]
+    Queue --> Processor[Background Processor]
+    Processor --> DB[(Database)]
+    Processor --> Cache
     
-    %% Query Processing
-    QP[Query Processor<br/>Fragment Generation<br/>Query Normalization<br/>Hash Generation]
-    
-    %% Queue System
-    subgraph Queue["Queue System"]
-        OQ[Original Query Queue]
-        FQ[Fragment Query Queue]
-        QH[Queue Handlers<br/>PostgreSQL/Redis]
-    end
-    
-    %% Cache System
-    subgraph Cache["Cache System"]
-        CH[Cache Helper<br/>Partition-specific wrapper]
-        CHL[Cache Handler Layer]
-        
-        subgraph Handlers["Cache Handlers"]
-            PG_A[PostgreSQL Array]
-            PG_B[PostgreSQL Bit]
-            RED_S[Redis Set]
-            RED_B[Redis Bit]
-            ROCK_S[RocksDB Set]
-            ROCK_B[RocksDB Bit]
-            ROCK_D[RocksDict]
-        end
-    end
-    
-    %% Database Layer
-    subgraph Database["Database Layer"]
-        DBH[DB Handler Layer]
-        PG_DB[(PostgreSQL)]
-        MY_DB[(MySQL)]
-        SQ_DB[(SQLite)]
-    end
-    
-    %% Processing Components
-    Monitor[Queue Monitor<br/>Background Processor]
-    DirectProc[PostgreSQL Queue Processor<br/>pg_cron integration]
-    
-    %% CLI Components
-    subgraph CLI_Tools["CLI Tools"]
-        ManageCache[Cache Management]
-        MonitorQueue[Queue Monitoring]
-        AddCache[Add to Cache]
-        ReadCache[Read from Cache]
-        SetupPostgreSQLQueue[Setup PostgreSQL Queue Processor]
-    end
-    
-    %% Flow connections
-    User -->|SQL Query| API
-    CLI --> CLI_Tools
-    CLI_Tools --> API
-    CLI_Tools --> Queue
-    CLI_Tools --> Cache
-    
-    API -->|Process Query| QP
-    QP -->|Generate Fragments| Queue
-    API -->|Check Cache| Cache
-    
-    Queue --> Monitor
-    Queue --> DirectProc
-    Monitor -->|Execute Fragments| DBH
-    DirectProc -->|Execute Fragments| PG_DB
-    
-    Monitor -->|Store Results| Cache
-    DirectProc -->|Store Results| Cache
-    
-    API -->|Wrap Handler| CH
-    CH -->|Delegate Operations| CHL
-    CHL --> Handlers
-    
-    DBH --> PG_DB
-    DBH --> MY_DB
-    DBH --> SQ_DB
-    
-    %% Cache to Database connections
-    PG_A -.->|Metadata Tables| PG_DB
-    PG_B -.->|Metadata Tables| PG_DB
-    RED_S -.->|Cache Storage| Redis[(Redis)]
-    RED_B -.->|Cache Storage| Redis
-    ROCK_S -.->|Cache Storage| RocksDB[(RocksDB)]
-    ROCK_B -.->|Cache Storage| RocksDB
-    ROCK_D -.->|Cache Storage| RocksDB
-    
-    %% Queue to Database connections  
-    QH -.->|Queue Tables| PG_DB
-    QH -.->|Queue Lists| Redis
-    
-    %% Data flow annotations
-    OQ -->|Fragment Generation| FQ
-    FQ -->|Process Items| Monitor
-    FQ -->|Process Items| DirectProc
-    
-    %% Return path
-    Cache -->|Partition Keys| API
-    API -->|Extended Query| User
+    Cache --> Storage[Storage Backends]
+    Storage --> PG[(PostgreSQL)]
+    Storage --> Redis[(Redis)]
+    Storage --> RocksDB[(RocksDB)]
     
     style API fill:#e1f5fe
     style Cache fill:#f3e5f5
     style Queue fill:#e8f5e8
-    style Database fill:#fff3e0
-    style CLI_Tools fill:#fce4ec
+    style Storage fill:#fff3e0
 ```
 
-```mermaid
-flowchart TD
-    Start([User Submits Query])
-    
-    %% PartitionCache Library/CLI Processing
-    subgraph PCLib["PartitionCache Library / CLI"]
-        Fragment[Query Gets<br/>Fragmented]
-        Variants[Variants Get Created]
-        Hash[Stable Representation<br/>and Hashing]
-    end
-    
-    %% Cache Check Phase
-    Check{Check Cache for<br/>Partition Keys}
-    Cache[(Cache)]
-    
-    %% Decision Paths
-    NoHits[Use Original Query]
-    FoundHits[Extend query to be<br/>restricted to<br/>Intersection of Found<br/>Partitions]
-    
-    %% Queue Processing
-    ReducedSet[Reduced Set of Variants]
-    Queue[Queue]
-    
-    %% Background Processing
-    subgraph Processing["Background Processing"]
-        Pop[Pop Fragment From<br/>Queue]
-        Execute[Execute Fragment on<br/>Database]
-        Store[Store results]
-    end
-    
-    %% Database
-    DB[(DB)]
-    
-    %% Flow connections
-    Start --> Fragment
-    Fragment --> Variants
-    Variants --> Hash
-    Hash --> Check
-    Check <--> Cache
-    
-    Check -->|No Hits| NoHits
-    Check -->|Found Hits| FoundHits
-    
-    Hash -->|Reduced Set of Variants| ReducedSet
-    ReducedSet --> Queue
-    
-    Queue --> Pop
-    Pop --> Execute
-    Execute --> Store
-    Store --> Cache
-    Store --> Pop
-    
-    Execute --> DB
-    NoHits --> DB
-    FoundHits --> DB
-    
-    %% Styling
-    style Start fill:#e8f5e8
-    style PCLib fill:#f0f8ff
-    style Check fill:#fff3e0
-    style NoHits fill:#ffe6e6
-    style FoundHits fill:#e1f5fe
-    style Processing fill:#f3e5f5
-    style Cache fill:#e8f5e8
-    style DB fill:#fff3e0
-```
+For detailed architectural diagrams, see [Architecture Diagrams](architecture_diagrams.md).

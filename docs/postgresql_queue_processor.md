@@ -116,11 +116,11 @@ Utility Functions:
 
 ### Core Processing Functions
 
-#### `partitioncache_process_queue(table_prefix)`
-Main processing function called by pg_cron:
+#### `partitioncache_run_single_job(p_job_name)`
+Main processing function called by pg_cron workers:
 
 ```sql
-SELECT partitioncache_process_queue('partitioncache');
+SELECT partitioncache_run_single_job('partitioncache_process_queue_1');
 ```
 
 **Function Flow:**
@@ -147,11 +147,11 @@ Processes individual queue items:
 
 ### Monitoring Functions
 
-#### `get_processor_status()`
+#### `partitioncache_get_processor_status(p_queue_prefix, p_job_name)`
 Returns comprehensive processor status:
 
 ```sql
-SELECT * FROM get_processor_status();
+SELECT * FROM partitioncache_get_processor_status('partitioncache_queue', 'partitioncache_process_queue');
 ```
 
 **Returns:**
@@ -162,33 +162,41 @@ SELECT * FROM get_processor_status();
 - **queue_length**: Number of items waiting in queue
 - **last_seen**: Timestamp of last processor activity
 
-#### `set_processor_enabled(enabled_flag)`
+#### `partitioncache_set_processor_enabled(p_enabled, p_queue_prefix, p_job_name)`
 Enable or disable the processor:
 
 ```sql
 -- Enable processor
-SELECT set_processor_enabled(true);
+SELECT partitioncache_set_processor_enabled(true, 'partitioncache_queue', 'partitioncache_process_queue');
 
 -- Disable processor  
-SELECT set_processor_enabled(false);
+SELECT partitioncache_set_processor_enabled(false, 'partitioncache_queue', 'partitioncache_process_queue');
 ```
 
 ### Configuration Management
 
-#### `update_processor_config(max_jobs, frequency)`
+#### `partitioncache_update_processor_config(...)`
 Update processor configuration:
 
 ```sql
 -- Set max parallel jobs to 3, frequency to 5 seconds
-SELECT update_processor_config(3, 5);
+SELECT partitioncache_update_processor_config(
+    'partitioncache_process_queue', 
+    NULL, -- enabled (keep current)
+    3,    -- max_parallel_jobs
+    5,    -- frequency_seconds
+    1800, -- timeout_seconds
+    'partitioncache', -- table_prefix
+    'partitioncache_queue' -- queue_prefix
+);
 ```
 
-#### `manual_process_queue(count, table_prefix)`
+#### `partitioncache_manual_process_queue(p_count)`
 Manually process queue items:
 
 ```sql
 -- Process up to 5 queue items immediately
-SELECT manual_process_queue(5, 'partitioncache');
+SELECT partitioncache_manual_process_queue(5);
 ```
 
 ## Processing State Machine
@@ -248,15 +256,12 @@ SELECT manual_process_queue(5, 'partitioncache');
 Using the CLI tool:
 
 ```bash
-python -m partitioncache.cli.setup_postgresql_queue_processor \
-    --host localhost \
-    --port 5432 \
-    --user postgres \
-    --password your_password \
-    --dbname your_database \
+pcache-postgresql-queue-processor setup \
     --table-prefix partitioncache \
     --frequency 1 \
-    --max-parallel-jobs 2
+    --max-parallel-jobs 2 \
+    --timeout 1800 \
+    --enable-after-setup
 ```
 
 #### 2. Manual SQL Setup
@@ -274,12 +279,14 @@ CREATE TABLE IF NOT EXISTS partitioncache_processor_config (
 -- 2. Create monitoring tables
 CREATE TABLE IF NOT EXISTS partitioncache_processor_log (
     id SERIAL PRIMARY KEY,
-    job_id TEXT,
-    query_hash TEXT,
-    partition_key TEXT,
-    status TEXT,
-    error_msg TEXT,
-    execution_time_ms INTEGER,
+    job_id TEXT NOT NULL,
+    query_hash TEXT NOT NULL,
+    partition_key TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('started', 'success', 'failed', 'timeout', 'skipped')),
+    error_message TEXT,
+    rows_affected INTEGER,
+    execution_time_ms NUMERIC(10,3),
+    execution_source TEXT NOT NULL CHECK (execution_source IN ('cron', 'manual', 'unknown')),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -296,12 +303,9 @@ CREATE TABLE IF NOT EXISTS partitioncache_active_jobs (
 \i path/to/postgresql_queue_processor.sql
 \i path/to/postgresql_queue_processor_info.sql
 
--- 5. Configure pg_cron job
-INSERT INTO cron.job (jobname, schedule, command) VALUES (
-    'partitioncache_process_queue',
-    '1 seconds',
-    'SELECT partitioncache_process_queue(''partitioncache'');'
-);
+-- 5. Configure pg_cron jobs (multiple workers created automatically)
+-- Jobs are created via trigger when processor configuration is updated
+-- Example job names: partitioncache_process_queue_1, partitioncache_process_queue_2, etc.
 ```
 
 ## Configuration
@@ -312,12 +316,12 @@ The system automatically detects table prefixes from environment variables:
 
 ```bash
 # For PostgreSQL Array cache backend
-CACHE_BACKEND=array
+CACHE_BACKEND=postgresql_array
 PG_ARRAY_CACHE_TABLE_PREFIX=my_custom_prefix
 
 # For PostgreSQL Bit cache backend  
-CACHE_BACKEND=bit
-PG_BIT_TABLE_TABLE_PREFIX=my_custom_prefix
+CACHE_BACKEND=postgresql_bit
+PG_BIT_CACHE_TABLE_PREFIX=my_custom_prefix
 
 # Default if not specified
 # Uses 'partitioncache' as prefix
@@ -607,7 +611,7 @@ External Application
 
 ```bash
 # 1. Add query to processing queue
-python -m partitioncache.cli.add_to_cache \
+pcache-add \
     --queue \
     --query "SELECT DISTINCT city_id FROM pois WHERE type='restaurant'" \
     --partition-key "city_id"
@@ -768,7 +772,7 @@ LIMIT 10;
 **Before (External Python):**
 ```bash
 # Manual monitoring process
-python -m partitioncache.cli.monitor_cache_queue \
+pcache-monitor \
     --db-backend postgresql \
     --cache-backend postgresql_array
 ```

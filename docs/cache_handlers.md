@@ -97,12 +97,12 @@ All cache handlers support multiple partition keys with independent datatypes:
 import partitioncache
 
 # Create handler
-cache = partitioncache.create_cache("postgresql_array", "default", "integer")
+cache = partitioncache.create_cache_helper("postgresql_array", "default", "integer")
 
 # Multiple partition keys with different datatypes
-cache.set_set("spatial_query", {1, 5, 10}, settype=int, partition_key="city_id")
-cache.set_set("temporal_query", {2, 7, 12}, settype=int, partition_key="time_bucket") 
-cache.set_set("text_query", {"NYC", "LA"}, settype=str, partition_key="city_names")
+cache.set_set("spatial_query", {1, 5, 10}, partition_key="city_id")
+cache.set_set("temporal_query", {2, 7, 12}, partition_key="time_bucket") 
+cache.set_set("text_query", {"NYC", "LA"}, partition_key="city_names")
 
 # Retrieve data for specific partition
 results = cache.get("spatial_query", partition_key="city_id")
@@ -117,10 +117,10 @@ partitions = cache.get_partition_keys()
 The system automatically validates datatypes and prevents conflicts:
 
 ```python
-cache.set_set("key1", {1, 2, 3}, settype=int, partition_key="test")
+cache.set_set("key1", {1, 2, 3}, partition_key="test")
 # Partition "test" is now locked to "integer" datatype
 
-cache.set_set("key2", {"a", "b"}, settype=str, partition_key="test")  
+cache.set_set("key2", {"a", "b"}, partition_key="test")  
 # Raises: ValueError: Partition key 'test' already exists with datatype 'integer'
 ```
 
@@ -159,22 +159,26 @@ All cache handlers provide these methods:
 
 ```python
 # Storage operations
-set_set(key: str, value: set, settype: type = int, partition_key: str = "partition_key") -> bool
+set_set(key: str, value: set, partition_key: str = "partition_key") -> bool
 set_null(key: str, partition_key: str = "partition_key") -> bool
 set_query(key: str, querytext: str, partition_key: str = "partition_key") -> bool
 
 # Retrieval operations  
 get(key: str, partition_key: str = "partition_key") -> set | None
 exists(key: str, partition_key: str = "partition_key") -> bool
-get_query(key: str, partition_key: str = "partition_key") -> str | None
+is_null(key: str, partition_key: str = "partition_key") -> bool
 
 # Management operations
 delete(key: str, partition_key: str = "partition_key") -> bool
 get_all_keys(partition_key: str = "partition_key") -> list[str]
 get_partition_keys() -> list[tuple[str, str]]
+filter_existing_keys(keys: set, partition_key: str = "partition_key") -> set
+get_datatype(partition_key: str) -> str | None
+register_partition_key(partition_key: str, datatype: str, **kwargs) -> None
 
 # Advanced operations
 get_intersected(keys: set[str], partition_key: str = "partition_key") -> tuple[set, int]
+get_intersected_lazy(keys: set[str], partition_key: str = "partition_key") -> tuple[str | None, int]
 close() -> None
 ```
 
@@ -215,7 +219,7 @@ bitsize = cache._get_partition_bitsize("large_dataset")
 Different partition keys can have different bit array sizes:
 
 ```python
-cache = partitioncache.create_cache("postgresql_bit", "default", "integer")
+cache = partitioncache.create_cache_helper("postgresql_bit", "default", "integer")
 
 # Create partitions with different bit sizes
 cache._create_partition_table("small_partition", bitsize=1000)
@@ -231,7 +235,7 @@ cache.set_set("query2", {1, 1000, 49999}, partition_key="large_partition")  # OK
 The roaring bitmap handler provides exceptional compression for sparse integer datasets:
 
 ```python
-cache = partitioncache.create_cache("postgresql_roaringbit", "default", "integer")
+cache = partitioncache.create_cache_helper("postgresql_roaringbit", "default", "integer")
 
 from pyroaring import BitMap
 from bitarray import bitarray
@@ -272,31 +276,14 @@ print(f"Intersection: {set(intersection)} from {count} keys")
 - **Industry Standard**: Used by Apache Lucene, Elasticsearch, and others
 - **Memory Efficient**: Adaptive compression based on data density
 
-## Migration and Backward Compatibility
-
-### From Single Partition
+## Backward Compatibility
 
 All existing code using the default `partition_key="partition_key"` continues to work:
 
 ```python
-# Old code still works
+# Default partition key behavior
 cache.set_set("key", {1, 2, 3})  # Uses default partition_key="partition_key"
 cache.get("key")                 # Uses default partition_key="partition_key"
-```
-
-### Migration Process
-
-1. **Identify Partition Strategy**: Determine how to split your data
-2. **Update Code**: Add `partition_key` parameters to cache operations
-3. **Data Migration**: Use `get_all_keys()` and re-import with new partition keys
-
-```python
-# Migration example
-old_keys = cache.get_all_keys("partition_key")  # Get all old data
-for key in old_keys:
-    data = cache.get(key, partition_key="partition_key")
-    new_partition = determine_partition(key)  # Your logic
-    cache.set_set(key, data, partition_key=new_partition)
 ```
 
 ## Best Practices

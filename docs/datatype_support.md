@@ -33,7 +33,7 @@ Use the `--partition-datatype` parameter to specify the datatype:
 
 ```bash
 # Integer partition keys (default)
-python -m partitioncache.cli.add_to_cache \
+pcache-add \
     --query "SELECT DISTINCT user_id FROM users WHERE age > 25" \
     --partition-key "user_id" \
     --partition-datatype "integer" \
@@ -41,7 +41,7 @@ python -m partitioncache.cli.add_to_cache \
     --direct
 
 # String partition keys
-python -m partitioncache.cli.add_to_cache \
+pcache-add \
     --query "SELECT DISTINCT country FROM users WHERE active = true" \
     --partition-key "country" \
     --partition-datatype "text" \
@@ -49,7 +49,7 @@ python -m partitioncache.cli.add_to_cache \
     --direct
 
 # Float partition keys
-python -m partitioncache.cli.add_to_cache \
+pcache-add \
     --query "SELECT DISTINCT price FROM products WHERE category = 'electronics'" \
     --partition-key "price" \
     --partition-datatype "float" \
@@ -57,7 +57,7 @@ python -m partitioncache.cli.add_to_cache \
     --direct
 
 # Timestamp partition keys
-python -m partitioncache.cli.add_to_cache \
+pcache-add \
     --query "SELECT DISTINCT created_at FROM orders WHERE status = 'completed'" \
     --partition-key "created_at" \
     --partition-datatype "timestamp" \
@@ -71,14 +71,14 @@ Specify the datatype when reading from cache:
 
 ```bash
 # Read integer partition keys
-python -m partitioncache.cli.read_from_cache \
+pcache-read \
     --query "SELECT DISTINCT user_id FROM users WHERE age > 25" \
     --partition-key "user_id" \
     --partition-datatype "integer" \
     --cache-backend "postgresql_array"
 
 # Read string partition keys
-python -m partitioncache.cli.read_from_cache \
+pcache-read \
     --query "SELECT DISTINCT country FROM users WHERE active = true" \
     --partition-key "country" \
     --partition-datatype "text" \
@@ -91,7 +91,7 @@ The queue system automatically handles datatype information:
 
 ```bash
 # Add to original query queue with datatype
-python -m partitioncache.cli.add_to_cache \
+pcache-add \
     --query "SELECT DISTINCT user_id FROM users WHERE age > 25" \
     --partition-key "user_id" \
     --partition-datatype "integer" \
@@ -99,7 +99,7 @@ python -m partitioncache.cli.add_to_cache \
     --queue-original
 
 # Monitor queue (automatically processes datatype information)
-python -m partitioncache.cli.monitor_cache_queue \
+pcache-monitor \
     --cache-backend "postgresql_array" \
     --db-backend "postgresql"
 ```
@@ -110,9 +110,8 @@ python -m partitioncache.cli.monitor_cache_queue \
 
 ```python
 from partitioncache.cache_handler import get_cache_handler
-from partitioncache.cache_handler.datatype_support import (
-    DATATYPE_TO_PYTHON_TYPE,
-    validate_datatype_compatibility
+from partitioncache.cache_handler.datatype_utils import (
+    DATATYPE_TO_PYTHON_TYPE
 )
 
 # Validate datatype compatibility

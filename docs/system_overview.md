@@ -14,7 +14,7 @@ PartitionCache follows a modular architecture with distinct layers for cache han
 │ ┌─────────────────────────────────────────────────────────────────────────┐ │
 │ │                        Streamlined API Layer                           │ │
 │ │  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐        │ │
-│ │  │ create_cache()  │  │ list_cache_     │  │ get_partition_  │        │ │
+│ │  │ create_cache_   │  │ list_cache_     │  │ get_partition_  │        │ │
 │ │  │ - Auto-detect   │  │ types()         │  │ keys()          │        │ │
 │ │  │ - Validation    │  │ - Backend info  │  │ - Query         │        │ │
 │ │  │ - Error help    │  │ - Compatibility │  │ - Processing    │        │ │
@@ -74,7 +74,7 @@ The streamlined API provides a user-friendly interface with automatic configurat
 import partitioncache
 
 # Simple cache creation with automatic validation
-cache = partitioncache.create_cache("postgresql_array", "user_id", "integer")
+cache = partitioncache.create_cache_helper("postgresql_array", "user_id", "integer")
 
 # Store and retrieve partition keys
 cache.set_set("query_hash", {1, 2, 3, 4, 5})
@@ -141,7 +141,7 @@ External Python observer scripts that poll queues and process items:
 
 ```bash
 # Run external monitor
-python -m partitioncache.cli.monitor_cache_queue \
+pcache-monitor \
     --db-backend postgresql \
     --cache-backend postgresql_array \
     --db-name mydb
@@ -187,8 +187,9 @@ optimized_query = partitioncache.extend_query_with_partition_keys(
 |---------|---------|-------|------|-----------|------------------|-------------|
 | **postgresql_array** | ✅ | ✅ | ✅ | ✅ | Moderate | Excellent |
 | **postgresql_bit** | ✅ | ❌ | ❌ | ❌ | High | Excellent |
-| **redis_set** | ✅ | ❌ | ✅ | ❌ | Good | Excellent |
-| **redis_bit** | ✅ | ❌ | ❌ | ❌ | High | Excellent |
+| **postgresql_roaringbit** | ✅ | ❌ | ❌ | ❌ | Very High | Excellent |
+| **redis_set** | ✅ | ❌ | ✅ | ❌ | Low | Excellent |
+| **redis_bit** | ✅ | ❌ | ❌ | ❌ | Moderate | Excellent |
 | **rocksdb_set** | ✅ | ❌ | ✅ | ❌ | Good | Good |
 | **rocksdb_bit** | ✅ | ❌ | ❌ | ❌ | High | Good |
 | **rocksdict** | ✅ | ✅ | ✅ | ✅ | Good | Good |
@@ -213,6 +214,7 @@ CACHE_BACKEND=postgresql_array
 # Cache table prefixes
 PG_ARRAY_CACHE_TABLE_PREFIX=myapp_cache
 PG_BIT_CACHE_TABLE_PREFIX=myapp_bit_cache
+PG_ROARINGBIT_CACHE_TABLE_PREFIX=myapp_roaring_cache
 
 # Queue configuration
 QUERY_QUEUE_PROVIDER=postgresql
@@ -296,7 +298,7 @@ pcache-manage --clear-cache --partition-key user_id
 ### Queue Operations
 ```bash
 # Monitor queue processing
-python -m partitioncache.cli.monitor_cache_queue \
+pcache-monitor \
   --db-backend postgresql \
   --cache-backend postgresql_array
 
@@ -308,14 +310,14 @@ pcache-manage --clear-queue
 ### PostgreSQL Queue Processor
 ```bash
 # Setup PostgreSQL queue processor
-python -m partitioncache.cli.setup_postgresql_queue_processor \
+pcache-postgresql-queue-processor \
   --frequency 1 \
   --max-parallel-jobs 3 \
   enable
 
 # Monitor processor status
-python -m partitioncache.cli.setup_postgresql_queue_processor status
-python -m partitioncache.cli.setup_postgresql_queue_processor logs
+pcache-postgresql-queue-processor status
+pcache-postgresql-queue-processor logs
 ```
 
 ## Use Cases and Recommendations
@@ -326,7 +328,7 @@ python -m partitioncache.cli.setup_postgresql_queue_processor logs
 **Benefits**: ~99% memory reduction compared to other backends
 
 ```python
-cache = partitioncache.create_cache("postgresql_bit", "postal_code", "integer")
+cache = partitioncache.create_cache_helper("postgresql_bit", "postal_code", "integer")
 cache.set_set("restaurant_query", {10001, 10002, 10003, 10004})
 ```
 
@@ -336,7 +338,7 @@ cache.set_set("restaurant_query", {10001, 10002, 10003, 10004})
 **Benefits**: Full datatype flexibility
 
 ```python
-cache = partitioncache.create_cache("postgresql_array", "default", "integer")
+cache = partitioncache.create_cache_helper("postgresql_array", "default", "integer")
 cache.set_set("cities", {1, 2, 3}, partition_key="city_id")
 cache.set_set("regions", {"north", "south"}, partition_key="region_name")
 ```
@@ -347,7 +349,7 @@ cache.set_set("regions", {"north", "south"}, partition_key="region_name")
 **Benefits**: Network-accessible, high concurrency
 
 ```python
-cache = partitioncache.create_cache("redis_set", "session_id", "text",
+cache = partitioncache.create_cache_helper("redis_set", "session_id", "text",
                                    host="redis-cluster.example.com")
 ```
 
@@ -357,7 +359,7 @@ cache = partitioncache.create_cache("redis_set", "session_id", "text",
 **Benefits**: No external dependencies, full feature support
 
 ```python
-cache = partitioncache.create_cache("rocksdict", "test_partition", "integer")
+cache = partitioncache.create_cache_helper("rocksdict", "test_partition", "integer")
 ```
 
 ### Time-Series Data
@@ -367,7 +369,7 @@ cache = partitioncache.create_cache("rocksdict", "test_partition", "integer")
 
 ```python
 from datetime import datetime
-cache = partitioncache.create_cache("postgresql_array", "time_bucket", "timestamp")
+cache = partitioncache.create_cache_helper("postgresql_array", "time_bucket", "timestamp")
 cache.set_set("events", {datetime(2024, 1, 1), datetime(2024, 1, 2)})
 ```
 
@@ -388,33 +390,21 @@ cache.set_set("events", {datetime(2024, 1, 1), datetime(2024, 1, 2)})
 - **Network Isolation**: Recommend VPC/private networks
 - **Encryption**: Support for encrypted connections
 
-## Migration Paths
+## Integration Guidelines
 
-### From Legacy Systems
-1. **Assessment**: Identify current partition strategies
-2. **Backend Selection**: Choose optimal cache backend
-3. **Gradual Migration**: Migrate partition by partition
-4. **Validation**: Verify cache accuracy and performance
+### Backend Migration
+When changing cache backends, use the cache management tools:
 
-### Between Backends
-```python
-# Migration utility function
-def migrate_cache_backend(old_cache, new_cache, partition_key):
-    keys = old_cache.get_all_keys(partition_key)
-    for key in keys:
-        data = old_cache.get(key, partition_key)
-        query = old_cache.get_query(key, partition_key)
-        
-        new_cache.set_set(key, data, partition_key=partition_key)
-        if query:
-            new_cache.set_query(key, query, partition_key=partition_key)
+```bash
+# Export from current backend
+pcache-manage cache export --file backup.pkl
+
+# Switch environment configuration
+export CACHE_BACKEND=new_backend_type
+
+# Import to new backend  
+pcache-manage cache import --file backup.pkl
 ```
-
-### Queue Provider Migration
-1. **Drain Current Queues**: Process all pending items
-2. **Update Configuration**: Change environment variables
-3. **Restart Services**: Monitor processes and PostgreSQL queue processor
-4. **Verify Operations**: Test queue functionality
 
 ## Monitoring and Observability
 
@@ -461,11 +451,11 @@ def monitor_cache_metrics(cache, partition_key):
 
 # Monitor queue health
 def monitor_queue_health():
-    incoming, outgoing = partitioncache.get_queue_lengths()
+    original, fragment = partitioncache.get_queue_lengths()
     return {
-        'incoming_depth': incoming,
-        'outgoing_depth': outgoing,
-        'processing_backlog': incoming + outgoing
+        'original_depth': original,
+        'fragment_depth': fragment,
+        'processing_backlog': original + fragment
     }
 ```
 
