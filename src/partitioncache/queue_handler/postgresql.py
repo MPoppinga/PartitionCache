@@ -3,12 +3,12 @@ PostgreSQL queue handler implementation.
 """
 
 import os
-from typing import List, Tuple, Optional
-from logging import getLogger
-import psycopg.sql as sql
-import psycopg
-import time
 import select
+import time
+from logging import getLogger
+
+import psycopg
+import psycopg.sql as sql
 
 from partitioncache.queue_handler.abstract import AbstractPriorityQueueHandler
 
@@ -38,7 +38,7 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
         self.password = password
         self.dbname = dbname
         self._connection = None
-        
+
         # Get table prefix from environment variable
         table_prefix = os.getenv("PG_QUEUE_TABLE_PREFIX", "partitioncache_queue")
         self.table_prefix = table_prefix
@@ -196,10 +196,10 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
             cursor = conn.cursor()
             cursor.execute(
                 sql.SQL("""
-                INSERT INTO {} (query, partition_key, partition_datatype, priority, updated_at) 
+                INSERT INTO {} (query, partition_key, partition_datatype, priority, updated_at)
                 VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP)
-                ON CONFLICT (query, partition_key) 
-                DO UPDATE SET 
+                ON CONFLICT (query, partition_key)
+                DO UPDATE SET
                     priority = {}.priority + 1,
                     updated_at = CURRENT_TIMESTAMP
             """).format(sql.Identifier(self.original_queue_table), sql.Identifier(self.original_queue_table)),
@@ -214,7 +214,7 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
             return False
 
     def push_to_query_fragment_queue_with_priority(
-        self, query_hash_pairs: List[Tuple[str, str]], partition_key: str, priority: int = 1, partition_datatype: str | None = None
+        self, query_hash_pairs: list[tuple[str, str]], partition_key: str, priority: int = 1, partition_datatype: str | None = None
     ) -> bool:
         """
         Push query fragments with specified priority.
@@ -230,17 +230,17 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
             bool: True if all fragments were pushed/updated successfully, False otherwise.
         """
         try:
-            
+
             conn = self._get_connection()
             cursor = conn.cursor()
 
             for query, hash_value in query_hash_pairs:
                 cursor.execute(
                     sql.SQL("""
-                    INSERT INTO {} (query, hash, partition_key, partition_datatype, priority, updated_at) 
+                    INSERT INTO {} (query, hash, partition_key, partition_datatype, priority, updated_at)
                     VALUES (%s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
-                    ON CONFLICT (hash, partition_key) 
-                    DO UPDATE SET 
+                    ON CONFLICT (hash, partition_key)
+                    DO UPDATE SET
                         priority = {}.priority + 1,
                         updated_at = CURRENT_TIMESTAMP
                 """).format(sql.Identifier(self.fragment_queue_table), sql.Identifier(self.fragment_queue_table)),
@@ -254,7 +254,7 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
             logger.error(f"Failed to push query fragments to PostgreSQL query fragment queue: {e}")
             return False
 
-    def pop_from_original_query_queue(self) -> Optional[Tuple[str, str, str]]:
+    def pop_from_original_query_queue(self) -> tuple[str, str, str] | None:
         """
         Pop an original query from the original query queue.
         Uses PostgreSQL's SELECT FOR UPDATE SKIP LOCKED for atomic operations.
@@ -264,7 +264,7 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
         """
         cursor = None
         try:
-      
+
             conn = self._get_connection()
             cursor = conn.cursor()
 
@@ -273,8 +273,8 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
 
             # Get the highest priority entry (highest priority first, then oldest)
             cursor.execute(sql.SQL("""
-                SELECT id, query, partition_key, partition_datatype FROM {} 
-                ORDER BY priority DESC, created_at ASC 
+                SELECT id, query, partition_key, partition_datatype FROM {}
+                ORDER BY priority DESC, created_at ASC
                 LIMIT 1 FOR UPDATE SKIP LOCKED
             """).format(sql.Identifier(self.original_queue_table)))
 
@@ -301,7 +301,7 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
                 pass
             return None
 
-    def pop_from_original_query_queue_blocking(self, timeout: int = 60) -> Optional[Tuple[str, str, str]]:
+    def pop_from_original_query_queue_blocking(self, timeout: int = 60) -> tuple[str, str, str] | None:
         """
         Pop an original query from the original query queue with blocking wait.
         Uses PostgreSQL LISTEN/NOTIFY for efficient blocking with timeout fallback.
@@ -358,7 +358,7 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
                         if result is not None:
                             return result
 
-                except (OSError, psycopg.Error) as e:
+                except (OSError, psycopg.Error, psycopg.OperationalError) as e:
                     logger.debug(f"LISTEN/NOTIFY error, falling back to polling: {e}")
                     # Fall back to polling for remainder of timeout
                     break
@@ -384,11 +384,13 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
         finally:
             if listen_conn:
                 try:
+                    cursor = listen_conn.cursor()
+                    cursor.execute("UNLISTEN original_query_available")
                     listen_conn.close()
                 except Exception:
                     pass
 
-    def pop_from_query_fragment_queue(self) -> Optional[Tuple[str, str, str, str]]:
+    def pop_from_query_fragment_queue(self) -> tuple[str, str, str, str] | None:
         """
         Pop a query fragment from the query fragment queue.
         Uses PostgreSQL's SELECT FOR UPDATE SKIP LOCKED for atomic operations.
@@ -398,8 +400,8 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
         """
         cursor = None
         try:
-            
-            
+
+
             conn = self._get_connection()
             cursor = conn.cursor()
 
@@ -408,8 +410,8 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
 
             # Get the highest priority entry (highest priority first, then oldest)
             cursor.execute(sql.SQL("""
-                SELECT id, query, hash, partition_key, partition_datatype FROM {} 
-                ORDER BY priority DESC, created_at ASC 
+                SELECT id, query, hash, partition_key, partition_datatype FROM {}
+                ORDER BY priority DESC, created_at ASC
                 LIMIT 1 FOR UPDATE SKIP LOCKED
             """).format(sql.Identifier(self.fragment_queue_table)))
 
@@ -436,7 +438,7 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
                 pass
             return None
 
-    def pop_from_query_fragment_queue_blocking(self, timeout: int = 60) -> Optional[Tuple[str, str, str, str]]:
+    def pop_from_query_fragment_queue_blocking(self, timeout: int = 60) -> tuple[str, str, str, str] | None:
         """
         Pop a query fragment from the query fragment queue with blocking wait.
         Uses PostgreSQL LISTEN/NOTIFY for efficient blocking with timeout fallback.
@@ -447,7 +449,7 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
         Returns:
             Tuple[str, str, str, str] or None: (query, hash, partition_key, partition_datatype) tuple if available, None if timeout or error occurred.
         """
-        
+
         # First try to get an item immediately
         result = self.pop_from_query_fragment_queue()
         if result is not None:
@@ -492,7 +494,7 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
                         if result is not None:
                             return result
 
-                except (OSError, psycopg.Error) as e:
+                except (OSError, psycopg.Error, psycopg.OperationalError) as e:
                     logger.debug(f"LISTEN/NOTIFY error, falling back to polling: {e}")
                     # Fall back to polling for remainder of timeout
                     break
@@ -518,6 +520,8 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
         finally:
             if listen_conn:
                 try:
+                    cursor = listen_conn.cursor()
+                    cursor.execute("UNLISTEN query_fragment_available")
                     listen_conn.close()
                 except Exception:
                     pass
@@ -584,7 +588,7 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
             logger.error(f"Failed to clear PostgreSQL query fragment queue: {e}")
             return 0
 
-    def clear_all_queues(self) -> Tuple[int, int]:
+    def clear_all_queues(self) -> tuple[int, int]:
         """
         Clear both original query and query fragment queues.
 

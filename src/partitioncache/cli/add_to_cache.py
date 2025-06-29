@@ -7,8 +7,8 @@ import os
 from logging import getLogger
 
 import dotenv
-import partitioncache
 
+import partitioncache
 from partitioncache.db_handler import get_db_handler
 from partitioncache.db_handler.abstract import AbstractDBHandler
 from partitioncache.query_processor import clean_query, generate_all_query_hash_pairs, hash_query
@@ -75,7 +75,7 @@ def main():
         exit(1)
 
     if args.query_file:
-        with open(args.query_file, "r") as f:
+        with open(args.query_file) as f:
             query = f.read()
     else:
         query = args.query

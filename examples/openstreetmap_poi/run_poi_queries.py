@@ -1,6 +1,7 @@
 import os
-import psycopg2
 import time
+
+import psycopg2
 from dotenv import load_dotenv
 
 import partitioncache
@@ -43,7 +44,7 @@ def test_partition_key(conn, partition_key: str, datatype: str = "integer"):
 
     queries = []
     for file in sorted(os.listdir(os.path.join("testqueries_examples", partition_key))):
-        with open(os.path.join("testqueries_examples", partition_key, file), "r") as f:
+        with open(os.path.join("testqueries_examples", partition_key, file)) as f:
             queries.append((file, f.read()))
 
     # Create cache handler using the API with context manager

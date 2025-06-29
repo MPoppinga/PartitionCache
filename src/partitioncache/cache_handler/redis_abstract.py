@@ -1,8 +1,11 @@
-from functools import cache
-import redis
+import logging
 from datetime import datetime
 
+import redis
+
 from partitioncache.cache_handler.abstract import AbstractCacheHandler
+
+logger = logging.getLogger("PartitionCache")
 
 
 class RedisAbstractCacheHandler(AbstractCacheHandler):
@@ -13,6 +16,7 @@ class RedisAbstractCacheHandler(AbstractCacheHandler):
 
     _instance = None
     _refcount = 0
+    _cached_datatype: dict[str, str] = {}
 
     @classmethod
     def get_instance(cls, *args, **kwargs):
@@ -28,21 +32,26 @@ class RedisAbstractCacheHandler(AbstractCacheHandler):
         """
         self.db = redis.Redis(host=db_host, port=db_port, db=db_name, password=db_password)
 
-    @cache
     def _get_partition_datatype(self, partition_key: str) -> str | None:
         """Get the datatype for a partition key from metadata."""
         metadata_key = f"_partition_metadata:{partition_key}"
+
+        if partition_key in self._cached_datatype:
+            return self._cached_datatype[partition_key]
+
         # Check if it's the old format (just a string) or new format (hash)
         key_type = self.db.type(metadata_key)
         if key_type == b"string":
             # Old format - just return the datatype
             datatype = self.db.get(metadata_key)
             if datatype is not None and isinstance(datatype, bytes):
+                self._cached_datatype[partition_key] = datatype.decode()
                 return datatype.decode()
         elif key_type == b"hash":
             # New format - get datatype from hash
             datatype = self.db.hget(metadata_key, "datatype")
             if datatype is not None and isinstance(datatype, bytes):
+                self._cached_datatype[partition_key] = datatype.decode()
                 return datatype.decode()
         return None
 
@@ -169,6 +178,36 @@ class RedisAbstractCacheHandler(AbstractCacheHandler):
         except (TypeError, AttributeError):
             # Fallback for Redis typing issues
             return []
+
+    def clear_all_cache_data(self) -> int:
+        """Clear all cache-related data from this Redis database.
+
+        Returns:
+            Number of keys deleted
+        """
+        deleted_count = 0
+        try:
+            # Find all cache-related keys using patterns
+            patterns = [
+                "cache:*",  # Cache data keys
+                "query:*",  # Query tracking keys
+                "_partition_metadata:*",  # Partition metadata
+            ]
+
+            for pattern in patterns:
+                # Use SCAN to find keys matching pattern (safer than KEYS for large datasets)
+                cursor = 0
+                while True:
+                    cursor, keys = self.db.scan(cursor, match=pattern, count=100)  # type: ignore
+                    if keys:
+                        deleted_count += self.db.delete(*keys)  # type: ignore
+                    if cursor == 0:
+                        break
+
+            return deleted_count
+        except Exception as e:
+            logger.error(f"Failed to clear cache data: {e}")
+            return deleted_count
 
     def get_datatype(self, partition_key: str) -> str | None:
         """Get the datatype of the cache handler. If the partition key is not set, return None."""

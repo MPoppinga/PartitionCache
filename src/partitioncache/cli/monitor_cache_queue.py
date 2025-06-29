@@ -9,22 +9,22 @@ import multiprocessing
 import os
 import threading
 import time
+
 import dotenv
 import psycopg
 
 from partitioncache.cache_handler import get_cache_handler
-
 from partitioncache.db_handler import get_db_handler
 from partitioncache.db_handler.abstract import AbstractDBHandler
 from partitioncache.query_processor import generate_all_query_hash_pairs
 from partitioncache.queue import (
+    get_queue_lengths,
+    get_queue_provider_name,
     pop_from_original_query_queue,
     pop_from_original_query_queue_blocking,
     pop_from_query_fragment_queue,
     pop_from_query_fragment_queue_blocking,
     push_to_query_fragment_queue,
-    get_queue_provider_name,
-    get_queue_lengths,
 )
 
 args: argparse.Namespace

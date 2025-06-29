@@ -8,7 +8,7 @@ import logging
 import re
 from collections import defaultdict
 from itertools import combinations
-from typing import Any, Dict, List, Tuple
+from typing import Any
 
 import networkx as nx  # type: ignore
 import sqlglot
@@ -28,6 +28,9 @@ def clean_query(query: str) -> str:
 
     query = re.sub(r"\s+", " ", query)
     query = re.sub(r"\s*=\s*", "=", query)
+
+    # Remove trailing semicolons (they're not part of the SQL statement)
+    query = query.rstrip().rstrip(";")
 
     # Normalize the query
     sqlglot_query = sqlglot.parse_one(query)
@@ -56,7 +59,7 @@ def all_connected_subgraphs(G: nx.Graph, min_comp_size: int, max_comp_size: int)
     """
     Get all connected subgraphs of the given graph.
     """
-    con_comp = [c for c in sorted(nx.connected_components(G), key=len, reverse=True)]
+    con_comp = sorted(nx.connected_components(G), key=len, reverse=True)
 
     def recursive_local_expand(node_set, possible, excluded, results, max_size):
         """
@@ -98,11 +101,11 @@ def all_connected_subgraphs(G: nx.Graph, min_comp_size: int, max_comp_size: int)
 
 
 def generate_tuples(
-    edges: List[Tuple[str, str]],
-    table_aliases: List,
+    edges: list[tuple[str, str]],
+    table_aliases: list,
     min_component_size: int,
     follow_graph: bool,
-) -> Dict[int, List[Tuple[str, str]]]:
+) -> dict[int, list[tuple[str, str]]]:
     """
     Generates sets of tuples of table aliases. Grouped by the number of tables in the tuple.
     If follow_graph is True, the function will only return partial queries that are connected to each other.
@@ -124,8 +127,8 @@ def generate_tuples(
 
 
 def remove_single_conditions(
-    conditions: Dict[str, List[str]],
-) -> List[Dict[str, List[str]]]:
+    conditions: dict[str, list[str]],
+) -> list[dict[str, list[str]]]:
     """
     If in one condition more thand one attribute is used, remove one of the attributes (all possible outcomes)
     Returns all new conditions together with the original conditions
@@ -176,7 +179,7 @@ def extract_and_group_query_conditions(
     Extracts all conditions from a query
     Splits it by distance functions, attributes and subqueries for the partition key
     """
-    attribute_conditions: dict[str, list[str]] = dict()  # {table_alias: [conditions]}
+    attribute_conditions: dict[str, list[str]] = {}  # {table_alias: [conditions]}
     distance_conditions: dict[tuple[str, str], list[str]] = defaultdict(list)  # {(table_alias1, table_alias2): [conditions]}
     other_functions: dict[tuple, list[str]] = defaultdict(list)  # {(table_alias1, ...): [conditions]}
     partition_key_conditions: list[str] = []  # List of all subqueries
@@ -188,8 +191,8 @@ def extract_and_group_query_conditions(
     tables = [x.strip() for x in tables]
 
     # warn if more than one table is used
-    if len(set([re.split(r"\s+", x)[0] for x in tables])) > 1:
-        table_names = set([re.split(r"\s+", x)[0] for x in tables])
+    if len({re.split(r"\s+", x)[0] for x in tables}) > 1:
+        table_names = {re.split(r"\s+", x)[0] for x in tables}
         logger.warning(f"More than one table is used in the query ({', '.join(table_names)}). This may cause unexpected behavior.")
 
     table_aliases = [re.split(r"\s+", x)[-1] for x in tables]
@@ -197,7 +200,7 @@ def extract_and_group_query_conditions(
 
     # define emtpy list for attribute_conditions for each tablealias
     for ta in table_aliases:
-        attribute_conditions[ta] = list()
+        attribute_conditions[ta] = []
 
     # get all conditions from where clause
     condition_list: list[str] = extract_conjunctive_conditions(query)
@@ -231,30 +234,30 @@ def extract_and_group_query_conditions(
             all_alias: set = set(re.findall(r"[a-zA-Z_]\w*(?=\.)", condition))
             if sqlglot.parse_one(condition).find(sqlglot.expressions.Func):
                 if len(all_alias) == 2:
-                    all_alias_list = sorted(list(all_alias))
+                    all_alias_list = sorted(all_alias)
                     distance_conditions[(all_alias_list[0], all_alias_list[1])].append(condition)
                     continue
                 else:
                     parsed = sqlglot.parse_one(condition)
-                    table_identifiers = tuple(sorted(list({col.table for col in parsed.find_all(sqlglot.expressions.Column) if col.table})))
+                    table_identifiers = tuple(sorted({col.table for col in parsed.find_all(sqlglot.expressions.Column) if col.table}))
                     other_functions[table_identifiers].append(condition)
                     continue
 
             elif sqlglot.parse_one(condition).find(sqlglot.expressions.Or):
                 parsed = sqlglot.parse_one(condition)
-                table_identifiers = tuple(sorted(list({col.table for col in parsed.find_all(sqlglot.expressions.Column) if col.table})))
+                table_identifiers = tuple(sorted({col.table for col in parsed.find_all(sqlglot.expressions.Column) if col.table}))
                 or_conditions[table_identifiers].append(condition)
                 continue
             else:
                 if len(all_alias) == 2:
                     # get all aliases with sqlglot
                     parsed = sqlglot.parse_one(condition)
-                    table_identifiers = tuple(sorted(list({col.table for col in parsed.find_all(sqlglot.expressions.Column) if col.table})))
+                    table_identifiers = tuple(sorted({col.table for col in parsed.find_all(sqlglot.expressions.Column) if col.table}))
                     distance_conditions[(table_identifiers[0], table_identifiers[1])].append(condition)
                     continue
                 else:
                     parsed = sqlglot.parse_one(condition)
-                    table_identifiers = tuple(sorted(list({col.table for col in parsed.find_all(sqlglot.expressions.Column) if col.table})))
+                    table_identifiers = tuple(sorted({col.table for col in parsed.find_all(sqlglot.expressions.Column) if col.table}))
                     other_functions[table_identifiers].append(condition)
                     continue
 
@@ -272,10 +275,10 @@ def extract_and_group_query_conditions(
 def generate_partial_queries(
     query: str,
     partition_key: str,
-    min_component_size,
-    follow_graph=True,
-    keep_all_attributes=True,
-    other_functions_as_distance_conditions=True,
+    min_component_size: int = 1,
+    follow_graph: bool = True,
+    keep_all_attributes: bool = True,
+    other_functions_as_distance_conditions: bool = True,
 ) -> list[str]:
     """
     This function takes a query and returns the list of all possible partial queries.
@@ -370,7 +373,7 @@ def generate_partial_queries(
                 query_where.extend([f"{table_alias}.{x}" for x in var_attribute_conditions[table_condition_key]])
 
                 # set the correct table alias in the distance conditions
-                pattern = r"\b{}\b".format(re.escape(table_condition_key))
+                pattern = rf"\b{re.escape(table_condition_key)}\b"
                 relvant_conditions_for_combination = [re.sub(pattern, table_alias, cc) for cc in relvant_conditions_for_combination]
 
             # Add distance conditions to the query
@@ -562,12 +565,12 @@ def normalize_distance_conditions(original_query: str, bucket_steps: float = 1.0
 def generate_all_query_hash_pairs(
     query: str,
     partition_key: str,
-    min_component_size,
-    follow_graph=True,
-    keep_all_attributes=True,
-    canonicalize_queries=False,
-) -> List[Tuple[str, str]]:
-    query_set = set()
+    min_component_size: int = 1,
+    follow_graph: bool = True,
+    keep_all_attributes: bool = True,
+    canonicalize_queries: bool = False,
+) -> list[tuple[str, str]]:
+    query_set: set[str] = set()
 
     # Clean the query
     query = clean_query(query)
@@ -622,11 +625,11 @@ def hash_query(query: str) -> str:
 def generate_all_hashes(
     query: str,
     partition_key: str,
-    min_component_size,
+    min_component_size=1,
     follow_graph=True,
     fix_attributes=True,
     canonicalize_queries=False,
-) -> List[str]:
+) -> list[str]:
     """
     Generates all hashes for the given query.
     """

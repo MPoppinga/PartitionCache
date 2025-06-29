@@ -6,10 +6,10 @@ It utilizes the given cache to extend the SQL query with the set of possible par
 
 """
 
+import random
+from datetime import datetime
 from logging import getLogger
 from typing import Literal
-from datetime import datetime
-import random
 
 import sqlglot
 import sqlglot.expressions as exp

@@ -3,7 +3,6 @@ Abstract base class for queue handlers.
 """
 
 from abc import ABC, abstractmethod
-from typing import List, Tuple, Optional
 
 
 class AbstractQueueHandler(ABC):
@@ -39,7 +38,7 @@ class AbstractQueueHandler(ABC):
         pass
 
     @abstractmethod
-    def push_to_query_fragment_queue(self, query_hash_pairs: List[Tuple[str, str]], partition_key: str, partition_datatype: str | None = None) -> bool:
+    def push_to_query_fragment_queue(self, query_hash_pairs: list[tuple[str, str]], partition_key: str, partition_datatype: str | None = None) -> bool:
         """
         Push query fragments (as query-hash pairs) directly to the query fragment queue.
 
@@ -54,7 +53,7 @@ class AbstractQueueHandler(ABC):
         pass
 
     @abstractmethod
-    def pop_from_original_query_queue(self) -> Optional[Tuple[str, str, str]]:
+    def pop_from_original_query_queue(self) -> tuple[str, str, str] | None:
         """
         Pop an original query from the original query queue.
 
@@ -64,7 +63,7 @@ class AbstractQueueHandler(ABC):
         pass
 
     @abstractmethod
-    def pop_from_query_fragment_queue(self) -> Optional[Tuple[str, str, str, str]]:
+    def pop_from_query_fragment_queue(self) -> tuple[str, str, str, str] | None:
         """
         Pop a query fragment from the query fragment queue.
 
@@ -104,7 +103,7 @@ class AbstractQueueHandler(ABC):
         pass
 
     @abstractmethod
-    def clear_all_queues(self) -> Tuple[int, int]:
+    def clear_all_queues(self) -> tuple[int, int]:
         """
         Clear both original query and query fragment queues.
 
@@ -146,7 +145,7 @@ class AbstractPriorityQueueHandler(AbstractQueueHandler):
 
     @abstractmethod
     def push_to_query_fragment_queue_with_priority(
-        self, query_hash_pairs: List[Tuple[str, str]], partition_key: str, priority: int = 1, partition_datatype: str | None = None
+        self, query_hash_pairs: list[tuple[str, str]], partition_key: str, priority: int = 1, partition_datatype: str | None = None
     ) -> bool:
         """
         Push query fragments with specified priority.
@@ -169,7 +168,7 @@ class AbstractPriorityQueueHandler(AbstractQueueHandler):
         """
         return self.push_to_original_query_queue_with_priority(query, partition_key, 1, partition_datatype)
 
-    def push_to_query_fragment_queue(self, query_hash_pairs: List[Tuple[str, str]], partition_key: str, partition_datatype: str | None = None) -> bool:
+    def push_to_query_fragment_queue(self, query_hash_pairs: list[tuple[str, str]], partition_key: str, partition_datatype: str | None = None) -> bool:
         """
         Default implementation using priority system with priority=1.
         """

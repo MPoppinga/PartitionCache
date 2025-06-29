@@ -11,7 +11,7 @@ from typing import Optional
 from partitioncache.queue_handler.abstract import AbstractQueueHandler
 
 
-def get_queue_handler(provider: Optional[str] = None) -> AbstractQueueHandler:
+def get_queue_handler(provider: str | None = None) -> AbstractQueueHandler:
     """
     Factory function to create queue handler instances.
 
@@ -71,7 +71,7 @@ def get_queue_handler(provider: Optional[str] = None) -> AbstractQueueHandler:
         raise ValueError(f"Unsupported queue provider: {provider}. Supported providers: {', '.join(supported_providers)}")
 
 
-def validate_queue_configuration(provider: Optional[str] = None) -> bool:
+def validate_queue_configuration(provider: str | None = None) -> bool:
     """
     Validate that the queue configuration is properly set up.
 

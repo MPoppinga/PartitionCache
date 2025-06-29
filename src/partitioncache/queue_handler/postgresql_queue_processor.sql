@@ -311,7 +311,7 @@ BEGIN
             CREATE TABLE IF NOT EXISTS %I (
                 query_hash TEXT PRIMARY KEY,
                 partition_keys BIT VARYING,
-                partition_keys_count INTEGER NOT NULL GENERATED ALWAYS AS (length(replace(partition_keys::text, ''0'', ''''))) STORED
+                partition_keys_count INTEGER GENERATED ALWAYS AS (length(replace(partition_keys::text, ''0'', ''''))) STORED
             )', v_cache_table);
     ELSIF p_cache_backend = 'roaringbit' THEN
         -- For roaring bit cache
@@ -326,7 +326,7 @@ BEGIN
             CREATE TABLE IF NOT EXISTS %I (
                 query_hash TEXT PRIMARY KEY,
                 partition_keys roaringbitmap,
-                partition_keys_count INTEGER NOT NULL GENERATED ALWAYS AS (rb_cardinality(partition_keys)) STORED
+                partition_keys_count INTEGER GENERATED ALWAYS AS (rb_cardinality(partition_keys)) STORED
             )', v_cache_table);
     ELSE -- 'array'
         -- For array cache
@@ -340,7 +340,7 @@ BEGIN
             CREATE TABLE IF NOT EXISTS %I (
                 query_hash TEXT PRIMARY KEY,
                 partition_keys %s[],
-                partition_keys_count integer NOT NULL GENERATED ALWAYS AS (array_length(partition_keys, 1)) STORED
+                partition_keys_count integer GENERATED ALWAYS AS (array_length(partition_keys, 1)) STORED
             )', v_cache_table, 
             CASE p_datatype 
                 WHEN 'integer' THEN 'INTEGER'
@@ -366,8 +366,23 @@ DECLARE
     v_config_table TEXT;
     v_queue_item RECORD;
 BEGIN
-    -- For job name 'partitioncache_process_queue', we need 'partitioncache_queue_processor_config'
-    v_config_table := replace(p_job_name, 'partitioncache_process_queue', 'partitioncache_queue_processor_config');
+    -- For job name 'partitioncache_process_queue', we need to find the processor config table
+    -- Try to find it by looking for tables ending with '_processor_config'
+    SELECT tablename INTO v_config_table
+    FROM pg_tables 
+    WHERE schemaname = 'public' 
+    AND tablename LIKE '%_processor_config'
+    AND EXISTS (
+        SELECT 1 FROM information_schema.columns 
+        WHERE table_name = tablename 
+        AND column_name = 'job_name'
+    )
+    LIMIT 1;
+    
+    IF v_config_table IS NULL THEN
+        -- Use default if not found
+        v_config_table := 'partitioncache_queue_processor_config';
+    END IF;
     
     -- Get configuration for this job
     BEGIN
@@ -378,7 +393,7 @@ BEGIN
 
     EXCEPTION 
         WHEN NO_DATA_FOUND THEN
-            RAISE NOTICE 'No data found for job %', p_job_name;
+            RAISE NOTICE 'No data found for job % in table %', p_job_name, v_config_table;
             -- This can happen if the trigger creates jobs before config is committed. Exit gracefully.
             RETURN;
         WHEN TOO_MANY_ROWS THEN
@@ -728,6 +743,12 @@ BEGIN
         END;
 END;
 $$ LANGUAGE plpgsql;
+
+-- Note: For timeout testing, use transaction-level statement_timeout:
+-- BEGIN;
+-- SET LOCAL statement_timeout = 1000;  -- 1 second
+-- SELECT * FROM partitioncache_manual_process_queue(1);
+-- COMMIT;
 
 -- Manual processing function for partitioncache_manual_process_queue with manual execution source
 -- DEPRECATED: This function has been consolidated into _partitioncache_execute_job

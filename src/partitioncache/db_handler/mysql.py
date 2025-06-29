@@ -3,7 +3,7 @@ Handles the connection to a MySQL/MariaDB database
 """
 
 from logging import getLogger
-from typing import Any, List
+from typing import Any
 
 import mysql.connector
 
@@ -41,7 +41,7 @@ class MySQLDBHandler(AbstractDBHandler):
             logger.error(f"Error connecting to MySQL: {e}")
             raise
 
-    def execute(self, query) -> List:
+    def execute(self, query) -> list:
         try:
             self.cur.execute(query)
             self.conn.commit()  # Ensure changes are committed

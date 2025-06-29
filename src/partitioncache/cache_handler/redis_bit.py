@@ -1,4 +1,3 @@
-from functools import cache
 import uuid
 from datetime import datetime
 from logging import getLogger
@@ -42,13 +41,21 @@ class RedisBitCacheHandler(RedisAbstractCacheHandler):
     def _ensure_partition_exists(self, partition_key: str, bitsize: int | None = None) -> None:
         """Ensure partition exists with correct datatype and bitsize."""
         existing_datatype = self._get_partition_datatype(partition_key)
+
+        # Determine the bitsize to use
+        if bitsize is None:
+            bitsize = self.default_bitsize
+
         if existing_datatype is None:
             # Create new partition with bitsize
-            if bitsize is None:
-                bitsize = self.default_bitsize
             self._set_partition_metadata(partition_key, "integer", bitsize)
         elif existing_datatype != "integer":
             raise ValueError(f"Partition key '{partition_key}' already exists with datatype '{existing_datatype}', cannot use datatype 'integer'")
+        else:
+            # If the partition already exists, still ensure the bitsize is set
+            current_bitsize = self._get_partition_bitsize(partition_key)
+            if current_bitsize is None:
+                self._set_partition_metadata(partition_key, "integer", bitsize)
 
     def get(self, key: str, partition_key: str = "partition_key") -> set[int] | set[str] | set[float] | set[datetime] | None:
         """Get value from partition-specific cache namespace."""
@@ -86,7 +93,7 @@ class RedisBitCacheHandler(RedisAbstractCacheHandler):
         key_types = pipe.execute()
 
         existing_keys = set()
-        for key, key_type in zip(keys, key_types):
+        for key, key_type in zip(keys, key_types, strict=False):
             if key_type == b"string":
                 existing_keys.add(key)
         return existing_keys
@@ -106,7 +113,7 @@ class RedisBitCacheHandler(RedisAbstractCacheHandler):
             pipe.type(cache_key)
         key_types = pipe.execute()
 
-        valid_cache_keys: list[str] = [cache_key for cache_key, key_type in zip(cache_keys, key_types) if key_type == b"string"]
+        valid_cache_keys: list[str] = [cache_key for cache_key, key_type in zip(cache_keys, key_types, strict=False) if key_type == b"string"]
         valid_keys_count = len(valid_cache_keys)
 
         randuuid = str(uuid.uuid4())
@@ -115,7 +122,7 @@ class RedisBitCacheHandler(RedisAbstractCacheHandler):
             return None, 0
         elif len(valid_cache_keys) == 1:
             # Get the original key for the single valid cache key
-            original_key = next(key for key, cache_key in zip(keys, cache_keys) if cache_key in valid_cache_keys)
+            original_key = next(key for key, cache_key in zip(keys, cache_keys, strict=False) if cache_key in valid_cache_keys)
             return self.get(original_key, partition_key=partition_key), 1
         else:
             temp_key = f"temp_{randuuid}"
@@ -130,7 +137,12 @@ class RedisBitCacheHandler(RedisAbstractCacheHandler):
             return True
         # Ensure partition exists with correct datatype and bitsize
         self._ensure_partition_exists(partition_key)
-        val = bitarray(self._get_partition_bitsize(partition_key))
+        bitsize = self._get_partition_bitsize(partition_key)
+        if bitsize is None:
+            # Fallback to default bitsize if metadata is corrupted or missing
+            bitsize = self.default_bitsize
+            self._set_partition_metadata(partition_key, "integer", bitsize)
+        val = bitarray(bitsize)
         try:
             for k in value:
                 if isinstance(k, int):
@@ -140,7 +152,7 @@ class RedisBitCacheHandler(RedisAbstractCacheHandler):
                 else:
                     raise ValueError("Only integer values are supported")
         except (IndexError, ValueError):
-            raise ValueError(f"Value {value} is out of range for bitarray of size {self._get_partition_bitsize(partition_key)}")
+            raise ValueError(f"Value {value} is out of range for bitarray of size {bitsize}") from None
         try:
             cache_key = self._get_cache_key(key, partition_key)
             self.db.set(cache_key, val.to01())

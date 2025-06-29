@@ -1,15 +1,15 @@
 """Tests for PostgreSQL direct queue processor."""
 
 import os
+from unittest.mock import Mock, patch
+
 import pytest
-from unittest.mock import Mock, patch, MagicMock
-from pathlib import Path
 
 from partitioncache.cli.setup_postgresql_queue_processor import (
-    validate_environment,
+    SQL_FILE,
     check_pg_cron_installed,
     get_processor_status,
-    SQL_FILE,
+    validate_environment,
 )
 
 
@@ -56,7 +56,7 @@ class TestEnvironmentValidation:
             "DB_USER": "user",
             "DB_PASSWORD": "pass",
             "DB_NAME": "testdb",
-            "CACHE_BACKEND": "redis",  # Not supported
+            "CACHE_BACKEND": "redis_set",  # Not supported
         }
         with patch.dict(os.environ, env, clear=True):
             valid, message = validate_environment()
@@ -89,7 +89,7 @@ class TestPgCronCheck:
     """Test pg_cron extension checking."""
 
     def test_check_pg_cron_installed_true(self):
-        """Test when pg_cron is installed."""
+        """Test when pg_cron is already installed."""
         mock_conn = Mock()
         mock_cursor = Mock()
         mock_conn.cursor.return_value.__enter__ = Mock(return_value=mock_cursor)
@@ -98,21 +98,40 @@ class TestPgCronCheck:
 
         assert check_pg_cron_installed(mock_conn) is True
 
-        # Should make two calls: CREATE EXTENSION and SELECT to check
-        assert mock_cursor.execute.call_count == 2
+        # Should only make one call to check if it exists (since it does)
+        assert mock_cursor.execute.call_count == 1
         calls = mock_cursor.execute.call_args_list
-        assert "CREATE EXTENSION IF NOT EXISTS pg_cron" in calls[0][0][0]
-        assert "SELECT 1 FROM pg_extension WHERE extname = 'pg_cron'" in calls[1][0][0]
+        assert "SELECT 1 FROM pg_extension WHERE extname = 'pg_cron'" in calls[0][0][0]
 
     def test_check_pg_cron_installed_false(self):
-        """Test when pg_cron is not installed."""
+        """Test when pg_cron is not installed and cannot be created."""
         mock_conn = Mock()
         mock_cursor = Mock()
         mock_conn.cursor.return_value.__enter__ = Mock(return_value=mock_cursor)
         mock_conn.cursor.return_value.__exit__ = Mock(return_value=None)
         mock_cursor.fetchone.return_value = None
+        # Simulate CREATE EXTENSION failing
+        mock_cursor.execute.side_effect = [None, Exception("permission denied")]
 
         assert check_pg_cron_installed(mock_conn) is False
+
+    def test_check_pg_cron_installed_create_success(self):
+        """Test when pg_cron is not installed but can be created."""
+        mock_conn = Mock()
+        mock_cursor = Mock()
+        mock_conn.cursor.return_value.__enter__ = Mock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = Mock(return_value=None)
+        # First check returns None (not installed), CREATE succeeds
+        mock_cursor.fetchone.return_value = None
+        mock_cursor.execute.side_effect = [None, None]  # SELECT succeeds, CREATE succeeds
+
+        assert check_pg_cron_installed(mock_conn) is True
+
+        # Should make two calls: SELECT to check and CREATE EXTENSION
+        assert mock_cursor.execute.call_count == 2
+        calls = mock_cursor.execute.call_args_list
+        assert "SELECT 1 FROM pg_extension WHERE extname = 'pg_cron'" in calls[0][0][0]
+        assert "CREATE EXTENSION IF NOT EXISTS pg_cron" in calls[1][0][0]
 
 
 class TestProcessorStatus:

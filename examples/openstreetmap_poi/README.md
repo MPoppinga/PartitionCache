@@ -213,10 +213,10 @@ CACHE_BACKEND=postgresql_array
 CACHE_BACKEND=postgresql_bit
 
 # RocksDB (file-based, good for development)
-CACHE_BACKEND=rocksdb
+CACHE_BACKEND=rocksdb_set
 
 # Redis (in-memory, good for distributed setups)
-CACHE_BACKEND=redis
+CACHE_BACKEND=redis_set
 ```
 
 ## Troubleshooting

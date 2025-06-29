@@ -1,8 +1,11 @@
+import threading
+from abc import abstractmethod
+from logging import getLogger
+
 import psycopg
 from psycopg import sql
-from functools import cache
+
 from partitioncache.cache_handler.abstract import AbstractCacheHandler_Lazy
-from logging import getLogger
 
 logger = getLogger("PartitionCache")
 
@@ -10,9 +13,14 @@ logger = getLogger("PartitionCache")
 class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
     _instance = None
     _refcount = 0
+    _cached_datatype: dict[str, str] = {}
 
     @classmethod
     def get_instance(cls, *args, **kwargs):
+        # If externally threaded, skip singleton pattern and always create new instances
+        if hasattr(threading.current_thread(), "ident") and threading.active_count() > 1:
+            return cls(*args, **kwargs)
+
         if cls._instance is None:
             cls._instance = cls(*args, **kwargs)
         cls._refcount += 1
@@ -28,14 +36,85 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
         self.tableprefix = db_tableprefix
         self.cursor = self.db.cursor()
 
-    @cache
+        # Create metadata tables with supported datatypes
+        self._recreate_metadata_table(self.get_supported_datatypes())
+
+    def _recreate_metadata_table(self, supported_datatypes: set[str]) -> None:
+        """
+        Recreate metadata table if it was dropped during cleanup.
+
+        Args:
+            supported_datatypes: Set of supported datatype strings (e.g., {'integer', 'float', 'text', 'timestamp'})
+        """
+        try:
+            # Create datatype constraint based on supported datatypes
+            datatype_constraint = sql.SQL("CHECK (datatype IN ({}))").format(sql.SQL(", ").join(sql.Literal(dt) for dt in sorted(supported_datatypes)))
+
+            # Create metadata table with datatype constraint
+            self.cursor.execute(
+                sql.SQL("""CREATE TABLE IF NOT EXISTS {0} (
+                    partition_key TEXT PRIMARY KEY,
+                    datatype TEXT NOT NULL {1},
+                    created_at TIMESTAMP DEFAULT now()
+                );""").format(sql.Identifier(self.tableprefix + "_partition_metadata"), datatype_constraint)
+            )
+
+            # Create queries table
+            self.cursor.execute(
+                sql.SQL("""CREATE TABLE IF NOT EXISTS {0} (
+                    query_hash TEXT NOT NULL,
+                    query TEXT NOT NULL,
+                    partition_key TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'ok' CHECK (status IN ('ok', 'timeout', 'failed')),
+                    last_seen TIMESTAMP NOT NULL DEFAULT now(),
+                    PRIMARY KEY (query_hash, partition_key)
+                );""").format(sql.Identifier(self.tableprefix + "_queries"))
+            )
+
+            self.db.commit()
+        except Exception as e:
+            logger.error(f"Failed to recreate metadata table: {e}")
+            try:
+                self.db.rollback()
+            except Exception as rollback_error:
+                logger.error(f"Failed to rollback after metadata table creation error: {rollback_error}")
+            raise
+
+    def _ensure_metadata_table_exists(self) -> None:
+        """Ensure the metadata table exists, create it if it doesn't."""
+        try:
+            # Test if metadata table exists by trying to query it
+            self.cursor.execute(sql.SQL("SELECT 1 FROM {0} LIMIT 1").format(sql.Identifier(self.tableprefix + "_partition_metadata")))
+        except Exception:
+            # Metadata table doesn't exist, create it
+            logger.info(f"Creating metadata table: {self.tableprefix}_partition_metadata")
+            self._recreate_metadata_table(self.get_supported_datatypes())
+
     def _get_partition_datatype(self, partition_key: str) -> str | None:
         """Get the datatype for a partition key from metadata."""
-        self.cursor.execute(
-            sql.SQL("SELECT datatype FROM {0} WHERE partition_key = %s").format(sql.Identifier(self.tableprefix + "_partition_metadata")), (partition_key,)
-        )
-        result = self.cursor.fetchone()
-        return result[0] if result else None
+        if partition_key in self._cached_datatype:
+            return self._cached_datatype[partition_key]
+
+        try:
+            self.cursor.execute(
+                sql.SQL("SELECT datatype FROM {0} WHERE partition_key = %s").format(sql.Identifier(self.tableprefix + "_partition_metadata")), (partition_key,)
+            )
+            result = self.cursor.fetchone()
+            if result:
+                self._cached_datatype[partition_key] = result[0]
+            return result[0] if result else None
+        except Exception as e:
+            # Metadata table might not exist - rollback and return None
+            try:
+                if "does not exist" in str(e).lower() or "relation" in str(e).lower():
+                    self.db.rollback()
+                    return None
+                else:
+                    logger.error(f"Failed to get datatype for partition {partition_key}: {e}")
+                    self.db.rollback()
+                    return None
+            except Exception:
+                return None
 
     def close(self):
         self._refcount -= 1
@@ -78,7 +157,14 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
             # Ensure partition exists with default datatype
             datatype = self._get_partition_datatype(partition_key)
             if datatype is None:
-                return False
+                # For handlers that only support one datatype, create partition with that datatype
+                supported_datatypes = self.get_supported_datatypes()
+                if len(supported_datatypes) == 1:
+                    datatype = next(iter(supported_datatypes))
+                    self.register_partition_key(partition_key, datatype)
+                else:
+                    # For multi-datatype handlers, we can't determine datatype automatically
+                    return False
 
             table_name = f"{self.tableprefix}_cache_{partition_key}"
             self.cursor.execute(
@@ -112,7 +198,7 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
         result = self.cursor.fetchone()
         if result == [None] or result == (None,) or result is None:
             return True
-        if isinstance(result, (tuple, list)) and len(result) > 0 and result[0] is None:
+        if isinstance(result, tuple | list) and len(result) > 0 and result[0] is None:
             return True
         return False
 
@@ -128,8 +214,20 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
             result = self.cursor.fetchone()
             return result is not None
         except Exception as e:
-            logger.error(f"Failed to check existence for key {key} in partition {partition_key}: {e}")
-            return False
+            # If table doesn't exist or other error, rollback to prevent transaction abort
+            try:
+                if "does not exist" in str(e).lower() or "relation" in str(e).lower():
+                    # Table doesn't exist - rollback and return False
+                    self.db.rollback()
+                    return False
+                else:
+                    # Other error - log and rollback
+                    logger.error(f"Failed to check existence for key {key} in partition {partition_key}: {e}")
+                    self.db.rollback()
+                    return False
+            except Exception:
+                # Rollback failed - return False anyway
+                return False
 
     def filter_existing_keys(self, keys: set, partition_key: str = "partition_key") -> set:
         """Return the set of keys that exist in the partition-specific cache."""
@@ -143,7 +241,7 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
                 sql.SQL("SELECT query_hash FROM {0} WHERE query_hash = ANY(%s) AND partition_keys IS NOT NULL").format(sql.Identifier(table_name)),
                 [list(keys)],
             )
-            keys_set = set(x[0] for x in self.cursor.fetchall())
+            keys_set = {x[0] for x in self.cursor.fetchall()}
             logger.info(f"Found {len(keys_set)} existing hashkeys for partition {partition_key}")
             return keys_set
         except Exception as e:
@@ -207,7 +305,7 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
                 sql.SQL("DELETE FROM {0} WHERE partition_key = %s").format(sql.Identifier(self.tableprefix + "_partition_metadata")), (partition_key,)
             )
 
-            self._get_partition_datatype.cache_clear()
+            self._cached_datatype.pop(partition_key, None)  # Remove from cached datatypes
 
             self.db.commit()
             logger.info(f"Deleted partition {partition_key}")
@@ -270,3 +368,9 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
         except Exception as e:
             logger.error(f"Failed to get partition keys: {e}")
             return []
+
+    @classmethod
+    @abstractmethod
+    def get_supported_datatypes(cls) -> set[str]:
+        """Return the set of supported datatypes for this cache handler."""
+        pass

@@ -67,19 +67,25 @@ def test_set_set_str_type(cache_handler):
 
 
 def test_get(cache_handler):
-    cache_handler.cursor.fetchone.side_effect = [("integer",), ([1, 2, 3],)]
+    # Mock the _get_partition_datatype method directly instead of relying on cursor side effects
+    cache_handler._get_partition_datatype = Mock(return_value="integer")
+    cache_handler.cursor.fetchone.return_value = ([1, 2, 3],)
     result = cache_handler.get("key1")
     assert result == {1, 2, 3}
 
 
 def test_get_none(cache_handler):
-    cache_handler.cursor.fetchone.side_effect = [("integer",), (None,)]
+    # Mock the _get_partition_datatype method directly
+    cache_handler._get_partition_datatype = Mock(return_value="integer")
+    cache_handler.cursor.fetchone.return_value = (None,)
     result = cache_handler.get("non_existent_key")
     assert result is None
 
 
 def test_get_str_type(cache_handler):
-    cache_handler.cursor.fetchone.side_effect = [("text",), (None,)]
+    # Mock the _get_partition_datatype method directly
+    cache_handler._get_partition_datatype = Mock(return_value="text")
+    cache_handler.cursor.fetchone.return_value = (None,)
     result = cache_handler.get("str_key")
     assert result is None
 
@@ -91,9 +97,12 @@ def test_set_null(cache_handler):
 
 
 def test_is_null(cache_handler):
-    cache_handler.cursor.fetchone.side_effect = [("integer",), (None,)]
+    # Mock the _get_partition_datatype method directly
+    cache_handler._get_partition_datatype = Mock(return_value="integer")
+    cache_handler.cursor.fetchone.return_value = (None,)
     assert cache_handler.is_null("null_key") is True
-    cache_handler.cursor.fetchone.side_effect = [("integer",), ([1, 2, 3],)]
+
+    cache_handler.cursor.fetchone.return_value = ([1, 2, 3],)
     assert cache_handler.is_null("non_null_key") is False
 
 
@@ -107,7 +116,9 @@ def test_exists_existing_key(cache_handler, mock_db, mock_cursor):
 def test_exists_non_existent_key(cache_handler, mock_db, mock_cursor):
     cache_handler.cursor = mock_cursor
     cache_handler.db = mock_db
-    mock_cursor.fetchone.side_effect = [("integer",), None]
+    # Mock the _get_partition_datatype method directly
+    cache_handler._get_partition_datatype = Mock(return_value="integer")
+    mock_cursor.fetchone.return_value = None
     assert cache_handler.exists("non_existent_key") is False
 
 
@@ -322,7 +333,9 @@ def test_set_set_large_numbers(cache_handler):
 
 def test_get_very_large_set(cache_handler):
     large_set = set(range(1, 1000001))  # 1 million elements
-    cache_handler.cursor.fetchone.side_effect = [("integer",), (list(large_set),)]
+    # Mock the _get_partition_datatype method directly
+    cache_handler._get_partition_datatype = Mock(return_value="integer")
+    cache_handler.cursor.fetchone.return_value = (list(large_set),)
     result = cache_handler.get("large_key")
     assert result == large_set
 

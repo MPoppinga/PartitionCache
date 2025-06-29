@@ -60,12 +60,16 @@ def test_set_set(cache_handler):
     class FakeBitArray:
         def __init__(self, size):
             self.bits = [0] * size
+
         def setall(self, val):
             self.bits = [val] * len(self.bits)
+
         def __setitem__(self, idx, val):
             self.bits[idx] = val
+
         def to01(self):
-            return ''.join(str(b) for b in self.bits)
+            return "".join(str(b) for b in self.bits)
+
     with patch("partitioncache.cache_handler.postgresql_bit.bitarray", FakeBitArray):
         cache_handler._get_partition_datatype = lambda pk: "integer"
         cache_handler._get_partition_bitsize = lambda pk: 100
@@ -106,8 +110,10 @@ def test_get(cache_handler):
     class MockBitArray:
         def __init__(self, bitstr):
             self.bitstr = bitstr
+
         def search(self, pattern):
-            return [i for i, c in enumerate(self.bitstr) if c == '1']
+            return [i for i, c in enumerate(self.bitstr) if c == "1"]
+
     with patch("partitioncache.cache_handler.postgresql_bit.bitarray", MockBitArray):
         cache_handler._get_partition_datatype = lambda pk: "integer"
         cache_handler.cursor.fetchone.side_effect = [("0101" + "0" * 96,)]
@@ -129,10 +135,22 @@ def test_get_none(cache_handler):
 
 
 def test_get_str_type(cache_handler):
-    # First call returns datatype, second call returns a valid bit string
-    cache_handler.cursor.fetchone.side_effect = [("integer",), ("0101",)]
-    result = cache_handler.get("str_key")
-    assert result == {1, 3}
+    # Mock partition datatype directly instead of using side effects
+    cache_handler._get_partition_datatype = Mock(return_value="integer")
+    # Mock with valid bit string data
+    cache_handler.cursor.fetchone.return_value = ("0101",)
+
+    # Patch bitarray to return a mock with a .search method
+    class MockBitArray:
+        def __init__(self, bitstr):
+            self.bitstr = bitstr
+
+        def search(self, pattern):
+            return [i for i, c in enumerate(self.bitstr) if c == "1"]
+
+    with patch("partitioncache.cache_handler.postgresql_bit.bitarray", MockBitArray):
+        result = cache_handler.get("str_key")
+        assert result == {1, 3}
 
 
 def test_set_null(cache_handler):
