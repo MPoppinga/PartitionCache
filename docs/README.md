@@ -1,175 +1,34 @@
 # PartitionCache Documentation
 
-This directory contains the technical documentation for PartitionCache, a caching middleware for partition-based query optimization.
+Technical documentation for PartitionCache middleware.
 
-## Documentation Structure
+## Getting Started
 
-### Core Documentation
+- **[System Overview](system_overview.md)** - Architecture, concepts, and configuration
+- **[API Reference](api_reference.md)** - Python API functions and classes
+- **[CLI Reference](cli_reference.md)** - Command-line tools documentation
 
-#### [System Overview](system_overview.md)
-**Primary Entry Point** - Comprehensive high-level guide covering:
-- Complete system architecture with diagrams
-- Streamlined API usage and examples
-- Configuration management and environment variables
-- Performance characteristics and benchmarks
-- Use case recommendations and best practices
-- CLI tools and management interfaces
-- Security considerations and migration paths
+## Backend Selection
 
-#### [Cache Handlers](cache_handlers.md) 
-**Backend Reference** - Detailed cache backend documentation:
-- All supported cache backends (PostgreSQL, Redis, RocksDB)
-- Multi-partition support and datatype management
-- Performance characteristics and memory efficiency
-- Backend-specific features and API reference
-- Migration and troubleshooting guides
+- **[Cache Handlers](cache_handlers.md)** - Backend comparison and selection guide
+- **[Datatype Support](datatype_support.md)** - Datatype compatibility matrix
 
-#### [Queue System](queue_system.md)
-**Queue Architecture** - Two-queue system documentation:
-- Queue providers (PostgreSQL and Redis)
-- Priority processing and concurrency control
-- LISTEN/NOTIFY support and real-time processing
-- CLI tools and management operations
-- Performance tuning and monitoring
+## Operations
 
-#### [PostgreSQL Queue Processor](postgresql_queue_processor.md)
-**Modern Processing** - Database-native processing documentation:
-- pg_cron integration and automated scheduling
-- Comprehensive monitoring and logging
-- Concurrency control and error recovery
-- Installation, configuration, and troubleshooting
-- Performance optimization and best practices
+- **[Queue System](queue_system.md)** - Two-queue architecture and providers
+- **[PostgreSQL Queue Processor](postgresql_queue_processor.md)** - pg_cron integration
+- **[Cache Eviction](cache_eviction.md)** - Automatic cleanup strategies
 
-### Reference Documentation
+## Deployment
 
-#### [API Reference](api_reference.md)
-**Complete API Documentation** - Comprehensive Python API reference:
-- Core functions and classes with examples
-- Cache management and query processing
-- Queue operations and error handling
-- Advanced usage patterns and best practices
-- Performance optimization techniques
+- **[Production Deployment](production_deployment.md)** - Best practices and scaling
+- **[Migration Guide](migration_guide.md)** - Backend migration procedures
+- **[Integration Test Guide](integration_test_guide.md)** - Testing documentation
 
-#### [Datatype Support](datatype_support.md)
-**Compatibility Guide** - Datatype compatibility and usage:
-- Backend datatype support matrix
-- Conversion guidelines and recommendations
-- Performance implications of different datatypes
-- Usage examples and best practices
+## Examples
 
-### Operations and Deployment
+- **[Complete Workflow](complete_workflow_example.md)** - End-to-end tutorial
+- **[Cache Management CLI](manage_cache_cli.md)** - pcache-manage usage guide
+- **[Architecture Diagrams](architecture_diagrams.md)** - Visual system representations
 
-#### [Production Deployment](production_deployment.md)
-**Production Guide** - Complete production deployment documentation:
-- Infrastructure setup and architecture patterns
-- Security hardening and authentication
-- Monitoring, alerting, and observability
-- Backup, recovery, and scaling strategies
-- Operational procedures and maintenance
-
-#### [Migration Guide](migration_guide.md)
-**Migration Documentation** - Comprehensive migration procedures:
-- Backend migration strategies and scripts
-- Version upgrade procedures
-- External system migration patterns
-- Data validation and rollback procedures
-- Migration testing and best practices
-
-#### [Integration Test Guide](integration_test_guide.md)
-**Testing Documentation** - Comprehensive testing guide:
-- Test structure and coverage
-- Local and CI/CD execution differences
-- Environment setup and dependencies
-- Running specific test suites
-- Troubleshooting and debugging
-
-## Quick Start Guide
-
-### 1. System Overview
-Start with [System Overview](system_overview.md) for architecture understanding and API introduction.
-
-### 2. Choose Your Backend
-Consult [Cache Handlers](cache_handlers.md) to select the optimal cache backend for your use case:
-- **PostgreSQL Array**: Mixed datatypes, full SQL features
-- **PostgreSQL Bit**: Integer-only, memory efficient
-- **Redis**: Distributed, high throughput
-- **RocksDB**: File-based, development/embedded
-
-### 3. Configuration
-Follow the configuration examples in [System Overview](system_overview.md) for environment setup.
-
-### 4. Processing Model
-Choose between:
-- **PostgreSQL Queue Processor**: Modern, database-native ([PostgreSQL Queue Processor](postgresql_queue_processor.md))
-- **Monitor Processing**: Traditional, external scripts ([Queue System](queue_system.md))
-
-### 5. Implementation
-Use the streamlined API examples throughout the documentation for implementation.
-
-## Documentation Philosophy
-
-This documentation has been restructured to:
-- **Eliminate Duplication**: Each topic is covered comprehensively in one place
-- **Focus on Current State**: No references to old versions or historical changes
-- **Provide Practical Guidance**: Emphasis on implementation and best practices
-- **Include Comprehensive Diagrams**: Visual representations of system architecture
-- **Maintain Accuracy**: All information reflects the current codebase state
-
-## Additional Documentation
-
-#### [Complete Workflow Example](complete_workflow_example.md)
-**End-to-End Tutorial** - Comprehensive workflow demonstration:
-- Real-world OpenStreetMap POI example
-- PostgreSQL queue processor integration
-- Performance monitoring and optimization
-- Production deployment patterns
-
-#### [Cache Management CLI](manage_cache_cli.md)
-**CLI Reference** - Complete command-line interface documentation:
-- Cache operations and management
-- Queue monitoring and control
-- Maintenance and cleanup procedures
-- Advanced configuration options
-
-#### [Cache Eviction](cache_eviction.md)
-**Eviction Management** - Automatic cache cleanup documentation:
-- Eviction strategies and algorithms
-- pg_cron integration for automation
-- Performance impact and monitoring
-- Configuration and troubleshooting
-
-## Getting Help
-
-- **System Architecture**: See [System Overview](system_overview.md)
-- **API Usage**: See [API Reference](api_reference.md)
-- **Backend Selection**: See [Cache Handlers](cache_handlers.md) 
-- **Queue Setup**: See [Queue System](queue_system.md)
-- **PostgreSQL Queue Processor**: See [PostgreSQL Queue Processor](postgresql_queue_processor.md)
-- **Production Deployment**: See [Production Deployment](production_deployment.md)
-- **Migration Help**: See [Migration Guide](migration_guide.md)
-- **Datatype Issues**: See [Datatype Support](datatype_support.md)
-
-For examples and practical workflows, refer to the `examples/` directory in the project root.
-
-```mermaid
-graph TB
-    User[Application] --> API[PartitionCache API]
-    API --> Cache[Cache System]
-    API --> Queue[Queue System]
-    
-    Queue --> Processor[Background Processor]
-    Processor --> DB[(Database)]
-    Processor --> Cache
-    
-    Cache --> Storage[Storage Backends]
-    Storage --> PG[(PostgreSQL)]
-    Storage --> Redis[(Redis)]
-    Storage --> RocksDB[(RocksDB)]
-    
-    style API fill:#e1f5fe
-    style Cache fill:#f3e5f5
-    style Queue fill:#e8f5e8
-    style Storage fill:#fff3e0
-```
-
-For detailed architectural diagrams, see [Architecture Diagrams](architecture_diagrams.md).
+For working examples, see the `examples/` directory in the project root.

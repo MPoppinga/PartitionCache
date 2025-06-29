@@ -158,8 +158,16 @@ class TestMetadataTableCreation:
         # Reset mock to test _ensure_metadata_table_exists
         mock_cursor.reset_mock()
 
-        # Test when table doesn't exist (exception thrown)
-        mock_cursor.execute.side_effect = Exception("relation does not exist")
+        # Test when table doesn't exist (exception thrown on first call only)
+        call_count = 0
+        def side_effect(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:  # First call fails (SELECT check)
+                raise Exception("relation does not exist")
+            return None  # Subsequent calls succeed
+        
+        mock_cursor.execute.side_effect = side_effect
         
         # Call _ensure_metadata_table_exists
         handler._ensure_metadata_table_exists()

@@ -224,19 +224,6 @@ def clear_all_queues(queue_provider: str | None = None) -> tuple[int, int]:
         return (0, 0)
 
 
-def push_to_queue(query: str, partition_key: str = "partition_key", partition_datatype: str | None = None, queue_provider: str | None = None) -> bool:
-    """
-    Legacy function for backward compatibility. Pushes to original query queue.
-
-    Args:
-        query (str): The query to be pushed to the queue.
-        partition_key (str): The partition key for this query (default: "partition_key").
-        partition_datatype (str): The datatype of the partition key (default: None).
-
-    Returns:
-        bool: True if the query was pushed to the queue, False otherwise.
-    """
-    return push_to_original_query_queue(query, partition_key, partition_datatype, queue_provider)
 
 
 def close_queue_handler() -> None:

@@ -162,12 +162,34 @@ SELECT partitioncache_process_queue('partitioncache');
 
 ### Query Processing
 
-Advanced query rewriting and optimization:
+#### Query Decomposition and Recomposition Process
+
+PartitionCache uses sophisticated query decomposition to maximize cache effectiveness:
+
+1. **Query Analysis**: Incoming queries are parsed to identify conjunctive (AND) conditions
+2. **Variant Generation**: Complex queries are decomposed into simpler variants
+   - Example: `WHERE type='click' AND user_id IN (1,2,3)` becomes:
+     - Variant 1: `WHERE type='click'`
+     - Variant 2: `WHERE user_id IN (1,2,3)`
+3. **Parallel Execution**: Each variant is executed to find partition identifiers with matches
+4. **Cache Storage**: Results are stored as sets of partition identifiers per query variant
+5. **Intersection Optimization**: Future queries benefit from set intersections of cached results
 
 ```python
-# Get partition keys for complex queries
+# Example: Complex query decomposition
+query = "SELECT * FROM events WHERE type='click' AND region='US' AND date > '2024-01-01'"
+
+# PartitionCache automatically generates variants:
+# 1. "WHERE type='click'"
+# 2. "WHERE region='US'"
+# 3. "WHERE date > '2024-01-01'"
+# 4. "WHERE type='click' AND region='US'"
+# 5. "WHERE type='click' AND date > '2024-01-01'"
+# 6. "WHERE region='US' AND date > '2024-01-01'"
+
+# Get partition keys using cached results
 partition_keys, num_subqueries, cache_hits = partitioncache.get_partition_keys(
-    query="SELECT * FROM events WHERE type='click' AND user_id IN (1,2,3)",
+    query=query,
     cache_handler=cache.underlying_handler,
     partition_key="user_id"
 )
@@ -180,6 +202,12 @@ optimized_query = partitioncache.extend_query_with_partition_keys(
     method="IN"
 )
 ```
+
+This decomposition strategy enables:
+- **Reusability**: Simple variants are more likely to match future queries
+- **Intersection Benefits**: AND conditions leverage set intersections
+- **Incremental Learning**: Cache becomes more effective over time
+- **Search Space Reduction**: Only partitions with potential matches are searched
 
 ## Datatype Support Matrix
 

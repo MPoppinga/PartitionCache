@@ -170,10 +170,10 @@ class TestPgCronIntegration:
             with db_session.cursor() as cur:
                 try:
                     # Disable the test processor
-                    cur.execute("UPDATE %s SET enabled = false WHERE job_name = %%s" % config_table, (test_job_name,))
+                    cur.execute(f"UPDATE {config_table} SET enabled = false WHERE job_name = %s", (test_job_name,))
 
                     # This should trigger removal of cron jobs
-                    cur.execute("DELETE FROM %s WHERE job_name = %%s" % config_table, (test_job_name,))
+                    cur.execute(f"DELETE FROM {config_table} WHERE job_name = %s", (test_job_name,))
 
                     # Explicitly remove any remaining cron jobs
                     cur.execute("DELETE FROM cron.job WHERE jobname LIKE %s", (f"{job_prefix}%",))

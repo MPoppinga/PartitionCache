@@ -4,6 +4,37 @@ This document contains detailed architectural diagrams for PartitionCache compon
 
 ## System Architecture Overview
 
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           PartitionCache System                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────────────┐  │
+│  │  Application    │    │  Query          │    │ Cache Storage Layer     │  │
+│  │  Layer          │    │  Processing     │    │                         │  │
+│  │                 │    │  Layer          │    │ ┌─────────────────────┐ │  │
+│  │ ┌─────────────┐ │    │                 │    │ │ PostgreSQL Handlers │ │  │
+│  │ │ CLI Tools   │ │    │ ┌─────────────┐ │    │ │ - Array Storage     │ │  │
+│  │ │ Python API  │ │───>│ │ Query       │ │───>│ │ - Bit Storage       │ │  │
+│  │ │             │ │    │ │           │ │    │ │ - RoaringBitmap Storage│ │  │
+│  │ │ Helper Objs │ │    │ │ Processor   │ │    │ └─────────────────────┘ │  │
+│  │ └─────────────┘ │    │ │ Fragment    │ │    │                         │  │
+│  └─────────────────┘    │ │ Generator   │ │    │ ┌─────────────────────┐ │  │
+│                         │ └─────────────┘ │    │ │ Redis Handlers      │ │  │
+│                         │                 │    │ │ - Set Storage       │ │  │
+│                         │ ┌─────────────┐ │    │ │ - Bit Storage       │ │  │
+│                         │ │ Cache       │ │    │ └─────────────────────┘ │  │
+│                         │ │ Application │ │    │                         │  │
+│                         │ │ Engine      │ │    │ ┌─────────────────────┐ │  │
+│                         │ └─────────────┘ │    │ │ RocksDB Handlers    │ │  │
+│                         └─────────────────┘    │ │ - Set Storage       │ │  │
+│                                                │ │ - Bit Storage       │ │  │
+│                                                │ │ - Dict Storage      │ │  │
+│                                                │ └─────────────────────┘ │  │
+│                                                └─────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
 ```mermaid
 graph TB
     %% User Interface Layer
