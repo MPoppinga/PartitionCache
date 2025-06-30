@@ -103,7 +103,7 @@ class TestDataSetup:
                 batch_end = min(batch_start + batch_size, num_records)
                 batch_data = []
 
-                for i in range(batch_start, batch_end):
+                for _i in range(batch_start, batch_end):
                     order_date = date(2023, 1, 1) + timedelta(days=random.randint(0, 364))
                     batch_data.append(
                         (
@@ -216,7 +216,7 @@ class TestDataSetup:
                 batch_end = min(batch_start + batch_size, num_points)
                 batch_data = []
 
-                for i in range(batch_start, batch_end):
+                for _i in range(batch_start, batch_end):
                     # Choose random region
                     region = random.choice(regions)
 
@@ -230,7 +230,7 @@ class TestDataSetup:
                     # Generate zipcode based on city
                     zipcode = f"{10000 + city_id * 100 + random.randint(1, 99):05d}"
 
-                    batch_data.append((x, y, random.choice(point_types), f"{random.choice(point_types).title()} {i + 1}", region["id"], city_id, zipcode))
+                    batch_data.append((x, y, random.choice(point_types), f"{random.choice(point_types).title()} {_i + 1}", region["id"], city_id, zipcode))
 
                 cur.executemany(
                     """
@@ -261,7 +261,7 @@ class TestDataSetup:
                 batch_end = min(batch_start + batch_size, num_businesses)
                 batch_data = []
 
-                for i in range(batch_start, batch_end):
+                for _i in range(batch_start, batch_end):
                     region = random.choice(regions)
                     x = region["center_x"] + random.uniform(-0.02, 0.02)
                     y = region["center_y"] + random.uniform(-0.02, 0.02)
@@ -270,9 +270,9 @@ class TestDataSetup:
 
                     business_type = random.choice(business_types)
                     if business_type in business_names:
-                        name = f"{random.choice(business_names[business_type])} {i + 1}"
+                        name = f"{random.choice(business_names[business_type])} {_i + 1}"
                     else:
-                        name = f"{business_type.replace('_', ' ').title()} {i + 1}"
+                        name = f"{business_type.replace('_', ' ').title()} {_i + 1}"
 
                     batch_data.append(
                         (

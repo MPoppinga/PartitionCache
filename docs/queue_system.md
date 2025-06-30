@@ -44,7 +44,7 @@ PartitionCache implements a sophisticated two-queue system that separates query 
 - Comprehensive indexing for optimal performance
 
 **Configuration:**
-See [System Overview - Configuration Management](system_overview.md#configuration-management) for complete environment setup.
+See [CLI Reference - Global Options](cli_reference.md#global-options) for complete environment setup.
 
 **Database Schema:**
 ```sql
@@ -83,7 +83,7 @@ CREATE TABLE query_fragment_queue (
 - Lightweight for high-volume scenarios
 
 **Configuration:**
-See [System Overview - Configuration Management](system_overview.md#configuration-management) for Redis queue setup.
+See [CLI Reference - Global Options](cli_reference.md#global-options) for Redis queue setup.
 
 ## Queue Operations
 
@@ -302,34 +302,6 @@ while True:
             process_queue_item()
 ```
 
-## Performance Characteristics
-
-### Throughput Comparison
-
-| Provider | Throughput | Latency | Scalability |
-|----------|------------|---------|-------------|
-| **PostgreSQL** | Medium-High | Low | Excellent |
-| **Redis** | Very High | Very Low | Excellent |
-
-### Memory Usage
-
-| Component | PostgreSQL | Redis |
-|-----------|------------|-------|
-| **Queue Storage** | Disk-based | Memory-based |
-| **Metadata** | SQL tables | JSON objects |
-| **Indexes** | B-tree | Hash tables |
-
-### Scalability Patterns
-
-**PostgreSQL Provider:**
-- Vertical scaling: Increase database resources
-- Horizontal scaling: Read replicas for monitoring
-- Partitioning: Time-based queue partitioning
-
-**Redis Provider:**
-- Vertical scaling: Increase Redis memory
-- Horizontal scaling: Redis Cluster
-- Sharding: Multiple Redis instances by partition key
 
 ## Monitoring and Debugging
 
@@ -369,6 +341,9 @@ redis-cli -h localhost -p 6379 lrange partition_cache_queue_original_query 0 4
 ```
 
 ### Performance Monitoring
+Use CLI tools to monitor queue processing rates
+See [CLI Reference](cli_reference.md) for more details
+Or use look up the queue lengths in the database:
 
 ```python
 import time
@@ -434,57 +409,3 @@ redis-cli -h localhost -p 6379 del partition_cache_queue_original_query
 redis-cli -h localhost -p 6379 del partition_cache_queue_fragment_query
 ```
 
-## Best Practices
-
-### Queue Provider Selection
-
-**Choose PostgreSQL when:**
-- Priority processing is required
-- Durable storage is important
-- Complex monitoring needs
-- Integration with existing PostgreSQL infrastructure
-
-**Choose Redis when:**
-- Maximum throughput is required
-- Temporary storage is acceptable
-- Distributed processing architecture
-- Memory-based performance is critical
-
-### Operational Guidelines
-
-1. **Monitor Queue Depths**: Prevent unbounded growth
-2. **Priority Management**: Use priorities for important queries
-3. **Partition Key Strategy**: Align with data access patterns
-4. **Error Recovery**: Implement robust error handling
-5. **Capacity Planning**: Monitor processing rates vs. input rates
-
-### Configuration Tuning
-
-**High-Throughput Setup:**
-```bash
-# Redis provider for maximum throughput
-QUERY_QUEUE_PROVIDER=redis
-REDIS_HOST=high_memory_instance
-REDIS_PORT=6379
-
-# Multiple monitor processes
-for i in {1..4}; do
-    pcache-monitor &
-done
-```
-
-**Priority-Aware Setup:**
-```bash
-# PostgreSQL provider for priority processing
-QUERY_QUEUE_PROVIDER=postgresql
-PG_QUEUE_HOST=database_server
-
-# Single monitor with priority processing
-pcache-monitor
-```
-
-## Integration Notes
-
-The queue system is designed for seamless integration with existing applications. All queue operations use the configured provider transparently.
-
-This two-queue architecture provides the foundation for scalable, reliable, and high-performance query processing in PartitionCache systems.

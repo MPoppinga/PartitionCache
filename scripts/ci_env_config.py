@@ -171,20 +171,20 @@ class CIEnvironmentConfig:
     def get_handlers_requiring_service(self, service: str) -> list[str]:
         """Get handlers that require a specific service (postgres, redis, rocksdb)."""
         handlers = []
-        for name, config in self.handlers.items():
+        for _name, config in self.handlers.items():
             if service == "postgres" and config.requires_postgres:
-                handlers.append(name)
+                handlers.append(_name)
             elif service == "redis" and config.requires_redis:
-                handlers.append(name)
+                handlers.append(_name)
             elif service == "rocksdb" and config.requires_rocksdb:
-                handlers.append(name)
+                handlers.append(_name)
         return handlers
 
     def generate_github_actions_matrix(self) -> dict[str, Any]:
         """Generate GitHub Actions matrix configuration."""
         matrix_config = {"cache-handler": []}
 
-        for name, config in self.handlers.items():
+        for _name, config in self.handlers.items():
             matrix_config["cache-handler"].append(
                 {
                     "name": config.name,
@@ -288,7 +288,7 @@ class CIEnvironmentConfig:
         print("Cache Handler Summary")
         print("=" * 50)
 
-        for name, config in self.handlers.items():
+        for _name, config in self.handlers.items():
             print(f"\n{config.name}:")
             print(f"  Backend: {config.backend}")
             print(f"  Table Prefix: {config.table_prefix}")

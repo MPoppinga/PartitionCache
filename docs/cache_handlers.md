@@ -20,7 +20,7 @@ PartitionCache supports multiple cache backends with different performance chara
 - **Type**: `postgresql_bit`
 - **Storage**: Bit arrays (PostgreSQL bit strings)
 - **Datatypes**: `integer` only
-- **Best for**: Large integer datasets, memory efficiency
+- **Best for**: Large integer datasets, memory efficiency if all integers are used as partition keys
 - **Memory**: Highly efficient for integers
 - **Scalability**: Excellent (database-native)
 
@@ -47,7 +47,7 @@ PartitionCache supports multiple cache backends with different performance chara
 - **Storage**: Redis bit arrays
 - **Datatypes**: `integer` only  
 - **Best for**: Large integer datasets in distributed setup
-- **Memory**: Highly efficient for integers
+- **Memory**: Efficient for integers
 - **Scalability**: Excellent (network-distributed)
 
 ### RocksDB Backends
@@ -72,7 +72,7 @@ PartitionCache supports multiple cache backends with different performance chara
 - **Type**: `rocksdict`
 - **Storage**: RocksDB with rich datatypes
 - **Datatypes**: `integer`, `float`, `text`, `timestamp`
-- **Best for**: Development, testing, embedded applications
+- **Best for**: Development, flexible storage, embedded applications
 - **Memory**: Disk-based with cache
 - **Scalability**: Good (single-instance)
 
@@ -130,26 +130,28 @@ cache.set_set("key2", {"a", "b"}, partition_key="test")
 
 | Use Case | Volume | Datatypes | Recommended Backend | Notes |
 |----------|--------|-----------|-------------------|-------|
-| High-volume integers | Large | integer only | postgresql_bit, redis_bit | Bit arrays most efficient |
+| High-volume integers | Large | integer only | postgresql_roaringbit, postgresql_bit, redis_bit | Bit arrays most efficient |
 | Mixed datatypes | Any | multiple | postgresql_array, rocksdict | Full datatype support |
 | Distributed system | Any | integer, text | redis_set, redis_bit | Network-accessible |
 | Development/testing | Any | any | rocksdict | No server setup required |
 | Time-series data | Large | timestamp | postgresql_array | Native timestamp support |
-| Geographic data | Large | float | postgresql_array, rocksdict | Precision handling |
+| Geographic data | Large | float | postgresql_array | PostGIS support |
 
 ### Memory Efficiency Comparison
 
 For 1 million integer partition keys:
 
+TODO: Numbers not updated yet, needs to be updated for current implementation
 | Backend | Memory Usage | Storage Format |
 |---------|-------------|----------------|
-| postgresql_bit | ~125 KB | Bit array |
-| redis_bit | ~125 KB | Bit array |
+| postgresql_bit | ~100 KB | Bit array |
+| postgresql_roaringbit | ~? KB | Roaring bitmap |
+| redis_bit | ~1 MB | Bit array |
 | rocksdb_bit | ~125 KB | Bit array |
-| postgresql_array | ~4 MB | Integer array |
+| postgresql_array | ~ 300 KB | Integer array |
 | redis_set | ~8 MB | Set of strings |
-| rocksdb_set | ~6 MB | Key-value pairs |
-| rocksdict | ~4 MB | Serialized data |
+| rocksdb_set | ~200 KB | Key-value pairs |
+| rocksdict | ~200 KB | Serialized data |
 
 ## API Reference
 
@@ -273,18 +275,8 @@ print(f"Intersection: {set(intersection)} from {count} keys")
 - **Compression**: Extremely efficient for sparse datasets
 - **No Size Limits**: No predefined bitsize required (unlike bit handler)
 - **Fast Operations**: Optimized intersection and union operations
-- **Industry Standard**: Used by Apache Lucene, Elasticsearch, and others
 - **Memory Efficient**: Adaptive compression based on data density
 
-## Backward Compatibility
-
-All existing code using the default `partition_key="partition_key"` continues to work:
-
-```python
-# Default partition key behavior
-cache.set_set("key", {1, 2, 3})  # Uses default partition_key="partition_key"
-cache.get("key")                 # Uses default partition_key="partition_key"
-```
 
 ## Best Practices
 
@@ -301,6 +293,7 @@ cache.get("key")                 # Uses default partition_key="partition_key"
 ### Performance Optimization
 - Separate hot/cold data into different partitions
 - Use partition keys that align with query patterns
+- Use PostgreSQL partitioning or multi-column indexes with the partition key to optimize query performance
 - Monitor partition sizes and redistribute if needed
 
 ### Backend Selection

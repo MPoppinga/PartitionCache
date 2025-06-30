@@ -152,7 +152,7 @@ print(optimized)
 
 #### `apply_cache_lazy(query: str, cache_handler: AbstractCacheHandler_Lazy, partition_key: str, method: Literal["IN_SUBQUERY", "TMP_TABLE_IN", "TMP_TABLE_JOIN"] = "IN_SUBQUERY", p0_alias: str | None = None, min_component_size: int = 2, canonicalize_queries: bool = False, follow_graph: bool = True, analyze_tmp_table: bool = True, use_p0_table: bool = False, p0_table_name: str | None = None)`
 
-**🆕 Recommended** - High-performance cache application with lazy evaluation.
+**Recommended** - High-performance cache application with lazy evaluation.
 
 **Parameters:**
 - `query` (str): SQL query to optimize
@@ -172,7 +172,7 @@ print(optimized)
 
 **Example:**
 ```python
-# Modern high-performance approach
+# Best-performance approach
 enhanced_query, stats = partitioncache.apply_cache_lazy(
     query="SELECT * FROM orders o WHERE status = 'pending'",
     cache_handler=cache.underlying_handler,
@@ -189,15 +189,13 @@ print(f"Query enhanced: {stats['enhanced']}")
 ```
 
 **Performance Benefits:**
-- ~50% reduction in hash generation overhead
 - Lazy SQL subquery evaluation
 - Optimal database query plan integration
-- Comprehensive statistics reporting
 
 **Integration Methods:**
 
 ```python
-# Method 1: Direct subquery integration (fastest for simple queries)
+# Method 1: Direct subquery integration (fastest for simple queries or a low number of partitions)
 enhanced_query, stats = partitioncache.apply_cache_lazy(
     query="SELECT * FROM products WHERE category = 'electronics'",
     cache_handler=cache.underlying_handler,
@@ -205,7 +203,7 @@ enhanced_query, stats = partitioncache.apply_cache_lazy(
     method="IN_SUBQUERY"
 )
 
-# Method 2: Temporary table with IN clause (best for complex queries)
+# Method 2: Temporary table with IN clause (best for complex queries or a high number of partitions)
 enhanced_query, stats = partitioncache.apply_cache_lazy(
     query="SELECT * FROM products WHERE category = 'electronics'",
     cache_handler=cache.underlying_handler,
@@ -214,7 +212,7 @@ enhanced_query, stats = partitioncache.apply_cache_lazy(
     analyze_tmp_table=True  # Enables indexing and statistics
 )
 
-# Method 3: Temporary table with JOIN (optimal for large result sets)
+# Method 3: Temporary table with JOIN (best for large result sets)
 enhanced_query, stats = partitioncache.apply_cache_lazy(
     query="SELECT p.*, s.name FROM products p JOIN stores s ON p.store_id = s.id",
     cache_handler=cache.underlying_handler,
@@ -387,7 +385,7 @@ print(f"Intersection: {intersection} (from {hits} cache hits)")
 
 ##### `get_intersected_lazy(keys: set[str], partition_key: str = "partition_key") -> tuple[str | None, int]`
 
-🆕 **Advanced** - Returns lazy SQL subquery for intersection operations.
+**Advanced** - Returns lazy SQL subquery for intersection operations.
 
 **Returns:**
 - `Tuple[str | None, int]`: (sql_subquery, cache_hits)
@@ -709,7 +707,7 @@ def setup_cache_with_cleanup():
 def optimized_query_execution(query, cache, partition_key):
     """Execute query with optimal cache integration."""
     
-    # Use modern lazy cache application
+    # Use lazy cache application
     enhanced_query, stats = partitioncache.apply_cache_lazy(
         query=query,
         cache_handler=cache.underlying_handler,

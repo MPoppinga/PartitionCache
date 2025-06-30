@@ -66,7 +66,7 @@ tests/
 
 ### PostgreSQL
 - **Required Version**: 14+
-- **Extensions**: pg_cron (required for queue tests), roaringbitmap (optional)
+- **Extensions**: pg_cron (required for queue tests), roaringbitmap (required for roaringbitmap backend)
 - **Databases**: Separate databases for each test job to ensure isolation
 - **Tables**: Automatically created during test setup
 
@@ -91,7 +91,7 @@ tests/
 
 2. **Load environment variables**:
 ```bash
-source .env.integration
+source scripts/load_env.sh
 ```
 
 3. **Run all integration tests**:
@@ -137,8 +137,6 @@ The CI/CD pipeline runs tests in a matrix configuration:
 1. **Database Isolation**: Each job gets a unique database name with run ID
 2. **Service Containers**: Uses Docker services instead of docker-compose
 3. **Parallel Execution**: Jobs run concurrently with resource isolation
-4. **Artifact Collection**: Test results and coverage reports are uploaded
-5. **Conditional Testing**: Performance tests only run on main branch pushes
 
 ### Environment Variables
 
@@ -226,18 +224,4 @@ For tests that must use pg_cron:
 - Tests clean up their jobs after completion
 - Only one test class uses pg_cron to minimize conflicts
 
-## Performance Expectations
 
-- **Basic Operations**: < 10ms per operation
-- **Bulk Operations**: > 1000 ops/second
-- **Queue Processing**: < 100ms latency
-- **Memory Usage**: < 100MB for test data
-- **Concurrent Access**: Support 10+ concurrent clients
-
-## Best Practices
-
-1. **Isolation**: Each test should clean up after itself
-2. **Determinism**: Tests should produce consistent results
-3. **Coverage**: Test both success and failure paths
-4. **Documentation**: Document any special requirements
-5. **Performance**: Keep individual tests under 30 seconds

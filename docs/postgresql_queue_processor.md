@@ -202,10 +202,10 @@ SELECT partitioncache_manual_process_queue(5);
 ## Processing State Machine
 
 ```
-┌─────────────┐     ┌──────────────┐     ┌─────────────┐
+┌─────────────┐      ┌──────────────┐     ┌─────────────┐
 │ Query Added │────▶│ Queue Item   │────▶│ Available   │
-│ to Queue    │     │ Created      │     │ for Process │
-└─────────────┘     └──────────────┘     └─────────────┘
+│ to Queue    │      │ Created      │     │ for Process │
+└─────────────┘      └──────────────┘     └─────────────┘
                                                 │
                 ┌─────────────────────────────────┘
                 ▼
@@ -213,24 +213,24 @@ SELECT partitioncache_manual_process_queue(5);
         │ Job Started │────▶│ Query        │────▶│ Cache       │
         │ (logged)    │     │ Executing    │     │ Updated     │
         └─────────────┘     └──────────────┘     └─────────────┘
-                │                   │                   │
-                │                   ▼                   │
-                │           ┌──────────────┐           │
-                │           │ Error/       │           │
-                │           │ Exception    │           │
-                │           └──────────────┘           │
-                │                   │                   │
-                ▼                   ▼                   ▼
-        ┌─────────────┐     ┌──────────────┐     ┌─────────────┐
-        │ Job Cleaned │◀────│ Job Cleaned  │◀────│ Job Success │
-        │ (failed)    │     │ (failed)     │     │ (completed) │
-        └─────────────┘     └──────────────┘     └─────────────┘
-                │                   │                   │
-                ▼                   ▼                   ▼
-        ┌─────────────┐     ┌──────────────┐     ┌─────────────┐
-        │ Logged as   │     │ Logged as    │     │ Logged as   │
-        │ 'failed'    │     │ 'failed'     │     │ 'success'   │
-        └─────────────┘     └──────────────┘     └─────────────┘
+                                  │                   │
+                                  ▼                   │
+                          ┌──────────────┐            │
+                          │ Error/       │            │
+                          │ Exception    │            │
+                          └──────────────┘            │
+                                  │                   │
+                                  ▼                   ▼
+                          ┌──────────────┐     ┌─────────────┐
+                          │ Job Cleaned  │◀────│ Job Success │
+                          │ (failed)     │     │ (completed) │
+                          └──────────────┘     └─────────────┘
+                                  │                   │
+                                  ▼                   ▼
+                          ┌──────────────┐     ┌─────────────┐
+                          │ Logged as    │     │ Logged as   │
+                          │ 'failed'     │     │ 'success'   │
+                          └──────────────┘     └─────────────┘
 ```
 
 ## Installation and Setup
@@ -264,50 +264,6 @@ pcache-postgresql-queue-processor setup \
     --enable-after-setup
 ```
 
-#### 2. Manual SQL Setup
-
-If you prefer manual setup:
-
-```sql
--- 1. Create processor configuration table
-CREATE TABLE IF NOT EXISTS partitioncache_processor_config (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
--- 2. Create monitoring tables
-CREATE TABLE IF NOT EXISTS partitioncache_processor_log (
-    id SERIAL PRIMARY KEY,
-    job_id TEXT NOT NULL,
-    query_hash TEXT NOT NULL,
-    partition_key TEXT NOT NULL,
-    status TEXT NOT NULL CHECK (status IN ('started', 'success', 'failed', 'timeout', 'skipped')),
-    error_message TEXT,
-    rows_affected INTEGER,
-    execution_time_ms NUMERIC(10,3),
-    execution_source TEXT NOT NULL CHECK (execution_source IN ('cron', 'manual', 'unknown')),
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
--- 3. Create active jobs tracking
-CREATE TABLE IF NOT EXISTS partitioncache_active_jobs (
-    query_hash TEXT,
-    partition_key TEXT,
-    job_id TEXT,
-    started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (query_hash, partition_key)
-);
-
--- 4. Install processor functions (see SQL file)
-\i path/to/postgresql_queue_processor.sql
-\i path/to/postgresql_queue_processor_info.sql
-
--- 5. Configure pg_cron jobs (multiple workers created automatically)
--- Jobs are created via trigger when processor configuration is updated
--- Example job names: partitioncache_process_queue_1, partitioncache_process_queue_2, etc.
-```
-
 ## Configuration
 
 ### Environment Variables
@@ -339,7 +295,7 @@ PG_BIT_CACHE_TABLE_PREFIX=my_custom_prefix
 Update configuration:
 
 ```sql
--- Disable processor temporarily
+-- Disable processor temporarily (optional)
 SELECT set_processor_enabled(false);
 
 -- Increase parallel processing
@@ -423,12 +379,10 @@ END IF;
 
 **Currently Supported:**
 - ✅ **PostgreSQL Array**: Full support with automatic detection
-- ✅ **Schema Detection**: Automatic backend type identification
+- ✅ **PostgreSQL Bit**: Full support with automatic detection
+- ✅ **PostgreSQL Roaring Bit**: Full support with automatic detection
 
-**Planned Support:**
-- 🔄 **PostgreSQL Bit**: Backend detection implemented, execution pending
-- 🔄 **Redis Integration**: Direct database-to-Redis population
-- 🔄 **RocksDB Support**: File-based cache population
+
 
 ## Monitoring and Logging
 
@@ -596,13 +550,6 @@ External Application
 │  │ └─────────────┘ │    │ └─────────────┘ │           │
 │  └─────────────────┘    └─────────────────┘           │
 └─────────────────────────────────────────────────────────┘
-        ▲
-        │
-┌─────────────────┐
-│ Application     │
-│ Queries Cache   │
-│ (Automatic)     │
-└─────────────────┘
 ```
 
 ## Usage Examples
@@ -616,24 +563,11 @@ pcache-add \
     --query "SELECT DISTINCT city_id FROM pois WHERE type='restaurant'" \
     --partition-key "city_id"
 
-# 2. Monitor processing (automatic via pg_cron)
-python -c "
-import psycopg2
-conn = psycopg2.connect('postgresql://user:pass@host:port/db')
-cur = conn.cursor()
-cur.execute('SELECT * FROM get_processor_status()')
-print(cur.fetchone())
-"
+# 2. Monitor processing 
+pcache-postgresql-queue-processor status
 
 # 3. View processing logs
-python -c "
-import psycopg2
-conn = psycopg2.connect('postgresql://user:pass@host:port/db')
-cur = conn.cursor()
-cur.execute('SELECT * FROM partitioncache_processor_log ORDER BY created_at DESC LIMIT 5')
-for row in cur.fetchall():
-    print(row)
-"
+pcache-postgresql-queue-processor logs
 ```
 
 ### Advanced Configuration
@@ -658,7 +592,7 @@ WHERE status = 'failed'
 AND created_at > CURRENT_TIMESTAMP - INTERVAL '1 hour';
 ```
 
-### Maintenance Operations
+### Maintenance Operations (SQL)
 
 ```sql
 -- Pause processing for maintenance
@@ -778,19 +712,10 @@ pcache-monitor \
 ```
 
 **After (PostgreSQL Queue Processor):**
-```sql
--- Automatic database-native processing
-SELECT partitioncache_process_queue('partitioncache');
--- Runs automatically via pg_cron every 1-30 seconds
+```bash
+pcache-postgresql-queue-processor setup
+pcache-postgresql-queue-processor enable
 ```
-
-### Benefits of Migration
-
-1. **Reliability**: No external process failures or monitoring needed
-2. **Performance**: Direct database operations eliminate network overhead
-3. **Monitoring**: Built-in comprehensive logging and status tracking
-4. **Maintenance**: Reduced operational complexity
-5. **Scalability**: Native database concurrency and resource management
 
 ## Best Practices
 
@@ -815,6 +740,7 @@ SELECT partitioncache_process_queue('partitioncache');
 2. **SQL Injection**: All queries are parameterized and validated
 3. **Resource Limits**: Configure appropriate timeouts and job limits
 4. **Access Control**: Restrict access to processor management functions
+5. **Ensure Trusted Code**: Only use trusted code and trusted environments, as malicious SQL could be executed if provided in the queue
 
 This comprehensive PostgreSQL queue processor implementation provides a robust, scalable, and maintainable solution for automated partition cache management entirely within PostgreSQL. 
 
@@ -961,77 +887,7 @@ Job Execution Flow:
 └─────────────┘  └─────────────┘  └─────────────┘
 ```
 
-## Environment Variable Auto-Detection
 
-```
-get_table_prefix_from_env() Decision Tree:
-
-┌─────────────────────────────────────┐
-│ Read CACHE_BACKEND environment      │
-└─────────────────────────────────────┘
-                │
-                ▼
-        ┌───────────────┐
-        │ Backend Type? │
-        └───────────────┘
-                │
-    ┌───────────┼───────────┐
-    ▼           ▼           ▼
-┌─────────┐ ┌─────────┐ ┌─────────┐
-│ array   │ │ bit     │ │ other   │
-└─────────┘ └─────────┘ └─────────┘
-    │           │           │
-    ▼           ▼           ▼
-┌─────────┐ ┌─────────┐ ┌─────────┐
-│ Read    │ │ Read    │ │ Return  │
-│ PG_ARRAY│ │ PG_BIT_ │ │ default │
-│ _CACHE_ │ │ TABLE   │ │ 'partit-│
-│ TABLE   │ │ TABLE   │ │ oncache'│
-└─────────┘ └─────────┘ └─────────┘
-    │           │           │
-    └───────────┼───────────┘
-                ▼
-        ┌───────────────┐
-        │ Use detected  │
-        │ table prefix  │
-        │ in all        │
-        │ operations    │
-        └───────────────┘
-```
-
-## Complete Processing Timeline
-
-```
-Time: 0s                1s              2s              3s
-      │                 │               │               │
-      ▼                 ▼               ▼               ▼
-┌─────────┐       ┌─────────┐    ┌─────────┐    ┌─────────┐
-│pg_cron  │       │pg_cron  │    │pg_cron  │    │pg_cron  │
-│calls    │       │calls    │    │calls    │    │calls    │
-│function │       │function │    │function │    │function │
-└─────────┘       └─────────┘    └─────────┘    └─────────┘
-     │                 │             │             │
-     ▼                 ▼             ▼             ▼
-┌─────────┐       ┌─────────┐    ┌─────────┐    ┌─────────┐
-│Process  │       │Process  │    │Process  │    │Process  │
-│up to N  │       │up to N  │    │up to N  │    │up to N  │
-│items    │       │items    │    │items    │    │items    │
-└─────────┘       └─────────┘    └─────────┘    └─────────┘
-     │                 │             │             │
-     ▼                 ▼             ▼             ▼
-┌─────────┐       ┌─────────┐    ┌─────────┐    ┌─────────┐
-│Log      │       │Log      │    │Log      │    │Log      │
-│results  │       │results  │    │results  │    │results  │
-│to audit │       │to audit │    │to audit │    │to audit │
-│table    │       │table    │    │table    │    │table    │
-└─────────┘       └─────────┘    └─────────┘    └─────────┘
-
-Status tracking across all executions:
-┌─────────────────────────────────────────────────────────┐
-│ partitioncache_processor_log maintains complete        │
-│ execution history with millisecond timing precision    │
-└─────────────────────────────────────────────────────────┘
-```
 
 ## Parallel Processing Architecture
 

@@ -454,7 +454,9 @@ Next steps:
 - View processor logs: pcache-postgresql-queue-processor logs
 ```
 
-## Performance Benefits Demonstrated
+## Performance Benefits 
+
+TODO: Verify numbers and add more metrics
 
 ### Query Optimization Results
 
@@ -554,17 +556,5 @@ pcache-manage maintenance prune --days 30
 
 - **Small Applications**: 1-2 parallel jobs, 5-second frequency
 - **Medium Applications**: 3-5 parallel jobs, 2-second frequency  
-- **Large Applications**: 5-10 parallel jobs, 1-second frequency
-- **Enterprise**: Multiple processors, dedicated cache instances
+- **Large Applications**: 5-10 parallel jobs, 1-second frequency, dedicated database servers for cache population
 
-## Conclusion
-
-This complete workflow demonstrates PartitionCache's ability to:
-
-1. **Automatically optimize complex spatial queries**
-2. **Provide real-time cache population**
-3. **Scale performance with minimal configuration**
-4. **Integrate seamlessly with existing PostgreSQL workflows**
-5. **Deliver measurable performance improvements**
-
-The PostgreSQL queue processor approach eliminates the need for external monitoring scripts while providing comprehensive logging and error handling. This makes PartitionCache suitable for production deployments requiring high reliability and performance. 

@@ -242,8 +242,8 @@ graph TB
         end
         
         subgraph "Cache Tables"
-            CacheTable[{prefix}_cache_{partition_key}<br/>- query_hash<br/>- value (array/bit/roaring)]
-            QueriesTable[{prefix}_queries<br/>- query_hash, query<br/>- partition_key, last_seen]
+            CacheTable["{prefix}_cache_{partition_key}<br/>- query_hash<br/>- value (array/bit/roaring)"]
+            QueriesTable["{prefix}_queries<br/>- query_hash, query<br/>- partition_key, last_seen"]
         end
         
         subgraph "Processing Functions"

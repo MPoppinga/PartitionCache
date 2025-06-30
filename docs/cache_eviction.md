@@ -190,7 +190,7 @@ pcache-manage maintenance evict \
 | **rocksdb_set** | ❌ No | ✅ Yes |
 | **rocksdb_bit** | ❌ No | ✅ Yes |
 
-**Note:** The `oldest` strategy requires access to query timestamps, which is only available in PostgreSQL-based caches.
+**Note:** The `oldest` strategy requires access to query timestamps, which is currently only available in PostgreSQL-based caches.
 
 ## Best Practices
 
@@ -217,13 +217,8 @@ pcache-manage maintenance evict \
 ### Strategy Selection
 
 - **Oldest Strategy**: Best for time-sensitive data where older queries are less relevant
-- **Largest Strategy**: Best for memory optimization where large result sets consume disproportionate resources
+- **Largest Strategy**: Best for memory optimization where large result sets consume disproportionate resources, while providing the least impact on query performance
 
-### Frequency Tuning
-
-- **High-Volume Systems**: 15-30 minute intervals
-- **Medium-Volume Systems**: 1-2 hour intervals  
-- **Low-Volume Systems**: 4-24 hour intervals
 
 ## Integration Examples
 
@@ -280,10 +275,3 @@ Status: failed | Message: No count column found
 ```
 **Solution**: Ensure cache tables have been created through normal caching operations, which creates the required count columns.
 
-### Performance Impact
-
-- **PostgreSQL Eviction Manager**: Minimal impact, runs during low-activity periods
-- **Manual Eviction**: May cause temporary performance impact during execution
-- **Monitoring Overhead**: Negligible database overhead for logging and configuration
-
-This comprehensive eviction system ensures your PartitionCache deployments remain performant and resource-efficient while providing the flexibility to choose the right approach for your specific use case. 

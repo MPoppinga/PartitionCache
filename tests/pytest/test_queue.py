@@ -3,18 +3,19 @@ Unit tests for the queue module.
 """
 
 import os
-import pytest
 from unittest.mock import Mock, patch
+
+import pytest
+
 from partitioncache.queue import (
-    push_to_original_query_queue,
-    push_to_query_fragment_queue,
-    pop_from_original_query_queue,
-    pop_from_query_fragment_queue,
-    push_to_queue,
-    get_queue_lengths,
+    clear_all_queues,
     clear_original_query_queue,
     clear_query_fragment_queue,
-    clear_all_queues,
+    get_queue_lengths,
+    pop_from_original_query_queue,
+    pop_from_query_fragment_queue,
+    push_to_original_query_queue,
+    push_to_query_fragment_queue,
 )
 
 
@@ -156,28 +157,6 @@ class TestQueryFragmentQueue:
         mock_handler.pop_from_query_fragment_queue.assert_called_once()
 
 
-class TestLegacyFunctions:
-    """Test legacy functions and compatibility."""
-
-    @patch("partitioncache.queue.push_to_original_query_queue")
-    def test_push_to_queue_calls_original_query_queue(self, mock_push_original):
-        """Test that push_to_queue calls push_to_original_query_queue."""
-        mock_push_original.return_value = True
-
-        result = push_to_queue("SELECT * FROM table", "test_partition_key")
-
-        assert result is True
-        mock_push_original.assert_called_once_with("SELECT * FROM table", "test_partition_key", None, None)
-
-    @patch("partitioncache.queue.push_to_original_query_queue")
-    def test_push_to_queue_default_partition_key(self, mock_push_original):
-        """Test that push_to_queue uses default partition key."""
-        mock_push_original.return_value = True
-
-        result = push_to_queue("SELECT * FROM table")
-
-        assert result is True
-        mock_push_original.assert_called_once_with("SELECT * FROM table", "partition_key", None, None)
 
 
 class TestQueueLengths:

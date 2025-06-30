@@ -80,36 +80,36 @@ def check_env_vars():
     print("Environment Variable Check")
     print("=" * 50)
 
-    print("\n🗄️ Cache Database Variables:")
+    print("\nCache Database Variables:")
     for var, value in cache_vars.items():
-        status = "✅" if value else "❌"
+        status = "[OK]" if value else "[MISSING]"
         print(f"  {status} {var}: {value or 'NOT SET'}")
 
-    print("\n📬 Queue Variables:")
+    print("\nQueue Variables:")
     for var, value in queue_vars.items():
-        status = "✅" if value else "❌"
+        status = "[OK]" if value else "[MISSING]"
         print(f"  {status} {var}: {value or 'NOT SET'}")
 
-    print("\n🔧 Cache Backend Variables:")
+    print("\nCache Backend Variables:")
     for var, value in cache_backend_vars.items():
-        status = "✅" if value else "❌"
+        status = "[OK]" if value else "[MISSING]"
         print(f"  {status} {var}: {value or 'NOT SET'}")
 
     if backend_specific_vars:
-        print(f"\n🎯 {backend.upper()} Backend-Specific Variables:")
+        print(f"\n{backend.upper()} Backend-Specific Variables:")
         for var, value in backend_specific_vars.items():
-            status = "✅" if value else "❌"
+            status = "[OK]" if value else "[MISSING]"
             print(f"  {status} {var}: {value or 'NOT SET'}")
     elif backend:
-        print(f"\n🎯 {backend.upper()} Backend: No additional variables required")
+        print(f"\n{backend.upper()} Backend: No additional variables required")
 
     # Check for legacy variables that might cause confusion
-    print("\n🔍 Legacy Variables (for reference):")
+    print("\nLegacy Variables (for reference):")
     legacy_vars = ["PG_HOST", "PG_PORT", "PG_USER", "PG_PASSWORD", "PG_DBNAME"]
     for var in legacy_vars:
         value = os.getenv(var)
         if value:
-            print(f"  📝 {var}: {value}")
+            print(f"  [FOUND] {var}: {value}")
 
     # Validation
     missing_cache = [var for var, value in cache_vars.items() if not value]
