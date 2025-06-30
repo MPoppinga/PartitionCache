@@ -29,9 +29,10 @@ import sys
 from logging import getLogger
 from pathlib import Path
 
-import dotenv
 import psycopg
 from psycopg import sql
+
+from partitioncache.cli.common_args import add_environment_args, load_environment_with_validation
 
 logger = getLogger("PartitionCache.PostgreSQLQueueProcessor")
 
@@ -511,7 +512,7 @@ def view_logs(conn, limit: int = 20, status_filter: str | None = None, queue_pre
 
     with conn.cursor() as cur:
         query = sql.SQL("SELECT * FROM {}").format(sql.Identifier(log_table))
-        params = []
+        params: list = []  # type: ignore[type-arg]
         if status_filter:
             query += sql.SQL(" WHERE status = %s")
             params.append(status_filter)
@@ -558,27 +559,17 @@ def manual_process_queue(conn, count: int):
 
 def main():
     """Main function to handle CLI commands."""
-    # A parent parser for global options like --env that we need to process early
-    env_parser = argparse.ArgumentParser(add_help=False)
-    env_parser.add_argument("--env", default=".env", help="Path to the .env file to load.")
+    # Create main parser
+    parser = argparse.ArgumentParser(description="Manage PostgreSQL queue processor for PartitionCache.")
 
-    # Parse the --env argument first, ignoring other args
-    env_args, _ = env_parser.parse_known_args()
+    # Add common environment arguments
+    add_environment_args(parser)
 
-    # Load .env file if specified and it exists
-    env_path = Path(env_args.env)
-    if env_path.is_file():
-        logger.info(f"Loading environment variables from {env_path}")
-        dotenv.load_dotenv(dotenv_path=env_path)
-    elif env_args.env != ".env":
-        # Only warn if a non-default path was given and not found
-        logger.warning(f"Specified environment file not found: {env_path}")
+    # Parse environment arguments early to load config
+    env_args, _ = parser.parse_known_args()
 
-    # Main parser that inherits the --env option for help messages
-    parser = argparse.ArgumentParser(
-        description="Manage PostgreSQL queue processor for PartitionCache.",
-        parents=[env_parser],
-    )
+    # Load environment variables
+    load_environment_with_validation(env_args.env_file)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     # setup command

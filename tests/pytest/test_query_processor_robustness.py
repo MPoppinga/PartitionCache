@@ -5,8 +5,9 @@ These tests are designed to catch issues like the KeyError with unknown aliases
 and ensure the correct processing order for p0 table functionality.
 """
 
-import pytest
 from unittest.mock import Mock, patch
+
+import pytest
 
 from partitioncache.apply_cache import apply_cache_lazy, rewrite_query_with_p0_table
 from partitioncache.cache_handler.abstract import AbstractCacheHandler_Lazy

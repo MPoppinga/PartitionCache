@@ -10,12 +10,17 @@ import os
 import threading
 import time
 
-import dotenv
 import psycopg
 
 from partitioncache.cache_handler import get_cache_handler
+from partitioncache.cli.common_args import (
+    add_database_args,
+    add_environment_args,
+    get_database_connection_params,
+    load_environment_with_validation,
+    resolve_cache_backend,
+)
 from partitioncache.db_handler import get_db_handler
-from partitioncache.db_handler.abstract import AbstractDBHandler
 from partitioncache.query_processor import generate_all_query_hash_pairs
 from partitioncache.queue import (
     get_queue_lengths,
@@ -38,7 +43,7 @@ exit_event = threading.Event()  # Create an event to signal exit
 fragment_processor_exit = threading.Event()  # Exit signal for fragment processor
 
 # Add logging control variables
-last_status_log_time = 0
+last_status_log_time = 0.0
 status_log_interval = 10  # Log status every 10 seconds when idle
 
 
@@ -90,33 +95,21 @@ def run_and_store_query(query: str, query_hash: str, partition_key: str, partiti
         partition_key: Partition key for organizing cached results
         partition_datatype: Datatype of the partition key (default: None)
     """
-    if not args.db_name:
-        args.db_name = os.getenv("DB_NAME")
     try:
-        cache_handler = get_cache_handler(args.cache_backend)
+        # Resolve cache backend
+        cache_backend = resolve_cache_backend(args)
+        cache_handler = get_cache_handler(cache_backend)
 
-        db_handler: AbstractDBHandler
+        # Get database connection parameters
+        db_connection_params = get_database_connection_params(args)
+
         if args.db_backend == "postgresql":
-            db_handler = get_db_handler(
-                "postgres",
-                host=os.getenv("PG_DB_HOST", os.getenv("DB_HOST", "localhost")),
-                port=int(os.getenv("PG_DB_PORT", os.getenv("DB_PORT", 5432))),
-                user=os.getenv("PG_DB_USER", os.getenv("DB_USER", "postgres")),
-                password=os.getenv("PG_DB_PASSWORD", os.getenv("DB_PASSWORD", "postgres")),
-                dbname=args.db_name,
-                timeout=args.long_running_query_timeout,
-            )
+            db_connection_params["timeout"] = args.long_running_query_timeout
+            db_handler = get_db_handler("postgres", **db_connection_params)
         elif args.db_backend == "mysql":
-            db_handler = get_db_handler(
-                "mysql",
-                host=os.getenv("MY_DB_HOST", os.getenv("DB_HOST", "localhost")),
-                port=int(os.getenv("MY_DB_PORT", os.getenv("DB_PORT", 3306))),
-                user=os.getenv("MY_DB_USER", os.getenv("DB_USER", "root")),
-                password=os.getenv("MY_DB_PASSWORD", os.getenv("DB_PASSWORD", "root")),
-                dbname=args.db_name,
-            )
+            db_handler = get_db_handler("mysql", **db_connection_params)
         elif args.db_backend == "sqlite":
-            db_handler = get_db_handler("sqlite", db_path=args.db_dir)
+            db_handler = get_db_handler("sqlite", **db_connection_params)
         else:
             raise AssertionError("No db backend specified, querying not possible")
 
@@ -181,7 +174,7 @@ def process_completed_future(future, query_hash):
             next_query, next_hash, next_partition_key, next_partition_datatype = pending_jobs.pop(0)
             new_future = pool.submit(run_and_store_query, next_query, next_hash, next_partition_key, next_partition_datatype)
             active_futures.append(next_hash)
-            new_future.add_done_callback(lambda f, h=next_hash: process_completed_future(f, h))
+            new_future.add_done_callback(lambda f, h=next_hash: process_completed_future(f, h))  # type: ignore[misc]
             print(f"Started query {next_hash} from pending queue")
 
         # Check queue lengths for status using generic function
@@ -305,30 +298,23 @@ def validate_queue_configuration():
 
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Monitor cache queue and process queries")
 
-    parser.add_argument("--db-backend", type=str, default="postgresql", help="database backend", choices=["postgresql", "mysql", "sqlite"])
-    parser.add_argument("--cache-backend", type=str, default=None, help="cache backend")
-    parser.add_argument("--db-dir", type=str, default="data/test_db.sqlite", help="database directory")
-    parser.add_argument("--env", type=str, default=".env", help="Path to environment file with database credentials")
-    parser.add_argument("--close", action="store_true", default=False, help="Close the cache after operation")
+    # Processing configuration
+    processing_group = parser.add_argument_group("processing options")
+    processing_group.add_argument("--close", action="store_true", default=False, help="Close the cache after operation")
+    processing_group.add_argument("--max-processes", type=int, default=12, help="Max number of processes to use")
+    processing_group.add_argument("--long-running-query-timeout", type=str, default="0", help="Timeout for long running queries")
+    processing_group.add_argument("--limit", type=int, default=None, help="Limit the number of returned partition keys")
+    processing_group.add_argument("--status-log-interval", type=int, default=10, help="Interval in seconds for logging status when queues are empty (default: 10)")
+    processing_group.add_argument("--disable-optimized-polling", action="store_true", help="Disable optimized polling and use simple polling")
 
-    parser.add_argument("--max-processes", type=int, default=12, help="max number of processes to use")
-    # DB Info
-    parser.add_argument(
-        "--db-name",
-        action="store",
-        type=str,
-        help="database name",
-    )
+    # Add common argument groups
+    add_database_args(parser)
+    add_environment_args(parser)
 
-    parser.add_argument("--long-running-query-timeout", type=str, default="0", help="timeout for long running queries")
-
-    parser.add_argument("--limit", type=int, default=None, help="limit the number of returned partition keys")
-
-    parser.add_argument("--status-log-interval", type=int, default=10, help="interval in seconds for logging status when queues are empty (default: 10)")
-
-    parser.add_argument("--disable-optimized-polling", action="store_true", help="disable optimized polling and use simple polling")
+    # Cache backend argument (not using add_cache_args because this tool doesn't need partition args)
+    parser.add_argument("--cache-backend", type=str, help="Cache backend to use (if not specified, uses CACHE_BACKEND environment variable)")
 
     global args
     args = parser.parse_args()
@@ -337,9 +323,10 @@ def main():
     if args.db_backend is None:
         raise ValueError("db_backend is required")
 
-    # Load dotenv
-    dotenv.load_dotenv(args.env)
+    # Load environment variables
+    load_environment_with_validation(args.env_file)
 
+    # Set cache backend if not specified
     if args.cache_backend is None:
         args.cache_backend = os.getenv("CACHE_BACKEND", "postgresql_bit")
 

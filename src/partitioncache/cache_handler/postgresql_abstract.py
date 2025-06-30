@@ -369,6 +369,21 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
             logger.error(f"Failed to get partition keys: {e}")
             return []
 
+    def get_datatype(self, partition_key: str) -> str | None:
+        """Get the datatype of the cache handler. If the partition key is not set, return None."""
+        return self._get_partition_datatype(partition_key)
+
+    def register_partition_key(self, partition_key: str, datatype: str, **kwargs) -> None:
+        """Register a partition key with the cache handler."""
+        if datatype not in self.get_supported_datatypes():
+            raise ValueError(f"Handler supports only {self.get_supported_datatypes()} datatypes, got: {datatype}")
+        self._ensure_partition_table(partition_key, datatype, **kwargs)
+
+    @abstractmethod
+    def _ensure_partition_table(self, partition_key: str, datatype: str, **kwargs) -> None:
+        """Ensure a partition table exists. Must be implemented by subclasses."""
+        pass
+
     @classmethod
     @abstractmethod
     def get_supported_datatypes(cls) -> set[str]:

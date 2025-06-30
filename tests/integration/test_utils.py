@@ -20,7 +20,7 @@ def compare_cache_values(retrieved, expected):
         return False
     if not expected and not retrieved:
         return True
-        
+
     # Handle BitMap objects from roaringbit backend
     try:
         from pyroaring import BitMap
@@ -28,15 +28,15 @@ def compare_cache_values(retrieved, expected):
             return set(retrieved) == expected
     except ImportError:
         pass
-    
+
     # Handle regular sets and other iterable types
     if hasattr(retrieved, '__iter__') and not isinstance(retrieved, (str, bytes)):
         return set(retrieved) == expected
-    
+
     # Handle single values
     if not hasattr(expected, '__iter__') or isinstance(expected, (str, bytes)):
         return retrieved == expected
-    
+
     # Default comparison
     return retrieved == expected
 
@@ -53,7 +53,7 @@ def normalize_cache_result(value):
     """
     if value is None:
         return set()
-        
+
     # Handle BitMap objects from roaringbit backend
     try:
         from pyroaring import BitMap
@@ -61,10 +61,10 @@ def normalize_cache_result(value):
             return set(value)
     except ImportError:
         pass
-    
+
     # Handle iterable types (but not strings/bytes)
     if hasattr(value, '__iter__') and not isinstance(value, (str, bytes)):
         return set(value)
-    
+
     # Handle single values
     return {value} if value else set()

@@ -23,8 +23,8 @@ try:
 
     ROCKSDB_AVAILABLE = True
 except ImportError:
-    RocksDBCacheHandler = None
-    RocksDBBitCacheHandler = None
+    RocksDBCacheHandler = None  # type: ignore[misc, assignment]
+    RocksDBBitCacheHandler = None  # type: ignore[misc, assignment]
     ROCKSDB_AVAILABLE = False
 from partitioncache.queue import get_queue_lengths, push_to_original_query_queue, push_to_query_fragment_queue
 
@@ -70,7 +70,7 @@ def list_cache_types() -> dict[str, list[str]]:
     if ROCKSDB_AVAILABLE:
         handler_classes["rocksdb_set"] = RocksDBCacheHandler
         handler_classes["rocksdb_bit"] = RocksDBBitCacheHandler
-    return {name: sorted(cls.get_supported_datatypes()) for name, cls in handler_classes.items()}
+    return {name: sorted(cls.get_supported_datatypes()) for name, cls in handler_classes.items() if cls is not None}  # type: ignore[attr-defined]
 
 
 __all__ = [

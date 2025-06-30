@@ -11,7 +11,6 @@ This module tests PartitionCache with spatial data, including:
 import os
 from pathlib import Path
 
-import psycopg
 import pytest
 
 # Import PartitionCache modules

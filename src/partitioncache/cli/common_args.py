@@ -1,0 +1,300 @@
+"""
+Common CLI argument definitions and utilities for PartitionCache CLI tools.
+
+This module provides reusable argument groups and utilities to ensure
+consistency across all CLI tools and reduce code duplication.
+"""
+
+import argparse
+import os
+import sys
+from pathlib import Path
+from typing import Any
+
+import dotenv
+
+
+def add_database_args(parser: argparse.ArgumentParser, include_sqlite: bool = True) -> None:
+    """
+    Add common database connection arguments to an ArgumentParser.
+
+    Args:
+        parser: The ArgumentParser to add arguments to
+        include_sqlite: Whether to include SQLite in backend choices
+    """
+    db_group = parser.add_argument_group("database connection")
+
+    # Database backend selection
+    backend_choices = ["postgresql", "mysql"]
+    if include_sqlite:
+        backend_choices.append("sqlite")
+
+    db_group.add_argument(
+        "--db-backend",
+        type=str,
+        default="postgresql",
+        choices=backend_choices,
+        help="Database backend to use (default: postgresql)"
+    )
+
+    # Database name/path
+    db_group.add_argument(
+        "--db-name",
+        type=str,
+        help="Database name (if not specified, uses DB_NAME environment variable)"
+    )
+
+    if include_sqlite:
+        db_group.add_argument(
+            "--db-dir",
+            type=str,
+            default="data/test_db.sqlite",
+            help="Database directory/path for SQLite (default: data/test_db.sqlite)"
+        )
+
+
+def add_cache_args(parser: argparse.ArgumentParser, require_partition_key: bool = False) -> None:
+    """
+    Add common cache-related arguments to an ArgumentParser.
+
+    Args:
+        parser: The ArgumentParser to add arguments to
+        require_partition_key: Whether partition key is required
+    """
+    cache_group = parser.add_argument_group("cache configuration")
+
+    cache_group.add_argument(
+        "--cache-backend",
+        type=str,
+        help="Cache backend to use (if not specified, uses CACHE_BACKEND environment variable)"
+    )
+
+    cache_group.add_argument(
+        "--partition-key",
+        type=str,
+        required=require_partition_key,
+        help="Name of the partition key column"
+    )
+
+    cache_group.add_argument(
+        "--partition-datatype",
+        type=str,
+        choices=["integer", "float", "text", "timestamp"],
+        help="Datatype of the partition key (if not specified, will be inferred)"
+    )
+
+
+def add_environment_args(parser: argparse.ArgumentParser) -> None:
+    """
+    Add environment file loading arguments to an ArgumentParser.
+
+    Args:
+        parser: The ArgumentParser to add arguments to
+    """
+    env_group = parser.add_argument_group("environment")
+
+    env_group.add_argument(
+        "--env-file",
+        "--env",  # Alias for backward compatibility
+        dest="env_file",
+        type=str,
+        default=".env",
+        help="Path to environment file with configuration (default: .env)"
+    )
+
+
+def add_queue_args(parser: argparse.ArgumentParser) -> None:
+    """
+    Add queue-related arguments to an ArgumentParser.
+
+    Args:
+        parser: The ArgumentParser to add arguments to
+    """
+    queue_group = parser.add_argument_group("queue configuration")
+
+    queue_group.add_argument(
+        "--queue-provider",
+        type=str,
+        choices=["postgresql", "redis"],
+        help="Queue provider to use (if not specified, uses QUERY_QUEUE_PROVIDER environment variable)"
+    )
+
+
+def add_output_args(parser: argparse.ArgumentParser) -> None:
+    """
+    Add output formatting arguments to an ArgumentParser.
+
+    Args:
+        parser: The ArgumentParser to add arguments to
+    """
+    output_group = parser.add_argument_group("output options")
+
+    output_group.add_argument(
+        "--output-format",
+        choices=["list", "json", "lines"],
+        default="list",
+        help="Output format: list (comma-separated), json (JSON array), lines (one per line)"
+    )
+
+    output_group.add_argument(
+        "--output-file",
+        type=str,
+        help="Write output to file instead of console"
+    )
+
+
+def load_environment_with_validation(env_file: str, required_vars: list[str] | None = None) -> dict[str, str]:
+    """
+    Load environment variables from file with validation.
+
+    Args:
+        env_file: Path to environment file
+        required_vars: List of required environment variable names
+
+    Returns:
+        Dictionary of loaded environment variables
+
+    Raises:
+        SystemExit: If required variables are missing
+    """
+    # Load environment file if it exists
+    env_path = Path(env_file)
+    if env_path.exists():
+        dotenv.load_dotenv(env_file)
+        print(f"Loaded environment from {env_file}")
+    elif env_file != ".env":  # Only warn if user explicitly specified a file
+        print(f"Warning: Environment file {env_file} not found")
+
+    # Validate required variables
+    if required_vars:
+        missing_vars = [var for var in required_vars if not os.getenv(var)]
+        if missing_vars:
+            print(f"Error: Missing required environment variables: {', '.join(missing_vars)}")
+            print("Please set these variables in your environment or .env file")
+            sys.exit(1)
+
+    # Return current environment
+    return dict(os.environ)
+
+
+def resolve_cache_backend(args: argparse.Namespace) -> str:
+    """
+    Resolve cache backend from arguments or environment.
+
+    Args:
+        args: Parsed command line arguments
+
+    Returns:
+        Cache backend string
+
+    Raises:
+        SystemExit: If no cache backend is specified
+    """
+    cache_backend = getattr(args, 'cache_backend', None) or os.getenv("CACHE_BACKEND")
+
+    if not cache_backend:
+        print("Error: No cache backend specified. Use --cache-backend or set CACHE_BACKEND environment variable")
+        print("Available backends: postgresql_array, postgresql_bit, postgresql_roaringbit, redis_set, redis_bit, rocksdb_set, rocksdb_bit, rocksdict")
+        sys.exit(1)
+
+    return cache_backend
+
+
+def resolve_database_name(args: argparse.Namespace) -> str:
+    """
+    Resolve database name from arguments or environment.
+
+    Args:
+        args: Parsed command line arguments
+
+    Returns:
+        Database name string
+
+    Raises:
+        SystemExit: If no database name is specified
+    """
+    db_name = getattr(args, 'db_name', None) or os.getenv("DB_NAME")
+
+    if not db_name:
+        print("Error: No database name specified. Use --db-name or set DB_NAME environment variable")
+        sys.exit(1)
+
+    return db_name
+
+
+def validate_mutual_exclusivity(args: argparse.Namespace, groups: list[tuple[str, list[str]]]) -> None:
+    """
+    Validate mutual exclusivity of argument groups.
+
+    Args:
+        args: Parsed command line arguments
+        groups: List of (group_name, arg_names) tuples for mutual exclusivity validation
+
+    Raises:
+        SystemExit: If mutual exclusivity is violated
+    """
+    for _group_name, arg_names in groups:
+        specified_args = [arg for arg in arg_names if getattr(args, arg.replace('-', '_'), None)]
+
+        if len(specified_args) == 0:
+            print(f"Error: One of {', '.join(f'--{arg}' for arg in arg_names)} must be specified")
+            sys.exit(1)
+        elif len(specified_args) > 1:
+            print(f"Error: Only one of {', '.join(f'--{arg}' for arg in specified_args)} can be specified")
+            sys.exit(1)
+
+
+def get_database_connection_params(args: argparse.Namespace, backend_type: str | None = None) -> dict[str, Any]:
+    """
+    Get database connection parameters based on backend type and environment.
+
+    Args:
+        args: Parsed command line arguments
+        backend_type: Database backend type (uses args.db_backend if not specified)
+
+    Returns:
+        Dictionary of connection parameters
+    """
+    backend = backend_type or getattr(args, 'db_backend', 'postgresql')
+
+    if backend == "postgresql":
+        return {
+            "host": os.getenv("PG_DB_HOST", os.getenv("DB_HOST", "localhost")),
+            "port": int(os.getenv("PG_DB_PORT", os.getenv("DB_PORT", "5432"))),
+            "user": os.getenv("PG_DB_USER", os.getenv("DB_USER", "postgres")),
+            "password": os.getenv("PG_DB_PASSWORD", os.getenv("DB_PASSWORD", "postgres")),
+            "dbname": resolve_database_name(args),
+        }
+    elif backend == "mysql":
+        return {
+            "host": os.getenv("MY_DB_HOST", os.getenv("DB_HOST", "localhost")),
+            "port": int(os.getenv("MY_DB_PORT", os.getenv("DB_PORT", "3306"))),
+            "user": os.getenv("MY_DB_USER", os.getenv("DB_USER", "root")),
+            "password": os.getenv("MY_DB_PASSWORD", os.getenv("DB_PASSWORD", "root")),
+            "dbname": resolve_database_name(args),
+        }
+    elif backend == "sqlite":
+        return {
+            "db_path": getattr(args, 'db_dir', "data/test_db.sqlite")
+        }
+    else:
+        raise ValueError(f"Unsupported database backend: {backend}")
+
+
+def setup_logging(verbose: bool = False) -> None:
+    """
+    Setup consistent logging configuration for CLI tools.
+
+    Args:
+        verbose: Whether to enable verbose logging
+    """
+    import logging
+
+    level = logging.DEBUG if verbose else logging.INFO
+    format_string = "%(asctime)s - %(name)s - %(levelname)s - %(message)s" if verbose else "%(levelname)s: %(message)s"
+
+    logging.basicConfig(
+        level=level,
+        format=format_string,
+        datefmt="%Y-%m-%d %H:%M:%S"
+    )

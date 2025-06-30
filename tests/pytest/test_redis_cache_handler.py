@@ -1,5 +1,7 @@
-import pytest
 from unittest.mock import Mock, patch
+
+import pytest
+
 from partitioncache.cache_handler.redis_set import RedisCacheHandler
 
 
@@ -195,7 +197,7 @@ def test_get_intersected_multiple_keys(cache_handler, mock_redis):
     result, count = cache_handler.get_intersected(keys)
     assert result == {2, 3}
     assert count == 2
-    mock_redis.sinter.assert_called_with(*[k for k, t in zip(cache_keys, [b"set", b"set", b"hash"]) if t == b"set"])
+    mock_redis.sinter.assert_called_with(*[k for k, t in zip(cache_keys, [b"set", b"set", b"hash"], strict=False) if t == b"set"])
 
 
 def test_close(cache_handler, mock_redis):

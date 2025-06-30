@@ -303,12 +303,3 @@ class PostgreSQLArrayCacheHandler(PostgreSQLAbstractCacheHandler):
 
         return query
 
-    def get_datatype(self, partition_key: str) -> str | None:
-        """Get the datatype of the cache handler. If the partition key is not set, return None."""
-        return self._get_partition_datatype(partition_key)
-
-    def register_partition_key(self, partition_key: str, datatype: str, **kwargs) -> None:
-        """Register a partition key with the cache handler."""
-        if datatype not in self.get_supported_datatypes():
-            raise ValueError(f"PostgreSQL array handler supports only {self.get_supported_datatypes()} datatypes")
-        self._ensure_partition_table(partition_key, datatype)

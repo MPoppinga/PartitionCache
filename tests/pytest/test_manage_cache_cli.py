@@ -213,14 +213,14 @@ class TestManageCacheCLI:
                 main()
                 mock_help.assert_called_once()
 
-    @patch("partitioncache.cli.manage_cache.load_dotenv")
-    def test_env_file_loading(self, mock_load_dotenv):
+    @patch("partitioncache.cli.manage_cache.load_environment_with_validation")
+    def test_env_file_loading(self, mock_load_env):
         """Test that environment file loading works."""
 
         with patch("partitioncache.cli.manage_cache.validate_environment"):
-            with patch("sys.argv", ["manage_cache.py", "--env", "custom.env", "status", "env"]):
+            with patch("sys.argv", ["manage_cache.py", "--env-file", "custom.env", "status", "env"]):
                 main()
-                mock_load_dotenv.assert_called_once_with("custom.env")
+                mock_load_env.assert_called_once_with("custom.env")
 
     def test_error_handling(self):
         """Test that exceptions are handled gracefully."""

@@ -158,8 +158,8 @@ class TestCLICommands:
                 assert "configuration" in result.stderr.lower() or "connection" in result.stderr.lower()
             else:
                 # Success case: either has output indicating success or succeeds silently
-                assert (result.returncode == 0 and 
-                       ("added" in result.stdout.lower() or "processed" in result.stdout.lower() or 
+                assert (result.returncode == 0 and
+                       ("added" in result.stdout.lower() or "processed" in result.stdout.lower() or
                         result.stdout.strip() == ""))
 
         finally:

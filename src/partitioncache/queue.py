@@ -56,7 +56,7 @@ def push_to_original_query_queue(
     """
     try:
         handler = _get_queue_handler(queue_provider)
-        return handler.push_to_original_query_queue(query, partition_key, partition_datatype)
+        return handler.push_to_original_query_queue(query, partition_key, partition_datatype)  # type: ignore[no-any-return]
     except Exception as e:
         logger.error(f"Failed to push query to original query queue: {e}")
         return False
@@ -78,7 +78,7 @@ def push_to_query_fragment_queue(
     """
     try:
         handler = _get_queue_handler(queue_provider)
-        return handler.push_to_query_fragment_queue(query_hash_pairs, partition_key, partition_datatype)
+        return handler.push_to_query_fragment_queue(query_hash_pairs, partition_key, partition_datatype)  # type: ignore[no-any-return]
     except Exception as e:
         logger.error(f"Failed to push fragments to query fragment queue: {e}")
         return False
@@ -93,7 +93,7 @@ def pop_from_original_query_queue(queue_provider: str | None = None) -> tuple[st
     """
     try:
         handler = _get_queue_handler(queue_provider)
-        return handler.pop_from_original_query_queue()
+        return handler.pop_from_original_query_queue()  # type: ignore[no-any-return]
     except Exception as e:
         logger.error(f"Failed to pop from original query queue: {e}")
         return None
@@ -118,7 +118,7 @@ def pop_from_original_query_queue_blocking(timeout: int = 60, queue_provider: st
             return handler.pop_from_original_query_queue_blocking(timeout)  # type: ignore
         else:
             # Fallback to regular pop
-            return handler.pop_from_original_query_queue()
+            return handler.pop_from_original_query_queue()  # type: ignore[no-any-return]
     except Exception as e:
         logger.error(f"Failed to pop from original query queue with blocking: {e}")
         return None
@@ -133,7 +133,7 @@ def pop_from_query_fragment_queue(queue_provider: str | None = None) -> tuple[st
     """
     try:
         handler = _get_queue_handler(queue_provider)
-        return handler.pop_from_query_fragment_queue()
+        return handler.pop_from_query_fragment_queue()  # type: ignore[no-any-return]
     except Exception as e:
         logger.error(f"Failed to pop from query fragment queue: {e}")
         return None
@@ -158,7 +158,7 @@ def pop_from_query_fragment_queue_blocking(timeout: int = 60, queue_provider: st
             return handler.pop_from_query_fragment_queue_blocking(timeout)  # type: ignore
         else:
             # Fallback to regular pop
-            return handler.pop_from_query_fragment_queue()
+            return handler.pop_from_query_fragment_queue()  # type: ignore[no-any-return]
     except Exception as e:
         logger.error(f"Failed to pop from query fragment queue with blocking: {e}")
         return None
@@ -173,7 +173,7 @@ def get_queue_lengths(queue_provider: str | None = None) -> dict:
     """
     try:
         handler = _get_queue_handler(queue_provider)
-        return handler.get_queue_lengths()
+        return handler.get_queue_lengths()  # type: ignore[no-any-return]
     except Exception as e:
         logger.error(f"Failed to get queue lengths: {e}")
         return {"original_query_queue": 0, "query_fragment_queue": 0}
@@ -188,7 +188,7 @@ def clear_original_query_queue(queue_provider: str | None = None) -> int:
     """
     try:
         handler = _get_queue_handler(queue_provider)
-        return handler.clear_original_query_queue()
+        return handler.clear_original_query_queue()  # type: ignore[no-any-return]
     except Exception as e:
         logger.error(f"Failed to clear original query queue: {e}")
         return 0
@@ -203,7 +203,7 @@ def clear_query_fragment_queue(queue_provider: str | None = None) -> int:
     """
     try:
         handler = _get_queue_handler(queue_provider)
-        return handler.clear_query_fragment_queue()
+        return handler.clear_query_fragment_queue()  # type: ignore[no-any-return]
     except Exception as e:
         logger.error(f"Failed to clear query fragment queue: {e}")
         return 0
@@ -218,7 +218,7 @@ def clear_all_queues(queue_provider: str | None = None) -> tuple[int, int]:
     """
     try:
         handler = _get_queue_handler(queue_provider)
-        return handler.clear_all_queues()
+        return handler.clear_all_queues()  # type: ignore[no-any-return]
     except Exception as e:
         logger.error(f"Failed to clear all queues: {e}")
         return (0, 0)

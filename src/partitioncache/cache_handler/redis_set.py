@@ -100,7 +100,7 @@ class RedisCacheHandler(RedisAbstractCacheHandler):
         else:
             intersected = self.db.sinter(*valid_cache_keys)  # type: ignore
 
-        settype = None
+        settype: type[int] | type[str] | None = None
         datatype = self._get_partition_datatype(partition_key)
         if datatype is not None:
             if datatype == "integer":

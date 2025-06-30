@@ -1,7 +1,10 @@
-import pytest
 from unittest.mock import Mock, patch
+
+import pytest
 from bitarray import bitarray
+
 from partitioncache.cache_handler.redis_bit import RedisBitCacheHandler
+
 
 @pytest.fixture
 def mock_redis():

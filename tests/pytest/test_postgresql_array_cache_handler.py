@@ -2,7 +2,6 @@ from unittest.mock import Mock, patch
 
 import psycopg
 import pytest
-from psycopg import sql
 
 from partitioncache.cache_handler.postgresql_array import PostgreSQLArrayCacheHandler
 

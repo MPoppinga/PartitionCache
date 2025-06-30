@@ -6,11 +6,11 @@ import sys
 from logging import getLogger
 from typing import Any
 
-from dotenv import load_dotenv
 from tqdm import tqdm
 
 from partitioncache.cache_handler import get_cache_handler
 from partitioncache.cache_handler.abstract import AbstractCacheHandler
+from partitioncache.cli.common_args import add_environment_args, load_environment_with_validation
 from partitioncache.queue import get_queue_lengths
 from partitioncache.queue_handler import get_queue_handler
 
@@ -268,7 +268,7 @@ def get_all_keys(cache: AbstractCacheHandler) -> list[str]:
                     if isinstance(partition_info, tuple):
                         partition_key = partition_info[0]
                     else:
-                        partition_key = str(partition_info)
+                        partition_key = str(partition_info)  # type: ignore[unreachable]
 
                     keys = cache.get_all_keys(partition_key)
                     all_keys.extend(keys)
@@ -666,7 +666,7 @@ def get_partition_overview(cache_type: str) -> list[dict[str, Any]]:
                 partition_key, datatype = partition_info[0], partition_info[1]
             else:
                 # Handle case where partition_info is just a string
-                partition_key = str(partition_info)
+                partition_key = str(partition_info)  # type: ignore[unreachable]
                 datatype = "unknown"
 
             # Get cache statistics for this partition
@@ -880,12 +880,8 @@ to load configuration from a custom environment file.
         """,
     )
 
-    parser.add_argument(
-        "--env",
-        dest="env_file",
-        default=".env",
-        help="Environment file to use (default: .env)",
-    )
+    # Add common environment arguments
+    add_environment_args(parser)
 
     # Create subparsers
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
@@ -975,7 +971,7 @@ to load configuration from a custom environment file.
     args = parser.parse_args()
 
     # Load environment variables
-    load_dotenv(args.env_file)
+    load_environment_with_validation(args.env_file)
 
     # Handle commands
     if not args.command:

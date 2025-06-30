@@ -91,13 +91,14 @@ class TestCachePerformance:
     @pytest.mark.slow
     def test_intersection_performance(self, cache_client: AbstractCacheHandler):
         """Test performance of set intersection operations."""
-        import pytest
         import os
-        
+
+        import pytest
+
         # Skip in CI parallel execution due to race conditions
         if os.getenv('CI') and 'redis' in getattr(cache_client, '__class__', type(cache_client)).__name__.lower():
             pytest.skip("Skipping Redis intersection performance test in CI due to parallel execution issues")
-        
+
         partition_key = "zipcode"
         num_sets = 50
         set_size = 1000
@@ -360,11 +361,11 @@ class TestCacheRealWorldScenarios:
             )
 
             assert hits > 0, f"No cache hits for query: {query}"
-            
+
             # Use utility function for backend-agnostic comparison
             from .test_utils import normalize_cache_result
             actual_set = normalize_cache_result(partition_keys)
-            
+
             assert actual_set == expected_zipcodes, f"Unexpected results for: {query}"
 
     def test_cache_eviction_simulation(self, cache_client: AbstractCacheHandler):
@@ -395,12 +396,12 @@ class TestCacheRealWorldScenarios:
     def test_partition_key_isolation(self, cache_client: AbstractCacheHandler):
         """Test that different partition keys are properly isolated."""
         import pytest
-        
+
         # Skip for bit backends due to table creation and datatype conflicts
         backend_name = getattr(cache_client, 'backend_type', str(cache_client.__class__.__name__))
         if 'bit' in backend_name.lower():
             pytest.skip(f"Partition isolation test skipped for {backend_name} - requires complex table setup")
-        
+
         zipcode_key = "zipcode"
         region_key = "region_isolation"  # Use different key to avoid conflicts
         cache_key = "isolation_test"

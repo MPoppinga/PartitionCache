@@ -41,7 +41,7 @@ SQL_FILE = Path(__file__).parent.parent / "cache_handler" / "postgresql_cache_ev
 def get_table_prefix(args) -> str:
     """Get the table prefix from args or environment."""
     if args.table_prefix:
-        return args.table_prefix
+        return str(args.table_prefix)
 
     # Check cache backend and use corresponding table prefix
     cache_backend = os.getenv("CACHE_BACKEND", "postgresql_array")
