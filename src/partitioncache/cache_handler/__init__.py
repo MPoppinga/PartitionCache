@@ -4,6 +4,12 @@ from partitioncache.cache_handler.abstract import AbstractCacheHandler
 
 
 def get_cache_handler(cache_type: str, singleton: bool = False) -> AbstractCacheHandler:
+    # Handle backward compatibility for old cache type names
+    if cache_type == "redis":
+        cache_type = "redis_set"
+    elif cache_type == "rocksdb":
+        cache_type = "rocksdb_set"
+
     if cache_type == "postgresql_array":
         from partitioncache.cache_handler.postgresql_array import PostgreSQLArrayCacheHandler
 
@@ -87,19 +93,24 @@ def get_cache_handler(cache_type: str, singleton: bool = False) -> AbstractCache
                 db_tableprefix=db_table,
                 bitsize=int(bitsize),
             )
-    elif cache_type == "redis":
+    elif cache_type == "redis_set":
         from partitioncache.cache_handler.redis_set import RedisCacheHandler
 
-        db_name = os.getenv("REDIS_CACHE_DB")
+        # Support both REDIS_SET_DB (preferred) and REDIS_CACHE_DB (legacy)
+        db_name = os.getenv("REDIS_SET_DB") or os.getenv("REDIS_CACHE_DB")
         if not db_name:
-            raise ValueError("REDIS_CACHE_DB environment variable not set")
-        db_host = os.getenv("REDIS_HOST")
+            raise ValueError("REDIS_SET_DB or REDIS_CACHE_DB environment variable not set")
+
+        # Support redis_set specific variables with fallback to generic Redis variables
+        db_host = os.getenv("REDIS_SET_HOST") or os.getenv("REDIS_HOST")
         if not db_host:
-            raise ValueError("REDIS_HOST environment variable not set")
-        db_password = os.getenv("REDIS_PASSWORD", "")
-        db_port = os.getenv("REDIS_PORT")
+            raise ValueError("REDIS_SET_HOST or REDIS_HOST environment variable not set")
+
+        db_password = os.getenv("REDIS_SET_PASSWORD") or os.getenv("REDIS_PASSWORD", "")
+
+        db_port = os.getenv("REDIS_SET_PORT") or os.getenv("REDIS_PORT")
         if not db_port:
-            raise ValueError("REDIS_PORT environment variable not set")
+            raise ValueError("REDIS_SET_PORT or REDIS_PORT environment variable not set")
         if singleton:
             return RedisCacheHandler.get_instance(
                 db_name=db_name,
@@ -120,13 +131,17 @@ def get_cache_handler(cache_type: str, singleton: bool = False) -> AbstractCache
         db_name = os.getenv("REDIS_BIT_DB")
         if not db_name:
             raise ValueError("REDIS_BIT_DB environment variable not set")
-        db_host = os.getenv("REDIS_HOST")
+
+        # Support redis_bit specific variables with fallback to generic Redis variables
+        db_host = os.getenv("REDIS_BIT_HOST") or os.getenv("REDIS_HOST")
         if not db_host:
-            raise ValueError("REDIS_HOST environment variable not set")
-        db_password = os.getenv("REDIS_PASSWORD", "")
-        db_port = os.getenv("REDIS_PORT")
+            raise ValueError("REDIS_BIT_HOST or REDIS_HOST environment variable not set")
+
+        db_password = os.getenv("REDIS_BIT_PASSWORD") or os.getenv("REDIS_PASSWORD", "")
+
+        db_port = os.getenv("REDIS_BIT_PORT") or os.getenv("REDIS_PORT")
         if not db_port:
-            raise ValueError("REDIS_PORT environment variable not set")
+            raise ValueError("REDIS_BIT_PORT or REDIS_PORT environment variable not set")
         bitsize = os.getenv("REDIS_BIT_BITSIZE")
         if not bitsize:
             raise ValueError("REDIS_BIT_BITSIZE environment variable not set")
@@ -146,7 +161,7 @@ def get_cache_handler(cache_type: str, singleton: bool = False) -> AbstractCache
                 db_port=db_port,
                 bitsize=int(bitsize),
             )
-    elif cache_type == "rocksdb":
+    elif cache_type == "rocksdb_set":
         from partitioncache.cache_handler.rocks_db_set import RocksDBCacheHandler
 
         db_path = os.getenv("ROCKSDB_PATH")

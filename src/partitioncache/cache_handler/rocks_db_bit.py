@@ -1,4 +1,5 @@
 from datetime import datetime
+
 from bitarray import bitarray
 
 from partitioncache.cache_handler.rocks_db_abstract import RocksDBAbstractCacheHandler
@@ -117,11 +118,14 @@ class RocksDBBitCacheHandler(RocksDBAbstractCacheHandler):
                 if isinstance(k, int):
                     bitval[k] = 1
                 elif isinstance(k, str):
-                    bitval[int(k)] = 1
+                    try:
+                        bitval[int(k)] = 1
+                    except ValueError:
+                        raise ValueError(f"RocksDB bit handler only supports integer values or numeric strings. Got non-numeric string: '{k}'") from None
                 else:
-                    raise ValueError("Only integer values are supported")
-        except (IndexError, ValueError):
-            raise ValueError(f"Value {value} is out of range for bitarray of size {bitsize}")
+                    raise ValueError(f"RocksDB bit handler only supports integer values. Got {type(k)}: {k}")
+        except IndexError:
+            raise ValueError(f"Value {value} is out of range for bitarray of size {bitsize}") from None
         try:
             cache_key = self._get_cache_key(key, partition_key)
             self.db.put(cache_key.encode(), bitval.tobytes(), sync=True)

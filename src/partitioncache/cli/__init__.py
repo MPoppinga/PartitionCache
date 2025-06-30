@@ -1,1 +1,1 @@
-"""CLI tools for partitioncache""" 
+"""CLI tools for partitioncache"""

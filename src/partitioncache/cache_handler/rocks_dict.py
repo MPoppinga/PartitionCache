@@ -1,5 +1,5 @@
-from logging import getLogger
 from datetime import datetime
+from logging import getLogger
 
 from rocksdict import AccessType, Options, Rdict
 
@@ -16,7 +16,7 @@ class RocksDictCacheHandler(AbstractCacheHandler):
 
     _instance = None
     _refcount = 0
-    
+
     @classmethod
     def get_supported_datatypes(cls) -> set[str]:
         """RocksDict supports all datatypes with native serialization."""

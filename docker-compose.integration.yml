@@ -1,0 +1,74 @@
+services:
+  # PostgreSQL for all PostgreSQL-based backends and queue processing
+  postgres-integration:
+    image: partitioncache-postgres:latest
+    pull_policy: never
+    environment:
+      POSTGRES_DB: partitioncache_integration
+      POSTGRES_USER: integration_user
+      POSTGRES_PASSWORD: integration_password
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      - "5434:5432"
+    # Use tmpfs for ephemeral storage to ensure fresh start every time
+    tmpfs:
+      - /var/lib/postgresql/data:noexec,nosuid,size=1g
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U integration_user -d partitioncache_integration"]
+      interval: 5s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+    # Let the custom image handle pg_cron configuration
+    command: >
+      postgres
+      -c shared_preload_libraries=pg_cron
+      -c cron.database_name=partitioncache_integration
+      -c log_statement=all
+      -c log_min_duration_statement=0
+
+  # Redis for Redis-based backends
+  redis-integration:
+    image: redis:7-alpine
+    ports:
+      - "6381:6379"
+    # Use tmpfs for ephemeral storage to ensure fresh start every time
+    tmpfs:
+      - /data:noexec,nosuid,size=256m
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  # MySQL for MySQL database handler testing (if needed)
+  mysql-integration:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: integration_root_password
+      MYSQL_DATABASE: partitioncache_integration
+      MYSQL_USER: integration_user
+      MYSQL_PASSWORD: integration_password
+    ports:
+      - "3307:3306"
+    volumes:
+      - mysql_integration_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "integration_user", "-pintegration_password"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    command: >
+      --default-authentication-plugin=mysql_native_password
+      --innodb-buffer-pool-size=256M
+      --max-connections=200
+
+  # SQLite doesn't need a container (file-based)
+  # RocksDB backends use local file storage (handled in test fixtures)
+
+# No persistent volumes needed - using tmpfs for fresh starts
+volumes:
+  mysql_integration_data:

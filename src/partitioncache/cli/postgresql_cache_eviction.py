@@ -25,11 +25,12 @@ Usage Examples:
 import argparse
 import os
 import sys
-from pathlib import Path
 from logging import getLogger
+from pathlib import Path
+
+import dotenv
 import psycopg
 from psycopg import sql
-import dotenv
 
 logger = getLogger("PartitionCache.PostgreSQLCacheEviction")
 
@@ -217,7 +218,7 @@ def get_processor_status(conn, table_prefix: str):
             status = cur.fetchone()
             if status:
                 columns = [desc[0] for desc in cur.description]
-                return dict(zip(columns, status))
+                return dict(zip(columns, status, strict=False))
         except psycopg.errors.UndefinedTable:
             logger.error(f"Config table '{config_table}' not found. Please run setup first.")
             return None
@@ -258,7 +259,7 @@ def view_logs(conn, table_prefix: str, limit: int = 20):
 
             columns = [desc[0] for desc in cur.description]
             for log in logs:
-                log_dict = dict(zip(columns, log))
+                log_dict = dict(zip(columns, log, strict=False))
                 print(
                     f"[{log_dict['created_at']}] Job: {log_dict['job_name']} | "
                     f"Partition: {log_dict.get('partition_key', 'N/A')} | "
@@ -328,6 +329,7 @@ def main():
     # Load .env file
     dotenv.load_dotenv(dotenv_path=args.env)
 
+    # Only validate environment for actual commands, not help
     is_valid, message = validate_environment()
     if not is_valid:
         logger.error(f"Environment validation failed: {message}")

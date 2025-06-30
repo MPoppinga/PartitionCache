@@ -1,10 +1,9 @@
-from logging import getLogger
 from datetime import datetime
-from typing import Union
+from logging import getLogger
 
 from bitarray import bitarray
-from pyroaring import BitMap
 from psycopg import sql
+from pyroaring import BitMap
 
 from partitioncache.cache_handler.postgresql_abstract import PostgreSQLAbstractCacheHandler
 
@@ -30,64 +29,81 @@ class PostgreSQLRoaringBitCacheHandler(PostgreSQLAbstractCacheHandler):
             logger.warning(f"Failed to create roaringbitmap extension: {e}")
             # Continue anyway - extension might already exist
 
-        # Create metadata table to track partition keys (no bitsize needed for roaring bitmaps)
-        self.cursor.execute(
-            sql.SQL("""CREATE TABLE IF NOT EXISTS {0} (
-                partition_key TEXT PRIMARY KEY,
-                datatype TEXT NOT NULL CHECK (datatype = 'integer'),
-                created_at TIMESTAMP DEFAULT now()
-            );""").format(sql.Identifier(self.tableprefix + "_partition_metadata"))
-        )
-
-        # Create queries table (shared across all partition keys)
-        self.cursor.execute(
-            sql.SQL("""CREATE TABLE IF NOT EXISTS {0} (
-            query_hash TEXT NOT NULL,
-            query TEXT NOT NULL,
-            partition_key TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'ok' CHECK (status IN ('ok', 'timeout', 'failed')),
-            last_seen TIMESTAMP NOT NULL DEFAULT now(),
-            PRIMARY KEY (query_hash, partition_key)
-        );""").format(sql.Identifier(self.tableprefix + "_queries"))
-        )
-
-        self.db.commit()
-
     def _create_partition_table(self, partition_key: str) -> None:
         """Create a cache table for a specific partition key."""
         table_name = f"{self.tableprefix}_cache_{partition_key}"
 
-        # Create the cache table for roaring bitmaps
-        self.cursor.execute(
-            sql.SQL("""CREATE TABLE IF NOT EXISTS {0} (
-                query_hash TEXT PRIMARY KEY,
-                partition_keys roaringbitmap,
-                partition_keys_count integer NOT NULL GENERATED ALWAYS AS (rb_cardinality(partition_keys)) STORED
-            );""").format(sql.Identifier(table_name))
-        )
+        try:
+            # Check if roaringbitmap extension is available
+            self.cursor.execute("SELECT 1 FROM pg_extension WHERE extname = 'roaringbitmap';")
+            if not self.cursor.fetchone():
+                # Try to create the extension first
+                try:
+                    self.cursor.execute("CREATE EXTENSION IF NOT EXISTS roaringbitmap;")
+                    self.db.commit()
+                    logger.info("Successfully created roaringbitmap extension")
+                except Exception as ext_error:
+                    logger.error(f"roaringbitmap extension not found and cannot be created: {ext_error}")
+                    raise RuntimeError("roaringbitmap extension required but not available") from ext_error
 
-        # Insert metadata
-        self.cursor.execute(
-            sql.SQL("INSERT INTO {0} (partition_key, datatype) VALUES (%s, %s) ON CONFLICT (partition_key) DO NOTHING").format(
-                sql.Identifier(self.tableprefix + "_partition_metadata")
-            ),
-            (partition_key, "integer"),
-        )
+            # Create the cache table for roaring bitmaps with improved error handling
+            self.cursor.execute(
+                sql.SQL("""CREATE TABLE IF NOT EXISTS {0} (
+                    query_hash TEXT PRIMARY KEY,
+                    partition_keys roaringbitmap,
+                    partition_keys_count integer GENERATED ALWAYS AS (
+                        CASE
+                            WHEN partition_keys IS NULL THEN NULL
+                            ELSE rb_cardinality(partition_keys)
+                        END
+                    ) STORED
+                );""").format(sql.Identifier(table_name))
+            )
 
-        self.db.commit()
+            # Insert metadata
+            self.cursor.execute(
+                sql.SQL("INSERT INTO {0} (partition_key, datatype) VALUES (%s, %s) ON CONFLICT (partition_key) DO NOTHING").format(
+                    sql.Identifier(self.tableprefix + "_partition_metadata")
+                ),
+                (partition_key, "integer"),
+            )
+
+            self.db.commit()
+
+        except Exception as e:
+            logger.error(f"Failed to create roaringbitmap table {table_name}: {e}")
+            self.db.rollback()
+            raise
 
     def _ensure_partition_table(self, partition_key: str) -> None:
         """Ensure a partition table exists."""
-        existing_datatype = self._get_partition_datatype(partition_key)
+        try:
+            # First ensure metadata table exists before trying to query it
+            self._ensure_metadata_table_exists()
 
-        if existing_datatype is None:
-            # Create new table
-            self._create_partition_table(partition_key)
+            existing_datatype = self._get_partition_datatype(partition_key)
+
+            if existing_datatype is None:
+                # Create new table
+                self._create_partition_table(partition_key)
+        except Exception as e:
+            logger.error(f"Failed to ensure roaringbit partition table for {partition_key}: {e}")
+            # Rollback and recreate metadata table if needed
+            try:
+                self.db.rollback()
+                logger.warning(f"Attempting to recreate roaringbit metadata table after error: {e}")
+                self._recreate_metadata_table(self.get_supported_datatypes())
+                self._create_partition_table(partition_key)
+            except Exception as recreate_error:
+                logger.error(f"Failed to recreate roaringbit partition table for {partition_key}: {recreate_error}")
+                # Avoid infinite retry loops
+                self.db.rollback()
+                raise
 
     def set_set(
         self,
         key: str,
-        value: Union[set[int], set[str], set[float], set[datetime], BitMap, bitarray, list],
+        value: set[int] | set[str] | set[float] | set[datetime] | BitMap | bitarray | list,
         partition_key: str = "partition_key",
     ) -> bool:
         """
@@ -106,39 +122,27 @@ class PostgreSQLRoaringBitCacheHandler(PostgreSQLAbstractCacheHandler):
             # Ensure partition table exists
             self._ensure_partition_table(partition_key)
 
-            # Convert input to roaring bitmap
+            # Convert input to a list of integers for rb_build
             if isinstance(value, BitMap):
-                rb = value
+                value_list = list(value)
             elif isinstance(value, bitarray):
-                # Convert bitarray to roaring bitmap
-                rb = BitMap()
-                for pos in value.search(bitarray("1")):
-                    rb.add(pos)
-            elif isinstance(value, (list, set)):
-                rb = BitMap()
+                value_list = [i for i, bit in enumerate(value) if bit]
+            elif isinstance(value, list | set):
+                # Validate that all items can be converted to integers without loss
+                value_list = []
                 for item in value:
-                    if isinstance(item, int):
-                        rb.add(item)
-                    elif isinstance(item, str):
-                        rb.add(int(item))
-                    else:
-                        raise ValueError(f"Only integer values are supported for roaring bitmaps: {item} : {value}")
+                    if not isinstance(item, int) and isinstance(item, float) and not item.is_integer():
+                        raise ValueError("Only integer values are supported for roaring bitmaps")
+                    value_list.append(int(item))  # type: ignore
             else:
                 raise ValueError(f"Unsupported value type for roaring bitmap: {type(value)}")
-
-            # Convert roaring bitmap to bytes for storage
-            if isinstance(rb, BitMap):
-                rb_bytes = rb.serialize()
-            else:
-                # This path should not be reached due to the checks above, but it satisfies the type checker
-                raise ValueError("Could not create BitMap instance")
 
             table_name = f"{self.tableprefix}_cache_{partition_key}"
             self.cursor.execute(
                 sql.SQL(
-                    "INSERT INTO {0} (query_hash, partition_keys) VALUES (%s, %s) ON CONFLICT (query_hash) DO UPDATE SET partition_keys = EXCLUDED.partition_keys"
+                    "INSERT INTO {0} (query_hash, partition_keys) VALUES (%s, rb_build(%s)) ON CONFLICT (query_hash) DO UPDATE SET partition_keys = EXCLUDED.partition_keys"
                 ).format(sql.Identifier(table_name)),
-                (key, rb_bytes),
+                (key, value_list),
             )
             self.db.commit()
             return True
@@ -169,7 +173,7 @@ class PostgreSQLRoaringBitCacheHandler(PostgreSQLAbstractCacheHandler):
         if result is None or result[0] is None:
             return None
 
-        # Deserialize roaring bitmap from bytes
+        # Deserialize roaring bitmap from bytes and return as BitMap
         rb = BitMap.deserialize(result[0])
         return rb
 
@@ -183,7 +187,7 @@ class PostgreSQLRoaringBitCacheHandler(PostgreSQLAbstractCacheHandler):
         table_name = f"{self.tableprefix}_cache_{partition_key}"
         query = sql.SQL("SELECT query_hash FROM {0} WHERE query_hash = ANY(%s) AND partition_keys IS NOT NULL").format(sql.Identifier(table_name))
         self.cursor.execute(query, (list(keys),))
-        keys_set = set(x[0] for x in self.cursor.fetchall())
+        keys_set = {x[0] for x in self.cursor.fetchall()}
 
         if not keys_set:
             return None, 0
@@ -195,7 +199,7 @@ class PostgreSQLRoaringBitCacheHandler(PostgreSQLAbstractCacheHandler):
         if result is None or result[0] is None:
             return None, 0
 
-        # Deserialize the intersected roaring bitmap
+        # Deserialize the intersected roaring bitmap and return as BitMap
         rb = BitMap.deserialize(result[0])
         return rb, len(keys_set)
 

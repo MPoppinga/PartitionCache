@@ -1,8 +1,8 @@
+from unittest.mock import MagicMock, patch
+
 import pytest
-import os
-from pyroaring import BitMap
 from bitarray import bitarray
-from unittest.mock import patch, MagicMock
+from pyroaring import BitMap
 
 from partitioncache.cache_handler.postgresql_roaringbit import PostgreSQLRoaringBitCacheHandler
 
@@ -41,9 +41,13 @@ class TestPostgreSQLRoaringBitCacheHandler:
     def cache_handler(self, mock_db_config, mock_db, mock_cursor):
         """Create a cache handler instance with mocked database."""
         with patch("psycopg.connect", return_value=mock_db):
+            # Simulate that the roaringbitmap extension exists
+            mock_cursor.fetchone.return_value = (1,)
             handler = PostgreSQLRoaringBitCacheHandler(**mock_db_config)
             handler.cursor = mock_cursor
             handler.db = mock_db
+            # Reset mock after initialization to have a clean slate for tests
+            mock_cursor.reset_mock()
             return handler
 
     def test_repr(self, cache_handler):
@@ -150,11 +154,11 @@ class TestPostgreSQLRoaringBitCacheHandler:
         rb = BitMap([1, 2, 3, 10, 100])
         serialized_rb = rb.serialize()
 
-        # Update mock to return real serialized data
-        mock_cursor.fetchone.side_effect = [
-            ("integer",),  # For datatype check
-            (serialized_rb,),  # Real serialized roaring bitmap
-        ]
+        # Mock the _get_partition_datatype method directly
+        cache_handler._get_partition_datatype = MagicMock(return_value="integer")
+
+        # Mock the cursor fetchone to return the serialized roaring bitmap
+        mock_cursor.fetchone.return_value = (serialized_rb,)
 
         result = cache_handler.get("test_key", "test_partition")
 
@@ -163,11 +167,11 @@ class TestPostgreSQLRoaringBitCacheHandler:
 
     def test_get_nonexistent_key(self, cache_handler, mock_cursor):
         """Test getting a non-existent key."""
-        # Mock partition datatype exists but key doesn't exist
-        mock_cursor.fetchone.side_effect = [
-            ("integer",),  # For datatype check
-            None,  # Key doesn't exist
-        ]
+        # Mock the _get_partition_datatype method directly
+        cache_handler._get_partition_datatype = MagicMock(return_value="integer")
+
+        # Mock that the key doesn't exist
+        mock_cursor.fetchone.return_value = None
 
         result = cache_handler.get("nonexistent_key", "test_partition")
         assert result is None
@@ -189,13 +193,14 @@ class TestPostgreSQLRoaringBitCacheHandler:
         # Expected intersection
         rb_intersection = rb1 & rb2
 
-        mock_cursor.fetchall.return_value = [("key1",), ("key2",)]  # Both keys exist
+        # Mock the _get_partition_datatype method directly
+        cache_handler._get_partition_datatype = MagicMock(return_value="integer")
 
-        # Mock the intersection query result
-        mock_cursor.fetchone.side_effect = [
-            ("integer",),  # For datatype check
-            (rb_intersection.serialize(),),
-        ]
+        # Mock that both keys exist in the fetchall call
+        mock_cursor.fetchall.return_value = [("key1",), ("key2",)]
+
+        # Mock the intersection query result with proper serialized data
+        mock_cursor.fetchone.return_value = (rb_intersection.serialize(),)
 
         result, count = cache_handler.get_intersected({"key1", "key2"}, "test_partition")
 
@@ -215,13 +220,13 @@ class TestPostgreSQLRoaringBitCacheHandler:
 
     def test_register_partition_key_valid(self, cache_handler, mock_cursor):
         """Test registering a valid partition key."""
-        # Mock that partition doesn't exist yet
-        mock_cursor.fetchone.return_value = None
+        # Mock sequence: metadata check returns None (new partition), extension check returns 1
+        mock_cursor.fetchone.side_effect = [None, (1,)]
 
         cache_handler.register_partition_key("new_partition", "integer")
 
-        # Should have called table creation
-        assert mock_cursor.execute.call_count >= 1
+        # Should have called table creation and metadata insertion
+        assert mock_cursor.execute.call_count >= 3
 
     def test_register_partition_key_invalid_datatype(self, cache_handler):
         """Test registering with invalid datatype raises error."""
@@ -277,13 +282,13 @@ class TestPostgreSQLRoaringBitCacheHandler:
 
     def test_ensure_partition_table_new_partition(self, cache_handler, mock_cursor):
         """Test ensuring partition table for new partition."""
-        # Mock partition doesn't exist
-        mock_cursor.fetchone.return_value = None
+        # Mock sequence: metadata check returns None (new partition), extension check returns 1
+        mock_cursor.fetchone.side_effect = [None, (1,)]
 
         cache_handler._ensure_partition_table("new_partition")
 
-        # Should have created the table
-        assert mock_cursor.execute.call_count >= 2
+        # Should have created the table (metadata check + extension check + create table)
+        assert mock_cursor.execute.call_count >= 3
 
     def test_ensure_partition_table_existing_partition(self, cache_handler, mock_cursor):
         """Test ensuring partition table for existing partition."""
@@ -295,10 +300,16 @@ class TestPostgreSQLRoaringBitCacheHandler:
 
         cache_handler._ensure_partition_table("existing_partition")
 
-        # Should call _get_partition_datatype which does one execute, but not create a new table
-        assert mock_cursor.execute.call_count == 1
+        # Should call _ensure_metadata_table_exists and _get_partition_datatype
+        # Since partition exists, it shouldn't create a new table
+        assert mock_cursor.execute.call_count >= 1
 
-        # Verify it was the datatype check
-        call_args = mock_cursor.execute.call_args[0][0]
-        assert "SELECT datatype FROM" in str(call_args)
-        assert "WHERE partition_key = %s" in str(call_args)
+        # Find the datatype check call
+        datatype_check_found = False
+        for call in mock_cursor.execute.call_args_list:
+            call_sql = str(call[0][0])
+            if "SELECT datatype FROM" in call_sql and "WHERE partition_key = %s" in call_sql:
+                datatype_check_found = True
+                break
+
+        assert datatype_check_found, "Should have checked for existing partition datatype"

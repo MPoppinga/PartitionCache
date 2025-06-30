@@ -21,23 +21,17 @@ Usage Examples:
     # Show detailed queue info with custom table prefix
     pcache-postgresql-queue-processor queue-info --table-prefix my_cache
 
-The new commands provide information about:
-- Which partition keys are being observed in the queue
-- Cache table architecture (bit vs array)
-- Cache table existence and column types
-- Queue item counts per partition
-- Last cache update timestamps
-- Partition data types and bit sizes (for bit caches)
 """
 
 import argparse
 import os
 import sys
-from pathlib import Path
 from logging import getLogger
+from pathlib import Path
+
+import dotenv
 import psycopg
 from psycopg import sql
-import dotenv
 
 logger = getLogger("PartitionCache.PostgreSQLQueueProcessor")
 
@@ -154,16 +148,28 @@ def check_pg_cron_installed(conn) -> bool:
     """Check if pg_cron extension is installed."""
     with conn.cursor() as cur:
         try:
+            # First check if it exists without trying to create it
+            cur.execute("SELECT 1 FROM pg_extension WHERE extname = 'pg_cron'")
+            if cur.fetchone() is not None:
+                return True
+
+            # Try to create it if not exists
             cur.execute("CREATE EXTENSION IF NOT EXISTS pg_cron")
+            conn.commit()
+            return True
         except Exception as e:
-            logger.error(f"Failed to create pg_cron extension: {e}")
+            # pg_cron not available - this is OK for manual processing
+            logger.debug(f"pg_cron extension not available: {e}")
             return False
-        cur.execute("SELECT 1 FROM pg_extension WHERE extname = 'pg_cron'")
-        return cur.fetchone() is not None
 
 
-def setup_database_objects(conn):
-    """Execute the SQL file to create all necessary database objects."""
+def setup_database_objects(conn, include_pg_cron_trigger=True):
+    """Execute the SQL file to create all necessary database objects.
+
+    Args:
+        conn: Database connection
+        include_pg_cron_trigger: Whether to create pg_cron trigger (default True for backwards compatibility)
+    """
     logger.info("Setting up database objects...")
 
     # First, ensure queue tables are set up using the queue handler
@@ -206,7 +212,12 @@ def setup_database_objects(conn):
     queue_prefix = get_queue_table_prefix_from_env()
     with conn.cursor() as cur:
         cur.execute("SELECT partitioncache_initialize_processor_tables(%s)", [queue_prefix])
-        cur.execute("SELECT partitioncache_create_config_trigger(%s)", [queue_prefix])
+
+        if include_pg_cron_trigger:
+            logger.info("Creating pg_cron config trigger...")
+            cur.execute("SELECT partitioncache_create_config_trigger(%s)", [queue_prefix])
+        else:
+            logger.info("Skipping pg_cron config trigger creation")
 
     conn.commit()
     logger.info("PostgreSQL queue processor database objects created successfully")
@@ -328,16 +339,28 @@ def update_processor_config(
 def handle_setup(conn, table_prefix: str, queue_prefix: str, cache_backend: str, frequency: int, enabled: bool, timeout: int):
     """Handle the main setup logic."""
     logger.info("Starting PostgreSQL queue processor setup...")
-    if not check_pg_cron_installed(conn):
-        logger.error("pg_cron extension is not installed. Please install it first.")
+
+    # Check if pg_cron is available (but don't require it)
+    pg_cron_available = check_pg_cron_installed(conn)
+
+    if enabled and not pg_cron_available:
+        logger.error("Cannot enable processor with pg_cron: extension is not installed.")
+        logger.info("You can still set up the processor infrastructure and use manual processing.")
         sys.exit(1)
 
-    setup_database_objects(conn)
+    # Setup all database objects (functions, tables, etc.)
+    # Only create pg_cron trigger if we're enabling the processor
+    setup_database_objects(conn, include_pg_cron_trigger=(enabled and pg_cron_available))
 
     job_name = "partitioncache_process_queue"
     insert_initial_config(conn, job_name, table_prefix, queue_prefix, cache_backend, frequency, enabled, timeout)
 
-    logger.info("Setup complete. The processor job is created and configured via the config table.")
+    if enabled and pg_cron_available:
+        logger.info("Setup complete. The processor job is created and scheduled via pg_cron.")
+    else:
+        logger.info("Setup complete. The processor infrastructure is ready for manual processing.")
+        if not pg_cron_available:
+            logger.info("Note: pg_cron is not available. Use 'manual-process' command or enable pg_cron for automated processing.")
 
 
 def get_processor_status(conn, queue_prefix: str):
@@ -348,7 +371,7 @@ def get_processor_status(conn, queue_prefix: str):
         status = cur.fetchone()
         if status:
             columns = [desc[0] for desc in cur.description]
-            return dict(zip(columns, status))
+            return dict(zip(columns, status, strict=False))
     return None
 
 
@@ -360,7 +383,7 @@ def get_processor_status_detailed(conn, table_prefix: str, queue_prefix: str):
         status = cur.fetchone()
         if status:
             columns = [desc[0] for desc in cur.description]
-            return dict(zip(columns, status))
+            return dict(zip(columns, status, strict=False))
     return None
 
 
@@ -371,7 +394,7 @@ def get_queue_and_cache_info(conn, table_prefix: str, queue_prefix: str):
         cur.execute("SELECT * FROM partitioncache_get_queue_and_cache_info(%s, %s)", [table_prefix, queue_prefix])
         results = cur.fetchall()
         columns = [desc[0] for desc in cur.description]
-        return [dict(zip(columns, row)) for row in results]
+        return [dict(zip(columns, row, strict=False)) for row in results]
 
 
 def print_status(status):
@@ -504,7 +527,7 @@ def view_logs(conn, limit: int = 20, status_filter: str | None = None, queue_pre
 
             columns = [desc[0] for desc in cur.description]
             for log in logs:
-                log_dict = dict(zip(columns, log))
+                log_dict = dict(zip(columns, log, strict=False))
                 execution_source = log_dict.get("execution_source", "unknown")
                 execution_time = log_dict.get("execution_time_ms", "N/A")
                 print(
@@ -550,12 +573,6 @@ def main():
     elif env_args.env != ".env":
         # Only warn if a non-default path was given and not found
         logger.warning(f"Specified environment file not found: {env_path}")
-
-    # Validate environment after loading .env
-    is_valid, message = validate_environment()
-    if not is_valid:
-        logger.error(f"Environment validation failed: {message}")
-        sys.exit(1)
 
     # Main parser that inherits the --env option for help messages
     parser = argparse.ArgumentParser(
@@ -680,7 +697,14 @@ def main():
     try:
         # Parse all arguments and execute the corresponding function
         args = parser.parse_args()
+
+        # Only validate environment for non-help commands
         if hasattr(args, "func"):
+            # Validate environment after loading .env
+            is_valid, message = validate_environment()
+            if not is_valid:
+                logger.error(f"Environment validation failed: {message}")
+                sys.exit(1)
             args.func(args)
         else:
             parser.print_help()

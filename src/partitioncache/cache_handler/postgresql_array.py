@@ -1,13 +1,10 @@
 import time
-from logging import getLogger
 from datetime import datetime
-from typing import Set
-
+from logging import getLogger
 
 from psycopg import sql
 
 from partitioncache.cache_handler.postgresql_abstract import PostgreSQLAbstractCacheHandler
-
 
 logger = getLogger("PartitionCache")
 
@@ -16,7 +13,7 @@ class PostgreSQLArrayCacheHandler(PostgreSQLAbstractCacheHandler):
     USE_AGGREGATES = True
 
     @classmethod
-    def get_supported_datatypes(cls) -> Set[str]:
+    def get_supported_datatypes(cls) -> set[str]:
         """PostgreSQL array handler supports all datatypes."""
         return {"integer", "float", "text", "timestamp"}
 
@@ -41,7 +38,7 @@ class PostgreSQLArrayCacheHandler(PostgreSQLAbstractCacheHandler):
                 """
                 CREATE OR REPLACE FUNCTION _array_intersect(anyarray, anyarray)
                 RETURNS anyarray AS $$
-                    SELECT CASE 
+                    SELECT CASE
                         WHEN $1 IS NULL THEN $2
                         WHEN $2 IS NULL THEN $1
                         ELSE ARRAY(SELECT unnest($1) INTERSECT SELECT unnest($2) ORDER BY 1)
@@ -66,36 +63,6 @@ class PostgreSQLArrayCacheHandler(PostgreSQLAbstractCacheHandler):
             if self.db.closed is False:
                 self.db.rollback()
 
-        try:
-            self.cursor.execute(
-                sql.SQL("""CREATE TABLE IF NOT EXISTS {0} (
-                    partition_key TEXT PRIMARY KEY,
-                    datatype TEXT NOT NULL CHECK (datatype IN ('integer', 'float', 'text', 'timestamp')),
-                    created_at TIMESTAMP DEFAULT now()
-                );""").format(sql.Identifier(self.tableprefix + "_partition_metadata"))
-            )
-
-            # Shared queries table
-            self.cursor.execute(
-                sql.SQL("""CREATE TABLE IF NOT EXISTS {0} (
-                    query_hash TEXT NOT NULL,
-                    partition_key TEXT NOT NULL,
-                    query TEXT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'ok' CHECK (status IN ('ok', 'timeout', 'failed')),
-                    last_seen TIMESTAMP NOT NULL DEFAULT now(),
-                    PRIMARY KEY (query_hash, partition_key)
-                );""").format(sql.Identifier(self.tableprefix + "_queries"))
-            )
-
-            self.db.commit()
-        except Exception as e:
-            logger.error(f"Failed to create metadata tables: {e}")
-            try:
-                self.db.rollback()
-            except Exception as rollback_error:
-                logger.error(f"Failed to rollback after metadata table creation error: {rollback_error}")
-            raise
-
     def _create_partition_table(self, partition_key: str, datatype: str) -> None:
         """Create a cache table for a specific partition key with appropriate datatype."""
         table_name = f"{self.tableprefix}_cache_{partition_key}"
@@ -118,7 +85,12 @@ class PostgreSQLArrayCacheHandler(PostgreSQLAbstractCacheHandler):
                 sql.SQL("""CREATE TABLE IF NOT EXISTS {0} (
                     query_hash TEXT PRIMARY KEY,
                     partition_keys {1},
-                    partition_keys_count integer NOT NULL GENERATED ALWAYS AS (cardinality(partition_keys)) STORED
+                    partition_keys_count integer GENERATED ALWAYS AS (
+                        CASE
+                            WHEN partition_keys IS NULL THEN NULL
+                            ELSE cardinality(partition_keys)
+                        END
+                    ) STORED
                 );""").format(sql.Identifier(table_name), sql.SQL(sql_datatype))
             )
 
