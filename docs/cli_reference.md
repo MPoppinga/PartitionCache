@@ -52,15 +52,24 @@ pcache-manage setup {all,queue,cache}
 
 #### status - Check System Status
 ```bash
-pcache-manage status {env,tables}
+pcache-manage status [{all,env,tables}]
 ```
 
 **Subcommands:**
-- `env` - Validate environment configuration
+- *(default/no subcommand)* - Show comprehensive status overview
+  - Displays complete system status including queue and cache statistics
+  - Shows system health checks and recommendations
+  - Same as `status all`
+- `all` - Show comprehensive status overview (explicit)
+  - Configuration details (cache backend, queue provider)
+  - Queue statistics (original and fragment queue counts)
+  - Cache statistics (total entries, partitions, top partitions by size)
+  - System health checks (pg_cron status, eviction manager status)
+- `env` - Validate environment configuration only
   - Checks all required environment variables
   - Tests database connectivity
   - Validates cache backend configuration
-- `tables` - Check table status and accessibility
+- `tables` - Check table status and accessibility only
   - Verifies table existence
   - Checks table permissions
   - Reports table statistics
@@ -214,7 +223,7 @@ pcache-add [options] --partition-key PARTITION_KEY {--direct|--queue|--queue-ori
 - **Processing**: Queue processor will fragment and process automatically
 
 ### Backend Configuration
-- `--queue-provider QUEUE_PROVIDER` - Queue provider (`postgresql`, `redis`)
+- `--queue-provider QUERY_QUEUE_PROVIDER` - Queue provider (`postgresql`, `redis`)
   - **Default**: `postgresql`
 - `--cache-backend CACHE_BACKEND` - Cache backend type
   - **Default**: `postgresql_bit`

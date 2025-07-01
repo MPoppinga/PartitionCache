@@ -41,7 +41,7 @@ SQL_FILE = Path(__file__).parent.parent / "cache_handler" / "postgresql_cache_ev
 def get_table_prefix(args) -> str:
     """Get the table prefix from args or environment."""
     if args.table_prefix:
-        return args.table_prefix
+        return str(args.table_prefix)
 
     # Check cache backend and use corresponding table prefix
     cache_backend = os.getenv("CACHE_BACKEND", "postgresql_array")
@@ -137,6 +137,59 @@ def insert_initial_config(conn, job_name: str, table_prefix: str, frequency: int
         )
     conn.commit()
     logger.info("Initial configuration inserted. Cron job should be synced.")
+
+
+def check_eviction_job_exists() -> bool:
+    """Check if any eviction job exists in the database."""
+    try:
+        conn = psycopg.connect(
+            host=os.getenv("DB_HOST"),
+            port=int(os.getenv("DB_PORT", "5432")),
+            user=os.getenv("DB_USER"),
+            password=os.getenv("DB_PASSWORD"),
+            dbname=os.getenv("DB_NAME"),
+        )
+
+        # Get the table prefix from environment
+        cache_backend = os.getenv("CACHE_BACKEND", "postgresql_array")
+        if cache_backend == "postgresql_array":
+            table_prefix = os.getenv("PG_ARRAY_CACHE_TABLE_PREFIX", "partitioncache")
+        elif cache_backend == "postgresql_bit":
+            table_prefix = os.getenv("PG_BIT_CACHE_TABLE_PREFIX", "partitioncache")
+        else:
+            table_prefix = os.getenv("PG_ROARINGBIT_CACHE_TABLE_PREFIX", "partitioncache")
+
+        job_name = f"partitioncache_evict_{table_prefix}"
+        config_table = f"{table_prefix}_eviction_config"
+
+        with conn.cursor() as cur:
+            # Check if config table exists and has an enabled job
+            cur.execute(
+                """
+                SELECT EXISTS (
+                    SELECT 1 FROM information_schema.tables
+                    WHERE table_name = %s
+                )
+                """,
+                [config_table],
+            )
+            table_exists = cur.fetchone()
+            if table_exists:
+                table_exists = table_exists[0]
+
+            if not table_exists:
+                conn.close()
+                return False
+
+            # Check if job is enabled
+            cur.execute(sql.SQL("SELECT enabled FROM {} WHERE job_name = %s").format(sql.Identifier(config_table)), [job_name])
+            result = cur.fetchone()
+
+        conn.close()
+        return bool(result and result[0])
+
+    except Exception:
+        return False
 
 
 def remove_all_eviction_objects(conn, table_prefix: str):

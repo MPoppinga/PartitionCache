@@ -291,7 +291,7 @@ class TestCLIIntegration:
     @patch("partitioncache.cli.setup_postgresql_queue_processor.get_queue_table_prefix_from_env")
     @patch("partitioncache.cli.setup_postgresql_queue_processor.get_db_connection")
     @patch("partitioncache.cli.setup_postgresql_queue_processor.validate_environment")
-    @patch("partitioncache.cli.setup_postgresql_queue_processor.dotenv.load_dotenv")
+    @patch("partitioncache.cli.setup_postgresql_queue_processor.load_environment_with_validation")
     def test_main_status_command(self, mock_load_env, mock_validate, mock_get_conn, mock_get_queue_prefix):
         """Test the status command."""
         from partitioncache.cli.setup_postgresql_queue_processor import main

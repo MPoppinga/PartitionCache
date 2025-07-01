@@ -5,12 +5,9 @@ This module tests that all PostgreSQL cache handlers correctly create
 metadata tables with appropriate datatype constraints.
 """
 
-import os
-import pytest
-import tempfile
-from unittest.mock import Mock, patch, MagicMock
+from unittest.mock import Mock, patch
 
-import psycopg
+import pytest
 
 
 class TestMetadataTableCreation:
@@ -32,7 +29,7 @@ class TestMetadataTableCreation:
     def test_postgresql_array_metadata_table_creation(self, mock_connect, mock_db_connection):
         """Test that PostgreSQL array handler creates metadata table with correct constraints."""
         from partitioncache.cache_handler.postgresql_array import PostgreSQLArrayCacheHandler
-        
+
         mock_db, mock_cursor = mock_db_connection
         mock_connect.return_value = mock_db
 
@@ -48,10 +45,10 @@ class TestMetadataTableCreation:
         # Check that datatype constraint includes all supported types
         execute_calls = [call[0][0] for call in mock_cursor.execute.call_args_list]
         metadata_calls = [call for call in execute_calls if "partition_metadata" in str(call)]
-        
+
         assert len(metadata_calls) > 0, "Metadata table creation should be called"
         metadata_sql = str(metadata_calls[0])
-        
+
         # Should contain constraint for supported datatypes
         assert "integer" in metadata_sql
         assert "float" in metadata_sql
@@ -64,7 +61,7 @@ class TestMetadataTableCreation:
     def test_postgresql_bit_metadata_table_creation(self, mock_connect, mock_db_connection):
         """Test that PostgreSQL bit handler creates metadata table with bitsize column."""
         from partitioncache.cache_handler.postgresql_bit import PostgreSQLBitCacheHandler
-        
+
         mock_db, mock_cursor = mock_db_connection
         mock_connect.return_value = mock_db
 
@@ -80,10 +77,10 @@ class TestMetadataTableCreation:
         # Check that bitsize column is included
         execute_calls = [call[0][0] for call in mock_cursor.execute.call_args_list]
         metadata_calls = [call for call in execute_calls if "partition_metadata" in str(call)]
-        
+
         assert len(metadata_calls) > 0, "Metadata table creation should be called"
         metadata_sql = str(metadata_calls[0])
-        
+
         # Should contain bitsize column and integer constraint
         assert "bitsize" in metadata_sql
         assert "integer" in metadata_sql
@@ -95,7 +92,7 @@ class TestMetadataTableCreation:
     def test_postgresql_roaringbit_metadata_table_creation(self, mock_connect, mock_db_connection):
         """Test that PostgreSQL roaringbit handler creates metadata table with integer constraint."""
         from partitioncache.cache_handler.postgresql_roaringbit import PostgreSQLRoaringBitCacheHandler
-        
+
         mock_db, mock_cursor = mock_db_connection
         mock_connect.return_value = mock_db
 
@@ -111,10 +108,10 @@ class TestMetadataTableCreation:
         # Check that only integer datatype is supported
         execute_calls = [call[0][0] for call in mock_cursor.execute.call_args_list]
         metadata_calls = [call for call in execute_calls if "partition_metadata" in str(call)]
-        
+
         assert len(metadata_calls) > 0, "Metadata table creation should be called"
         metadata_sql = str(metadata_calls[0])
-        
+
         # Should contain only integer constraint
         assert "integer" in metadata_sql
         # Should not contain other datatypes
@@ -146,7 +143,7 @@ class TestMetadataTableCreation:
     def test_ensure_metadata_table_exists_functionality(self, mock_connect, mock_db_connection):
         """Test that _ensure_metadata_table_exists works correctly."""
         from partitioncache.cache_handler.postgresql_array import PostgreSQLArrayCacheHandler
-        
+
         mock_db, mock_cursor = mock_db_connection
         mock_connect.return_value = mock_db
 
@@ -166,9 +163,9 @@ class TestMetadataTableCreation:
             if call_count == 1:  # First call fails (SELECT check)
                 raise Exception("relation does not exist")
             return None  # Subsequent calls succeed
-        
+
         mock_cursor.execute.side_effect = side_effect
-        
+
         # Call _ensure_metadata_table_exists
         handler._ensure_metadata_table_exists()
 
@@ -181,7 +178,7 @@ class TestMetadataTableCreation:
     def test_metadata_table_creation_error_handling(self, mock_connect, mock_db_connection):
         """Test error handling during metadata table creation."""
         from partitioncache.cache_handler.postgresql_array import PostgreSQLArrayCacheHandler
-        
+
         mock_db, mock_cursor = mock_db_connection
         mock_connect.return_value = mock_db
 
@@ -209,14 +206,14 @@ class TestMetadataTableCreation:
 
     def test_abstract_class_defines_required_methods(self):
         """Test that abstract class defines the required abstract methods."""
+
         from partitioncache.cache_handler.postgresql_abstract import PostgreSQLAbstractCacheHandler
-        import inspect
 
         # Should have _recreate_metadata_table method
         assert hasattr(PostgreSQLAbstractCacheHandler, '_recreate_metadata_table')
         assert hasattr(PostgreSQLAbstractCacheHandler, '_ensure_metadata_table_exists')
-        
+
         # get_supported_datatypes should be abstract
         assert hasattr(PostgreSQLAbstractCacheHandler, 'get_supported_datatypes')
-        method = getattr(PostgreSQLAbstractCacheHandler, 'get_supported_datatypes')
+        method = PostgreSQLAbstractCacheHandler.get_supported_datatypes
         assert getattr(method, '__isabstractmethod__', False), "get_supported_datatypes should be abstract"

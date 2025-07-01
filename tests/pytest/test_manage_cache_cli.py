@@ -59,14 +59,20 @@ class TestManageCacheCLI:
                 mock_check.assert_called_once()
 
     def test_status_default_command(self):
-        """Test the default status command (both env and tables)."""
+        """Test the default status command (comprehensive status)."""
 
-        with patch("partitioncache.cli.manage_cache.validate_environment") as mock_validate:
-            with patch("partitioncache.cli.manage_cache.check_table_status") as mock_check:
-                with patch("sys.argv", ["manage_cache.py", "status"]):
-                    main()
-                    mock_validate.assert_called_once()
-                    mock_check.assert_called_once()
+        with patch("partitioncache.cli.manage_cache.show_comprehensive_status") as mock_status:
+            with patch("sys.argv", ["manage_cache.py", "status"]):
+                main()
+                mock_status.assert_called_once()
+
+    def test_status_all_command(self):
+        """Test the status all command."""
+
+        with patch("partitioncache.cli.manage_cache.show_comprehensive_status") as mock_status:
+            with patch("sys.argv", ["manage_cache.py", "status", "all"]):
+                main()
+                mock_status.assert_called_once()
 
     def test_cache_count_command(self):
         """Test the cache count command."""
@@ -213,14 +219,14 @@ class TestManageCacheCLI:
                 main()
                 mock_help.assert_called_once()
 
-    @patch("partitioncache.cli.manage_cache.load_dotenv")
-    def test_env_file_loading(self, mock_load_dotenv):
+    @patch("partitioncache.cli.manage_cache.load_environment_with_validation")
+    def test_env_file_loading(self, mock_load_env):
         """Test that environment file loading works."""
 
         with patch("partitioncache.cli.manage_cache.validate_environment"):
-            with patch("sys.argv", ["manage_cache.py", "--env", "custom.env", "status", "env"]):
+            with patch("sys.argv", ["manage_cache.py", "--env-file", "custom.env", "status", "env"]):
                 main()
-                mock_load_dotenv.assert_called_once_with("custom.env")
+                mock_load_env.assert_called_once_with("custom.env")
 
     def test_error_handling(self):
         """Test that exceptions are handled gracefully."""

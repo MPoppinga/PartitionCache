@@ -1,9 +1,10 @@
-import pytest
 from unittest.mock import Mock, patch
+
+import pytest
+from psycopg import sql
+
 from partitioncache.cache_handler.abstract import AbstractCacheHandler_Lazy
 from partitioncache.cache_handler.postgresql_bit import PostgreSQLBitCacheHandler
-from psycopg import sql
-from bitarray import bitarray
 
 INIT_CALLS = [
     (

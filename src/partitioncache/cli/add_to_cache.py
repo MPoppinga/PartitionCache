@@ -6,11 +6,17 @@ import argparse
 import os
 from logging import getLogger
 
-import dotenv
-
 import partitioncache
+from partitioncache.cli.common_args import (
+    add_cache_args,
+    add_database_args,
+    add_environment_args,
+    add_queue_args,
+    get_database_connection_params,
+    load_environment_with_validation,
+    resolve_cache_backend,
+)
 from partitioncache.db_handler import get_db_handler
-from partitioncache.db_handler.abstract import AbstractDBHandler
 from partitioncache.query_processor import clean_query, generate_all_query_hash_pairs, hash_query
 
 logger = getLogger("PartitionCache")
@@ -20,55 +26,39 @@ def main():
     parser = argparse.ArgumentParser(description="Add queries to the partition cache either directly or via the queue")
 
     # Query configuration
-    parser.add_argument("--query", type=str, help="SQL query to cache")
-
-    parser.add_argument("--query-file", type=str, help="Path to file containing a SQL query to add to cache")
-
-    parser.add_argument(
-        "--no-recompose", action="store_true", help="Do not recompose the query before adding to cache, the query is added as is to the cache or fragment queue"
+    query_group = parser.add_argument_group("query configuration")
+    query_group.add_argument("--query", type=str, help="SQL query to cache")
+    query_group.add_argument("--query-file", type=str, help="Path to file containing a SQL query to add to cache")
+    query_group.add_argument(
+        "--no-recompose",
+        action="store_true",
+        help="Do not recompose the query before adding to cache, the query is added as is to the cache or fragment queue"
     )
 
-    parser.add_argument("--partition-key", type=str, required=True, help="Name of the partition key column")
+    # Execution mode configuration
+    mode_group = parser.add_argument_group("execution mode")
+    mode_group.add_argument("--queue", action="store_true", help="Add query to fragment queue instead of executing directly")
+    mode_group.add_argument("--queue-original", action="store_true", help="Add query to original query queue instead of fragment queue")
+    mode_group.add_argument("--direct", action="store_true", help="Calculate fragments directly instead of using the incoming queue")
 
-    parser.add_argument(
-        "--partition-datatype",
-        type=str,
-        default=None,
-        choices=["integer", "float", "text", "timestamp"],
-        help="Datatype of the partition key (if not specified, the datatype will be inferred from the query)",
-    )
-
-    # Queue configuration
-    parser.add_argument("--queue", action="store_true", help="Add query to fragment queue instead of executing directly")
-
-    parser.add_argument("--queue-original", action="store_true", help="Add query to original query queue instead of fragment queue")
-
-    parser.add_argument("--queue-provider", type=str, default="postgresql", help="Queue provider to use")
-
-    # Direct execution configuration
-    parser.add_argument("--direct", action="store_true", help="Calculate fragments directly instead of using the incoming queue")
-
-    parser.add_argument("--db-backend", type=str, default="postgresql", help="Database backend (currently only postgresql supported)")
-
-    parser.add_argument("--db-name", type=str, help="Database name, if not specified, the database name will be read from the environment file")
-
-    parser.add_argument("--env", type=str, default=".env", help="Path to environment file with database credentials")
-
-    # Cache configuration
-    parser.add_argument("--cache-backend", type=str, default="postgresql_bit", help="Cache backend to use")
-    # TODO allow Null values to use the env files entries
+    # Add common argument groups
+    add_cache_args(parser, require_partition_key=True)
+    add_database_args(parser)
+    add_queue_args(parser)
+    add_environment_args(parser)
 
     args = parser.parse_args()
 
-    # Load environment variables
-    dotenv.load_dotenv(args.env)
+    # Load environment variables with validation
+    load_environment_with_validation(args.env_file)
 
-    # Validate mutually exclusive options
+    # Validate mutually exclusive options for execution mode
     queue_options = [args.queue, args.direct, args.queue_original]
     if sum(queue_options) != 1:
         logger.error("Only one of --queue, --direct or --queue-original can be specified")
         exit(1)
 
+    # Validate query source options
     query_options = [args.query is not None, args.query_file is not None]
     if sum(query_options) != 1:
         logger.error("Only one of --query or --query-file can be provided")
@@ -80,8 +70,11 @@ def main():
     else:
         query = args.query
 
+    # Determine queue provider
+    queue_provider = getattr(args, 'queue_provider', None) or os.getenv("QUERY_QUEUE_PROVIDER", "postgresql")
+
     if args.queue_original:
-        success = partitioncache.push_to_original_query_queue(query, args.partition_key, args.partition_datatype, args.queue_provider)
+        success = partitioncache.push_to_original_query_queue(query, args.partition_key, args.partition_datatype, queue_provider)
         if success:
             logger.info("Query successfully added to original query queue")
         else:
@@ -97,11 +90,11 @@ def main():
                 follow_graph=True,
                 keep_all_attributes=True,
             )
-            success = partitioncache.push_to_query_fragment_queue(query_hash_pairs, args.partition_key, args.partition_datatype, args.queue_provider)
+            success = partitioncache.push_to_query_fragment_queue(query_hash_pairs, args.partition_key, args.partition_datatype, queue_provider)
         else:
             query = clean_query(query)
             query_hash_pairs = [(query, hash_query(query))]
-            success = partitioncache.push_to_query_fragment_queue(query_hash_pairs, args.partition_key, args.partition_datatype, args.queue_provider)
+            success = partitioncache.push_to_query_fragment_queue(query_hash_pairs, args.partition_key, args.partition_datatype, queue_provider)
         if success:
             logger.info("Query successfully added to query fragment queue")
         else:
@@ -112,39 +105,22 @@ def main():
         if not args.no_recompose:
             logger.warning("Direct mode with recomposing may take a long time on large queries, consider using the queue instead")
 
-        if args.db_name is None:
-            db_name = os.getenv("DB_NAME")
-            if db_name is None:
-                logger.error("--db-name is required")
-                exit(1)
-            args.db_name = db_name
-
         try:
-            # Initialize cache handler using API
-            cache = partitioncache.create_cache_helper(args.cache_backend, args.partition_key, args.partition_datatype)
+            # Resolve cache backend and database connection
+            cache_backend = resolve_cache_backend(args)
 
-            # Get database handler
-            db_handler: AbstractDBHandler
+            # Initialize cache handler using API
+            cache = partitioncache.create_cache_helper(cache_backend, args.partition_key, args.partition_datatype)
+
+            # Get database handler using common connection parameters
+            db_connection_params = get_database_connection_params(args)
+
             if args.db_backend == "postgresql":
-                db_handler = get_db_handler(
-                    "postgres",
-                    host=os.getenv("PG_DB_HOST", os.getenv("DB_HOST", "localhost")),
-                    port=int(os.getenv("PG_DB_PORT", os.getenv("DB_PORT", 5432))),
-                    user=os.getenv("PG_DB_USER", os.getenv("DB_USER", "postgres")),
-                    password=os.getenv("PG_DB_PASSWORD", os.getenv("DB_PASSWORD", "postgres")),
-                    dbname=args.db_name,
-                )
+                db_handler = get_db_handler("postgres", **db_connection_params)
             elif args.db_backend == "mysql":
-                db_handler = get_db_handler(
-                    "mysql",
-                    host=os.getenv("MY_DB_HOST", os.getenv("DB_HOST", "localhost")),
-                    port=int(os.getenv("MY_DB_PORT", os.getenv("DB_PORT", 3306))),
-                    user=os.getenv("MY_DB_USER", os.getenv("DB_USER", "root")),
-                    password=os.getenv("MY_DB_PASSWORD", os.getenv("DB_PASSWORD", "root")),
-                    dbname=args.db_name,
-                )
+                db_handler = get_db_handler("mysql", **db_connection_params)
             elif args.db_backend == "sqlite":
-                db_handler = get_db_handler("sqlite", db_path=args.db_dir)
+                db_handler = get_db_handler("sqlite", **db_connection_params)
             else:
                 raise ValueError(f"Unsupported database backend: {args.db_backend}")
 

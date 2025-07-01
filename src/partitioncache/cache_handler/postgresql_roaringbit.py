@@ -75,7 +75,7 @@ class PostgreSQLRoaringBitCacheHandler(PostgreSQLAbstractCacheHandler):
             self.db.rollback()
             raise
 
-    def _ensure_partition_table(self, partition_key: str) -> None:
+    def _ensure_partition_table(self, partition_key: str, datatype: str, **kwargs) -> None:
         """Ensure a partition table exists."""
         try:
             # First ensure metadata table exists before trying to query it
@@ -120,7 +120,7 @@ class PostgreSQLRoaringBitCacheHandler(PostgreSQLAbstractCacheHandler):
 
         try:
             # Ensure partition table exists
-            self._ensure_partition_table(partition_key)
+            self._ensure_partition_table(partition_key, "integer")
 
             # Convert input to a list of integers for rb_build
             if isinstance(value, BitMap):
@@ -257,12 +257,8 @@ class PostgreSQLRoaringBitCacheHandler(PostgreSQLAbstractCacheHandler):
         """PostgreSQL roaring bit handler supports only integer datatype."""
         return {"integer"}
 
-    def get_datatype(self, partition_key: str) -> str | None:
-        """Get the datatype of the cache handler. If the partition key is not set, return None."""
-        return self._get_partition_datatype(partition_key)
-
     def register_partition_key(self, partition_key: str, datatype: str, **kwargs) -> None:
         """Register a partition key with the cache handler."""
         if datatype != "integer":
             raise ValueError("PostgreSQL roaring bit handler supports only integer datatype")
-        self._ensure_partition_table(partition_key)
+        self._ensure_partition_table(partition_key, datatype)

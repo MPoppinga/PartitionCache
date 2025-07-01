@@ -105,8 +105,9 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
 
         self.db.commit()
 
-    def _ensure_partition_table(self, partition_key: str, bitsize: int | None = None) -> None:
+    def _ensure_partition_table(self, partition_key: str, datatype: str, **kwargs) -> None:
         """Ensure a partition table exists."""
+        bitsize = kwargs.get("bitsize", self.default_bitsize)
         try:
             # First ensure metadata table exists before trying to query it
             self._ensure_metadata_table_exists()
@@ -140,7 +141,7 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
 
         try:
             # Ensure partition table exists
-            self._ensure_partition_table(partition_key)
+            self._ensure_partition_table(partition_key, "integer")
 
             # Get the bitsize for this partition
             bitsize = self._get_partition_bitsize(partition_key)
@@ -288,10 +289,6 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
         """PostgreSQL bit handler supports only integer datatype."""
         return {"integer"}
 
-    def get_datatype(self, partition_key: str) -> str | None:
-        """Get the datatype of the cache handler. If the partition key is not set, return None."""
-        return self._get_partition_datatype(partition_key)
-
     def register_partition_key(self, partition_key: str, datatype: str, **kwargs) -> None:
         """Register a partition key with the cache handler."""
         if datatype != "integer":
@@ -300,4 +297,4 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
             bitsize = kwargs["bitsize"]
         else:
             bitsize = self.default_bitsize
-        self._ensure_partition_table(partition_key, bitsize)
+        self._ensure_partition_table(partition_key, datatype, bitsize=bitsize)

@@ -519,6 +519,7 @@ def apply_cache_lazy(
         return working_query, stats
 
     # Step 3: Apply cache restrictions
+    cache_target_alias: str | None
     if use_p0_table and p0_rewritten:
         # Target p0 table for cache restrictions
         cache_target_alias = p0_alias if p0_alias else "p0"
@@ -627,6 +628,7 @@ def apply_cache(
 
     # Step 3: Apply the partition keys to the working query
     # Determine the correct alias for cache restrictions
+    cache_target_alias: str | None
     if use_p0_table and p0_rewritten:
         # P0 table was added, target the p0 table for cache restrictions
         cache_target_alias = p0_alias if p0_alias else "p0"

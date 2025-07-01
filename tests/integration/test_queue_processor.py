@@ -15,7 +15,7 @@ class TestQueueProcessor:
     def test_queue_basic_operations(self, db_session):
         """Test basic queue operations: add, count, and clear."""
         from partitioncache.queue import clear_all_queues, reset_queue_handler
-        
+
         # Reset and clear queues to start fresh
         reset_queue_handler()
         clear_all_queues()
@@ -34,31 +34,31 @@ class TestQueueProcessor:
         # Check queue lengths
         lengths = get_queue_lengths()
         assert lengths["original_query_queue"] >= 1, "Original queue should have at least 1 entry"
-        
+
         # Clean up
         reset_queue_handler()
 
     def test_queue_processor_setup(self, db_session):
         """Test queue processor setup and configuration for different providers."""
-        from partitioncache.queue import reset_queue_handler, get_queue_provider_name
-        
+        from partitioncache.queue import get_queue_provider_name, reset_queue_handler
+
         # Reset queue handler to ensure clean state
         reset_queue_handler()
-        
+
         try:
             # Check current queue provider
             provider = get_queue_provider_name()
-            
+
             if provider == "postgresql":
                 # For PostgreSQL, verify queue tables are created when handler is initialized
                 from partitioncache.queue import get_queue_lengths
-                
+
                 # This should trigger table creation
                 lengths = get_queue_lengths()
                 assert isinstance(lengths, dict)
                 assert "original_query_queue" in lengths
                 assert "query_fragment_queue" in lengths
-                
+
                 # Verify queue tables exist in database
                 with db_session.cursor() as cur:
                     cur.execute("""
@@ -68,7 +68,7 @@ class TestQueueProcessor:
                     """)
                     tables = cur.fetchall()
                     table_names = [t[0] for t in tables]
-                    
+
                     # At least one queue table should exist after initialization
                     assert len(table_names) >= 0  # Tables might have different prefixes
             else:
@@ -93,13 +93,13 @@ class TestQueueProcessor:
         3. Verify job execution and side effects
         """
         from partitioncache.queue import get_queue_provider_name, reset_queue_handler
-        
+
         # Only run this test for PostgreSQL queue provider
         if get_queue_provider_name() != "postgresql":
             pytest.skip("This test is specific to PostgreSQL queue provider with pg_cron")
-            
+
         reset_queue_handler()
-        
+
         # Check if pg_cron extension is available
         with db_session.cursor() as cur:
             try:
@@ -155,7 +155,7 @@ class TestQueueProcessor:
             """, (f'Test executed at {test_jobname}',))
 
             result_record = cur.fetchone()
-            
+
             # If no record found, check execution details (if available)
             if result_record is None:
                 try:
@@ -167,10 +167,10 @@ class TestQueueProcessor:
                         LIMIT 5;
                     """)
                     recent_runs = cur.fetchall()
-                    
+
                     # Log recent runs for debugging
                     print(f"Recent cron runs: {recent_runs}")
-                    
+
                     # Check if any recent run matches our job (by timing)
                     if recent_runs:
                         # At least one job ran, which is a good sign
@@ -178,7 +178,7 @@ class TestQueueProcessor:
                 except Exception as e:
                     # pg_cron table structure might be different
                     print(f"Could not check cron execution details: {e}")
-                
+
                 # Re-check for the result record after additional time
                 time.sleep(2)
                 cur.execute("""
@@ -189,7 +189,7 @@ class TestQueueProcessor:
                     LIMIT 1;
                 """, (f'Test executed at {test_jobname}',))
                 result_record = cur.fetchone()
-            
+
             # For integration testing, we verify that the job was scheduled and the command is valid
             # rather than waiting for actual cron execution (which happens at minute boundaries)
             if result_record is None:
@@ -198,7 +198,7 @@ class TestQueueProcessor:
                     cur.execute(test_command)
                     db_session.commit()
                     print("✅ Test command executed manually - pg_cron scheduling capability verified")
-                    
+
                     # Clean up the manual test record
                     cur.execute("DELETE FROM test_cron_results WHERE message LIKE %s", (f'Test executed at {test_jobname}',))
                     db_session.commit()
@@ -209,7 +209,7 @@ class TestQueueProcessor:
 
             # Cleanup: unschedule the test job
             cur.execute("SELECT cron.unschedule(%s);", (test_jobname,))
-            
+
         reset_queue_handler()
 
     def test_schedule_job_fast(self, db_session):
@@ -218,13 +218,13 @@ class TestQueueProcessor:
         Verifies that jobs can be scheduled and are properly configured.
         """
         from partitioncache.queue import get_queue_provider_name, reset_queue_handler
-        
+
         # Only run this test for PostgreSQL queue provider
         if get_queue_provider_name() != "postgresql":
             pytest.skip("This test is specific to PostgreSQL queue provider with pg_cron")
-            
+
         reset_queue_handler()
-        
+
         # Check if pg_cron extension is available
         with db_session.cursor() as cur:
             try:
@@ -271,7 +271,7 @@ class TestQueueProcessor:
                 SELECT jobname FROM cron.job WHERE jobname = %s;
             """, (test_jobname,))
             assert cur.fetchone() is None, "Job should be unscheduled"
-            
+
         reset_queue_handler()
 
     def test_queue_processing_integration(self, db_session, cache_client):
@@ -280,12 +280,12 @@ class TestQueueProcessor:
         Simulates the complete workflow from query queuing to cache storage.
         """
         import pytest
-        
+
         # Skip PostgreSQL bit/roaringbit backends in CI due to table creation issues
         backend_name = getattr(cache_client, '__class__', type(cache_client)).__name__.lower()
         if 'postgresql' in backend_name and ('bit' in backend_name or 'roaring' in backend_name):
             pytest.skip(f"Skipping {backend_name} due to CI table creation issues")
-        
+
         partition_key = "zipcode"
         test_query = """
             SELECT zipcode, COUNT(*) as location_count
@@ -347,11 +347,11 @@ class TestQueueProcessor:
 
         # Verify cache was populated
         cached_values = cache_client.get(first_hash, partition_key)
-        
+
         # Convert BitMap to set for comparison if necessary
         if hasattr(cached_values, '__iter__') and not isinstance(cached_values, set):
             cached_values = set(cached_values)
-            
+
         assert cached_values == actual_zipcodes, "Cache should contain actual zipcode values"
 
         # Test basic cache retrieval without full get_partition_keys (which might hang)
@@ -371,25 +371,24 @@ class TestQueueProcessor:
         
         This simulates what would happen with proper concurrent processing.
         """
-        from partitioncache.queue import (get_queue_provider_name, reset_queue_handler, 
-                                         clear_all_queues, pop_from_original_query_queue)
-        
+        from partitioncache.queue import clear_all_queues, get_queue_provider_name, pop_from_original_query_queue, reset_queue_handler
+
         provider = get_queue_provider_name()
-        
+
         # Skip for PostgreSQL since it has its own cron-based tests
         if provider == "postgresql":
             pytest.skip("PostgreSQL uses pg_cron, this test is for other providers")
-            
+
         reset_queue_handler()
         clear_all_queues()
-        
+
         partition_key = "zipcode"
         test_queries = [
             "SELECT * FROM test_locations WHERE zipcode = 1001;",
             "SELECT * FROM test_locations WHERE zipcode = 1002;",
             "SELECT COUNT(*) FROM test_locations WHERE zipcode > 10000;",
         ]
-        
+
         # Step 1: Producer - Add queries to queue (simulates application adding queries)
         for query in test_queries:
             success = push_to_original_query_queue(
@@ -398,50 +397,50 @@ class TestQueueProcessor:
                 partition_datatype="integer"
             )
             assert success, f"Failed to queue query: {query}"
-        
+
         # Verify all queries were queued
         lengths = get_queue_lengths()
         assert lengths["original_query_queue"] >= len(test_queries), "Not all queries were queued"
-        
+
         # Step 2: Consumer - Process queries from queue (simulates separate worker process)
         processed_queries = []
         max_attempts = len(test_queries) + 2  # Safety limit
-        
+
         for attempt in range(max_attempts):
             # Non-blocking pop to simulate worker processing
             result = pop_from_original_query_queue()
             if result is None:
                 break  # Queue is empty
-                
+
             query, partition_key_from_queue, partition_datatype = result
             processed_queries.append(query)
-            
+
             # Step 3: Simulate processing - generate cache entries
             from partitioncache.query_processor import generate_all_hashes
-            
+
             hashes = generate_all_hashes(query, partition_key_from_queue)
             if hashes:
                 # Simulate cache population with dummy data
                 first_hash = list(hashes)[0]
                 test_values = {1001, 1002}  # Dummy partition values
                 cache_client.set_set(first_hash, test_values, partition_key_from_queue)
-                
+
                 # Verify cache was populated
                 cached_values = cache_client.get(first_hash, partition_key_from_queue)
-                
+
                 # Convert BitMap to set for comparison if necessary
                 if hasattr(cached_values, '__iter__') and not isinstance(cached_values, set):
                     cached_values = set(cached_values)
-                    
+
                 assert cached_values == test_values, "Cache should be populated by worker"
-        
+
         # Verify all queries were processed
         assert len(processed_queries) == len(test_queries), f"Expected {len(test_queries)} processed, got {len(processed_queries)}"
-        
+
         # Verify queue is now empty
         final_lengths = get_queue_lengths()
         assert final_lengths["original_query_queue"] == 0, "Queue should be empty after processing"
-        
+
         reset_queue_handler()
 
     @pytest.mark.slow
@@ -499,9 +498,9 @@ class TestQueueErrorHandling:
     def test_invalid_query_handling(self, db_session):
         """Test handling of invalid SQL queries in queue."""
         from partitioncache.queue import reset_queue_handler
-        
+
         reset_queue_handler()
-        
+
         invalid_query = "INVALID SQL SYNTAX HERE;"
 
         # Should handle invalid queries gracefully

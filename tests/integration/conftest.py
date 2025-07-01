@@ -110,7 +110,7 @@ def db_connection(tmp_path_factory):
                             city_id INTEGER NOT NULL,
                             zipcode TEXT NOT NULL,
                             x DECIMAL(10,6) NOT NULL,  -- longitude-like coordinate
-                            y DECIMAL(10,6) NOT NULL,  -- latitude-like coordinate  
+                            y DECIMAL(10,6) NOT NULL,  -- latitude-like coordinate
                             rating DECIMAL(2,1) DEFAULT 3.0,
                             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                         );
@@ -127,7 +127,7 @@ def db_connection(tmp_path_factory):
                             city_id INTEGER NOT NULL,
                             zipcode TEXT NOT NULL,
                             x DECIMAL(10,6) NOT NULL,  -- longitude-like coordinate
-                            y DECIMAL(10,6) NOT NULL,  -- latitude-like coordinate  
+                            y DECIMAL(10,6) NOT NULL,  -- latitude-like coordinate
                             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                         );
                     """)
@@ -251,7 +251,7 @@ def db_session(db_connection):
                             city_id INTEGER NOT NULL,
                             zipcode TEXT NOT NULL,
                             x DECIMAL(10,6) NOT NULL,
-                            y DECIMAL(10,6) NOT NULL,  
+                            y DECIMAL(10,6) NOT NULL,
                             rating DECIMAL(2,1) DEFAULT 3.0,
                             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                         );
@@ -398,7 +398,7 @@ def _is_rocksdb_available():
 def _is_rocksdict_available():
     """Check if rocksdict is available for testing."""
     try:
-        import rocksdict
+        import rocksdic
 
         return True
     except ImportError:
@@ -639,7 +639,7 @@ def postgresql_queue_functions(db_connection):
 
     try:
         # Import the setup function
-        from partitioncache.cli.setup_postgresql_queue_processor import get_queue_table_prefix_from_env, setup_database_objects
+        from partitioncache.cli.setup_postgresql_queue_processor import setup_database_objects
 
         # Load the SQL functions into the database
         # Only create pg_cron trigger if the extension is available

@@ -285,7 +285,7 @@ class TestPostgreSQLRoaringBitCacheHandler:
         # Mock sequence: metadata check returns None (new partition), extension check returns 1
         mock_cursor.fetchone.side_effect = [None, (1,)]
 
-        cache_handler._ensure_partition_table("new_partition")
+        cache_handler._ensure_partition_table("new_partition", "integer")
 
         # Should have created the table (metadata check + extension check + create table)
         assert mock_cursor.execute.call_count >= 3
@@ -298,7 +298,7 @@ class TestPostgreSQLRoaringBitCacheHandler:
         # Reset call count to ignore __init__ calls
         mock_cursor.reset_mock()
 
-        cache_handler._ensure_partition_table("existing_partition")
+        cache_handler._ensure_partition_table("existing_partition", "integer")
 
         # Should call _ensure_metadata_table_exists and _get_partition_datatype
         # Since partition exists, it shouldn't create a new table

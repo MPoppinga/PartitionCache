@@ -6,9 +6,14 @@ import argparse
 import sys
 from logging import WARNING, getLogger
 
-import dotenv
-
 import partitioncache
+from partitioncache.cli.common_args import (
+    add_cache_args,
+    add_environment_args,
+    add_output_args,
+    load_environment_with_validation,
+    resolve_cache_backend,
+)
 
 logger = getLogger("PartitionCache")
 
@@ -19,49 +24,35 @@ logger.setLevel(WARNING)
 def main(file=sys.stdout):
     parser = argparse.ArgumentParser(description="Read partition keys from cache for a given query")
 
+    # Query configuration
     parser.add_argument("--query", type=str, required=True, help="SQL query to look up in cache")
 
-    parser.add_argument("--cache-backend", type=str, default="rocksdb_set", help="Cache backend to use")
+    # Add common argument groups
+    add_cache_args(parser, require_partition_key=False)
+    add_environment_args(parser)
+    add_output_args(parser)
 
-    parser.add_argument("--partition-key", type=str, default="partition_key", help="Name of the partition key column")
-
-    parser.add_argument(
-        "--partition-datatype",
-        type=str,
-        default="integer",
-        choices=["integer", "float", "text", "timestamp"],
-        help="Datatype of the partition key (default: integer)",
-    )
-
-    parser.add_argument("--env-file", type=str, help="Path to environment file with cache configuration")
-
-    parser.add_argument(
-        "--output-format",
-        choices=["list", "json", "lines"],
-        default="list",
-        help="Output format for the partition keys, list is a simple comma separated list of partition keys, json is a json array and lines is one partition key per line",
-    )
-
-    parser.add_argument(
-        "--output-file", type=str, help="Path to file to write the partition keys to, if not specified, the partition keys will be printed to the console"
-    )
+    # Set default partition key if not provided
+    parser.set_defaults(partition_key="partition_key", partition_datatype="integer")
 
     args = parser.parse_args()
 
-    # Load environment variables if specified
-    if args.env_file:
-        dotenv.load_dotenv(args.env_file)
+    # Load environment variables
+    load_environment_with_validation(args.env_file)
+
+    # Resolve cache backend and determine output file
+    cache_backend = resolve_cache_backend(args)
+
+    # Determine output file
+    if args.output_file:
+        output_file = open(args.output_file, "w")
+    else:
+        output_file = sys.stdout
 
     cache = None
-    if args.output_file:
-        with open(args.output_file, "w") as f:
-            file = f
-    else:
-        file = sys.stdout
-
     try:
         # Initialize cache handler using API
-        cache = partitioncache.create_cache_helper(args.cache_backend, args.partition_key, args.partition_datatype)
+        cache = partitioncache.create_cache_helper(cache_backend, args.partition_key, args.partition_datatype)
 
         # Get partition keys # TODO use cache.get_partition_keys() etc instead
         partition_keys, num_subqueries, num_hits = partitioncache.get_partition_keys(
@@ -84,13 +75,13 @@ def main(file=sys.stdout):
             if args.output_format == "json":
                 import json
 
-                print(json.dumps(sorted(partition_keys)), file=file)
+                print(json.dumps(sorted(partition_keys)), file=output_file)
 
             elif args.output_format == "lines":
                 for key in sorted(partition_keys):
-                    print(str(key), file=file)
+                    print(str(key), file=output_file)
             else:  # list format
-                print(",".join(str(x) for x in sorted(partition_keys)), file=file)
+                print(",".join(str(x) for x in sorted(partition_keys)), file=output_file)
 
             # Print summary
             logger.info(f"Found {len(partition_keys)} partition keys")
@@ -106,6 +97,8 @@ def main(file=sys.stdout):
     finally:
         if cache is not None:
             cache.close()
+        if args.output_file and output_file != sys.stdout:
+            output_file.close()
 
 
 if __name__ == "__main__":

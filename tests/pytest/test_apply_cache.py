@@ -2,15 +2,16 @@
 Tests for the apply_cache module, specifically extend_query_with_partition_keys function.
 """
 
-import pytest
 from datetime import datetime
-from unittest.mock import patch, Mock
+from unittest.mock import Mock, patch
+
+import pytest
 
 from partitioncache.apply_cache import (
-    extend_query_with_partition_keys,
-    find_p0_alias,
-    extend_query_with_partition_keys_lazy,
     apply_cache_lazy,
+    extend_query_with_partition_keys,
+    extend_query_with_partition_keys_lazy,
+    find_p0_alias,
     rewrite_query_with_p0_table,
 )
 from partitioncache.cache_handler.abstract import AbstractCacheHandler_Lazy
@@ -592,7 +593,7 @@ class TestApplyCacheLazy:
     def create_mock_cache_handler(self, lazy_subquery: str | None = None, used_hashes: int = 5):
         """Create a mock cache handler for testing."""
         mock_handler = Mock(spec=AbstractCacheHandler_Lazy)
-        
+
         # Mock get_intersected_lazy method
         mock_handler.get_intersected_lazy.return_value = (lazy_subquery, used_hashes)
 
@@ -603,7 +604,7 @@ class TestApplyCacheLazy:
         """Test that function returns original query when no cache hits."""
         # Make isinstance return True for AbstractCacheHandler_Lazy
         mock_isinstance.side_effect = lambda obj, cls: cls.__name__ == 'AbstractCacheHandler_Lazy' or isinstance(obj, cls.__bases__[0] if hasattr(cls, '__bases__') and cls.__bases__ else object)
-        
+
         query = "SELECT * FROM users AS u WHERE u.active = true"
         mock_handler = self.create_mock_cache_handler(lazy_subquery=None, used_hashes=0)
 
