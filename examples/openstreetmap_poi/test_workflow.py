@@ -19,8 +19,9 @@ import time
 from pathlib import Path
 
 import psycopg2
-import partitioncache
 from dotenv import load_dotenv
+
+import partitioncache
 
 # Add the project root to sys.path for imports
 project_root = Path(__file__).parent.parent.parent
@@ -92,7 +93,7 @@ def run_poi_query(query_file, description=""):
             dbname=os.getenv("DB_NAME"), user=os.getenv("DB_USER"), password=os.getenv("DB_PASSWORD"), host=os.getenv("DB_HOST"), port=os.getenv("DB_PORT")
         )
 
-        with open(query_file, "r") as f:
+        with open(query_file) as f:
             query = f.read().strip()
 
         print(f"   Query file: {query_file}")

@@ -138,20 +138,20 @@ done
 
 ```bash
 # Read zipcode partition keys for a query
-pcache-get \
+pcache-read \
   --query-file testqueries_examples/zipcode/q1.sql \
   --partition-key zipcode \
   --partition-datatype integer \
   --cache-backend postgresql_array \
-  --env .env
+  --env-file .env
 
 # Read landkreis partition keys for a query
-pcache-get \
+pcache-read \
   --query-file testqueries_examples/landkreis/q1.sql \
   --partition-key landkreis \
   --partition-datatype text \
   --cache-backend postgresql_array \
-  --env .env
+  --env-file .env
 ```
 
 ### Queue Monitoring
@@ -159,7 +159,7 @@ pcache-get \
 Start the queue monitor to process queries asynchronously:
 
 ```bash
-pcache-observer \
+pcache-monitor \
   --cache-backend postgresql_array \
   --db-backend postgresql \
   --env .env

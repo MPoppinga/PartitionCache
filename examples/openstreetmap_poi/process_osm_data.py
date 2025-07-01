@@ -1,13 +1,12 @@
+import os
+import time
+
 import osmium
 import psycopg2
 import requests
-from shapely.geometry import Point, Polygon, MultiPolygon
-from rtree import index
-import time
-
-
 from dotenv import load_dotenv
-import os
+from rtree import index
+from shapely.geometry import MultiPolygon, Point, Polygon
 from tqdm import tqdm
 
 # Load environment variables from .env file
@@ -20,7 +19,7 @@ DB_USER = os.getenv("DB_USER")
 DB_PASSWORD = os.getenv("DB_PASSWORD")
 DB_HOST = os.getenv("DB_HOST")
 DB_PORT = os.getenv("DB_PORT")
- 
+
 # OSM file path
 
 OSM_FILE = os.getenv("OSM_FILE", "germany-latest.osm.pbf")
@@ -29,7 +28,7 @@ OSM_URL = os.getenv("OSM_URL", "https://download.geofabrik.de/europe/germany-lat
 
 class POIHandler(osmium.SimpleHandler):
     def __init__(self):
-        super(POIHandler, self).__init__()
+        super().__init__()
         self.pois = []
         self.postal_areas = index.Index()
         self.postal_codes = {}
@@ -47,13 +46,13 @@ class POIHandler(osmium.SimpleHandler):
                     outer_rings.append([(n.lon, n.lat) for n in outer_ring])
                     for inner_ring in a.inner_rings(outer_ring):
                         inner_rings.append([(n.lon, n.lat) for n in inner_ring])
-                
+
                 if outer_rings:
                     if len(outer_rings) == 1:
                         polygon = Polygon(outer_rings[0], inner_rings)
                     else:
                         polygon = MultiPolygon([Polygon(ring, inner_rings) for ring in outer_rings])
-                
+
                     self.postal_areas.insert(a.id, polygon.bounds, obj=(polygon, a.tags['postal_code']))
                 else:
                     print(f"Warning: No outer rings found for postal area {a.id}")
@@ -69,13 +68,13 @@ class POIHandler(osmium.SimpleHandler):
                     outer_rings.append([(n.lon, n.lat) for n in outer_ring])
                     for inner_ring in a.inner_rings(outer_ring):
                         inner_rings.append([(n.lon, n.lat) for n in inner_ring])
-                
+
                 if outer_rings:
                     if len(outer_rings) == 1:
                         polygon = Polygon(outer_rings[0], inner_rings)
                     else:
                         polygon = MultiPolygon([Polygon(ring, inner_rings) for ring in outer_rings])
-                
+
                     district_name = a.tags['name']
                     self.admin_areas.insert(a.id, polygon.bounds, obj=(polygon, district_name))
                 else:
@@ -166,8 +165,6 @@ def create_table(conn):
             landkreis TEXT,
             geom GEOMETRY(Point, 25832)
         );
-
-        
         """)
     conn.commit()
     print("Table and indexes created successfully")
@@ -201,19 +198,19 @@ def main():
             port=DB_PORT
         )
         print("Database connection successful")
-        
+
         # setup postgis if not already done
         with conn.cursor() as cur:
             cur.execute("CREATE EXTENSION IF NOT EXISTS postgis;")
-            conn.commit()            
-        
+            conn.commit()
+
         cur.close()
         conn.close()
-        
+
     except psycopg2.OperationalError as e:
         print(f"Database connection failed: {e}")
         return
-    
+
     if not os.path.exists(OSM_FILE):
         # Download the OSM file
         print(f"Downloading OSM file from {OSM_URL}...")
@@ -221,7 +218,7 @@ def main():
         with open(OSM_FILE, 'wb') as f:
             f.write(response.content)
         print(f"OSM file downloaded and saved as {OSM_FILE}")
-        
+
     print("Starting POI extraction from OSM file...")
     handler = POIHandler()
     handler.apply_file(OSM_FILE)
@@ -250,16 +247,16 @@ def main():
 
     print("Inserting POIs into the database...")
     insert_pois(conn, handler.pois)
-    
-    
+
+
     sql = """CREATE INDEX IF NOT EXISTS pois_geom_idx ON pois USING GIST (geom);
         CREATE INDEX IF NOT EXISTS pois_type_idx ON pois (type);
         CREATE INDEX IF NOT EXISTS pois_subtype_idx ON pois (subtype);
         CREATE INDEX IF NOT EXISTS pois_zipcode_idx ON pois (zipcode, type, subtype, geom);
         CREATE INDEX IF NOT EXISTS pois_landkreis_idx ON pois (landkreis, type, subtype, geom);
-        CREATE MATERIALIZED VIEW IF NOT EXISTS zipcodes AS 
+        CREATE MATERIALIZED VIEW IF NOT EXISTS zipcodes AS
         SELECT DISTINCT zipcode FROM pois WHERE zipcode IS NOT NULL;
-        CREATE MATERIALIZED VIEW IF NOT EXISTS landkreise AS 
+        CREATE MATERIALIZED VIEW IF NOT EXISTS landkreise AS
         SELECT DISTINCT landkreis FROM pois WHERE landkreis IS NOT NULL;
         REFRESH MATERIALIZED VIEW zipcodes;
         REFRESH MATERIALIZED VIEW landkreise;
@@ -267,7 +264,7 @@ def main():
     with conn.cursor() as cur:
         cur.execute(sql)
         conn.commit()
-    
+
     with conn.cursor() as cur:
         cur.execute("CLUSTER pois USING pois_zipcode_idx;")
         conn.commit()
