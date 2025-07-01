@@ -379,6 +379,134 @@ def clear_original_query_queue():
         logger.error(f"Error clearing {provider} original query queue: {e}")
 
 
+def show_comprehensive_status() -> None:
+    """
+    Show comprehensive status of PartitionCache including queue and cache statistics.
+    """
+    logger.info("\n" + "=" * 70)
+    logger.info("PartitionCache Status Overview")
+    logger.info("=" * 70)
+
+    # Environment Configuration
+    logger.info("\n📋 Configuration:")
+    cache_backend = os.getenv("CACHE_BACKEND", "postgresql_array")
+    queue_provider = os.getenv("QUERY_QUEUE_PROVIDER", "postgresql")
+    logger.info(f"  Cache Backend: {cache_backend}")
+    logger.info(f"  Queue Provider: {queue_provider}")
+
+    # Queue Status
+    logger.info("\n📊 Queue Status:")
+    try:
+        queue_lengths = get_queue_lengths()
+        original_query_count = queue_lengths.get("original_query_queue", 0)
+        query_fragment_count = queue_lengths.get("query_fragment_queue", 0)
+        total_queue_count = original_query_count + query_fragment_count
+
+        logger.info(f"  Original Query Queue: {original_query_count:,} entries")
+        logger.info(f"  Query Fragment Queue: {query_fragment_count:,} entries")
+        logger.info(f"  Total Queue Entries: {total_queue_count:,}")
+
+        # Check if pg_cron processor is enabled
+        if queue_provider == "postgresql":
+            try:
+                queue_handler = get_queue_handler(queue_provider)
+                if hasattr(queue_handler, "_check_pg_cron_job_exists") and queue_handler._check_pg_cron_job_exists():  # type: ignore
+                    logger.info("  ✓ PostgreSQL Queue Processor (pg_cron) is enabled")
+                else:
+                    logger.info("  ⚠ PostgreSQL Queue Processor (pg_cron) is not enabled")
+                    logger.info("    Run: pcache-postgresql-queue-processor enable")
+                queue_handler.close()
+            except Exception:
+                pass
+
+    except Exception as e:
+        logger.error(f"  ❌ Error accessing queue: {e}")
+        logger.info("    Run: pcache-manage setup queue")
+
+    # Cache Status
+    logger.info("\n💾 Cache Status:")
+    try:
+        if cache_backend.startswith("postgresql"):
+            # Use PostgreSQL-specific counting for better accuracy
+            partitions = get_partition_overview(cache_backend)
+
+            if not partitions:
+                logger.info("  No partitions found")
+            else:
+                total_entries = sum(p["total_entries"] for p in partitions)
+                valid_entries = sum(p["valid_entries"] for p in partitions)
+                limit_entries = sum(p["limit_entries"] for p in partitions)
+                timeout_entries = sum(p["timeout_entries"] for p in partitions)
+
+                logger.info(f"  Total Cache Entries: {total_entries:,}")
+                logger.info(f"  Valid Entries: {valid_entries:,}")
+                logger.info(f"  Limit Entries: {limit_entries:,}")
+                logger.info(f"  Timeout Entries: {timeout_entries:,}")
+                logger.info(f"  Partitions: {len(partitions)}")
+
+                # Show top 5 partitions by size
+                if len(partitions) > 0:
+                    sorted_partitions = sorted(partitions, key=lambda x: x["total_entries"], reverse=True)
+                    logger.info("\n  Top Partitions by Size:")
+                    for i, partition in enumerate(sorted_partitions[:5]):
+                        logger.info(f"    {i + 1}. {partition['partition_key']:<15} ({partition['datatype']:<8}): {partition['total_entries']:,} entries")
+                    if len(partitions) > 5:
+                        logger.info(f"    ... and {len(partitions) - 5} more partitions")
+        else:
+            # For other cache types
+            cache_handler = get_cache_handler(cache_backend)
+            all_keys = get_all_keys(cache_handler)
+
+            limit_count = sum(1 for key in all_keys if key.startswith("_LIMIT_"))
+            timeout_count = sum(1 for key in all_keys if key.startswith("_TIMEOUT_"))
+            valid_count = len(all_keys) - limit_count - timeout_count
+
+            logger.info(f"  Total Cache Entries: {len(all_keys):,}")
+            logger.info(f"  Valid Entries: {valid_count:,}")
+            logger.info(f"  Limit Entries: {limit_count:,}")
+            logger.info(f"  Timeout Entries: {timeout_count:,}")
+
+            # Get partition information
+            try:
+                partitions = cache_handler.get_partition_keys()
+                logger.info(f"  Partitions: {len(partitions)}")
+            except (AttributeError, TypeError):
+                pass
+
+            cache_handler.close()
+
+    except Exception as e:
+        logger.error(f"  ❌ Error accessing cache: {e}")
+        logger.info("    Run: pcache-manage setup cache")
+
+    # System Health Check
+    logger.info("\n🔍 System Health:")
+    health_issues = []
+
+    # Check environment
+    if not os.getenv("CACHE_BACKEND"):
+        health_issues.append("CACHE_BACKEND environment variable not set")
+
+    # Check if eviction manager is set up (for PostgreSQL)
+    if cache_backend.startswith("postgresql"):
+        try:
+            # Import here to avoid circular dependency
+            from partitioncache.cli.postgresql_cache_eviction import check_eviction_job_exists
+
+            if not check_eviction_job_exists():
+                health_issues.append("PostgreSQL Eviction Manager not enabled (pcache-postgresql-eviction-manager enable)")
+        except Exception:
+            pass
+
+    if health_issues:
+        for issue in health_issues:
+            logger.info(f"  ⚠ {issue}")
+    else:
+        logger.info("  ✓ All systems operational")
+
+    logger.info("\n" + "=" * 70 + "\n")
+
+
 def clear_query_fragment_queue():
     """Clear only the query fragment queue."""
     provider = os.environ.get("QUERY_QUEUE_PROVIDER", "postgresql")
@@ -858,8 +986,11 @@ Examples:
   # Setup new project
   pcache-manage setup all
 
-  # Check environment and tables
-  pcache-manage status
+  # Check comprehensive system status (NEW)
+  pcache-manage status                    # Shows queue + cache stats + health
+  pcache-manage status all               # Same as above
+  pcache-manage status env               # Environment validation only
+  pcache-manage status tables            # Table accessibility only
 
   # Cache operations (uses CACHE_BACKEND from environment)
   pcache-manage cache count
@@ -898,6 +1029,7 @@ to load configuration from a custom environment file.
     status_parser = subparsers.add_parser("status", help="Check PartitionCache status and configuration")
     status_subparsers = status_parser.add_subparsers(dest="status_command", help="Status operations")
 
+    status_subparsers.add_parser("all", help="Show comprehensive status overview (default)")
     status_subparsers.add_parser("env", help="Validate environment configuration")
     status_subparsers.add_parser("tables", help="Check table status and accessibility")
 
@@ -992,12 +1124,9 @@ to load configuration from a custom environment file.
                 setup_cache_metadata_tables()
 
         elif args.command == "status":
-            if not args.status_command:
-                # Default: check both environment and tables
-                env_valid = validate_environment()
-                check_table_status()
-                if not env_valid:
-                    sys.exit(1)
+            if not args.status_command or args.status_command == "all":
+                # Default: show comprehensive status
+                show_comprehensive_status()
                 return
 
             if args.status_command == "env":
