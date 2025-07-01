@@ -98,7 +98,7 @@ def run_and_store_query(query: str, query_hash: str, partition_key: str, partiti
     try:
         # Resolve cache backend
         cache_backend = resolve_cache_backend(args)
-        cache_handler = get_cache_handler(cache_backend)
+        cache_handler = get_cache_handler(cache_backend, singleton=True)
 
         # Get database connection parameters
         db_connection_params = get_database_connection_params(args)
@@ -195,7 +195,7 @@ def fragment_executor():
     global pool, last_status_log_time
 
     # Initialize cache handler for the main process
-    main_cache_handler = get_cache_handler(args.cache_backend)
+    main_cache_handler = get_cache_handler(args.cache_backend, singleton=True)
 
     print("Starting fragment executor")
 
