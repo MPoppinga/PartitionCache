@@ -137,6 +137,33 @@ class RedisAbstractCacheHandler(AbstractCacheHandler):
         except Exception:
             return False
 
+    def get_query(self, key: str, partition_key: str = "partition_key") -> str | None:
+        """Retrieve the query text associated with the given key."""
+        try:
+            query_key = f"query:{partition_key}:{key}"
+            query_data = self.db.hgetall(query_key)
+            return query_data.get("query") if query_data else None
+        except Exception:
+            return None
+
+    def get_all_queries(self, partition_key: str) -> list[tuple[str, str]]:
+        """Retrieve all query hash and text pairs for a specific partition."""
+        try:
+            pattern = f"query:{partition_key}:*"
+            query_keys = self.db.keys(pattern)
+
+            queries = []
+            for query_key in query_keys:
+                query_data = self.db.hgetall(query_key)
+                if query_data and "query" in query_data:
+                    # Extract hash from key: query:partition:hash -> hash
+                    query_hash = query_key.split(":", 2)[-1]
+                    queries.append((query_hash, query_data["query"]))
+
+            return queries
+        except Exception:
+            return []
+
     def close(self) -> None:
         self._refcount -= 1
         if self._refcount <= 0:

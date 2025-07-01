@@ -207,6 +207,33 @@ class AbstractCacheHandler(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def get_query(self, key: str, partition_key: str = "partition_key") -> str | None:
+        """
+        Retrieve the query text associated with the given key.
+
+        Args:
+            key (str): The key to look up in the queries table.
+            partition_key (str): The partition key for this query (default: "partition_key").
+
+        Returns:
+            str | None: The query text if found, None otherwise.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_all_queries(self, partition_key: str) -> list[tuple[str, str]]:
+        """
+        Retrieve all query hash and text pairs for a specific partition.
+
+        Args:
+            partition_key (str): The partition key to filter by.
+
+        Returns:
+            list[tuple[str, str]]: List of (query_hash, query_text) tuples for the partition.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
     def get_datatype(self, partition_key: str) -> str | None:
         """
         Get the datatype of the cache handler. If the partition key is not set up, return None.

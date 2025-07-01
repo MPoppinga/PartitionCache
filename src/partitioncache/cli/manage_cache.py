@@ -248,85 +248,388 @@ def check_table_status() -> None:
         logger.info("  Run: python -m partitioncache.cli.manage_cache setup cache")
 
 
-def copy_cache(from_cache_type: str, to_cache_type: str):
+def copy_cache(from_cache_type: str, to_cache_type: str, partition_key: str | None = None):
     added = 0
     skipped = 0
     prefixed_skipped = 0
+    partitions_registered = 0
 
     from_cache = get_cache_handler(from_cache_type)
     to_cache = get_cache_handler(to_cache_type)
 
-    # Implement a method to get all keys from the 'from' cache
-    all_keys = get_all_keys(from_cache)
+    try:
+        # Get all partitions from source
+        all_partitions = from_cache.get_partition_keys()
 
-    for key in tqdm(all_keys, desc="Copying cache", unit="key"):
-        # Skip prefixed entries
-        if key.startswith("_LIMIT_") or key.startswith("_TIMEOUT_"):
-            prefixed_skipped += 1
-            continue
-
-        if not to_cache.exists(key):
-            value = from_cache.get(key)
-            if value is not None:
-                to_cache.set_set(key, value)
-                added += 1
+        # Filter partitions if specific partition key requested
+        if partition_key:
+            from_partitions = [p for p in all_partitions
+                             if (isinstance(p, tuple) and p[0] == partition_key) or
+                                (isinstance(p, str) and p == partition_key)]
+            if not from_partitions:
+                logger.error(f"Partition key '{partition_key}' not found in source cache")
+                logger.info(f"Available partitions: {[p[0] if isinstance(p, tuple) else p for p in all_partitions]}")
+                from_cache.close()
+                to_cache.close()
+                return
+            logger.info(f"Copying only partition: {partition_key}")
         else:
-            skipped += 1
+            from_partitions = all_partitions
+            logger.info(f"Copying all {len(from_partitions)} partitions")
+
+        # First, copy partition metadata for selected partitions
+        for partition_info in from_partitions:
+            if isinstance(partition_info, tuple):
+                pk, datatype = partition_info[0], partition_info[1]
+            else:
+                pk = str(partition_info)
+                datatype = from_cache.get_datatype(pk) or "unknown"
+
+            # Register partition in target if it doesn't exist
+            try:
+                if to_cache.get_datatype(pk) is None:
+                    to_cache.register_partition_key(pk, datatype)
+                    partitions_registered += 1
+                    logger.info(f"Registered partition '{pk}' with datatype '{datatype}'")
+            except Exception as e:
+                logger.error(f"Failed to register partition '{pk}': {e}")
+
+        # Copy keys by partition
+        queries_copied = 0
+        for partition_info in from_partitions:
+            if isinstance(partition_info, tuple):
+                current_partition_key = partition_info[0]
+            else:
+                current_partition_key = str(partition_info)
+
+            try:
+                keys = from_cache.get_all_keys(current_partition_key)
+
+                for key in tqdm(keys, desc=f"Copying {current_partition_key}", unit="key", leave=False):
+                    # Skip prefixed entries
+                    if key.startswith("_LIMIT_") or key.startswith("_TIMEOUT_"):
+                        prefixed_skipped += 1
+                        continue
+
+                    if not to_cache.exists(key, current_partition_key):
+                        value = from_cache.get(key, current_partition_key)
+                        if value is not None:
+                            to_cache.set_set(key, value, current_partition_key)
+                            added += 1
+                    else:
+                        skipped += 1
+
+                # Copy queries metadata for this partition
+                try:
+                    queries = from_cache.get_all_queries(current_partition_key)
+                    for query_hash, query_text in queries:
+                        try:
+                            if to_cache.set_query(query_hash, query_text, current_partition_key):
+                                queries_copied += 1
+                        except Exception as e:
+                            logger.debug(f"Failed to copy query {query_hash} for partition {current_partition_key}: {e}")
+                except Exception as e:
+                    logger.debug(f"Error copying queries for partition {current_partition_key}: {e}")
+
+            except Exception as e:
+                logger.error(f"Error copying partition {current_partition_key}: {e}")
+                continue
+
+    except Exception as e:
+        logger.error(f"Error getting partitions: {e}")
+        raise
 
     from_cache.close()
     to_cache.close()
-    logger.info(f"Copy completed: {added} keys copied, {skipped} keys skipped, {prefixed_skipped} prefixed keys skipped")
+    logger.info(f"Copy completed: {added} keys copied, {skipped} keys skipped, {prefixed_skipped} prefixed keys skipped, {partitions_registered} partitions registered, {queries_copied} queries copied")
 
 
-def export_cache(cache_type: str, archive_file: str):
+def export_cache(cache_type: str, archive_file: str, partition_key: str | None = None):
     cache = get_cache_handler(cache_type)
-    all_keys = get_all_keys(cache)
-
-    # skip prefixed entries
-    all_keys = [key for key in all_keys if not (key.startswith("_LIMIT_") or key.startswith("_TIMEOUT_"))]
+    exported_count = 0
+    total_keys_found = 0
 
     with open(archive_file, "wb") as file:
-        for key in tqdm(all_keys, desc="Exporting cache", unit="key"):
-            value = cache.get(key)
-            if value is not None:
-                pickle.dump({key: value}, file, protocol=pickle.HIGHEST_PROTOCOL)
+        # First, export partition metadata
+        try:
+            all_partitions = cache.get_partition_keys()
 
-    logger.info(f"Export {len(all_keys)} keys to {archive_file}")
+            # Filter partitions if specific partition key requested
+            if partition_key:
+                partitions = [p for p in all_partitions
+                            if (isinstance(p, tuple) and p[0] == partition_key) or
+                               (isinstance(p, str) and p == partition_key)]
+                if not partitions:
+                    logger.error(f"Partition key '{partition_key}' not found in cache")
+                    logger.info(f"Available partitions: {[p[0] if isinstance(p, tuple) else p for p in all_partitions]}")
+                    cache.close()
+                    return
+                logger.info(f"Exporting only partition: {partition_key}")
+            else:
+                partitions = all_partitions
+                logger.info(f"Exporting all {len(partitions)} partitions")
+
+            # Build partition metadata for selected partitions
+            partition_metadata = []
+            for partition_info in partitions:
+                if isinstance(partition_info, tuple):
+                    pk, datatype = partition_info[0], partition_info[1]
+                else:
+                    pk = str(partition_info)
+                    datatype = cache.get_datatype(pk) or "unknown"
+                partition_metadata.append((pk, datatype))
+
+            # Export partition metadata as special entry
+            pickle.dump({"__PARTITION_METADATA__": partition_metadata}, file, protocol=pickle.HIGHEST_PROTOCOL)
+
+            # Export queries metadata for selected partitions
+            queries_metadata = []
+            for partition_info in partitions:
+                if isinstance(partition_info, tuple):
+                    current_partition_key = partition_info[0]
+                else:
+                    current_partition_key = str(partition_info)
+
+                try:
+                    # Get all queries for this partition
+                    queries = cache.get_all_queries(current_partition_key)
+                    for query_hash, query_text in queries:
+                        queries_metadata.append((query_hash, query_text, current_partition_key))
+                except Exception as e:
+                    logger.debug(f"Error exporting queries for partition {current_partition_key}: {e}")
+                    continue
+
+            if queries_metadata:
+                logger.info(f"Exporting {len(queries_metadata)} queries metadata")
+                pickle.dump({"__QUERIES_METADATA__": queries_metadata}, file, protocol=pickle.HIGHEST_PROTOCOL)
+
+            # Export keys by partition
+            for partition_info in partitions:
+                if isinstance(partition_info, tuple):
+                    current_partition_key = partition_info[0]
+                else:
+                    current_partition_key = str(partition_info)
+
+                try:
+                    keys = cache.get_all_keys(current_partition_key)
+                    # skip prefixed entries
+                    keys = [key for key in keys if not (key.startswith("_LIMIT_") or key.startswith("_TIMEOUT_"))]
+                    total_keys_found += len(keys)
+
+                    for key in tqdm(keys, desc=f"Exporting {current_partition_key}", unit="key", leave=False):
+                        value = cache.get(key, current_partition_key)
+                        if value is not None:
+                            # Include partition key in export
+                            pickle.dump({"key": key, "value": value, "partition_key": current_partition_key}, file, protocol=pickle.HIGHEST_PROTOCOL)
+                            exported_count += 1
+
+                except Exception as e:
+                    logger.debug(f"Error exporting partition {current_partition_key}: {e}")
+                    continue
+
+        except Exception as e:
+            logger.error(f"Error getting partitions: {e}")
+            raise
+
+    logger.info(f"Export completed: {exported_count} keys exported from {total_keys_found} total keys, queries metadata included, to {archive_file}")
     cache.close()
 
 
-def restore_cache(cache_type: str, archive_file: str):
+def restore_cache(cache_type: str, archive_file: str, target_partition_key: str | None = None):
     cache = get_cache_handler(cache_type)
     restored = 0
-    skipped = 0
+    skipped_already_exists = 0
+    skipped_partition_filtered = 0
+    partitions_registered = 0
 
     with open(archive_file, "rb") as file:
         while True:
             try:
                 data = pickle.load(file)
-                key, value = list(data.items())[0]
-                if not cache.exists(key):
-                    cache.set_set(key, value)
-                    restored += 1
-                else:
-                    skipped += 1
+
+                # Handle partition metadata
+                if "__PARTITION_METADATA__" in data:
+                    partition_metadata = data["__PARTITION_METADATA__"]
+                    logger.info(f"Found partition metadata for {len(partition_metadata)} partitions")
+
+                    # Register partitions found in metadata
+                    partitions_to_register = set()
+
+                    for pk, datatype in partition_metadata:
+                        # If target partition specified, we'll register it when needed
+                        if target_partition_key:
+                            if pk == target_partition_key:
+                                partitions_to_register.add((target_partition_key, datatype))
+                        else:
+                            # Register all original partitions
+                            partitions_to_register.add((pk, datatype))
+
+                    # If target partition specified but not found in metadata, register with inferred type
+                    if target_partition_key and not any(p[0] == target_partition_key for p in partitions_to_register):
+                        # Will infer datatype from first data entry
+                        partitions_to_register.add((target_partition_key, None))
+
+                    for effective_pk, datatype in partitions_to_register:
+                        if datatype is None:
+                            continue  # Will be handled during data import
+
+                        try:
+                            # Check if partition already exists
+                            existing_datatype = cache.get_datatype(effective_pk)
+                            if existing_datatype is None:
+                                # Register new partition
+                                cache.register_partition_key(effective_pk, datatype)
+                                partitions_registered += 1
+                                logger.info(f"Registered partition '{effective_pk}' with datatype '{datatype}'")
+                            elif existing_datatype != datatype:
+                                logger.warning(f"Partition '{effective_pk}' exists with different datatype: '{existing_datatype}' vs '{datatype}'")
+                        except Exception as e:
+                            logger.error(f"Failed to register partition '{effective_pk}': {e}")
+                    continue
+
+                # Handle queries metadata
+                if "__QUERIES_METADATA__" in data:
+                    queries_metadata = data["__QUERIES_METADATA__"]
+                    logger.info(f"Found queries metadata for {len(queries_metadata)} queries")
+
+                    queries_restored = 0
+                    for query_hash, query_text, source_partition_key in queries_metadata:
+                        # Skip if filtering by specific partition and this doesn't match
+                        if target_partition_key and source_partition_key != target_partition_key:
+                            continue
+
+                        # Use target partition if specified, otherwise use source partition
+                        effective_partition_key = target_partition_key if target_partition_key else source_partition_key
+
+                        try:
+                            # Store the query using the cache's set_query method
+                            if cache.set_query(query_hash, query_text, effective_partition_key):
+                                queries_restored += 1
+                        except Exception as e:
+                            logger.debug(f"Failed to restore query {query_hash} for partition {effective_partition_key}: {e}")
+
+                    logger.info(f"Restored {queries_restored} queries metadata")
+                    continue
+
+                # Handle new format with explicit partition key
+                if "key" in data and "value" in data and "partition_key" in data:
+                    key = data["key"]
+                    value = data["value"]
+                    source_partition_key = data["partition_key"]
+
+                    # Skip if filtering by specific partition and this doesn't match
+                    if target_partition_key and source_partition_key != target_partition_key:
+                        skipped_partition_filtered += 1
+                        continue
+
+                    # Use target partition if specified, otherwise use source partition
+                    effective_partition_key = target_partition_key if target_partition_key else source_partition_key
+
+                    # Ensure target partition is registered if needed
+                    try:
+                        if cache.get_datatype(effective_partition_key) is None:
+                            # Infer datatype from value
+                            if value and len(value) > 0:
+                                sample_value = next(iter(value))
+                                if isinstance(sample_value, int):
+                                    datatype = "integer"
+                                elif isinstance(sample_value, float):
+                                    datatype = "float"
+                                elif isinstance(sample_value, str):
+                                    datatype = "text"
+                                else:
+                                    datatype = "text"  # default fallback
+
+                                cache.register_partition_key(effective_partition_key, datatype)
+                                partitions_registered += 1
+                                logger.info(f"Auto-registered partition '{effective_partition_key}' with datatype '{datatype}'")
+                    except Exception as e:
+                        logger.warning(f"Could not register partition '{effective_partition_key}': {e}")
+
+                    if not cache.exists(key, effective_partition_key):
+                        cache.set_set(key, value, effective_partition_key)
+                        restored += 1
+                    else:
+                        skipped_already_exists += 1
+
+                # Handle legacy format (backward compatibility)
+                elif len(data) == 1 and "__PARTITION_METADATA__" not in data:
+                    key, value = list(data.items())[0]
+                    # Use default partition key for legacy format
+                    partition_key = "partition_key"
+
+                    # Ensure default partition exists
+                    try:
+                        if cache.get_datatype(partition_key) is None:
+                            # Try to infer datatype from value
+                            if value and len(value) > 0:
+                                sample_value = next(iter(value))
+                                if isinstance(sample_value, int):
+                                    datatype = "integer"
+                                elif isinstance(sample_value, float):
+                                    datatype = "float"
+                                elif isinstance(sample_value, str):
+                                    datatype = "text"
+                                else:
+                                    datatype = "text"  # default fallback
+
+                                cache.register_partition_key(partition_key, datatype)
+                                partitions_registered += 1
+                                logger.info(f"Auto-registered default partition '{partition_key}' with datatype '{datatype}'")
+                    except Exception as e:
+                        logger.warning(f"Could not auto-register partition: {e}")
+
+                    if not cache.exists(key, partition_key):
+                        cache.set_set(key, value, partition_key)
+                        restored += 1
+                    else:
+                        skipped_already_exists += 1
+
             except EOFError:
                 break
+            except Exception as e:
+                logger.error(f"Error processing import entry: {e}")
+                continue
 
-    logger.info(f"Restore completed: {restored} keys restored, {skipped} keys skipped")
+    total_skipped = skipped_already_exists + skipped_partition_filtered
+    logger.info(f"Restore completed: {restored} keys restored, {total_skipped} keys skipped ({skipped_already_exists} already exist, {skipped_partition_filtered} partition filtered), {partitions_registered} partitions registered")
     cache.close()
 
 
 def delete_cache(cache_type: str):
     cache = get_cache_handler(cache_type)
-    all_keys = get_all_keys(cache)
     deleted = 0
+    total_keys_found = 0
 
-    for key in tqdm(all_keys, desc="Deleting cache", unit="key"):
-        cache.delete(key)
-        deleted += 1
+    try:
+        # Get all partitions
+        partitions = cache.get_partition_keys()
 
-    logger.info(f"Deleted {deleted} keys from {cache_type} cache")
+        # Delete keys by partition
+        for partition_info in partitions:
+            if isinstance(partition_info, tuple):
+                partition_key = partition_info[0]
+            else:
+                partition_key = str(partition_info)
+
+            try:
+                keys = cache.get_all_keys(partition_key)
+                total_keys_found += len(keys)
+
+                for key in tqdm(keys, desc=f"Deleting {partition_key}", unit="key", leave=False):
+                    success = cache.delete(key, partition_key)
+                    if success:
+                        deleted += 1
+
+            except Exception as e:
+                logger.debug(f"Error deleting from partition {partition_key}: {e}")
+                continue
+
+    except Exception as e:
+        logger.error(f"Error getting partitions: {e}")
+        raise
+
+    logger.info(f"Deleted {deleted} keys from {total_keys_found} total keys in {cache_type} cache")
     cache.close()
 
 
@@ -568,10 +871,10 @@ def show_comprehensive_status() -> None:
                         try:
                             if hasattr(cache_handler, 'redis_client'):
                                 # Quick Redis ping with timeout
-                                cache_handler.redis_client.ping()
+                                cache_handler.redis_client.ping()  # type: ignore[attr-defined]
                             elif hasattr(cache_handler, 'db'):
                                 # Quick RocksDB access test
-                                _ = list(cache_handler.db.iterkeys())[:1]
+                                _ = list(cache_handler.db.iterkeys())[:1]  # type: ignore[attr-defined]
                         except Exception as conn_error:
                             cache_handler.close()
                             raise Exception(f"Connection failed: {conn_error}") from conn_error
@@ -759,33 +1062,79 @@ def count_all_caches():
 
 def remove_termination_entries(cache_type: str):
     cache = get_cache_handler(cache_type)
-    all_keys = get_all_keys(cache)
     removed = 0
+    total_keys_found = 0
 
-    for key in tqdm(all_keys, desc="Removing termination entries", unit="key"):
-        if key.find("_LIMIT_") == 0 or key.find("_TIMEOUT_") == 0:
-            cache.delete(key)
-            removed += 1
+    try:
+        # Get all partitions
+        partitions = cache.get_partition_keys()
 
-    logger.info(f"Removed {removed} termination entries from {cache_type} cache")
+        # Remove termination entries by partition
+        for partition_info in partitions:
+            if isinstance(partition_info, tuple):
+                partition_key = partition_info[0]
+            else:
+                partition_key = str(partition_info)
+
+            try:
+                keys = cache.get_all_keys(partition_key)
+                total_keys_found += len(keys)
+
+                for key in tqdm(keys, desc=f"Cleaning {partition_key}", unit="key", leave=False):
+                    if key.find("_LIMIT_") == 0 or key.find("_TIMEOUT_") == 0:
+                        success = cache.delete(key, partition_key)
+                        if success:
+                            removed += 1
+
+            except Exception as e:
+                logger.debug(f"Error cleaning partition {partition_key}: {e}")
+                continue
+
+    except Exception as e:
+        logger.error(f"Error getting partitions: {e}")
+        raise
+
+    logger.info(f"Removed {removed} termination entries from {total_keys_found} total keys in {cache_type} cache")
     cache.close()
 
 
 def remove_large_entries(cache_type: str, max_entries: int):
     cache = get_cache_handler(cache_type)
-    all_keys = get_all_keys(cache)
     removed = 0
-    total = 0
+    total_keys_processed = 0
 
-    for key in tqdm(all_keys, desc="Removing large entries", unit="key"):
-        total += 1
-        value = cache.get(key)
-        if isinstance(value, set) and len(value) > max_entries:
-            cache.delete(key)
-            removed += 1
+    try:
+        # Get all partitions
+        partitions = cache.get_partition_keys()
+
+        # Remove large entries by partition
+        for partition_info in partitions:
+            if isinstance(partition_info, tuple):
+                partition_key = partition_info[0]
+            else:
+                partition_key = str(partition_info)
+
+            try:
+                keys = cache.get_all_keys(partition_key)
+
+                for key in tqdm(keys, desc=f"Checking {partition_key}", unit="key", leave=False):
+                    total_keys_processed += 1
+                    value = cache.get(key, partition_key)
+                    if isinstance(value, set) and len(value) > max_entries:
+                        success = cache.delete(key, partition_key)
+                        if success:
+                            removed += 1
+
+            except Exception as e:
+                logger.debug(f"Error processing partition {partition_key}: {e}")
+                continue
+
+    except Exception as e:
+        logger.error(f"Error getting partitions: {e}")
+        raise
 
     logger.info(f"Removed {removed} entries with more than {max_entries} items from {cache_type} cache")
-    logger.info(f"Total entries processed: {total}")
+    logger.info(f"Total entries processed: {total_keys_processed}")
     cache.close()
 
 
@@ -888,7 +1237,7 @@ def evict_cache_manual(cache_type: str, strategy: str, threshold: int):
                     for key in all_cache_keys:
                         if key.find("_") == 0:
                             continue  # Skip internal keys
-                        value = cache.get(key)
+                        value = cache.get(key, partition_key)
                         if value and hasattr(value, "__len__"):
                             key_sizes.append((key, len(value)))
 
@@ -896,7 +1245,7 @@ def evict_cache_manual(cache_type: str, strategy: str, threshold: int):
 
                     for i in range(min(to_remove_count, len(key_sizes))):
                         key_to_delete = key_sizes[i][0]
-                        cache.delete(key_to_delete)
+                        cache.delete(key_to_delete, partition_key)
                         total_removed += 1
 
         except Exception as e:
@@ -1190,15 +1539,18 @@ valid environment variables. Use --env to load configuration from a custom file.
     cache_copy_parser = cache_subparsers.add_parser("copy", help="Copy cache from one type to another")
     cache_copy_parser.add_argument("--from", dest="from_cache_type", required=True, help="Source cache type")
     cache_copy_parser.add_argument("--to", dest="to_cache_type", required=True, help="Destination cache type")
+    cache_copy_parser.add_argument("--partition-key", dest="partition_key", help="Copy only specific partition key (default: all partitions)")
 
     # Cache export/import
     cache_export_parser = cache_subparsers.add_parser("export", help="Export cache to file")
     cache_export_parser.add_argument("--type", dest="cache_type", help="Cache type to export (default: from CACHE_BACKEND env var)")
     cache_export_parser.add_argument("--file", dest="archive_file", required=True, help="Archive file path")
+    cache_export_parser.add_argument("--partition-key", dest="partition_key", help="Export only specific partition key (default: all partitions)")
 
     cache_import_parser = cache_subparsers.add_parser("import", help="Import cache from file")
     cache_import_parser.add_argument("--type", dest="cache_type", help="Cache type to import to (default: from CACHE_BACKEND env var)")
     cache_import_parser.add_argument("--file", dest="archive_file", required=True, help="Archive file path")
+    cache_import_parser.add_argument("--partition-key", dest="target_partition_key", help="Import only from specific partition or import to specific partition (default: preserve original partition keys)")
 
     # Cache delete
     cache_delete_parser = cache_subparsers.add_parser("delete", help="Delete cache")
@@ -1291,13 +1643,13 @@ valid environment variables. Use --env to load configuration from a custom file.
                 cache_type = args.cache_type or get_cache_type_from_env()
                 show_partition_overview(cache_type)
             elif args.cache_command == "copy":
-                copy_cache(args.from_cache_type, args.to_cache_type)
+                copy_cache(args.from_cache_type, args.to_cache_type, getattr(args, "partition_key", None))
             elif args.cache_command == "export":
                 cache_type = args.cache_type or get_cache_type_from_env()
-                export_cache(cache_type, args.archive_file)
+                export_cache(cache_type, args.archive_file, getattr(args, "partition_key", None))
             elif args.cache_command == "import":
                 cache_type = args.cache_type or get_cache_type_from_env()
-                restore_cache(cache_type, args.archive_file)
+                restore_cache(cache_type, args.archive_file, getattr(args, "target_partition_key", None))
             elif args.cache_command == "delete":
                 if args.all:
                     delete_all_caches()

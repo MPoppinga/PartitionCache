@@ -211,6 +211,35 @@ class RocksDictCacheHandler(AbstractCacheHandler):
         except Exception:
             return False
 
+    def get_query(self, key: str, partition_key: str = "partition_key") -> str | None:
+        """Retrieve the query text associated with the given key."""
+        try:
+            query_key = f"query:{partition_key}:{key}"
+            query_data = self.db.get(query_key)
+            if query_data and isinstance(query_data, dict):
+                return query_data.get("query")
+            return None
+        except Exception:
+            return None
+
+    def get_all_queries(self, partition_key: str) -> list[tuple[str, str]]:
+        """Retrieve all query hash and text pairs for a specific partition."""
+        try:
+            prefix = f"query:{partition_key}:"
+            queries = []
+
+            for key in self.db.keys():
+                if key.startswith(prefix):
+                    query_data = self.db.get(key)
+                    if query_data and isinstance(query_data, dict) and "query" in query_data:
+                        # Extract hash from key: query:partition:hash -> hash
+                        query_hash = key.split(":", 2)[-1]
+                        queries.append((query_hash, query_data["query"]))
+
+            return queries
+        except Exception:
+            return []
+
     def close(self) -> None:
         """
         Close the RocksDict database.

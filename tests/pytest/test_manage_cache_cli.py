@@ -96,7 +96,7 @@ class TestManageCacheCLI:
         with patch("partitioncache.cli.manage_cache.copy_cache") as mock_copy:
             with patch("sys.argv", ["manage_cache.py", "cache", "copy", "--from", "redis_set", "--to", "postgresql_array"]):
                 main()
-                mock_copy.assert_called_once_with("redis_set", "postgresql_array")
+                mock_copy.assert_called_once_with("redis_set", "postgresql_array", None)
 
     def test_cache_export_command(self):
         """Test the cache export command."""
@@ -104,7 +104,7 @@ class TestManageCacheCLI:
         with patch("partitioncache.cli.manage_cache.export_cache") as mock_export:
             with patch("sys.argv", ["manage_cache.py", "cache", "export", "--type", "postgresql_array", "--file", "backup.pkl"]):
                 main()
-                mock_export.assert_called_once_with("postgresql_array", "backup.pkl")
+                mock_export.assert_called_once_with("postgresql_array", "backup.pkl", None)
 
     def test_cache_import_command(self):
         """Test the cache import command."""
@@ -112,7 +112,7 @@ class TestManageCacheCLI:
         with patch("partitioncache.cli.manage_cache.restore_cache") as mock_restore:
             with patch("sys.argv", ["manage_cache.py", "cache", "import", "--type", "postgresql_array", "--file", "backup.pkl"]):
                 main()
-                mock_restore.assert_called_once_with("postgresql_array", "backup.pkl")
+                mock_restore.assert_called_once_with("postgresql_array", "backup.pkl", None)
 
     def test_cache_delete_command(self):
         """Test the cache delete command."""
@@ -253,7 +253,7 @@ class TestManageCacheCLI:
             with patch("partitioncache.cli.manage_cache.get_cache_type_from_env", return_value="postgresql_bit"):
                 with patch("sys.argv", ["manage_cache.py", "cache", "export", "--file", "test.pkl"]):
                     main()
-                    mock_export.assert_called_once_with("postgresql_bit", "test.pkl")
+                    mock_export.assert_called_once_with("postgresql_bit", "test.pkl", None)
 
     def test_cache_import_with_env_backend(self):
         """Test that cache import uses environment CACHE_BACKEND when --type is omitted."""
@@ -262,7 +262,7 @@ class TestManageCacheCLI:
             with patch("partitioncache.cli.manage_cache.get_cache_type_from_env", return_value="rocksdb_set"):
                 with patch("sys.argv", ["manage_cache.py", "cache", "import", "--file", "test.pkl"]):
                     main()
-                    mock_restore.assert_called_once_with("rocksdb_set", "test.pkl")
+                    mock_restore.assert_called_once_with("rocksdb_set", "test.pkl", None)
 
     def test_cache_delete_with_env_backend(self):
         """Test that cache delete uses environment CACHE_BACKEND when --type is omitted."""
@@ -385,7 +385,7 @@ class TestCLITimeoutProtection:
         # Verify the key components of timeout protection are in the source
         assert 'backend.startswith(("redis_", "rocksdb_"))' in source
         assert 'hasattr(cache_handler, \'db\')' in source
-        assert 'list(cache_handler.db.iterkeys())[:1]' in source
+        assert 'cache_handler.db.iterkeys()' in source
         assert 'except Exception as conn_error:' in source
         assert 'cache_handler.close()' in source
 
