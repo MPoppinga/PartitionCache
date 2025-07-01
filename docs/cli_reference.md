@@ -223,7 +223,7 @@ pcache-add [options] --partition-key PARTITION_KEY {--direct|--queue|--queue-ori
 - **Processing**: Queue processor will fragment and process automatically
 
 ### Backend Configuration
-- `--queue-provider QUEUE_PROVIDER` - Queue provider (`postgresql`, `redis`)
+- `--queue-provider QUERY_QUEUE_PROVIDER` - Queue provider (`postgresql`, `redis`)
   - **Default**: `postgresql`
 - `--cache-backend CACHE_BACKEND` - Cache backend type
   - **Default**: `postgresql_bit`

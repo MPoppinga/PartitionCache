@@ -38,7 +38,7 @@ args: argparse.Namespace
 status_lock = threading.Lock()
 active_futures: list[str] = []
 pending_jobs: list[tuple[str, str, str, str]] = []  # (query, hash, partition_key, partition_datatype)
-pool: concurrent.futures.ProcessPoolExecutor | None = None  # Initialize pool as None
+pool: concurrent.futures.ThreadPoolExecutor | None = None  # Initialize pool as None
 exit_event = threading.Event()  # Create an event to signal exit
 fragment_processor_exit = threading.Event()  # Exit signal for fragment processor
 
@@ -199,7 +199,7 @@ def fragment_executor():
 
     print("Starting fragment executor")
 
-    with concurrent.futures.ProcessPoolExecutor(max_workers=args.max_processes) as pool:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.max_processes) as pool:
         while not exit_event.is_set():
             try:
                 current_time = time.time()

@@ -1,3 +1,4 @@
+import threading
 from datetime import datetime
 
 from rocksdb import (  # type: ignore
@@ -15,11 +16,14 @@ class RocksDBAbstractCacheHandler(AbstractCacheHandler):
     """
 
     _instance = None
+    _lock = threading.Lock()
 
     @classmethod
     def get_instance(cls, db_path: str, read_only: bool = False, **kwargs):
         if cls._instance is None:
-            cls._instance = cls(db_path, read_only=read_only, **kwargs)
+            with cls._lock:
+                if cls._instance is None:  # Double-checked locking
+                    cls._instance = cls(db_path, read_only=read_only, **kwargs)
         return cls._instance
 
     def __init__(self, db_path: str, read_only: bool = False, **kwargs) -> None:
