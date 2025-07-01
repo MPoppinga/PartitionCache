@@ -22,21 +22,42 @@ Initialize PartitionCache tables and configuration.
 Set up both queue and cache metadata tables.
 
 ```bash
-pcache-manage setup all
+pcache-manage setup all [--cache BACKEND] [--queue PROVIDER]
 ```
+
+Options:
+- `--cache BACKEND`: Cache backend to setup (defaults to CACHE_BACKEND env var)
+- `--queue PROVIDER`: Queue provider to setup (defaults to QUERY_QUEUE_PROVIDER env var)
 
 #### `setup queue`
 Set up only queue tables.
 
 ```bash
-pcache-manage setup queue
+pcache-manage setup queue [--queue PROVIDER]
 ```
+
+Options:
+- `--queue PROVIDER`: Queue provider to setup (defaults to QUERY_QUEUE_PROVIDER env var)
 
 #### `setup cache`
 Set up only cache metadata tables.
 
 ```bash
-pcache-manage setup cache
+pcache-manage setup cache [--cache BACKEND]
+```
+
+Options:
+- `--cache BACKEND`: Cache backend to setup (defaults to CACHE_BACKEND env var)
+
+Examples:
+```bash
+# Use environment defaults
+pcache-manage setup all
+
+# Setup specific backends
+pcache-manage setup all --cache redis_set --queue postgresql
+pcache-manage setup cache --cache postgresql_array
+pcache-manage setup queue --queue redis
 ```
 
 ### Status Commands (`status`)

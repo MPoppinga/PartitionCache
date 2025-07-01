@@ -27,12 +27,82 @@ def get_cache_type_from_env() -> str:
     return os.getenv("CACHE_BACKEND", "postgresql_array")
 
 
-def setup_queue_tables() -> None:
+def detect_configured_cache_backends() -> list[str]:
+    """
+    Detect all cache backends that have valid environment configurations.
+
+    Returns:
+        List of cache backend names that are properly configured
+    """
+    from partitioncache.cache_handler.environment_config import EnvironmentConfigManager
+
+    configured_backends = []
+
+    # Test each backend type
+    backend_configs = {
+        "postgresql_array": lambda: EnvironmentConfigManager.get_postgresql_array_config(),
+        "postgresql_bit": lambda: EnvironmentConfigManager.get_postgresql_bit_config(),
+        "postgresql_roaringbit": lambda: EnvironmentConfigManager.get_postgresql_roaringbit_config(),
+        "redis_set": lambda: EnvironmentConfigManager.get_redis_config("set"),
+        "redis_bit": lambda: EnvironmentConfigManager.get_redis_config("bit"),
+        "rocksdb_set": lambda: EnvironmentConfigManager.get_rocksdb_config("set"),
+        "rocksdb_bit": lambda: EnvironmentConfigManager.get_rocksdb_config("bit"),
+        "rocksdict": lambda: EnvironmentConfigManager.get_rocksdb_config("dict"),
+    }
+
+    for backend_name, config_func in backend_configs.items():
+        try:
+            config_func()  # Try to get configuration
+            configured_backends.append(backend_name)
+        except ValueError:
+            # Configuration is missing/invalid for this backend
+            pass
+        except Exception:
+            # Other errors (e.g., import issues) - skip this backend
+            pass
+
+    return configured_backends
+
+
+def detect_configured_queue_providers() -> list[str]:
+    """
+    Detect all queue providers that have valid environment configurations.
+
+    Returns:
+        List of queue provider names that are properly configured
+    """
+    from partitioncache.queue_handler import get_queue_handler
+
+    configured_providers = []
+
+    # Test each provider type
+    providers = ["postgresql", "redis"]
+
+    for provider in providers:
+        try:
+            # Try to create queue handler to test configuration
+            handler = get_queue_handler(provider)
+            handler.close()
+            configured_providers.append(provider)
+        except ValueError:
+            # Configuration is missing/invalid for this provider
+            pass
+        except Exception:
+            # Other errors - skip this provider
+            pass
+
+    return configured_providers
+
+
+def setup_queue_tables(queue_provider: str | None = None) -> None:
     """
     Set up queue tables by initializing a queue handler.
+
+    Args:
+        queue_provider: Queue provider to use (defaults to QUERY_QUEUE_PROVIDER env var)
     """
     try:
-        provider = os.getenv("QUERY_QUEUE_PROVIDER", "postgresql")
+        provider = queue_provider or os.getenv("QUERY_QUEUE_PROVIDER", "postgresql")
         logger.info(f"Setting up queue tables for provider: {provider}")
 
         # Initialize queue handler - this creates all tables
@@ -48,17 +118,20 @@ def setup_queue_tables() -> None:
         raise
 
 
-def setup_cache_metadata_tables() -> None:
+def setup_cache_metadata_tables(cache_backend: str | None = None) -> None:
     """
     Set up cache metadata tables by initializing cache handlers.
     This ensures the metadata tables exist for the configured cache backends.
+
+    Args:
+        cache_backend: Cache backend to use (defaults to CACHE_BACKEND env var)
     """
     try:
-        cache_backend = os.getenv("CACHE_BACKEND", "postgresql_array")
-        logger.info(f"Setting up cache metadata tables for backend: {cache_backend}")
+        backend = cache_backend or os.getenv("CACHE_BACKEND", "postgresql_array")
+        logger.info(f"Setting up cache metadata tables for backend: {backend}")
 
         # Initialize cache handler - this creates metadata tables
-        cache_handler = get_cache_handler(cache_backend)
+        cache_handler = get_cache_handler(backend)
 
         logger.info("Cache metadata tables setup completed successfully")
 
@@ -70,18 +143,22 @@ def setup_cache_metadata_tables() -> None:
         raise
 
 
-def setup_all_tables() -> None:
+def setup_all_tables(cache_backend: str | None = None, queue_provider: str | None = None) -> None:
     """
     Set up both queue and cache metadata tables.
+
+    Args:
+        cache_backend: Cache backend to use (defaults to CACHE_BACKEND env var)
+        queue_provider: Queue provider to use (defaults to QUERY_QUEUE_PROVIDER env var)
     """
     logger.info("Setting up PartitionCache tables...")
 
     try:
         # Setup queue tables first
-        setup_queue_tables()
+        setup_queue_tables(queue_provider)
 
         # Setup cache metadata tables
-        setup_cache_metadata_tables()
+        setup_cache_metadata_tables(cache_backend)
 
         logger.info("PartitionCache setup completed successfully!")
         logger.info("Your project is now ready to use PartitionCache.")
@@ -382,6 +459,7 @@ def clear_original_query_queue():
 def show_comprehensive_status() -> None:
     """
     Show comprehensive status of PartitionCache including queue and cache statistics.
+    Now shows status for ALL configured backends, not just the current ones.
     """
     logger.info("\n" + "=" * 70)
     logger.info("PartitionCache Status Overview")
@@ -391,92 +469,141 @@ def show_comprehensive_status() -> None:
     logger.info("\n📋 Configuration:")
     cache_backend = os.getenv("CACHE_BACKEND", "postgresql_array")
     queue_provider = os.getenv("QUERY_QUEUE_PROVIDER", "postgresql")
-    logger.info(f"  Cache Backend: {cache_backend}")
-    logger.info(f"  Queue Provider: {queue_provider}")
+    logger.info(f"  Default Cache Backend: {cache_backend}")
+    logger.info(f"  Default Queue Provider: {queue_provider}")
 
-    # Queue Status
+    # Detect all configured backends
+    configured_cache_backends = detect_configured_cache_backends()
+    configured_queue_providers = detect_configured_queue_providers()
+
+    logger.info(f"  Configured Cache Backends: {', '.join(configured_cache_backends) if configured_cache_backends else 'None'}")
+    logger.info(f"  Configured Queue Providers: {', '.join(configured_queue_providers) if configured_queue_providers else 'None'}")
+
+    # Queue Status for all configured providers
     logger.info("\n📊 Queue Status:")
-    try:
-        queue_lengths = get_queue_lengths()
-        original_query_count = queue_lengths.get("original_query_queue", 0)
-        query_fragment_count = queue_lengths.get("query_fragment_queue", 0)
-        total_queue_count = original_query_count + query_fragment_count
 
-        logger.info(f"  Original Query Queue: {original_query_count:,} entries")
-        logger.info(f"  Query Fragment Queue: {query_fragment_count:,} entries")
-        logger.info(f"  Total Queue Entries: {total_queue_count:,}")
+    for provider in configured_queue_providers:
+        logger.info(f"\n  Provider: {provider}")
+        try:
+            # Temporarily override environment to check this provider
+            original_provider = os.environ.get("QUERY_QUEUE_PROVIDER")
+            os.environ["QUERY_QUEUE_PROVIDER"] = provider
 
-        # Check if pg_cron processor is enabled
-        if queue_provider == "postgresql":
-            try:
-                queue_handler = get_queue_handler(queue_provider)
-                if hasattr(queue_handler, "_check_pg_cron_job_exists") and queue_handler._check_pg_cron_job_exists():  # type: ignore
-                    logger.info("  ✓ PostgreSQL Queue Processor (pg_cron) is enabled")
-                else:
-                    logger.info("  ⚠ PostgreSQL Queue Processor (pg_cron) is not enabled")
-                    logger.info("    Run: pcache-postgresql-queue-processor enable")
-                queue_handler.close()
-            except Exception:
-                pass
+            queue_lengths = get_queue_lengths()
+            original_query_count = queue_lengths.get("original_query_queue", 0)
+            query_fragment_count = queue_lengths.get("query_fragment_queue", 0)
+            total_queue_count = original_query_count + query_fragment_count
 
-    except Exception as e:
-        logger.error(f"  ❌ Error accessing queue: {e}")
+            logger.info(f"    Original Query Queue: {original_query_count:,} entries")
+            logger.info(f"    Query Fragment Queue: {query_fragment_count:,} entries")
+            logger.info(f"    Total Queue Entries: {total_queue_count:,}")
+
+            # Check if pg_cron processor is enabled for PostgreSQL
+            if provider == "postgresql":
+                try:
+                    queue_handler = get_queue_handler(provider)
+                    if hasattr(queue_handler, "_check_pg_cron_job_exists") and queue_handler._check_pg_cron_job_exists():  # type: ignore
+                        logger.info("    ✓ PostgreSQL Queue Processor (pg_cron) is enabled")
+                    else:
+                        logger.info("    ⚠ PostgreSQL Queue Processor (pg_cron) is not enabled")
+                        logger.info("      Run: pcache-postgresql-queue-processor enable")
+                    queue_handler.close()
+                except Exception:
+                    pass
+
+            # Restore original environment
+            if original_provider:
+                os.environ["QUERY_QUEUE_PROVIDER"] = original_provider
+            elif "QUERY_QUEUE_PROVIDER" in os.environ:
+                del os.environ["QUERY_QUEUE_PROVIDER"]
+
+        except Exception as e:
+            logger.error(f"    ❌ Error accessing {provider} queue: {e}")
+            logger.info(f"      Run: pcache-manage setup queue --queue {provider}")
+
+    if not configured_queue_providers:
+        logger.info("  ❌ No queue providers configured")
         logger.info("    Run: pcache-manage setup queue")
 
-    # Cache Status
+    # Cache Status for all configured backends
     logger.info("\n💾 Cache Status:")
-    try:
-        if cache_backend.startswith("postgresql"):
-            # Use PostgreSQL-specific counting for better accuracy
-            partitions = get_partition_overview(cache_backend)
 
-            if not partitions:
-                logger.info("  No partitions found")
+    for backend in configured_cache_backends:
+        logger.info(f"\n  Backend: {backend}")
+        try:
+            if backend.startswith("postgresql"):
+                # Use PostgreSQL-specific counting for better accuracy
+                partitions = get_partition_overview(backend)
+
+                if not partitions:
+                    logger.info("    No partitions found")
+                else:
+                    total_entries = sum(p["total_entries"] for p in partitions)
+                    valid_entries = sum(p["valid_entries"] for p in partitions)
+                    limit_entries = sum(p["limit_entries"] for p in partitions)
+                    timeout_entries = sum(p["timeout_entries"] for p in partitions)
+
+                    logger.info(f"    Total Cache Entries: {total_entries:,}")
+                    logger.info(f"    Valid Entries: {valid_entries:,}")
+                    logger.info(f"    Limit Entries: {limit_entries:,}")
+                    logger.info(f"    Timeout Entries: {timeout_entries:,}")
+                    logger.info(f"    Partitions: {len(partitions)}")
+
+                    # Show top 3 partitions by size (reduced for multi-backend display)
+                    if len(partitions) > 0:
+                        sorted_partitions = sorted(partitions, key=lambda x: x["total_entries"], reverse=True)
+                        logger.info("    Top Partitions:")
+                        for i, partition in enumerate(sorted_partitions[:3]):
+                            logger.info(f"      {i + 1}. {partition['partition_key']:<12}: {partition['total_entries']:,} entries")
+                        if len(partitions) > 3:
+                            logger.info(f"      ... and {len(partitions) - 3} more partitions")
             else:
-                total_entries = sum(p["total_entries"] for p in partitions)
-                valid_entries = sum(p["valid_entries"] for p in partitions)
-                limit_entries = sum(p["limit_entries"] for p in partitions)
-                timeout_entries = sum(p["timeout_entries"] for p in partitions)
+                # For other cache types - add connection timeout protection
+                try:
+                    cache_handler = get_cache_handler(backend)
 
-                logger.info(f"  Total Cache Entries: {total_entries:,}")
-                logger.info(f"  Valid Entries: {valid_entries:,}")
-                logger.info(f"  Limit Entries: {limit_entries:,}")
-                logger.info(f"  Timeout Entries: {timeout_entries:,}")
-                logger.info(f"  Partitions: {len(partitions)}")
+                    # Quick connectivity test with timeout for Redis/RocksDB
+                    if backend.startswith(("redis_", "rocksdb_")):
+                        # Test basic connectivity first - this will fail fast if service unavailable
+                        try:
+                            if hasattr(cache_handler, 'redis_client'):
+                                # Quick Redis ping with timeout
+                                cache_handler.redis_client.ping()
+                            elif hasattr(cache_handler, 'db'):
+                                # Quick RocksDB access test
+                                _ = list(cache_handler.db.iterkeys())[:1]
+                        except Exception as conn_error:
+                            cache_handler.close()
+                            raise Exception(f"Connection failed: {conn_error}") from conn_error
 
-                # Show top 5 partitions by size
-                if len(partitions) > 0:
-                    sorted_partitions = sorted(partitions, key=lambda x: x["total_entries"], reverse=True)
-                    logger.info("\n  Top Partitions by Size:")
-                    for i, partition in enumerate(sorted_partitions[:5]):
-                        logger.info(f"    {i + 1}. {partition['partition_key']:<15} ({partition['datatype']:<8}): {partition['total_entries']:,} entries")
-                    if len(partitions) > 5:
-                        logger.info(f"    ... and {len(partitions) - 5} more partitions")
-        else:
-            # For other cache types
-            cache_handler = get_cache_handler(cache_backend)
-            all_keys = get_all_keys(cache_handler)
+                    all_keys = get_all_keys(cache_handler)
 
-            limit_count = sum(1 for key in all_keys if key.startswith("_LIMIT_"))
-            timeout_count = sum(1 for key in all_keys if key.startswith("_TIMEOUT_"))
-            valid_count = len(all_keys) - limit_count - timeout_count
+                    limit_count = sum(1 for key in all_keys if key.startswith("_LIMIT_"))
+                    timeout_count = sum(1 for key in all_keys if key.startswith("_TIMEOUT_"))
+                    valid_count = len(all_keys) - limit_count - timeout_count
 
-            logger.info(f"  Total Cache Entries: {len(all_keys):,}")
-            logger.info(f"  Valid Entries: {valid_count:,}")
-            logger.info(f"  Limit Entries: {limit_count:,}")
-            logger.info(f"  Timeout Entries: {timeout_count:,}")
+                    logger.info(f"    Total Cache Entries: {len(all_keys):,}")
+                    logger.info(f"    Valid Entries: {valid_count:,}")
+                    logger.info(f"    Limit Entries: {limit_count:,}")
+                    logger.info(f"    Timeout Entries: {timeout_count:,}")
 
-            # Get partition information
-            try:
-                partitions = cache_handler.get_partition_keys()
-                logger.info(f"  Partitions: {len(partitions)}")
-            except (AttributeError, TypeError):
-                pass
+                    # Get partition information
+                    try:
+                        partitions = cache_handler.get_partition_keys()
+                        logger.info(f"    Partitions: {len(partitions)}")
+                    except (AttributeError, TypeError):
+                        pass
 
-            cache_handler.close()
+                    cache_handler.close()
+                except Exception as conn_error:
+                    raise Exception(f"Cache backend connection error: {conn_error}") from conn_error
 
-    except Exception as e:
-        logger.error(f"  ❌ Error accessing cache: {e}")
+        except Exception as e:
+            logger.error(f"    ❌ Error accessing {backend} cache: {e}")
+            logger.info(f"      Run: pcache-manage setup cache --cache {backend}")
+
+    if not configured_cache_backends:
+        logger.info("  ❌ No cache backends configured")
         logger.info("    Run: pcache-manage setup cache")
 
     # System Health Check
@@ -487,8 +614,9 @@ def show_comprehensive_status() -> None:
     if not os.getenv("CACHE_BACKEND"):
         health_issues.append("CACHE_BACKEND environment variable not set")
 
-    # Check if eviction manager is set up (for PostgreSQL)
-    if cache_backend.startswith("postgresql"):
+    # Check if eviction manager is set up (for any PostgreSQL backend)
+    postgresql_backends = [b for b in configured_cache_backends if b.startswith("postgresql")]
+    if postgresql_backends:
         try:
             # Import here to avoid circular dependency
             from partitioncache.cli.postgresql_cache_eviction import check_eviction_job_exists
@@ -983,11 +1111,14 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Setup new project
-  pcache-manage setup all
+  # Setup new project with specific backends
+  pcache-manage setup all                                   # Use env defaults
+  pcache-manage setup all --cache redis_set --queue postgresql
+  pcache-manage setup cache --cache postgresql_array
+  pcache-manage setup queue --queue redis
 
-  # Check comprehensive system status (NEW)
-  pcache-manage status                    # Shows queue + cache stats + health
+  # Check comprehensive system status (shows ALL configured backends)
+  pcache-manage status                    # Shows all configured backends + stats
   pcache-manage status all               # Same as above
   pcache-manage status env               # Environment validation only
   pcache-manage status tables            # Table accessibility only
@@ -1005,9 +1136,9 @@ Examples:
   pcache-manage maintenance prune --days 30
   pcache-manage maintenance cleanup --remove-termination
 
-Note: Cache type parameters are optional for most commands and will use
-the CACHE_BACKEND environment variable when not specified. Use --env
-to load configuration from a custom environment file.
+Note: Setup commands now support --cache and --queue options to override
+environment defaults. Status command shows ALL configured backends with
+valid environment variables. Use --env to load configuration from a custom file.
         """,
     )
 
@@ -1021,9 +1152,18 @@ to load configuration from a custom environment file.
     setup_parser = subparsers.add_parser("setup", help="Setup PartitionCache tables and configuration")
     setup_subparsers = setup_parser.add_subparsers(dest="setup_command", help="Setup operations")
 
-    setup_subparsers.add_parser("all", help="Set up all tables (recommended for new projects)")
-    setup_subparsers.add_parser("queue", help="Set up queue tables only")
-    setup_subparsers.add_parser("cache", help="Set up cache metadata tables only")
+    # Setup all command
+    setup_all = setup_subparsers.add_parser("all", help="Set up all tables (recommended for new projects)")
+    setup_all.add_argument("--cache", type=str, help="Cache backend to setup (defaults to CACHE_BACKEND env var)")
+    setup_all.add_argument("--queue", type=str, help="Queue provider to setup (defaults to QUERY_QUEUE_PROVIDER env var)")
+
+    # Setup queue command
+    setup_queue = setup_subparsers.add_parser("queue", help="Set up queue tables only")
+    setup_queue.add_argument("--queue", type=str, help="Queue provider to setup (defaults to QUERY_QUEUE_PROVIDER env var)")
+
+    # Setup cache command
+    setup_cache = setup_subparsers.add_parser("cache", help="Set up cache metadata tables only")
+    setup_cache.add_argument("--cache", type=str, help="Cache backend to setup (defaults to CACHE_BACKEND env var)")
 
     # Status commands
     status_parser = subparsers.add_parser("status", help="Check PartitionCache status and configuration")
@@ -1117,11 +1257,11 @@ to load configuration from a custom environment file.
                 return
 
             if args.setup_command == "all":
-                setup_all_tables()
+                setup_all_tables(cache_backend=getattr(args, "cache", None), queue_provider=getattr(args, "queue", None))
             elif args.setup_command == "queue":
-                setup_queue_tables()
+                setup_queue_tables(queue_provider=getattr(args, "queue", None))
             elif args.setup_command == "cache":
-                setup_cache_metadata_tables()
+                setup_cache_metadata_tables(cache_backend=getattr(args, "cache", None))
 
         elif args.command == "status":
             if not args.status_command or args.status_command == "all":

@@ -35,7 +35,7 @@ pcache-manage [--env ENV_FILE] {setup,status,cache,queue,maintenance} ...
 
 #### setup - Setup PartitionCache Infrastructure
 ```bash
-pcache-manage setup {all,queue,cache}
+pcache-manage setup {all,queue,cache} [OPTIONS]
 ```
 
 **Subcommands:**
@@ -43,11 +43,29 @@ pcache-manage setup {all,queue,cache}
   - Creates cache metadata tables
   - Creates queue tables
   - Sets up proper indexes and constraints
+  - **Options:**
+    - `--cache BACKEND` - Cache backend to setup (defaults to CACHE_BACKEND env var)
+    - `--queue PROVIDER` - Queue provider to setup (defaults to QUERY_QUEUE_PROVIDER env var)
 - `queue` - Set up queue tables only
   - Creates `original_query_queue` and `query_fragment_queue`
   - Sets up queue-related indexes
+  - **Options:**
+    - `--queue PROVIDER` - Queue provider to setup (defaults to QUERY_QUEUE_PROVIDER env var)
 - `cache` - Set up cache metadata tables only
   - Creates partition metadata tables
+  - **Options:**
+    - `--cache BACKEND` - Cache backend to setup (defaults to CACHE_BACKEND env var)
+
+**Examples:**
+```bash
+# Setup with environment defaults
+pcache-manage setup all
+
+# Setup specific backends
+pcache-manage setup all --cache redis_set --queue postgresql
+pcache-manage setup cache --cache postgresql_array
+pcache-manage setup queue --queue redis
+```
   - Sets up cache-related indexes
 
 #### status - Check System Status
@@ -57,14 +75,22 @@ pcache-manage status [{all,env,tables}]
 
 **Subcommands:**
 - *(default/no subcommand)* - Show comprehensive status overview
-  - Displays complete system status including queue and cache statistics
+  - Automatically detects all configured backends and queue providers
+  - Displays status for each backend with valid environment configuration
+  - Shows queue statistics for all configured providers
   - Shows system health checks and recommendations
   - Same as `status all`
 - `all` - Show comprehensive status overview (explicit)
-  - Configuration details (cache backend, queue provider)
-  - Queue statistics (original and fragment queue counts)
-  - Cache statistics (total entries, partitions, top partitions by size)
-  - System health checks (pg_cron status, eviction manager status)
+  - Configuration details:
+    - Default cache backend and queue provider from environment
+    - List of all detected configured backends and providers
+  - Queue statistics for each configured provider:
+    - Original and fragment queue counts
+    - pg_cron processor status for PostgreSQL
+  - Cache statistics for each configured backend:
+    - Total entries, valid entries, limit/timeout entries
+    - Partition count and top partitions by size
+  - System health checks (eviction manager status)
 - `env` - Validate environment configuration only
   - Checks all required environment variables
   - Tests database connectivity
@@ -73,6 +99,36 @@ pcache-manage status [{all,env,tables}]
   - Verifies table existence
   - Checks table permissions
   - Reports table statistics
+
+**Example Output:**
+```
+📋 Configuration:
+  Default Cache Backend: postgresql_array
+  Default Queue Provider: postgresql
+  Configured Cache Backends: postgresql_array, redis_set, rocksdb_bit
+  Configured Queue Providers: postgresql, redis
+
+📊 Queue Status:
+  Provider: postgresql
+    Original Query Queue: 150 entries
+    Query Fragment Queue: 1,230 entries
+    ✓ PostgreSQL Queue Processor (pg_cron) is enabled
+  
+  Provider: redis
+    Original Query Queue: 0 entries
+    Query Fragment Queue: 0 entries
+
+💾 Cache Status:
+  Backend: postgresql_array
+    Total Cache Entries: 45,230
+    Valid Entries: 44,100
+    Partitions: 5
+    
+  Backend: redis_set
+    Total Cache Entries: 12,450
+    Valid Entries: 12,000
+    Partitions: 3
+```
 
 #### cache - Cache Operations
 ```bash
