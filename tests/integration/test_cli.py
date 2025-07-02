@@ -290,6 +290,16 @@ class TestCLIIntegration:
             "DB_NAME": os.getenv("DB_NAME", "partitioncache_integration"),
         })
 
+        # First ensure cache is set up via CLI for the specific backend
+        setup_result = subprocess.run(
+            ["python", "-m", "partitioncache.cli.manage_cache", "setup", "cache"],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=60
+        )
+        assert setup_result.returncode == 0 or "exist" in setup_result.stderr.lower()
+
         # Setup and add test data with queries
         cache_client.register_partition_key("region_id", "integer")
         test_query = "SELECT * FROM locations WHERE region_id IN (10,20,30)"
@@ -358,6 +368,16 @@ class TestCLIIntegration:
             "DB_PASSWORD": os.getenv("DB_PASSWORD", "integration_password"),
             "DB_NAME": os.getenv("DB_NAME", "partitioncache_integration"),
         })
+
+        # First ensure cache is set up via CLI for the specific backend
+        setup_result = subprocess.run(
+            ["python", "-m", "partitioncache.cli.manage_cache", "setup", "cache"],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=60
+        )
+        assert setup_result.returncode == 0 or "exist" in setup_result.stderr.lower()
 
         # Setup multiple partitions with data
         cache_client.register_partition_key("city_id", "integer")
