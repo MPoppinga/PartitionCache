@@ -151,6 +151,33 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
                 logger.error(f"Failed to rollback transaction: {rollback_error}")
             return False
 
+    def get_query(self, key: str, partition_key: str = "partition_key") -> str | None:
+        """Retrieve the query text associated with the given key."""
+        try:
+            query_sql = sql.SQL(
+                "SELECT query FROM {0} WHERE query_hash = %s AND partition_key = %s"
+            ).format(sql.Identifier(self.tableprefix + "_queries"))
+
+            self.cursor.execute(query_sql, (key, partition_key))
+            result = self.cursor.fetchone()
+            return result[0] if result else None
+        except Exception as e:
+            logger.debug(f"Failed to get query for key {key}: {e}")
+            return None
+
+    def get_all_queries(self, partition_key: str) -> list[tuple[str, str]]:
+        """Retrieve all query hash and text pairs for a specific partition."""
+        try:
+            query_sql = sql.SQL(
+                "SELECT query_hash, query FROM {0} WHERE partition_key = %s ORDER BY last_seen DESC"
+            ).format(sql.Identifier(self.tableprefix + "_queries"))
+
+            self.cursor.execute(query_sql, (partition_key,))
+            return self.cursor.fetchall()
+        except Exception as e:
+            logger.debug(f"Failed to get all queries for partition {partition_key}: {e}")
+            return []
+
     def set_null(self, key: str, partition_key: str = "partition_key") -> bool:
         """Set null value in partition-specific table."""
         try:

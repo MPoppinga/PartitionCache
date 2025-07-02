@@ -39,16 +39,13 @@ class RedisAbstractCacheHandler(AbstractCacheHandler):
         if partition_key in self._cached_datatype:
             return self._cached_datatype[partition_key]
 
-        # Check if it's the old format (just a string) or new format (hash)
         key_type = self.db.type(metadata_key)
         if key_type == b"string":
-            # Old format - just return the datatype
             datatype = self.db.get(metadata_key)
             if datatype is not None and isinstance(datatype, bytes):
                 self._cached_datatype[partition_key] = datatype.decode()
                 return datatype.decode()
         elif key_type == b"hash":
-            # New format - get datatype from hash
             datatype = self.db.hget(metadata_key, "datatype")
             if datatype is not None and isinstance(datatype, bytes):
                 self._cached_datatype[partition_key] = datatype.decode()
@@ -137,6 +134,42 @@ class RedisAbstractCacheHandler(AbstractCacheHandler):
         except Exception:
             return False
 
+    def get_query(self, key: str, partition_key: str = "partition_key") -> str | None:
+        """Retrieve the query text associated with the given key."""
+        try:
+            query_key = f"query:{partition_key}:{key}"
+            query_data: dict[bytes, bytes] = self.db.hgetall(query_key)  # type: ignore
+            if query_data:
+                query_bytes = query_data.get(b"query")
+                if query_bytes and isinstance(query_bytes, bytes):
+                    return query_bytes.decode()
+            return None
+        except Exception:
+            return None
+
+    def get_all_queries(self, partition_key: str) -> list[tuple[str, str]]:
+        """Retrieve all query hash and text pairs for a specific partition."""
+        try:
+            pattern = f"query:{partition_key}:*"
+            query_keys = self.db.keys(pattern)  # type: ignore
+
+            queries = []
+            for query_key in query_keys:  # type: ignore
+                if isinstance(query_key, bytes):
+                    query_key_str = query_key.decode()
+                    query_data: dict[bytes, bytes] = self.db.hgetall(query_key_str)  # type: ignore
+                    if query_data and b"query" in query_data:
+                        # Extract hash from key: query:partition:hash -> hash
+                        query_hash = query_key_str.split(":", 2)[-1]
+                        query_value = query_data[b"query"]
+                        if isinstance(query_value, bytes):
+                            query_text = query_value.decode()
+                            queries.append((query_hash, query_text))
+
+            return queries
+        except Exception:
+            return []
+
     def close(self) -> None:
         self._refcount -= 1
         if self._refcount <= 0:
@@ -170,10 +203,19 @@ class RedisAbstractCacheHandler(AbstractCacheHandler):
             for metadata_key in metadata_keys:
                 if isinstance(metadata_key, bytes):
                     partition_key = metadata_key.decode().split(":", 1)[1]
-                    datatype_bytes = self.db.get(metadata_key)
-                    if datatype_bytes is not None and isinstance(datatype_bytes, bytes):
-                        datatype = datatype_bytes.decode()
-                        result.append((partition_key, datatype))
+
+                    key_type = self.db.type(metadata_key)
+                    if key_type == b"string":
+                        datatype_bytes = self.db.get(metadata_key)
+                        if datatype_bytes is not None and isinstance(datatype_bytes, bytes):
+                            datatype = datatype_bytes.decode()
+                            result.append((partition_key, datatype))
+                    elif key_type == b"hash":
+                        metadata_key_str = metadata_key.decode() if isinstance(metadata_key, bytes) else metadata_key
+                        datatype_bytes = self.db.hget(metadata_key_str, "datatype")
+                        if datatype_bytes is not None and isinstance(datatype_bytes, bytes):
+                            datatype = datatype_bytes.decode()
+                            result.append((partition_key, datatype))
             return sorted(result)
         except (TypeError, AttributeError):
             # Fallback for Redis typing issues

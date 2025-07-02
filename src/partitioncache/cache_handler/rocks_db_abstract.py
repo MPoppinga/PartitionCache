@@ -207,3 +207,43 @@ class RocksDBAbstractCacheHandler(AbstractCacheHandler):
             return True
         except Exception:
             return False
+
+    def get_query(self, key: str, partition_key: str = "partition_key") -> str | None:
+        """Retrieve the query text associated with the given key."""
+        try:
+            query_key = f"query:{partition_key}:{key}"
+            query_data = self.db.get(query_key.encode("utf-8"))
+            if query_data:
+                # Parse pipe-separated format: querytext|partition_key|timestamp
+                parts = query_data.decode("utf-8").split("|", 2)
+                return parts[0] if len(parts) >= 1 else None
+            return None
+        except Exception:
+            return None
+
+    def get_all_queries(self, partition_key: str) -> list[tuple[str, str]]:
+        """Retrieve all query hash and text pairs for a specific partition."""
+        try:
+            prefix = f"query:{partition_key}:".encode()
+            queries = []
+
+            # Iterate through all keys with the partition prefix
+            it = self.db.iterkeys()
+            it.seek(prefix)
+
+            for key in it:
+                if not key.startswith(prefix):
+                    break
+
+                query_data = self.db.get(key)
+                if query_data:
+                    # Parse pipe-separated format: querytext|partition_key|timestamp
+                    parts = query_data.decode("utf-8").split("|", 2)
+                    if len(parts) >= 1:
+                        # Extract hash from key: query:partition:hash -> hash
+                        query_hash = key.decode("utf-8").split(":", 2)[-1]
+                        queries.append((query_hash, parts[0]))
+
+            return queries
+        except Exception:
+            return []
