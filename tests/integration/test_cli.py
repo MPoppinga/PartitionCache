@@ -4,6 +4,8 @@ import tempfile
 
 import pytest
 
+from .test_utils import compare_cache_values
+
 
 class TestCLICommands:
     """
@@ -268,8 +270,11 @@ class TestCLIIntegration:
         # Should contain partition information
         assert "test_city" in output or "partition" in output or "integer" in output
 
-    def test_export_import_with_query_metadata(self, db_session, cache_client):
+    def test_export_import_with_query_metadata(self, db_session, cache_client, request):
         """Test export/import preserves query metadata via CLI."""
+        # Get the backend type from the request parameter
+        backend_type = request.node.callspec.params['cache_client']
+
         env = os.environ.copy()
         env.update({
             "PG_HOST": os.getenv("PG_HOST", "localhost"),
@@ -277,7 +282,7 @@ class TestCLIIntegration:
             "PG_USER": os.getenv("PG_USER", "integration_user"),
             "PG_PASSWORD": os.getenv("PG_PASSWORD", "integration_password"),
             "PG_DBNAME": os.getenv("PG_DBNAME", "partitioncache_integration"),
-            "CACHE_BACKEND": "postgresql_array",
+            "CACHE_BACKEND": backend_type,
             "DB_HOST": os.getenv("DB_HOST", "localhost"),
             "DB_PORT": os.getenv("DB_PORT", "5432"),
             "DB_USER": os.getenv("DB_USER", "integration_user"),
@@ -299,7 +304,7 @@ class TestCLIIntegration:
             # Export cache with queries
             export_result = subprocess.run(
                 ["python", "-m", "partitioncache.cli.manage_cache", "cache", "export",
-                 "--file", export_file, "--type", "postgresql_array"],
+                 "--file", export_file, "--type", backend_type],
                 capture_output=True,
                 text=True,
                 env=env,
@@ -315,7 +320,7 @@ class TestCLIIntegration:
             # Import cache
             import_result = subprocess.run(
                 ["python", "-m", "partitioncache.cli.manage_cache", "cache", "import",
-                 "--file", export_file, "--type", "postgresql_array"],
+                 "--file", export_file, "--type", backend_type],
                 capture_output=True,
                 text=True,
                 env=env,
@@ -327,15 +332,18 @@ class TestCLIIntegration:
             restored_data = cache_client.get("query_test_hash", "region_id")
             restored_query = cache_client.get_query("query_test_hash", "region_id")
 
-            assert restored_data == {10, 20, 30}, "Cache data not restored correctly"
+            assert compare_cache_values(restored_data, {10, 20, 30}), "Cache data not restored correctly"
             assert restored_query == test_query, "Query metadata not restored correctly"
 
         finally:
             if os.path.exists(export_file):
                 os.unlink(export_file)
 
-    def test_selective_export_import_partition_key(self, db_session, cache_client):
+    def test_selective_export_import_partition_key(self, db_session, cache_client, request):
         """Test selective export/import with --partition-key parameter."""
+        # Get the backend type from the request parameter
+        backend_type = request.node.callspec.params['cache_client']
+
         env = os.environ.copy()
         env.update({
             "PG_HOST": os.getenv("PG_HOST", "localhost"),
@@ -343,7 +351,7 @@ class TestCLIIntegration:
             "PG_USER": os.getenv("PG_USER", "integration_user"),
             "PG_PASSWORD": os.getenv("PG_PASSWORD", "integration_password"),
             "PG_DBNAME": os.getenv("PG_DBNAME", "partitioncache_integration"),
-            "CACHE_BACKEND": "postgresql_array",
+            "CACHE_BACKEND": backend_type,
             "DB_HOST": os.getenv("DB_HOST", "localhost"),
             "DB_PORT": os.getenv("DB_PORT", "5432"),
             "DB_USER": os.getenv("DB_USER", "integration_user"),
@@ -370,7 +378,7 @@ class TestCLIIntegration:
             # Export only city_id partition
             export_result = subprocess.run(
                 ["python", "-m", "partitioncache.cli.manage_cache", "cache", "export",
-                 "--file", export_file, "--type", "postgresql_array", "--partition-key", "city_id"],
+                 "--file", export_file, "--type", backend_type, "--partition-key", "city_id"],
                 capture_output=True,
                 text=True,
                 env=env,
@@ -389,7 +397,7 @@ class TestCLIIntegration:
             # Import selective data
             import_result = subprocess.run(
                 ["python", "-m", "partitioncache.cli.manage_cache", "cache", "import",
-                 "--file", export_file, "--type", "postgresql_array"],
+                 "--file", export_file, "--type", backend_type],
                 capture_output=True,
                 text=True,
                 env=env,
@@ -401,7 +409,7 @@ class TestCLIIntegration:
             city_data = cache_client.get("city_hash", "city_id")
             state_data = cache_client.get("state_hash", "state_id")
 
-            assert city_data == {1, 2, 3}, "City data should be restored"
+            assert compare_cache_values(city_data, {1, 2, 3}), "City data should be restored"
             assert state_data is None, "State data should not be restored"
 
         finally:
