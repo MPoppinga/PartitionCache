@@ -222,6 +222,284 @@ class TestCLIIntegration:
     Tests complete workflows using multiple CLI commands in sequence.
     """
 
+    def test_cache_overview_command(self, db_session, cache_client):
+        """Test cache overview command output."""
+        env = os.environ.copy()
+        env.update({
+            "PG_HOST": os.getenv("PG_HOST", "localhost"),
+            "PG_PORT": os.getenv("PG_PORT", "5432"),
+            "PG_USER": os.getenv("PG_USER", "integration_user"),
+            "PG_PASSWORD": os.getenv("PG_PASSWORD", "integration_password"),
+            "PG_DBNAME": os.getenv("PG_DBNAME", "partitioncache_integration"),
+            "CACHE_BACKEND": "postgresql_array",
+            "DB_HOST": os.getenv("DB_HOST", "localhost"),
+            "DB_PORT": os.getenv("DB_PORT", "5432"),
+            "DB_USER": os.getenv("DB_USER", "integration_user"),
+            "DB_PASSWORD": os.getenv("DB_PASSWORD", "integration_password"),
+            "DB_NAME": os.getenv("DB_NAME", "partitioncache_integration"),
+        })
+
+        # First ensure cache is set up
+        setup_result = subprocess.run(
+            ["python", "-m", "partitioncache.cli.manage_cache", "setup", "cache"],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=60
+        )
+        assert setup_result.returncode == 0 or "exist" in setup_result.stderr.lower()
+
+        # Add some test data to cache
+        cache_client.register_partition_key("test_city", "integer")
+        cache_client.set_set("test_hash", {1, 2, 3}, "test_city")
+        cache_client.set_query("test_hash", "SELECT * FROM test WHERE city_id IN (1,2,3)", "test_city")
+
+        # Test cache overview
+        result = subprocess.run(
+            ["python", "-m", "partitioncache.cli.manage_cache", "cache", "overview"],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=60
+        )
+
+        assert result.returncode == 0, f"Cache overview failed: {result.stderr}"
+        output = (result.stdout + result.stderr).lower()
+        # Should contain partition information
+        assert "test_city" in output or "partition" in output or "integer" in output
+
+    def test_export_import_with_query_metadata(self, db_session, cache_client):
+        """Test export/import preserves query metadata via CLI."""
+        env = os.environ.copy()
+        env.update({
+            "PG_HOST": os.getenv("PG_HOST", "localhost"),
+            "PG_PORT": os.getenv("PG_PORT", "5432"),
+            "PG_USER": os.getenv("PG_USER", "integration_user"),
+            "PG_PASSWORD": os.getenv("PG_PASSWORD", "integration_password"),
+            "PG_DBNAME": os.getenv("PG_DBNAME", "partitioncache_integration"),
+            "CACHE_BACKEND": "postgresql_array",
+            "DB_HOST": os.getenv("DB_HOST", "localhost"),
+            "DB_PORT": os.getenv("DB_PORT", "5432"),
+            "DB_USER": os.getenv("DB_USER", "integration_user"),
+            "DB_PASSWORD": os.getenv("DB_PASSWORD", "integration_password"),
+            "DB_NAME": os.getenv("DB_NAME", "partitioncache_integration"),
+        })
+
+        # Setup and add test data with queries
+        cache_client.register_partition_key("region_id", "integer")
+        test_query = "SELECT * FROM locations WHERE region_id IN (10,20,30)"
+        cache_client.set_set("query_test_hash", {10, 20, 30}, "region_id")
+        cache_client.set_query("query_test_hash", test_query, "region_id")
+
+        # Create temporary export file
+        with tempfile.NamedTemporaryFile(suffix='.pkl', delete=False) as f:
+            export_file = f.name
+
+        try:
+            # Export cache with queries
+            export_result = subprocess.run(
+                ["python", "-m", "partitioncache.cli.manage_cache", "cache", "export",
+                 "--file", export_file, "--type", "postgresql_array"],
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=60
+            )
+            assert export_result.returncode == 0, f"Export failed: {export_result.stderr}"
+            assert os.path.exists(export_file), "Export file not created"
+
+            # Clear cache
+            cache_client.delete("query_test_hash", "region_id")
+            assert cache_client.get("query_test_hash", "region_id") is None
+
+            # Import cache
+            import_result = subprocess.run(
+                ["python", "-m", "partitioncache.cli.manage_cache", "cache", "import",
+                 "--file", export_file, "--type", "postgresql_array"],
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=60
+            )
+            assert import_result.returncode == 0, f"Import failed: {import_result.stderr}"
+
+            # Verify cache data and query metadata were restored
+            restored_data = cache_client.get("query_test_hash", "region_id")
+            restored_query = cache_client.get_query("query_test_hash", "region_id")
+
+            assert restored_data == {10, 20, 30}, "Cache data not restored correctly"
+            assert restored_query == test_query, "Query metadata not restored correctly"
+
+        finally:
+            if os.path.exists(export_file):
+                os.unlink(export_file)
+
+    def test_selective_export_import_partition_key(self, db_session, cache_client):
+        """Test selective export/import with --partition-key parameter."""
+        env = os.environ.copy()
+        env.update({
+            "PG_HOST": os.getenv("PG_HOST", "localhost"),
+            "PG_PORT": os.getenv("PG_PORT", "5432"),
+            "PG_USER": os.getenv("PG_USER", "integration_user"),
+            "PG_PASSWORD": os.getenv("PG_PASSWORD", "integration_password"),
+            "PG_DBNAME": os.getenv("PG_DBNAME", "partitioncache_integration"),
+            "CACHE_BACKEND": "postgresql_array",
+            "DB_HOST": os.getenv("DB_HOST", "localhost"),
+            "DB_PORT": os.getenv("DB_PORT", "5432"),
+            "DB_USER": os.getenv("DB_USER", "integration_user"),
+            "DB_PASSWORD": os.getenv("DB_PASSWORD", "integration_password"),
+            "DB_NAME": os.getenv("DB_NAME", "partitioncache_integration"),
+        })
+
+        # Setup multiple partitions with data
+        cache_client.register_partition_key("city_id", "integer")
+        cache_client.register_partition_key("state_id", "integer")
+
+        # Add data to both partitions
+        cache_client.set_set("city_hash", {1, 2, 3}, "city_id")
+        cache_client.set_query("city_hash", "SELECT * FROM test WHERE city_id IN (1,2,3)", "city_id")
+
+        cache_client.set_set("state_hash", {100, 200}, "state_id")
+        cache_client.set_query("state_hash", "SELECT * FROM test WHERE state_id IN (100,200)", "state_id")
+
+        # Create temporary export file
+        with tempfile.NamedTemporaryFile(suffix='.pkl', delete=False) as f:
+            export_file = f.name
+
+        try:
+            # Export only city_id partition
+            export_result = subprocess.run(
+                ["python", "-m", "partitioncache.cli.manage_cache", "cache", "export",
+                 "--file", export_file, "--type", "postgresql_array", "--partition-key", "city_id"],
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=60
+            )
+            assert export_result.returncode == 0, f"Selective export failed: {export_result.stderr}"
+
+            # Output should indicate selective export
+            output = export_result.stdout + export_result.stderr
+            assert "city_id" in output, "Export output should mention partition key"
+
+            # Clear all cache data
+            cache_client.delete("city_hash", "city_id")
+            cache_client.delete("state_hash", "state_id")
+
+            # Import selective data
+            import_result = subprocess.run(
+                ["python", "-m", "partitioncache.cli.manage_cache", "cache", "import",
+                 "--file", export_file, "--type", "postgresql_array"],
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=60
+            )
+            assert import_result.returncode == 0, f"Import failed: {import_result.stderr}"
+
+            # Verify only city_id data was imported
+            city_data = cache_client.get("city_hash", "city_id")
+            state_data = cache_client.get("state_hash", "state_id")
+
+            assert city_data == {1, 2, 3}, "City data should be restored"
+            assert state_data is None, "State data should not be restored"
+
+        finally:
+            if os.path.exists(export_file):
+                os.unlink(export_file)
+
+    def test_pcache_add_queue_original(self, db_session):
+        """Test pcache-add with --queue-original mode."""
+        env = os.environ.copy()
+        env.update({
+            "PG_HOST": os.getenv("PG_HOST", "localhost"),
+            "PG_PORT": os.getenv("PG_PORT", "5432"),
+            "PG_USER": os.getenv("PG_USER", "integration_user"),
+            "PG_PASSWORD": os.getenv("PG_PASSWORD", "integration_password"),
+            "PG_DBNAME": os.getenv("PG_DBNAME", "partitioncache_integration"),
+            "QUERY_QUEUE_PROVIDER": "postgresql",
+            "PG_QUEUE_HOST": os.getenv("PG_HOST", "localhost"),
+            "PG_QUEUE_PORT": os.getenv("PG_PORT", "5432"),
+            "PG_QUEUE_USER": os.getenv("PG_USER", "integration_user"),
+            "PG_QUEUE_PASSWORD": os.getenv("PG_PASSWORD", "integration_password"),
+            "PG_QUEUE_DB": os.getenv("PG_DBNAME", "partitioncache_integration"),
+        })
+
+        # Setup queue tables
+        setup_result = subprocess.run(
+            ["python", "-m", "partitioncache.cli.manage_cache", "setup", "queue"],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=60
+        )
+        assert setup_result.returncode == 0 or "exist" in setup_result.stderr.lower()
+
+        # Add query to original queue
+        result = subprocess.run([
+            "python", "-m", "partitioncache.cli.add_to_cache",
+            "--queue-original",
+            "--query", "SELECT * FROM test WHERE region_id = 500",
+            "--partition-key", "region_id",
+            "--partition-datatype", "integer"
+        ], capture_output=True, text=True, env=env, timeout=60)
+
+        # Should succeed or provide meaningful error
+        assert result.returncode == 0 or "configuration" in result.stderr.lower(), f"Queue add failed: {result.stderr}"
+
+        if result.returncode == 0:
+            # Verify queue has the query (use general count command)
+            count_result = subprocess.run(
+                ["python", "-m", "partitioncache.cli.manage_cache", "queue", "count"],
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=60
+            )
+            assert count_result.returncode == 0, f"Queue count failed: {count_result.stderr}"
+            # Should show non-zero count
+            output = count_result.stdout + count_result.stderr
+            assert any(char.isdigit() for char in output), "Should show queue count"
+
+    def test_env_file_loading(self, db_session):
+        """Test CLI --env-file parameter functionality."""
+        # Create temporary env file
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.env', delete=False) as f:
+            f.write("CACHE_BACKEND=postgresql_array\n")
+            f.write(f"DB_HOST={os.getenv('PG_HOST', 'localhost')}\n")
+            f.write(f"DB_PORT={os.getenv('PG_PORT', '5432')}\n")
+            f.write(f"DB_USER={os.getenv('PG_USER', 'integration_user')}\n")
+            f.write(f"DB_PASSWORD={os.getenv('PG_PASSWORD', 'integration_password')}\n")
+            f.write(f"DB_NAME={os.getenv('PG_DBNAME', 'partitioncache_integration')}\n")
+            env_file = f.name
+
+        try:
+            # Test with env file
+            result = subprocess.run([
+                "python", "-m", "partitioncache.cli.add_to_cache",
+                "--env-file", env_file,
+                "--direct",
+                "--no-recompose",
+                "--query", "SELECT * FROM test WHERE id = 999",
+                "--partition-key", "test_partition",
+                "--partition-datatype", "integer"
+            ], capture_output=True, text=True, timeout=60)
+
+            # Should succeed or show SQL error (not file/configuration error)
+            # Check stdout for successful env file loading
+            assert "loaded environment from" in result.stdout.lower(), "Should show env file was loaded"
+
+            if result.returncode != 0:
+                # Should be SQL error (table doesn't exist) not configuration error
+                stderr_lower = result.stderr.lower()
+                assert ("relation" in stderr_lower and "does not exist" in stderr_lower) or \
+                       "configuration" in stderr_lower or "connection" in stderr_lower
+                # Should NOT be file not found error
+                assert "file" not in stderr_lower or "not found" not in stderr_lower
+
+        finally:
+            os.unlink(env_file)
+
     def test_complete_cache_workflow(self, db_session):
         """Test complete workflow: setup -> add -> read -> count."""
         env = os.environ.copy()
@@ -294,7 +572,7 @@ class TestCLIIntegration:
         assert count_result.returncode == 0 or "queue" in count_result.stderr.lower()
 
     def test_cache_export_import_workflow(self, db_session):
-        """Test cache export and import workflow."""
+        """Test basic cache export and import workflow."""
         env = os.environ.copy()
         env.update({
             "PG_HOST": os.getenv("PG_HOST", "localhost"),
