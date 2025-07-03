@@ -8,10 +8,13 @@ consistency across all CLI tools and reduce code duplication.
 import argparse
 import os
 import sys
+from logging import getLogger
 from pathlib import Path
 from typing import Any
 
 import dotenv
+
+logger = getLogger("PartitionCache")
 
 
 def add_database_args(parser: argparse.ArgumentParser, include_sqlite: bool = True) -> None:
@@ -120,6 +123,28 @@ def add_queue_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def add_verbosity_args(parser: argparse.ArgumentParser) -> None:
+    """
+    Add verbosity control arguments to an ArgumentParser.
+
+    Args:
+        parser: The ArgumentParser to add arguments to
+    """
+    verbosity_group = parser.add_argument_group("verbosity options")
+    
+    verbosity_group.add_argument(
+        "--quiet", "-q",
+        action="store_true",
+        help="Suppress status messages (only output data/results)"
+    )
+    
+    verbosity_group.add_argument(
+        "--verbose", "-v",
+        action="store_true", 
+        help="Show detailed status and progress messages"
+    )
+
+
 def add_output_args(parser: argparse.ArgumentParser) -> None:
     """
     Add output formatting arguments to an ArgumentParser.
@@ -143,6 +168,36 @@ def add_output_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def configure_logging(args: argparse.Namespace) -> None:
+    """
+    Configure logging based on verbosity arguments.
+
+    Args:
+        args: Parsed command line arguments with quiet/verbose flags
+    """
+    import logging
+    
+    logger = getLogger("PartitionCache")
+    
+    # Remove existing handlers to avoid duplication
+    for handler in logger.handlers[:]:
+        logger.removeHandler(handler)
+    
+    # Configure based on verbosity
+    if getattr(args, 'quiet', False):
+        logger.setLevel(logging.WARNING)  # Only warnings and errors
+    elif getattr(args, 'verbose', False):
+        logger.setLevel(logging.DEBUG)    # All messages including debug
+    else:
+        logger.setLevel(logging.INFO)     # Default: info, warnings, errors
+    
+    # Always send logging to stderr
+    handler = logging.StreamHandler(sys.stderr)
+    formatter = logging.Formatter('%(levelname)s: %(message)s')
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+
+
 def load_environment_with_validation(env_file: str, required_vars: list[str] | None = None) -> dict[str, str]:
     """
     Load environment variables from file with validation.
@@ -161,20 +216,66 @@ def load_environment_with_validation(env_file: str, required_vars: list[str] | N
     env_path = Path(env_file)
     if env_path.exists():
         dotenv.load_dotenv(env_file)
-        print(f"Loaded environment from {env_file}")
+        print(f"Loaded environment from {env_file}", file=sys.stderr)
     elif env_file != ".env":  # Only warn if user explicitly specified a file
-        print(f"Warning: Environment file {env_file} not found")
+        print(f"Warning: Environment file {env_file} not found", file=sys.stderr)
 
     # Validate required variables
     if required_vars:
         missing_vars = [var for var in required_vars if not os.getenv(var)]
         if missing_vars:
-            print(f"Error: Missing required environment variables: {', '.join(missing_vars)}")
-            print("Please set these variables in your environment or .env file")
+            print(f"Error: Missing required environment variables: {', '.join(missing_vars)}", file=sys.stderr)
+            print("Please set these variables in your environment or .env file", file=sys.stderr)
             sys.exit(1)
 
     # Return current environment
     return dict(os.environ)
+
+
+def add_variant_generation_args(parser: argparse.ArgumentParser) -> None:
+    """
+    Add common variant generation arguments to an ArgumentParser.
+
+    Args:
+        parser: The ArgumentParser to add arguments to
+    """
+    variant_group = parser.add_argument_group("variant generation configuration")
+    variant_group.add_argument(
+        "--min-component-size",
+        type=int,
+        default=int(os.getenv("PARTITION_CACHE_MIN_COMPONENT_SIZE", "1")),
+        help="Minimum number of tables in query variants (connected components) (default: 1 or PARTITION_CACHE_MIN_COMPONENT_SIZE)"
+    )
+    variant_group.add_argument(
+        "--follow-graph",
+        type=lambda x: x.lower() in ('true', '1', 'yes'),
+        default=os.getenv("PARTITION_CACHE_FOLLOW_GRAPH", "true").lower() in ('true', '1', 'yes'),
+        help="Only generate variants from tables forming connected subgraphs via multi-table predicates like distance conditions or non-equijoin conditions (default: True or PARTITION_CACHE_FOLLOW_GRAPH)"
+    )
+    variant_group.add_argument(
+        "--no-auto-detect-star-join",
+        action="store_true",
+        default=os.getenv("PARTITION_CACHE_NO_AUTO_DETECT_STAR_JOIN", "false").lower() in ('true', '1', 'yes'),
+        help="Disable automatic star-join table detection based on query pattern (default: False or PARTITION_CACHE_NO_AUTO_DETECT_STAR_JOIN)"
+    )
+    variant_group.add_argument(
+        "--star-join-table",
+        type=str,
+        default=os.getenv("PARTITION_CACHE_STAR_JOIN_TABLE", None),
+        help="Explicitly specify star-join table alias or name (only one star-join table per query, or set PARTITION_CACHE_STAR_JOIN_TABLE)"
+    )
+    variant_group.add_argument(
+        "--max-component-size",
+        type=int,
+        default=int(os.getenv("PARTITION_CACHE_MAX_COMPONENT_SIZE", "0")) or None,
+        help="Maximum number of tables in query variants (connected components) (default: no limit or PARTITION_CACHE_MAX_COMPONENT_SIZE)"
+    )
+    variant_group.add_argument(
+        "--no-warn-partition-key",
+        action="store_true",
+        default=os.getenv("PARTITION_CACHE_NO_WARN_PARTITION_KEY", "false").lower() in ('true', '1', 'yes'),
+        help="Disable warnings for tables not using partition key (default: False or PARTITION_CACHE_NO_WARN_PARTITION_KEY)"
+    )
 
 
 def resolve_cache_backend(args: argparse.Namespace) -> str:

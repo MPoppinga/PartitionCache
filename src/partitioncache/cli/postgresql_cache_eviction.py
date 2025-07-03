@@ -23,6 +23,7 @@ Usage Examples:
 """
 
 import argparse
+import logging
 import os
 import sys
 from logging import getLogger

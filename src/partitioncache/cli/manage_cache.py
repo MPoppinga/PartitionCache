@@ -10,13 +10,11 @@ from tqdm import tqdm
 
 from partitioncache.cache_handler import get_cache_handler
 from partitioncache.cache_handler.abstract import AbstractCacheHandler
-from partitioncache.cli.common_args import add_environment_args, load_environment_with_validation
+from partitioncache.cli.common_args import add_environment_args, add_verbosity_args, configure_logging, load_environment_with_validation
 from partitioncache.queue import get_queue_lengths
 from partitioncache.queue_handler import get_queue_handler
 
 logger = getLogger("PartitionCache")
-logger.setLevel(logging.INFO)
-logger.addHandler(logging.StreamHandler())
 
 
 def get_cache_type_from_env() -> str:
@@ -263,9 +261,7 @@ def copy_cache(from_cache_type: str, to_cache_type: str, partition_key: str | No
 
         # Filter partitions if specific partition key requested
         if partition_key:
-            from_partitions = [p for p in all_partitions
-                             if (isinstance(p, tuple) and p[0] == partition_key) or
-                                (isinstance(p, str) and p == partition_key)]
+            from_partitions = [p for p in all_partitions if (isinstance(p, tuple) and p[0] == partition_key) or (isinstance(p, str) and p == partition_key)]
             if not from_partitions:
                 logger.error(f"Partition key '{partition_key}' not found in source cache")
                 logger.info(f"Available partitions: {[p[0] if isinstance(p, tuple) else p for p in all_partitions]}")
@@ -341,7 +337,9 @@ def copy_cache(from_cache_type: str, to_cache_type: str, partition_key: str | No
 
     from_cache.close()
     to_cache.close()
-    logger.info(f"Copy completed: {added} keys copied, {skipped} keys skipped, {prefixed_skipped} prefixed keys skipped, {partitions_registered} partitions registered, {queries_copied} queries copied")
+    logger.info(
+        f"Copy completed: {added} keys copied, {skipped} keys skipped, {prefixed_skipped} prefixed keys skipped, {partitions_registered} partitions registered, {queries_copied} queries copied"
+    )
 
 
 def export_cache(cache_type: str, archive_file: str, partition_key: str | None = None):
@@ -356,9 +354,7 @@ def export_cache(cache_type: str, archive_file: str, partition_key: str | None =
 
             # Filter partitions if specific partition key requested
             if partition_key:
-                partitions = [p for p in all_partitions
-                            if (isinstance(p, tuple) and p[0] == partition_key) or
-                               (isinstance(p, str) and p == partition_key)]
+                partitions = [p for p in all_partitions if (isinstance(p, tuple) and p[0] == partition_key) or (isinstance(p, str) and p == partition_key)]
                 if not partitions:
                     logger.error(f"Partition key '{partition_key}' not found in cache")
                     logger.info(f"Available partitions: {[p[0] if isinstance(p, tuple) else p for p in all_partitions]}")
@@ -592,7 +588,9 @@ def restore_cache(cache_type: str, archive_file: str, target_partition_key: str 
                 continue
 
     total_skipped = skipped_already_exists + skipped_partition_filtered
-    logger.info(f"Restore completed: {restored} keys restored, {total_skipped} keys skipped ({skipped_already_exists} already exist, {skipped_partition_filtered} partition filtered), {partitions_registered} partitions registered")
+    logger.info(
+        f"Restore completed: {restored} keys restored, {total_skipped} keys skipped ({skipped_already_exists} already exist, {skipped_partition_filtered} partition filtered), {partitions_registered} partitions registered"
+    )
     cache.close()
 
 
@@ -869,12 +867,14 @@ def show_comprehensive_status() -> None:
                     if backend.startswith(("redis_", "rocksdb_")):
                         # Test basic connectivity first - this will fail fast if service unavailable
                         try:
-                            if hasattr(cache_handler, 'redis_client'):
+                            if backend.startswith("redis_"):
                                 # Quick Redis ping with timeout
-                                cache_handler.redis_client.ping()  # type: ignore[attr-defined]
-                            elif hasattr(cache_handler, 'db'):
+                                if hasattr(cache_handler, "db") and hasattr(cache_handler.db, "ping"):
+                                    cache_handler.db.ping()  # type: ignore[attr-defined]
+                            elif backend.startswith("rocksdb_"):
                                 # Quick RocksDB access test
-                                _ = list(cache_handler.db.iterkeys())[:1]  # type: ignore[attr-defined]
+                                if hasattr(cache_handler, "db") and hasattr(cache_handler.db, "iterkeys"):
+                                    _ = list(cache_handler.db.iterkeys())[:1]  # type: ignore[attr-defined]
                         except Exception as conn_error:
                             cache_handler.close()
                             raise Exception(f"Connection failed: {conn_error}") from conn_error
@@ -1493,6 +1493,7 @@ valid environment variables. Use --env to load configuration from a custom file.
 
     # Add common environment arguments
     add_environment_args(parser)
+    add_verbosity_args(parser)
 
     # Create subparsers
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
@@ -1550,7 +1551,11 @@ valid environment variables. Use --env to load configuration from a custom file.
     cache_import_parser = cache_subparsers.add_parser("import", help="Import cache from file")
     cache_import_parser.add_argument("--type", dest="cache_type", help="Cache type to import to (default: from CACHE_BACKEND env var)")
     cache_import_parser.add_argument("--file", dest="archive_file", required=True, help="Archive file path")
-    cache_import_parser.add_argument("--partition-key", dest="target_partition_key", help="Import only from specific partition or import to specific partition (default: preserve original partition keys)")
+    cache_import_parser.add_argument(
+        "--partition-key",
+        dest="target_partition_key",
+        help="Import only from specific partition or import to specific partition (default: preserve original partition keys)",
+    )
 
     # Cache delete
     cache_delete_parser = cache_subparsers.add_parser("delete", help="Delete cache")
@@ -1593,6 +1598,9 @@ valid environment variables. Use --env to load configuration from a custom file.
     partition_parser.add_argument("--type", dest="cache_type", help="Cache type (default: from CACHE_BACKEND env var)")
 
     args = parser.parse_args()
+
+    # Configure logging based on verbosity
+    configure_logging(args)
 
     # Load environment variables
     load_environment_with_validation(args.env_file)

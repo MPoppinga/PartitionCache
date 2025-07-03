@@ -11,14 +11,13 @@ from partitioncache.cli.common_args import (
     add_cache_args,
     add_environment_args,
     add_output_args,
+    add_verbosity_args,
+    configure_logging,
     load_environment_with_validation,
     resolve_cache_backend,
 )
 
 logger = getLogger("PartitionCache")
-
-# set logger to warning
-logger.setLevel(WARNING)
 
 
 def main(file=sys.stdout):
@@ -31,11 +30,15 @@ def main(file=sys.stdout):
     add_cache_args(parser, require_partition_key=False)
     add_environment_args(parser)
     add_output_args(parser)
+    add_verbosity_args(parser)
 
     # Set default partition key if not provided
     parser.set_defaults(partition_key="partition_key", partition_datatype="integer")
 
     args = parser.parse_args()
+
+    # Configure logging based on verbosity
+    configure_logging(args)
 
     # Load environment variables
     load_environment_with_validation(args.env_file)

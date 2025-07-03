@@ -24,6 +24,7 @@ Usage Examples:
 """
 
 import argparse
+import logging
 import os
 import sys
 from logging import getLogger
@@ -32,7 +33,7 @@ from pathlib import Path
 import psycopg
 from psycopg import sql
 
-from partitioncache.cli.common_args import add_environment_args, load_environment_with_validation
+from partitioncache.cli.common_args import add_environment_args, add_verbosity_args, configure_logging, load_environment_with_validation
 
 logger = getLogger("PartitionCache.PostgreSQLQueueProcessor")
 
