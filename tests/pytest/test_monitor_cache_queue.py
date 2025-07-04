@@ -2,6 +2,7 @@
 Unit tests for the monitor cache queue module.
 """
 
+import logging
 import os
 from unittest.mock import Mock, patch
 
@@ -79,7 +80,17 @@ class TestQueryFragmentProcessor:
 
         # Verify calls
         mock_pop.assert_called_once()
-        mock_generate.assert_called_once_with("SELECT * FROM test_table", "test_partition_key", 1, True, True)
+        mock_generate.assert_called_once_with(
+            "SELECT * FROM test_table", 
+            "test_partition_key",
+            min_component_size=mock_args.min_component_size,
+            follow_graph=mock_args.follow_graph,
+            keep_all_attributes=True,
+            auto_detect_star_join=not mock_args.no_auto_detect_star_join,
+            max_component_size=mock_args.max_component_size,
+            star_join_table=mock_args.star_join_table,
+            warn_no_partition_key=not mock_args.no_warn_partition_key,
+        )
         mock_push_fragments.assert_called_once_with([("SELECT DISTINCT t1.partition_key FROM test_table t1", "hash1")], "test_partition_key", "integer")
 
     @patch("partitioncache.cli.monitor_cache_queue.exit_event")
@@ -258,17 +269,17 @@ class TestRunAndStoreQuery:
 class TestPrintStatus:
     """Test print status functionality."""
 
-    def test_print_status_basic(self, capsys):
+    def test_print_status_basic(self, caplog):
         """Test basic print status."""
-        print_status(5, 3)
-        captured = capsys.readouterr()
-        assert "Active processes: 5, Pending jobs: 3, Original query queue: 0, Query fragment queue: 0" in captured.out
+        with caplog.at_level(logging.INFO):
+            print_status(5, 3)
+        assert "Active processes: 5, Pending jobs: 3, Original query queue: 0, Query fragment queue: 0" in caplog.text
 
-    def test_print_status_with_queues(self, capsys):
+    def test_print_status_with_queues(self, caplog):
         """Test print status with queue lengths."""
-        print_status(2, 1, 10, 5)
-        captured = capsys.readouterr()
-        assert "Active processes: 2, Pending jobs: 1, Original query queue: 10, Query fragment queue: 5" in captured.out
+        with caplog.at_level(logging.INFO):
+            print_status(2, 1, 10, 5)
+        assert "Active processes: 2, Pending jobs: 1, Original query queue: 10, Query fragment queue: 5" in caplog.text
 
 
 class TestProcessCompletedFuture:
@@ -338,6 +349,8 @@ class TestFragmentExecutorComponents:
         # Set up mock args with required attributes
         mock_args.status_log_interval = 10
         mock_args.disable_optimized_polling = False
+        mock_args.max_pending_jobs = 5
+        mock_args.cache_backend = "redis_set"
 
         with patch("partitioncache.cli.monitor_cache_queue.exit_event") as mock_exit_event:
             with patch("partitioncache.cli.monitor_cache_queue.pop_from_query_fragment_queue") as mock_pop:
@@ -345,7 +358,7 @@ class TestFragmentExecutorComponents:
                     with patch("partitioncache.cli.monitor_cache_queue.get_cache_handler") as mock_get_cache:
                         with patch("partitioncache.cli.monitor_cache_queue.get_queue_lengths") as mock_get_lengths:
                             with patch("partitioncache.cli.monitor_cache_queue.time.time") as mock_time:
-                                mock_exit_event.is_set.side_effect = [False, True]  # Run once then exit
+                                mock_exit_event.is_set.side_effect = [False, False, True]  # Run a bit then exit
                                 mock_pop.return_value = None  # Empty queue
                                 mock_pop_blocking.return_value = None
                                 mock_get_lengths.return_value = {"original_query_queue": 0, "query_fragment_queue": 0}
@@ -378,6 +391,8 @@ class TestFragmentExecutorComponents:
         # Set up mock args with required attributes
         mock_args.status_log_interval = 10
         mock_args.disable_optimized_polling = False
+        mock_args.max_pending_jobs = 5
+        mock_args.cache_backend = "redis_set"
 
         with patch("partitioncache.cli.monitor_cache_queue.exit_event") as mock_exit_event:
             with patch("partitioncache.cli.monitor_cache_queue.pop_from_query_fragment_queue") as mock_pop:
@@ -385,7 +400,7 @@ class TestFragmentExecutorComponents:
                     with patch("partitioncache.cli.monitor_cache_queue.get_cache_handler") as mock_get_cache:
                         with patch("partitioncache.cli.monitor_cache_queue.get_queue_lengths") as mock_get_lengths:
                             with patch("partitioncache.cli.monitor_cache_queue.time.time") as mock_time:
-                                mock_exit_event.is_set.side_effect = [False, True]  # Run once then exit
+                                mock_exit_event.is_set.side_effect = [False, False, True]  # Run a bit then exit
                                 mock_pop.return_value = ("SELECT * FROM test", "cached_hash", "test_partition_key", "integer")
                                 mock_pop_blocking.return_value = ("SELECT * FROM test", "cached_hash", "test_partition_key", "integer")
                                 mock_get_lengths.return_value = {"original_query_queue": 0, "query_fragment_queue": 0}
@@ -445,7 +460,17 @@ class TestIntegration:
 
         # Verify the workflow
         mock_pop.assert_called_once()
-        mock_generate.assert_called_once_with("SELECT * FROM test_table WHERE id = 1", "test_partition_key", 1, True, True)
+        mock_generate.assert_called_once_with(
+            "SELECT * FROM test_table WHERE id = 1", 
+            "test_partition_key",
+            min_component_size=mock_args.min_component_size,
+            follow_graph=mock_args.follow_graph,
+            keep_all_attributes=True,
+            auto_detect_star_join=not mock_args.no_auto_detect_star_join,
+            max_component_size=mock_args.max_component_size,
+            star_join_table=mock_args.star_join_table,
+            warn_no_partition_key=not mock_args.no_warn_partition_key,
+        )
         mock_push_to_outgoing.assert_called_once_with(
             [("SELECT DISTINCT t1.partition_key FROM test_table t1 WHERE t1.id = 1", "hash1")], "test_partition_key", "integer"
         )

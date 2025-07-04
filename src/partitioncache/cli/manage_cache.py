@@ -1,5 +1,4 @@
 import argparse
-import logging
 import os
 import pickle
 import sys
@@ -181,7 +180,7 @@ def validate_environment() -> bool:
             # Try to create a cache handler to validate configuration
             cache_handler = get_cache_handler(cache_backend)
             cache_handler.close()
-            logger.info(f"✓ Cache backend '{cache_backend}' configuration is valid")
+            logger.debug(f"✓ Cache backend '{cache_backend}' configuration is valid")
         except Exception as e:
             issues.append(f"Cache backend '{cache_backend}' configuration error: {e}")
 
@@ -191,7 +190,7 @@ def validate_environment() -> bool:
         # Try to create a queue handler to validate configuration
         queue_handler = get_queue_handler(queue_provider)
         queue_handler.close()
-        logger.info(f"✓ Queue provider '{queue_provider}' configuration is valid")
+        logger.debug(f"✓ Queue provider '{queue_provider}' configuration is valid")
     except Exception as e:
         issues.append(f"Queue provider '{queue_provider}' configuration error: {e}")
 
@@ -201,7 +200,7 @@ def validate_environment() -> bool:
             logger.error(f"  - {issue}")
         return False
     else:
-        logger.info("✓ Environment validation passed")
+        logger.debug("✓ Environment validation passed")
         return True
 
 
@@ -218,7 +217,7 @@ def check_table_status() -> None:
         lengths = queue_handler.get_queue_lengths()
         queue_handler.close()
 
-        logger.info(f"✓ Queue tables ({queue_provider}) are accessible")
+        logger.debug(f"✓ Queue tables ({queue_provider}) are accessible")
         logger.info(f"  - Original query queue: {lengths.get('original_query_queue', 0)} items")
         logger.info(f"  - Query fragment queue: {lengths.get('query_fragment_queue', 0)} items")
 
@@ -234,10 +233,10 @@ def check_table_status() -> None:
         # Try to access metadata functionality
         try:
             partitions = cache_handler.get_partition_keys()  # type: ignore
-            logger.info(f"✓ Cache metadata tables ({cache_backend}) are accessible")
+            logger.debug(f"✓ Cache metadata tables ({cache_backend}) are accessible")
             logger.info(f"  - Found {len(partitions)} partition keys")
         except AttributeError:
-            logger.info(f"✓ Cache backend ({cache_backend}) is accessible")
+            logger.debug(f"✓ Cache backend ({cache_backend}) is accessible")
 
         cache_handler.close()
 

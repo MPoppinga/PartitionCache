@@ -24,7 +24,6 @@ Usage Examples:
 """
 
 import argparse
-import logging
 import os
 import sys
 from logging import getLogger
@@ -402,9 +401,10 @@ def get_queue_and_cache_info(conn, table_prefix: str, queue_prefix: str):
 def print_status(status):
     """Print basic processor status."""
     if not status:
-        print("Processor status not available. Is it set up?")
+        logger.warning("Processor status not available. Is it set up?")
         return
 
+    # Status output goes to stdout via print since this IS the requested data
     print("--- PostgreSQL Processor Status ---")
     print(f"  Job Name:           {status.get('job_name', 'N/A')}")
     print(f"  Enabled:            {status.get('enabled', 'N/A')}")
@@ -565,9 +565,13 @@ def main():
 
     # Add common environment arguments
     add_environment_args(parser)
+    add_verbosity_args(parser)
 
     # Parse environment arguments early to load config
     env_args, _ = parser.parse_known_args()
+
+    # Configure logging based on verbosity
+    configure_logging(env_args)
 
     # Load environment variables
     load_environment_with_validation(env_args.env_file)
