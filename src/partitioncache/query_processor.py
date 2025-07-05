@@ -696,11 +696,16 @@ def generate_partial_queries(
                     if uses_partition_key:
                         break
 
+            # Check in partition key joins
+            if not uses_partition_key:
+                for (t1, t2), _conds in partition_key_joins.items():
+                    if t1 == alias or t2 == alias:
+                        uses_partition_key = True
+                        break
+
             if not uses_partition_key:
                 logger.warning(f"Table '{alias}' ({alias_to_table_map.get(alias, alias)}) does not use partition key '{partition_key}'")
-                logger.info(f"Query: {query}")
 
-    # No need to limit - we already have only one detected_star_join_alias
 
     # Filter aliases for variant generation - always exclude star-join table
     if detected_star_join_alias:
