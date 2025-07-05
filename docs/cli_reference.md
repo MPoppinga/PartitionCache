@@ -409,6 +409,11 @@ pcache-monitor [options]
 - `--max-processes MAX_PROCESSES` - Maximum number of worker processes
   - **Default**: CPU count
   - **Use case**: Control resource usage and concurrency
+- `--max-pending-jobs MAX_PENDING_JOBS` - Maximum number of jobs to keep in pending buffer
+  - **Default**: 2 * max_processes
+  - **Purpose**: Limit memory usage by controlling how many queue items are consumed into memory
+  - **Behavior**: When buffer is full, items remain in persistent queue until processing capacity becomes available
+  - **Recommended**: 1-4x max_processes for optimal performance
 - `--long-running-query-timeout LONG_RUNNING_QUERY_TIMEOUT` - Query timeout in seconds
   - **Default**: 300 seconds
   - **Purpose**: Prevent hanging queries from blocking processing
@@ -426,6 +431,27 @@ pcache-monitor [options]
   - **Optimized**: Uses LISTEN/NOTIFY for PostgreSQL, native blocking for Redis
   - **Simple**: Uses regular polling with sleep intervals
   - **Use case**: Troubleshooting or compatibility issues
+
+### Cache Optimization Options for fragment queries in queue
+- `--enable-cache-optimization` - Enable cache-aware optimization for fragment queries
+  - **Default**: Disabled
+  - **Purpose**: Check existing cache entries to restrict search space before execution
+  - **Benefit**: Reduces database load by applying IN/subquery restrictions
+- `--cache-optimization-method {IN,VALUES,IN_SUBQUERY,TMP_TABLE_IN,TMP_TABLE_JOIN}` - Method for applying cache restrictions
+  - **Default**: `IN`
+  - **`IN`**: Simple IN clause with partition keys
+  - **`VALUES`**: IN clause with VALUES construct
+  - **`IN_SUBQUERY`**: IN clause with lazy subquery (recommended for large result sets)
+  - **`TMP_TABLE_IN`**: Create temp table and use IN subquery
+  - **`TMP_TABLE_JOIN`**: Create temp table and JOIN
+- `--min-cache-hits MIN_CACHE_HITS` - Minimum cache hits required for non-lazy optimization
+  - **Default**: 1
+  - **Note**: Only applies to non-lazy methods (IN, VALUES)
+  - **Purpose**: Avoid optimization overhead for minimal cache hits
+- `--prefer-lazy-optimization` / `--no-prefer-lazy-optimization` - Prefer lazy methods when available
+  - **Default**: `--prefer-lazy-optimization` (enabled)
+  - **Purpose**: Use more efficient lazy subqueries with PostgreSQL backends
+  - **Note**: Lazy methods don't materialize results upfront
 
 ### Configuration
 - `--env ENV` - Environment file path
@@ -447,6 +473,7 @@ pcache-monitor \
 pcache-monitor \
   --cache-backend "redis_set" \
   --max-processes 8 \
+  --max-pending-jobs 16 \
   --long-running-query-timeout 600 \
   --status-log-interval 30
 ```
@@ -458,6 +485,36 @@ pcache-monitor \
   --max-processes 1 \
   --disable-optimized-polling \
   --status-log-interval 5
+```
+
+**Memory-constrained setup:**
+```bash
+pcache-monitor \
+  --cache-backend "postgresql_array" \
+  --max-processes 4 \
+  --max-pending-jobs 4 \
+  --limit 1000 \
+  --status-log-interval 15
+```
+
+**Cache-optimized setup:**
+```bash
+pcache-monitor \
+  --cache-backend "postgresql_array" \
+  --enable-cache-optimization \
+  --cache-optimization-method IN_SUBQUERY \
+  --max-processes 8
+```
+
+**Cache-optimized with thresholds:**
+```bash
+pcache-monitor \
+  --cache-backend "redis_set" \
+  --enable-cache-optimization \
+  --cache-optimization-method IN \
+  --min-cache-hits 5 \
+  --no-prefer-lazy-optimization \
+  --max-processes 4
 ```
 
 ---

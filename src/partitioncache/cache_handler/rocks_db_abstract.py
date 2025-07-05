@@ -54,7 +54,7 @@ class RocksDBAbstractCacheHandler(AbstractCacheHandler):
         #    block_cache_compressed=compressed_cache,
         # )
 
-    def exists(self, key: str, partition_key: str = "partition_key") -> bool:
+    def exists(self, key: str, partition_key: str = "partition_key", check_invalid_too: bool = False) -> bool:
         """
         Returns True if the key exists in the partition-specific cache, otherwise False.
         """
@@ -64,9 +64,22 @@ class RocksDBAbstractCacheHandler(AbstractCacheHandler):
             return False
 
         cache_key = self._get_cache_key(key, partition_key)
-        return self.db.get(cache_key.encode()) is not None
+        cache_exists = self.db.get(cache_key.encode()) is not None
 
-    def filter_existing_keys(self, keys: set, partition_key: str = "partition_key") -> set:
+        if not check_invalid_too:
+            return cache_exists
+
+        # For check_invalid_too=True, check if termination bits exist
+        limit_key = self._get_cache_key(f"_LIMIT_{key}", partition_key)
+        timeout_key = self._get_cache_key(f"_TIMEOUT_{key}", partition_key)
+
+        # If either termination bit exists, the result is invalid
+        has_limit_bit = self.db.get(limit_key.encode()) is not None
+        has_timeout_bit = self.db.get(timeout_key.encode()) is not None
+
+        return cache_exists or has_limit_bit or has_timeout_bit
+
+    def filter_existing_keys(self, keys: set, partition_key: str = "partition_key", check_invalid_too: bool = False) -> set:
         """
         Checks in RocksDB which of the keys exists in cache and returns the set of existing keys.
         """
@@ -78,8 +91,23 @@ class RocksDBAbstractCacheHandler(AbstractCacheHandler):
         existing_keys = set()
         for key in keys:
             cache_key = self._get_cache_key(key, partition_key)
-            if self.db.get(cache_key.encode()) is not None:
+            cache_exists = self.db.get(cache_key.encode()) is not None
+
+            if not check_invalid_too:
+                if cache_exists:
+                    existing_keys.add(key)
+                continue
+
+            # For check_invalid_too=True, check also if termination bits exist
+            limit_key = self._get_cache_key(f"_LIMIT_{key}", partition_key)
+            timeout_key = self._get_cache_key(f"_TIMEOUT_{key}", partition_key)
+
+            has_limit_bit = self.db.get(limit_key.encode()) is not None
+            has_timeout_bit = self.db.get(timeout_key.encode()) is not None
+
+            if cache_exists or has_limit_bit or has_timeout_bit:
                 existing_keys.add(key)
+
         return existing_keys
 
     def _get_partition_datatype(self, partition_key: str) -> str | None:
@@ -139,6 +167,13 @@ class RocksDBAbstractCacheHandler(AbstractCacheHandler):
             # Also delete associated query
             query_key = f"query:{partition_key}:{key}"
             self.db.delete(query_key.encode("utf-8"))
+
+            # Delete termination bits
+            limit_key = self._get_cache_key(f"_LIMIT_{key}", partition_key)
+            timeout_key = self._get_cache_key(f"_TIMEOUT_{key}", partition_key)
+            self.db.delete(limit_key.encode("utf-8"))
+            self.db.delete(timeout_key.encode("utf-8"))
+
             return True
         except Exception:
             return False
@@ -202,7 +237,7 @@ class RocksDBAbstractCacheHandler(AbstractCacheHandler):
         """Store a query in the cache associated with the given key."""
         try:
             query_key = f"query:{partition_key}:{key}"
-            query_data = f"{querytext}|{partition_key}|{datetime.now().isoformat()}"
+            query_data = f"{querytext}|{partition_key}|{datetime.now().isoformat()}|ok"
             self.db.put(query_key.encode("utf-8"), query_data.encode("utf-8"), sync=True)
             return True
         except Exception:
@@ -217,6 +252,98 @@ class RocksDBAbstractCacheHandler(AbstractCacheHandler):
                 # Parse pipe-separated format: querytext|partition_key|timestamp
                 parts = query_data.decode("utf-8").split("|", 2)
                 return parts[0] if len(parts) >= 1 else None
+            return None
+        except Exception:
+            return None
+
+    def set_query_status(self, key: str, partition_key: str = "partition_key", status: str = "ok") -> bool:
+        """Set the status of a query using termination bits for RocksDB backend."""
+        try:
+            # Valid statuses
+            valid_statuses = {'ok', 'timeout', 'failed'}
+            if status not in valid_statuses:
+                raise ValueError(f"Invalid status '{status}'. Must be one of: {valid_statuses}")
+
+            # Get termination bit keys
+            limit_key = self._get_cache_key(f"_LIMIT_{key}", partition_key)
+            timeout_key = self._get_cache_key(f"_TIMEOUT_{key}", partition_key)
+
+            if status == "ok":
+                # Remove any existing termination bits
+                self.db.delete(limit_key.encode("utf-8"))
+                self.db.delete(timeout_key.encode("utf-8"))
+                # Update query metadata if it exists
+                query_key = f"query:{partition_key}:{key}"
+                query_data = self.db.get(query_key.encode("utf-8"))
+                if query_data:
+                    # Update status in pipe-separated format: querytext|partition_key|timestamp|status
+                    parts = query_data.decode("utf-8").split("|", 3)
+                    if len(parts) >= 3:
+                        parts = parts[:3] + ["ok"]  # Replace or add status
+                        updated_data = "|".join(parts)
+                        self.db.put(query_key.encode("utf-8"), updated_data.encode("utf-8"), sync=True)
+            elif status == "failed":
+                # Set limit termination bit
+                self.db.put(limit_key.encode("utf-8"), b"\x00", sync=True)
+                # Remove timeout bit if it exists
+                self.db.delete(timeout_key.encode("utf-8"))
+                # Update query metadata if it exists
+                query_key = f"query:{partition_key}:{key}"
+                query_data = self.db.get(query_key.encode("utf-8"))
+                if query_data:
+                    parts = query_data.decode("utf-8").split("|", 3)
+                    if len(parts) >= 3:
+                        parts = parts[:3] + ["failed"]
+                        updated_data = "|".join(parts)
+                        self.db.put(query_key.encode("utf-8"), updated_data.encode("utf-8"), sync=True)
+            elif status == "timeout":
+                # Set timeout termination bit
+                self.db.put(timeout_key.encode("utf-8"), b"\x00", sync=True)
+                # Remove limit bit if it exists
+                self.db.delete(limit_key.encode("utf-8"))
+                # Update query metadata if it exists
+                query_key = f"query:{partition_key}:{key}"
+                query_data = self.db.get(query_key.encode("utf-8"))
+                if query_data:
+                    parts = query_data.decode("utf-8").split("|", 3)
+                    if len(parts) >= 3:
+                        parts = parts[:3] + ["timeout"]
+                        updated_data = "|".join(parts)
+                        self.db.put(query_key.encode("utf-8"), updated_data.encode("utf-8"), sync=True)
+
+            return True
+        except Exception:
+            # Could add logging here if logger is available
+            return False
+
+    def get_query_status(self, key: str, partition_key: str = "partition_key") -> str | None:
+        """Get the status of a query from termination bits for RocksDB backend."""
+        try:
+            # Check termination bits first
+            limit_key = self._get_cache_key(f"_LIMIT_{key}", partition_key)
+            timeout_key = self._get_cache_key(f"_TIMEOUT_{key}", partition_key)
+
+            if self.db.get(limit_key.encode("utf-8")) is not None:
+                return "failed"
+            elif self.db.get(timeout_key.encode("utf-8")) is not None:
+                return "timeout"
+
+            # Check query metadata for status
+            query_key = f"query:{partition_key}:{key}"
+            query_data = self.db.get(query_key.encode("utf-8"))
+            if query_data:
+                # Parse pipe-separated format: querytext|partition_key|timestamp|status
+                parts = query_data.decode("utf-8").split("|", 3)
+                if len(parts) >= 4:
+                    return parts[3]
+                # If no status field, assume ok if query exists
+                return "ok"
+
+            # Check if cache entry exists
+            cache_key = self._get_cache_key(key, partition_key)
+            if self.db.get(cache_key.encode()) is not None:
+                return "ok"
+
             return None
         except Exception:
             return None
@@ -237,8 +364,8 @@ class RocksDBAbstractCacheHandler(AbstractCacheHandler):
 
                 query_data = self.db.get(key)
                 if query_data:
-                    # Parse pipe-separated format: querytext|partition_key|timestamp
-                    parts = query_data.decode("utf-8").split("|", 2)
+                    # Parse pipe-separated format: querytext|partition_key|timestamp|status
+                    parts = query_data.decode("utf-8").split("|", 3)
                     if len(parts) >= 1:
                         # Extract hash from key: query:partition:hash -> hash
                         query_hash = key.decode("utf-8").split(":", 2)[-1]

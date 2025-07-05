@@ -326,7 +326,7 @@ class TestCLITimeoutProtection:
 
         # Mock Redis handler with connection timeout
         mock_redis_handler = MagicMock()
-        mock_redis_handler.redis_client.ping.side_effect = Exception("Connection timeout")
+        mock_redis_handler.db.ping.side_effect = Exception("Connection timeout")
         mock_get_cache_handler.return_value = mock_redis_handler
 
         # Call show_comprehensive_status - should not raise exception
@@ -334,7 +334,7 @@ class TestCLITimeoutProtection:
             show_comprehensive_status()
 
             # Verify that the connection was attempted
-            mock_redis_handler.redis_client.ping.assert_called_once()
+            mock_redis_handler.db.ping.assert_called_once()
             mock_redis_handler.close.assert_called()
 
             # Verify that error was logged appropriately
@@ -384,7 +384,7 @@ class TestCLITimeoutProtection:
 
         # Verify the key components of timeout protection are in the source
         assert 'backend.startswith(("redis_", "rocksdb_"))' in source
-        assert 'hasattr(cache_handler, \'db\')' in source
+        assert 'hasattr(cache_handler, "db")' in source
         assert 'cache_handler.db.iterkeys()' in source
         assert 'except Exception as conn_error:' in source
         assert 'cache_handler.close()' in source
@@ -409,7 +409,7 @@ class TestCLITimeoutProtection:
 
         # Mock successful Redis handler
         mock_redis_handler = MagicMock()
-        mock_redis_handler.redis_client.ping.return_value = True  # Successful ping
+        mock_redis_handler.db.ping.return_value = True  # Successful ping
         mock_get_cache_handler.return_value = mock_redis_handler
         mock_get_all_keys.return_value = ["query_1", "query_2", "_LIMIT_query_3", "_TIMEOUT_query_4"]
 
@@ -418,7 +418,7 @@ class TestCLITimeoutProtection:
             show_comprehensive_status()
 
             # Verify that the connection was successful
-            mock_redis_handler.redis_client.ping.assert_called_once()
+            mock_redis_handler.db.ping.assert_called_once()
             mock_get_all_keys.assert_called_once_with(mock_redis_handler)
             mock_redis_handler.close.assert_called()
 
@@ -485,7 +485,7 @@ class TestCLITimeoutProtection:
             if backend == "redis_set":
                 # Redis times out
                 mock_handler = MagicMock()
-                mock_handler.redis_client.ping.side_effect = Exception("Redis timeout")
+                mock_handler.db.ping.side_effect = Exception("Redis timeout")
                 return mock_handler
             elif backend == "rocksdb_bit":
                 # RocksDB works fine
@@ -525,9 +525,9 @@ class TestCLITimeoutProtection:
         mock_detect_queue_providers.return_value = []
         mock_get_queue_lengths.return_value = {"original_query_queue": 0, "query_fragment_queue": 0}
 
-        # Mock handler without redis_client attribute (edge case)
+        # Mock handler without db attribute (edge case)
         mock_handler = MagicMock()
-        del mock_handler.redis_client  # Remove the attribute
+        del mock_handler.db  # Remove the attribute
         mock_get_cache_handler.return_value = mock_handler
 
         with patch("partitioncache.cli.manage_cache.get_all_keys") as mock_get_all_keys:

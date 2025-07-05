@@ -1,5 +1,4 @@
 import argparse
-import logging
 import os
 import pickle
 import sys
@@ -10,6 +9,8 @@ from tqdm import tqdm
 
 from partitioncache.cache_handler import get_cache_handler
 from partitioncache.cache_handler.abstract import AbstractCacheHandler
+from partitioncache.cache_handler.redis_abstract import RedisAbstractCacheHandler
+from partitioncache.cache_handler.redis_set import RedisCacheHandler
 from partitioncache.cli.common_args import add_environment_args, add_verbosity_args, configure_logging, load_environment_with_validation
 from partitioncache.queue import get_queue_lengths
 from partitioncache.queue_handler import get_queue_handler
@@ -181,7 +182,7 @@ def validate_environment() -> bool:
             # Try to create a cache handler to validate configuration
             cache_handler = get_cache_handler(cache_backend)
             cache_handler.close()
-            logger.info(f"✓ Cache backend '{cache_backend}' configuration is valid")
+            logger.debug(f"✓ Cache backend '{cache_backend}' configuration is valid")
         except Exception as e:
             issues.append(f"Cache backend '{cache_backend}' configuration error: {e}")
 
@@ -191,7 +192,7 @@ def validate_environment() -> bool:
         # Try to create a queue handler to validate configuration
         queue_handler = get_queue_handler(queue_provider)
         queue_handler.close()
-        logger.info(f"✓ Queue provider '{queue_provider}' configuration is valid")
+        logger.debug(f"✓ Queue provider '{queue_provider}' configuration is valid")
     except Exception as e:
         issues.append(f"Queue provider '{queue_provider}' configuration error: {e}")
 
@@ -201,7 +202,7 @@ def validate_environment() -> bool:
             logger.error(f"  - {issue}")
         return False
     else:
-        logger.info("✓ Environment validation passed")
+        logger.debug("✓ Environment validation passed")
         return True
 
 
@@ -218,7 +219,7 @@ def check_table_status() -> None:
         lengths = queue_handler.get_queue_lengths()
         queue_handler.close()
 
-        logger.info(f"✓ Queue tables ({queue_provider}) are accessible")
+        logger.debug(f"✓ Queue tables ({queue_provider}) are accessible")
         logger.info(f"  - Original query queue: {lengths.get('original_query_queue', 0)} items")
         logger.info(f"  - Query fragment queue: {lengths.get('query_fragment_queue', 0)} items")
 
@@ -234,10 +235,10 @@ def check_table_status() -> None:
         # Try to access metadata functionality
         try:
             partitions = cache_handler.get_partition_keys()  # type: ignore
-            logger.info(f"✓ Cache metadata tables ({cache_backend}) are accessible")
+            logger.debug(f"✓ Cache metadata tables ({cache_backend}) are accessible")
             logger.info(f"  - Found {len(partitions)} partition keys")
         except AttributeError:
-            logger.info(f"✓ Cache backend ({cache_backend}) is accessible")
+            logger.debug(f"✓ Cache backend ({cache_backend}) is accessible")
 
         cache_handler.close()
 
@@ -867,11 +868,13 @@ def show_comprehensive_status() -> None:
                     if backend.startswith(("redis_", "rocksdb_")):
                         # Test basic connectivity first - this will fail fast if service unavailable
                         try:
-                            if backend.startswith("redis_"):
+                            if isinstance(cache_handler, RedisAbstractCacheHandler):
                                 # Quick Redis ping with timeout
                                 if hasattr(cache_handler, "db") and hasattr(cache_handler.db, "ping"):
                                     cache_handler.db.ping()  # type: ignore[attr-defined]
                             elif backend.startswith("rocksdb_"):
+                                from partitioncache.cache_handler.rocks_db_abstract import RocksDBAbstractCacheHandler
+                                assert isinstance(cache_handler, RocksDBAbstractCacheHandler)
                                 # Quick RocksDB access test
                                 if hasattr(cache_handler, "db") and hasattr(cache_handler.db, "iterkeys"):
                                     _ = list(cache_handler.db.iterkeys())[:1]  # type: ignore[attr-defined]

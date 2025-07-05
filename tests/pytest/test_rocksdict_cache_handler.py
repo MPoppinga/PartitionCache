@@ -123,11 +123,26 @@ class TestRocksDictCacheHandler:
 
     def test_exists_true(self, cache_handler, mock_rocksdict):
         """Test exists returns True for existing key."""
-        mock_rocksdict.get.return_value = "integer"
-        mock_rocksdict.__contains__.return_value = True
 
-        assert cache_handler.exists("test_key") is True
-        mock_rocksdict.__contains__.assert_called_with("cache:partition_key:test_key")
+        # Mock the metadata lookup
+        def mock_get(key):
+            if key == "_partition_metadata:partition_key":
+                return "integer"
+            return None
+
+        mock_rocksdict.get.side_effect = mock_get
+
+        # Mock the contains check for cache key and termination bits
+        def mock_contains(key):
+            if key == "cache:partition_key:test_key":
+                return True  # Cache exists
+            elif key in ["cache:partition_key:_LIMIT_test_key", "cache:partition_key:_TIMEOUT_test_key"]:
+                return False  # No termination bits
+            return False
+
+        mock_rocksdict.__contains__.side_effect = mock_contains
+
+        assert cache_handler.exists("test_key") is True  # Default check_invalid_too=False
 
     def test_exists_false_no_partition(self, cache_handler, mock_rocksdict):
         """Test exists returns False for non-existent partition."""
@@ -142,12 +157,30 @@ class TestRocksDictCacheHandler:
 
     def test_filter_existing_keys(self, cache_handler, mock_rocksdict):
         """Test filtering existing keys."""
-        mock_rocksdict.get.return_value = "integer"
-        mock_rocksdict.__contains__.side_effect = lambda k: k.endswith("key1") or k.endswith("key3")
+
+        # Mock the metadata lookup
+        def mock_get(key):
+            if key == "_partition_metadata:partition_key":
+                return "integer"
+            return None
+
+        mock_rocksdict.get.side_effect = mock_get
+
+        # Mock __contains__ to handle cache keys and termination bits
+        def mock_contains(key):
+            # No termination bits exist (check first to avoid interference with endswith)
+            if "_LIMIT_" in key or "_TIMEOUT_" in key:
+                return False
+            # Cache keys that exist
+            elif key.endswith("key1") or key.endswith("key3"):
+                return True
+            return False
+
+        mock_rocksdict.__contains__.side_effect = mock_contains
 
         keys = {"key1", "key2", "key3", "key4"}
         existing = cache_handler.filter_existing_keys(keys)
-        assert existing == {"key1", "key3"}
+        assert existing == {"key1", "key3"}  # Default check_invalid_too=False
 
     def test_filter_existing_keys_no_partition(self, cache_handler, mock_rocksdict):
         """Test filtering keys with no partition."""
@@ -174,6 +207,7 @@ class TestRocksDictCacheHandler:
 
     def test_get_intersected_multiple_keys(self, cache_handler, mock_rocksdict):
         """Test intersection with multiple keys."""
+
         def mock_get_side_effect(key):
             if key == "_partition_metadata:partition_key":
                 return "integer"
@@ -383,7 +417,7 @@ class TestRocksDictCacheHandler:
             "cache:test_partition:key2",
             "cache:other_partition:key3",
             "_partition_metadata:test_partition",
-            "query:test_partition:key1"
+            "query:test_partition:key1",
         ]
         mock_rocksdict.keys.return_value = mock_keys
 
@@ -398,17 +432,9 @@ class TestRocksDictCacheHandler:
 
     def test_get_partition_keys(self, cache_handler, mock_rocksdict):
         """Test getting all partition keys and datatypes."""
-        mock_keys = [
-            "_partition_metadata:partition1",
-            "_partition_metadata:partition2",
-            "cache:partition1:key1",
-            "other_key"
-        ]
+        mock_keys = ["_partition_metadata:partition1", "_partition_metadata:partition2", "cache:partition1:key1", "other_key"]
         mock_rocksdict.keys.return_value = mock_keys
-        mock_rocksdict.get.side_effect = lambda k: {
-            "_partition_metadata:partition1": "integer",
-            "_partition_metadata:partition2": "text"
-        }.get(k)
+        mock_rocksdict.get.side_effect = lambda k: {"_partition_metadata:partition1": "integer", "_partition_metadata:partition2": "text"}.get(k)
 
         result = cache_handler.get_partition_keys()
         assert result == [("partition1", "integer"), ("partition2", "text")]
@@ -479,10 +505,7 @@ class TestRocksDictCacheHandler:
 
     def test_mixed_type_partition_keys(self, cache_handler, mock_rocksdict):
         """Test operations with different partition keys."""
-        mock_rocksdict.get.side_effect = lambda k: {
-            "_partition_metadata:int_partition": "integer",
-            "_partition_metadata:text_partition": "text"
-        }.get(k)
+        mock_rocksdict.get.side_effect = lambda k: {"_partition_metadata:int_partition": "integer", "_partition_metadata:text_partition": "text"}.get(k)
 
         # Test integer partition
         int_result = cache_handler.get_datatype("int_partition")

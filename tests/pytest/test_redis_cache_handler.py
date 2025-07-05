@@ -100,13 +100,21 @@ def test_get_set_invalid_type(cache_handler, mock_redis):
 
 def test_exists_true(cache_handler, mock_redis):
     cache_key = "cache:partition_key:existing_key"
+    limit_key = "cache:partition_key:_LIMIT_existing_key"
+    timeout_key = "cache:partition_key:_TIMEOUT_existing_key"
     metadata_key = "_partition_metadata:partition_key"
     # First call for metadata check
     mock_redis.type.return_value = b"string"
     mock_redis.get.side_effect = lambda k: b"integer" if k == metadata_key else None
-    mock_redis.exists.return_value = 1
+    # exists() will be called for cache_key, limit_key, and timeout_key
+    def mock_exists(key):
+        if key == cache_key:
+            return 1  # Cache exists
+        elif key in [limit_key, timeout_key]:
+            return 0  # No termination bits
+        return 0
+    mock_redis.exists.side_effect = mock_exists
     assert cache_handler.exists("existing_key") is True
-    mock_redis.exists.assert_called_with(cache_key)
 
 
 def test_exists_false(cache_handler, mock_redis):

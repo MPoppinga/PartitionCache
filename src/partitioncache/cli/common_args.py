@@ -131,16 +131,16 @@ def add_verbosity_args(parser: argparse.ArgumentParser) -> None:
         parser: The ArgumentParser to add arguments to
     """
     verbosity_group = parser.add_argument_group("verbosity options")
-    
+
     verbosity_group.add_argument(
         "--quiet", "-q",
         action="store_true",
         help="Suppress status messages (only output data/results)"
     )
-    
+
     verbosity_group.add_argument(
         "--verbose", "-v",
-        action="store_true", 
+        action="store_true",
         help="Show detailed status and progress messages"
     )
 
@@ -176,13 +176,13 @@ def configure_logging(args: argparse.Namespace) -> None:
         args: Parsed command line arguments with quiet/verbose flags
     """
     import logging
-    
+
     logger = getLogger("PartitionCache")
-    
+
     # Remove existing handlers to avoid duplication
     for handler in logger.handlers[:]:
         logger.removeHandler(handler)
-    
+
     # Configure based on verbosity
     if getattr(args, 'quiet', False):
         logger.setLevel(logging.WARNING)  # Only warnings and errors
@@ -190,11 +190,19 @@ def configure_logging(args: argparse.Namespace) -> None:
         logger.setLevel(logging.DEBUG)    # All messages including debug
     else:
         logger.setLevel(logging.INFO)     # Default: info, warnings, errors
-    
+
     # Always send logging to stderr
     handler = logging.StreamHandler(sys.stderr)
-    formatter = logging.Formatter('%(levelname)s: %(message)s')
-    handler.setFormatter(formatter)
+
+    # Custom formatter that only shows level prefix for WARNING and ERROR
+    class SelectiveLevelFormatter(logging.Formatter):
+        def format(self, record):
+            if record.levelno >= logging.WARNING:
+                return f"{record.levelname}: {record.getMessage()}"
+            else:
+                return record.getMessage()
+
+    handler.setFormatter(SelectiveLevelFormatter())
     logger.addHandler(handler)
 
 
@@ -214,18 +222,20 @@ def load_environment_with_validation(env_file: str, required_vars: list[str] | N
     """
     # Load environment file if it exists
     env_path = Path(env_file)
+    logger = getLogger("PartitionCache")
+
     if env_path.exists():
         dotenv.load_dotenv(env_file)
-        print(f"Loaded environment from {env_file}", file=sys.stderr)
+        logger.debug(f"Loaded environment from {env_file}")
     elif env_file != ".env":  # Only warn if user explicitly specified a file
-        print(f"Warning: Environment file {env_file} not found", file=sys.stderr)
+        logger.warning(f"Environment file {env_file} not found")
 
     # Validate required variables
     if required_vars:
         missing_vars = [var for var in required_vars if not os.getenv(var)]
         if missing_vars:
-            print(f"Error: Missing required environment variables: {', '.join(missing_vars)}", file=sys.stderr)
-            print("Please set these variables in your environment or .env file", file=sys.stderr)
+            logger.error(f"Missing required environment variables: {', '.join(missing_vars)}")
+            logger.error("Please set these variables in your environment or .env file")
             sys.exit(1)
 
     # Return current environment

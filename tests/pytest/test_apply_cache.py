@@ -56,11 +56,23 @@ class TestFindP0Alias:
         result = find_p0_alias(query, "zipcode")
         assert result == "p0"
 
-    def test_detects_mv_table_by_name(self):
-        """Test that mv table is detected by name pattern."""
+    def test_detects_star_join_table(self):
+        """Test that mv table is detected  when it's a proper star-join."""
+        # With only 2 tables, the mv table won't be auto-detected as star-join
+        # It needs to join multiple tables to be considered a star-join
         query = "SELECT * FROM users AS u, zipcode_mv AS zips WHERE u.zipcode = zips.zipcode"
         result = find_p0_alias(query, "zipcode")
-        assert result == "zips"
+        # Should return first table since it's not detected as star-join with only 2 tables
+        assert result == "u"
+
+        # Test with 3+ tables where zipcode_mv joins all others
+        query_star = """
+        SELECT * FROM users AS u, orders AS o, zipcode_mv AS zips 
+        WHERE u.zipcode = zips.zipcode AND o.zipcode = zips.zipcode
+        """
+        result_star = find_p0_alias(query_star, "zipcode")
+        # Now it should detect zips as the star-join table
+        assert result_star == "zips"
 
 
 class TestRewriteQueryWithP0Table:
@@ -599,11 +611,13 @@ class TestApplyCacheLazy:
 
         return mock_handler
 
-    @patch('partitioncache.apply_cache.isinstance')
+    @patch("partitioncache.apply_cache.isinstance")
     def test_no_cache_hits_returns_original_query(self, mock_isinstance):
         """Test that function returns original query when no cache hits."""
         # Make isinstance return True for AbstractCacheHandler_Lazy
-        mock_isinstance.side_effect = lambda obj, cls: cls.__name__ == 'AbstractCacheHandler_Lazy' or isinstance(obj, cls.__bases__[0] if hasattr(cls, '__bases__') and cls.__bases__ else object)
+        mock_isinstance.side_effect = lambda obj, cls: cls.__name__ == "AbstractCacheHandler_Lazy" or isinstance(
+            obj, cls.__bases__[0] if hasattr(cls, "__bases__") and cls.__bases__ else object
+        )
 
         query = "SELECT * FROM users AS u WHERE u.active = true"
         mock_handler = self.create_mock_cache_handler(lazy_subquery=None, used_hashes=0)
@@ -736,7 +750,9 @@ class TestApplyCacheLazy:
         lazy_subquery = "SELECT zipcode FROM cache_data"
         mock_handler = self.create_mock_cache_handler(lazy_subquery=lazy_subquery, used_hashes=1)
 
-        enhanced_query, stats = apply_cache_lazy(query, mock_handler, "zipcode", method="TMP_TABLE_IN", p0_alias="u", analyze_tmp_table=True, min_component_size=1)
+        enhanced_query, stats = apply_cache_lazy(
+            query, mock_handler, "zipcode", method="TMP_TABLE_IN", p0_alias="u", analyze_tmp_table=True, min_component_size=1
+        )
 
         assert enhanced_query != query
         assert "CREATE INDEX tmp_cache_keys_" in enhanced_query and "_idx ON tmp_cache_keys_" in enhanced_query
