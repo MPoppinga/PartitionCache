@@ -15,13 +15,19 @@ import sqlglot
 import sqlglot.expressions as exp
 
 from partitioncache.cache_handler.abstract import AbstractCacheHandler, AbstractCacheHandler_Lazy
-from partitioncache.query_processor import generate_all_hashes
+from partitioncache.query_processor import detect_star_join_from_query, generate_all_hashes
 
 logger = getLogger("PartitionCache")
 
 
 def get_partition_keys(
-    query: str, cache_handler: AbstractCacheHandler, partition_key: str, min_component_size=2, canonicalize_queries=False
+    query: str,
+    cache_handler: AbstractCacheHandler,
+    partition_key: str,
+    min_component_size=2,
+    canonicalize_queries=False,
+    auto_detect_star_join: bool = True,
+    star_join_table: str | None = None,
 ) -> tuple[set[int] | set[str] | set[float] | set[datetime] | None, int, int]:
     """
     Using the partition cache to get the partition keys for a given query.
@@ -30,9 +36,16 @@ def get_partition_keys(
         query (str): The SQL query to be checked in the cache.
         cache_handler (AbstractCacheHandler): The cache handler object.
         partition_key: The identifier for the partition.
+        min_component_size: Minimum size of query components to consider.
+        canonicalize_queries: Whether to canonicalize queries before hashing.
+        auto_detect_star_join: Whether to auto-detect star-join tables.
+        star_join_table: Explicitly specified star-join table alias or name.
 
     Returns:
-       set[int] | set[str] | set[float] | set[datetime] | None: The set of partition keys.
+       tuple containing:
+       - set[int] | set[str] | set[float] | set[datetime] | None: The set of partition keys.
+       - int: Total number of query variant hashes generated
+       - int: Number of cache hits
     """
 
     # Generate all hashes for the given query (Only consider subqueries with two ore more components that are connected, allow modifying attributes)
@@ -43,6 +56,8 @@ def get_partition_keys(
         follow_graph=True,
         fix_attributes=False,
         canonicalize_queries=canonicalize_queries,
+        auto_detect_star_join=auto_detect_star_join,
+        star_join_table=star_join_table,
     )
 
     logger.info(f"Found {len(cache_entry_hashes)} subqueries in query")
@@ -61,6 +76,8 @@ def get_partition_keys_lazy(
     min_component_size=2,
     canonicalize_queries=False,
     follow_graph=True,
+    auto_detect_star_join: bool = True,
+    star_join_table: str | None = None,
 ) -> tuple[str | None, int, int]:
     """
     Gets the lazy intersection representation of the partition keys for the given query.
@@ -72,6 +89,8 @@ def get_partition_keys_lazy(
         min_component_size (int): Minimum size of query components to consider for cache lookup.
         canonicalize_queries (bool): Whether to canonicalize queries before hashing.
         follow_graph (bool): Whether to follow the query graph for generating variants.
+        auto_detect_star_join: Whether to auto-detect star-join tables.
+        star_join_table: Explicitly specified star-join table alias or name.
 
     Returns:
         tuple[str, int, int]: A tuple containing:
@@ -89,6 +108,8 @@ def get_partition_keys_lazy(
         fix_attributes=False,
         canonicalize_queries=canonicalize_queries,
         follow_graph=follow_graph,
+        auto_detect_star_join=auto_detect_star_join,
+        star_join_table=star_join_table,
     )
 
     if not isinstance(cache_handler, AbstractCacheHandler_Lazy):
@@ -99,32 +120,48 @@ def get_partition_keys_lazy(
     return lazy_cache_subquery, len(hashses), used_hashes
 
 
-def find_p0_alias(query: str, partition_key: str) -> str:
+def find_p0_alias(query: str, partition_key: str, auto_detect_star_join: bool = True, star_join_table: str | None = None) -> str:
     """
     Find the appropriate table alias for cache restrictions.
 
-    If a p0 table exists (e.g., partition_key_mv as p0), use that.
-    Otherwise, use the first table in the query.
+    Uses the query processor's star-join detection logic.
+    If no star-join table is detected, falls back to the first table in the query.
+
+    Args:
+        query: SQL query to analyze
+        partition_key: The partition key column name
+        auto_detect_star_join: Whether to auto-detect star-join tables
+        star_join_table: Explicitly specified star-join table alias or name
+
+    Returns:
+        The alias to use for cache restrictions
     """
+    # First check if query has tables at all
     parsed_query = sqlglot.parse_one(query)
-
-    # First check for p0 table (star-schema pattern)
-    for table in parsed_query.find_all(exp.Table):
-        alias = table.alias if table.alias else table.name
-        table_name = table.name if hasattr(table, "name") else str(table.this)
-
-        # Check if this is a p0 table (ends with _mv and matches partition_key)
-        if table_name == f"{partition_key}_mv" or alias == "p0":
-            return alias
-
-    # Fallback to first table
     first_table = parsed_query.find(exp.Table)
     if first_table is None:
         raise ValueError("No table found in query")
+
+    # Use query processor's star-join detection only if query has FROM clause
+    try:
+        star_join_alias = detect_star_join_from_query(
+            query=query,
+            partition_key=partition_key,
+            auto_detect_star_join=auto_detect_star_join,
+            star_join_table=star_join_table,
+        )
+
+        if star_join_alias:
+            return star_join_alias
+    except (IndexError, ValueError):
+        # If star-join detection fails (e.g., no FROM clause), fall through to default
+        pass
+
+    # Fallback to first table
     return first_table.alias_or_name
 
 
-def rewrite_query_with_p0_table(
+def rewrite_query_with_p0_table( # TODO: Check duplication with query_processor
     query: str,
     partition_key: str,
     mv_table_name: str | None = None,
@@ -272,6 +309,8 @@ def extend_query_with_partition_keys(
     method: Literal["IN", "VALUES", "TMP_TABLE_JOIN", "TMP_TABLE_IN"] = "IN",
     p0_alias: str | None = None,
     analyze_tmp_table: bool = True,
+    auto_detect_star_join: bool = True,
+    star_join_table: str | None = None,
 ) -> str:
     """
     Extend a given SQL query with the cache functionality.
@@ -286,6 +325,8 @@ def extend_query_with_partition_keys(
         method (Literal["IN", "VALUES", "TMP_TABLE_IN", "TMP_TABLE_JOIN"]): The method to use to extend the query.
         p0_alias (str | None): The alias of the table to use for the partition key.
         analyze_tmp_table (bool): Whether to create index and analyze. (only for temporary table methods)
+        auto_detect_star_join: Whether to auto-detect star-join tables.
+        star_join_table: Explicitly specified star-join table alias or name.
 
     Returns:
         str: The extended SQL query as string.
@@ -295,7 +336,7 @@ def extend_query_with_partition_keys(
 
     if p0_alias is None and method != "TMP_TABLE_JOIN":
         # No alias provided, try to find it (TMP_TABLE_JOIN does join on all tables)
-        p0_alias = find_p0_alias(query, partition_key)
+        p0_alias = find_p0_alias(query, partition_key, auto_detect_star_join, star_join_table)
 
     parsed_query = sqlglot.parse_one(query)
 
@@ -375,6 +416,8 @@ def extend_query_with_partition_keys_lazy(
     method: Literal["IN_SUBQUERY", "TMP_TABLE_IN", "TMP_TABLE_JOIN"] = "IN_SUBQUERY",
     p0_alias: str | None = None,
     analyze_tmp_table: bool = True,
+    auto_detect_star_join: bool = True,
+    star_join_table: str | None = None,
 ) -> str:
     """
     Extend a given SQL query with the cache functionality using a lazy SQL subquery.
@@ -390,6 +433,8 @@ def extend_query_with_partition_keys_lazy(
         p0_alias (str | None): The alias of the table to use for the partition key. If None, will be auto-detected.
             When use_p0_table=True, cache restrictions automatically target the p0 table regardless of this parameter.
         analyze_tmp_table (bool): Whether to create index and analyze. (only for temporary table methods)
+        auto_detect_star_join: Whether to auto-detect star-join tables.
+        star_join_table: Explicitly specified star-join table alias or name.
 
     Returns:
         str: The extended SQL query as string.
@@ -399,7 +444,7 @@ def extend_query_with_partition_keys_lazy(
 
     if p0_alias is None and method != "TMP_TABLE_JOIN":
         # No alias provided, try to find it (TMP_TABLE_JOIN does join on all tables)
-        p0_alias = find_p0_alias(query, partition_key)
+        p0_alias = find_p0_alias(query, partition_key, auto_detect_star_join, star_join_table)
 
     parsed_query = sqlglot.parse_one(query)
 
@@ -467,6 +512,8 @@ def apply_cache_lazy(
     analyze_tmp_table: bool = True,
     use_p0_table: bool = False,
     p0_table_name: str | None = None,
+    auto_detect_star_join: bool = True,
+    star_join_table: str | None = None,
 ) -> tuple[str, dict[str, int]]:
     """
     Complete wrapper function that applies partition cache to a query using lazy intersection.
@@ -484,6 +531,8 @@ def apply_cache_lazy(
         analyze_tmp_table (bool): Whether to create index and analyze for temporary table methods.
         use_p0_table (bool): Whether to rewrite the query to use a p0 table (star-schema).
         p0_table_name (str | None): Name of the p0 table. Defaults to {partition_key}_mv.
+        auto_detect_star_join: Whether to auto-detect star-join tables.
+        star_join_table: Explicitly specified star-join table alias or name.
 
     Returns:
         tuple[str, dict[str, int]]: Enhanced query and statistics.
@@ -496,6 +545,8 @@ def apply_cache_lazy(
         min_component_size=min_component_size,
         canonicalize_queries=canonicalize_queries,
         follow_graph=follow_graph,
+        auto_detect_star_join=auto_detect_star_join,
+        star_join_table=star_join_table,
     )
 
     # Step 2: Optionally rewrite with p0 table
@@ -534,6 +585,8 @@ def apply_cache_lazy(
         method=method,
         p0_alias=cache_target_alias,
         analyze_tmp_table=analyze_tmp_table,
+        auto_detect_star_join=auto_detect_star_join,
+        star_join_table=star_join_table,
     )
 
     stats["enhanced"] = 1
@@ -551,6 +604,8 @@ def apply_cache(
     analyze_tmp_table: bool = True,
     use_p0_table: bool = False,
     p0_table_name: str | None = None,
+    auto_detect_star_join: bool = True,
+    star_join_table: str | None = None,
 ) -> tuple[str, dict[str, int]]:
     """
     Complete wrapper function that applies partition cache to a query using regular cache handlers.
@@ -574,7 +629,8 @@ def apply_cache(
         analyze_tmp_table (bool): Whether to create index and analyze for temporary table methods.
         use_p0_table (bool): Whether to rewrite the query to use a p0 table for optimizer hints.
         p0_table_name (str | None): Name of the p0 table. Defaults to {partition_key}_mv.
-        p0_method (Literal["JOIN", "IN"]): The method to use for p0 table rewriting.
+        auto_detect_star_join: Whether to auto-detect star-join tables.
+        star_join_table: Explicitly specified star-join table alias or name.
 
     Returns:
         tuple[str, dict[str, int]]: A tuple containing:
@@ -596,13 +652,15 @@ def apply_cache(
         )
         ```
     """
-    # Step 1: Generate all query variants from ORIGINAL query (not p0-rewritten)
+    # Step 1: Generate all query variants from ORIGINAL query (not p0-rewritten) # TODO obsolete as query processor does this transparently?
     partition_keys, generated_variants, used_hashes = get_partition_keys(
         query=query,
         cache_handler=cache_handler,
         partition_key=partition_key,
         min_component_size=min_component_size,
         canonicalize_queries=canonicalize_queries,
+        auto_detect_star_join=auto_detect_star_join,
+        star_join_table=star_join_table,
     )
 
     # Step 2: Optionally rewrite original query with p0 table
@@ -643,6 +701,8 @@ def apply_cache(
         method=method,
         p0_alias=cache_target_alias,
         analyze_tmp_table=analyze_tmp_table,
+        auto_detect_star_join=auto_detect_star_join,
+        star_join_table=star_join_table,
     )
 
     stats["enhanced"] = 1

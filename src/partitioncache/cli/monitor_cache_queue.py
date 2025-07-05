@@ -13,7 +13,14 @@ from logging import getLogger
 
 import psycopg
 
+from partitioncache.apply_cache import (
+    extend_query_with_partition_keys,
+    extend_query_with_partition_keys_lazy,
+    get_partition_keys,
+    get_partition_keys_lazy,
+)
 from partitioncache.cache_handler import get_cache_handler
+from partitioncache.cache_handler.abstract import AbstractCacheHandler_Lazy
 from partitioncache.cli.common_args import (
     add_database_args,
     add_environment_args,
@@ -102,6 +109,106 @@ def query_fragment_processor():
     logger.info("Query fragment processor thread exiting")
 
 
+def apply_cache_optimization(query: str, query_hash: str, partition_key: str, partition_datatype: str | None, cache_handler, args) -> tuple[str, bool, dict]:
+    """
+    Apply cache-aware optimization to a query before execution.
+
+    Args:
+        query: SQL query to potentially optimize
+        query_hash: Hash of the original query
+        partition_key: Partition key for the query
+        partition_datatype: Datatype of the partition key
+        cache_handler: Cache handler instance
+        args: Command line arguments
+
+    Returns:
+        tuple: (optimized_query, was_optimized, stats)
+            - optimized_query: Either the original or optimized query
+            - was_optimized: Whether optimization was applied
+            - stats: Dictionary with optimization statistics
+    """
+    stats = {"total_hashes": 0, "cache_hits": 0, "method_used": None}
+
+    if not args.enable_cache_optimization:
+        return query, False, stats
+
+    try:
+        # Check if we should use lazy optimization
+        use_lazy = args.prefer_lazy_optimization and isinstance(cache_handler, AbstractCacheHandler_Lazy)
+
+        if use_lazy:
+            # Use lazy intersection - no min-hits check needed
+            lazy_subquery, total_hashes, hits = get_partition_keys_lazy(
+                query=query,
+                cache_handler=cache_handler,
+                partition_key=partition_key,
+                min_component_size=args.min_component_size,
+                canonicalize_queries=False,
+                follow_graph=args.follow_graph,
+            )
+
+            stats["total_hashes"] = total_hashes
+            stats["cache_hits"] = hits
+
+            if hits > 0 and lazy_subquery:
+                # Map method names for lazy optimization
+                lazy_method_map = {
+                    "IN": "IN_SUBQUERY",
+                    "IN_SUBQUERY": "IN_SUBQUERY",
+                    "TMP_TABLE_IN": "TMP_TABLE_IN",
+                    "TMP_TABLE_JOIN": "TMP_TABLE_JOIN",
+                }
+                method = lazy_method_map.get(args.cache_optimization_method, "IN_SUBQUERY")
+                stats["method_used"] = method
+
+                optimized_query = extend_query_with_partition_keys_lazy(
+                    query=query,
+                    lazy_subquery=lazy_subquery,
+                    partition_key=partition_key,
+                    method=method,  # type: ignore[arg-type]
+                    analyze_tmp_table=True,
+                )
+
+                logger.info(f"Applied lazy cache optimization to {query_hash}: {hits}/{total_hashes} cache hits, method={method}")
+                return optimized_query, True, stats
+        else:
+            # Use standard intersection with min-hits check
+            partition_keys, total_hashes, hits = get_partition_keys(
+                query=query,
+                cache_handler=cache_handler,
+                partition_key=partition_key,
+                min_component_size=args.min_component_size,
+                canonicalize_queries=False,
+            )
+
+            stats["total_hashes"] = total_hashes
+            stats["cache_hits"] = hits
+
+            if hits >= args.min_cache_hits and partition_keys:
+                method = args.cache_optimization_method
+                stats["method_used"] = method
+
+                optimized_query = extend_query_with_partition_keys(
+                    query=query,
+                    partition_keys=partition_keys,
+                    partition_key=partition_key,
+                    method=method,
+                    analyze_tmp_table=True,
+                )
+
+                logger.info(f"Applied cache optimization to {query_hash}: {hits}/{total_hashes} cache hits, {len(partition_keys)} keys, method={method}")
+                return optimized_query, True, stats
+
+        # No optimization applied
+        if stats["cache_hits"] > 0:
+            logger.debug(f"Cache hits below threshold for {query_hash}: {stats['cache_hits']}/{stats['total_hashes']} (min={args.min_cache_hits})")
+
+    except Exception as e:
+        logger.warning(f"Failed to apply cache optimization to {query_hash}: {e}")
+
+    return query, False, stats
+
+
 def run_and_store_query(query: str, query_hash: str, partition_key: str, partition_datatype: str | None = None):
     """Worker function to execute and store a query.
 
@@ -111,10 +218,23 @@ def run_and_store_query(query: str, query_hash: str, partition_key: str, partiti
         partition_key: Partition key for organizing cached results
         partition_datatype: Datatype of the partition key (default: None)
     """
+    original_query = query  # Store the original query for cache storage
+    original_hash = query_hash  # Preserve the original hash
+
     try:
         # Resolve cache backend
         cache_backend = resolve_cache_backend(args)
         cache_handler = get_cache_handler(cache_backend, singleton=True)
+
+        # Apply cache optimization if enabled
+        query_to_execute = query
+        optimization_applied = False
+        optimization_stats = {}
+
+        if args.enable_cache_optimization:
+            query_to_execute, optimization_applied, optimization_stats = apply_cache_optimization(
+                query, query_hash, partition_key, partition_datatype, cache_handler, args
+            )
 
         # Get database connection parameters
         db_connection_params = get_database_connection_params(args)
@@ -131,18 +251,18 @@ def run_and_store_query(query: str, query_hash: str, partition_key: str, partiti
 
         try:
             t = time.perf_counter()
-            result = set(db_handler.execute(query))
+            result = set(db_handler.execute(query_to_execute))
 
             # Apply limit if specified
             if args.limit is not None and result is not None and len(result) >= args.limit:
                 logger.info(f"Query {query_hash} limited to {args.limit} partition keys")
-                cache_handler.set_null(f"_LIMIT_{query_hash}", partition_key)  # Set null termination bit
+                cache_handler.set_query_status(query_hash, partition_key, "failed")  # Set failed status for limit exceeded
                 return True
 
         except psycopg.OperationalError as e:
             if "statement timeout" in str(e):
                 logger.info(f"Query {query_hash} is a long running query")
-                cache_handler.set_null(f"_TIMEOUT_{query_hash}", partition_key)  # Set null termination bit
+                cache_handler.set_query_status(query_hash, partition_key, "timeout")  # Set timeout status
                 return True
             else:
                 raise e
@@ -155,9 +275,15 @@ def run_and_store_query(query: str, query_hash: str, partition_key: str, partiti
         if partition_datatype is not None:
             cache_handler.register_partition_key(partition_key, partition_datatype)
 
-        cache_handler.set_set(query_hash, result, partition_key)
-        cache_handler.set_query(query_hash, query, partition_key)
-        logger.debug(f"Stored {query_hash} in cache")
+        # Always store with original hash and query (not the optimized version)
+        cache_handler.set_set(original_hash, result, partition_key)
+        cache_handler.set_query(original_hash, original_query, partition_key)
+        logger.debug(f"Stored {original_hash} in cache")
+
+        if optimization_applied:
+            logger.info(
+                f"Query {original_hash} executed with cache optimization: {optimization_stats['cache_hits']} hits, method={optimization_stats['method_used']}"
+            )
         return True
     except Exception as e:
         logger.error(f"Error processing query {query_hash}: {str(e)}")
@@ -169,7 +295,9 @@ def run_and_store_query(query: str, query_hash: str, partition_key: str, partiti
 
 
 def print_status(active, pending, original_query_queue=0, query_fragment_queue=0):
-    logger.info(f"Active processes: {active}, Pending jobs: {pending}, Original query queue: {original_query_queue}, Query fragment queue: {query_fragment_queue}")
+    logger.info(
+        f"Active processes: {active}, Pending jobs: {pending}, Original query queue: {original_query_queue}, Query fragment queue: {query_fragment_queue}"
+    )
 
 
 def print_enhanced_status(active, pending, queue_lengths, waiting_reason=None):
@@ -190,11 +318,11 @@ def get_timeout_for_state(can_consume, exit_event_set, error_count=0):
     if exit_event_set:
         return 0.5  # Quick exit during shutdown
     elif error_count > 0:
-        return min(0.5 * (2 ** error_count), 5.0)  # Exponential backoff for errors
+        return min(0.5 * (2**error_count), 5.0)  # Exponential backoff for errors
     elif can_consume:
         return 60.0  # Long blocking for efficiency when we can process
     else:
-        return 1.0   # Short wait when waiting for capacity
+        return 1.0  # Short wait when waiting for capacity
 
 
 def process_pending_job_if_available():
@@ -281,6 +409,7 @@ def fragment_executor():
                 except Exception as e:
                     logger.error(f"Error getting queue lengths: {e}")
                     incoming_count = fragment_count = 0
+                    lengths = {"original_query_queue": 0, "query_fragment_queue": 0}
 
                 # Determine if we should log status
                 should_log_status = False
@@ -327,7 +456,7 @@ def fragment_executor():
                         # Use efficient blocking pop (with LISTEN/NOTIFY for PostgreSQL, native blocking for Redis)
                         queue_provider = get_queue_provider_name()
                         logger.debug(f"Using {queue_provider} blocking pop with timeout {timeout}s")
-                        fragment_result = pop_from_query_fragment_queue_blocking(timeout=timeout)
+                        fragment_result = pop_from_query_fragment_queue_blocking(timeout=int(timeout))
                     else:
                         # Use regular pop when optimized polling is disabled
                         queue_provider = get_queue_provider_name()
@@ -349,18 +478,10 @@ def fragment_executor():
                 query, hash_value, partition_key, partition_datatype = fragment_result
                 logger.debug(f"Found fragment in fragment queue: {hash_value} for partition_key: {partition_key} (datatype: {partition_datatype})")
 
-                # Check if already in cache or being processed
-                if main_cache_handler.exists(hash_value, partition_key):
-                    logger.debug(f"Query {hash_value} already in cache")
+                # Check if already in cache with valid status (unified approach)
+                if main_cache_handler.exists(hash_value, partition_key, check_invalid_too=False):
+                    logger.debug(f"Query {hash_value} already in cache with valid status")
                     main_cache_handler.set_query(hash_value, query, partition_key)  # update the query last_seen
-                    continue
-
-                # Check for existing termination bits before submitting
-                if main_cache_handler.exists(f"_LIMIT_{hash_value}", partition_key):
-                    logger.debug(f"Query {hash_value} previously hit limit, skipping")
-                    continue
-                if main_cache_handler.exists(f"_TIMEOUT_{hash_value}", partition_key):
-                    logger.debug(f"Query {hash_value} previously timed out, skipping")
                     continue
 
                 if hash_value in active_futures or any(job[1] == hash_value for job in pending_jobs):
@@ -434,9 +555,29 @@ def main():
     processing_group.add_argument("--max-processes", type=int, default=12, help="Max number of processes to use")
     processing_group.add_argument("--long-running-query-timeout", type=str, default="0", help="Timeout for long running queries")
     processing_group.add_argument("--limit", type=int, default=None, help="Limit the number of returned partition keys")
-    processing_group.add_argument("--status-log-interval", type=int, default=10, help="Interval in seconds for logging status when queues are empty (default: 10)")
+    processing_group.add_argument(
+        "--status-log-interval", type=int, default=10, help="Interval in seconds for logging status when queues are empty (default: 10)"
+    )
     processing_group.add_argument("--disable-optimized-polling", action="store_true", help="Disable optimized polling and use simple polling")
     processing_group.add_argument("--max-pending-jobs", type=int, help="Maximum number of jobs to keep in pending buffer (default: 2 * max_processes)")
+
+    # Cache optimization configuration
+    optimization_group = parser.add_argument_group("cache optimization options")
+    optimization_group.add_argument(
+        "--enable-cache-optimization", action="store_true", default=True, help="Enable cache-aware optimization for fragment queries"
+    )
+    optimization_group.add_argument(
+        "--cache-optimization-method",
+        type=str,
+        default="IN",
+        choices=["IN", "VALUES", "IN_SUBQUERY", "TMP_TABLE_IN", "TMP_TABLE_JOIN"],
+        help="Method for applying cache restrictions (default: IN)",
+    )
+    optimization_group.add_argument("--min-cache-hits", type=int, default=1, help="Minimum cache hits required for non-lazy optimization (default: 1)")
+    optimization_group.add_argument("--prefer-lazy-optimization", action="store_true", default=True, help="Prefer lazy methods when available (default: True)")
+    optimization_group.add_argument(
+        "--no-prefer-lazy-optimization", dest="prefer_lazy_optimization", action="store_false", help="Disable preference for lazy optimization"
+    )
 
     # Add common argument groups
     add_database_args(parser)
@@ -474,7 +615,9 @@ def main():
         logger.debug(f"Using max_pending_jobs: {args.max_pending_jobs}")
 
     if args.max_pending_jobs > 10 * args.max_processes:
-        logger.warning(f"max_pending_jobs ({args.max_pending_jobs}) is very large compared to max_processes ({args.max_processes}). Consider reducing for better memory efficiency.")
+        logger.warning(
+            f"max_pending_jobs ({args.max_pending_jobs}) is very large compared to max_processes ({args.max_processes}). Consider reducing for better memory efficiency."
+        )
 
     # Validate queue configuration (supports both PostgreSQL and Redis)
     try:
@@ -501,6 +644,12 @@ def main():
         logger.info("- Using regular polling (optimized polling disabled)")
     else:
         logger.info("- Using optimized polling with blocking queue operations")
+
+    if args.enable_cache_optimization:
+        logger.info("- Cache optimization ENABLED:")
+        logger.info(f"  - Method: {args.cache_optimization_method}")
+        logger.info(f"  - Min cache hits: {args.min_cache_hits}")
+        logger.info(f"  - Prefer lazy: {args.prefer_lazy_optimization}")
 
     # Start the query fragment processor thread
     fragment_processor_thread = threading.Thread(target=query_fragment_processor, daemon=True)

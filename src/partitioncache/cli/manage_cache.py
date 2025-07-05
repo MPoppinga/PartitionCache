@@ -9,6 +9,8 @@ from tqdm import tqdm
 
 from partitioncache.cache_handler import get_cache_handler
 from partitioncache.cache_handler.abstract import AbstractCacheHandler
+from partitioncache.cache_handler.redis_abstract import RedisAbstractCacheHandler
+from partitioncache.cache_handler.redis_set import RedisCacheHandler
 from partitioncache.cli.common_args import add_environment_args, add_verbosity_args, configure_logging, load_environment_with_validation
 from partitioncache.queue import get_queue_lengths
 from partitioncache.queue_handler import get_queue_handler
@@ -866,11 +868,13 @@ def show_comprehensive_status() -> None:
                     if backend.startswith(("redis_", "rocksdb_")):
                         # Test basic connectivity first - this will fail fast if service unavailable
                         try:
-                            if backend.startswith("redis_"):
+                            if isinstance(cache_handler, RedisAbstractCacheHandler):
                                 # Quick Redis ping with timeout
                                 if hasattr(cache_handler, "db") and hasattr(cache_handler.db, "ping"):
                                     cache_handler.db.ping()  # type: ignore[attr-defined]
                             elif backend.startswith("rocksdb_"):
+                                from partitioncache.cache_handler.rocks_db_abstract import RocksDBAbstractCacheHandler
+                                assert isinstance(cache_handler, RocksDBAbstractCacheHandler)
                                 # Quick RocksDB access test
                                 if hasattr(cache_handler, "db") and hasattr(cache_handler.db, "iterkeys"):
                                     _ = list(cache_handler.db.iterkeys())[:1]  # type: ignore[attr-defined]

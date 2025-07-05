@@ -92,16 +92,19 @@ class AbstractCacheHandler(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def exists(self, key: str, partition_key: str = "partition_key") -> bool:
+    def exists(self, key: str, partition_key: str = "partition_key", check_invalid_too: bool = False) -> bool:
         """
         Check if a key exists in the cache.
 
         Args:
             key (str): The key to check.
             partition_key (str, optional): The partition key. Defaults to "partition_key".
+            check_invalid_too (bool, optional): If True, return True if either a valid entry or a failed/timeout entry exists.
+                                                If False, only return True for valid entries (excludes failed/timeout).
+                                                Defaults to False.
 
         Returns:
-            bool: True if the key exists, False otherwise.
+            bool: True if the key exists (and meets validity criteria), False otherwise.
         """
         raise NotImplementedError
 
@@ -178,16 +181,19 @@ class AbstractCacheHandler(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def filter_existing_keys(self, keys: set, partition_key: str = "partition_key") -> set:
+    def filter_existing_keys(self, keys: set, partition_key: str = "partition_key", check_invalid_too: bool = False) -> set:
         """
         Filter and return the set of keys that exist in the cache of the given set.
 
         Args:
             keys (set): A set of keys to verify.
             partition_key (str, optional): The partition key. Defaults to "partition_key".
+            check_invalid_too (bool, optional): If True, return both valid and invalid keys.
+                                               If False, only return valid keys no failed/timeout entries.
+                                               Defaults to False.
 
         Returns:
-            set: The subset set of keys that exist in the cache.
+            set: The subset set of keys that exist in the cache (and meet validity criteria).
         """
         raise NotImplementedError
 
@@ -267,6 +273,35 @@ class AbstractCacheHandler(ABC):
     def get_instance(cls, *args, **kwargs) -> "AbstractCacheHandler":
         """
         Get an instance of the cache handler.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def set_query_status(self, key: str, partition_key: str = "partition_key", status: str = "ok") -> bool:
+        """
+        Set the status of a query in the cache.
+
+        Args:
+            key (str): The query hash to set status for.
+            partition_key (str, optional): The partition key. Defaults to "partition_key".
+            status (str, optional): The status to set ('ok', 'timeout', 'failed'). Defaults to "ok".
+
+        Returns:
+            bool: True if the operation was successful, False otherwise.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_query_status(self, key: str, partition_key: str = "partition_key") -> str | None:
+        """
+        Get the status of a query from the cache.
+
+        Args:
+            key (str): The query hash to check.
+            partition_key (str, optional): The partition key. Defaults to "partition_key".
+
+        Returns:
+            str | None: The status ('ok', 'timeout', 'failed') or None if not found.
         """
         raise NotImplementedError
 

@@ -23,7 +23,24 @@ logger = logging.getLogger("PartitionCache")
 
 def clean_query(query: str) -> str:
     """
-    Perform some basic cleaning of the query to ensure a stable output even if the query is formatted differently.
+    Perform query cleaning to ensure stable output for cache variant generation.
+
+    This function normalizes queries and removes clauses that don't affect which partition keys
+    are accessed, ensuring that semantically equivalent queries for caching purposes generate
+    the same hash variants.
+
+    Removes:
+    - ORDER BY clauses (don't affect partition key access patterns)
+    - LIMIT clauses (don't affect partition key access patterns)
+    - Comments
+    - Trailing semicolons
+    - Unnecessary parentheses in WHERE clauses
+
+    Args:
+        query (str): SQL query to clean
+
+    Returns:
+        str: Cleaned and normalized query suitable for cache variant generation
     """
 
     query = re.sub(r"\s+", " ", query)
@@ -32,13 +49,15 @@ def clean_query(query: str) -> str:
     # Remove trailing semicolons (they're not part of the SQL statement)
     query = query.rstrip().rstrip(";")
 
+    # Remove comments first to avoid issues with ORDER BY/LIMIT parsing
+    query = re.sub(r"--.*", "", query)
+
     # Normalize the query
     sqlglot_query = sqlglot.parse_one(query)
 
     # Normalize the query (including building DNF)
     nquery = sqlglot.optimizer.normalize.normalize(sqlglot_query)
     query = nquery.sql()
-
 
     # Use sqlglot to properly parse and flatten WHERE clause
     try:
@@ -61,11 +80,30 @@ def clean_query(query: str) -> str:
         logger.debug(f"Could not flatten WHERE parentheses using sqlglot: {e}")
         # Fallback to regex approach for simple cases
 
-    # Removing all comments
-    query = re.sub(r"--.*", "", query)
+    # Remove clauses that don't affect caching logic using sqlglot for proper parsing
+    try:
+        parsed = sqlglot.parse_one(query)
 
-    # Removing LIMIT
-    query = re.sub(r"LIMIT\s\d+", "", query)
+        # Remove ORDER BY and LIMIT clauses - they don't affect which partition keys are accessed
+        # We need to process all SELECT statements (including subqueries)
+        for select_stmt in parsed.find_all(sqlglot.expressions.Select):
+            # Remove ORDER BY
+            if select_stmt.args.get("order"):
+                select_stmt.set("order", None)
+                logger.debug("Removed ORDER BY clause for cache variant generation")
+
+            # Remove LIMIT
+            if select_stmt.args.get("limit"):
+                select_stmt.set("limit", None)
+                logger.debug("Removed LIMIT clause for cache variant generation")
+
+        query = parsed.sql()
+
+    except Exception as e:
+        logger.debug(f"Could not remove ORDER BY/LIMIT using sqlglot, falling back to regex: {e}")
+        # Fallback to regex for ORDER BY and LIMIT removal
+        query = re.sub(r"ORDER\s+BY\s+[^)]*?(?=\s+LIMIT|\s+$|$)", "", query, flags=re.IGNORECASE)
+        query = re.sub(r"LIMIT\s+\d+", "", query, flags=re.IGNORECASE)
 
     # Removing tailing semicolon
     query = re.sub(r";\s*$", "", query)
@@ -256,8 +294,7 @@ def extract_and_group_query_conditions(
                 partition_key_joins[(min(left_alias, right_alias), max(left_alias, right_alias))].append(condition)
             continue  # Skip adding to other conditions
         elif condition.count(partition_key) >= 1 and (
-            sqlglot.parse_one(condition).find(sqlglot.expressions.In) or
-            any(op in condition for op in ["BETWEEN", ">", "<", "=", "!=", "<>"])
+            sqlglot.parse_one(condition).find(sqlglot.expressions.In) or any(op in condition for op in ["BETWEEN", ">", "<", "=", "!=", "<>"])
         ):
             # if partition_key is in condition, it is a partition key condition (IN, BETWEEN, comparison, etc.)
             # Preserve the full condition including NOT, BETWEEN, comparison operators
@@ -464,6 +501,95 @@ def detect_star_join_table(
     return detected_star_join_alias
 
 
+def detect_star_join_from_query(
+    query: str,
+    partition_key: str,
+    auto_detect_star_join: bool = True,
+    star_join_table: str | None = None,
+) -> str | None:
+    """
+    Public wrapper to detect star-join table from a SQL query.
+
+    This function extracts query conditions and uses the internal star-join detection
+    logic to identify star-join tables in the query.
+
+    Args:
+        query: SQL query to analyze
+        partition_key: The partition key column name
+        auto_detect_star_join: Whether to auto-detect star-join tables
+        star_join_table: Explicitly specified star-join table alias or name
+
+    Returns:
+        The alias of the detected star-join table, or None if no star-join table is found
+    """
+    (
+        attribute_conditions,
+        distance_conditions,
+        other_functions,
+        partition_key_conditions,
+        or_conditions,
+        table_aliases,
+        alias_to_table_map,
+        partition_key_joins,
+    ) = extract_and_group_query_conditions(query, partition_key)
+
+    return detect_star_join_table(
+        table_aliases,
+        alias_to_table_map,
+        attribute_conditions,
+        distance_conditions,
+        partition_key_joins,
+        partition_key,
+        auto_detect_star_join,
+        star_join_table,
+    )
+
+
+def _build_select_clause(
+    strip_select: bool,
+    original_select_clause: str | None,
+    table_aliases: list[str],
+    original_to_new_alias_mapping: dict[str, str],
+    partition_key: str,
+    star_join_alias: str | None = None,
+) -> str:
+    """
+    Build the SELECT clause for a partial query.
+
+    Args:
+        strip_select: If True, use stripped SELECT (partition key only)
+        original_select_clause: Original SELECT clause expressions if available
+        table_aliases: List of new table aliases in the partial query (e.g., ['t1', 't2'])
+        original_to_new_alias_mapping: Mapping from original aliases to new aliases
+        partition_key: The partition key column name
+        star_join_alias: Alias of the star-join table if present (e.g., 'p1')
+
+    Returns:
+        Complete SELECT clause string (with SELECT keyword)
+    """
+    if strip_select or original_select_clause is None:
+        # For star-join queries, prefer selecting from the star-join table
+        if star_join_alias:
+            return f"SELECT DISTINCT {star_join_alias}.{partition_key}"
+        else:
+            # Default behavior: select only partition key from first table
+            return f"SELECT DISTINCT {table_aliases[0]}.{partition_key}"
+
+    # Preserve original SELECT clause with alias mapping
+    try:
+        # Replace original aliases with new aliases in the SELECT clause
+        mapped_select_clause = original_select_clause
+        for original_alias, new_alias in original_to_new_alias_mapping.items():
+            # Replace table alias references (e.g., "cd.pdb_id" -> "t1.pdb_id")
+            pattern = rf"\b{re.escape(original_alias)}\."
+            mapped_select_clause = re.sub(pattern, f"{new_alias}.", mapped_select_clause)
+
+        return f"SELECT {mapped_select_clause}"
+    except Exception as e:
+        logger.warning(f"Failed to map SELECT clause aliases: {e}. Falling back to stripped SELECT.")
+        return f"SELECT DISTINCT {table_aliases[0]}.{partition_key}"
+
+
 def generate_partial_queries(
     query: str,
     partition_key: str,
@@ -475,6 +601,7 @@ def generate_partial_queries(
     max_component_size: int | None = None,
     star_join_table: str | None = None,
     warn_no_partition_key: bool = True,
+    strip_select: bool = True,
 ) -> list[str]:
     """
     This function takes a query and returns the list of all possible partial queries.
@@ -494,6 +621,8 @@ def generate_partial_queries(
         star_join_table: str: Explicit table alias or name to treat as the star-join table.
             Only one star-join table is allowed per query
         warn_no_partition_key: bool: If True, emit warnings for tables not using the partition key
+        strip_select: bool: If True (default), strip SELECT clause to only select partition keys.
+            If False, preserve original SELECT clause with proper alias mapping for partial queries.
 
     Returns:
         List[str]: List of all possible partial queries
@@ -502,6 +631,20 @@ def generate_partial_queries(
 
     # init variables
     ret: list[str] = []  # List of all possible partial queries for return
+
+    # Extract original SELECT clause if strip_select=False
+    original_select_clause = None
+    if not strip_select:
+        try:
+            parsed_query = sqlglot.parse_one(query)
+            if parsed_query and parsed_query.find(sqlglot.expressions.Select):
+                select_expr = parsed_query.find(sqlglot.expressions.Select)
+                if select_expr and select_expr.expressions:
+                    # Extract SELECT expressions (columns) without the SELECT keyword
+                    original_select_clause = ", ".join(expr.sql() for expr in select_expr.expressions)
+        except Exception as e:
+            logger.warning(f"Failed to extract original SELECT clause: {e}. Falling back to stripped SELECT.")
+            original_select_clause = None
 
     (
         attribute_conditions,
@@ -555,6 +698,7 @@ def generate_partial_queries(
 
             if not uses_partition_key:
                 logger.warning(f"Table '{alias}' ({alias_to_table_map.get(alias, alias)}) does not use partition key '{partition_key}'")
+                logger.info(f"Query: {query}")
 
     # No need to limit - we already have only one detected_star_join_alias
 
@@ -655,10 +799,13 @@ def generate_partial_queries(
 
             # Build table list with correct table names from alias_to_table_map
             new_table_list_with_alias = []
+            original_to_new_alias_mapping = {}
             for i, table_condition_key in enumerate(table_conditions_keys):
                 original_table = alias_to_table_map.get(table_condition_key, table_condition_key)
                 new_alias = f"t{i + 1}"
                 new_table_list_with_alias.append(f"{original_table} AS {new_alias}")
+                # Build mapping from original alias to new alias for SELECT clause mapping
+                original_to_new_alias_mapping[table_condition_key] = new_alias
 
             # Re-add star-join table if one was detected
             if detected_star_join_alias:
@@ -667,6 +814,8 @@ def generate_partial_queries(
                 star_join_table_name = alias_to_table_map.get(detected_star_join_alias, detected_star_join_alias)
                 star_join_new_alias = "p1"
                 star_join_table_spec = f"{star_join_table_name} AS {star_join_new_alias}"
+                # Add star-join alias mapping
+                original_to_new_alias_mapping[detected_star_join_alias] = star_join_new_alias
 
                 # Build combined table list
                 combined_table_list = new_table_list_with_alias + [star_join_table_spec]
@@ -695,9 +844,8 @@ def generate_partial_queries(
                     query_where_without_pk_joins.append(condition)
 
                 combined_where = query_where_without_pk_joins + star_join_joins + star_join_conditions
-                q_with_star_join = (
-                    f"SELECT DISTINCT {new_table_list[0]}.{partition_key} FROM {', '.join(combined_table_list)} WHERE {' AND '.join(combined_where)}"
-                )
+                select_clause = _build_select_clause(strip_select, original_select_clause, new_table_list, original_to_new_alias_mapping, partition_key, star_join_new_alias)
+                q_with_star_join = f"{select_clause} FROM {', '.join(combined_table_list)} WHERE {' AND '.join(combined_where)}"
                 ret.append(q_with_star_join)
 
                 # If there are partition key conditions (like IN subqueries), create variants
@@ -718,24 +866,22 @@ def generate_partial_queries(
                                     star_join_subquery = f"{star_join_new_alias}.{subquery}"
                                 query_where_comb.append(star_join_subquery)
                             # Build WHERE clause only if conditions exist
+                            select_clause = _build_select_clause(
+                                strip_select, original_select_clause, new_table_list, original_to_new_alias_mapping, partition_key, star_join_new_alias
+                            )
                             if query_where_comb:
-                                q = (
-                                    f"SELECT DISTINCT {new_table_list[0]}.{partition_key} FROM "
-                                    + f"{', '.join(combined_table_list)} WHERE {' AND '.join(query_where_comb)}"
-                                )
+                                q = f"{select_clause} FROM {', '.join(combined_table_list)} WHERE {' AND '.join(query_where_comb)}"
                             else:
-                                q = (
-                                    f"SELECT DISTINCT {new_table_list[0]}.{partition_key} FROM "
-                                    + f"{', '.join(combined_table_list)}"
-                                )
+                                q = f"{select_clause} FROM {', '.join(combined_table_list)}"
                             ret.append(q)
             else:
                 # Normal case without p0 exclusion
                 # Build WHERE clause only if conditions exist
+                select_clause = _build_select_clause(strip_select, original_select_clause, new_table_list, original_to_new_alias_mapping, partition_key, None)
                 if query_where:
-                    q = f"SELECT DISTINCT {new_table_list[0]}.{partition_key} FROM {', '.join(new_table_list_with_alias)} WHERE {' AND '.join(query_where)}"
+                    q = f"{select_clause} FROM {', '.join(new_table_list_with_alias)} WHERE {' AND '.join(query_where)}"
                 else:
-                    q = f"SELECT DISTINCT {new_table_list[0]}.{partition_key} FROM {', '.join(new_table_list_with_alias)}"
+                    q = f"{select_clause} FROM {', '.join(new_table_list_with_alias)}"
                 ret.append(q)
 
             if partition_key_conditions:  # TODO handle CTE expressions
@@ -755,16 +901,11 @@ def generate_partial_queries(
                                 p_subquery = f"{new_table_list[0]}.{subquery}"
                             query_where_comb.append(p_subquery)
                         # Build WHERE clause only if conditions exist
+                        select_clause = _build_select_clause(strip_select, original_select_clause, new_table_list, original_to_new_alias_mapping, partition_key, None)
                         if query_where_comb:
-                            q = (
-                                f"SELECT DISTINCT {new_table_list[0]}.{partition_key} FROM "
-                                + f"{', '.join(new_table_list_with_alias)} WHERE {' AND '.join(query_where_comb)}"
-                            )
+                            q = f"{select_clause} FROM {', '.join(new_table_list_with_alias)} WHERE {' AND '.join(query_where_comb)}"
                         else:
-                            q = (
-                                f"SELECT DISTINCT {new_table_list[0]}.{partition_key} FROM "
-                                + f"{', '.join(new_table_list_with_alias)}"
-                            )
+                            q = f"{select_clause} FROM {', '.join(new_table_list_with_alias)}"
                         ret.append(q)
 
     # Add also the raw partition_key queries
@@ -886,7 +1027,7 @@ def normalize_distance_conditions(original_query: str, bucket_steps: float = 1.0
         # More robust parsing: use regex to extract the numeric value correctly
         if "<=" in distance_condition:
             # Use regex to find the number after <=, avoiding parsing issues with subsequent AND clauses
-            match = re.search(r'<=\s*([+-]?(?:\d+\.?\d*|\.\d+))', distance_condition)
+            match = re.search(r"<=\s*([+-]?(?:\d+\.?\d*|\.\d+))", distance_condition)
             if not match:
                 logger.warning(f"Could not extract numeric value from condition: {distance_condition}")
                 continue
@@ -912,7 +1053,7 @@ def normalize_distance_conditions(original_query: str, bucket_steps: float = 1.0
             new_condition = f"{left_part} <= {valuef:g}"
         else:
             # Similar robust parsing for < operator
-            match = re.search(r'<\s*([+-]?(?:\d+\.?\d*|\.\d+))', distance_condition)
+            match = re.search(r"<\s*([+-]?(?:\d+\.?\d*|\.\d+))", distance_condition)
             if not match:
                 logger.warning(f"Could not extract numeric value from condition: {distance_condition}")
                 continue
@@ -941,7 +1082,7 @@ def normalize_distance_conditions(original_query: str, bucket_steps: float = 1.0
 
         # More robust parsing for >= and > operators
         if ">=" in distance_condition:
-            match = re.search(r'>=\s*([+-]?(?:\d+\.?\d*|\.\d+))', distance_condition)
+            match = re.search(r">=\s*([+-]?(?:\d+\.?\d*|\.\d+))", distance_condition)
             if not match:
                 logger.warning(f"Could not extract numeric value from condition: {distance_condition}")
                 continue
@@ -959,7 +1100,7 @@ def normalize_distance_conditions(original_query: str, bucket_steps: float = 1.0
             left_part = distance_condition.split(">=")[0]
             new_condition = f"{left_part} >= {valuef:g}"
         else:
-            match = re.search(r'>\s*([+-]?(?:\d+\.?\d*|\.\d+))', distance_condition)
+            match = re.search(r">\s*([+-]?(?:\d+\.?\d*|\.\d+))", distance_condition)
             if not match:
                 logger.warning(f"Could not extract numeric value from condition: {distance_condition}")
                 continue
@@ -992,6 +1133,7 @@ def generate_all_query_hash_pairs(
     max_component_size: int | None = None,
     star_join_table: str | None = None,
     warn_no_partition_key: bool = True,
+    strip_select: bool = True,
 ) -> list[tuple[str, str]]:
     query_set: set[str] = set()
 
@@ -1011,6 +1153,7 @@ def generate_all_query_hash_pairs(
             max_component_size=max_component_size,
             star_join_table=star_join_table,
             warn_no_partition_key=warn_no_partition_key,
+            strip_select=strip_select,
         )
     )
     query_set.update(query_set_diff_combinations)
@@ -1031,6 +1174,7 @@ def generate_all_query_hash_pairs(
                 max_component_size=max_component_size,
                 star_join_table=star_join_table,
                 warn_no_partition_key=warn_no_partition_key,
+                strip_select=strip_select,
             )
         )
     )
@@ -1064,6 +1208,7 @@ def generate_all_hashes(
     max_component_size: int | None = None,
     star_join_table: str | None = None,
     warn_no_partition_key: bool = True,
+    strip_select: bool = True,
 ) -> list[str]:
     """
     Generates all hashes for the given query.
@@ -1079,6 +1224,7 @@ def generate_all_hashes(
         max_component_size=max_component_size,
         star_join_table=star_join_table,
         warn_no_partition_key=warn_no_partition_key,
+        strip_select=strip_select,
     )
     return [x[1] for x in qh_pairs]
 

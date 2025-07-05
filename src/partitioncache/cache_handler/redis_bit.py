@@ -77,26 +77,6 @@ class RedisBitCacheHandler(RedisAbstractCacheHandler):
         bitval = bitarray(value.decode())  # type: ignore
         return set(bitval.search(bitarray("1")))
 
-    def filter_existing_keys(self, keys: set, partition_key: str = "partition_key") -> set:
-        """
-        Checks in Redis which of the keys exists in cache and returns the set of existing keys.
-        """
-        # Check if partition exists
-        datatype = self._get_partition_datatype(partition_key)
-        if datatype is None:
-            return set()
-
-        pipe = self.db.pipeline()
-        cache_keys = [self._get_cache_key(key, partition_key) for key in keys]
-        for cache_key in cache_keys:
-            pipe.type(cache_key)
-        key_types = pipe.execute()
-
-        existing_keys = set()
-        for key, key_type in zip(keys, key_types, strict=False):
-            if key_type == b"string":
-                existing_keys.add(key)
-        return existing_keys
 
     def get_intersected(self, keys: set[str], partition_key: str = "partition_key") -> tuple[set[int] | set[str] | set[float] | set[datetime] | None, int]:
         """

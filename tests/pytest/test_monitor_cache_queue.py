@@ -8,7 +8,14 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from partitioncache.cli.monitor_cache_queue import fragment_executor, print_status, process_completed_future, query_fragment_processor, run_and_store_query
+from partitioncache.cli.monitor_cache_queue import (
+    apply_cache_optimization,
+    fragment_executor,
+    print_status,
+    process_completed_future,
+    query_fragment_processor,
+    run_and_store_query,
+)
 
 
 @pytest.fixture
@@ -81,7 +88,7 @@ class TestQueryFragmentProcessor:
         # Verify calls
         mock_pop.assert_called_once()
         mock_generate.assert_called_once_with(
-            "SELECT * FROM test_table", 
+            "SELECT * FROM test_table",
             "test_partition_key",
             min_component_size=mock_args.min_component_size,
             follow_graph=mock_args.follow_graph,
@@ -206,7 +213,7 @@ class TestRunAndStoreQuery:
                 delattr(mcq_module, "args")
 
         assert result is True
-        mock_cache.set_null.assert_called_once_with("_LIMIT_test_hash", "test_partition_key")
+        mock_cache.set_query_status.assert_called_once_with("test_hash", "test_partition_key", "failed")
         mock_cache.set_set.assert_not_called()
 
     @patch("partitioncache.cli.monitor_cache_queue.get_cache_handler")
@@ -238,7 +245,7 @@ class TestRunAndStoreQuery:
                 delattr(mcq_module, "args")
 
         assert result is True
-        mock_cache.set_null.assert_called_once_with("_TIMEOUT_test_hash", "test_partition_key")
+        mock_cache.set_query_status.assert_called_once_with("test_hash", "test_partition_key", "timeout")
 
     @patch("partitioncache.cli.monitor_cache_queue.get_cache_handler")
     @patch("partitioncache.cli.monitor_cache_queue.get_db_handler")
@@ -425,7 +432,7 @@ class TestFragmentExecutorComponents:
                                     else:
                                         delattr(mcq_module, "args")
 
-                                mock_cache.exists.assert_called_with("cached_hash", "test_partition_key")
+                                mock_cache.exists.assert_called_with("cached_hash", "test_partition_key", check_invalid_too=False)
 
 
 class TestIntegration:
@@ -461,7 +468,7 @@ class TestIntegration:
         # Verify the workflow
         mock_pop.assert_called_once()
         mock_generate.assert_called_once_with(
-            "SELECT * FROM test_table WHERE id = 1", 
+            "SELECT * FROM test_table WHERE id = 1",
             "test_partition_key",
             min_component_size=mock_args.min_component_size,
             follow_graph=mock_args.follow_graph,
@@ -474,3 +481,169 @@ class TestIntegration:
         mock_push_to_outgoing.assert_called_once_with(
             [("SELECT DISTINCT t1.partition_key FROM test_table t1 WHERE t1.id = 1", "hash1")], "test_partition_key", "integer"
         )
+
+
+class TestCacheOptimization:
+    """Test cache optimization functionality."""
+
+    def test_apply_cache_optimization_disabled(self, mock_args):
+        """Test that optimization is not applied when disabled."""
+        mock_args.enable_cache_optimization = False
+
+        mock_cache_handler = Mock()
+
+        query = "SELECT * FROM test WHERE id = 1"
+        query_hash = "test_hash"
+        partition_key = "test_partition"
+        partition_datatype = "integer"
+
+        optimized_query, was_optimized, stats = apply_cache_optimization(
+            query, query_hash, partition_key, partition_datatype, mock_cache_handler, mock_args
+        )
+
+        assert optimized_query == query
+        assert was_optimized is False
+        assert stats["total_hashes"] == 0
+        assert stats["cache_hits"] == 0
+        assert stats["method_used"] is None
+
+    @patch("partitioncache.cli.monitor_cache_queue.get_partition_keys_lazy")
+    def test_apply_cache_optimization_lazy_with_hits(self, mock_get_lazy, mock_args):
+        """Test lazy optimization when cache hits are found."""
+        mock_args.enable_cache_optimization = True
+        mock_args.prefer_lazy_optimization = True
+        mock_args.cache_optimization_method = "IN_SUBQUERY"
+        mock_args.min_component_size = 2
+        mock_args.follow_graph = True
+
+        # Create a proper mock that will pass isinstance check
+        from partitioncache.cache_handler.abstract import AbstractCacheHandler_Lazy
+        mock_cache_handler = Mock(spec=AbstractCacheHandler_Lazy)
+
+        # Mock lazy intersection results
+        lazy_subquery = "SELECT partition_key FROM cache_table WHERE hash IN ('h1', 'h2')"
+        mock_get_lazy.return_value = (lazy_subquery, 5, 2)  # subquery, total_hashes, hits
+
+        query = "SELECT * FROM test WHERE id = 1"
+        query_hash = "test_hash"
+        partition_key = "test_partition"
+        partition_datatype = "integer"
+
+        with patch("partitioncache.cli.monitor_cache_queue.extend_query_with_partition_keys_lazy") as mock_extend:
+            mock_extend.return_value = "SELECT * FROM test WHERE id = 1 AND test_partition IN (SELECT ...)"
+
+            optimized_query, was_optimized, stats = apply_cache_optimization(
+                query, query_hash, partition_key, partition_datatype, mock_cache_handler, mock_args
+            )
+
+        assert was_optimized is True
+        assert stats["total_hashes"] == 5
+        assert stats["cache_hits"] == 2
+        assert stats["method_used"] == "IN_SUBQUERY"
+
+        mock_extend.assert_called_once_with(
+            query=query,
+            lazy_subquery=lazy_subquery,
+            partition_key=partition_key,
+            method="IN_SUBQUERY",
+            analyze_tmp_table=True,
+        )
+
+    @patch("partitioncache.cli.monitor_cache_queue.get_partition_keys")
+    def test_apply_cache_optimization_standard_with_hits(self, mock_get_keys, mock_args):
+        """Test standard optimization when cache hits are found."""
+        mock_args.enable_cache_optimization = True
+        mock_args.prefer_lazy_optimization = False
+        mock_args.cache_optimization_method = "IN"
+        mock_args.min_cache_hits = 2
+        mock_args.min_component_size = 2
+
+        mock_cache_handler = Mock()
+
+        # Mock standard intersection results
+        partition_keys = {100, 200, 300}
+        mock_get_keys.return_value = (partition_keys, 10, 3)  # keys, total_hashes, hits
+
+        query = "SELECT * FROM test WHERE id = 1"
+        query_hash = "test_hash"
+        partition_key = "test_partition"
+        partition_datatype = "integer"
+
+        with patch("partitioncache.cli.monitor_cache_queue.extend_query_with_partition_keys") as mock_extend:
+            mock_extend.return_value = "SELECT * FROM test WHERE id = 1 AND test_partition IN (100, 200, 300)"
+
+            optimized_query, was_optimized, stats = apply_cache_optimization(
+                query, query_hash, partition_key, partition_datatype, mock_cache_handler, mock_args
+            )
+
+        assert was_optimized is True
+        assert stats["total_hashes"] == 10
+        assert stats["cache_hits"] == 3
+        assert stats["method_used"] == "IN"
+
+        mock_extend.assert_called_once_with(
+            query=query,
+            partition_keys=partition_keys,
+            partition_key=partition_key,
+            method="IN",
+            analyze_tmp_table=True,
+        )
+
+    @patch("partitioncache.cli.monitor_cache_queue.get_partition_keys")
+    def test_apply_cache_optimization_below_threshold(self, mock_get_keys, mock_args):
+        """Test that optimization is not applied when hits are below threshold."""
+        mock_args.enable_cache_optimization = True
+        mock_args.prefer_lazy_optimization = False
+        mock_args.min_cache_hits = 5
+        mock_args.min_component_size = 2
+
+        mock_cache_handler = Mock()
+
+        # Mock intersection results with hits below threshold
+        partition_keys = {100, 200}
+        mock_get_keys.return_value = (partition_keys, 10, 2)  # keys, total_hashes, hits
+
+        query = "SELECT * FROM test WHERE id = 1"
+        query_hash = "test_hash"
+        partition_key = "test_partition"
+        partition_datatype = "integer"
+
+        optimized_query, was_optimized, stats = apply_cache_optimization(
+            query, query_hash, partition_key, partition_datatype, mock_cache_handler, mock_args
+        )
+
+        assert optimized_query == query
+        assert was_optimized is False
+        assert stats["total_hashes"] == 10
+        assert stats["cache_hits"] == 2
+        assert stats["method_used"] is None
+
+    @patch("partitioncache.cli.monitor_cache_queue.get_partition_keys_lazy")
+    def test_apply_cache_optimization_exception_handling(self, mock_get_lazy, mock_args):
+        """Test that exceptions are handled gracefully."""
+        mock_args.enable_cache_optimization = True
+        mock_args.prefer_lazy_optimization = True
+        mock_args.min_component_size = 2
+        mock_args.follow_graph = True
+
+        # Create a proper mock that will pass isinstance check
+        from partitioncache.cache_handler.abstract import AbstractCacheHandler_Lazy
+        mock_cache_handler = Mock(spec=AbstractCacheHandler_Lazy)
+
+        # Mock exception
+        mock_get_lazy.side_effect = Exception("Test error")
+
+        query = "SELECT * FROM test WHERE id = 1"
+        query_hash = "test_hash"
+        partition_key = "test_partition"
+        partition_datatype = "integer"
+
+        optimized_query, was_optimized, stats = apply_cache_optimization(
+            query, query_hash, partition_key, partition_datatype, mock_cache_handler, mock_args
+        )
+
+        assert optimized_query == query
+        assert was_optimized is False
+        assert stats["total_hashes"] == 0
+        assert stats["cache_hits"] == 0
+        assert stats["method_used"] is None
