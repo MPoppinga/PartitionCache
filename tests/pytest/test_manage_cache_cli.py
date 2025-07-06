@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from partitioncache.cli.manage_cache import main, show_comprehensive_status
+from partitioncache.cache_handler.redis_abstract import RedisAbstractCacheHandler
 
 
 class TestManageCacheCLI:
@@ -326,12 +327,15 @@ class TestCLITimeoutProtection:
 
         # Mock Redis handler with connection timeout
         mock_redis_handler = MagicMock()
+        # Make isinstance check pass
+        mock_redis_handler.__class__ = RedisAbstractCacheHandler
         mock_redis_handler.db.ping.side_effect = Exception("Connection timeout")
         mock_get_cache_handler.return_value = mock_redis_handler
 
         # Call show_comprehensive_status - should not raise exception
         with patch("partitioncache.cli.manage_cache.logger") as mock_logger:
-            show_comprehensive_status()
+            with patch("partitioncache.cli.manage_cache.get_all_keys", return_value=[]):
+                show_comprehensive_status()
 
             # Verify that the connection was attempted
             mock_redis_handler.db.ping.assert_called_once()
@@ -409,6 +413,8 @@ class TestCLITimeoutProtection:
 
         # Mock successful Redis handler
         mock_redis_handler = MagicMock()
+        # Make isinstance check pass
+        mock_redis_handler.__class__ = RedisAbstractCacheHandler
         mock_redis_handler.db.ping.return_value = True  # Successful ping
         mock_get_cache_handler.return_value = mock_redis_handler
         mock_get_all_keys.return_value = ["query_1", "query_2", "_LIMIT_query_3", "_TIMEOUT_query_4"]
@@ -485,11 +491,14 @@ class TestCLITimeoutProtection:
             if backend == "redis_set":
                 # Redis times out
                 mock_handler = MagicMock()
+                mock_handler.__class__ = RedisAbstractCacheHandler
                 mock_handler.db.ping.side_effect = Exception("Redis timeout")
                 return mock_handler
             elif backend == "rocksdb_bit":
-                # RocksDB works fine
+                # RocksDB works fine  
+                from partitioncache.cache_handler.rocks_db_abstract import RocksDBAbstractCacheHandler
                 mock_handler = MagicMock()
+                mock_handler.__class__ = RocksDBAbstractCacheHandler
                 mock_handler.db.iterkeys.return_value = iter(["key1", "key2"])
                 return mock_handler
 

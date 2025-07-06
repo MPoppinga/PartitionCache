@@ -97,6 +97,10 @@ class TestQueryFragmentProcessor:
             max_component_size=mock_args.max_component_size,
             star_join_table=mock_args.star_join_table,
             warn_no_partition_key=not mock_args.no_warn_partition_key,
+            bucket_steps=mock_args.bucket_steps,
+            add_constraints=None,
+            remove_constraints_all=None,
+            remove_constraints_add=None,
         )
         mock_push_fragments.assert_called_once_with([("SELECT DISTINCT t1.partition_key FROM test_table t1", "hash1")], "test_partition_key", "integer")
 
@@ -477,6 +481,10 @@ class TestIntegration:
             max_component_size=mock_args.max_component_size,
             star_join_table=mock_args.star_join_table,
             warn_no_partition_key=not mock_args.no_warn_partition_key,
+            bucket_steps=mock_args.bucket_steps,
+            add_constraints=None,
+            remove_constraints_all=None,
+            remove_constraints_add=None,
         )
         mock_push_to_outgoing.assert_called_once_with(
             [("SELECT DISTINCT t1.partition_key FROM test_table t1 WHERE t1.id = 1", "hash1")], "test_partition_key", "integer"
