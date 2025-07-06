@@ -28,6 +28,10 @@ def get_partition_keys(
     canonicalize_queries=False,
     auto_detect_star_join: bool = True,
     star_join_table: str | None = None,
+    bucket_steps: float = 1.0,
+    add_constraints: dict[str, str] | None = None,
+    remove_constraints_all: list[str] | None = None,
+    remove_constraints_add: list[str] | None = None,
 ) -> tuple[set[int] | set[str] | set[float] | set[datetime] | None, int, int]:
     """
     Using the partition cache to get the partition keys for a given query.
@@ -40,6 +44,10 @@ def get_partition_keys(
         canonicalize_queries: Whether to canonicalize queries before hashing.
         auto_detect_star_join: Whether to auto-detect star-join tables.
         star_join_table: Explicitly specified star-join table alias or name.
+        bucket_steps: Step size for normalizing distance conditions (e.g., 1.0, 0.5, etc.)
+        add_constraints: Dict mapping table names to constraints to add (e.g., {"table": "col = val"})
+        remove_constraints_all: List of attribute names to remove from all query variants
+        remove_constraints_add: List of attribute names to remove, creating additional variants
 
     Returns:
        tuple containing:
@@ -58,6 +66,10 @@ def get_partition_keys(
         canonicalize_queries=canonicalize_queries,
         auto_detect_star_join=auto_detect_star_join,
         star_join_table=star_join_table,
+        bucket_steps=bucket_steps,
+        add_constraints=add_constraints,
+        remove_constraints_all=remove_constraints_all,
+        remove_constraints_add=remove_constraints_add,
     )
 
     logger.info(f"Found {len(cache_entry_hashes)} subqueries in query")
@@ -78,6 +90,10 @@ def get_partition_keys_lazy(
     follow_graph=True,
     auto_detect_star_join: bool = True,
     star_join_table: str | None = None,
+    bucket_steps: float = 1.0,
+    add_constraints: dict[str, str] | None = None,
+    remove_constraints_all: list[str] | None = None,
+    remove_constraints_add: list[str] | None = None,
 ) -> tuple[str | None, int, int]:
     """
     Gets the lazy intersection representation of the partition keys for the given query.
@@ -91,6 +107,10 @@ def get_partition_keys_lazy(
         follow_graph (bool): Whether to follow the query graph for generating variants.
         auto_detect_star_join: Whether to auto-detect star-join tables.
         star_join_table: Explicitly specified star-join table alias or name.
+        bucket_steps: Step size for normalizing distance conditions (e.g., 1.0, 0.5, etc.)
+        add_constraints: Dict mapping table names to constraints to add (e.g., {"table": "col = val"})
+        remove_constraints_all: List of attribute names to remove from all query variants
+        remove_constraints_add: List of attribute names to remove, creating additional variants
 
     Returns:
         tuple[str, int, int]: A tuple containing:
@@ -110,6 +130,10 @@ def get_partition_keys_lazy(
         follow_graph=follow_graph,
         auto_detect_star_join=auto_detect_star_join,
         star_join_table=star_join_table,
+        bucket_steps=bucket_steps,
+        add_constraints=add_constraints,
+        remove_constraints_all=remove_constraints_all,
+        remove_constraints_add=remove_constraints_add,
     )
 
     if not isinstance(cache_handler, AbstractCacheHandler_Lazy):
@@ -514,6 +538,10 @@ def apply_cache_lazy(
     p0_table_name: str | None = None,
     auto_detect_star_join: bool = True,
     star_join_table: str | None = None,
+    bucket_steps: float = 1.0,
+    add_constraints: dict[str, str] | None = None,
+    remove_constraints_all: list[str] | None = None,
+    remove_constraints_add: list[str] | None = None,
 ) -> tuple[str, dict[str, int]]:
     """
     Complete wrapper function that applies partition cache to a query using lazy intersection.
@@ -533,6 +561,10 @@ def apply_cache_lazy(
         p0_table_name (str | None): Name of the p0 table. Defaults to {partition_key}_mv.
         auto_detect_star_join: Whether to auto-detect star-join tables.
         star_join_table: Explicitly specified star-join table alias or name.
+        bucket_steps: Step size for normalizing distance conditions (e.g., 1.0, 0.5, etc.)
+        add_constraints: Dict mapping table names to constraints to add (e.g., {"table": "col = val"})
+        remove_constraints_all: List of attribute names to remove from all query variants
+        remove_constraints_add: List of attribute names to remove, creating additional variants
 
     Returns:
         tuple[str, dict[str, int]]: Enhanced query and statistics.
@@ -547,6 +579,10 @@ def apply_cache_lazy(
         follow_graph=follow_graph,
         auto_detect_star_join=auto_detect_star_join,
         star_join_table=star_join_table,
+        bucket_steps=bucket_steps,
+        add_constraints=add_constraints,
+        remove_constraints_all=remove_constraints_all,
+        remove_constraints_add=remove_constraints_add,
     )
 
     # Step 2: Optionally rewrite with p0 table
@@ -606,6 +642,10 @@ def apply_cache(
     p0_table_name: str | None = None,
     auto_detect_star_join: bool = True,
     star_join_table: str | None = None,
+    bucket_steps: float = 1.0,
+    add_constraints: dict[str, str] | None = None,
+    remove_constraints_all: list[str] | None = None,
+    remove_constraints_add: list[str] | None = None,
 ) -> tuple[str, dict[str, int]]:
     """
     Complete wrapper function that applies partition cache to a query using regular cache handlers.
@@ -631,6 +671,10 @@ def apply_cache(
         p0_table_name (str | None): Name of the p0 table. Defaults to {partition_key}_mv.
         auto_detect_star_join: Whether to auto-detect star-join tables.
         star_join_table: Explicitly specified star-join table alias or name.
+        bucket_steps: Step size for normalizing distance conditions (e.g., 1.0, 0.5, etc.)
+        add_constraints: Dict mapping table names to constraints to add (e.g., {"table": "col = val"})
+        remove_constraints_all: List of attribute names to remove from all query variants
+        remove_constraints_add: List of attribute names to remove, creating additional variants
 
     Returns:
         tuple[str, dict[str, int]]: A tuple containing:
@@ -661,6 +705,10 @@ def apply_cache(
         canonicalize_queries=canonicalize_queries,
         auto_detect_star_join=auto_detect_star_join,
         star_join_table=star_join_table,
+        bucket_steps=bucket_steps,
+        add_constraints=add_constraints,
+        remove_constraints_all=remove_constraints_all,
+        remove_constraints_add=remove_constraints_add,
     )
 
     # Step 2: Optionally rewrite original query with p0 table

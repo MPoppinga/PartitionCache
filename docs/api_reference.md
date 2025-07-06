@@ -150,7 +150,7 @@ print(optimized)
 # SELECT * FROM users WHERE age > 25 AND user_id IN (1, 5, 10, 15, 20)
 ```
 
-#### `apply_cache_lazy(query: str, cache_handler: AbstractCacheHandler_Lazy, partition_key: str, method: Literal["IN_SUBQUERY", "TMP_TABLE_IN", "TMP_TABLE_JOIN"] = "IN_SUBQUERY", p0_alias: str | None = None, min_component_size: int = 2, canonicalize_queries: bool = False, follow_graph: bool = True, analyze_tmp_table: bool = True, use_p0_table: bool = False, p0_table_name: str | None = None)`
+#### `apply_cache_lazy(query: str, cache_handler: AbstractCacheHandler_Lazy, partition_key: str, method: Literal["IN_SUBQUERY", "TMP_TABLE_IN", "TMP_TABLE_JOIN"] = "IN_SUBQUERY", p0_alias: str | None = None, min_component_size: int = 2, canonicalize_queries: bool = False, follow_graph: bool = True, analyze_tmp_table: bool = True, use_p0_table: bool = False, p0_table_name: str | None = None, auto_detect_star_join: bool = True, star_join_table: str | None = None, bucket_steps: float = 1.0, add_constraints: dict[str, str] | None = None, remove_constraints_all: list[str] | None = None, remove_constraints_add: list[str] | None = None)`
 
 **Recommended** - High-performance cache application with lazy evaluation.
 
@@ -166,6 +166,12 @@ print(optimized)
 - `analyze_tmp_table` (bool, optional): Enable temp table analysis (default: True)
 - `use_p0_table` (bool, optional): Rewrite the query to use a p0 table/star-schema (default: False)
 - `p0_table_name` (str | None, optional): Name of the p0 table. Defaults to `{partition_key}_mv`
+- `auto_detect_star_join` (bool, optional): Whether to auto-detect star-join tables (default: True)
+- `star_join_table` (str | None, optional): Explicitly specified star-join table alias or name
+- `bucket_steps` (float, optional): Step size for normalizing distance conditions (default: 1.0)
+- `add_constraints` (dict[str, str] | None, optional): Dict mapping table names to constraints to add
+- `remove_constraints_all` (list[str] | None, optional): List of attribute names to remove from all query variants
+- `remove_constraints_add` (list[str] | None, optional): List of attribute names to remove, creating additional variants
 
 **Returns:**
 - `Tuple[str, Dict]`: (enhanced_query, statistics)

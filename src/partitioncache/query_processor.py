@@ -61,8 +61,6 @@ def clean_query(query: str) -> str:
     # Simplification e.g. Sort comparison operators to ensure consistent order
     parsed = sqlglot.optimizer.simplify.simplify(parsed)
 
-
-
     # Remove ORDER BY and LIMIT clauses - they don't affect which partition keys are accessed
     # We need to process all SELECT statements (including subqueries)
     for select_stmt in parsed.find_all(sqlglot.expressions.Select):
@@ -77,8 +75,6 @@ def clean_query(query: str) -> str:
             logger.debug("Removed LIMIT clause for cache variant generation")
 
     query = parsed.sql()
-
-
 
     # Removing tailing semicolon
     query = re.sub(r";\s*$", "", query)
@@ -681,7 +677,6 @@ def generate_partial_queries(
             if not uses_partition_key:
                 logger.warning(f"Table '{alias}' ({alias_to_table_map.get(alias, alias)}) does not use partition key '{partition_key}'")
 
-
     # Filter aliases for variant generation - always exclude star-join table
     if detected_star_join_alias:
         aliases_for_variants = [a for a in table_aliases if a != detected_star_join_alias]
@@ -824,7 +819,9 @@ def generate_partial_queries(
                     query_where_without_pk_joins.append(condition)
 
                 combined_where = query_where_without_pk_joins + star_join_joins + star_join_conditions
-                select_clause = _build_select_clause(strip_select, original_select_clause, new_table_list, original_to_new_alias_mapping, partition_key, star_join_new_alias)
+                select_clause = _build_select_clause(
+                    strip_select, original_select_clause, new_table_list, original_to_new_alias_mapping, partition_key, star_join_new_alias
+                )
                 q_with_star_join = f"{select_clause} FROM {', '.join(combined_table_list)} WHERE {' AND '.join(combined_where)}"
                 ret.append(q_with_star_join)
 
@@ -881,7 +878,9 @@ def generate_partial_queries(
                                 p_subquery = f"{new_table_list[0]}.{subquery}"
                             query_where_comb.append(p_subquery)
                         # Build WHERE clause only if conditions exist
-                        select_clause = _build_select_clause(strip_select, original_select_clause, new_table_list, original_to_new_alias_mapping, partition_key, None)
+                        select_clause = _build_select_clause(
+                            strip_select, original_select_clause, new_table_list, original_to_new_alias_mapping, partition_key, None
+                        )
                         if query_where_comb:
                             q = f"{select_clause} FROM {', '.join(new_table_list_with_alias)} WHERE {' AND '.join(query_where_comb)}"
                         else:
@@ -901,7 +900,7 @@ def generate_partial_queries(
             sub = sub.strip()
             ret.append(sub)
 
-    return [sqlglot.optimizer.simplify.simplify(sqlglot.parse_one(q)).sql() for q in ret] # TODO test if this is needed
+    return [sqlglot.optimizer.simplify.simplify(sqlglot.parse_one(q)).sql() for q in ret]  # TODO test if this is needed
 
 
 def is_distance_function(condition: str) -> bool:
@@ -1111,6 +1110,191 @@ def normalize_distance_conditions(original_query: str, bucket_steps: float = 1.0
     return " ".join(query.split())
 
 
+def _add_constraints_to_query(query: str, add_constraints: dict[str, str]) -> str:
+    """
+    Add constraints to specific tables in a query.
+
+    Args:
+        query: The SQL query to modify
+        add_constraints: Dict mapping table names to constraints (e.g. {"points_table": "size = 4"})
+
+    Returns:
+        Modified query with constraints added
+    """
+    if not add_constraints:
+        return query
+
+    try:
+        parsed = sqlglot.parse_one(query)
+
+        # Check if we have any of the target tables in the query
+        has_target_table = False
+        for table in parsed.find_all(sqlglot.exp.Table):
+            if table.name in add_constraints:
+                has_target_table = True
+                break
+
+        if not has_target_table:
+            return query
+
+        # Find the main SELECT statement
+        select_stmt = parsed if isinstance(parsed, sqlglot.exp.Select) else parsed.find(sqlglot.exp.Select)
+        if not select_stmt:
+            return query
+
+        # Build combined constraint for all matching tables
+        new_constraints = []
+        for table_name, constraint in add_constraints.items():
+            # Check if this table exists in the query
+            table_exists = any(table.name == table_name for table in parsed.find_all(sqlglot.exp.Table))
+            if table_exists:
+                try:
+                    # Parse the constraint as an expression
+                    constraint_expr = sqlglot.parse_one(f"SELECT * FROM t WHERE {constraint}").find(sqlglot.exp.Where).this
+                    new_constraints.append(constraint_expr)
+                except Exception as e:
+                    logger.warning(f"Failed to parse constraint '{constraint}': {e}")
+
+        if not new_constraints:
+            return query
+
+        # Get existing WHERE clause
+        existing_where = select_stmt.args.get("where")
+
+        if existing_where:
+            # Combine with existing WHERE clause using AND
+            combined_condition = existing_where.this
+            for constraint_expr in new_constraints:
+                combined_condition = sqlglot.exp.And(this=combined_condition, expression=constraint_expr)
+            select_stmt.set("where", sqlglot.exp.Where(this=combined_condition))
+        else:
+            # Create new WHERE clause
+            if len(new_constraints) == 1:
+                where_condition = new_constraints[0]
+            else:
+                where_condition = new_constraints[0]
+                for constraint_expr in new_constraints[1:]:
+                    where_condition = sqlglot.exp.And(this=where_condition, expression=constraint_expr)
+            select_stmt.set("where", sqlglot.exp.Where(this=where_condition))
+
+        return parsed.sql()
+    except Exception as e:
+        logger.warning(f"Failed to add constraints to query: {e}")
+        return query
+
+
+def _remove_constraints_from_query(query: str, attributes_to_remove: list[str]) -> str:
+    """
+    Remove constraints involving specific attributes from a query.
+
+    Args:
+        query: The SQL query to modify
+        attributes_to_remove: List of attribute names to remove from constraints
+
+    Returns:
+        Modified query with specified constraints removed
+    """
+    if not attributes_to_remove:
+        return query
+
+    try:
+        parsed = sqlglot.parse_one(query)
+
+        # Function to check if an expression contains any of the attributes to remove
+        def contains_attribute(expr, attrs):
+            for col in expr.find_all(sqlglot.exp.Column):
+                if col.name in attrs:
+                    return True
+            return False
+
+        # Process WHERE clause
+        select = parsed if isinstance(parsed, sqlglot.exp.Select) else parsed.find(sqlglot.exp.Select)
+        if select and select.args.get("where"):
+            where = select.args["where"].this
+
+            if isinstance(where, sqlglot.exp.And):
+                # Filter out conditions that contain the attributes
+                new_conditions = []
+                for condition in where.flatten():
+                    if not contains_attribute(condition, attributes_to_remove):
+                        new_conditions.append(condition)
+
+                if new_conditions:
+                    # Rebuild the WHERE clause
+                    if len(new_conditions) == 1:
+                        select.set("where", sqlglot.exp.Where(this=new_conditions[0]))
+                    else:
+                        # Combine remaining conditions with AND
+                        combined = new_conditions[0]
+                        for cond in new_conditions[1:]:
+                            combined = sqlglot.exp.And(this=combined, expression=cond)
+                        select.set("where", sqlglot.exp.Where(this=combined))
+                else:
+                    # Remove WHERE clause entirely if no conditions remain
+                    select.set("where", None)
+            else:
+                # Single condition in WHERE
+                if contains_attribute(where, attributes_to_remove):
+                    select.set("where", None)
+
+        return parsed.sql()
+    except Exception as e:
+        logger.warning(f"Failed to remove constraints from query: {e}")
+        return query
+
+
+def _apply_constraint_modifications(
+    queries: set[str],
+    add_constraints: dict[str, str] | None = None,
+    remove_constraints_all: list[str] | None = None,
+    remove_constraints_add: list[str] | None = None,
+) -> set[str]:
+    """
+    Apply constraint modifications to a set of queries.
+
+    Args:
+        queries: Set of SQL queries to modify
+        add_constraints: Constraints to add to specific tables
+        remove_constraints_all: Attributes to remove from all queries
+        remove_constraints_add: Attributes to remove, creating additional variants
+
+    Returns:
+        Set of modified queries
+    """
+    result_queries = set()
+
+    # First, handle remove_constraints_all (modifies all queries)
+    if remove_constraints_all:
+        modified_queries = set()
+        for q in queries:
+            modified_q = _remove_constraints_from_query(q, remove_constraints_all)
+            modified_queries.add(modified_q)
+        queries = modified_queries
+
+    # Second, handle remove_constraints_add (creates additional variants)
+    if remove_constraints_add:
+        # Keep original queries and add variants with constraints removed
+        result_queries.update(queries)
+        for q in queries:
+            modified_q = _remove_constraints_from_query(q, remove_constraints_add)
+            result_queries.add(modified_q)
+    else:
+        result_queries = queries.copy()
+
+    # Finally, handle add_constraints (can create multiple variants per query)
+    if add_constraints:
+        final_queries = set()
+        for q in result_queries:
+            # For each query, create a variant with constraints added
+            modified_q = _add_constraints_to_query(q, add_constraints)
+            final_queries.add(modified_q)
+            # Also keep the original
+            final_queries.add(q)
+        result_queries = final_queries
+
+    return result_queries
+
+
 def generate_all_query_hash_pairs(
     query: str,
     partition_key: str,
@@ -1123,7 +1307,34 @@ def generate_all_query_hash_pairs(
     star_join_table: str | None = None,
     warn_no_partition_key: bool = True,
     strip_select: bool = True,
+    bucket_steps: float = 1.0,
+    add_constraints: dict[str, str] | None = None,
+    remove_constraints_all: list[str] | None = None,
+    remove_constraints_add: list[str] | None = None,
 ) -> list[tuple[str, str]]:
+    """
+    Generate all query hash pairs for a given query with configurable variant generation.
+
+    Args:
+        query: The SQL query to process
+        partition_key: The partition key identifier
+        min_component_size: Minimum size for query components
+        follow_graph: Whether to follow multi-point non-equality joins (e.g. spatial constraints)
+        keep_all_attributes: Whether to keep all attributes in variants fixed
+        canonicalize_queries: Whether to canonicalize queries for consistent hashing
+        auto_detect_star_join: Automatically detect star join patterns
+        max_component_size: Maximum size for query components
+        star_join_table: Specific table to use as star join center
+        warn_no_partition_key: Whether to warn if partition key is missing
+        strip_select: Whether to strip SELECT clause
+        bucket_steps: Step size for normalizing distance conditions (e.g., 1.0, 0.5, etc.)
+        add_constraints: Dict mapping table names to constraints to add (e.g., {"table": "col = val"})
+        remove_constraints_all: List of attribute names to remove from all query variants
+        remove_constraints_add: List of attribute names to remove, creating additional variants
+
+    Returns:
+        List of tuples containing (query_text, query_hash) pairs
+    """
     query_set: set[str] = set()
 
     # Clean the query
@@ -1148,7 +1359,7 @@ def generate_all_query_hash_pairs(
     query_set.update(query_set_diff_combinations)
 
     # Create bucket variant with normalized distances (Example: 1.6 - 3.6 -> 1 - 4 WITH bucket_steps = 1)
-    nor_dist_query = normalize_distance_conditions(query)  # TODO: expose bucket_steps parameter
+    nor_dist_query = normalize_distance_conditions(query, bucket_steps=bucket_steps)
 
     query_set.update(
         set(
@@ -1167,6 +1378,22 @@ def generate_all_query_hash_pairs(
             )
         )
     )
+
+    # Apply constraint modifications to all generated queries
+    query_set = _apply_constraint_modifications(
+        query_set, add_constraints=add_constraints, remove_constraints_all=remove_constraints_all, remove_constraints_add=remove_constraints_add
+    )
+
+    # If we have constraint modifications, also apply them to normalized distance variants
+    if add_constraints or remove_constraints_add:
+        # Generate normalized distance variants for modified queries
+        additional_normalized_queries = set()
+        for q in query_set:
+            if q != query and q != nor_dist_query:  # Avoid re-processing original queries
+                nor_q = normalize_distance_conditions(q, bucket_steps=bucket_steps)
+                if nor_q != q:  # Only add if normalization changed something
+                    additional_normalized_queries.add(nor_q)
+        query_set.update(additional_normalized_queries)
 
     if canonicalize_queries:
         # canonicalize each query (to make sure that the hash is unique for the same query)
@@ -1198,6 +1425,10 @@ def generate_all_hashes(
     star_join_table: str | None = None,
     warn_no_partition_key: bool = True,
     strip_select: bool = True,
+    bucket_steps: float = 1.0,
+    add_constraints: dict[str, str] | None = None,
+    remove_constraints_all: list[str] | None = None,
+    remove_constraints_add: list[str] | None = None,
 ) -> list[str]:
     """
     Generates all hashes for the given query.
@@ -1214,6 +1445,10 @@ def generate_all_hashes(
         star_join_table=star_join_table,
         warn_no_partition_key=warn_no_partition_key,
         strip_select=strip_select,
+        bucket_steps=bucket_steps,
+        add_constraints=add_constraints,
+        remove_constraints_all=remove_constraints_all,
+        remove_constraints_add=remove_constraints_add,
     )
     return [x[1] for x in qh_pairs]
 

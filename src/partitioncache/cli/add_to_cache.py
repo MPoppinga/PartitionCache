@@ -17,6 +17,7 @@ from partitioncache.cli.common_args import (
     configure_logging,
     get_database_connection_params,
     load_environment_with_validation,
+    parse_variant_generation_json_args,
     resolve_cache_backend,
 )
 from partitioncache.db_handler import get_db_handler
@@ -61,6 +62,9 @@ def main():
     # Load environment variables with validation
     load_environment_with_validation(args.env_file)
 
+    # Parse JSON arguments for constraint modifications
+    add_constraints, remove_constraints_all, remove_constraints_add = parse_variant_generation_json_args(args)
+
     # Validate mutually exclusive options for execution mode
     queue_options = [args.queue, args.direct, args.queue_original]
     if sum(queue_options) != 1:
@@ -102,6 +106,10 @@ def main():
                 max_component_size=args.max_component_size,
                 star_join_table=args.star_join_table,
                 warn_no_partition_key=not args.no_warn_partition_key,
+                bucket_steps=args.bucket_steps,
+                add_constraints=add_constraints,
+                remove_constraints_all=remove_constraints_all,
+                remove_constraints_add=remove_constraints_add,
             )
             success = partitioncache.push_to_query_fragment_queue(query_hash_pairs, args.partition_key, args.partition_datatype, queue_provider)
         else: # Compute fragments and add to fragment queue
@@ -151,6 +159,10 @@ def main():
                     max_component_size=args.max_component_size,
                     star_join_table=args.star_join_table,
                     warn_no_partition_key=not args.no_warn_partition_key,
+                    bucket_steps=args.bucket_steps,
+                    add_constraints=add_constraints,
+                    remove_constraints_all=remove_constraints_all,
+                    remove_constraints_add=remove_constraints_add,
                 )
 
             else:

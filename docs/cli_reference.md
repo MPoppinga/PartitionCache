@@ -246,6 +246,36 @@ pcache-add [options] --partition-key PARTITION_KEY {--direct|--queue|--queue-ori
   - **With flag**: Adds the complete query directly to cache/queue
   - **Use case**: When you want to cache the exact query without optimization
 
+### Variant Generation Configuration
+Advanced options for controlling how query variants are generated for better cache coverage:
+
+#### Distance Normalization
+- `--bucket-steps FLOAT` - Step size for normalizing distance conditions
+  - **Default**: `1.0` (or `PARTITION_CACHE_BUCKET_STEPS` environment variable)
+  - **Purpose**: Controls bucketing of distance ranges for better cache hits
+  - **Example**: With `--bucket-steps 0.5`, distance `BETWEEN 1.6 AND 3.6` becomes `BETWEEN 1.5 AND 4.0`
+
+#### Constraint Modification
+- `--add-constraints JSON` - Add constraints to specific tables
+  - **Format**: JSON object mapping table names to constraint conditions
+  - **Example**: `'{"points": "size = 4", "regions": "active = true"}'`
+  - **Purpose**: Create additional query variants with extra constraints
+  - **Environment**: `PARTITION_CACHE_ADD_CONSTRAINTS`
+
+- `--remove-constraints-all JSON` - Remove attributes from all query variants
+  - **Format**: JSON array of attribute names to remove
+  - **Example**: `'["color", "category"]'`
+  - **Purpose**: Generalize queries by removing specific filters
+  - **Environment**: `PARTITION_CACHE_REMOVE_CONSTRAINTS_ALL`
+
+- `--remove-constraints-add JSON` - Remove attributes creating additional variants
+  - **Format**: JSON array of attribute names to remove
+  - **Example**: `'["size", "priority"]'`
+  - **Purpose**: Generate variants both with and without specific constraints
+  - **Environment**: `PARTITION_CACHE_REMOVE_CONSTRAINTS_ADD`
+
+**Processing Order**: Constraint modifications are applied in the order: `remove-constraints-all` → `remove-constraints-add` → `add-constraints`, enabling replacement scenarios.
+
 ### Partition Configuration (Required)
 - `--partition-key PARTITION_KEY` - Name of the partition key column (**Required**)
 - `--partition-datatype {integer,float,text,timestamp}` - Partition key datatype
@@ -321,6 +351,20 @@ pcache-add --queue --no-recompose \
   --query "SELECT * FROM users WHERE city_id IN (1,2,3)" \
   --partition-key "city_id"
 ```
+
+**Advanced variant generation:**
+```bash
+pcache-add --direct \
+  --query "SELECT * FROM points WHERE distance BETWEEN 1.6 AND 3.6 AND size = 4" \
+  --partition-key "region_id" \
+  --bucket-steps 0.5 \
+  --add-constraints '{"points": "active = true"}' \
+  --remove-constraints-add '["size"]'
+```
+This generates multiple variants:
+- Original query with normalized distance (`BETWEEN 1.5 AND 4.0`)
+- Variants with and without `size = 4` constraint
+- Variants with added `active = true` constraint
 
 ---
 
@@ -453,6 +497,26 @@ pcache-monitor [options]
   - **Purpose**: Use more efficient lazy subqueries with PostgreSQL backends
   - **Note**: Lazy methods don't materialize results upfront
 
+### Variant Generation Configuration
+Controls how query variants are generated when processing original queries from the queue:
+
+#### Distance Normalization
+- `--bucket-steps FLOAT` - Step size for normalizing distance conditions
+  - **Default**: `1.0` (or `PARTITION_CACHE_BUCKET_STEPS` environment variable)
+
+#### Constraint Modification
+- `--add-constraints JSON` - Add constraints to specific tables
+  - **Format**: JSON object mapping table names to constraint conditions
+  - **Environment**: `PARTITION_CACHE_ADD_CONSTRAINTS`
+
+- `--remove-constraints-all JSON` - Remove attributes from all query variants
+  - **Format**: JSON array of attribute names to remove
+  - **Environment**: `PARTITION_CACHE_REMOVE_CONSTRAINTS_ALL`
+
+- `--remove-constraints-add JSON` - Remove attributes creating additional variants
+  - **Format**: JSON array of attribute names to remove
+  - **Environment**: `PARTITION_CACHE_REMOVE_CONSTRAINTS_ADD`
+
 ### Configuration
 - `--env ENV` - Environment file path
   - **Default**: `.env`
@@ -485,6 +549,16 @@ pcache-monitor \
   --max-processes 1 \
   --disable-optimized-polling \
   --status-log-interval 5
+```
+
+**Advanced variant generation:**
+```bash
+pcache-monitor \
+  --cache-backend "postgresql_array" \
+  --max-processes 4 \
+  --bucket-steps 0.5 \
+  --add-constraints '{"points": "active = true"}' \
+  --remove-constraints-add '["size", "category"]'
 ```
 
 **Memory-constrained setup:**

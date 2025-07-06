@@ -6,6 +6,7 @@ consistency across all CLI tools and reduce code duplication.
 """
 
 import argparse
+import json
 import os
 import sys
 from logging import getLogger
@@ -32,28 +33,13 @@ def add_database_args(parser: argparse.ArgumentParser, include_sqlite: bool = Tr
     if include_sqlite:
         backend_choices.append("sqlite")
 
-    db_group.add_argument(
-        "--db-backend",
-        type=str,
-        default="postgresql",
-        choices=backend_choices,
-        help="Database backend to use (default: postgresql)"
-    )
+    db_group.add_argument("--db-backend", type=str, default="postgresql", choices=backend_choices, help="Database backend to use (default: postgresql)")
 
     # Database name/path
-    db_group.add_argument(
-        "--db-name",
-        type=str,
-        help="Database name (if not specified, uses DB_NAME environment variable)"
-    )
+    db_group.add_argument("--db-name", type=str, help="Database name (if not specified, uses DB_NAME environment variable)")
 
     if include_sqlite:
-        db_group.add_argument(
-            "--db-dir",
-            type=str,
-            default="data/test_db.sqlite",
-            help="Database directory/path for SQLite (default: data/test_db.sqlite)"
-        )
+        db_group.add_argument("--db-dir", type=str, default="data/test_db.sqlite", help="Database directory/path for SQLite (default: data/test_db.sqlite)")
 
 
 def add_cache_args(parser: argparse.ArgumentParser, require_partition_key: bool = False) -> None:
@@ -66,24 +52,15 @@ def add_cache_args(parser: argparse.ArgumentParser, require_partition_key: bool 
     """
     cache_group = parser.add_argument_group("cache configuration")
 
-    cache_group.add_argument(
-        "--cache-backend",
-        type=str,
-        help="Cache backend to use (if not specified, uses CACHE_BACKEND environment variable)"
-    )
+    cache_group.add_argument("--cache-backend", type=str, help="Cache backend to use (if not specified, uses CACHE_BACKEND environment variable)")
 
-    cache_group.add_argument(
-        "--partition-key",
-        type=str,
-        required=require_partition_key,
-        help="Name of the partition key column"
-    )
+    cache_group.add_argument("--partition-key", type=str, required=require_partition_key, help="Name of the partition key column")
 
     cache_group.add_argument(
         "--partition-datatype",
         type=str,
         choices=["integer", "float", "text", "timestamp"],
-        help="Datatype of the partition key (if not specified, will be inferred)"
+        help="Datatype of the partition key (if not specified, will be inferred)",
     )
 
 
@@ -102,7 +79,7 @@ def add_environment_args(parser: argparse.ArgumentParser) -> None:
         dest="env_file",
         type=str,
         default=".env",
-        help="Path to environment file with configuration (default: .env)"
+        help="Path to environment file with configuration (default: .env)",
     )
 
 
@@ -119,7 +96,7 @@ def add_queue_args(parser: argparse.ArgumentParser) -> None:
         "--queue-provider",
         type=str,
         choices=["postgresql", "redis"],
-        help="Queue provider to use (if not specified, uses QUERY_QUEUE_PROVIDER environment variable)"
+        help="Queue provider to use (if not specified, uses QUERY_QUEUE_PROVIDER environment variable)",
     )
 
 
@@ -132,17 +109,9 @@ def add_verbosity_args(parser: argparse.ArgumentParser) -> None:
     """
     verbosity_group = parser.add_argument_group("verbosity options")
 
-    verbosity_group.add_argument(
-        "--quiet", "-q",
-        action="store_true",
-        help="Suppress status messages (only output data/results)"
-    )
+    verbosity_group.add_argument("--quiet", "-q", action="store_true", help="Suppress status messages (only output data/results)")
 
-    verbosity_group.add_argument(
-        "--verbose", "-v",
-        action="store_true",
-        help="Show detailed status and progress messages"
-    )
+    verbosity_group.add_argument("--verbose", "-v", action="store_true", help="Show detailed status and progress messages")
 
 
 def add_output_args(parser: argparse.ArgumentParser) -> None:
@@ -158,14 +127,10 @@ def add_output_args(parser: argparse.ArgumentParser) -> None:
         "--output-format",
         choices=["list", "json", "lines"],
         default="list",
-        help="Output format: list (comma-separated), json (JSON array), lines (one per line)"
+        help="Output format: list (comma-separated), json (JSON array), lines (one per line)",
     )
 
-    output_group.add_argument(
-        "--output-file",
-        type=str,
-        help="Write output to file instead of console"
-    )
+    output_group.add_argument("--output-file", type=str, help="Write output to file instead of console")
 
 
 def configure_logging(args: argparse.Namespace) -> None:
@@ -184,12 +149,12 @@ def configure_logging(args: argparse.Namespace) -> None:
         logger.removeHandler(handler)
 
     # Configure based on verbosity
-    if getattr(args, 'quiet', False):
+    if getattr(args, "quiet", False):
         logger.setLevel(logging.WARNING)  # Only warnings and errors
-    elif getattr(args, 'verbose', False):
-        logger.setLevel(logging.DEBUG)    # All messages including debug
+    elif getattr(args, "verbose", False):
+        logger.setLevel(logging.DEBUG)  # All messages including debug
     else:
-        logger.setLevel(logging.INFO)     # Default: info, warnings, errors
+        logger.setLevel(logging.INFO)  # Default: info, warnings, errors
 
     # Always send logging to stderr
     handler = logging.StreamHandler(sys.stderr)
@@ -242,6 +207,53 @@ def load_environment_with_validation(env_file: str, required_vars: list[str] | N
     return dict(os.environ)
 
 
+def parse_variant_generation_json_args(args: argparse.Namespace) -> tuple[dict[str, str] | None, list[str] | None, list[str] | None]:
+    """
+    Parse JSON string arguments for constraint modifications.
+
+    Args:
+        args: Parsed command line arguments
+
+    Returns:
+        Tuple containing (add_constraints, remove_constraints_all, remove_constraints_add)
+    """
+    add_constraints = None
+    remove_constraints_all = None
+    remove_constraints_add = None
+
+    # Parse add_constraints
+    if args.add_constraints:
+        try:
+            add_constraints = json.loads(args.add_constraints)
+            if not isinstance(add_constraints, dict):
+                raise ValueError("add_constraints must be a JSON object/dict")
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.error(f"Failed to parse --add-constraints: {e}")
+            sys.exit(1)
+
+    # Parse remove_constraints_all
+    if args.remove_constraints_all:
+        try:
+            remove_constraints_all = json.loads(args.remove_constraints_all)
+            if not isinstance(remove_constraints_all, list):
+                raise ValueError("remove_constraints_all must be a JSON array/list")
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.error(f"Failed to parse --remove-constraints-all: {e}")
+            sys.exit(1)
+
+    # Parse remove_constraints_add
+    if args.remove_constraints_add:
+        try:
+            remove_constraints_add = json.loads(args.remove_constraints_add)
+            if not isinstance(remove_constraints_add, list):
+                raise ValueError("remove_constraints_add must be a JSON array/list")
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.error(f"Failed to parse --remove-constraints-add: {e}")
+            sys.exit(1)
+
+    return add_constraints, remove_constraints_all, remove_constraints_add
+
+
 def add_variant_generation_args(parser: argparse.ArgumentParser) -> None:
     """
     Add common variant generation arguments to an ArgumentParser.
@@ -254,37 +266,61 @@ def add_variant_generation_args(parser: argparse.ArgumentParser) -> None:
         "--min-component-size",
         type=int,
         default=int(os.getenv("PARTITION_CACHE_MIN_COMPONENT_SIZE", "1")),
-        help="Minimum number of tables in query variants (connected components) (default: 1 or PARTITION_CACHE_MIN_COMPONENT_SIZE)"
+        help="Minimum number of tables in query variants (connected components) (default: 1 or PARTITION_CACHE_MIN_COMPONENT_SIZE)",
     )
     variant_group.add_argument(
         "--follow-graph",
-        type=lambda x: x.lower() in ('true', '1', 'yes'),
-        default=os.getenv("PARTITION_CACHE_FOLLOW_GRAPH", "true").lower() in ('true', '1', 'yes'),
-        help="Only generate variants from tables forming connected subgraphs via multi-table predicates like distance conditions or non-equijoin conditions (default: True or PARTITION_CACHE_FOLLOW_GRAPH)"
+        type=lambda x: x.lower() in ("true", "1", "yes"),
+        default=os.getenv("PARTITION_CACHE_FOLLOW_GRAPH", "true").lower() in ("true", "1", "yes"),
+        help="Only generate variants from tables forming connected subgraphs via multi-table predicates like distance conditions or non-equijoin conditions (default: True or PARTITION_CACHE_FOLLOW_GRAPH)",
     )
     variant_group.add_argument(
         "--no-auto-detect-star-join",
         action="store_true",
-        default=os.getenv("PARTITION_CACHE_NO_AUTO_DETECT_STAR_JOIN", "false").lower() in ('true', '1', 'yes'),
-        help="Disable automatic star-join table detection based on query pattern (default: False or PARTITION_CACHE_NO_AUTO_DETECT_STAR_JOIN)"
+        default=os.getenv("PARTITION_CACHE_NO_AUTO_DETECT_STAR_JOIN", "false").lower() in ("true", "1", "yes"),
+        help="Disable automatic star-join table detection based on query pattern (default: False or PARTITION_CACHE_NO_AUTO_DETECT_STAR_JOIN)",
     )
     variant_group.add_argument(
         "--star-join-table",
         type=str,
         default=os.getenv("PARTITION_CACHE_STAR_JOIN_TABLE", None),
-        help="Explicitly specify star-join table alias or name (only one star-join table per query, or set PARTITION_CACHE_STAR_JOIN_TABLE)"
+        help="Explicitly specify star-join table alias or name (only one star-join table per query, or set PARTITION_CACHE_STAR_JOIN_TABLE)",
     )
     variant_group.add_argument(
         "--max-component-size",
         type=int,
         default=int(os.getenv("PARTITION_CACHE_MAX_COMPONENT_SIZE", "0")) or None,
-        help="Maximum number of tables in query variants (connected components) (default: no limit or PARTITION_CACHE_MAX_COMPONENT_SIZE)"
+        help="Maximum number of tables in query variants (connected components) (default: no limit or PARTITION_CACHE_MAX_COMPONENT_SIZE)",
     )
     variant_group.add_argument(
         "--no-warn-partition-key",
         action="store_true",
-        default=os.getenv("PARTITION_CACHE_NO_WARN_PARTITION_KEY", "false").lower() in ('true', '1', 'yes'),
-        help="Disable warnings for tables not using partition key (default: False or PARTITION_CACHE_NO_WARN_PARTITION_KEY)"
+        default=os.getenv("PARTITION_CACHE_NO_WARN_PARTITION_KEY", "false").lower() in ("true", "1", "yes"),
+        help="Disable warnings for tables not using partition key (default: False or PARTITION_CACHE_NO_WARN_PARTITION_KEY)",
+    )
+    variant_group.add_argument(
+        "--bucket-steps",
+        type=float,
+        default=float(os.getenv("PARTITION_CACHE_BUCKET_STEPS", "1.0")),
+        help="Step size for normalizing distance conditions (e.g., 1.0, 0.5, etc.) (default: 1.0 or PARTITION_CACHE_BUCKET_STEPS)",
+    )
+    variant_group.add_argument(
+        "--add-constraints",
+        type=str,
+        default=os.getenv("PARTITION_CACHE_ADD_CONSTRAINTS", None),
+        help='JSON dict mapping table names to constraints to add, e.g. \'{"table": "col = val"}\' (default: None or PARTITION_CACHE_ADD_CONSTRAINTS)',
+    )
+    variant_group.add_argument(
+        "--remove-constraints-all",
+        type=str,
+        default=os.getenv("PARTITION_CACHE_REMOVE_CONSTRAINTS_ALL", None),
+        help='JSON list of attribute names to remove from all query variants, e.g. \'["col1", "col2"]\' (default: None or PARTITION_CACHE_REMOVE_CONSTRAINTS_ALL)',
+    )
+    variant_group.add_argument(
+        "--remove-constraints-add",
+        type=str,
+        default=os.getenv("PARTITION_CACHE_REMOVE_CONSTRAINTS_ADD", None),
+        help='JSON list of attribute names to remove, creating additional variants, e.g. \'["col1", "col2"]\' (default: None or PARTITION_CACHE_REMOVE_CONSTRAINTS_ADD)',
     )
 
 
@@ -301,7 +337,7 @@ def resolve_cache_backend(args: argparse.Namespace) -> str:
     Raises:
         SystemExit: If no cache backend is specified
     """
-    cache_backend = getattr(args, 'cache_backend', None) or os.getenv("CACHE_BACKEND")
+    cache_backend = getattr(args, "cache_backend", None) or os.getenv("CACHE_BACKEND")
 
     if not cache_backend:
         print("Error: No cache backend specified. Use --cache-backend or set CACHE_BACKEND environment variable")
@@ -324,7 +360,7 @@ def resolve_database_name(args: argparse.Namespace) -> str:
     Raises:
         SystemExit: If no database name is specified
     """
-    db_name = getattr(args, 'db_name', None) or os.getenv("DB_NAME")
+    db_name = getattr(args, "db_name", None) or os.getenv("DB_NAME")
 
     if not db_name:
         print("Error: No database name specified. Use --db-name or set DB_NAME environment variable")
@@ -345,7 +381,7 @@ def validate_mutual_exclusivity(args: argparse.Namespace, groups: list[tuple[str
         SystemExit: If mutual exclusivity is violated
     """
     for _group_name, arg_names in groups:
-        specified_args = [arg for arg in arg_names if getattr(args, arg.replace('-', '_'), None)]
+        specified_args = [arg for arg in arg_names if getattr(args, arg.replace("-", "_"), None)]
 
         if len(specified_args) == 0:
             print(f"Error: One of {', '.join(f'--{arg}' for arg in arg_names)} must be specified")
@@ -366,7 +402,7 @@ def get_database_connection_params(args: argparse.Namespace, backend_type: str |
     Returns:
         Dictionary of connection parameters
     """
-    backend = backend_type or getattr(args, 'db_backend', 'postgresql')
+    backend = backend_type or getattr(args, "db_backend", "postgresql")
 
     if backend == "postgresql":
         return {
@@ -385,9 +421,7 @@ def get_database_connection_params(args: argparse.Namespace, backend_type: str |
             "dbname": resolve_database_name(args),
         }
     elif backend == "sqlite":
-        return {
-            "db_path": getattr(args, 'db_dir', "data/test_db.sqlite")
-        }
+        return {"db_path": getattr(args, "db_dir", "data/test_db.sqlite")}
     else:
         raise ValueError(f"Unsupported database backend: {backend}")
 
@@ -404,8 +438,4 @@ def setup_logging(verbose: bool = False) -> None:
     level = logging.DEBUG if verbose else logging.INFO
     format_string = "%(asctime)s - %(name)s - %(levelname)s - %(message)s" if verbose else "%(levelname)s: %(message)s"
 
-    logging.basicConfig(
-        level=level,
-        format=format_string,
-        datefmt="%Y-%m-%d %H:%M:%S"
-    )
+    logging.basicConfig(level=level, format=format_string, datefmt="%Y-%m-%d %H:%M:%S")
