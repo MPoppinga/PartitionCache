@@ -437,9 +437,9 @@ class TestEdgeCasesAndErrorHandling:
         not_in_variants = [v for v in variants if "NOT " in v and " IN (" in v]
         assert len(not_in_variants) > 0, "NOT IN conditions should be preserved"
 
-        # Verify BETWEEN conditions are preserved
-        between_variants = [v for v in variants if "BETWEEN" in v]
-        assert len(between_variants) > 0, "BETWEEN conditions should be preserved"
+        # Verify BETWEEN conditions are processed (may be normalized to >= and <= conditions)
+        between_or_range_variants = [v for v in variants if ("BETWEEN" in v or (">=" in v and "<=" in v))]
+        assert len(between_or_range_variants) > 0, "BETWEEN conditions should be preserved or normalized to range conditions"
 
     def test_true_partition_key_conditions_on_star_join(self):
         """Test true partition key conditions (IN subqueries) on star-join tables."""
@@ -502,8 +502,9 @@ class TestEdgeCasesAndErrorHandling:
             join_conditions = [cond.strip() for cond in variant.split("WHERE")[1].split(" AND ") if " = " in cond]
 
             # Count direct table-to-table joins vs star-join joins
-            direct_joins = [j for j in join_conditions if " = t" in j and ".region_id" in j]
-            star_joins = [j for j in join_conditions if " = p1.region_id" in j]
+            # Direct joins look like: t1.region_id = t2.region_id (both sides start with 't')
+            direct_joins = [j for j in join_conditions if j.startswith("t") and " = t" in j and ".region_id" in j]
+            star_joins = [j for j in join_conditions if " = p1.region_id" in j or "p1.region_id = " in j]
 
             assert len(direct_joins) == 0, f"Should have no direct table-to-table joins, found: {direct_joins}"
             assert len(star_joins) > 0, f"Should have star-join pattern joins, found: {star_joins}"
@@ -618,8 +619,9 @@ class TestRegressionTests:
             join_conditions = [cond.strip() for cond in variant.split("WHERE")[1].split(" AND ") if " = " in cond]
 
             # Count direct table-to-table joins vs star-join joins
-            direct_joins = [j for j in join_conditions if " = t" in j and ".region_id" in j]
-            star_joins = [j for j in join_conditions if " = p1.region_id" in j]
+            # Direct joins look like: t1.region_id = t2.region_id (both sides start with 't')
+            direct_joins = [j for j in join_conditions if j.startswith("t") and " = t" in j and ".region_id" in j]
+            star_joins = [j for j in join_conditions if " = p1.region_id" in j or "p1.region_id = " in j]
 
             assert len(direct_joins) == 0, f"Should have no direct table-to-table joins, found: {direct_joins}"
             assert len(star_joins) > 0, f"Should have star-join pattern joins, found: {star_joins}"

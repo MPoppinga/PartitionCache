@@ -957,9 +957,12 @@ def normalize_distance_conditions(original_query: str, bucket_steps: float = 1.0
     for distance_condition in list(distance_conditions_between + distance_conditions_smaller + distance_conditions_greater):
         if not any(str(x).replace(".", "", 1).isdigit() for x in distance_condition.split()):
             logger.warning(f"No numeric value found in distance condition: {distance_condition}")
-            distance_conditions_between.remove(distance_condition)
-            distance_conditions_smaller.remove(distance_condition)
-            distance_conditions_greater.remove(distance_condition)
+            if distance_condition in distance_conditions_between:
+                distance_conditions_between.remove(distance_condition)
+            if distance_condition in distance_conditions_smaller:
+                distance_conditions_smaller.remove(distance_condition)
+            if distance_condition in distance_conditions_greater:
+                distance_conditions_greater.remove(distance_condition)
 
     # Check if number is on right side of comparison operator for distance functions # TODO check if this is needed, should be handled by sqlglot
     for distance_condition in list(distance_conditions_between + distance_conditions_smaller + distance_conditions_greater):
@@ -968,18 +971,24 @@ def normalize_distance_conditions(original_query: str, bucket_steps: float = 1.0
                 parts = re.split(r"(<=|>=|<|>)", distance_condition)
                 if len(parts) == 2 and not str(parts[1].strip()).replace(".", "", 1).isdigit():
                     logger.warning(f"Numeric value not on right side of comparison in distance condition: {distance_condition}")
-                    distance_conditions_between.remove(distance_condition)
-                    distance_conditions_smaller.remove(distance_condition)
-                    distance_conditions_greater.remove(distance_condition)
+                    if distance_condition in distance_conditions_between:
+                        distance_conditions_between.remove(distance_condition)
+                    if distance_condition in distance_conditions_smaller:
+                        distance_conditions_smaller.remove(distance_condition)
+                    if distance_condition in distance_conditions_greater:
+                        distance_conditions_greater.remove(distance_condition)
 
     # Check for negative numbers
     for distance_condition in list(distance_conditions_between + distance_conditions_smaller + distance_conditions_greater):
         numbers = [float(x) for x in re.findall(r"-?\d*\.?\d+", distance_condition)]
         if any(n < 0 for n in numbers):
             logger.warning(f"Negative value found in distance condition: {distance_condition}")
-            distance_conditions_between.remove(distance_condition)
-            distance_conditions_smaller.remove(distance_condition)
-            distance_conditions_greater.remove(distance_condition)
+            if distance_condition in distance_conditions_between:
+                distance_conditions_between.remove(distance_condition)
+            if distance_condition in distance_conditions_smaller:
+                distance_conditions_smaller.remove(distance_condition)
+            if distance_condition in distance_conditions_greater:
+                distance_conditions_greater.remove(distance_condition)
 
     for distance_condition in distance_conditions_between:
         if restrict_to_dist_functions and not is_distance_function(distance_condition):

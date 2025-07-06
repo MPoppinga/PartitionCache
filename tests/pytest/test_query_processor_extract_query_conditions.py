@@ -15,7 +15,8 @@ def test_extract_query_conditions():
         partition_key_conditions,
         or_conditions,
         table_aliases,
-        table,
+        alias_to_table_map,
+        partition_key_joins,
     ) = extract_and_group_query_conditions(query, partition_key)
 
     # Test attribute_conditions
@@ -39,9 +40,9 @@ def test_extract_query_conditions():
     expected_table_aliases = ["t1", "t2"]
     assert table_aliases == expected_table_aliases
 
-    # Test table
-    expected_table = "table"
-    assert table == expected_table
+    # Test alias_to_table_map
+    expected_alias_to_table_map = {"t1": "table", "t2": "table"}
+    assert alias_to_table_map == expected_alias_to_table_map
 
 
 def test_basic_query():
@@ -61,7 +62,8 @@ def test_basic_query():
         partition_key_conditions,
         or_conditions,
         table_aliases,
-        table,
+        alias_to_table_map,
+        partition_key_joins,
     ) = extract_and_group_query_conditions(query, partition_key)
 
     assert attribute_conditions == {"rp0": ["field1 = 1"], "rp1": []}
@@ -69,7 +71,8 @@ def test_basic_query():
     assert or_conditions == {}
     assert partition_key_conditions == []
     assert set(table_aliases) == {"rp0", "rp1"}
-    assert table == "random_point"
+    # All aliases should map to random_point table
+    assert all(table_name == "random_point" for table_name in alias_to_table_map.values())
 
 
 def test_complex_query():
@@ -94,7 +97,8 @@ def test_complex_query():
         partition_key_conditions,
         or_conditions,
         table_aliases,
-        table,
+        alias_to_table_map,
+        partition_key_joins,
     ) = extract_and_group_query_conditions(query, partition_key)
 
     assert dict(or_conditions) == {("rp2",): ["(rp2.field2 = 2 OR rp2.field2 = 3)"]}
@@ -106,7 +110,8 @@ def test_complex_query():
         "search_space IN (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10))",
     ]
     assert set(table_aliases) == {"rp0", "rp1", "rp2", "rp3"}
-    assert table == "random_point"
+    # All aliases should map to random_point table
+    assert all(table_name == "random_point" for table_name in alias_to_table_map.values())
 
 
 def test_query_with_subquery():
@@ -125,7 +130,8 @@ def test_query_with_subquery():
         partition_key_conditions,
         or_conditions,
         table_aliases,
-        table,
+        alias_to_table_map,
+        partition_key_joins,
     ) = extract_and_group_query_conditions(query, partition_key)
 
     assert attribute_conditions == {"rp0": ["field1 = 1"]}
@@ -133,7 +139,8 @@ def test_query_with_subquery():
     assert or_conditions == {}
     assert partition_key_conditions == ["search_space IN (SELECT x FROM other_table WHERE y = 1 AND z = 2)"]
     assert table_aliases == ["rp0"]
-    assert table == "random_point"
+    # All aliases should map to random_point table
+    assert all(table_name == "random_point" for table_name in alias_to_table_map.values())
 
 
 def test_query_with_multiple_distance_conditions():
@@ -153,7 +160,8 @@ def test_query_with_multiple_distance_conditions():
         partition_key_conditions,
         or_conditions,
         table_aliases,
-        table,
+        alias_to_table_map,
+        partition_key_joins,
     ) = extract_and_group_query_conditions(query, partition_key)
 
     assert attribute_conditions == {"rp0": [], "rp1": [], "rp2": []}
@@ -165,7 +173,8 @@ def test_query_with_multiple_distance_conditions():
     assert len(other_functions) == 0
     assert partition_key_conditions == []
     assert set(table_aliases) == {"rp0", "rp1", "rp2"}
-    assert table == "random_point"
+    # All aliases should map to random_point table
+    assert all(table_name == "random_point" for table_name in alias_to_table_map.values())
 
 
 def test_query_with_no_conditions():
@@ -182,7 +191,8 @@ def test_query_with_no_conditions():
         partition_key_conditions,
         or_conditions,
         table_aliases,
-        table,
+        alias_to_table_map,
+        partition_key_joins,
     ) = extract_and_group_query_conditions(query, partition_key)
 
     assert attribute_conditions == {"rp0": []}
@@ -191,7 +201,8 @@ def test_query_with_no_conditions():
     assert partition_key_conditions == []
     assert or_conditions == {}
     assert table_aliases == ["rp0"]
-    assert table == "random_point"
+    # All aliases should map to random_point table
+    assert all(table_name == "random_point" for table_name in alias_to_table_map.values())
 
 
 def test_query_with_3_or_conditions():
@@ -214,7 +225,8 @@ def test_query_with_3_or_conditions():
         partition_key_conditions,
         or_conditions,
         table_aliases,
-        table,
+        alias_to_table_map,
+        partition_key_joins,
     ) = extract_and_group_query_conditions(query, partition_key)
 
     assert attribute_conditions == {"rp0": ["field1 = 1"], "rp1": [], "rp2": []}
@@ -229,7 +241,8 @@ def test_query_with_3_or_conditions():
         ("rp0", "rp1"): ["(rp0.field3 = 5 OR rp1.field3 = 6 OR rp1.field3 = 7)"],
     }
     assert set(table_aliases) == {"rp0", "rp1", "rp2"}
-    assert table == "random_point"
+    # All aliases should map to random_point table
+    assert all(table_name == "random_point" for table_name in alias_to_table_map.values())
 
 
 def test_udf_with_3_tables():
@@ -250,7 +263,8 @@ def test_udf_with_3_tables():
         partition_key_conditions,
         or_conditions,
         table_aliases,
-        table,
+        alias_to_table_map,
+        partition_key_joins,
     ) = extract_and_group_query_conditions(query, partition_key)
 
     assert attribute_conditions == {"rp0": ["field1 = 1"], "rp1": [], "rp2": []}
@@ -259,4 +273,5 @@ def test_udf_with_3_tables():
     assert partition_key_conditions == []
     assert or_conditions == {}
     assert set(table_aliases) == {"rp0", "rp1", "rp2"}
-    assert table == "random_point"
+    # All aliases should map to random_point table
+    assert all(table_name == "random_point" for table_name in alias_to_table_map.values())

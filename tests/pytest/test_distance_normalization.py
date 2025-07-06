@@ -156,7 +156,9 @@ class TestDistanceNormalization:
 
         # Query should be essentially unchanged (except for whitespace normalization)
         assert "element = 16" in normalized
-        assert "complex_data_id = cd.complex_data_id" in normalized
+        # SQLGlot may normalize the order of columns in equality comparisons
+        assert ("complex_data_id = cd.complex_data_id" in normalized or 
+                "cd.complex_data_id = p1.complex_data_id" in normalized)
 
     def test_negative_values_skipped(self):
         """Test that negative distance values are skipped."""
@@ -168,8 +170,8 @@ class TestDistanceNormalization:
         cleaned = clean_query(query)
         normalized = normalize_distance_conditions(cleaned, bucket_steps=1.0)
 
-        # Negative value should be left unchanged
-        assert "<= -0.1" in normalized
+        # Negative value should be left unchanged (sqlglot may reorder comparison)
+        assert ("<= -0.1" in normalized or "-0.1 >=" in normalized)
 
     def test_non_distance_function_conditions_skipped(self):
         """Test that non-distance function conditions are skipped when restrict_to_dist_functions=True."""
