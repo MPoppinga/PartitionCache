@@ -49,61 +49,36 @@ def clean_query(query: str) -> str:
     # Remove trailing semicolons (they're not part of the SQL statement)
     query = query.rstrip().rstrip(";")
 
-    # Remove comments first to avoid issues with ORDER BY/LIMIT parsing
+    # Remove comment
     query = re.sub(r"--.*", "", query)
 
-    # Normalize the query
-    sqlglot_query = sqlglot.parse_one(query)
+    # Parse the query
+    parsed = sqlglot.parse_one(query)
 
-    # Normalize the query (including building DNF)
-    nquery = sqlglot.optimizer.normalize.normalize(sqlglot_query)
-    query = nquery.sql()
+    # Normalize the query (building CNF)
+    parsed = sqlglot.optimizer.normalize.normalize(parsed)
 
-    # Use sqlglot to properly parse and flatten WHERE clause
-    try:
-        parsed = sqlglot.parse_one(query)
-        where_clause = parsed.find(sqlglot.expressions.Where)
+    # Simplification e.g. Sort comparison operators to ensure consistent order
+    parsed = sqlglot.optimizer.simplify.simplify(parsed)
 
-        if where_clause and where_clause.this:
-            # Check if the WHERE clause is wrapped in unnecessary parentheses
-            where_expr = where_clause.this
 
-            # If the top-level expression is wrapped in Paren, unwrap it if it's just a container
-            if isinstance(where_expr, sqlglot.expressions.Paren):
-                # The parentheses are unnecessary - extract the inner expression
-                inner_expr = where_expr.this
-                where_clause.set("this", inner_expr)
-                query = parsed.sql()
-                logger.debug("Flattened unnecessary parentheses around WHERE clause")
 
-    except Exception as e:
-        logger.debug(f"Could not flatten WHERE parentheses using sqlglot: {e}")
-        # Fallback to regex approach for simple cases
+    # Remove ORDER BY and LIMIT clauses - they don't affect which partition keys are accessed
+    # We need to process all SELECT statements (including subqueries)
+    for select_stmt in parsed.find_all(sqlglot.expressions.Select):
+        # Remove ORDER BY
+        if select_stmt.args.get("order"):
+            select_stmt.set("order", None)
+            logger.debug("Removed ORDER BY clause for cache variant generation")
 
-    # Remove clauses that don't affect caching logic using sqlglot for proper parsing
-    try:
-        parsed = sqlglot.parse_one(query)
+        # Remove LIMIT
+        if select_stmt.args.get("limit"):
+            select_stmt.set("limit", None)
+            logger.debug("Removed LIMIT clause for cache variant generation")
 
-        # Remove ORDER BY and LIMIT clauses - they don't affect which partition keys are accessed
-        # We need to process all SELECT statements (including subqueries)
-        for select_stmt in parsed.find_all(sqlglot.expressions.Select):
-            # Remove ORDER BY
-            if select_stmt.args.get("order"):
-                select_stmt.set("order", None)
-                logger.debug("Removed ORDER BY clause for cache variant generation")
+    query = parsed.sql()
 
-            # Remove LIMIT
-            if select_stmt.args.get("limit"):
-                select_stmt.set("limit", None)
-                logger.debug("Removed LIMIT clause for cache variant generation")
 
-        query = parsed.sql()
-
-    except Exception as e:
-        logger.debug(f"Could not remove ORDER BY/LIMIT using sqlglot, falling back to regex: {e}")
-        # Fallback to regex for ORDER BY and LIMIT removal
-        query = re.sub(r"ORDER\s+BY\s+[^)]*?(?=\s+LIMIT|\s+$|$)", "", query, flags=re.IGNORECASE)
-        query = re.sub(r"LIMIT\s+\d+", "", query, flags=re.IGNORECASE)
 
     # Removing tailing semicolon
     query = re.sub(r";\s*$", "", query)
@@ -191,7 +166,7 @@ def remove_single_conditions(
     conditions: dict[str, list[str]],
 ) -> list[dict[str, list[str]]]:
     """
-    If in one condition more thand one attribute is used, remove one of the attributes (all possible outcomes)
+    If in one condition more than one attribute is used, remove one of the attributes (yielding all possible outcomes)
     Returns all new conditions together with the original conditions
     """
     ret = [conditions]
@@ -926,7 +901,7 @@ def generate_partial_queries(
             sub = sub.strip()
             ret.append(sub)
 
-    return ret
+    return [sqlglot.optimizer.simplify.simplify(sqlglot.parse_one(q)).sql() for q in ret] # TODO test if this is needed
 
 
 def is_distance_function(condition: str) -> bool:
@@ -975,28 +950,37 @@ def normalize_distance_conditions(original_query: str, bucket_steps: float = 1.0
         else:
             pass
 
-    # TODO Ensure one of the values is a number
+    # TODO Ensure one of the values is a literal number
     # TODO Ensure number is on second position
-    # TODO Ensure number is not negative
+    # TODO Ensure number is not negative (verify that this is needed)
 
     # Check if at least one value is a number
-    for distance_condition in distance_conditions_between + distance_conditions_smaller + distance_conditions_greater:
+    for distance_condition in list(distance_conditions_between + distance_conditions_smaller + distance_conditions_greater):
         if not any(str(x).replace(".", "", 1).isdigit() for x in distance_condition.split()):
             logger.warning(f"No numeric value found in distance condition: {distance_condition}")
+            distance_conditions_between.remove(distance_condition)
+            distance_conditions_smaller.remove(distance_condition)
+            distance_conditions_greater.remove(distance_condition)
 
-    # Check if number is on right side of comparison operator for distance functions
-    for distance_condition in distance_conditions_between + distance_conditions_smaller + distance_conditions_greater:
+    # Check if number is on right side of comparison operator for distance functions # TODO check if this is needed, should be handled by sqlglot
+    for distance_condition in list(distance_conditions_between + distance_conditions_smaller + distance_conditions_greater):
         if is_distance_function(distance_condition):
             if "<" in distance_condition or ">" in distance_condition:
                 parts = re.split(r"(<=|>=|<|>)", distance_condition)
                 if len(parts) == 2 and not str(parts[1].strip()).replace(".", "", 1).isdigit():
                     logger.warning(f"Numeric value not on right side of comparison in distance condition: {distance_condition}")
+                    distance_conditions_between.remove(distance_condition)
+                    distance_conditions_smaller.remove(distance_condition)
+                    distance_conditions_greater.remove(distance_condition)
 
     # Check for negative numbers
-    for distance_condition in distance_conditions_between + distance_conditions_smaller + distance_conditions_greater:
+    for distance_condition in list(distance_conditions_between + distance_conditions_smaller + distance_conditions_greater):
         numbers = [float(x) for x in re.findall(r"-?\d*\.?\d+", distance_condition)]
         if any(n < 0 for n in numbers):
             logger.warning(f"Negative value found in distance condition: {distance_condition}")
+            distance_conditions_between.remove(distance_condition)
+            distance_conditions_smaller.remove(distance_condition)
+            distance_conditions_greater.remove(distance_condition)
 
     for distance_condition in distance_conditions_between:
         if restrict_to_dist_functions and not is_distance_function(distance_condition):
@@ -1164,7 +1148,7 @@ def generate_all_query_hash_pairs(
     query_set.update(query_set_diff_combinations)
 
     # Create bucket variant with normalized distances (Example: 1.6 - 3.6 -> 1 - 4 WITH bucket_steps = 1)
-    nor_dist_query = normalize_distance_conditions(query)
+    nor_dist_query = normalize_distance_conditions(query)  # TODO: expose bucket_steps parameter
 
     query_set.update(
         set(
