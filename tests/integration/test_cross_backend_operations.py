@@ -63,7 +63,7 @@ class TestCrossBackendExportImport:
 
         # Add cache entries with queries
         for query_hash, partition_keys, partition_key, query_text in test_data["cache_entries"]:
-            cache_handler.set_set(query_hash, partition_keys, partition_key)
+            cache_handler.set_cache(query_hash, partition_keys, partition_key)
             cache_handler.set_query(query_hash, query_text, partition_key)
 
         return cache_handler
@@ -209,7 +209,7 @@ class TestCrossBackendExportImport:
 
         dst_cache = get_cache_handler("rocksdict")
         dst_cache.register_partition_key("existing_partition", "integer")
-        dst_cache.set_set("existing_hash", {100, 200}, "existing_partition")
+        dst_cache.set_cache("existing_hash", {100, 200}, "existing_partition")
         dst_cache.set_query("existing_hash", "SELECT * FROM existing WHERE id IN (100,200)", "existing_partition")
         dst_cache.close()
 
@@ -337,7 +337,7 @@ class TestCrossBackendCopy:
             src_cache.register_partition_key(partition_key, datatype)
 
         for query_hash, partition_keys, partition_key, query_text in test_data["cache_entries"]:
-            src_cache.set_set(query_hash, partition_keys, partition_key)
+            src_cache.set_cache(query_hash, partition_keys, partition_key)
             src_cache.set_query(query_hash, query_text, partition_key)
 
         src_cache.close()
@@ -351,7 +351,7 @@ class TestCrossBackendCopy:
         mock_dst_cache = MagicMock()
         mock_dst_cache.get_datatype.return_value = None
         mock_dst_cache.exists.return_value = False
-        mock_dst_cache.set_set.return_value = True
+        mock_dst_cache.set_cache.return_value = True
         mock_dst_cache.set_query.return_value = True
 
         with patch("partitioncache.cli.manage_cache.get_cache_handler") as mock_get_handler:
@@ -370,9 +370,9 @@ class TestCrossBackendCopy:
         expected_register_calls = len(test_data["partitions"])
         assert mock_dst_cache.register_partition_key.call_count == expected_register_calls
 
-        # Check that set_set was called for each cache entry
+        # Check that set_cache was called for each cache entry
         expected_set_calls = len(test_data["cache_entries"])
-        assert mock_dst_cache.set_set.call_count == expected_set_calls
+        assert mock_dst_cache.set_cache.call_count == expected_set_calls
 
         # Check that set_query was called for each query
         assert mock_dst_cache.set_query.call_count == expected_set_calls
@@ -392,7 +392,7 @@ class TestCrossBackendCopy:
             src_cache.register_partition_key(partition_key, datatype)
 
         for query_hash, partition_keys, partition_key, query_text in test_data["cache_entries"]:
-            src_cache.set_set(query_hash, partition_keys, partition_key)
+            src_cache.set_cache(query_hash, partition_keys, partition_key)
             src_cache.set_query(query_hash, query_text, partition_key)
 
         src_cache.close()
@@ -403,7 +403,7 @@ class TestCrossBackendCopy:
         mock_dst_cache = MagicMock()
         mock_dst_cache.get_datatype.return_value = None
         mock_dst_cache.exists.return_value = False
-        mock_dst_cache.set_set.return_value = True
+        mock_dst_cache.set_cache.return_value = True
         mock_dst_cache.set_query.return_value = True
 
         with patch("partitioncache.cli.manage_cache.get_cache_handler") as mock_get_handler:
@@ -422,7 +422,7 @@ class TestCrossBackendCopy:
 
         # Should copy only city_id entries
         expected_city_entries = [e for e in test_data["cache_entries"] if e[2] == "city_id"]
-        assert mock_dst_cache.set_set.call_count == len(expected_city_entries)
+        assert mock_dst_cache.set_cache.call_count == len(expected_city_entries)
         assert mock_dst_cache.set_query.call_count == len(expected_city_entries)
 
 
@@ -463,16 +463,16 @@ class TestDataIntegrityValidation:
         src_cache.register_partition_key("integer_partition", "integer")
 
         # Add complex data
-        src_cache.set_set("timestamp_hash", complex_data["timestamp_data"], "timestamp_partition")
+        src_cache.set_cache("timestamp_hash", complex_data["timestamp_data"], "timestamp_partition")
         src_cache.set_query("timestamp_hash", complex_queries["timestamp_query"], "timestamp_partition")
 
-        src_cache.set_set("float_hash", complex_data["float_data"], "float_partition")
+        src_cache.set_cache("float_hash", complex_data["float_data"], "float_partition")
         src_cache.set_query("float_hash", complex_queries["float_query"], "float_partition")
 
-        src_cache.set_set("text_hash", complex_data["text_data"], "text_partition")
+        src_cache.set_cache("text_hash", complex_data["text_data"], "text_partition")
         src_cache.set_query("text_hash", complex_queries["text_query"], "text_partition")
 
-        src_cache.set_set("integer_hash", complex_data["integer_data"], "integer_partition")
+        src_cache.set_cache("integer_hash", complex_data["integer_data"], "integer_partition")
         src_cache.set_query("integer_hash", complex_queries["integer_query"], "integer_partition")
 
         src_cache.close()
@@ -523,7 +523,7 @@ class TestDataIntegrityValidation:
 
         # Add large dataset
         for query_hash, partition_keys, query_text in large_data:
-            src_cache.set_set(query_hash, partition_keys, "large_partition")
+            src_cache.set_cache(query_hash, partition_keys, "large_partition")
             src_cache.set_query(query_hash, query_text, "large_partition")
 
         # Verify source counts

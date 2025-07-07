@@ -74,28 +74,28 @@ def test_get_intersected_multiple_keys(cache_handler, mock_redis):
     assert count == 2
     mock_redis.bitop.assert_called()
 
-def test_set_set_int(cache_handler, mock_redis):
+def test_set_cache_int(cache_handler, mock_redis):
     cache_key = "cache:partition_key:int_bit_key"
     cache_handler._get_partition_datatype = lambda pk: "integer"
     cache_handler._get_partition_bitsize = lambda pk: cache_handler.default_bitsize
-    cache_handler.set_set("int_bit_key", {1, 2, 3})
+    cache_handler.set_cache("int_bit_key", {1, 2, 3})
     expected_bitarray = bitarray(cache_handler.default_bitsize)
     expected_bitarray.setall(0)
     for k in {1, 2, 3}:
         expected_bitarray[k] = 1
     mock_redis.set.assert_called_with(cache_key, expected_bitarray.to01())
 
-def test_set_set_invalid_type(cache_handler, mock_redis):
+def test_set_cache_invalid_type(cache_handler, mock_redis):
     cache_handler._get_partition_datatype = lambda pk: "integer"
     cache_handler._get_partition_bitsize = lambda pk: cache_handler.default_bitsize
     with pytest.raises(ValueError):
-        cache_handler.set_set("invalid_bit_key", {"a", "b", "c"})
+        cache_handler.set_cache("invalid_bit_key", {"a", "b", "c"})
 
-def test_set_set_out_of_range(cache_handler, mock_redis):
+def test_set_cache_out_of_range(cache_handler, mock_redis):
     cache_handler._get_partition_datatype = lambda pk: "integer"
     cache_handler._get_partition_bitsize = lambda pk: cache_handler.default_bitsize
     with pytest.raises(ValueError):
-        cache_handler.set_set("out_of_range_key", {100})
+        cache_handler.set_cache("out_of_range_key", {100})
 
 def test_set_null(cache_handler, mock_redis):
     cache_key = "cache:partition_key:null_key"

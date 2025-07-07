@@ -57,7 +57,7 @@ def test_init(cache_handler):
     assert cache_handler.cursor.execute.call_count == len(INIT_CALLS)  # type: ignore
 
 
-def test_set_set(cache_handler):
+def test_set_cache(cache_handler):
     class FakeBitArray:
         def __init__(self, size):
             self.bits = [0] * size
@@ -76,7 +76,7 @@ def test_set_set(cache_handler):
         cache_handler._get_partition_bitsize = lambda pk: 100
         cache_handler.cursor.execute.reset_mock()
         cache_handler.db.commit.reset_mock()
-        cache_handler.set_set("key1", {1, 2, 3})
+        cache_handler.set_cache("key1", {1, 2, 3})
         found = False
         for call in cache_handler.cursor.execute.call_args_list:
             if "INSERT" in str(call) and "key1" in str(call):
@@ -98,9 +98,9 @@ def test_set_query(cache_handler):
     cache_handler.db.commit.assert_called()
 
 
-def test_set_set_empty(cache_handler):
+def test_set_cache_empty(cache_handler):
     cache_handler.cursor.execute.reset_mock()
-    cache_handler.set_set("empty_key", set())
+    cache_handler.set_cache("empty_key", set())
 
     # Execute only for init calls
     assert cache_handler.cursor.execute.call_count == 0

@@ -127,19 +127,19 @@ def test_exists_false(cache_handler, mock_redis):
     mock_redis.exists.assert_called_with(cache_key)
 
 
-def test_set_set_int(cache_handler, mock_redis):
+def test_set_cache_int(cache_handler, mock_redis):
     cache_key = "cache:partition_key:int_set_key"
 
     # Mock the _get_partition_datatype method directly
     cache_handler._get_partition_datatype = Mock(return_value="integer")
 
-    cache_handler.set_set("int_set_key", {1, 2, 3})
+    cache_handler.set_cache("int_set_key", {1, 2, 3})
     mock_redis.sadd.assert_called_with(cache_key, "1", "2", "3")
 
 
-def test_set_set_invalid_type(cache_handler, mock_redis):
+def test_set_cache_invalid_type(cache_handler, mock_redis):
     with pytest.raises(ValueError):
-        cache_handler.set_set("invalid_set_key", {1.1, 2.2, 3.3})
+        cache_handler.set_cache("invalid_set_key", {1.1, 2.2, 3.3})
 
 
 def test_set_null(cache_handler, mock_redis):

@@ -100,9 +100,9 @@ import partitioncache
 cache = partitioncache.create_cache_helper("postgresql_array", "default", "integer")
 
 # Multiple partition keys with different datatypes
-cache.set_set("spatial_query", {1, 5, 10}, partition_key="city_id")
-cache.set_set("temporal_query", {2, 7, 12}, partition_key="time_bucket") 
-cache.set_set("text_query", {"NYC", "LA"}, partition_key="city_names")
+cache.set_cache("spatial_query", {1, 5, 10}, partition_key="city_id")
+cache.set_cache("temporal_query", {2, 7, 12}, partition_key="time_bucket") 
+cache.set_cache("text_query", {"NYC", "LA"}, partition_key="city_names")
 
 # Retrieve data for specific partition
 results = cache.get("spatial_query", partition_key="city_id")
@@ -117,10 +117,10 @@ partitions = cache.get_partition_keys()
 The system automatically validates datatypes and prevents conflicts:
 
 ```python
-cache.set_set("key1", {1, 2, 3}, partition_key="test")
+cache.set_cache("key1", {1, 2, 3}, partition_key="test")
 # Partition "test" is now locked to "integer" datatype
 
-cache.set_set("key2", {"a", "b"}, partition_key="test")  
+cache.set_cache("key2", {"a", "b"}, partition_key="test")  
 # Raises: ValueError: Partition key 'test' already exists with datatype 'integer'
 ```
 
@@ -161,7 +161,8 @@ All cache handlers provide these methods:
 
 ```python
 # Storage operations
-set_set(key: str, value: set, partition_key: str = "partition_key") -> bool
+set_entry(key: str, partition_key_identifiers: set, query_text: str, partition_key: str = "partition_key", force_update: bool = False) -> bool
+set_cache(key: str, partition_key_identifiers: set, partition_key: str = "partition_key") -> bool
 set_null(key: str, partition_key: str = "partition_key") -> bool
 set_query(key: str, querytext: str, partition_key: str = "partition_key") -> bool
 
@@ -184,13 +185,70 @@ get_intersected_lazy(keys: set[str], partition_key: str = "partition_key") -> tu
 close() -> None
 ```
 
+### Recommended Cache Population Method
+
+#### `set_entry()` - The Preferred API
+
+The `set_entry()` method is the **recommended way** to populate cache handlers as it atomically stores both cache data and query metadata in a single operation:
+
+```python
+import partitioncache
+from partitioncache.query_processor import hash_query
+
+# Create cache handler
+cache = partitioncache.create_cache_helper("postgresql_array", "user_id", "integer")
+
+# Best practice: Use set_entry() for complete cache population
+query = "SELECT * FROM orders WHERE status = 'pending' AND amount > 100"
+query_hash = hash_query(query)
+user_ids = {1, 5, 10, 15, 20}  # Users matching the query
+
+# Single atomic operation stores both cache data and query metadata
+success = cache.set_entry(
+    key=query_hash,
+    partition_key_identifiers=user_ids,
+    query_text=query
+)
+
+if success:
+    print("✅ Cache entry stored successfully")
+    
+    # Later retrieval includes both data and metadata
+    cached_users = cache.get(query_hash)         # Returns: {1, 5, 10, 15, 20}
+    cached_query = cache.get_query(query_hash)   # Returns: "SELECT * FROM orders..."
+    
+    print(f"Cached {len(cached_users)} user IDs")
+    print(f"Original query: {cached_query}")
+```
+
+#### Benefits of `set_entry()`
+
+1. **Atomic Operation**: Ensures cache data and query metadata are stored consistently
+2. **Full Context**: Associates queries with their cache results for debugging and analysis  
+3. **Reliability**: Single transaction reduces the chance of partial writes
+4. **Performance**: More efficient than separate `set_cache()` + `set_query()` calls
+5. **Metadata Tracking**: Enables rich query analysis and cache monitoring
+
+#### Alternative Lower-Level Methods
+
+For advanced use cases, you can use separate operations:
+
+```python
+# Lower-level approach (not recommended for most cases)
+cache.set_cache("query_hash", {1, 2, 3}, partition_key="user_id")
+cache.set_query("query_hash", "SELECT * FROM users...", partition_key="user_id")
+
+# set_entry() is equivalent to the above but atomic and safer
+cache.set_entry("query_hash", {1, 2, 3}, "SELECT * FROM users...", partition_key="user_id")
+```
+
 ### Enhanced Error Handling
 
 All methods return boolean values for success/failure:
 
 ```python
 # Check operation success
-if not cache.set_set("key1", {1, 2, 3}, partition_key="cities"):
+if not cache.set_cache("key1", {1, 2, 3}, partition_key="cities"):
     logger.error("Failed to store data in cache")
     
 # Robust deletion
@@ -228,8 +286,8 @@ cache._create_partition_table("small_partition", bitsize=1000)
 cache._create_partition_table("large_partition", bitsize=10000)
 
 # Store data respecting bit size limits
-cache.set_set("query1", {1, 100, 999}, partition_key="small_partition")  # OK
-cache.set_set("query2", {1, 1000, 49999}, partition_key="large_partition")  # OK
+cache.set_cache("query1", {1, 100, 999}, partition_key="small_partition")  # OK
+cache.set_cache("query2", {1, 1000, 49999}, partition_key="large_partition")  # OK
 ```
 
 ### PostgreSQL Roaring Bitmap Handler
@@ -244,20 +302,20 @@ from bitarray import bitarray
 
 # Multiple input formats supported:
 # 1. Set of integers
-cache.set_set("query1", {1, 1000, 10000, 100000}, "partition")
+cache.set_cache("query1", {1, 1000, 10000, 100000}, "partition")
 
 # 2. List of integers  
-cache.set_set("query2", [1, 5, 10, 50], "partition")
+cache.set_cache("query2", [1, 5, 10, 50], "partition")
 
 # 3. BitMap directly
 rb = BitMap([1, 2, 3, 1000])
-cache.set_set("query3", rb, "partition")
+cache.set_cache("query3", rb, "partition")
 
 # 4. Bitarray conversion
 ba = bitarray(1000)
 ba.setall(0)
 ba[1] = ba[10] = ba[100] = 1
-cache.set_set("query4", ba, "partition")
+cache.set_cache("query4", ba, "partition")
 
 # Returns BitMap objects
 result = cache.get("query1", "partition")

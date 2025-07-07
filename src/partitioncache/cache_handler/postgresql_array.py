@@ -137,7 +137,7 @@ class PostgreSQLArrayCacheHandler(PostgreSQLAbstractCacheHandler):
                 logger.error(f"Failed to rollback transaction during table creation: {rollback_error}")
             raise
 
-    def _ensure_partition_table(self, partition_key: str, datatype: str) -> bool:
+    def _ensure_partition_table(self, partition_key: str, datatype: str, **kwargs) -> bool:
         """Ensure a partition table exists with the correct datatype."""
         existing_datatype = self._get_partition_datatype(partition_key)
 
@@ -149,43 +149,43 @@ class PostgreSQLArrayCacheHandler(PostgreSQLAbstractCacheHandler):
             raise ValueError(f"Partition key '{partition_key}' already exists with datatype '{existing_datatype}', cannot use datatype '{datatype}'")
         return True
 
-    def set_set(self, key: str, value: set[int] | set[str] | set[float] | set[datetime], partition_key: str = "partition_key") -> bool:
-        """Set the value of the given key in the cache for a specific partition key."""
-        if not value:
+    def set_cache(self, key: str, partition_key_identifiers: set[int] | set[str] | set[float] | set[datetime], partition_key: str = "partition_key") -> bool:
+        """Store partition key identifiers in the cache for a specific partition key (column)."""
+        if not partition_key_identifiers:
             return True
 
         try:
             # Try to get datatype from metadata
             datatype = self._get_partition_datatype(partition_key)
 
-            # Determine the datatype of the incoming value
-            sample = next(iter(value))
+            # Determine the datatype of the incoming partition key identifiers
+            sample = next(iter(partition_key_identifiers))
             if isinstance(sample, int):
-                value_datatype = "integer"
+                identifier_datatype = "integer"
             elif isinstance(sample, float):
-                value_datatype = "float"
+                identifier_datatype = "float"
             elif isinstance(sample, str):
-                value_datatype = "text"
+                identifier_datatype = "text"
             elif isinstance(sample, datetime):
-                value_datatype = "timestamp"
+                identifier_datatype = "timestamp"
             else:
-                logger.error(f"Unsupported value type: {type(sample)}")
+                logger.error(f"Unsupported partition key identifier type: {type(sample)}")
                 return False
 
             if datatype is None:
                 # Partition key is not set in metadata, so we use the inferred datatype
-                datatype = value_datatype
+                datatype = identifier_datatype
                 # Create the partition table with the inferred datatype
                 if not self._ensure_partition_table(partition_key, datatype):
                     return False
             else:
-                # Validate that the value datatype matches the existing partition datatype
-                if datatype != value_datatype:
-                    logger.error(f"Value datatype '{value_datatype}' does not match partition datatype '{datatype}' for partition '{partition_key}'")
+                # Validate that the identifier datatype matches the existing partition datatype
+                if datatype != identifier_datatype:
+                    logger.error(f"Identifier datatype '{identifier_datatype}' does not match partition datatype '{datatype}' for partition '{partition_key}'")
                     return False
 
             # Convert set to list for PostgreSQL array serialization
-            val = list(value)
+            val = list(partition_key_identifiers)
 
             # Get partition-specific table
             table_name = f"{self.tableprefix}_cache_{partition_key}"
@@ -195,10 +195,19 @@ class PostgreSQLArrayCacheHandler(PostgreSQLAbstractCacheHandler):
                 ).format(sql.Identifier(table_name)),
                 (key, val),
             )
+
+            # Also create entry in queries table for exists() method to work properly
+            self.cursor.execute(
+                sql.SQL(
+                    "INSERT INTO {0} (query_hash, partition_key, query) VALUES (%s, %s, %s) ON CONFLICT (query_hash, partition_key) DO UPDATE SET last_seen = now()"
+                ).format(sql.Identifier(self.tableprefix + "_queries")),
+                (key, partition_key, ""),  # Empty query text for cache entries
+            )
+
             self.db.commit()
             return True
         except Exception as e:
-            logger.error(f"Failed to set value for key {key} in partition {partition_key}: {e}")
+            logger.error(f"Failed to set cache for hash {hash} in partition {partition_key}: {e}")
             # Rollback the transaction to prevent "current transaction is aborted" error
             try:
                 self.db.rollback()
@@ -302,4 +311,3 @@ class PostgreSQLArrayCacheHandler(PostgreSQLAbstractCacheHandler):
         query = sql.SQL("SELECT {select} FROM {from_}").format(select=sql.SQL(", ").join(select_parts), from_=sql.SQL(", ").join(from_parts))
 
         return query
-

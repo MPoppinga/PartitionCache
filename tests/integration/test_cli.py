@@ -270,7 +270,7 @@ class TestCLIIntegration:
 
         # Add some test data to cache using unique keys
         cache_client.register_partition_key(test_partition, "integer")
-        cache_client.set_set(test_hash, {1, 2, 3}, test_partition)
+        cache_client.set_cache(test_hash, {1, 2, 3}, test_partition)
         cache_client.set_query(test_hash, f"SELECT * FROM test WHERE {test_partition} IN (1,2,3)", test_partition)
 
         # Test cache overview
@@ -350,7 +350,7 @@ class TestCLIIntegration:
         # Setup test data
         cache_client.register_partition_key(partition_key, "integer")
         test_query = f"SELECT * FROM locations WHERE {partition_key} IN (10,20,30)"
-        cache_client.set_set(hash_key, {10, 20, 30}, partition_key)
+        cache_client.set_cache(hash_key, {10, 20, 30}, partition_key)
         cache_client.set_query(hash_key, test_query, partition_key)
 
         if backend_type.startswith("rocksdb"):
@@ -492,10 +492,10 @@ class TestCLIIntegration:
         cache_client.register_partition_key(state_partition, "integer")
 
         # Add data to both partitions using unique keys
-        cache_client.set_set(city_hash, {1, 2, 3}, city_partition)
+        cache_client.set_cache(city_hash, {1, 2, 3}, city_partition)
         cache_client.set_query(city_hash, f"SELECT * FROM test WHERE {city_partition} IN (1,2,3)", city_partition)
 
-        cache_client.set_set(state_hash, {100, 200}, state_partition)
+        cache_client.set_cache(state_hash, {100, 200}, state_partition)
         cache_client.set_query(state_hash, f"SELECT * FROM test WHERE {state_partition} IN (100,200)", state_partition)
 
         # Create temporary export file

@@ -12,7 +12,7 @@ from typing import Any
 
 import networkx as nx  # type: ignore
 import sqlglot
-import sqlglot.expressions
+import sqlglot.expressions as exp
 import sqlglot.optimizer
 import sqlglot.optimizer.canonicalize
 import sqlglot.optimizer.normalize
@@ -63,7 +63,7 @@ def clean_query(query: str) -> str:
 
     # Remove ORDER BY and LIMIT clauses - they don't affect which partition keys are accessed
     # We need to process all SELECT statements (including subqueries)
-    for select_stmt in parsed.find_all(sqlglot.expressions.Select):
+    for select_stmt in parsed.find_all(exp.Select):
         # Remove ORDER BY
         if select_stmt.args.get("order"):
             select_stmt.set("order", None)
@@ -180,11 +180,11 @@ def extract_conjunctive_conditions(sql: str) -> list[str]:
     Returns all conjunctive conditions from a query.
     """
     parsed = sqlglot.parse_one(sql)
-    where_clause = parsed.find(sqlglot.expressions.Where)
+    where_clause = parsed.find(exp.Where)
     conditions = []
 
     def extract_conditions_from_expression(expression):
-        if isinstance(expression, sqlglot.expressions.And):
+        if isinstance(expression, exp.And):
             extract_conditions_from_expression(expression.left)
             extract_conditions_from_expression(expression.right)
         else:
@@ -265,7 +265,7 @@ def extract_and_group_query_conditions(
                 partition_key_joins[(min(left_alias, right_alias), max(left_alias, right_alias))].append(condition)
             continue  # Skip adding to other conditions
         elif condition.count(partition_key) >= 1 and (
-            sqlglot.parse_one(condition).find(sqlglot.expressions.In) or any(op in condition for op in ["BETWEEN", ">", "<", "=", "!=", "<>"])
+            sqlglot.parse_one(condition).find(exp.In) or any(op in condition for op in ["BETWEEN", ">", "<", "=", "!=", "<>"])
         ):
             # if partition_key is in condition, it is a partition key condition (IN, BETWEEN, comparison, etc.)
             # Preserve the full condition including NOT, BETWEEN, comparison operators
@@ -304,32 +304,32 @@ def extract_and_group_query_conditions(
         # if two table aliases are in the condition
         else:
             all_alias: set = set(re.findall(r"[a-zA-Z_]\w*(?=\.)", condition))
-            if sqlglot.parse_one(condition).find(sqlglot.expressions.Func):
+            if sqlglot.parse_one(condition).find(exp.Func):
                 if len(all_alias) == 2:
                     all_alias_list = sorted(all_alias)
                     distance_conditions[(all_alias_list[0], all_alias_list[1])].append(condition)
                     continue
                 else:
                     parsed = sqlglot.parse_one(condition)
-                    table_identifiers = tuple(sorted({col.table for col in parsed.find_all(sqlglot.expressions.Column) if col.table}))
+                    table_identifiers = tuple(sorted({col.table for col in parsed.find_all(exp.Column) if col.table}))
                     other_functions[table_identifiers].append(condition)
                     continue
 
-            elif sqlglot.parse_one(condition).find(sqlglot.expressions.Or):
+            elif sqlglot.parse_one(condition).find(exp.Or):
                 parsed = sqlglot.parse_one(condition)
-                table_identifiers = tuple(sorted({col.table for col in parsed.find_all(sqlglot.expressions.Column) if col.table}))
+                table_identifiers = tuple(sorted({col.table for col in parsed.find_all(exp.Column) if col.table}))
                 or_conditions[table_identifiers].append(condition)
                 continue
             else:
                 if len(all_alias) == 2:
                     # get all aliases with sqlglot
                     parsed = sqlglot.parse_one(condition)
-                    table_identifiers = tuple(sorted({col.table for col in parsed.find_all(sqlglot.expressions.Column) if col.table}))
+                    table_identifiers = tuple(sorted({col.table for col in parsed.find_all(exp.Column) if col.table}))
                     distance_conditions[(table_identifiers[0], table_identifiers[1])].append(condition)
                     continue
                 else:
                     parsed = sqlglot.parse_one(condition)
-                    table_identifiers = tuple(sorted({col.table for col in parsed.find_all(sqlglot.expressions.Column) if col.table}))
+                    table_identifiers = tuple(sorted({col.table for col in parsed.find_all(exp.Column) if col.table}))
                     other_functions[table_identifiers].append(condition)
                     continue
 
@@ -608,8 +608,8 @@ def generate_partial_queries(
     if not strip_select:
         try:
             parsed_query = sqlglot.parse_one(query)
-            if parsed_query and parsed_query.find(sqlglot.expressions.Select):
-                select_expr = parsed_query.find(sqlglot.expressions.Select)
+            if parsed_query and parsed_query.find(exp.Select):
+                select_expr = parsed_query.find(exp.Select)
                 if select_expr and select_expr.expressions:
                     # Extract SELECT expressions (columns) without the SELECT keyword
                     original_select_clause = ", ".join(expr.sql() for expr in select_expr.expressions)
@@ -1138,7 +1138,7 @@ def _add_constraints_to_query(query: str, add_constraints: dict[str, str]) -> st
 
         # Check if we have any of the target tables in the query
         has_target_table = False
-        for table in parsed.find_all(sqlglot.exp.Table):
+        for table in parsed.find_all(exp.Table):
             if table.name in add_constraints:
                 has_target_table = True
                 break
@@ -1147,7 +1147,7 @@ def _add_constraints_to_query(query: str, add_constraints: dict[str, str]) -> st
             return query
 
         # Find the main SELECT statement
-        select_stmt = parsed if isinstance(parsed, sqlglot.exp.Select) else parsed.find(sqlglot.exp.Select)
+        select_stmt = parsed if isinstance(parsed, exp.Select) else parsed.find(exp.Select)
         if not select_stmt:
             return query
 
@@ -1155,12 +1155,15 @@ def _add_constraints_to_query(query: str, add_constraints: dict[str, str]) -> st
         new_constraints = []
         for table_name, constraint in add_constraints.items():
             # Check if this table exists in the query
-            table_exists = any(table.name == table_name for table in parsed.find_all(sqlglot.exp.Table))
+            table_exists = any(table.name == table_name for table in parsed.find_all(exp.Table))
             if table_exists:
                 try:
                     # Parse the constraint as an expression
-                    constraint_expr = sqlglot.parse_one(f"SELECT * FROM t WHERE {constraint}").find(sqlglot.exp.Where).this
-                    new_constraints.append(constraint_expr)
+                    constraint_parsed = sqlglot.parse_one(f"SELECT * FROM t WHERE {constraint}")
+                    where_clause = constraint_parsed.find(exp.Where)
+                    if where_clause and where_clause.this:
+                        constraint_expr = where_clause.this
+                        new_constraints.append(constraint_expr)
                 except Exception as e:
                     logger.warning(f"Failed to parse constraint '{constraint}': {e}")
 
@@ -1174,8 +1177,8 @@ def _add_constraints_to_query(query: str, add_constraints: dict[str, str]) -> st
             # Combine with existing WHERE clause using AND
             combined_condition = existing_where.this
             for constraint_expr in new_constraints:
-                combined_condition = sqlglot.exp.And(this=combined_condition, expression=constraint_expr)
-            select_stmt.set("where", sqlglot.exp.Where(this=combined_condition))
+                combined_condition = exp.And(this=combined_condition, expression=constraint_expr)
+            select_stmt.set("where", exp.Where(this=combined_condition))
         else:
             # Create new WHERE clause
             if len(new_constraints) == 1:
@@ -1183,8 +1186,8 @@ def _add_constraints_to_query(query: str, add_constraints: dict[str, str]) -> st
             else:
                 where_condition = new_constraints[0]
                 for constraint_expr in new_constraints[1:]:
-                    where_condition = sqlglot.exp.And(this=where_condition, expression=constraint_expr)
-            select_stmt.set("where", sqlglot.exp.Where(this=where_condition))
+                    where_condition = exp.And(this=where_condition, expression=constraint_expr)
+            select_stmt.set("where", exp.Where(this=where_condition))
 
         return parsed.sql()
     except Exception as e:
@@ -1211,17 +1214,17 @@ def _remove_constraints_from_query(query: str, attributes_to_remove: list[str]) 
 
         # Function to check if an expression contains any of the attributes to remove
         def contains_attribute(expr, attrs):
-            for col in expr.find_all(sqlglot.exp.Column):
+            for col in expr.find_all(exp.Column):
                 if col.name in attrs:
                     return True
             return False
 
         # Process WHERE clause
-        select = parsed if isinstance(parsed, sqlglot.exp.Select) else parsed.find(sqlglot.exp.Select)
+        select = parsed if isinstance(parsed, exp.Select) else parsed.find(exp.Select)
         if select and select.args.get("where"):
             where = select.args["where"].this
 
-            if isinstance(where, sqlglot.exp.And):
+            if isinstance(where, exp.And):
                 # Filter out conditions that contain the attributes
                 new_conditions = []
                 for condition in where.flatten():
@@ -1231,13 +1234,13 @@ def _remove_constraints_from_query(query: str, attributes_to_remove: list[str]) 
                 if new_conditions:
                     # Rebuild the WHERE clause
                     if len(new_conditions) == 1:
-                        select.set("where", sqlglot.exp.Where(this=new_conditions[0]))
+                        select.set("where", exp.Where(this=new_conditions[0]))
                     else:
                         # Combine remaining conditions with AND
                         combined = new_conditions[0]
                         for cond in new_conditions[1:]:
-                            combined = sqlglot.exp.And(this=combined, expression=cond)
-                        select.set("where", sqlglot.exp.Where(this=combined))
+                            combined = exp.And(this=combined, expression=cond)
+                        select.set("where", exp.Where(this=combined))
                 else:
                     # Remove WHERE clause entirely if no conditions remain
                     select.set("where", None)

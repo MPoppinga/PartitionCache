@@ -142,7 +142,7 @@ class TestRocksDictCacheHandler:
 
         mock_rocksdict.__contains__.side_effect = mock_contains
 
-        assert cache_handler.exists("test_key") is True  # Default check_invalid_too=False
+        assert cache_handler.exists("test_key") is True  # Default check_query=False
 
     def test_exists_false_no_partition(self, cache_handler, mock_rocksdict):
         """Test exists returns False for non-existent partition."""
@@ -180,7 +180,7 @@ class TestRocksDictCacheHandler:
 
         keys = {"key1", "key2", "key3", "key4"}
         existing = cache_handler.filter_existing_keys(keys)
-        assert existing == {"key1", "key3"}  # Default check_invalid_too=False
+        assert existing == {"key1", "key3"}  # Default check_query=False
 
     def test_filter_existing_keys_no_partition(self, cache_handler, mock_rocksdict):
         """Test filtering keys with no partition."""
@@ -233,12 +233,12 @@ class TestRocksDictCacheHandler:
         assert result is None
         assert count == 0
 
-    def test_set_set_integer_new_partition(self, cache_handler, mock_rocksdict):
+    def test_set_cache_integer_new_partition(self, cache_handler, mock_rocksdict):
         """Test setting integer set with new partition."""
         test_set = {1, 2, 3}
         mock_rocksdict.get.return_value = None  # No existing partition
 
-        result = cache_handler.set_set("test_key", test_set)
+        result = cache_handler.set_cache("test_key", test_set)
         assert result is True
 
         # Verify metadata was set
@@ -246,51 +246,51 @@ class TestRocksDictCacheHandler:
         # Verify cache value was set
         mock_rocksdict.__setitem__.assert_any_call("cache:partition_key:test_key", test_set)
 
-    def test_set_set_float_existing_partition(self, cache_handler, mock_rocksdict):
+    def test_set_cache_float_existing_partition(self, cache_handler, mock_rocksdict):
         """Test setting float set with existing partition."""
         test_set = {1.1, 2.2, 3.3}
         mock_rocksdict.get.return_value = "float"  # Existing partition
 
-        result = cache_handler.set_set("test_key", test_set)
+        result = cache_handler.set_cache("test_key", test_set)
         assert result is True
         mock_rocksdict.__setitem__.assert_called_with("cache:partition_key:test_key", test_set)
 
-    def test_set_set_text(self, cache_handler, mock_rocksdict):
+    def test_set_cache_text(self, cache_handler, mock_rocksdict):
         """Test setting text set."""
         test_set = {"a", "b", "c"}
         mock_rocksdict.get.return_value = None
 
-        result = cache_handler.set_set("test_key", test_set)
+        result = cache_handler.set_cache("test_key", test_set)
         assert result is True
         mock_rocksdict.__setitem__.assert_any_call("_partition_metadata:partition_key", "text")
 
-    def test_set_set_timestamp(self, cache_handler, mock_rocksdict):
+    def test_set_cache_timestamp(self, cache_handler, mock_rocksdict):
         """Test setting timestamp set."""
         test_set = {datetime(2023, 1, 1), datetime(2023, 1, 2)}
         mock_rocksdict.get.return_value = None
 
-        result = cache_handler.set_set("test_key", test_set)
+        result = cache_handler.set_cache("test_key", test_set)
         assert result is True
         mock_rocksdict.__setitem__.assert_any_call("_partition_metadata:partition_key", "timestamp")
 
-    def test_set_set_unsupported_type(self, cache_handler, mock_rocksdict):
+    def test_set_cache_unsupported_type(self, cache_handler, mock_rocksdict):
         """Test setting unsupported type raises error."""
         test_set = {complex(1, 2)}
         mock_rocksdict.get.return_value = None
 
-        with pytest.raises(ValueError, match="Unsupported value type"):
-            cache_handler.set_set("test_key", test_set)
+        with pytest.raises(ValueError, match="Unsupported partition key identifier type"):
+            cache_handler.set_cache("test_key", test_set)
 
-    def test_set_set_type_mismatch(self, cache_handler, mock_rocksdict):
+    def test_set_cache_type_mismatch(self, cache_handler, mock_rocksdict):
         """Test setting value with mismatched datatype raises error."""
         test_set = {1, 2, 3}
         mock_rocksdict.get.return_value = "invalid_type"
 
         with pytest.raises(ValueError, match="Unsupported datatype in metadata"):
-            cache_handler.set_set("test_key", test_set)
+            cache_handler.set_cache("test_key", test_set)
 
-    def test_set_set_exception_handling(self, cache_handler, mock_rocksdict):
-        """Test set_set exception handling."""
+    def test_set_cache_exception_handling(self, cache_handler, mock_rocksdict):
+        """Test set_cache exception handling."""
         test_set = {1, 2, 3}
         mock_rocksdict.get.return_value = None
 
@@ -302,7 +302,7 @@ class TestRocksDictCacheHandler:
 
         mock_rocksdict.__setitem__.side_effect = side_effect_func
 
-        result = cache_handler.set_set("test_key", test_set)
+        result = cache_handler.set_cache("test_key", test_set)
         assert result is False
 
     def test_set_null_new_partition(self, cache_handler, mock_rocksdict):
@@ -479,7 +479,7 @@ class TestRocksDictCacheHandler:
         large_set = set(range(100000))
         mock_rocksdict.get.return_value = None
 
-        result = cache_handler.set_set("large_key", large_set)
+        result = cache_handler.set_cache("large_key", large_set)
         assert result is True
         mock_rocksdict.__setitem__.assert_any_call("cache:partition_key:large_key", large_set)
 
@@ -489,7 +489,7 @@ class TestRocksDictCacheHandler:
         test_set = {1, 2, 3}
         mock_rocksdict.get.return_value = None
 
-        result = cache_handler.set_set(unicode_key, test_set)
+        result = cache_handler.set_cache(unicode_key, test_set)
         assert result is True
         mock_rocksdict.__setitem__.assert_any_call(f"cache:partition_key:{unicode_key}", test_set)
 
@@ -499,7 +499,7 @@ class TestRocksDictCacheHandler:
         test_set = {1, 2, 3}
         mock_rocksdict.get.return_value = None
 
-        result = cache_handler.set_set(long_key, test_set)
+        result = cache_handler.set_cache(long_key, test_set)
         assert result is True
         mock_rocksdict.__setitem__.assert_any_call(f"cache:partition_key:{long_key}", test_set)
 
@@ -522,4 +522,4 @@ class TestRocksDictCacheHandler:
 
         # This should raise StopIteration when trying to get sample from empty set
         with pytest.raises(StopIteration):
-            cache_handler.set_set("empty_key", empty_set)
+            cache_handler.set_cache("empty_key", empty_set)

@@ -44,24 +44,24 @@ def cache_handler(mock_db, mock_cursor):
         return handler
 
 
-def test_set_set(cache_handler):
+def test_set_cache(cache_handler):
     cache_handler.cursor.fetchone.side_effect = [("integer",)]
-    cache_handler.set_set("key1", {1, 2, 3})
+    cache_handler.set_cache("key1", {1, 2, 3})
     assert cache_handler.cursor.execute.called
     cache_handler.db.commit.assert_called()
 
 
-def test_set_set_empty(cache_handler):
+def test_set_cache_empty(cache_handler):
     cache_handler.cursor.execute.reset_mock()
-    cache_handler.set_set("empty_key", set())
+    cache_handler.set_cache("empty_key", set())
     assert not cache_handler.cursor.execute.called
 
 
-def test_set_set_str_type(cache_handler):
+def test_set_cache_str_type(cache_handler):
     cache_handler.cursor.fetchone.side_effect = [("integer",)]
-    cache_handler.set_set("int_key", {1, 2, 3})
+    cache_handler.set_cache("int_key", {1, 2, 3})
     cache_handler.cursor.fetchone.side_effect = [("integer",)]
-    result = cache_handler.set_set("str_key", {"a", "b", "c"})
+    result = cache_handler.set_cache("str_key", {"a", "b", "c"})
     assert result is False
 
 
@@ -318,10 +318,10 @@ def test_get_intersected_lazy_no_existing_keys(cache_handler):
     assert count == 0
 
 
-def test_set_set_large_numbers(cache_handler):
+def test_set_cache_large_numbers(cache_handler):
     large_set = {1000000, 2000000, 3000000}
     cache_handler.cursor.fetchone.side_effect = [(None,)]  # No existing partition
-    cache_handler.set_set("large_key", large_set)
+    cache_handler.set_cache("large_key", large_set)
     found = False
     for call in cache_handler.cursor.execute.call_args_list:
         if "INSERT" in str(call) and "large_key" in str(call):
@@ -375,9 +375,9 @@ def test_delete_non_existent_key(cache_handler):
     cache_handler.db.commit.assert_called()
 
 
-def test_set_set_update_existing(cache_handler):
+def test_set_cache_update_existing(cache_handler):
     cache_handler.cursor.fetchone.side_effect = [("integer",)]
-    cache_handler.set_set("existing_key", {4, 5, 6})
+    cache_handler.set_cache("existing_key", {4, 5, 6})
     found = False
     for call in cache_handler.cursor.execute.call_args_list:
         if "INSERT" in str(call) and "existing_key" in str(call) and "ON CONFLICT" in str(call):
@@ -396,7 +396,7 @@ def test_database_connection_error():
 def test_very_long_key(cache_handler):
     long_key = "x" * 1000
     cache_handler.cursor.fetchone.side_effect = [(None,)]
-    cache_handler.set_set(long_key, {1, 2, 3})
+    cache_handler.set_cache(long_key, {1, 2, 3})
     found = False
     for call in cache_handler.cursor.execute.call_args_list:
         if "INSERT" in str(call) and long_key in str(call):
@@ -408,7 +408,7 @@ def test_very_long_key(cache_handler):
 def test_unicode_key(cache_handler):
     unicode_key = "测试键"
     cache_handler.cursor.fetchone.side_effect = [(None,)]
-    cache_handler.set_set(unicode_key, {1, 2, 3})
+    cache_handler.set_cache(unicode_key, {1, 2, 3})
     found = False
     for call in cache_handler.cursor.execute.call_args_list:
         if "INSERT" in str(call) and unicode_key in str(call):

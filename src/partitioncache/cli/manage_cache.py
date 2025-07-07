@@ -10,7 +10,6 @@ from tqdm import tqdm
 from partitioncache.cache_handler import get_cache_handler
 from partitioncache.cache_handler.abstract import AbstractCacheHandler
 from partitioncache.cache_handler.redis_abstract import RedisAbstractCacheHandler
-from partitioncache.cache_handler.redis_set import RedisCacheHandler
 from partitioncache.cli.common_args import add_environment_args, add_verbosity_args, configure_logging, load_environment_with_validation
 from partitioncache.queue import get_queue_lengths
 from partitioncache.queue_handler import get_queue_handler
@@ -311,7 +310,7 @@ def copy_cache(from_cache_type: str, to_cache_type: str, partition_key: str | No
                     if not to_cache.exists(key, current_partition_key):
                         value = from_cache.get(key, current_partition_key)
                         if value is not None:
-                            to_cache.set_set(key, value, current_partition_key)
+                            to_cache.set_cache(key, value, current_partition_key)
                             added += 1
                     else:
                         skipped += 1
@@ -544,7 +543,7 @@ def restore_cache(cache_type: str, archive_file: str, target_partition_key: str 
                         logger.warning(f"Could not register partition '{effective_partition_key}': {e}")
 
                     if not cache.exists(key, effective_partition_key):
-                        cache.set_set(key, value, effective_partition_key)
+                        cache.set_cache(key, value, effective_partition_key)
                         restored += 1
                     else:
                         skipped_already_exists += 1
@@ -577,7 +576,7 @@ def restore_cache(cache_type: str, archive_file: str, target_partition_key: str 
                         logger.warning(f"Could not auto-register partition: {e}")
 
                     if not cache.exists(key, partition_key):
-                        cache.set_set(key, value, partition_key)
+                        cache.set_cache(key, value, partition_key)
                         restored += 1
                     else:
                         skipped_already_exists += 1

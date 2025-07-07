@@ -6,7 +6,7 @@ Usage:
     partition_handler = PartitionCacheHandler(handler, "user_id", int)
 
     # Use without specifying partition_key repeatedly
-    partition_handler.set_set("key1", {1, 2, 3})
+    partition_handler.set_cache("key1", {1, 2, 3})
     result = partition_handler.get("key1")
 """
 
@@ -82,21 +82,21 @@ class PartitionCacheHelper:
         """Get the underlying cache handler."""
         return self._cache_handler
 
-    def set_set(self, key: str, value: DataSet) -> bool:
+    def set_cache(self, key: str, partition_key_identifiers: DataSet) -> bool:
         """
-        Store a set in the cache.
+        Store a set of partition key identifiers in the cache.
 
         Args:
-            key: The cache key
-            value: The set of values to store
+            key: The cache hash
+            partition_key_identifiers: The set of partition key identifiers to store
 
         Returns:
             bool: True if successful, False otherwise
         """
         try:
-            return self._cache_handler.set_set(key=key, value=value, partition_key=self._partition_key)
+            return self._cache_handler.set_cache(key=key, partition_key_identifiers=partition_key_identifiers, partition_key=self._partition_key)
         except Exception as e:
-            logger.error(f"Failed to set_set for key {key}: {e}")
+            logger.error(f"Failed to set_cache for key {key}: {e}")
             return False
 
     def get(self, key: str) -> DataSet | None:
@@ -118,18 +118,23 @@ class PartitionCacheHelper:
             logger.error(f"Failed to get key {key}: {e}")
             return None
 
-    def exists(self, key: str) -> bool:
+    def exists(self, key: str, check_query: bool = False) -> bool:
         """
         Check if a key exists in the cache.
 
         Args:
-            key: The cache key
+            key: The cache hash
+            check_query: If False, only check cache entry existence (fast).
+                        If True, check query metadata first:
+                        - If query doesn't exist: return False
+                        - If query exists with 'ok' status: also check cache entry exists
+                        - If query exists with 'timeout'/'failed' status: return True (no cache check)
 
         Returns:
             bool: True if exists, False otherwise
         """
         try:
-            return self._cache_handler.exists(key=key, partition_key=self._partition_key)
+            return self._cache_handler.exists(key=key, partition_key=self._partition_key, check_query=check_query)
         except Exception as e:
             logger.error(f"Failed to check existence of key {key}: {e}")
             return False
@@ -199,6 +204,29 @@ class PartitionCacheHelper:
             logger.error(f"Failed to set_query for key {key}: {e}")
             return False
 
+    def set_entry(self, key: str, partition_key_identifiers: DataSet, query_text: str, force_update: bool = False) -> bool:
+        """
+        High-level method that stores both cache data and query metadata.
+
+        This is the preferred way to populate the cache as it ensures both cache data
+        and query metadata are stored consistently.
+
+        Args:
+            key: The cache key (query hash)
+            partition_key_identifiers: The set of partition key identifiers to store
+            query_text: The SQL query text to store
+            force_update: If True, always update cache data.
+                         If False, only update metadata if cache entry exists.
+
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            return self._cache_handler.set_entry(key=key, partition_key_identifiers=partition_key_identifiers, query_text=query_text, partition_key=self._partition_key, force_update=force_update)
+        except Exception as e:
+            logger.error(f"Failed to set cache entry for key {key}: {e}")
+            return False
+
     def get_intersected(self, keys: set[str]) -> tuple[DataSet | None, int]:
         """
         Get intersection of multiple cache entries.
@@ -215,18 +243,23 @@ class PartitionCacheHelper:
             logger.error(f"Failed to get_intersected for keys {keys}: {e}")
             return None, 0
 
-    def filter_existing_keys(self, keys: set[str]) -> set[str]:
+    def filter_existing_keys(self, keys: set[str], check_query: bool = False) -> set[str]:
         """
         Filter keys to only those that exist in cache.
 
         Args:
-            keys: Set of keys to filter
+            keys: Set of hashes to filter
+            check_query: If False, only check cache entry existence (fast).
+                        If True, check query metadata first:
+                        - If query doesn't exist: exclude hash
+                        - If query exists with 'ok' status: also check cache entry exists
+                        - If query exists with 'timeout'/'failed' status: include hash (no cache check)
 
         Returns:
-            Set of existing keys
+            Set of existing hashes
         """
         try:
-            return self._cache_handler.filter_existing_keys(keys=keys, partition_key=self._partition_key)
+            return self._cache_handler.filter_existing_keys(keys=keys, partition_key=self._partition_key, check_query=check_query)
         except Exception as e:
             logger.error(f"Failed to filter_existing_keys: {e}")
             return set()
@@ -284,7 +317,7 @@ class PartitionCacheHelper:
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Context manager exit - only close if not a singleton."""
         # Don't close singleton instances as they may be reused
-        if getattr(self._cache_handler.__class__, '_instance', None) is None:
+        if getattr(self._cache_handler.__class__, "_instance", None) is None:
             self.close()
         return False
 

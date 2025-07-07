@@ -77,7 +77,7 @@ def cache_optimization_setup(cache_client, request):
         # Generate a simple hash for the query
         import hashlib
         cache_hash = hashlib.sha1(query.encode()).hexdigest()
-        cache_client.set_set(cache_hash, store_ids, partition_key)
+        cache_client.set_cache(cache_hash, store_ids, partition_key)
         if hasattr(cache_client, 'set_query'):
             cache_client.set_query(cache_hash, query, partition_key)
 

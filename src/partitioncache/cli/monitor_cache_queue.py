@@ -284,7 +284,7 @@ def run_and_store_query(query: str, query_hash: str, partition_key: str, partiti
             cache_handler.register_partition_key(partition_key, partition_datatype)
 
         # Always store with original hash and query (not the optimized version)
-        cache_handler.set_set(original_hash, result, partition_key)
+        cache_handler.set_cache(original_hash, result, partition_key)
         cache_handler.set_query(original_hash, original_query, partition_key)
         logger.debug(f"Stored {original_hash} in cache")
 
@@ -487,7 +487,7 @@ def fragment_executor():
                 logger.debug(f"Found fragment in fragment queue: {hash_value} for partition_key: {partition_key} (datatype: {partition_datatype})")
 
                 # Check if already in cache with valid status (unified approach)
-                if main_cache_handler.exists(hash_value, partition_key, check_invalid_too=False):
+                if main_cache_handler.exists(hash_value, partition_key, check_query=False):
                     logger.debug(f"Query {hash_value} already in cache with valid status")
                     main_cache_handler.set_query(hash_value, query, partition_key)  # update the query last_seen
                     continue

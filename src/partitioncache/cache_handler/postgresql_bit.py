@@ -105,7 +105,7 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
 
         self.db.commit()
 
-    def _ensure_partition_table(self, partition_key: str, datatype: str, **kwargs) -> None:
+    def _ensure_partition_table(self, partition_key: str, datatype: str, **kwargs) -> bool:
         """Ensure a partition table exists."""
         bitsize = kwargs.get("bitsize", self.default_bitsize)
         try:
@@ -130,13 +130,14 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
                 # Avoid infinite retry loops
                 self.db.rollback()
                 raise
+        return True
 
-    def set_set(self, key: str, value: set[int] | set[str] | set[float] | set[datetime], partition_key: str = "partition_key") -> bool:
+    def set_cache(self, key: str, partition_key_identifiers: set[int] | set[str] | set[float] | set[datetime], partition_key: str = "partition_key") -> bool:
         """
-        Set the value of the given key in the cache for a specific partition key.
+        Set the partition key identifiers of the given hash in the cache for a specific partition key.
         Only integer values are supported for bit arrays.
         """
-        if not value:
+        if not partition_key_identifiers:
             return True
 
         try:
@@ -150,13 +151,13 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
             bitsize = int(bitsize)
             val = bitarray(bitsize)
             val.setall(0)
-            for k in value:
+            for k in partition_key_identifiers:
                 if isinstance(k, int):
                     val[k] = 1
                 elif isinstance(k, str):
                     val[int(k)] = 1
                 else:
-                    raise ValueError(f"Only integer values are supported for bit arrays: {k} : {value}")
+                    raise ValueError(f"Only integer values are supported for bit arrays: {k} : {partition_key_identifiers}")
             table_name = f"{self.tableprefix}_cache_{partition_key}"
             self.cursor.execute(
                 sql.SQL(
@@ -164,10 +165,19 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
                 ).format(sql.Identifier(table_name)),
                 (key, val.to01()),
             )
+
+            # Also create entry in queries table for exists() method to work properly
+            self.cursor.execute(
+                sql.SQL(
+                    "INSERT INTO {0} (query_hash, partition_key, query) VALUES (%s, %s, %s) ON CONFLICT (query_hash, partition_key) DO UPDATE SET last_seen = now()"
+                ).format(sql.Identifier(self.tableprefix + "_queries")),
+                (key, partition_key, ""),  # Empty query text for cache entries
+            )
+
             self.db.commit()
             return True
         except Exception as e:
-            logger.error(f"Failed to set value for key {key} in partition {partition_key}: {e}")
+            logger.error(f"Failed to set partition key identifiers for hash {hash} in partition {partition_key}: {e}")
             # Rollback the transaction to prevent "current transaction is aborted" error
             try:
                 self.db.rollback()

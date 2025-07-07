@@ -285,7 +285,7 @@ graph TB
 classDiagram
     class AbstractCacheHandler {
         <<abstract>>
-        +set_set(key, value, partition_key="partition_key") bool
+        +set_cache(key, value, partition_key="partition_key") bool
         +set_null(key, partition_key="partition_key") bool
         +set_query(key, query, partition_key="partition_key") bool
         +get(key, partition_key="partition_key") set|None

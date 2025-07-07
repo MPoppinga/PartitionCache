@@ -181,7 +181,7 @@ def main():
                 # Execute query and store results
                 result = set(db_handler.execute(query))
                 if result:
-                    cache.set_set(hash_value, result)
+                    cache.set_cache(hash_value, result)
                     cache.set_query(hash_value, query)
                     logger.debug(f"Stored query {hash_value} with {len(result)} results")
                 else:

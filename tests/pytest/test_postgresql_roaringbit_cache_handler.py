@@ -59,13 +59,13 @@ class TestPostgreSQLRoaringBitCacheHandler:
         supported = PostgreSQLRoaringBitCacheHandler.get_supported_datatypes()
         assert supported == {"integer"}
 
-    def test_set_set_with_integer_set(self, cache_handler, mock_cursor):
+    def test_set_cache_with_integer_set(self, cache_handler, mock_cursor):
         """Test setting a set of integers."""
         # Mock partition datatype exists
         mock_cursor.fetchone.return_value = ("integer",)
 
         test_values = {1, 2, 3, 10, 100}
-        result = cache_handler.set_set("test_key", test_values, "test_partition")
+        result = cache_handler.set_cache("test_key", test_values, "test_partition")
 
         assert result is True
 
@@ -82,28 +82,28 @@ class TestPostgreSQLRoaringBitCacheHandler:
         assert insert_call is not None
         assert "test_key" in str(insert_call[0][1])
 
-    def test_set_set_with_string_integers(self, cache_handler, mock_cursor):
+    def test_set_cache_with_string_integers(self, cache_handler, mock_cursor):
         """Test setting a set of string integers."""
         # Mock partition datatype exists
         mock_cursor.fetchone.return_value = ("integer",)
 
         test_values = {"1", "2", "3", "10", "100"}
-        result = cache_handler.set_set("test_key", test_values, "test_partition")
+        result = cache_handler.set_cache("test_key", test_values, "test_partition")
 
         assert result is True
 
-    def test_set_set_with_roaringbitmap(self, cache_handler, mock_cursor):
+    def test_set_cache_with_roaringbitmap(self, cache_handler, mock_cursor):
         """Test setting a roaring bitmap directly."""
         # Mock partition datatype exists
         mock_cursor.fetchone.return_value = ("integer",)
 
         rb = BitMap([1, 2, 3, 10, 100])
 
-        result = cache_handler.set_set("test_key", rb, "test_partition")
+        result = cache_handler.set_cache("test_key", rb, "test_partition")
 
         assert result is True
 
-    def test_set_set_with_bitarray(self, cache_handler, mock_cursor):
+    def test_set_cache_with_bitarray(self, cache_handler, mock_cursor):
         """Test setting from a bitarray."""
         # Mock partition datatype exists
         mock_cursor.fetchone.return_value = ("integer",)
@@ -116,21 +116,21 @@ class TestPostgreSQLRoaringBitCacheHandler:
         ba[10] = 1
         ba[100] = 1
 
-        result = cache_handler.set_set("test_key", ba, "test_partition")
+        result = cache_handler.set_cache("test_key", ba, "test_partition")
 
         assert result is True
 
-    def test_set_set_with_list(self, cache_handler, mock_cursor):
+    def test_set_cache_with_list(self, cache_handler, mock_cursor):
         """Test setting from a list."""
         # Mock partition datatype exists
         mock_cursor.fetchone.return_value = ("integer",)
 
         test_values = [1, 2, 3, 10, 100]
-        result = cache_handler.set_set("test_key", test_values, "test_partition")
+        result = cache_handler.set_cache("test_key", test_values, "test_partition")
 
         assert result is True
 
-    def test_set_set_invalid_datatype(self, cache_handler, mock_cursor):
+    def test_set_cache_invalid_datatype(self, cache_handler, mock_cursor):
         """Test setting with invalid datatype raises error."""
         # Mock partition datatype exists
         mock_cursor.fetchone.return_value = ("integer",)
@@ -138,15 +138,15 @@ class TestPostgreSQLRoaringBitCacheHandler:
         test_values = {1.5, 2.7, 3.14}  # Floats should fail
 
         with pytest.raises(ValueError, match="Only integer values are supported"):
-            cache_handler.set_set("test_key", test_values, "test_partition")
+            cache_handler.set_cache("test_key", test_values, "test_partition")
 
-    def test_set_set_unsupported_value_type(self, cache_handler, mock_cursor):
+    def test_set_cache_unsupported_value_type(self, cache_handler, mock_cursor):
         """Test setting with unsupported value type."""
         # Mock partition datatype exists
         mock_cursor.fetchone.return_value = ("integer",)
 
-        with pytest.raises(ValueError, match="Unsupported value type"):
-            cache_handler.set_set("test_key", "not_a_valid_type", "test_partition")
+        with pytest.raises(ValueError, match="Unsupported partition key identifier type"):
+            cache_handler.set_cache("test_key", "not_a_valid_type", "test_partition")
 
     def test_get_existing_key(self, cache_handler, mock_cursor):
         """Test getting an existing key."""
@@ -246,11 +246,11 @@ class TestPostgreSQLRoaringBitCacheHandler:
         mock_cursor.fetchone.return_value = ("integer",)
 
         # Test empty set
-        result = cache_handler.set_set("test_key", set(), "test_partition")
+        result = cache_handler.set_cache("test_key", set(), "test_partition")
         assert result is True
 
         # Test empty list
-        result = cache_handler.set_set("test_key", [], "test_partition")
+        result = cache_handler.set_cache("test_key", [], "test_partition")
         assert result is True
 
     def test_database_error_handling(self, cache_handler, mock_cursor):
@@ -261,7 +261,7 @@ class TestPostgreSQLRoaringBitCacheHandler:
         # Mock database error
         mock_cursor.execute.side_effect = Exception("Database error")
 
-        result = cache_handler.set_set("test_key", {1, 2, 3}, "test_partition")
+        result = cache_handler.set_cache("test_key", {1, 2, 3}, "test_partition")
         assert result is False
 
     def test_create_partition_table(self, cache_handler, mock_cursor):

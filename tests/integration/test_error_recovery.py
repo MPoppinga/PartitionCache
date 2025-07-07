@@ -71,7 +71,7 @@ class TestErrorRecovery:
                 if hashes:
                     test_values = {1001, 1002}
                     for hash_key in hashes:
-                        success = cache_client.set_set(hash_key, test_values, partition_key)
+                        success = cache_client.set_cache(hash_key, test_values, partition_key)
                         # Operations may succeed or fail, but shouldn't crash
                         assert isinstance(success, bool)
 
@@ -87,7 +87,7 @@ class TestErrorRecovery:
         # Store valid data first
         valid_key = "valid_data"
         valid_set = {1001, 1002}
-        cache_client.set_set(valid_key, valid_set, partition_key)
+        cache_client.set_cache(valid_key, valid_set, partition_key)
 
         # Simulate corruption by attempting invalid operations
         corruption_scenarios = [
@@ -100,7 +100,7 @@ class TestErrorRecovery:
             try:
                 if corrupt_key is not None:
                     # These operations might fail, but shouldn't break the cache
-                    cache_client.set_set(corrupt_key, {9999}, partition_key)
+                    cache_client.set_cache(corrupt_key, {9999}, partition_key)
                     cache_client.get(corrupt_key, partition_key)
                     cache_client.exists(corrupt_key, partition_key)
             except Exception:
@@ -125,7 +125,7 @@ class TestErrorRecovery:
                 large_set = set(range(size))
 
                 # This might fail due to resource limits
-                success = cache_client.set_set(cache_key, large_set, partition_key)
+                success = cache_client.set_cache(cache_key, large_set, partition_key)
                 if success:
                     successful_operations += 1
                     # Verify we can retrieve it
@@ -160,7 +160,7 @@ class TestErrorRecovery:
                     if random.random() < 0.7:  # 70% valid operations
                         cache_key = f"worker_{worker_id}_{i}"
                         test_set = {worker_id * 1000 + i}
-                        if cache_client.set_set(cache_key, test_set, partition_key):
+                        if cache_client.set_cache(cache_key, test_set, partition_key):
                             results["successes"] += 1
                     else:  # 30% problematic operations
                         # Intentionally problematic operations
@@ -415,7 +415,7 @@ class TestSystemLevelErrors:
                 start_val = i * range_increment
                 large_set = set(range(start_val, start_val + set_size))
 
-                success = cache_client.set_set(cache_key, large_set, partition_key)
+                success = cache_client.set_cache(cache_key, large_set, partition_key)
                 if success:
                     large_entries.append(cache_key)
                 else:

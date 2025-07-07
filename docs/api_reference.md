@@ -290,9 +290,48 @@ Base class for all cache backends implementing the core interface.
 
 #### Core Methods
 
-##### `set_set(key: str, value: set[int] | set[str] | set[float] | set[datetime], partition_key: str = "partition_key") -> bool`
+##### `set_entry(key: str, partition_key_identifiers: set[int] | set[str] | set[float] | set[datetime], query_text: str, partition_key: str = "partition_key", force_update: bool = False) -> bool`
 
-Stores a set of partition keys in the cache.
+High-level method that atomically stores both cache data and query metadata.
+
+This is the **preferred way** to populate the cache as it ensures both cache data and query metadata are stored consistently in a single operation.
+
+**Parameters:**
+- `key` (str): Cache key (usually query hash)
+- `partition_key_identifiers` (Set): Set of partition key values to cache
+- `query_text` (str): SQL query text to store with the cache entry
+- `partition_key` (str): Partition identifier (default: "partition_key")
+- `force_update` (bool): If True, always update cache data. If False, only update metadata if cache entry exists (default: False)
+
+**Returns:**
+- `bool`: Success status
+
+**Example:**
+```python
+from partitioncache.query_processor import hash_query
+
+# Generate hash for query
+query = "SELECT * FROM restaurants WHERE rating > 4.0"
+query_hash = hash_query(query)
+
+# Store both cache data and query metadata atomically
+success = cache.set_entry(
+    key=query_hash,
+    partition_key_identifiers={1, 5, 10, 15, 20},
+    query_text=query,
+    partition_key="city_id"
+)
+
+# Later retrieve with full context
+cached_data = cache.get(query_hash, "city_id")
+cached_query = cache.get_query(query_hash, "city_id")
+```
+
+##### `set_cache(key: str, value: set[int] | set[str] | set[float] | set[datetime], partition_key: str = "partition_key") -> bool`
+
+Stores a set of partition keys in the cache (cache data only).
+
+**Note:** For most use cases, prefer `set_entry()` which also stores query metadata.
 
 **Parameters:**
 - `key` (str): Cache key (usually query hash)
@@ -304,8 +343,8 @@ Stores a set of partition keys in the cache.
 
 **Example:**
 ```python
-# Store partition keys for a query
-success = cache.set_set(
+# Store partition keys only (query metadata stored separately)
+success = cache.set_cache(
     key="restaurants_rating_4plus",
     value={1, 5, 10, 15, 20}
 )
@@ -422,7 +461,30 @@ High-level wrapper providing additional convenience methods and validation.
 
 #### Methods
 
-All `AbstractCacheHandler` methods are available on the helper, but without the `partition_key` parameter.
+All `AbstractCacheHandler` methods are available on the helper, but without the `partition_key` parameter since it uses the helper's default partition key.
+
+**Recommended methods:**
+- `set_entry(key, partition_key_identifiers, query_text, force_update=False)` - **Preferred** method for storing cache entries with query metadata
+- `get(key)` - Retrieve cached partition keys
+- `get_query(key)` - Retrieve query metadata
+- `exists(key, check_query=False)` - Check if entry exists
+
+**Example:**
+```python
+# Create helper with default partition key
+cache = partitioncache.create_cache_helper("postgresql_array", "user_id", "integer")
+
+from partitioncache.query_processor import hash_query
+
+# Store entry with query metadata (recommended)
+query = "SELECT * FROM orders WHERE status = 'pending'"
+query_hash = hash_query(query)
+cache.set_entry(query_hash, {1, 5, 10}, query)
+
+# Retrieve cache data and metadata
+user_ids = cache.get(query_hash)
+original_query = cache.get_query(query_hash)
+```
 
 ##### `register_partition_key(partition_key, datatype, **kwargs)`
 
@@ -436,7 +498,7 @@ cache.register_partition_key("timestamp_bucket", "timestamp")
 cache.register_partition_key("price_range", "float")
 
 # Use with different partitions
-cache.set_set("expensive_items", {99.99, 199.99}, partition_key="price_range")
+cache.set_cache("expensive_items", {99.99, 199.99}, partition_key="price_range")
 ```
 
 ## Query Processing Utilities
@@ -585,10 +647,18 @@ cache.register_partition_key("city_id", "integer")
 cache.register_partition_key("region_name", "text")  
 cache.register_partition_key("time_bucket", "timestamp")
 
-# Store data across partitions
-cache.set_set("spatial_query", {1, 5, 10}, partition_key="city_id")
-cache.set_set("temporal_query", {"2024-01", "2024-02"}, partition_key="time_bucket")
-cache.set_set("regional_query", {"north", "south"}, partition_key="region_name")
+# Store data across partitions (recommended: use set_entry with query text)
+from partitioncache.query_processor import hash_query
+
+# Best practice: store with query metadata
+spatial_query = "SELECT * FROM locations WHERE city_id IN (1,5,10)"
+cache.set_entry(hash_query(spatial_query), {1, 5, 10}, spatial_query, partition_key="city_id")
+
+temporal_query = "SELECT * FROM events WHERE time_bucket IN ('2024-01','2024-02')"  
+cache.set_entry(hash_query(temporal_query), {"2024-01", "2024-02"}, temporal_query, partition_key="time_bucket")
+
+regional_query = "SELECT * FROM regions WHERE region_name IN ('north','south')"
+cache.set_entry(hash_query(regional_query), {"north", "south"}, regional_query, partition_key="region_name")
 
 # Query across partitions
 for partition_key, datatype in cache.get_partition_keys():
@@ -663,7 +733,7 @@ def batch_cache_population(queries_and_results, cache, partition_key):
         query_hash = hash_query(query)
         
         # Store in cache
-        if cache.set_set(query_hash, partition_keys, partition_key):
+        if cache.set_cache(query_hash, partition_keys, partition_key):
             success_count += 1
     
     print(f"Batch population: {success_count}/{len(queries_and_results)} successful")

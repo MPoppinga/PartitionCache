@@ -54,7 +54,7 @@ class RocksDBAbstractCacheHandler(AbstractCacheHandler):
         #    block_cache_compressed=compressed_cache,
         # )
 
-    def exists(self, key: str, partition_key: str = "partition_key", check_invalid_too: bool = False) -> bool:
+    def exists(self, key: str, partition_key: str = "partition_key", check_query: bool = False) -> bool:
         """
         Returns True if the key exists in the partition-specific cache, otherwise False.
         """
@@ -63,25 +63,26 @@ class RocksDBAbstractCacheHandler(AbstractCacheHandler):
         if datatype is None:
             return False
 
-        cache_key = self._get_cache_key(key, partition_key)
-        cache_exists = self.db.get(cache_key.encode()) is not None
+        if not check_query:
+            # Fast mode: Check cache existence only
+            cache_key = self._get_cache_key(key, partition_key)
+            return self.db.get(cache_key.encode()) is not None
+        else:
+            # Query mode: Check query metadata first
+            query_status = self.get_query_status(key, partition_key)
+            if query_status is None:
+                return False  # No query -> False
+            elif query_status == "ok":
+                # Query OK -> also check cache entry exists
+                cache_key = self._get_cache_key(key, partition_key)
+                return self.db.get(cache_key.encode()) is not None
+            else:  # timeout or failed
+                return True  # Query has error status -> True (no cache check)
 
-        if not check_invalid_too:
-            return cache_exists
-
-        # For check_invalid_too=True, check if termination bits exist
-        limit_key = self._get_cache_key(f"_LIMIT_{key}", partition_key)
-        timeout_key = self._get_cache_key(f"_TIMEOUT_{key}", partition_key)
-
-        # If either termination bit exists, the result is invalid
-        has_limit_bit = self.db.get(limit_key.encode()) is not None
-        has_timeout_bit = self.db.get(timeout_key.encode()) is not None
-
-        return cache_exists or has_limit_bit or has_timeout_bit
-
-    def filter_existing_keys(self, keys: set, partition_key: str = "partition_key", check_invalid_too: bool = False) -> set:
+    def filter_existing_keys(self, keys: set, partition_key: str = "partition_key", check_query: bool = False) -> set:
         """
         Checks in RocksDB which of the keys exists in cache and returns the set of existing keys.
+        For RocksDB, this checks cache existence and optionally query metadata.
         """
         # Check if partition exists
         datatype = self._get_partition_datatype(partition_key)
@@ -90,23 +91,23 @@ class RocksDBAbstractCacheHandler(AbstractCacheHandler):
 
         existing_keys = set()
         for key in keys:
-            cache_key = self._get_cache_key(key, partition_key)
-            cache_exists = self.db.get(cache_key.encode()) is not None
-
-            if not check_invalid_too:
-                if cache_exists:
+            if not check_query:
+                # Fast mode: Check cache existence only
+                cache_key = self._get_cache_key(key, partition_key)
+                if self.db.get(cache_key.encode()) is not None:
                     existing_keys.add(key)
-                continue
-
-            # For check_invalid_too=True, check also if termination bits exist
-            limit_key = self._get_cache_key(f"_LIMIT_{key}", partition_key)
-            timeout_key = self._get_cache_key(f"_TIMEOUT_{key}", partition_key)
-
-            has_limit_bit = self.db.get(limit_key.encode()) is not None
-            has_timeout_bit = self.db.get(timeout_key.encode()) is not None
-
-            if cache_exists or has_limit_bit or has_timeout_bit:
-                existing_keys.add(key)
+            else:
+                # Query mode: Check query status first
+                query_status = self.get_query_status(key, partition_key)
+                if query_status is None:
+                    continue  # No query -> exclude key
+                elif query_status == "ok":
+                    # Query OK -> also check cache entry exists
+                    cache_key = self._get_cache_key(key, partition_key)
+                    if self.db.get(cache_key.encode()) is not None:
+                        existing_keys.add(key)
+                else:  # timeout or failed
+                    existing_keys.add(key)  # Query has error status -> include key
 
         return existing_keys
 
@@ -260,7 +261,7 @@ class RocksDBAbstractCacheHandler(AbstractCacheHandler):
         """Set the status of a query using termination bits for RocksDB backend."""
         try:
             # Valid statuses
-            valid_statuses = {'ok', 'timeout', 'failed'}
+            valid_statuses = {"ok", "timeout", "failed"}
             if status not in valid_statuses:
                 raise ValueError(f"Invalid status '{status}'. Must be one of: {valid_statuses}")
 

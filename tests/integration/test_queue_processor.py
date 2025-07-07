@@ -343,7 +343,7 @@ class TestQueueProcessor:
         first_hash = list(hashes)[0]
 
         # Test cache population with single hash
-        cache_client.set_set(first_hash, actual_zipcodes, partition_key)
+        cache_client.set_cache(first_hash, actual_zipcodes, partition_key)
 
         # Verify cache was populated
         cached_values = cache_client.get(first_hash, partition_key)
@@ -423,7 +423,7 @@ class TestQueueProcessor:
                 # Simulate cache population with dummy data
                 first_hash = list(hashes)[0]
                 test_values = {1001, 1002}  # Dummy partition values
-                cache_client.set_set(first_hash, test_values, partition_key_from_queue)
+                cache_client.set_cache(first_hash, test_values, partition_key_from_queue)
 
                 # Verify cache was populated
                 cached_values = cache_client.get(first_hash, partition_key_from_queue)

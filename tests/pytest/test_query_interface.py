@@ -342,7 +342,7 @@ class TestQueryInterfaceIntegration:
         rocksdict_handler.db.get.side_effect = mock_get
 
         # Set cache data and query
-        rocksdict_handler.set_set(query_hash, cache_data, partition_key)
+        rocksdict_handler.set_cache(query_hash, cache_data, partition_key)
         rocksdict_handler.set_query(query_hash, query_text, partition_key)
 
         # Verify both are stored correctly

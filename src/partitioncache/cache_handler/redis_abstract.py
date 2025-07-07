@@ -71,7 +71,7 @@ class RedisAbstractCacheHandler(AbstractCacheHandler):
         """Get the Redis key for a cache entry with partition key namespace."""
         return f"cache:{partition_key}:{key}"
 
-    def exists(self, key: str, partition_key: str = "partition_key", check_invalid_too: bool = False) -> bool:
+    def exists(self, key: str, partition_key: str = "partition_key", check_query: bool = False) -> bool:
         """
         Returns True if the key exists in the partition-specific cache, otherwise False.
         """
@@ -80,22 +80,21 @@ class RedisAbstractCacheHandler(AbstractCacheHandler):
         if datatype is None:
             return False
 
-        cache_key = self._get_cache_key(key, partition_key)
-        cache_exists = self.db.exists(cache_key) != 0
-
-
-        if not check_invalid_too:
-            return cache_exists
-
-        # For check_invalid_too=False, check that termination bits don't exist (only valid entries)
-        limit_key = self._get_cache_key(f"_LIMIT_{key}", partition_key)
-        timeout_key = self._get_cache_key(f"_TIMEOUT_{key}", partition_key)
-
-        # If either termination bit exists, the result is invalid
-        has_limit_bit = self.db.exists(limit_key) != 0
-        has_timeout_bit = self.db.exists(timeout_key) != 0
-
-        return cache_exists or has_limit_bit or has_timeout_bit
+        if not check_query:
+            # Fast mode: Check cache existence only
+            cache_key = self._get_cache_key(key, partition_key)
+            return self.db.exists(cache_key) != 0
+        else:
+            # Query mode: Check query metadata first
+            query_status = self.get_query_status(key, partition_key)
+            if query_status is None:
+                return False  # No query -> False
+            elif query_status == "ok":
+                # Query OK -> also check cache entry exists
+                cache_key = self._get_cache_key(key, partition_key)
+                return self.db.exists(cache_key) != 0
+            else:  # timeout or failed
+                return True  # Query has error status -> True (no cache check)
 
     def set_null(self, key: str, partition_key: str = "partition_key") -> bool:
         """Set null value in partition-specific cache."""
@@ -279,7 +278,7 @@ class RedisAbstractCacheHandler(AbstractCacheHandler):
         """Set the status of a query using termination bits for Redis backend."""
         try:
             # Valid statuses
-            valid_statuses = {'ok', 'timeout', 'failed'}
+            valid_statuses = {"ok", "timeout", "failed"}
             if status not in valid_statuses:
                 raise ValueError(f"Invalid status '{status}'. Must be one of: {valid_statuses}")
 
@@ -351,18 +350,18 @@ class RedisAbstractCacheHandler(AbstractCacheHandler):
         except Exception:
             return None
 
-    def filter_existing_keys(self, keys: set, partition_key: str = "partition_key", check_invalid_too: bool = False) -> set:
+    def filter_existing_keys(self, keys: set, partition_key: str = "partition_key", check_query: bool = False) -> set:
         """
         Filter and return the set of keys that exist in the cache.
-        For Redis, this checks both cache existence and termination bits when check_invalid_too=False.
+        For Redis, this checks cache existence and optionally query metadata.
         """
         # Check if partition exists
         datatype = self._get_partition_datatype(partition_key)
         if datatype is None:
             return set()
 
-        if not check_invalid_too:
-            # Only valid entries - just check cache existence
+        if not check_query:
+            # Fast mode: Check cache existence only
             pipe = self.db.pipeline()
             cache_keys = [self._get_cache_key(key, partition_key) for key in keys]
             for cache_key in cache_keys:
@@ -375,33 +374,19 @@ class RedisAbstractCacheHandler(AbstractCacheHandler):
                     existing_keys.add(key)
             return existing_keys
         else:
-            # Include both valid and invalid entries - check cache existence AND validate status
-            pipe = self.db.pipeline()
-            cache_keys = [self._get_cache_key(key, partition_key) for key in keys]
-            limit_keys = [self._get_cache_key(f"_LIMIT_{key}", partition_key) for key in keys]
-            timeout_keys = [self._get_cache_key(f"_TIMEOUT_{key}", partition_key) for key in keys]
-
-            # Check existence of cache keys
-            for cache_key in cache_keys:
-                pipe.exists(cache_key)
-            # Check existence of termination bits
-            for limit_key in limit_keys:
-                pipe.exists(limit_key)
-            for timeout_key in timeout_keys:
-                pipe.exists(timeout_key)
-
-            results = pipe.execute()
-
-            # Split results
-            num_keys = len(keys)
-            cache_existence = results[:num_keys]
-            limit_existence = results[num_keys:2*num_keys]
-            timeout_existence = results[2*num_keys:3*num_keys]
-
+            # Query mode: Check each key's query status
             existing_keys = set()
-            for key, cache_exists, has_limit, has_timeout in zip(keys, cache_existence, limit_existence, timeout_existence, strict=False):
-                if cache_exists or has_limit or has_timeout:
-                    existing_keys.add(key)
+            for key in keys:
+                query_status = self.get_query_status(key, partition_key)
+                if query_status is None:
+                    continue  # No query -> exclude key
+                elif query_status == "ok":
+                    # Query OK -> also check cache entry exists
+                    cache_key = self._get_cache_key(key, partition_key)
+                    if self.db.exists(cache_key):
+                        existing_keys.add(key)
+                else:  # timeout or failed
+                    existing_keys.add(key)  # Query has error status -> include key
 
             return existing_keys
 

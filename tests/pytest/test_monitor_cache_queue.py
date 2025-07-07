@@ -185,7 +185,7 @@ class TestRunAndStoreQuery:
                 delattr(mcq_module, "args")
 
         assert result is True
-        mock_cache.set_set.assert_called_once_with("test_hash", {1, 2, 3}, "test_partition_key")
+        mock_cache.set_cache.assert_called_once_with("test_hash", {1, 2, 3}, "test_partition_key")
         mock_db.close.assert_called_once()
 
     @patch("partitioncache.cli.monitor_cache_queue.get_cache_handler")
@@ -218,7 +218,7 @@ class TestRunAndStoreQuery:
 
         assert result is True
         mock_cache.set_query_status.assert_called_once_with("test_hash", "test_partition_key", "failed")
-        mock_cache.set_set.assert_not_called()
+        mock_cache.set_cache.assert_not_called()
 
     @patch("partitioncache.cli.monitor_cache_queue.get_cache_handler")
     @patch("partitioncache.cli.monitor_cache_queue.get_db_handler")
@@ -436,7 +436,7 @@ class TestFragmentExecutorComponents:
                                     else:
                                         delattr(mcq_module, "args")
 
-                                mock_cache.exists.assert_called_with("cached_hash", "test_partition_key", check_invalid_too=False)
+                                mock_cache.exists.assert_called_with("cached_hash", "test_partition_key", check_query=False)
 
 
 class TestIntegration:
