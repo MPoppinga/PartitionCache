@@ -137,7 +137,7 @@ def apply_cache_optimization(query: str, query_hash: str, partition_key: str, pa
     """
     stats = {"total_hashes": 0, "cache_hits": 0, "method_used": None}
 
-    if not args.enable_cache_optimization:
+    if not args.enable_cache_optimization or args.disable_cache_optimization:
         return query, False, stats
 
     try:
@@ -239,7 +239,7 @@ def run_and_store_query(query: str, query_hash: str, partition_key: str, partiti
         optimization_applied = False
         optimization_stats = {}
 
-        if args.enable_cache_optimization:
+        if args.enable_cache_optimization and not args.disable_cache_optimization:
             query_to_execute, optimization_applied, optimization_stats = apply_cache_optimization(
                 query, query_hash, partition_key, partition_datatype, cache_handler, args
             )
@@ -575,6 +575,9 @@ def main():
         "--enable-cache-optimization", action="store_true", default=True, help="Enable cache-aware optimization for fragment queries"
     )
     optimization_group.add_argument(
+        "--disable-cache-optimization", action="store_true", default=False, help="Disable cache-aware optimization for fragment queries"
+    )
+    optimization_group.add_argument(
         "--cache-optimization-method",
         type=str,
         default="IN",
@@ -657,7 +660,7 @@ def main():
     else:
         logger.info("- Using optimized polling with blocking queue operations")
 
-    if args.enable_cache_optimization:
+    if args.enable_cache_optimization and not args.disable_cache_optimization:
         logger.info("- Cache optimization ENABLED:")
         logger.info(f"  - Method: {args.cache_optimization_method}")
         logger.info(f"  - Min cache hits: {args.min_cache_hits}")

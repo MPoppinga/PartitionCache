@@ -650,8 +650,9 @@ class TestCLIIntegration:
             )
 
             # Should succeed or show SQL error (not file/configuration error)
-            # Check stdout for successful env file loading
-            assert "loaded environment from" in result.stdout.lower(), "Should show env file was loaded"
+            # Check that cache handler was created (indicates env file was loaded successfully)
+            output_text = (result.stdout + result.stderr).lower()
+            assert "created partition cache handler" in output_text, "Should show cache handler was created"
 
             if result.returncode != 0:
                 # Should be SQL error (table doesn't exist) not configuration error

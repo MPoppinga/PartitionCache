@@ -519,6 +519,7 @@ class TestCacheOptimization:
     def test_apply_cache_optimization_lazy_with_hits(self, mock_get_lazy, mock_args):
         """Test lazy optimization when cache hits are found."""
         mock_args.enable_cache_optimization = True
+        mock_args.disable_cache_optimization = False
         mock_args.prefer_lazy_optimization = True
         mock_args.cache_optimization_method = "IN_SUBQUERY"
         mock_args.min_component_size = 2
@@ -561,6 +562,7 @@ class TestCacheOptimization:
     def test_apply_cache_optimization_standard_with_hits(self, mock_get_keys, mock_args):
         """Test standard optimization when cache hits are found."""
         mock_args.enable_cache_optimization = True
+        mock_args.disable_cache_optimization = False
         mock_args.prefer_lazy_optimization = False
         mock_args.cache_optimization_method = "IN"
         mock_args.min_cache_hits = 2
@@ -601,6 +603,7 @@ class TestCacheOptimization:
     def test_apply_cache_optimization_below_threshold(self, mock_get_keys, mock_args):
         """Test that optimization is not applied when hits are below threshold."""
         mock_args.enable_cache_optimization = True
+        mock_args.disable_cache_optimization = False
         mock_args.prefer_lazy_optimization = False
         mock_args.min_cache_hits = 5
         mock_args.min_component_size = 2
@@ -630,6 +633,7 @@ class TestCacheOptimization:
     def test_apply_cache_optimization_exception_handling(self, mock_get_lazy, mock_args):
         """Test that exceptions are handled gracefully."""
         mock_args.enable_cache_optimization = True
+        mock_args.disable_cache_optimization = False
         mock_args.prefer_lazy_optimization = True
         mock_args.min_component_size = 2
         mock_args.follow_graph = True

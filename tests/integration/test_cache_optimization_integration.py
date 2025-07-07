@@ -91,8 +91,8 @@ def cache_optimization_setup(cache_client, request):
 class TestCacheOptimizationIntegration:
     """Integration tests for cache optimization in pcache-monitor."""
 
-    def test_cache_optimization_disabled_by_default(self, cache_optimization_setup):
-        """Test that cache optimization is disabled by default."""
+    def test_cache_optimization_enabled_by_default(self, cache_optimization_setup):
+        """Test that cache optimization is enabled by default."""
         cache_client, partition_key = cache_optimization_setup
         print(f"DEBUG: Test is running with cache_client={cache_client}")
 
@@ -106,12 +106,45 @@ class TestCacheOptimizationIntegration:
 
         push_to_original_query_queue(test_query, partition_key, "integer")
 
-        # Run monitor without cache optimization (should be disabled by default)
+        # Run monitor without explicit optimization flag (should be enabled by default)
         with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False) as log_file:
             try:
                 # Run for a short time to process the query
                 result = subprocess.run(
                     ["pcache-monitor", "--max-processes", "1", "--close", "--status-log-interval", "1"], capture_output=True, text=True, timeout=30
+                )
+
+                # Check that cache optimization was enabled in logs
+                assert "Cache optimization ENABLED" in result.stderr
+
+            except subprocess.TimeoutExpired:
+                pass  # Expected for monitor processes
+            finally:
+                if os.path.exists(log_file.name):
+                    os.unlink(log_file.name)
+
+    def test_cache_optimization_can_be_disabled(self, cache_optimization_setup):
+        """Test that cache optimization can be explicitly disabled."""
+        cache_client, partition_key = cache_optimization_setup
+        print(f"DEBUG: Test is running with cache_client={cache_client}")
+
+        # Add a test query to the queue
+        test_query = """
+        SELECT store_id, SUM(revenue) as total_revenue
+        FROM sales
+        WHERE city_id = 10 AND product_category = 'electronics'
+        GROUP BY store_id
+        """
+
+        push_to_original_query_queue(test_query, partition_key, "integer")
+
+        # Run monitor with cache optimization explicitly disabled
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False) as log_file:
+            try:
+                # Run for a short time to process the query - explicitly disable optimization
+                result = subprocess.run(
+                    ["pcache-monitor", "--max-processes", "1", "--close", "--status-log-interval", "1", "--disable-cache-optimization"],
+                    capture_output=True, text=True, timeout=30
                 )
 
                 # Check that cache optimization was not mentioned in logs

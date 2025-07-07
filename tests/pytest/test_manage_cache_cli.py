@@ -501,6 +501,7 @@ class TestCLITimeoutProtection:
                 mock_handler.__class__ = RocksDBAbstractCacheHandler
                 mock_handler.db.iterkeys.return_value = iter(["key1", "key2"])
                 mock_handler.close.return_value = None
+                mock_handler.get_partition_keys.return_value = ["test_partition"]
                 return mock_handler
 
         with patch("partitioncache.cli.manage_cache.get_cache_handler", side_effect=mock_get_cache_handler_side_effect):
