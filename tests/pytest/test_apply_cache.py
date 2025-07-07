@@ -3,7 +3,7 @@ Tests for the apply_cache module, specifically extend_query_with_partition_keys 
 """
 
 from datetime import datetime
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
 import pytest
 
@@ -611,14 +611,8 @@ class TestApplyCacheLazy:
 
         return mock_handler
 
-    @patch("partitioncache.apply_cache.isinstance")
-    def test_no_cache_hits_returns_original_query(self, mock_isinstance):
+    def test_no_cache_hits_returns_original_query(self):
         """Test that function returns original query when no cache hits."""
-        # Make isinstance return True for AbstractCacheHandler_Lazy
-        mock_isinstance.side_effect = lambda obj, cls: cls.__name__ == "AbstractCacheHandler_Lazy" or isinstance(
-            obj, cls.__bases__[0] if hasattr(cls, "__bases__") and cls.__bases__ else object
-        )
-
         query = "SELECT * FROM users AS u WHERE u.active = true"
         mock_handler = self.create_mock_cache_handler(lazy_subquery=None, used_hashes=0)
 

@@ -156,15 +156,17 @@ class TestManualQueueProcessor:
             success = self._queue_query_as_fragments(query, partition_key, "integer")
             assert success, f"Failed to queue fragments for query: {query}"
 
-        # Request processing of 10 items (but only 2 available)
+        # Request processing of 10 items (but limited by available fragments)
         with db_session.cursor() as cur:
             cur.execute("SELECT * FROM partitioncache_manual_process_queue(10)")
             result = cur.fetchone()
 
             processed_count = result[0]
 
-            # Should process only the 2 available items
-            assert processed_count <= len(test_queries), f"Should process at most {len(test_queries)} items, processed {processed_count}"
+            # Should process the available query fragments
+            # Note: 2 queries generate 3 unique fragments (1 shared base query + 2 specific queries)
+            expected_max_fragments = len(test_queries) + 1  # Base query is shared, so +1 for the common fragment
+            assert processed_count <= expected_max_fragments, f"Should process at most {expected_max_fragments} items, processed {processed_count}"
 
     def test_manual_processing_different_partitions(self, db_session, manual_queue_processor):
         """Test manual processing with queries for different partition keys."""

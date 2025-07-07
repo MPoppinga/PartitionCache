@@ -900,7 +900,20 @@ def generate_partial_queries(
             sub = sub.strip()
             ret.append(sub)
 
-    return [sqlglot.optimizer.simplify.simplify(sqlglot.parse_one(q)).sql() for q in ret]  # TODO test if this is needed
+    # Process each query with sqlglot, skipping non-SQL fragments
+    result = []
+    for q in ret:
+        try:
+            parsed = sqlglot.parse_one(q)
+            simplified = sqlglot.optimizer.simplify.simplify(parsed)
+            sql_result = simplified.sql()
+            result.append(sql_result)
+        except Exception:
+            # If parsing fails, skip this fragment
+            logger.error(f"Failed to parse query: {q}")
+            continue
+
+    return result
 
 
 def is_distance_function(condition: str) -> bool:
