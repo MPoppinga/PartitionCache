@@ -5,10 +5,9 @@ Tests the new --max-pending-jobs functionality and queue consumption control.
 """
 
 import os
+from unittest.mock import patch
+
 import pytest
-import threading
-import time
-from unittest.mock import patch, MagicMock
 
 # Import the module under test
 from partitioncache.cli.monitor_cache_queue import (
@@ -45,11 +44,11 @@ class TestQueueConsumptionLogic:
         timeout1 = get_timeout_for_state(can_consume=False, exit_event_set=False, error_count=1)
         timeout2 = get_timeout_for_state(can_consume=False, exit_event_set=False, error_count=2)
         timeout3 = get_timeout_for_state(can_consume=False, exit_event_set=False, error_count=3)
-        
+
         assert timeout1 == 1.0, "First error should use base timeout"
         assert timeout2 == 2.0, "Second error should double timeout"
         assert timeout3 == 4.0, "Third error should continue exponential backoff"
-        
+
         # Test maximum backoff
         timeout_max = get_timeout_for_state(can_consume=False, exit_event_set=False, error_count=10)
         assert timeout_max == 5.0, "Should cap at maximum backoff time"
@@ -58,15 +57,15 @@ class TestQueueConsumptionLogic:
         """Test enhanced status logging with queue sizes and waiting reasons."""
         import logging
         caplog.set_level(logging.INFO, logger="PartitionCache")
-        
+
         queue_lengths = {
             "original_query_queue": 15,
             "query_fragment_queue": 25
         }
-        
+
         # Test with waiting reason
         print_enhanced_status(5, 10, queue_lengths, "Waiting for thread capacity")
-        
+
         # Check log message contains all expected information
         assert len(caplog.records) > 0, "Should have captured log message"
         log_message = caplog.records[-1].message
@@ -80,15 +79,15 @@ class TestQueueConsumptionLogic:
         """Test enhanced status logging without waiting reason."""
         import logging
         caplog.set_level(logging.INFO, logger="PartitionCache")
-        
+
         queue_lengths = {
             "original_query_queue": 0,
             "query_fragment_queue": 5
         }
-        
+
         # Test without waiting reason
         print_enhanced_status(2, 3, queue_lengths, None)
-        
+
         assert len(caplog.records) > 0, "Should have captured log message"
         log_message = caplog.records[-1].message
         assert "Active: 2" in log_message
@@ -111,30 +110,30 @@ class TestPendingJobProcessing:
     def test_pending_job_processing_logic(self):
         """Test the conceptual logic of pending job processing."""
         # Test the logic conceptually without complex mocking
-        
+
         # Scenario 1: No pending jobs
         pending_jobs_empty = []
         active_futures_count = 5
         max_processes = 10
-        
+
         # Should not process when no pending jobs
         can_process = bool(pending_jobs_empty) and (active_futures_count < max_processes)
         assert can_process is False, "Should not process when no pending jobs"
-        
+
         # Scenario 2: Has pending jobs and capacity
         pending_jobs_available = ["job1", "job2"]
         active_futures_count = 5
         max_processes = 10
-        
+
         # Should process when pending jobs and capacity available
         can_process = bool(pending_jobs_available) and (active_futures_count < max_processes)
         assert can_process is True, "Should process when pending jobs and capacity available"
-        
+
         # Scenario 3: Has pending jobs but no capacity
         pending_jobs_available = ["job1", "job2"]
         active_futures_count = 10
         max_processes = 10
-        
+
         # Should not process when no capacity
         can_process = bool(pending_jobs_available) and (active_futures_count < max_processes)
         assert can_process is False, "Should not process when no thread capacity"
@@ -156,7 +155,7 @@ class TestMaxPendingJobsValidation:
         # Test minimum value
         min_valid = 1
         assert min_valid >= 1, "Minimum valid value should be 1"
-        
+
         # Test warning threshold
         max_processes = 5
         warning_threshold = 10 * max_processes

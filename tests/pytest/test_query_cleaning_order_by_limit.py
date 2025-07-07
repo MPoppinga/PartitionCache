@@ -50,9 +50,9 @@ class TestOrderByLimitCleaning:
         """Test that ORDER BY and LIMIT are removed from subqueries."""
         query = """
         SELECT u.* FROM (
-            SELECT * FROM users 
-            WHERE active = true 
-            ORDER BY score DESC 
+            SELECT * FROM users
+            WHERE active = true
+            ORDER BY score DESC
             LIMIT 10
         ) u WHERE city_id = 10
         """
@@ -68,8 +68,8 @@ class TestOrderByLimitCleaning:
         query = """
         SELECT * FROM (
             SELECT city_id FROM (
-                SELECT * FROM users 
-                ORDER BY created_at DESC 
+                SELECT * FROM users
+                ORDER BY created_at DESC
                 LIMIT 50
             ) ORDER BY user_id ASC
         ) WHERE city_id IN (1, 2, 3)
@@ -149,7 +149,7 @@ class TestOrderByLimitCleaning:
         """Test that important clauses (WHERE, GROUP BY, HAVING) are preserved."""
         query = """
         SELECT city_id, COUNT(*) as user_count
-        FROM users 
+        FROM users
         WHERE active = true AND created_at > '2024-01-01'
         GROUP BY city_id
         HAVING COUNT(*) > 10
@@ -172,7 +172,7 @@ class TestOrderByLimitCleaning:
     def test_comments_and_formatting(self):
         """Test that comments are still removed along with ORDER BY/LIMIT."""
         query = """
-        SELECT * FROM users 
+        SELECT * FROM users
         WHERE city_id = 10 -- This is a comment
         ORDER BY created_at DESC -- Another comment
         LIMIT 50 -- Final comment

@@ -29,7 +29,7 @@ def _compare_cache_values(retrieved, expected):
         pass
 
     # Handle regular sets and other types
-    if hasattr(retrieved, "__iter__") and not isinstance(retrieved, (str, bytes)):
+    if hasattr(retrieved, "__iter__") and not isinstance(retrieved, str | bytes):
         return set(retrieved) == expected
 
     return retrieved == expected
@@ -389,19 +389,17 @@ class TestSystemLevelErrors:
         partition_key = "zipcode"
 
         # Check if backend has constraints that would interfere with this test
-        supported_datatypes = getattr(cache_client, "get_supported_datatypes", lambda: ["integer", "text"])()
+        getattr(cache_client, "get_supported_datatypes", lambda: ["integer", "text"])()
         backend_name = getattr(cache_client, "__class__", type(cache_client)).__name__.lower()
 
         # For bit backends, constrain values to avoid bitarray size issues
         if "bit" in backend_name:
             # Use smaller, constrained values for bit backends
             max_attempts = 20
-            base_range = 1000
             range_increment = 100
         else:
             # Use larger values for other backends
             max_attempts = 100
-            base_range = 10000
             range_increment = 1000
 
         # Create many cache entries to simulate resource pressure

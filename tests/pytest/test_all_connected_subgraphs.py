@@ -53,7 +53,7 @@ class TestAllConnectedSubgraphs:
         assert 3 in result and len(result[3]) == 1  # {1,2,3}
 
         # Verify specific subgraphs
-        size_3_subgraphs = [sorted(list(s)) for s in result[3]]
+        size_3_subgraphs = [sorted(s) for s in result[3]]
         assert [1, 2, 3] in size_3_subgraphs
 
     def test_disconnected_components(self):
@@ -91,7 +91,7 @@ class TestAllConnectedSubgraphs:
         result = all_connected_subgraphs(G, min_comp_size=1, max_comp_size=10)
 
         # Verify all expected subgraphs are present
-        expected_size_1 = [frozenset([i]) for i in range(1, 10)]
+        [frozenset([i]) for i in range(1, 10)]
         expected_size_2 = [frozenset([1, 2]), frozenset([2, 3]), frozenset([4, 5]), frozenset([6, 7]), frozenset([7, 8]), frozenset([7, 9])]
         expected_size_3 = [frozenset([1, 2, 3]), frozenset([6, 7, 8]), frozenset([6, 7, 9]), frozenset([7, 8, 9])]
         expected_size_4 = [frozenset([6, 7, 8, 9])]
@@ -190,3 +190,4 @@ class TestAllConnectedSubgraphs:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+

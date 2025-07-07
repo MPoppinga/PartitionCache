@@ -11,9 +11,15 @@ import partitioncache
 # Create cache helper with automatic validation
 cache = partitioncache.create_cache_helper("postgresql_array", "user_id", "integer")
 
-# Store and retrieve partition keys directly
-cache.set_set("query_hash", {1, 2, 3, 4, 5})
-results = cache.get("query_hash")  # Returns: {1, 2, 3, 4, 5}
+# Store and retrieve partition keys with query metadata (recommended)
+from partitioncache.query_processor import hash_query
+
+query = "SELECT * FROM users WHERE status = 'active'"
+query_hash = hash_query(query)
+cache.set_entry(query_hash, {1, 2, 3, 4, 5}, query)  # Stores both data and query
+
+results = cache.get(query_hash)        # Returns: {1, 2, 3, 4, 5}
+original_query = cache.get_query(query_hash)  # Returns: "SELECT * FROM users WHERE status = 'active'"
 ```
 
 ### Production Workflow: Queue-Based Population & Query Optimization
@@ -84,6 +90,7 @@ PartitionCache follows a modular architecture with distinct layers:
 ### Operations
 - **[Queue System](queue_system.md)** - Two-queue architecture and providers
 - **[PostgreSQL Queue Processor](postgresql_queue_processor.md)** - pg_cron integration
+- **[Cache Optimization](cache_optimization.md)** - Cache-aware query optimization in pcache-monitor
 - **[Cache Eviction](cache_eviction.md)** - Automatic cleanup strategies
 - **[Production Deployment](production_deployment.md)** - Configuration and best practices
 

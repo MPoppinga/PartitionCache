@@ -12,12 +12,10 @@ Star-join tables are special tables that:
 """
 
 import pytest
+
 from partitioncache.query_processor import (
-    generate_partial_queries,
     generate_all_query_hash_pairs,
-    generate_all_hashes,
-    extract_and_group_query_conditions,
-    detect_star_join_table,
+    generate_partial_queries,
 )
 
 
@@ -54,7 +52,7 @@ class TestStarJoinDetection:
         query = """
         SELECT * FROM customers c, orders o, products p, region_mapping rm
         WHERE c.region_id = rm.region_id
-          AND o.region_id = rm.region_id  
+          AND o.region_id = rm.region_id
           AND p.region_id = rm.region_id
           AND rm.region_id > 1000  -- Only partition key condition
           AND c.status = 'active'
@@ -68,7 +66,7 @@ class TestStarJoinDetection:
         # The system generates variants from non-star-join tables AND re-adds star-join to all variants
         # BUT also creates variants with partition key conditions applied directly to regular tables
         variants_with_rm = [v for v in variants if "region_mapping" in v]
-        variants_without_rm = [v for v in variants if "region_mapping" not in v and ("customers" in v or "orders" in v or "products" in v)]
+        [v for v in variants if "region_mapping" not in v and ("customers" in v or "orders" in v or "products" in v)]
 
         # The system now generates BOTH types of variants:
         # 1. Variants with star-join table re-added (AS p1)
@@ -95,7 +93,7 @@ class TestStarJoinDetection:
         """
 
         # Without explicit specification - should not detect star-join
-        variants_no_explicit = generate_partial_queries(query, "hub_id", auto_detect_star_join=True, warn_no_partition_key=False)
+        generate_partial_queries(query, "hub_id", auto_detect_star_join=True, warn_no_partition_key=False)
 
         # With explicit specification
         variants_explicit = generate_partial_queries(
@@ -212,7 +210,7 @@ class TestVariantGenerationPipeline:
 
         # Verify that star-join variants have p0_partition re-added
         star_join_variants = [v for v in variants if "p0_partition AS p1" in v]
-        direct_variants = [v for v in variants if "p0_partition" not in v and "users" in v]
+        [v for v in variants if "p0_partition" not in v and "users" in v]
 
         assert len(star_join_variants) > 0, "Should have variants with star-join table re-added"
         # Note: System also generates direct variants where partition key conditions are applied to regular tables
@@ -456,7 +454,7 @@ class TestEdgeCasesAndErrorHandling:
         # Should generate variants with and without the IN condition
 
         with_star_join = [v for v in variants if "p0_pure_partition AS p1" in v]
-        without_star_join = [v for v in variants if "p0_pure_partition" in v and " AS p1" not in v]
+        [v for v in variants if "p0_pure_partition" in v and " AS p1" not in v]
 
         assert len(with_star_join) > 0, "Should have variants with star-join table re-added"
         # Note: System behavior may vary on whether base variants without star-join are generated

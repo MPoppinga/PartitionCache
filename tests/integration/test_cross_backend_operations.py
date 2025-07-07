@@ -274,7 +274,7 @@ class TestCrossBackendExportImport:
         assert len(remapped_queries) == len(expected_city_entries)
 
         # Verify data integrity in remapped partition
-        for query_hash, expected_keys, partition_key, expected_query in expected_city_entries:
+        for query_hash, expected_keys, _partition_key, expected_query in expected_city_entries:
             actual_keys = dst_cache.get(query_hash, "remapped_cities")
             actual_query = dst_cache.get_query(query_hash, "remapped_cities")
 
@@ -324,7 +324,7 @@ class TestCrossBackendCopy:
     def test_copy_with_queries_metadata(self, temp_directories, test_data):
         """Test copy operation preserves queries metadata."""
         src_dir = temp_directories["rocksdict_src"]
-        dst_dir = temp_directories["rocksdict_dst"]
+        temp_directories["rocksdict_dst"]
 
         # Set up source cache
         os.environ["CACHE_BACKEND"] = "rocksdict"

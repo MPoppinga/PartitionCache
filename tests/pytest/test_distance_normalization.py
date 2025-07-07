@@ -15,7 +15,7 @@ class TestDistanceNormalization:
         # Query with parentheses around entire WHERE clause
         query_with_parens = """
         SELECT cd.pdb_id FROM complex_data AS cd, data_points AS p1
-        WHERE (p1.complex_data_id = cd.complex_data_id 
+        WHERE (p1.complex_data_id = cd.complex_data_id
                AND p1.element = 16
                AND ABS(SQRT(POWER(p1.x - 2.0, 2))) <= 0.1)
         """
@@ -23,7 +23,7 @@ class TestDistanceNormalization:
         # Query without parentheses around WHERE clause
         query_without_parens = """
         SELECT cd.pdb_id FROM complex_data AS cd, data_points AS p1
-        WHERE p1.complex_data_id = cd.complex_data_id 
+        WHERE p1.complex_data_id = cd.complex_data_id
                AND p1.element = 16
                AND ABS(SQRT(POWER(p1.x - 2.0, 2))) <= 0.1
         """
@@ -41,7 +41,7 @@ class TestDistanceNormalization:
     def test_bucket_steps_default(self):
         """Test default bucket_steps=1.0 behavior."""
         query = """
-        SELECT p.id FROM data_points p 
+        SELECT p.id FROM data_points p
         WHERE ABS(SQRT(POWER(p.x - 1.0, 2))) <= 0.1
         """
 
@@ -68,7 +68,7 @@ class TestDistanceNormalization:
 
         for original_value, bucket_steps, expected_value in test_cases:
             query = f"""
-            SELECT p.id FROM data_points p 
+            SELECT p.id FROM data_points p
             WHERE ABS(SQRT(POWER(p.x - 1.0, 2))) <= {original_value}
             """
 
@@ -89,7 +89,7 @@ class TestDistanceNormalization:
 
         for operator, original_value, bucket_steps, expected_value in test_cases:
             query = f"""
-            SELECT p.id FROM data_points p 
+            SELECT p.id FROM data_points p
             WHERE ABS(SQRT(POWER(p.x - 1.0, 2))) {operator} {original_value}
             """
 
@@ -103,8 +103,8 @@ class TestDistanceNormalization:
         """Test query with multiple distance conditions like the user's complex query."""
         query = """
         SELECT cd.pdb_id FROM complex_data AS cd, data_points AS p1, data_points AS p2
-        WHERE p1.complex_data_id = cd.complex_data_id 
-        AND p2.complex_data_id = cd.complex_data_id 
+        WHERE p1.complex_data_id = cd.complex_data_id
+        AND p2.complex_data_id = cd.complex_data_id
         AND ABS(SQRT(POWER(p1.x - p2.x, 2) + POWER(p1.y - p2.y, 2))) <= 0.1
         AND ABS(SQRT(POWER(p1.x - p2.x, 2))) <= 0.2
         """
@@ -125,9 +125,9 @@ class TestDistanceNormalization:
         # Complex query similar to user's original
         query = """
         SELECT cd.pdb_id FROM complex_data AS cd, data_points AS p1, data_points AS p2
-        WHERE p1.complex_data_id = cd.complex_data_id 
-        AND p2.complex_data_id = cd.complex_data_id 
-        AND p1.element = 16 
+        WHERE p1.complex_data_id = cd.complex_data_id
+        AND p2.complex_data_id = cd.complex_data_id
+        AND p1.element = 16
         AND p2.element = 6
         AND ABS(SQRT(POWER(p1.x - p2.x, 2) + POWER(p1.y - p2.y, 2) + POWER(p1.z - p2.z, 2)) - 1.8147338647856879) <= 0.1
         """
@@ -147,7 +147,7 @@ class TestDistanceNormalization:
         """Test that queries without distance conditions are unchanged."""
         query = """
         SELECT cd.pdb_id FROM complex_data AS cd, data_points AS p1
-        WHERE p1.complex_data_id = cd.complex_data_id 
+        WHERE p1.complex_data_id = cd.complex_data_id
         AND p1.element = 16
         """
 
@@ -157,13 +157,13 @@ class TestDistanceNormalization:
         # Query should be essentially unchanged (except for whitespace normalization)
         assert "element = 16" in normalized
         # SQLGlot may normalize the order of columns in equality comparisons
-        assert ("complex_data_id = cd.complex_data_id" in normalized or 
+        assert ("complex_data_id = cd.complex_data_id" in normalized or
                 "cd.complex_data_id = p1.complex_data_id" in normalized)
 
     def test_negative_values_skipped(self):
         """Test that negative distance values are skipped."""
         query = """
-        SELECT p.id FROM data_points p 
+        SELECT p.id FROM data_points p
         WHERE ABS(SQRT(POWER(p.x - 1.0, 2))) <= -0.1
         """
 
@@ -176,7 +176,7 @@ class TestDistanceNormalization:
     def test_non_distance_function_conditions_skipped(self):
         """Test that non-distance function conditions are skipped when restrict_to_dist_functions=True."""
         query = """
-        SELECT p.id FROM data_points p 
+        SELECT p.id FROM data_points p
         WHERE p.value <= 0.1
         AND ABS(SQRT(POWER(p.x - 1.0, 2))) <= 0.1
         """

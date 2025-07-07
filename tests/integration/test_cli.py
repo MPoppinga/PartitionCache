@@ -205,8 +205,6 @@ class TestCLIIntegration:
             pytest.skip(f"CLI tests not compatible with {backend_type} due to file locking")
 
         backend_suffix = backend_type.replace("_", "").replace("-", "")
-        partition_key = f"region_id_{backend_suffix}"
-        hash_key = f"query_test_hash_{backend_suffix}"
         backend_suffix = backend_type.replace("_", "").replace("-", "")
         test_partition = f"test_city_{backend_suffix}"
         test_hash = f"test_hash_{backend_suffix}"
@@ -422,8 +420,6 @@ class TestCLIIntegration:
             pytest.skip(f"CLI tests not compatible with {backend_type} due to file locking")
 
         backend_suffix = backend_type.replace("_", "").replace("-", "")
-        partition_key = f"region_id_{backend_suffix}"
-        hash_key = f"query_test_hash_{backend_suffix}"
         backend_suffix = backend_type.replace("_", "").replace("-", "")
         city_partition = f"city_id_{backend_suffix}"
         state_partition = f"state_id_{backend_suffix}"

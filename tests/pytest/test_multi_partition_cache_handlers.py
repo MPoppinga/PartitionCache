@@ -149,8 +149,8 @@ class TestMultiPartitionFunctionality:
             ]
 
             # Should get different data for different partitions
-            result1 = handler.get("same_key", partition_key="partition1")
-            result2 = handler.get("same_key", partition_key="partition2")
+            handler.get("same_key", partition_key="partition1")
+            handler.get("same_key", partition_key="partition2")
 
             # Verify separate table queries were made
             select_calls = [call for call in mock_cursor.execute.call_args_list
@@ -173,7 +173,7 @@ class TestMultiPartitionFunctionality:
             mock_db.type.return_value = b"set"
             mock_db.smembers.return_value = {b"1", b"2", b"3"}
 
-            result = handler.get("test_key", partition_key="test_partition")
+            handler.get("test_key", partition_key="test_partition")
 
             # Verify namespaced key was used
             expected_metadata_key = '_partition_metadata:test_partition'
@@ -220,7 +220,7 @@ class TestMultiPartitionFunctionality:
             handler.cursor = mock_cursor
             handler.db = mock_db
 
-            for datatype, settype, test_data in test_cases:
+            for datatype, _settype, test_data in test_cases:
                 # Mock partition doesn't exist
                 mock_cursor.fetchone.return_value = None
 

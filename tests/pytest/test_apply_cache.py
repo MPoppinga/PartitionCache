@@ -67,7 +67,7 @@ class TestFindP0Alias:
 
         # Test with 3+ tables where zipcode_mv joins all others
         query_star = """
-        SELECT * FROM users AS u, orders AS o, zipcode_mv AS zips 
+        SELECT * FROM users AS u, orders AS o, zipcode_mv AS zips
         WHERE u.zipcode = zips.zipcode AND o.zipcode = zips.zipcode
         """
         result_star = find_p0_alias(query_star, "zipcode")
@@ -318,9 +318,9 @@ class TestExtendQueryWithPartitionKeys:
     def test_complex_query_with_joins(self):
         """Test with complex query containing joins."""
         query = """
-        SELECT u.name, o.total 
-        FROM users AS u 
-        JOIN orders AS o ON u.id = o.user_id 
+        SELECT u.name, o.total
+        FROM users AS u
+        JOIN orders AS o ON u.id = o.user_id
         WHERE u.active = true AND o.status = 'complete'
         """
         partition_keys = {1, 2, 3}
@@ -333,7 +333,7 @@ class TestExtendQueryWithPartitionKeys:
     def test_query_with_subquery(self):
         """Test with query containing subquery."""
         query = """
-        SELECT * FROM users AS u 
+        SELECT * FROM users AS u
         WHERE u.id IN (SELECT user_id FROM orders WHERE total > 100)
         """
         partition_keys = {1, 2}
@@ -512,9 +512,9 @@ class TestExtendQueryWithPartitionKeysLazy:
     def test_complex_lazy_subquery(self):
         """Test with complex lazy subquery."""
         query = """
-        SELECT u.name, o.total 
-        FROM users AS u 
-        JOIN orders AS o ON u.id = o.user_id 
+        SELECT u.name, o.total
+        FROM users AS u
+        JOIN orders AS o ON u.id = o.user_id
         WHERE u.active = true
         """
         lazy_subquery = """
@@ -535,7 +535,7 @@ class TestExtendQueryWithPartitionKeysLazy:
     def test_lazy_subquery_with_original_subquery(self):
         """Test lazy subquery when original query contains subquery."""
         query = """
-        SELECT * FROM users AS u 
+        SELECT * FROM users AS u
         WHERE u.id IN (SELECT user_id FROM orders WHERE total > 100)
         """
         lazy_subquery = "SELECT zipcode FROM cache_zipcodes"

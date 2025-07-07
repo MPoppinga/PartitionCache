@@ -57,7 +57,7 @@ class TestRocksDictCacheHandler:
             mock_rdict = MagicMock()
             mock_rdict_class.return_value = mock_rdict
 
-            handler = RocksDictCacheHandler(temp_db_path, read_only=True)
+            RocksDictCacheHandler(temp_db_path, read_only=True)
 
             # Verify Rdict was called with correct parameters
             mock_rdict_class.assert_called_once()

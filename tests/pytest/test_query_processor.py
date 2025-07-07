@@ -84,15 +84,15 @@ class TestParenthesesHandling:
         # This was the bug that caused the user's issue
         query_with_wrapper_parens = """
         SELECT cd.pdb_id FROM complex_data AS cd, data_points AS p1
-        WHERE (p1.complex_data_id = cd.complex_data_id 
-               AND p1.element = 16 
+        WHERE (p1.complex_data_id = cd.complex_data_id
+               AND p1.element = 16
                AND p1.origin = 'MET')
         """
 
         query_without_wrapper_parens = """
         SELECT cd.pdb_id FROM complex_data AS cd, data_points AS p1
-        WHERE p1.complex_data_id = cd.complex_data_id 
-               AND p1.element = 16 
+        WHERE p1.complex_data_id = cd.complex_data_id
+               AND p1.element = 16
                AND p1.origin = 'MET'
         """
 
@@ -105,7 +105,7 @@ class TestParenthesesHandling:
 
         assert len(conditions_with) == len(conditions_without) == 3
         # SQLGlot may normalize the order of equality comparisons
-        assert ("p1.complex_data_id = cd.complex_data_id" in conditions_with or 
+        assert ("p1.complex_data_id = cd.complex_data_id" in conditions_with or
                 "cd.complex_data_id = p1.complex_data_id" in conditions_with)
         assert "p1.element = 16" in conditions_with
         assert "p1.origin = 'MET'" in conditions_with
@@ -120,7 +120,7 @@ class TestParenthesesHandling:
         cleaned = clean_query(query)
         conditions = extract_conjunctive_conditions(cleaned)
 
-        # Should extract conditions, SQLGlot may flatten/reorganize the logical structure  
+        # Should extract conditions, SQLGlot may flatten/reorganize the logical structure
         # Updated expectation: SQLGlot might extract more granular conditions
         assert len(conditions) >= 2
         assert any("(p.y = 1 OR p.z = 2)" in cond for cond in conditions)
@@ -227,7 +227,7 @@ class TestRobustness:
     def test_negative_distance_values(self):
         """Test that negative distance values are skipped."""
         query = """
-        SELECT p.id FROM data_points p 
+        SELECT p.id FROM data_points p
         WHERE ABS(SQRT(POWER(p.x - 1.0, 2))) <= -0.1
         """
 
@@ -319,12 +319,12 @@ class TestIntegrationScenarios:
     def test_cache_population_vs_lookup_parameters(self):
         """Test that parameter differences between cache population and lookup are handled."""
         test_query = """
-        SELECT * FROM table1 t1, table2 t2 
+        SELECT * FROM table1 t1, table2 t2
         WHERE t1.id = t2.id AND t1.value > 5 AND t2.status = 'active'
         """
 
         # Cache population parameters (from monitor job)
-        cache_population_hashes = generate_all_query_hash_pairs(
+        generate_all_query_hash_pairs(
             test_query,
             "id",
             min_component_size=1,

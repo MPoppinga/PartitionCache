@@ -56,7 +56,6 @@ class TestQueryInterface:
 
         assert result is True
         # Verify the query was stored with correct key format
-        expected_key = f"query:{partition_key}:{query_hash}"
         rocksdict_handler.db.__setitem__.assert_called()
 
     def test_set_query_with_special_characters(self, rocksdict_handler):
@@ -294,7 +293,6 @@ class TestQueryInterfaceIntegration:
     def test_delete_removes_associated_query(self, rocksdict_handler):
         """Test that deleting a cache entry also removes associated query."""
         query_hash = "integration_test"
-        query_text = "SELECT * FROM test WHERE id = 1"
         partition_key = "test_partition"
 
         # Track deletions

@@ -297,7 +297,7 @@ class TestEndToEndWorkflows:
         """Test complete workflow from queue processing to cache application."""
 
         # Backend name for diagnostics
-        backend_name = getattr(e2e_cache_client, "__class__", type(e2e_cache_client)).__name__.lower()
+        getattr(e2e_cache_client, "__class__", type(e2e_cache_client)).__name__.lower()
 
         from partitioncache.queue import clear_all_queues, push_to_original_query_queue
 
@@ -465,9 +465,9 @@ class TestEndToEndWorkflows:
             (
                 "complex",
                 """
-                SELECT l1.name, l1.population 
-                FROM test_locations l1 
-                JOIN test_locations l2 ON l1.region = l2.region 
+                SELECT l1.name, l1.population
+                FROM test_locations l1
+                JOIN test_locations l2 ON l1.region = l2.region
                 WHERE l1.zipcode = 1001;
             """,
             ),

@@ -34,7 +34,7 @@ def cache_optimization_setup(cache_client, request):
         cache_backend = str(request.fixturenames[request.fixturenames.index('cache_client')])
         # Try to get it from the actual param value
         try:
-            param_index = list(request.fixturenames).index('cache_client')
+            list(request.fixturenames).index('cache_client')
             cache_backend = request.node.callspec.id.split('[')[1].split(']')[0]
         except Exception as e:
             cache_backend = os.getenv("CACHE_BACKEND", "unknown")
@@ -69,7 +69,7 @@ def cache_optimization_setup(cache_client, request):
     # Register partition key if needed
     try:
         cache_client.register_partition_key(partition_key, "integer")
-    except:
+    except Exception:
         pass  # May already be registered
 
     # Use cache_client directly to add test data
@@ -259,11 +259,11 @@ class TestCacheOptimizationIntegration:
 
         # Use a distinctive query that we can check for later
         original_query = """
-        SELECT store_id, 
+        SELECT store_id,
                SUM(revenue) as total_revenue,
                COUNT(*) as order_count
         FROM sales
-        WHERE city_id = 10 
+        WHERE city_id = 10
           AND product_category = 'electronics'
           AND order_date >= '2024-01-01'
         GROUP BY store_id
@@ -278,12 +278,12 @@ class TestCacheOptimizationIntegration:
         try:
             all_queries = cache_client.get_all_queries(partition_key)
             initial_query_count = len(all_queries) if all_queries else 0
-        except:
+        except Exception:
             pass  # Some backends might not support this
 
         # Run monitor with optimization
         try:
-            result = subprocess.run(
+            subprocess.run(
                 [
                     "pcache-monitor",
                     "--enable-cache-optimization",
@@ -317,7 +317,7 @@ class TestCacheOptimizationIntegration:
             # Check that some query text contains parts of our original query
             if final_queries:
                 found_related_query = False
-                for query_hash, query_text in final_queries:
+                for _query_hash, query_text in final_queries:
                     if any(keyword in query_text.lower() for keyword in ["sales", "store_id", "revenue"]):
                         found_related_query = True
                         # Ensure it's a valid SQL fragment, not an optimized version with extra restrictions

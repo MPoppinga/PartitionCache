@@ -4,8 +4,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from partitioncache.cli.manage_cache import main, show_comprehensive_status
 from partitioncache.cache_handler.redis_abstract import RedisAbstractCacheHandler
+from partitioncache.cli.manage_cache import main, show_comprehensive_status
 
 
 class TestManageCacheCLI:
@@ -495,7 +495,7 @@ class TestCLITimeoutProtection:
                 mock_handler.db.ping.side_effect = Exception("Redis timeout")
                 return mock_handler
             elif backend == "rocksdb_bit":
-                # RocksDB works fine  
+                # RocksDB works fine
                 from partitioncache.cache_handler.rocks_db_abstract import RocksDBAbstractCacheHandler
                 mock_handler = MagicMock()
                 mock_handler.__class__ = RocksDBAbstractCacheHandler

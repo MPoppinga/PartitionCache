@@ -1,7 +1,7 @@
 """
 Test cases for the empty WHERE clause bug fix in query_processor.py
 
-This test ensures that query fragment generation never produces malformed SQL 
+This test ensures that query fragment generation never produces malformed SQL
 with incomplete WHERE clauses.
 """
 

@@ -5,11 +5,11 @@ Utility functions for integration tests.
 def compare_cache_values(retrieved, expected):
     """
     Helper function to compare cache values across different backend types.
-    
+
     Args:
         retrieved: Value returned from cache backend (could be set, BitMap, etc.)
         expected: Expected set value
-    
+
     Returns:
         bool: True if values are equivalent
     """
@@ -30,11 +30,11 @@ def compare_cache_values(retrieved, expected):
         pass
 
     # Handle regular sets and other iterable types
-    if hasattr(retrieved, '__iter__') and not isinstance(retrieved, (str, bytes)):
+    if hasattr(retrieved, '__iter__') and not isinstance(retrieved, str | bytes):
         return set(retrieved) == expected
 
     # Handle single values
-    if not hasattr(expected, '__iter__') or isinstance(expected, (str, bytes)):
+    if not hasattr(expected, '__iter__') or isinstance(expected, str | bytes):
         return retrieved == expected
 
     # Default comparison
@@ -44,10 +44,10 @@ def compare_cache_values(retrieved, expected):
 def normalize_cache_result(value):
     """
     Normalize cache results to Python sets for consistent comparison.
-    
+
     Args:
         value: Value from cache backend
-        
+
     Returns:
         set: Normalized set representation
     """
@@ -63,7 +63,7 @@ def normalize_cache_result(value):
         pass
 
     # Handle iterable types (but not strings/bytes)
-    if hasattr(value, '__iter__') and not isinstance(value, (str, bytes)):
+    if hasattr(value, '__iter__') and not isinstance(value, str | bytes):
         return set(value)
 
     # Handle single values

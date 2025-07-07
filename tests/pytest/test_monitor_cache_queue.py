@@ -301,7 +301,7 @@ class TestProcessCompletedFuture:
         with patch("partitioncache.cli.monitor_cache_queue.status_lock"):
             with patch("partitioncache.cli.monitor_cache_queue.active_futures", ["hash1", "hash2"]):
                 with patch("partitioncache.cli.monitor_cache_queue.pending_jobs", []):
-                    with patch("partitioncache.cli.monitor_cache_queue.pool") as mock_pool:
+                    with patch("partitioncache.cli.monitor_cache_queue.pool"):
                         with patch(
                             "partitioncache.cli.monitor_cache_queue.get_queue_lengths", return_value={"original_query_queue": 0, "query_fragment_queue": 0}
                         ):
@@ -324,8 +324,8 @@ class TestProcessCompletedFuture:
     def test_process_completed_future_with_pending(self, mock_args):
         """Test future completion with pending jobs."""
         with patch("partitioncache.cli.monitor_cache_queue.status_lock"):
-            with patch("partitioncache.cli.monitor_cache_queue.active_futures", ["hash1"]) as mock_active:
-                with patch("partitioncache.cli.monitor_cache_queue.pending_jobs", [("query2", "hash2", "test_partition_key", "integer")]) as mock_pending:
+            with patch("partitioncache.cli.monitor_cache_queue.active_futures", ["hash1"]):
+                with patch("partitioncache.cli.monitor_cache_queue.pending_jobs", [("query2", "hash2", "test_partition_key", "integer")]):
                     with patch("partitioncache.cli.monitor_cache_queue.pool") as mock_pool:
                         with patch(
                             "partitioncache.cli.monitor_cache_queue.get_queue_lengths", return_value={"original_query_queue": 0, "query_fragment_queue": 0}
