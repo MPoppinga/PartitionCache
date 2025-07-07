@@ -44,6 +44,27 @@ def mock_args():
     args.limit = None
     args.long_running_query_timeout = "0"
     args.close = False
+    # Add common variant generation args
+    args.min_component_size = 1
+    args.follow_graph = True
+    args.no_auto_detect_star_join = False
+    args.max_component_size = None
+    args.star_join_table = None
+    args.no_warn_partition_key = False
+    args.bucket_steps = 1.0
+    args.add_constraints = None
+    args.remove_constraints_all = None
+    args.remove_constraints_add = None
+    # Add cache optimization args (defaults from CLI)
+    args.enable_cache_optimization = True
+    args.disable_cache_optimization = False
+    args.cache_optimization_method = "IN"
+    args.min_cache_hits = 1
+    args.prefer_lazy_optimization = True
+    # Add other processing args
+    args.max_pending_jobs = 5
+    args.status_log_interval = 10
+    args.disable_optimized_polling = False
     return args
 
 
@@ -60,14 +81,15 @@ class TestQueryFragmentProcessor:
     """Test query fragment processor functionality."""
 
     @patch("partitioncache.cli.monitor_cache_queue.exit_event")
+    @patch("partitioncache.cli.monitor_cache_queue.pop_from_original_query_queue_blocking")
     @patch("partitioncache.cli.monitor_cache_queue.pop_from_original_query_queue")
     @patch("partitioncache.cli.monitor_cache_queue.generate_all_query_hash_pairs")
     @patch("partitioncache.cli.monitor_cache_queue.push_to_query_fragment_queue")
-    def test_query_fragment_processor_success(self, mock_push_fragments, mock_generate, mock_pop, mock_exit_event, mock_args):
+    def test_query_fragment_processor_success(self, mock_push_fragments, mock_generate, mock_pop, mock_pop_blocking, mock_exit_event, mock_args, mock_env):
         """Test successful query fragment processing."""
         # Setup mocks
         mock_exit_event.is_set.side_effect = [False, True]  # Run once then exit
-        mock_pop.return_value = ("SELECT * FROM test_table", "test_partition_key", "integer")
+        mock_pop_blocking.return_value = ("SELECT * FROM test_table", "test_partition_key", "integer")
         mock_generate.return_value = [("SELECT DISTINCT t1.partition_key FROM test_table t1", "hash1")]
 
         # Monkey patch args into the module
@@ -86,7 +108,7 @@ class TestQueryFragmentProcessor:
                 delattr(mcq_module, "args")
 
         # Verify calls
-        mock_pop.assert_called_once()
+        mock_pop_blocking.assert_called_once()
         mock_generate.assert_called_once_with(
             "SELECT * FROM test_table",
             "test_partition_key",
@@ -105,11 +127,12 @@ class TestQueryFragmentProcessor:
         mock_push_fragments.assert_called_once_with([("SELECT DISTINCT t1.partition_key FROM test_table t1", "hash1")], "test_partition_key", "integer")
 
     @patch("partitioncache.cli.monitor_cache_queue.exit_event")
+    @patch("partitioncache.cli.monitor_cache_queue.pop_from_original_query_queue_blocking")
     @patch("partitioncache.cli.monitor_cache_queue.pop_from_original_query_queue")
-    def test_query_fragment_processor_empty_queue(self, mock_pop, mock_exit_event, mock_args):
+    def test_query_fragment_processor_empty_queue(self, mock_pop, mock_pop_blocking, mock_exit_event, mock_args, mock_env):
         """Test query fragment processor with empty queue."""
         mock_exit_event.is_set.side_effect = [False, True]  # Run once then exit
-        mock_pop.return_value = None  # Empty queue
+        mock_pop_blocking.return_value = None  # Empty queue
 
         # Monkey patch args into the module
         import partitioncache.cli.monitor_cache_queue as mcq_module
@@ -126,14 +149,15 @@ class TestQueryFragmentProcessor:
             else:
                 delattr(mcq_module, "args")
 
-        mock_pop.assert_called_once()
+        mock_pop_blocking.assert_called_once()
 
     @patch("partitioncache.cli.monitor_cache_queue.exit_event")
+    @patch("partitioncache.cli.monitor_cache_queue.pop_from_original_query_queue_blocking")
     @patch("partitioncache.cli.monitor_cache_queue.pop_from_original_query_queue")
-    def test_query_fragment_processor_error_handling(self, mock_pop, mock_exit_event, mock_args):
+    def test_query_fragment_processor_error_handling(self, mock_pop, mock_pop_blocking, mock_exit_event, mock_args, mock_env):
         """Test query fragment processor error handling."""
         mock_exit_event.is_set.side_effect = [False, True]  # Run once then exit
-        mock_pop.side_effect = Exception("Test error")
+        mock_pop_blocking.side_effect = Exception("Test error")
 
         with patch("time.sleep") as mock_sleep:
             # Monkey patch args into the module
@@ -443,14 +467,15 @@ class TestIntegration:
     """Integration tests for monitor cache queue."""
 
     @patch("partitioncache.cli.monitor_cache_queue.exit_event")
+    @patch("partitioncache.cli.monitor_cache_queue.pop_from_original_query_queue_blocking")
     @patch("partitioncache.cli.monitor_cache_queue.pop_from_original_query_queue")
     @patch("partitioncache.cli.monitor_cache_queue.generate_all_query_hash_pairs")
     @patch("partitioncache.cli.monitor_cache_queue.push_to_query_fragment_queue")
-    def test_end_to_end_fragment_processing(self, mock_push_to_outgoing, mock_generate, mock_pop, mock_exit_event, mock_args):
+    def test_end_to_end_fragment_processing(self, mock_push_to_outgoing, mock_generate, mock_pop, mock_pop_blocking, mock_exit_event, mock_args, mock_env):
         """Test end-to-end fragment processing workflow."""
         # Setup mocks for one iteration
         mock_exit_event.is_set.side_effect = [False, True]
-        mock_pop.return_value = ("SELECT * FROM test_table WHERE id = 1", "test_partition_key", "integer")
+        mock_pop_blocking.return_value = ("SELECT * FROM test_table WHERE id = 1", "test_partition_key", "integer")
         mock_generate.return_value = [("SELECT DISTINCT t1.partition_key FROM test_table t1 WHERE t1.id = 1", "hash1")]
         mock_push_to_outgoing.return_value = True
 
@@ -470,7 +495,7 @@ class TestIntegration:
                 delattr(mcq_module, "args")
 
         # Verify the workflow
-        mock_pop.assert_called_once()
+        mock_pop_blocking.assert_called_once()
         mock_generate.assert_called_once_with(
             "SELECT * FROM test_table WHERE id = 1",
             "test_partition_key",
