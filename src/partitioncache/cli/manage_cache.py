@@ -872,11 +872,15 @@ def show_comprehensive_status() -> None:
                                 if hasattr(cache_handler, "db") and hasattr(cache_handler.db, "ping"):
                                     cache_handler.db.ping()  # type: ignore[attr-defined]
                             elif backend.startswith("rocksdb_"):
-                                from partitioncache.cache_handler.rocks_db_abstract import RocksDBAbstractCacheHandler
-                                if isinstance(cache_handler, RocksDBAbstractCacheHandler):
-                                    # Quick RocksDB access test
-                                    if hasattr(cache_handler, "db") and hasattr(cache_handler.db, "iterkeys"):
-                                        _ = list(cache_handler.db.iterkeys())[:1]  # type: ignore[attr-defined]
+                                try:
+                                    from partitioncache.cache_handler.rocks_db_abstract import RocksDBAbstractCacheHandler
+                                    if isinstance(cache_handler, RocksDBAbstractCacheHandler):
+                                        # Quick RocksDB access test
+                                        if hasattr(cache_handler, "db") and hasattr(cache_handler.db, "iterkeys"):
+                                            _ = list(cache_handler.db.iterkeys())[:1]  # type: ignore[attr-defined]
+                                except ImportError:
+                                    # RocksDB module not available, skip connectivity test
+                                    pass
                         except Exception as conn_error:
                             cache_handler.close()
                             raise Exception(f"Connection failed: {conn_error}") from conn_error

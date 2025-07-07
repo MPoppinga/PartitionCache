@@ -496,9 +496,11 @@ class TestCLITimeoutProtection:
                 return mock_handler
             elif backend == "rocksdb_bit":
                 # RocksDB works fine
-                from partitioncache.cache_handler.rocks_db_abstract import RocksDBAbstractCacheHandler
                 mock_handler = MagicMock()
-                mock_handler.__class__ = RocksDBAbstractCacheHandler
+                # Create a mock class to represent RocksDBAbstractCacheHandler
+                # This avoids import issues in CI environments without RocksDB
+                MockRocksDBClass = type('RocksDBAbstractCacheHandler', (), {})
+                mock_handler.__class__ = MockRocksDBClass
                 mock_handler.db.iterkeys.return_value = iter(["key1", "key2"])
                 mock_handler.close.return_value = None
                 mock_handler.get_partition_keys.return_value = ["test_partition"]
