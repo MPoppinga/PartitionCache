@@ -227,8 +227,13 @@ def parse_variant_generation_json_args(args: argparse.Namespace) -> tuple[dict[s
             add_constraints = json.loads(args.add_constraints)
             if not isinstance(add_constraints, dict):
                 raise ValueError("add_constraints must be a JSON object/dict")
+            # Validate dict values are strings
+            for table, constraint in add_constraints.items():
+                if not isinstance(table, str) or not isinstance(constraint, str):
+                    raise ValueError("add_constraints entries must be string table names mapping to string constraints")
         except (json.JSONDecodeError, ValueError) as e:
             logger.error(f"Failed to parse --add-constraints: {e}")
+            logger.error("Expected format: --add-constraints '{{\"table_name\": \"constraint_condition\"}}'")
             sys.exit(1)
 
     # Parse remove_constraints_all
@@ -237,8 +242,13 @@ def parse_variant_generation_json_args(args: argparse.Namespace) -> tuple[dict[s
             remove_constraints_all = json.loads(args.remove_constraints_all)
             if not isinstance(remove_constraints_all, list):
                 raise ValueError("remove_constraints_all must be a JSON array/list")
+            # Validate all elements are strings
+            for item in remove_constraints_all:
+                if not isinstance(item, str):
+                    raise ValueError("All elements in remove_constraints_all must be strings")
         except (json.JSONDecodeError, ValueError) as e:
             logger.error(f"Failed to parse --remove-constraints-all: {e}")
+            logger.error("Expected format: --remove-constraints-all '[\"attr1\", \"attr2\"]'")
             sys.exit(1)
 
     # Parse remove_constraints_add
@@ -247,8 +257,13 @@ def parse_variant_generation_json_args(args: argparse.Namespace) -> tuple[dict[s
             remove_constraints_add = json.loads(args.remove_constraints_add)
             if not isinstance(remove_constraints_add, list):
                 raise ValueError("remove_constraints_add must be a JSON array/list")
+            # Validate all elements are strings
+            for item in remove_constraints_add:
+                if not isinstance(item, str):
+                    raise ValueError("All elements in remove_constraints_add must be strings")
         except (json.JSONDecodeError, ValueError) as e:
             logger.error(f"Failed to parse --remove-constraints-add: {e}")
+            logger.error("Expected format: --remove-constraints-add '[\"attr1\", \"attr2\"]'")
             sys.exit(1)
 
     return add_constraints, remove_constraints_all, remove_constraints_add
