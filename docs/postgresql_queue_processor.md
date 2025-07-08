@@ -6,6 +6,15 @@ The PostgreSQL Queue Processor provides a sophisticated database-native approach
 
 This approach offers significant advantages in reliability, performance, and operational simplicity by eliminating external dependencies and providing comprehensive monitoring and logging capabilities.
 
+### Cross-Database Architecture Support
+
+**New in v2.0+**: PartitionCache now supports cross-database pg_cron configurations where:
+- **pg_cron** is installed in a central database (typically `postgres`)
+- **Work databases** contain PartitionCache tables and business logic
+- **Jobs execute** in work databases via `cron.schedule_in_database()`
+
+This architecture provides better isolation, security, and scalability. See [Cross-Database pg_cron Setup](pg_cron_cross_database_setup.md) for detailed configuration.
+
 ## Architecture Overview
 
 ```
@@ -282,6 +291,28 @@ PG_BIT_CACHE_TABLE_PREFIX=my_custom_prefix
 # Default if not specified
 # Uses 'partitioncache' as prefix
 ```
+
+### Cross-Database Configuration
+
+**New in v2.0+**: Additional environment variables for cross-database setup:
+
+```bash
+# pg_cron database connection (where pg_cron extension is installed)
+PG_CRON_HOST=localhost                   # Default: same as DB_HOST
+PG_CRON_PORT=5432                       # Default: same as DB_PORT
+PG_CRON_USER=your_username              # Default: same as DB_USER
+PG_CRON_PASSWORD=your_password          # Default: same as DB_PASSWORD
+PG_CRON_DATABASE=postgres               # Default: postgres
+
+# Work database (where PartitionCache tables exist)
+DB_HOST=localhost
+DB_PORT=5432
+DB_USER=your_username
+DB_PASSWORD=your_password
+DB_NAME=work_database
+```
+
+For detailed cross-database configuration, see [Cross-Database pg_cron Setup](pg_cron_cross_database_setup.md).
 
 ### Processor Configuration
 

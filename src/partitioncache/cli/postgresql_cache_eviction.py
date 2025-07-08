@@ -94,16 +94,34 @@ def get_db_connection():
     )
 
 
-def check_pg_cron_installed(conn) -> bool:
-    """Check if pg_cron extension is installed."""
-    with conn.cursor() as cur:
-        try:
-            cur.execute("CREATE EXTENSION IF NOT EXISTS pg_cron")
-        except Exception as e:
-            logger.error(f"Failed to create pg_cron extension: {e}")
-            return False
-        cur.execute("SELECT 1 FROM pg_extension WHERE extname = 'pg_cron'")
-        return cur.fetchone() is not None
+def get_pg_cron_connection():
+    """Get pg_cron database connection using environment variables."""
+    return psycopg.connect(
+        host=os.getenv("PG_CRON_HOST", os.getenv("DB_HOST")),
+        port=int(os.getenv("PG_CRON_PORT", os.getenv("DB_PORT", "5432"))),
+        user=os.getenv("PG_CRON_USER", os.getenv("DB_USER")),
+        password=os.getenv("PG_CRON_PASSWORD", os.getenv("DB_PASSWORD")),
+        dbname=os.getenv("PG_CRON_DATABASE", "postgres"),
+    )
+
+
+def check_pg_cron_installed() -> bool:
+    """Check if pg_cron extension is installed in the pg_cron database."""
+    try:
+        with get_pg_cron_connection() as conn:
+            with conn.cursor() as cur:
+                # First check if it exists without trying to create it
+                cur.execute("SELECT 1 FROM pg_extension WHERE extname = 'pg_cron'")
+                if cur.fetchone() is not None:
+                    return True
+
+                # Try to create it if not exists
+                cur.execute("CREATE EXTENSION IF NOT EXISTS pg_cron")
+                conn.commit()
+                return True
+    except Exception as e:
+        logger.error(f"Failed to check/create pg_cron extension: {e}")
+        return False
 
 
 def setup_database_objects(conn, table_prefix: str):
@@ -236,7 +254,7 @@ def update_processor_config(conn, table_prefix: str, job_name: str, **kwargs):
 def handle_setup(conn, table_prefix: str, frequency: int, enabled: bool, strategy: str, threshold: int):
     """Handle the main setup logic."""
     logger.info("Starting PostgreSQL cache eviction setup...")
-    if not check_pg_cron_installed(conn):
+    if not check_pg_cron_installed():
         logger.error("pg_cron extension is not installed. Please install it first.")
         sys.exit(1)
 

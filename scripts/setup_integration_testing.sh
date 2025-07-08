@@ -177,6 +177,13 @@ PG_QUEUE_PASSWORD=integration_password
 PG_QUEUE_DB=partitioncache_integration
 QUERY_QUEUE_PROVIDER=postgresql
 
+PG_CRON_HOST=localhost
+PG_CRON_PORT=5434
+PG_CRON_USER=integration_user
+PG_CRON_PASSWORD=integration_password
+PG_CRON_DATABASE=partitioncache_integration
+
+
 # PostgreSQL Cache Backend Configuration
 DB_HOST=localhost
 DB_PORT=5434

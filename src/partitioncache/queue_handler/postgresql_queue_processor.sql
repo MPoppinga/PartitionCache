@@ -66,6 +66,7 @@ BEGIN
             table_prefix TEXT NOT NULL,
             queue_prefix TEXT NOT NULL,
             cache_backend TEXT NOT NULL,
+            job_ids BIGINT[] DEFAULT ARRAY[]::BIGINT[], -- Store pg_cron job IDs for cross-database management
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )', v_config_table);
     
@@ -106,7 +107,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- Trigger function to synchronize config with cron.job
+-- Trigger function to synchronize config with pg_cron using API functions and cross-database scheduling
 CREATE OR REPLACE FUNCTION partitioncache_sync_cron_job()
 RETURNS TRIGGER AS $$
 DECLARE
@@ -114,14 +115,32 @@ DECLARE
     v_job_base TEXT;
     v_timeout_seconds INTEGER;
     v_timeout_statement TEXT;
+    v_work_database TEXT;
+    v_job_name TEXT;
+    v_job_id BIGINT;
+    v_new_job_ids BIGINT[] := ARRAY[]::BIGINT[];
+    v_old_job_id BIGINT;
 BEGIN
-    v_job_base := NEW.job_name; -- base name, e.g. partitioncache_process_queue
-
+    -- Get work database name (current database where this trigger is running)
+    SELECT current_database() INTO v_work_database;
+    
     IF (TG_OP = 'DELETE') THEN
-        -- Remove all jobs that start with the base name
-        DELETE FROM cron.job WHERE jobname LIKE v_job_base || '%';
+        -- Unschedule all jobs stored in job_ids array
+        IF OLD.job_ids IS NOT NULL THEN
+            FOREACH v_old_job_id IN ARRAY OLD.job_ids LOOP
+                BEGIN
+                    -- Use pg_cron API to unschedule
+                    PERFORM cron.unschedule(v_old_job_id);
+                EXCEPTION WHEN OTHERS THEN
+                    -- Job might already be deleted, continue
+                    RAISE NOTICE 'Could not unschedule job ID %: %', v_old_job_id, SQLERRM;
+                END;
+            END LOOP;
+        END IF;
         RETURN OLD;
     END IF;
+
+    v_job_base := NEW.job_name; -- base name, e.g. partitioncache_process_queue
 
     -- Get timeout from the config row being inserted/updated
     v_timeout_seconds := NEW.timeout_seconds;
@@ -130,25 +149,46 @@ BEGIN
     -- Set a local timeout for this specific transaction
     -- The timeout is specified in milliseconds.
     v_timeout_statement := 'SET LOCAL statement_timeout = ' || (v_timeout_seconds * 1000)::TEXT;
-    
 
-    -- Build the command string executed by every worker , with the timeout set in transaction
+    -- Build the command string executed by every worker, with the timeout set in transaction
     v_command := format('BEGIN; %s; SELECT * FROM partitioncache_run_single_job(%L); COMMIT;', v_timeout_statement, v_job_base);
 
-    -- Remove existing worker jobs and recreate to match max_parallel_jobs
-    DELETE FROM cron.job WHERE jobname LIKE v_job_base || '_%';
-    
+    -- First, unschedule existing jobs if this is an UPDATE
+    IF (TG_OP = 'UPDATE' AND OLD.job_ids IS NOT NULL) THEN
+        FOREACH v_old_job_id IN ARRAY OLD.job_ids LOOP
+            BEGIN
+                PERFORM cron.unschedule(v_old_job_id);
+            EXCEPTION WHEN OTHERS THEN
+                RAISE NOTICE 'Could not unschedule job ID %: %', v_old_job_id, SQLERRM;
+            END;
+        END LOOP;
+    END IF;
 
-
+    -- Create new jobs using pg_cron API with cross-database execution
     FOR i IN 1..NEW.max_parallel_jobs LOOP
-        INSERT INTO cron.job (jobname, schedule, command, active)
-        VALUES (
-            v_job_base || '_' || i,
-            CONCAT(NEW.frequency_seconds, ' seconds'),
-            v_command,
-            NEW.enabled
-        );
+        v_job_name := v_job_base || '_' || i;
+        
+        BEGIN
+            -- Use schedule_in_database to run jobs in the work database
+            SELECT cron.schedule_in_database(
+                v_job_name,
+                CONCAT(NEW.frequency_seconds, ' seconds'),
+                v_command,
+                v_work_database,
+                current_user, -- Use current user for job execution
+                NEW.enabled
+            ) INTO v_job_id;
+            
+            -- Store the job ID for later management
+            v_new_job_ids := array_append(v_new_job_ids, v_job_id);
+            
+        EXCEPTION WHEN OTHERS THEN
+            RAISE WARNING 'Failed to schedule job %: %', v_job_name, SQLERRM;
+        END;
     END LOOP;
+
+    -- Update the job_ids array in the config table
+    NEW.job_ids := v_new_job_ids;
 
     RETURN NEW;
 END;
@@ -170,7 +210,7 @@ BEGIN
     -- Create the trigger
     EXECUTE format('
         CREATE TRIGGER %I
-        AFTER INSERT OR UPDATE OR DELETE ON %I
+        BEFORE INSERT OR UPDATE OR DELETE ON %I
         FOR EACH ROW
         EXECUTE FUNCTION partitioncache_sync_cron_job()
     ', v_trigger_name, v_config_table);

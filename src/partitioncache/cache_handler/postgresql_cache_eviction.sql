@@ -70,6 +70,7 @@ BEGIN
             strategy TEXT NOT NULL DEFAULT ''oldest'' CHECK (strategy IN (''oldest'', ''largest'')),
             threshold INTEGER NOT NULL DEFAULT 1000 CHECK (threshold > 0),
             table_prefix TEXT NOT NULL,
+            job_id BIGINT DEFAULT NULL, -- Store pg_cron job ID for cross-database management
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )', v_config_table);
 
@@ -92,30 +93,58 @@ END;
 $$ LANGUAGE plpgsql;
 
 
--- Trigger function to synchronize config with cron.job for eviction
+-- Trigger function to synchronize config with pg_cron using API functions and cross-database scheduling
 CREATE OR REPLACE FUNCTION partitioncache_sync_eviction_cron_job()
 RETURNS TRIGGER AS $$
 DECLARE
     v_command TEXT;
+    v_work_database TEXT;
+    v_job_id BIGINT;
 BEGIN
+    -- Get work database name (current database where this trigger is running)
+    SELECT current_database() INTO v_work_database;
+    
     IF (TG_OP = 'DELETE') THEN
-        DELETE FROM cron.job WHERE jobname = OLD.job_name;
+        -- Unschedule job using stored job_id
+        IF OLD.job_id IS NOT NULL THEN
+            BEGIN
+                PERFORM cron.unschedule(OLD.job_id);
+            EXCEPTION WHEN OTHERS THEN
+                RAISE NOTICE 'Could not unschedule job ID %: %', OLD.job_id, SQLERRM;
+            END;
+        END IF;
         RETURN OLD;
     END IF;
 
     -- Build the command to be executed by cron
     v_command := format('SELECT partitioncache_run_eviction_job(%L, %L)', NEW.job_name, NEW.table_prefix);
 
-    IF (TG_OP = 'INSERT') THEN
-        INSERT INTO cron.job (jobname, schedule, command, active)
-        VALUES (NEW.job_name, CONCAT(NEW.frequency_minutes, ' minutes'), v_command, NEW.enabled);
-    ELSIF (TG_OP = 'UPDATE') THEN
-        UPDATE cron.job
-        SET schedule = CONCAT(NEW.frequency_minutes, ' minutes'),
-            command = v_command,
-            active = NEW.enabled
-        WHERE jobname = NEW.job_name;
+    -- First, unschedule existing job if this is an UPDATE
+    IF (TG_OP = 'UPDATE' AND OLD.job_id IS NOT NULL) THEN
+        BEGIN
+            PERFORM cron.unschedule(OLD.job_id);
+        EXCEPTION WHEN OTHERS THEN
+            RAISE NOTICE 'Could not unschedule job ID %: %', OLD.job_id, SQLERRM;
+        END;
     END IF;
+
+    -- Schedule new job using pg_cron API with cross-database execution
+    BEGIN
+        SELECT cron.schedule_in_database(
+            NEW.job_name,
+            CONCAT(NEW.frequency_minutes, ' minutes'),
+            v_command,
+            v_work_database,
+            current_user,
+            NEW.enabled
+        ) INTO v_job_id;
+        
+        -- Store the job ID for later management
+        NEW.job_id := v_job_id;
+        
+    EXCEPTION WHEN OTHERS THEN
+        RAISE WARNING 'Failed to schedule eviction job %: %', NEW.job_name, SQLERRM;
+    END;
 
     RETURN NEW;
 END;

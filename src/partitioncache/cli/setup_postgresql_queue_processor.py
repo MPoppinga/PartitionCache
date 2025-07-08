@@ -145,23 +145,89 @@ def get_db_connection():
     )
 
 
-def check_pg_cron_installed(conn) -> bool:
-    """Check if pg_cron extension is installed."""
-    with conn.cursor() as cur:
-        try:
-            # First check if it exists without trying to create it
-            cur.execute("SELECT 1 FROM pg_extension WHERE extname = 'pg_cron'")
-            if cur.fetchone() is not None:
-                return True
+def get_pg_cron_connection():
+    """Get pg_cron database connection using environment variables."""
+    return psycopg.connect(
+        host=os.getenv("PG_CRON_HOST", os.getenv("DB_HOST")),
+        port=int(os.getenv("PG_CRON_PORT", os.getenv("DB_PORT", "5432"))),
+        user=os.getenv("PG_CRON_USER", os.getenv("DB_USER")),
+        password=os.getenv("PG_CRON_PASSWORD", os.getenv("DB_PASSWORD")),
+        dbname=os.getenv("PG_CRON_DATABASE", "postgres"),
+    )
 
-            # Try to create it if not exists
-            cur.execute("CREATE EXTENSION IF NOT EXISTS pg_cron")
-            conn.commit()
-            return True
-        except Exception as e:
-            # pg_cron not available - this is OK for manual processing
-            logger.debug(f"pg_cron extension not available: {e}")
-            return False
+
+def check_pg_cron_installed() -> bool:
+    """Check if pg_cron extension is installed in the pg_cron database."""
+    try:
+        with get_pg_cron_connection() as conn:
+            with conn.cursor() as cur:
+                # First check if it exists without trying to create it
+                cur.execute("SELECT 1 FROM pg_extension WHERE extname = 'pg_cron'")
+                if cur.fetchone() is not None:
+                    return True
+
+                # Try to create it if not exists
+                cur.execute("CREATE EXTENSION IF NOT EXISTS pg_cron")
+                conn.commit()
+                return True
+    except Exception as e:
+        # pg_cron not available - this is OK for manual processing
+        logger.debug(f"pg_cron extension not available: {e}")
+        return False
+
+
+def check_and_grant_pg_cron_permissions() -> tuple[bool, str]:
+    """Check and optionally grant pg_cron permissions to current user."""
+    try:
+        with get_pg_cron_connection() as conn:
+            with conn.cursor() as cur:
+                # Get current user from work database
+                work_user = os.getenv("DB_USER")
+
+                # Check if user has required permissions
+                cur.execute("""
+                    SELECT
+                        has_schema_privilege(%s, 'cron', 'USAGE') as schema_usage,
+                        has_function_privilege(%s, 'cron.schedule_in_database(text,text,text,text,text,boolean)', 'EXECUTE') as schedule_exec,
+                        has_function_privilege(%s, 'cron.unschedule(bigint)', 'EXECUTE') as unschedule_exec
+                """, (work_user, work_user, work_user))
+
+                perms = cur.fetchone()
+                if not perms:
+                    return False, "Could not check permissions"
+
+                schema_usage, schedule_exec, unschedule_exec = perms
+
+                if schema_usage and schedule_exec and unschedule_exec:
+                    return True, "All required permissions are already granted"
+
+                # Try to grant missing permissions (requires superuser privileges)
+                missing_perms = []
+                try:
+                    if not schema_usage:
+                        cur.execute("GRANT USAGE ON SCHEMA cron TO %s", (work_user,))
+                        missing_perms.append("SCHEMA cron USAGE")
+
+                    if not schedule_exec:
+                        cur.execute("GRANT EXECUTE ON FUNCTION cron.schedule_in_database TO %s", (work_user,))
+                        missing_perms.append("cron.schedule_in_database")
+
+                    if not unschedule_exec:
+                        cur.execute("GRANT EXECUTE ON FUNCTION cron.unschedule TO %s", (work_user,))
+                        cur.execute("GRANT EXECUTE ON FUNCTION cron.alter_job TO %s", (work_user,))
+                        missing_perms.append("cron.unschedule and cron.alter_job")
+
+                    # Also grant SELECT on cron.job for monitoring (optional)
+                    cur.execute("GRANT SELECT ON cron.job TO %s", (work_user,))
+
+                    conn.commit()
+                    return True, f"Successfully granted permissions: {', '.join(missing_perms)}"
+
+                except Exception as grant_error:
+                    return False, f"Failed to grant permissions (need superuser): {grant_error}"
+
+    except Exception as e:
+        return False, f"Error checking pg_cron permissions: {e}"
 
 
 def setup_database_objects(conn, include_pg_cron_trigger=True):
@@ -342,12 +408,25 @@ def handle_setup(conn, table_prefix: str, queue_prefix: str, cache_backend: str,
     logger.info("Starting PostgreSQL queue processor setup...")
 
     # Check if pg_cron is available (but don't require it)
-    pg_cron_available = check_pg_cron_installed(conn)
+    pg_cron_available = check_pg_cron_installed()
 
     if enabled and not pg_cron_available:
         logger.error("Cannot enable processor with pg_cron: extension is not installed.")
         logger.info("You can still set up the processor infrastructure and use manual processing.")
         sys.exit(1)
+
+    # Check and grant pg_cron permissions if needed
+    if enabled and pg_cron_available:
+        perms_ok, perms_msg = check_and_grant_pg_cron_permissions()
+        if perms_ok:
+            logger.info(f"pg_cron permissions: {perms_msg}")
+        else:
+            logger.warning(f"pg_cron permissions issue: {perms_msg}")
+            logger.warning("You may need to manually grant permissions as superuser:")
+            work_user = os.getenv("DB_USER")
+            logger.warning(f"  GRANT USAGE ON SCHEMA cron TO {work_user};")
+            logger.warning(f"  GRANT EXECUTE ON FUNCTION cron.schedule_in_database TO {work_user};")
+            logger.warning(f"  GRANT EXECUTE ON FUNCTION cron.unschedule TO {work_user};")
 
     # Setup all database objects (functions, tables, etc.)
     # Only create pg_cron trigger if we're enabling the processor
@@ -677,6 +756,15 @@ def main():
             status_filter=args.status,
             queue_prefix=get_queue_table_prefix_from_env(),
         )
+    )
+
+    # check-permissions command
+    parser_perms = subparsers.add_parser("check-permissions", help="Check and optionally grant pg_cron permissions")
+    parser_perms.set_defaults(
+        func=lambda args: (lambda:
+            print("Checking pg_cron permissions...") or
+            (lambda result: print(f"Result: {result[1]}"))(check_and_grant_pg_cron_permissions())
+        )()
     )
 
     # manual-process command
