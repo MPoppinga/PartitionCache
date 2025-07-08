@@ -99,7 +99,9 @@ class TestQueryFragmentProcessor:
         mcq_module.args = mock_args
 
         try:
-            query_fragment_processor()
+            # Create constraint args tuple
+            constraint_args = (None, None, None)  # (add_constraints, remove_constraints_all, remove_constraints_add)
+            query_fragment_processor(mock_args, constraint_args)
         finally:
             # Restore original args
             if original_args is not None:
@@ -141,7 +143,9 @@ class TestQueryFragmentProcessor:
         mcq_module.args = mock_args
 
         try:
-            query_fragment_processor()
+            # Create constraint args tuple
+            constraint_args = (None, None, None)  # (add_constraints, remove_constraints_all, remove_constraints_add)
+            query_fragment_processor(mock_args, constraint_args)
         finally:
             # Restore original args
             if original_args is not None:
@@ -167,7 +171,9 @@ class TestQueryFragmentProcessor:
             mcq_module.args = mock_args
 
             try:
-                query_fragment_processor()
+                # Create constraint args tuple  
+                constraint_args = (None, None, None)  # (add_constraints, remove_constraints_all, remove_constraints_add)
+                query_fragment_processor(mock_args, constraint_args)
             finally:
                 # Restore original args
                 if original_args is not None:
@@ -176,6 +182,46 @@ class TestQueryFragmentProcessor:
                     delattr(mcq_module, "args")
 
         mock_sleep.assert_called_once_with(1)
+
+    @patch("partitioncache.cli.monitor_cache_queue.exit_event")
+    @patch("partitioncache.cli.monitor_cache_queue.pop_from_original_query_queue_blocking")
+    @patch("partitioncache.cli.monitor_cache_queue.pop_from_original_query_queue")
+    @patch("partitioncache.cli.monitor_cache_queue.generate_all_query_hash_pairs")
+    @patch("partitioncache.cli.monitor_cache_queue.push_to_query_fragment_queue")
+    def test_query_fragment_processor_with_constraints(self, mock_push_fragments, mock_generate, mock_pop, mock_pop_blocking, mock_exit_event, mock_args, mock_env):
+        """Test query fragment processing with constraint arguments."""
+        # Setup mocks
+        mock_exit_event.is_set.side_effect = [False, True]  # Run once then exit
+        mock_pop_blocking.return_value = ("SELECT * FROM test_table", "test_partition_key", "integer")
+        mock_generate.return_value = [("SELECT DISTINCT t1.partition_key FROM test_table t1", "hash1")]
+
+        # Test specific constraint args
+        add_constraints = {"test_table": "status = 'active'"}
+        remove_constraints_all = ["size", "color"]
+        remove_constraints_add = ["category"]
+        constraint_args = (add_constraints, remove_constraints_all, remove_constraints_add)
+
+        # Monkey patch args into the module
+        import partitioncache.cli.monitor_cache_queue as mcq_module
+
+        original_args = getattr(mcq_module, "args", None)
+        mcq_module.args = mock_args
+
+        try:
+            query_fragment_processor(mock_args, constraint_args)
+        finally:
+            # Restore original args
+            if original_args is not None:
+                mcq_module.args = original_args
+            else:
+                delattr(mcq_module, "args")
+
+        # Verify generate_all_query_hash_pairs was called with correct constraint args
+        mock_generate.assert_called_once()
+        call_kwargs = mock_generate.call_args[1]
+        assert call_kwargs["add_constraints"] == add_constraints
+        assert call_kwargs["remove_constraints_all"] == remove_constraints_all
+        assert call_kwargs["remove_constraints_add"] == remove_constraints_add
 
 
 class TestRunAndStoreQuery:
@@ -486,7 +532,9 @@ class TestIntegration:
         mcq_module.args = mock_args
 
         try:
-            query_fragment_processor()
+            # Create constraint args tuple
+            constraint_args = (None, None, None)  # (add_constraints, remove_constraints_all, remove_constraints_add)
+            query_fragment_processor(mock_args, constraint_args)
         finally:
             # Restore original args
             if original_args is not None:

@@ -47,9 +47,6 @@ from partitioncache.queue import (
 logger = getLogger("PartitionCache")
 
 args: argparse.Namespace
-add_constraints: dict[str, str] | None = None
-remove_constraints_all: list[str] | None = None
-remove_constraints_add: list[str] | None = None
 
 # Initialize threading components
 status_lock = threading.Lock()
@@ -64,8 +61,14 @@ last_status_log_time = 0.0
 status_log_interval = 10  # Log status every 10 seconds when idle
 
 
-def query_fragment_processor():
-    """Thread function that processes original queries into fragments and pushes to query fragment queue."""
+def query_fragment_processor(args, constraint_args):
+    """Thread function that processes original queries into fragments and pushes to query fragment queue.
+
+    Args:
+        args: Command line arguments
+        constraint_args: Tuple of (add_constraints, remove_constraints_all, remove_constraints_add)
+    """
+    add_constraints, remove_constraints_all, remove_constraints_add = constraint_args
     logger.info("Starting query fragment processor thread")
 
     while not exit_event.is_set():
@@ -613,8 +616,8 @@ def main():
     load_environment_with_validation(args.env_file)
 
     # Parse JSON arguments for constraint modifications
-    global add_constraints, remove_constraints_all, remove_constraints_add
     add_constraints, remove_constraints_all, remove_constraints_add = parse_variant_generation_json_args(args)
+    constraint_args = (add_constraints, remove_constraints_all, remove_constraints_add)
 
     # Set cache backend if not specified
     if args.cache_backend is None:
@@ -667,7 +670,7 @@ def main():
         logger.info(f"  - Prefer lazy: {args.prefer_lazy_optimization}")
 
     # Start the query fragment processor thread
-    fragment_processor_thread = threading.Thread(target=query_fragment_processor, daemon=True)
+    fragment_processor_thread = threading.Thread(target=query_fragment_processor, args=(args, constraint_args), daemon=True)
     fragment_processor_thread.start()
 
     # Start the fragment executor in the main thread

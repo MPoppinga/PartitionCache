@@ -452,10 +452,11 @@ def restore_cache(cache_type: str, archive_file: str, target_partition_key: str 
                     partitions_to_register = set()
 
                     for pk, datatype in partition_metadata:
-                        # If target partition specified, we'll register it when needed
+                        # If target partition specified, register target with source datatype
                         if target_partition_key:
-                            if pk == target_partition_key:
-                                partitions_to_register.add((target_partition_key, datatype))
+                            # Register target partition with source partition's datatype
+                            partitions_to_register.add((target_partition_key, datatype))
+                            break  # Only need first datatype when remapping
                         else:
                             # Register all original partitions
                             partitions_to_register.add((pk, datatype))
@@ -490,9 +491,8 @@ def restore_cache(cache_type: str, archive_file: str, target_partition_key: str 
 
                     queries_restored = 0
                     for query_hash, query_text, source_partition_key in queries_metadata:
-                        # Skip if filtering by specific partition and this doesn't match
-                        if target_partition_key and source_partition_key != target_partition_key:
-                            continue
+                        # Note: When target_partition_key is specified, we're remapping
+                        # So we should NOT skip entries - we import them to the target partition
 
                         # Use target partition if specified, otherwise use source partition
                         effective_partition_key = target_partition_key if target_partition_key else source_partition_key
@@ -513,10 +513,8 @@ def restore_cache(cache_type: str, archive_file: str, target_partition_key: str 
                     value = data["value"]
                     source_partition_key = data["partition_key"]
 
-                    # Skip if filtering by specific partition and this doesn't match
-                    if target_partition_key and source_partition_key != target_partition_key:
-                        skipped_partition_filtered += 1
-                        continue
+                    # Note: When target_partition_key is specified, we're remapping
+                    # So we should NOT skip entries - we import them to the target partition
 
                     # Use target partition if specified, otherwise use source partition
                     effective_partition_key = target_partition_key if target_partition_key else source_partition_key
@@ -539,6 +537,10 @@ def restore_cache(cache_type: str, archive_file: str, target_partition_key: str 
                                 cache.register_partition_key(effective_partition_key, datatype)
                                 partitions_registered += 1
                                 logger.info(f"Auto-registered partition '{effective_partition_key}' with datatype '{datatype}'")
+                                # Verify registration
+                                actual_datatype = cache.get_datatype(effective_partition_key)
+                                if actual_datatype != datatype:
+                                    logger.error(f"Registration verification failed: expected '{datatype}', got '{actual_datatype}'")
                     except Exception as e:
                         logger.warning(f"Could not register partition '{effective_partition_key}': {e}")
 

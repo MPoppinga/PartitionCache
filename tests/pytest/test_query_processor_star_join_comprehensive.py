@@ -399,8 +399,9 @@ class TestEdgeCasesAndErrorHandling:
         # and generate variants with the other table(s)
         assert len(variants) > 0, "Should generate variants"
 
-        # Only one table should be used as star-join (AS p1)
-        star_join_count = sum(1 for v in variants if " AS p1" in v)
+        # Only one table should be used as star-join
+        # When user alias is "p1", system uses fallback alias "star_join_*"
+        star_join_count = sum(1 for v in variants if " AS p1" in v or " AS star_join_" in v)
         assert star_join_count > 0, "Should have star-join table re-added"
 
     def test_complex_partition_key_conditions(self):

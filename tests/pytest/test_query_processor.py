@@ -34,6 +34,23 @@ class TestBasicFunctionality:
         expected_result = "SELECT * FROM table AS a, table AS b WHERE DIST(a, b) BETWEEN 1 AND 4"
         assert normalize_distance_conditions(query, restrict_to_dist_functions=False) == expected_result
 
+    def test_normalize_distance_conditions_bucket_steps_validation(self):
+        """Test bucket_steps edge cases."""
+        query = "SELECT * FROM table WHERE distance BETWEEN 1.6 AND 3.6"
+        
+        # Test case: bucket_steps = 0 should return original query (no normalization)
+        result = normalize_distance_conditions(query, bucket_steps=0, restrict_to_dist_functions=False)
+        assert result == query  # No changes when bucket_steps is 0
+        
+        # Test case: negative bucket_steps should also return original query
+        result = normalize_distance_conditions(query, bucket_steps=-1.0, restrict_to_dist_functions=False)
+        assert result == query  # No changes when bucket_steps is negative
+        
+        # Test case: valid bucket_steps should work
+        result = normalize_distance_conditions(query, bucket_steps=0.5, restrict_to_dist_functions=False)
+        expected = "SELECT * FROM table WHERE distance BETWEEN 1.5 AND 4"
+        assert result == expected
+
     def test_extract_conjunctive_conditions(self):
         """Test extraction of AND conditions."""
         # Test case: Single condition

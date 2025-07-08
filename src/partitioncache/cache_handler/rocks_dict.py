@@ -16,6 +16,7 @@ class RocksDictCacheHandler(AbstractCacheHandler):
 
     _instance = None
     _refcount = 0
+    _current_path = None
 
     @classmethod
     def get_supported_datatypes(cls) -> set[str]:
@@ -285,7 +286,11 @@ class RocksDictCacheHandler(AbstractCacheHandler):
         """
         self._refcount -= 1
         if self._refcount <= 0:
-            self.db.close()
+            try:
+                self.db.close()
+            except Exception:
+                # DB might already be closed, ignore
+                pass
             self._instance = None
             self._refcount = 0
 
@@ -326,8 +331,18 @@ class RocksDictCacheHandler(AbstractCacheHandler):
 
     @classmethod
     def get_instance(cls, db_path: str, read_only: bool = False):
-        if cls._instance is None:
+        # Check if we need a new instance due to path change
+        if cls._instance is None or cls._current_path != db_path:
+            if cls._instance is not None:
+                # Close existing instance if path changed
+                try:
+                    cls._instance.db.close()
+                except Exception:
+                    pass
+                cls._instance = None
+                cls._refcount = 0
             cls._instance = cls(db_path, read_only=read_only)
+            cls._current_path = db_path
         cls._refcount += 1
         return cls._instance
 

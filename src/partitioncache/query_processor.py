@@ -405,6 +405,8 @@ def detect_star_join_table(
 
             if not detected_star_join_alias:
                 logger.warning(f"Could not match star-join table specification '{star_join_table}' to any alias or table name")
+                logger.warning(f"Available aliases: {table_aliases}")
+                logger.warning(f"Available tables: {list(alias_to_table_map.values())}")
 
     # If no explicit star-join specified and auto-detection is enabled
     if not detected_star_join_alias and auto_detect_star_join:
@@ -787,7 +789,12 @@ def generate_partial_queries(
                 # ONLY create variant with star-join table re-added
                 # (no base variant without star-join for star-schema queries)
                 star_join_table_name = alias_to_table_map.get(detected_star_join_alias, detected_star_join_alias)
+                # Use p1 as default alias for star-join table (for backward compatibility)
+                # but check for conflicts and use alternative if needed
                 star_join_new_alias = "p1"
+                if star_join_new_alias in new_table_list or star_join_new_alias in table_aliases:
+                    # If p1 conflicts, use a unique alias
+                    star_join_new_alias = f"star_join_{abs(hash(star_join_table_name)) % 10000}"
                 star_join_table_spec = f"{star_join_table_name} AS {star_join_new_alias}"
                 # Add star-join alias mapping
                 original_to_new_alias_mapping[detected_star_join_alias] = star_join_new_alias
@@ -811,9 +818,23 @@ def generate_partial_queries(
                 # Only keep attribute conditions and distance conditions, not partition key joins
                 query_where_without_pk_joins = []
                 for condition in query_where:
-                    # Skip partition key equality joins between tables (t1.pk = t2.pk)
-                    if f".{partition_key} = " in condition and condition.count("=") == 1:
-                        # This is a simple partition key join, skip it
+                    # Check for partition key equality joins between tables
+                    # Pattern: table1.partition_key = table2.partition_key
+                    is_pk_join = False
+                    if "=" in condition and partition_key in condition:
+                        # Split on = and check both sides contain table.partition_key pattern
+                        parts = condition.split("=")
+                        if len(parts) == 2:
+                            left_side = parts[0].strip()
+                            right_side = parts[1].strip()
+                            # Check if both sides are table.partition_key references
+                            left_match = re.match(rf"^t\d+\.{re.escape(partition_key)}$", left_side)
+                            right_match = re.match(rf"^t\d+\.{re.escape(partition_key)}$", right_side)
+                            if left_match and right_match:
+                                is_pk_join = True
+
+                    if is_pk_join:
+                        # This is a partition key join between tables, skip it
                         continue
                     # Keep all other conditions (attribute conditions, distance conditions, etc.)
                     query_where_without_pk_joins.append(condition)
@@ -944,6 +965,10 @@ def normalize_distance_conditions(original_query: str, bucket_steps: float = 1.0
     """
     bucket_steps = float(bucket_steps)
 
+    # If bucket_steps is 0 or negative, return original query without distance normalization
+    if bucket_steps <= 0:
+        return original_query
+
     original_query = sqlglot.parse_one(original_query).sql()
     condition_list = extract_conjunctive_conditions(original_query)
 
@@ -1037,7 +1062,7 @@ def normalize_distance_conditions(original_query: str, bucket_steps: float = 1.0
         # More robust parsing: use regex to extract the numeric value correctly
         if "<=" in distance_condition:
             # Use regex to find the number after <=, avoiding parsing issues with subsequent AND clauses
-            match = re.search(r"<=\s*([+-]?(?:\d+\.?\d*|\.\d+))", distance_condition)
+            match = re.search(r"<=\s*([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)", distance_condition)
             if not match:
                 logger.warning(f"Could not extract numeric value from condition: {distance_condition}")
                 continue
@@ -1063,7 +1088,7 @@ def normalize_distance_conditions(original_query: str, bucket_steps: float = 1.0
             new_condition = f"{left_part} <= {valuef:g}"
         else:
             # Similar robust parsing for < operator
-            match = re.search(r"<\s*([+-]?(?:\d+\.?\d*|\.\d+))", distance_condition)
+            match = re.search(r"<\s*([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)", distance_condition)
             if not match:
                 logger.warning(f"Could not extract numeric value from condition: {distance_condition}")
                 continue
@@ -1092,7 +1117,7 @@ def normalize_distance_conditions(original_query: str, bucket_steps: float = 1.0
 
         # More robust parsing for >= and > operators
         if ">=" in distance_condition:
-            match = re.search(r">=\s*([+-]?(?:\d+\.?\d*|\.\d+))", distance_condition)
+            match = re.search(r">=\s*([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)", distance_condition)
             if not match:
                 logger.warning(f"Could not extract numeric value from condition: {distance_condition}")
                 continue
@@ -1110,7 +1135,7 @@ def normalize_distance_conditions(original_query: str, bucket_steps: float = 1.0
             left_part = distance_condition.split(">=")[0]
             new_condition = f"{left_part} >= {valuef:g}"
         else:
-            match = re.search(r">\s*([+-]?(?:\d+\.?\d*|\.\d+))", distance_condition)
+            match = re.search(r">\s*([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)", distance_condition)
             if not match:
                 logger.warning(f"Could not extract numeric value from condition: {distance_condition}")
                 continue
