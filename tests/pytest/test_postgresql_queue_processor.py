@@ -7,7 +7,9 @@ import pytest
 
 from partitioncache.cli.setup_postgresql_queue_processor import (
     SQL_FILE,
+    check_and_grant_pg_cron_permissions,
     check_pg_cron_installed,
+    get_pg_cron_connection,
     get_processor_status,
     validate_environment,
 )
@@ -88,50 +90,126 @@ class TestEnvironmentValidation:
 class TestPgCronCheck:
     """Test pg_cron extension checking."""
 
-    def test_check_pg_cron_installed_true(self):
+    @patch('partitioncache.cli.setup_postgresql_queue_processor.get_pg_cron_connection')
+    def test_check_pg_cron_installed_true(self, mock_get_conn):
         """Test when pg_cron is already installed."""
         mock_conn = Mock()
         mock_cursor = Mock()
+        mock_get_conn.return_value.__enter__ = Mock(return_value=mock_conn)
+        mock_get_conn.return_value.__exit__ = Mock(return_value=None)
         mock_conn.cursor.return_value.__enter__ = Mock(return_value=mock_cursor)
         mock_conn.cursor.return_value.__exit__ = Mock(return_value=None)
         mock_cursor.fetchone.return_value = (1,)
 
-        assert check_pg_cron_installed(mock_conn) is True
+        assert check_pg_cron_installed() is True
 
         # Should only make one call to check if it exists (since it does)
         assert mock_cursor.execute.call_count == 1
         calls = mock_cursor.execute.call_args_list
         assert "SELECT 1 FROM pg_extension WHERE extname = 'pg_cron'" in calls[0][0][0]
 
-    def test_check_pg_cron_installed_false(self):
+    @patch('partitioncache.cli.setup_postgresql_queue_processor.get_pg_cron_connection')
+    def test_check_pg_cron_installed_false(self, mock_get_conn):
         """Test when pg_cron is not installed and cannot be created."""
         mock_conn = Mock()
         mock_cursor = Mock()
+        mock_get_conn.return_value.__enter__ = Mock(return_value=mock_conn)
+        mock_get_conn.return_value.__exit__ = Mock(return_value=None)
         mock_conn.cursor.return_value.__enter__ = Mock(return_value=mock_cursor)
         mock_conn.cursor.return_value.__exit__ = Mock(return_value=None)
         mock_cursor.fetchone.return_value = None
         # Simulate CREATE EXTENSION failing
         mock_cursor.execute.side_effect = [None, Exception("permission denied")]
 
-        assert check_pg_cron_installed(mock_conn) is False
+        assert check_pg_cron_installed() is False
 
-    def test_check_pg_cron_installed_create_success(self):
+    @patch('partitioncache.cli.setup_postgresql_queue_processor.get_pg_cron_connection')
+    def test_check_pg_cron_installed_create_success(self, mock_get_conn):
         """Test when pg_cron is not installed but can be created."""
         mock_conn = Mock()
         mock_cursor = Mock()
+        mock_get_conn.return_value.__enter__ = Mock(return_value=mock_conn)
+        mock_get_conn.return_value.__exit__ = Mock(return_value=None)
         mock_conn.cursor.return_value.__enter__ = Mock(return_value=mock_cursor)
         mock_conn.cursor.return_value.__exit__ = Mock(return_value=None)
         # First check returns None (not installed), CREATE succeeds
         mock_cursor.fetchone.return_value = None
         mock_cursor.execute.side_effect = [None, None]  # SELECT succeeds, CREATE succeeds
+        mock_conn.commit = Mock()
 
-        assert check_pg_cron_installed(mock_conn) is True
+        assert check_pg_cron_installed() is True
 
         # Should make two calls: SELECT to check and CREATE EXTENSION
         assert mock_cursor.execute.call_count == 2
         calls = mock_cursor.execute.call_args_list
         assert "SELECT 1 FROM pg_extension WHERE extname = 'pg_cron'" in calls[0][0][0]
         assert "CREATE EXTENSION IF NOT EXISTS pg_cron" in calls[1][0][0]
+
+
+class TestPgCronConnection:
+    """Test pg_cron connection functions."""
+
+    @patch.dict(os.environ, {
+        "PG_CRON_HOST": "cron_host",
+        "PG_CRON_PORT": "5433",
+        "PG_CRON_USER": "cron_user",
+        "PG_CRON_PASSWORD": "cron_pass",
+        "PG_CRON_DATABASE": "cron_db"
+    })
+    @patch('psycopg.connect')
+    def test_get_pg_cron_connection_with_explicit_vars(self, mock_connect):
+        """Test connection with explicit PG_CRON_* variables."""
+        get_pg_cron_connection()
+
+        mock_connect.assert_called_once_with(
+            host="cron_host",
+            port=5433,
+            user="cron_user",
+            password="cron_pass",
+            dbname="cron_db"
+        )
+
+    @patch.dict(os.environ, {
+        "DB_HOST": "db_host",
+        "DB_PORT": "5432",
+        "DB_USER": "db_user",
+        "DB_PASSWORD": "db_pass"
+    })
+    @patch('psycopg.connect')
+    def test_get_pg_cron_connection_with_fallback(self, mock_connect):
+        """Test connection falls back to DB_* variables."""
+        get_pg_cron_connection()
+
+        mock_connect.assert_called_once_with(
+            host="db_host",
+            port=5432,
+            user="db_user",
+            password="db_pass",
+            dbname="postgres"  # Default database
+        )
+
+
+class TestPgCronPermissions:
+    """Test pg_cron permission checking and granting."""
+
+    @patch.dict(os.environ, {"DB_USER": "test_user"})
+    @patch('partitioncache.cli.setup_postgresql_queue_processor.get_pg_cron_connection')
+    def test_check_and_grant_permissions_already_granted(self, mock_get_conn):
+        """Test when user already has all required permissions."""
+        mock_conn = Mock()
+        mock_cursor = Mock()
+        mock_get_conn.return_value.__enter__ = Mock(return_value=mock_conn)
+        mock_get_conn.return_value.__exit__ = Mock(return_value=None)
+        mock_conn.cursor.return_value.__enter__ = Mock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = Mock(return_value=None)
+
+        # All permissions are already granted
+        mock_cursor.fetchone.return_value = (True, True, True)
+
+        success, message = check_and_grant_pg_cron_permissions()
+
+        assert success is True
+        assert "already granted" in message
 
 
 class TestProcessorStatus:

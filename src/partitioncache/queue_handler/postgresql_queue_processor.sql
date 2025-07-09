@@ -450,47 +450,62 @@ BEGIN
     v_active_jobs_table := v_config.queue_prefix || '_active_jobs';
     v_log_table := v_config.queue_prefix || '_processor_log';
 
-    -- Dequeue the next item, skipping locked items
-    EXECUTE format(
-        'DELETE FROM %I
-            WHERE id = (
-                SELECT id FROM %I
-                ORDER BY id
-                FOR UPDATE SKIP LOCKED
-                LIMIT 1
-            )
-            RETURNING id, query, hash, partition_key, partition_datatype',
-        v_queue_table, v_queue_table
-    ) INTO v_queue_item;
+    -- Dequeue the next uncached item, skipping locked items and already processed items
+    DECLARE
+        v_queries_table TEXT;
+    BEGIN
+        v_queries_table := partitioncache_get_queries_table_name(v_config.table_prefix);
+        
+        EXECUTE format(
+            'DELETE FROM %I
+                WHERE id = (
+                    SELECT q.id 
+                    FROM %I q
+                    LEFT JOIN %I qr ON qr.query_hash = q.hash 
+                        AND qr.partition_key = q.partition_key
+                    WHERE qr.query_hash IS NULL  -- Only uncached items
+                    ORDER BY q.id
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT 1
+                )
+                RETURNING id, query, hash, partition_key, partition_datatype',
+            v_queue_table, v_queue_table, v_queries_table
+        ) INTO v_queue_item;
+    END;
 
-    -- If no item was dequeued, exit gracefully
+    -- If no item was dequeued, use idle time for cleanup
     IF v_queue_item.id IS NULL THEN
-        dispatched_job_id := NULL;
-        status := 'no_jobs_available';
+        -- Try to clean up cached items during idle time
+        DECLARE
+            v_cleanup_count INTEGER;
+        BEGIN
+            v_cleanup_count := partitioncache_cleanup_cached_queue_items(
+                v_config.queue_prefix, 
+                v_config.table_prefix, 
+                50  -- Clean up to 50 cached items
+            );
+            
+            IF v_cleanup_count > 0 THEN
+                RAISE NOTICE 'Cleaned up % cached items from queue during idle time', v_cleanup_count;
+                dispatched_job_id := 'cleanup_' || v_cleanup_count;
+                status := 'cleanup_completed';
+            ELSE
+                dispatched_job_id := NULL;
+                status := 'no_jobs_available';
+            END IF;
+            
+        EXCEPTION WHEN OTHERS THEN
+            -- Don't let cleanup failures affect main processing
+            RAISE NOTICE 'Queue cleanup failed: %', SQLERRM;
+            dispatched_job_id := NULL;
+            status := 'no_jobs_available';
+        END;
+        
         RETURN NEXT;
         RETURN;
     END IF;
 
-    -- Check if this query has already been processed
-    DECLARE
-        v_queries_table TEXT;
-        v_already_processed BOOLEAN;
-    BEGIN
-        v_queries_table := partitioncache_get_queries_table_name(v_config.table_prefix);
-        EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I WHERE query_hash = %L AND partition_key = %L)', 
-            v_queries_table, v_queue_item.hash, v_queue_item.partition_key) INTO v_already_processed;
-        
-        IF v_already_processed THEN
-            EXECUTE format('INSERT INTO %I (job_id, query_hash, partition_key, status, error_message, execution_source) VALUES (%L, %L, %L, %L, %L, %L)', 
-                v_log_table, 'job_' || v_queue_item.id, v_queue_item.hash, v_queue_item.partition_key, 'skipped', 'Query already processed', 'cron');
-            
-            dispatched_job_id := 'job_' || v_queue_item.id;
-            RAISE NOTICE 'Skipping job %', dispatched_job_id;
-            status := 'skipped';
-            RETURN NEXT;
-            RETURN;
-        END IF;
-    END;
+    -- Note: Query already processed check is now handled in dequeue logic above
 
     -- Try to acquire a lock for this job by inserting into active jobs
     BEGIN
@@ -853,5 +868,53 @@ BEGIN
         );
         EXECUTE v_update_sql;
     END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Helper function to clean up cached items from queue during idle time
+CREATE OR REPLACE FUNCTION partitioncache_cleanup_cached_queue_items(
+    p_queue_prefix TEXT DEFAULT 'partitioncache_queue',
+    p_table_prefix TEXT DEFAULT 'partitioncache_bit', 
+    p_limit INTEGER DEFAULT 50
+)
+RETURNS INTEGER AS $$
+DECLARE
+    v_queue_table TEXT;
+    v_queries_table TEXT;
+    v_cleaned_count INTEGER;
+BEGIN
+    -- Build table names using existing helper functions
+    v_queue_table := p_queue_prefix || '_query_fragment_queue';
+    v_queries_table := partitioncache_get_queries_table_name(p_table_prefix);
+    
+    -- Single atomic operation: remove cached items and update last_seen
+    EXECUTE format('
+        WITH cleaned AS (
+            DELETE FROM %I q
+            WHERE id IN (
+                SELECT q.id 
+                FROM %I q
+                INNER JOIN %I qr ON qr.query_hash = q.hash 
+                    AND qr.partition_key = q.partition_key
+                ORDER BY q.id
+                FOR UPDATE SKIP LOCKED  -- Avoid conflicts with other workers
+                LIMIT %L
+            )
+            RETURNING q.hash, q.partition_key
+        )
+        UPDATE %I qr
+        SET last_seen = now()
+        FROM cleaned c
+        WHERE qr.query_hash = c.hash 
+        AND qr.partition_key = c.partition_key',
+        v_queue_table,
+        v_queue_table,
+        v_queries_table,
+        p_limit,
+        v_queries_table
+    );
+    
+    GET DIAGNOSTICS v_cleaned_count = ROW_COUNT;
+    RETURN v_cleaned_count;
 END;
 $$ LANGUAGE plpgsql;
