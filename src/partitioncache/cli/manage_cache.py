@@ -550,39 +550,6 @@ def restore_cache(cache_type: str, archive_file: str, target_partition_key: str 
                     else:
                         skipped_already_exists += 1
 
-                # Handle legacy format (backward compatibility)
-                elif len(data) == 1 and "__PARTITION_METADATA__" not in data:
-                    key, value = list(data.items())[0]
-                    # Use default partition key for legacy format
-                    partition_key = "partition_key"
-
-                    # Ensure default partition exists
-                    try:
-                        if cache.get_datatype(partition_key) is None:
-                            # Try to infer datatype from value
-                            if value and len(value) > 0:
-                                sample_value = next(iter(value))
-                                if isinstance(sample_value, int):
-                                    datatype = "integer"
-                                elif isinstance(sample_value, float):
-                                    datatype = "float"
-                                elif isinstance(sample_value, str):
-                                    datatype = "text"
-                                else:
-                                    datatype = "text"  # default fallback
-
-                                cache.register_partition_key(partition_key, datatype)
-                                partitions_registered += 1
-                                logger.info(f"Auto-registered default partition '{partition_key}' with datatype '{datatype}'")
-                    except Exception as e:
-                        logger.warning(f"Could not auto-register partition: {e}")
-
-                    if not cache.exists(key, partition_key):
-                        cache.set_cache(key, value, partition_key)
-                        restored += 1
-                    else:
-                        skipped_already_exists += 1
-
             except EOFError:
                 break
             except Exception as e:

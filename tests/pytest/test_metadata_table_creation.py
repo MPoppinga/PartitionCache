@@ -84,7 +84,7 @@ class TestMetadataTableCreation:
         # Should contain bitsize column and integer constraint
         assert "bitsize" in metadata_sql
         assert "integer" in metadata_sql
-        assert "DEFAULT 1000" in metadata_sql or "1000" in metadata_sql
+        assert "DEFAULT NULL" in metadata_sql or "bitsize INTEGER" in metadata_sql
 
         handler.close()
 

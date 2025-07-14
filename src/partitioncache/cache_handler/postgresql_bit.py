@@ -13,12 +13,12 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
     def __repr__(self) -> str:
         return "postgresql_bit"
 
-    def __init__(self, db_name: str, db_host: str, db_user: str, db_password: str, db_port: str | int, db_tableprefix: str, bitsize: int) -> None:
+    def __init__(self, db_name: str, db_host: str, db_user: str, db_password: str, db_port: str | int, db_tableprefix: str, bitsize: int | None = None) -> None:
         """
         Initialize the cache handler with the given db name.
         This handler supports multiple partition keys but only integer datatypes (for bit arrays).
         """
-        self.default_bitsize = bitsize  # Bitsize should be configured correctly by user (bitsize=1001 to store values 0-1000)
+        self.default_bitsize = bitsize
         super().__init__(db_name, db_host, db_user, db_password, db_port, db_tableprefix)
 
     def _recreate_metadata_table(self, supported_datatypes: set[str]) -> None:
@@ -32,9 +32,9 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
                 sql.SQL("""CREATE TABLE IF NOT EXISTS {0} (
                     partition_key TEXT PRIMARY KEY,
                     datatype TEXT NOT NULL CHECK (datatype = 'integer'),
-                    bitsize INTEGER NOT NULL DEFAULT {1},
+                    bitsize INTEGER DEFAULT NULL,
                     created_at TIMESTAMP DEFAULT now()
-                );""").format(sql.Identifier(self.tableprefix + "_partition_metadata"), sql.Literal(self.default_bitsize))
+                );""").format(sql.Identifier(self.tableprefix + "_partition_metadata"))
             )
 
             # Create queries table (same as base implementation)
@@ -76,6 +76,7 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
 
     def _create_partition_table(self, partition_key: str, bitsize: int | None = None) -> None:
         """Create a cache table for a specific partition key."""
+        # bitsize parameter is now optional and only used for metadata storage
         if bitsize is None:
             bitsize = self.default_bitsize
 
@@ -107,6 +108,7 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
 
     def _ensure_partition_table(self, partition_key: str, datatype: str, **kwargs) -> bool:
         """Ensure a partition table exists."""
+        # bitsize parameter is optional and only used for metadata storage
         bitsize = kwargs.get("bitsize", self.default_bitsize)
         try:
             # First ensure metadata table exists before trying to query it
@@ -144,20 +146,22 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
             # Ensure partition table exists
             self._ensure_partition_table(partition_key, "integer")
 
-            # Get the bitsize for this partition
-            bitsize = self._get_partition_bitsize(partition_key)
-            if bitsize is None:
-                bitsize = self.default_bitsize
-            bitsize = int(bitsize)
-            val = bitarray(bitsize)
-            val.setall(0)
+            # Create dynamic bitarray based on maximum value
+            # Convert all keys to integers first and find the maximum
+            int_keys = []
             for k in partition_key_identifiers:
                 if isinstance(k, int):
-                    val[k] = 1
+                    int_keys.append(k)
                 elif isinstance(k, str):
-                    val[int(k)] = 1
+                    int_keys.append(int(k))
                 else:
                     raise ValueError(f"Only integer values are supported for bit arrays: {k} : {partition_key_identifiers}")
+
+            max_value = max(int_keys)
+            val = bitarray(max_value + 1)
+            val.setall(0)
+            for k in int_keys:
+                val[k] = 1
             table_name = f"{self.tableprefix}_cache_{partition_key}"
             self.cursor.execute(
                 sql.SQL(
@@ -256,18 +260,12 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
 
     def get_intersected_lazy(self, keys: set[str], partition_key: str = "partition_key") -> tuple[str | None, int]:
         """Get lazy intersection for partition-specific table."""
-        filtered_keys = self.filter_existing_keys(keys, partition_key)
+        filtered_keys = self.filter_existing_keys(keys, partition_key)  # TODO: Check if this is needed, or if we can just use the keys directly
 
         if not filtered_keys:
             return None, 0
 
         intersect_sql_str = self.get_intersected_sql_wk(filtered_keys, partition_key)
-
-        # Get the bitsize for this partition
-        bitsize = self._get_partition_bitsize(partition_key)
-        if bitsize is None:
-            bitsize = self.default_bitsize
-        bitsize = int(bitsize)
 
         r = (
             sql.SQL("""(
@@ -277,16 +275,15 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
         numbered_bits AS (
             SELECT
                 bit_result,
-                generate_series(0, {1} - 1) AS bit_index
+                generate_series(0, bit_length(bit_result) - 1) AS bit_index
             FROM bit_result
         )
-        SELECT unnest(array_agg(bit_index)) AS {2}
+        SELECT unnest(array_agg(bit_index)) AS {1}
         FROM numbered_bits
         WHERE get_bit(bit_result, bit_index) = 1)
         """)
             .format(
                 sql.SQL(intersect_sql_str),  # type: ignore
-                sql.Literal(bitsize),
                 sql.Identifier(partition_key),
             )
             .as_string()

@@ -382,10 +382,11 @@ def update_processor_config(
     frequency: int | None = None,
     timeout: int | None = None,
     table_prefix: str | None = None,
+    result_limit: int | None = None,
     queue_prefix: str | None = None,
 ):
     """Update processor configuration."""
-    if all(arg is None for arg in [enabled, max_parallel_jobs, frequency, timeout, table_prefix]):
+    if all(arg is None for arg in [enabled, max_parallel_jobs, frequency, timeout, table_prefix, result_limit]):
         logger.warning("No configuration options provided to update.")
         return
 
@@ -396,8 +397,8 @@ def update_processor_config(
     logger.info(f"Updating processor configuration for job '{job_name}'...")
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT partitioncache_update_processor_config(%s, %s, %s, %s, %s, %s, %s)",
-            (job_name, enabled, max_parallel_jobs, frequency, timeout, table_prefix, queue_prefix),
+            "SELECT partitioncache_update_processor_config(%s, %s, %s, %s, %s, %s, %s, %s)",
+            (job_name, enabled, max_parallel_jobs, frequency, timeout, table_prefix, result_limit, queue_prefix),
         )
     conn.commit()
     logger.info("Processor configuration updated successfully.")
@@ -697,6 +698,7 @@ def main():
     parser_update.add_argument("--frequency", type=int, help="New frequency in seconds for the processor job")
     parser_update.add_argument("--timeout", type=int, help="New timeout in seconds for processing jobs")
     parser_update.add_argument("--table-prefix", type=str, help="New table prefix for the cache tables")
+    parser_update.add_argument("--result-limit", type=int, help="New result limit for queries (NULL to disable)")
     parser_update.set_defaults(
         func=lambda args: update_processor_config(
             get_db_connection(),
@@ -705,6 +707,7 @@ def main():
             frequency=args.frequency,
             timeout=args.timeout,
             table_prefix=args.table_prefix,
+            result_limit=args.result_limit,
             queue_prefix=get_queue_table_prefix_from_env(),
         )
     )

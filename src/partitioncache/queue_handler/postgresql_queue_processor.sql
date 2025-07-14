@@ -25,7 +25,7 @@
 -- │  └──────────┬───────────────────┘  │
 -- │             ▼                      │
 -- │  ┌──────────────────────────────┐  │
--- │  │ _partitioncache_execute_job  │───> Process item
+-- │  │ _partitioncache_execute_job  │───> Process item ---> Store result in cache table + queries table
 -- │  └──────────────────────────────┘  │
 -- └────────────────────────────────────┘
 --
@@ -66,6 +66,7 @@ BEGIN
             table_prefix TEXT NOT NULL,
             queue_prefix TEXT NOT NULL,
             cache_backend TEXT NOT NULL,
+            result_limit INTEGER DEFAULT NULL CHECK (result_limit IS NULL OR result_limit > 0), -- Limit number of partition keys, NULL = disabled
             job_ids BIGINT[] DEFAULT ARRAY[]::BIGINT[], -- Store pg_cron job IDs for cross-database management
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )', v_config_table);
@@ -279,7 +280,7 @@ BEGIN
             CREATE TABLE IF NOT EXISTS %I (
                 partition_key TEXT PRIMARY KEY,
                 datatype TEXT NOT NULL CHECK (datatype IN (''integer'', ''float'', ''text'', ''timestamp'')),
-                bitsize INTEGER NOT NULL DEFAULT 1000,
+                bitsize INTEGER DEFAULT NULL,
                 created_at TIMESTAMP DEFAULT now()
             )', v_metadata_table);
     ELSIF v_cache_backend = 'roaringbit' THEN
@@ -304,7 +305,7 @@ BEGIN
             query_hash TEXT NOT NULL,
             partition_key TEXT NOT NULL,
             query TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT ''ok'' CHECK (status IN (''ok'', ''timeout'', ''failed'')),
+            status TEXT NOT NULL DEFAULT ''ok'' CHECK (status IN (''ok'', ''timeout'', ''failed'', ''limit'')),
             last_seen TIMESTAMP NOT NULL DEFAULT now(),
             PRIMARY KEY (query_hash, partition_key)
         )', v_queries_table);
@@ -579,6 +580,7 @@ DECLARE
     v_bit_query TEXT;
     v_already_processed BOOLEAN;
     v_timeout_seconds INTEGER;
+    v_result_limit INTEGER;
 BEGIN
     v_job_id := 'job_' || p_item_id;
     v_start_time := clock_timestamp(); -- Use clock_timestamp() for better precision
@@ -589,8 +591,8 @@ BEGIN
     v_config_table := p_queue_prefix || '_processor_config';
     v_queries_table := partitioncache_get_queries_table_name(p_table_prefix);
     
-    -- Get timeout from config
-    EXECUTE format('SELECT timeout_seconds FROM %I LIMIT 1', v_config_table) INTO v_timeout_seconds;
+    -- Get timeout and result_limit from config
+    EXECUTE format('SELECT timeout_seconds, result_limit FROM %I LIMIT 1', v_config_table) INTO v_timeout_seconds, v_result_limit;
     
     BEGIN
         -- Process the item using the same logic as the background processor
@@ -674,16 +676,21 @@ BEGIN
         
         -- Build cache insertion query based on backend type
         IF p_cache_backend = 'bit' THEN
+            -- For bit cache, bitsize is no longer required for operations
+            -- Keep bitsize retrieval for backward compatibility but don't use it for bit operations
             EXECUTE format('SELECT bitsize FROM %I WHERE partition_key = %L', v_metadata_table, p_partition_key) INTO v_bitsize;
-            IF v_bitsize IS NULL THEN v_bitsize := 1000; END IF;
             v_bit_query := format(
                 'WITH bit_positions AS (
                     SELECT %s::INTEGER AS position
                     FROM (%s) AS query_result
-                    WHERE %s::INTEGER >= 0 AND %s::INTEGER < %s
+                    WHERE %s::INTEGER >= 0
+                ),
+                max_position AS (
+                    SELECT COALESCE(MAX(position), 0) AS max_pos FROM bit_positions
                 ),
                 bit_array AS (
-                    SELECT generate_series(0, %s - 1) AS bit_index
+                    SELECT generate_series(0, max_pos) AS bit_index
+                    FROM max_position
                 ),
                 bit_string AS (
                     SELECT string_agg(
@@ -697,7 +704,7 @@ BEGIN
                     FROM bit_array
                 )
                 SELECT bit_value::BIT VARYING FROM bit_string',
-                p_partition_key, p_query, p_partition_key, p_partition_key, v_bitsize, v_bitsize
+                p_partition_key, p_query, p_partition_key
             );
             v_insert_query := format('INSERT INTO %I (query_hash, partition_keys) SELECT %L, (%s) ON CONFLICT (query_hash) DO UPDATE SET partition_keys = EXCLUDED.partition_keys', v_cache_table, p_query_hash, v_bit_query);
         ELSIF p_cache_backend = 'roaringbit' THEN
@@ -721,6 +728,36 @@ BEGIN
         GET DIAGNOSTICS v_rows_affected = ROW_COUNT;
         
         RAISE NOTICE 'Query executed';
+        
+        -- Check result limit if configured
+        IF v_result_limit IS NOT NULL THEN
+            DECLARE
+                v_partition_count INTEGER;
+            BEGIN
+                -- Get the count from the cache table's generated column
+                EXECUTE format('SELECT partition_keys_count FROM %I WHERE query_hash = %L', v_cache_table, p_query_hash) 
+                INTO v_partition_count;
+                
+                IF v_partition_count IS NOT NULL AND v_partition_count >= v_result_limit THEN
+                    -- Limit exceeded: remove from cache and set limit status
+                    EXECUTE format('DELETE FROM %I WHERE query_hash = %L', v_cache_table, p_query_hash);
+                    EXECUTE format('INSERT INTO %I (query_hash, partition_key, query, status, last_seen) VALUES (%L, %L, %L, ''limit'', now()) ON CONFLICT (query_hash, partition_key) DO UPDATE SET status = ''limit'', last_seen = now()', v_queries_table, p_query_hash, p_partition_key, p_query);
+                    
+                    RAISE NOTICE 'Query % limit exceeded: % >= % partition keys', p_query_hash, v_partition_count, v_result_limit;
+                    
+                    -- Clean up active job
+                    EXECUTE format('DELETE FROM %I WHERE job_id = %L', v_active_jobs_table, v_job_id);
+                    
+                    -- Log as success with limit exceeded
+                    EXECUTE format('INSERT INTO %I (job_id, query_hash, partition_key, status, error_message, execution_time_ms, execution_source) VALUES (%L, %L, %L, %L, %L, %L, %L)', 
+                        v_log_table, v_job_id, p_query_hash, p_partition_key, 'success', 'Result limit exceeded: ' || v_partition_count || ' >= ' || v_result_limit, 
+                        ROUND(extract(epoch from (clock_timestamp() - v_start_time)) * 1000, 3), p_execution_source);
+                    
+                    RETURN true;
+                END IF;
+            END;
+        END IF;
+        
         -- Insert/update queries table with 'ok' status
         EXECUTE format('INSERT INTO %I (query_hash, partition_key, query, status, last_seen) VALUES (%L, %L, %L, ''ok'', now()) ON CONFLICT (query_hash, partition_key) DO UPDATE SET status = ''ok'', last_seen = now()', v_queries_table, p_query_hash, p_partition_key, p_query);
         
@@ -831,6 +868,7 @@ CREATE OR REPLACE FUNCTION partitioncache_update_processor_config(
     p_frequency_seconds INTEGER DEFAULT NULL,
     p_timeout_seconds INTEGER DEFAULT NULL,
     p_table_prefix TEXT DEFAULT NULL,
+    p_result_limit INTEGER DEFAULT NULL,
     p_queue_prefix TEXT DEFAULT 'partitioncache_queue'
 )
 RETURNS VOID AS $$
@@ -856,6 +894,9 @@ BEGIN
     END IF;
     IF p_table_prefix IS NOT NULL THEN
         v_set_clauses := array_append(v_set_clauses, format('table_prefix = %L', p_table_prefix));
+    END IF;
+    IF p_result_limit IS NOT NULL THEN
+        v_set_clauses := array_append(v_set_clauses, format('result_limit = %L', p_result_limit));
     END IF;
 
     -- Only execute if there's something to update
