@@ -36,8 +36,9 @@ from partitioncache.cli.common_args import add_environment_args, add_verbosity_a
 
 logger = getLogger("PartitionCache.PostgreSQLQueueProcessor")
 
-# SQL file location
-SQL_FILE = Path(__file__).parent.parent / "queue_handler" / "postgresql_queue_processor.sql"
+# SQL file locations
+SQL_CRON_FILE = Path(__file__).parent.parent / "queue_handler" / "postgresql_queue_processor_cron.sql"
+SQL_CACHE_FILE = Path(__file__).parent.parent / "queue_handler" / "postgresql_queue_processor_cache.sql"
 SQL_INFO_FILE = Path(__file__).parent.parent / "queue_handler" / "postgresql_queue_processor_info.sql"
 
 
@@ -88,6 +89,16 @@ def get_queue_table_prefix_from_env() -> str:
     return os.getenv("PG_QUEUE_TABLE_PREFIX", "partitioncache_queue")
 
 
+def get_cache_database_name() -> str:
+    """Get the cache database name from environment."""
+    return os.getenv("DB_NAME", "geominedb2_pdb")
+
+
+def get_cron_database_name() -> str:
+    """Get the cron database name from environment."""
+    return os.getenv("PG_CRON_DATABASE", "postgres")
+
+
 def validate_environment() -> tuple[bool, str]:
     """Validate that all required environment variables are set and consistent."""
     required_vars = {
@@ -107,6 +118,7 @@ def validate_environment() -> tuple[bool, str]:
         return False, "Missing environment variables:\n" + "\n".join(errors)
 
     # Check if queue and cache are the same database instance
+    # Note: pg_cron database (PG_CRON_*) can be different for cross-database setup
     queue_config = {
         "host": os.getenv("PG_QUEUE_HOST"),
         "port": os.getenv("PG_QUEUE_PORT"),
@@ -123,7 +135,8 @@ def validate_environment() -> tuple[bool, str]:
         return False, (
             f"Queue and cache databases must be the same instance for direct processing.\n"
             f"Queue: {queue_config['host']}:{queue_config['port']}/{queue_config['db']}\n"
-            f"Cache: {cache_config['host']}:{cache_config['port']}/{cache_config['db']}"
+            f"Cache: {cache_config['host']}:{cache_config['port']}/{cache_config['db']}\n"
+            f"Note: pg_cron database (PG_CRON_DATABASE) can be different for cross-database setup."
         )
 
     try:
@@ -230,14 +243,28 @@ def check_and_grant_pg_cron_permissions() -> tuple[bool, str]:
         return False, f"Error checking pg_cron permissions: {e}"
 
 
-def setup_database_objects(conn, include_pg_cron_trigger=True):
-    """Execute the SQL file to create all necessary database objects.
+def setup_cron_database_objects(cron_conn):
+    """Set up cron database components (configuration tables and scheduling functions)."""
+    logger.info("Setting up cron database objects...")
+    
+    # Read and execute cron SQL file
+    sql_cron_content = SQL_CRON_FILE.read_text()
+    with cron_conn.cursor() as cur:
+        cur.execute(sql_cron_content)
+    
+    # Initialize cron config table
+    queue_prefix = get_queue_table_prefix_from_env()
+    with cron_conn.cursor() as cur:
+        cur.execute("SELECT partitioncache_initialize_cron_config_table(%s)", [queue_prefix])
+        cur.execute("SELECT partitioncache_create_cron_config_trigger(%s)", [queue_prefix])
+    
+    cron_conn.commit()
+    logger.info("Cron database objects created successfully")
 
-    Args:
-        conn: Database connection
-        include_pg_cron_trigger: Whether to create pg_cron trigger (default True for backwards compatibility)
-    """
-    logger.info("Setting up database objects...")
+
+def setup_cache_database_objects(cache_conn):
+    """Set up cache database components (worker functions and processing logic)."""
+    logger.info("Setting up cache database objects...")
 
     # First, ensure queue tables are set up using the queue handler
     from partitioncache.queue_handler import get_queue_handler
@@ -264,52 +291,119 @@ def setup_database_objects(conn, include_pg_cron_trigger=True):
         logger.error(f"Failed to setup cache metadata tables via cache handler: {e}")
         raise
 
-    # Read and execute SQL file for PostgreSQL queue processor specific objects
-    sql_content = SQL_FILE.read_text()
+    # Read and execute cache SQL file
+    sql_cache_content = SQL_CACHE_FILE.read_text()
+    with cache_conn.cursor() as cur:
+        cur.execute(sql_cache_content)
 
-    with conn.cursor() as cur:
-        cur.execute(sql_content)
-
+    # Read and execute info SQL file
     sql_info_content = SQL_INFO_FILE.read_text()
-    with conn.cursor() as cur:
+    with cache_conn.cursor() as cur:
         cur.execute(sql_info_content)
 
-    # Initialize processor tables with correct queue prefix
-    logger.info("Initializing processor tables with queue prefix...")
+    # Initialize cache processor tables
     queue_prefix = get_queue_table_prefix_from_env()
-    with conn.cursor() as cur:
-        cur.execute("SELECT partitioncache_initialize_processor_tables(%s)", [queue_prefix])
+    with cache_conn.cursor() as cur:
+        cur.execute("SELECT partitioncache_initialize_cache_processor_tables(%s)", [queue_prefix])
 
-        if include_pg_cron_trigger:
-            logger.info("Creating pg_cron config trigger...")
-            cur.execute("SELECT partitioncache_create_config_trigger(%s)", [queue_prefix])
-        else:
-            logger.info("Skipping pg_cron config trigger creation")
-
-    conn.commit()
-    logger.info("PostgreSQL queue processor database objects created successfully")
+    cache_conn.commit()
+    logger.info("Cache database objects created successfully")
 
 
-def insert_initial_config(conn, job_name: str, table_prefix: str, queue_prefix: str, cache_backend: str, frequency: int, enabled: bool, timeout: int):
-    """Insert the initial configuration row which will trigger the cron job creation."""
-    logger.info(f"Inserting initial config for job '{job_name}'")
+def setup_database_objects(cache_conn, cron_conn=None):
+    """Execute the SQL files to create all necessary database objects in both databases.
+
+    Args:
+        cache_conn: Cache database connection
+        cron_conn: Cron database connection (optional, if None uses cache_conn)
+    """
+    logger.info("Setting up cross-database objects...")
+    
+    if cron_conn is None:
+        cron_conn = cache_conn
+        logger.info("Using same database for cron and cache operations")
+    else:
+        logger.info("Using separate databases for cron and cache operations")
+    
+    # Setup cron database components
+    setup_cron_database_objects(cron_conn)
+    
+    # Setup cache database components  
+    setup_cache_database_objects(cache_conn)
+    
+    logger.info("Cross-database setup completed successfully")
+
+
+def insert_initial_config(cron_conn, job_name: str, table_prefix: str, queue_prefix: str, cache_backend: str, frequency: int, enabled: bool, timeout: int, target_database: str):
+    """Insert the initial configuration row in cron database which will trigger the cron job creation."""
+    logger.info(f"Inserting initial config for job '{job_name}' in cron database")
     config_table = f"{queue_prefix}_processor_config"
 
-    with conn.cursor() as cur:
+    with cron_conn.cursor() as cur:
         # This will either insert a new config or do nothing if it already exists.
         # The trigger will handle creating/updating the cron.job.
         cur.execute(
             sql.SQL(
                 """
-                INSERT INTO {} (job_name, table_prefix, queue_prefix, cache_backend, frequency_seconds, enabled, timeout_seconds)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                INSERT INTO {} (job_name, table_prefix, queue_prefix, cache_backend, frequency_seconds, enabled, timeout_seconds, target_database)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (job_name) DO NOTHING
                 """
             ).format(sql.Identifier(config_table)),
-            (job_name, table_prefix, queue_prefix, cache_backend, frequency, enabled, timeout),
+            (job_name, table_prefix, queue_prefix, cache_backend, frequency, enabled, timeout, target_database),
         )
-    conn.commit()
-    logger.info("Initial configuration inserted successfully. Cron job should be synced.")
+    cron_conn.commit()
+    logger.info("Initial configuration inserted successfully in cron database. Cron job should be synced.")
+
+
+def insert_cache_config(cache_conn, job_name: str, table_prefix: str, queue_prefix: str, cache_backend: str, frequency: int, enabled: bool, timeout: int, target_database: str):
+    """Insert configuration in cache database for worker function access (eliminates need for dblink)."""
+    logger.info(f"Inserting config for job '{job_name}' in cache database for worker functions")
+    config_table = f"{queue_prefix}_processor_config"
+
+    with cache_conn.cursor() as cur:
+        # Create the config table if it doesn't exist (without trigger)
+        cur.execute(
+            sql.SQL(
+                """
+                CREATE TABLE IF NOT EXISTS {} (
+                    job_name TEXT PRIMARY KEY,
+                    enabled BOOLEAN NOT NULL DEFAULT false,
+                    max_parallel_jobs INTEGER NOT NULL DEFAULT 2,
+                    frequency_seconds INTEGER NOT NULL DEFAULT 1,
+                    timeout_seconds INTEGER NOT NULL DEFAULT 1800,
+                    table_prefix TEXT NOT NULL,
+                    queue_prefix TEXT NOT NULL,
+                    cache_backend TEXT NOT NULL,
+                    target_database TEXT NOT NULL,
+                    result_limit INTEGER DEFAULT NULL,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            ).format(sql.Identifier(config_table))
+        )
+        
+        # Insert configuration for worker functions to access
+        cur.execute(
+            sql.SQL(
+                """
+                INSERT INTO {} (job_name, table_prefix, queue_prefix, cache_backend, frequency_seconds, enabled, timeout_seconds, target_database)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (job_name) DO UPDATE SET
+                    table_prefix = EXCLUDED.table_prefix,
+                    queue_prefix = EXCLUDED.queue_prefix,
+                    cache_backend = EXCLUDED.cache_backend,
+                    frequency_seconds = EXCLUDED.frequency_seconds,
+                    enabled = EXCLUDED.enabled,
+                    timeout_seconds = EXCLUDED.timeout_seconds,
+                    target_database = EXCLUDED.target_database,
+                    updated_at = CURRENT_TIMESTAMP
+                """
+            ).format(sql.Identifier(config_table)),
+            (job_name, table_prefix, queue_prefix, cache_backend, frequency, enabled, timeout, target_database),
+        )
+    cache_conn.commit()
+    logger.info("Configuration inserted successfully in cache database for worker function access.")
 
 
 def remove_all_processor_objects(conn, queue_prefix: str):
@@ -404,9 +498,14 @@ def update_processor_config(
     logger.info("Processor configuration updated successfully.")
 
 
-def handle_setup(conn, table_prefix: str, queue_prefix: str, cache_backend: str, frequency: int, enabled: bool, timeout: int):
+def handle_setup(table_prefix: str, queue_prefix: str, cache_backend: str, frequency: int, enabled: bool, timeout: int):
     """Handle the main setup logic."""
-    logger.info("Starting PostgreSQL queue processor setup...")
+    logger.info("Starting PostgreSQL queue processor cross-database setup...")
+
+    # Get database connections
+    cache_conn = get_db_connection()
+    cron_conn = get_pg_cron_connection()
+    target_database = get_cache_database_name()
 
     # Check if pg_cron is available (but don't require it)
     pg_cron_available = check_pg_cron_installed()
@@ -429,19 +528,36 @@ def handle_setup(conn, table_prefix: str, queue_prefix: str, cache_backend: str,
             logger.warning(f"  GRANT EXECUTE ON FUNCTION cron.schedule_in_database TO {work_user};")
             logger.warning(f"  GRANT EXECUTE ON FUNCTION cron.unschedule TO {work_user};")
 
-    # Setup all database objects (functions, tables, etc.)
-    # Only create pg_cron trigger if we're enabling the processor
-    setup_database_objects(conn, include_pg_cron_trigger=(enabled and pg_cron_available))
+    # Setup all database objects in both databases
+    if get_cron_database_name() == get_cache_database_name():
+        logger.info("Setting up components in single database (cron and cache are same)")
+        setup_database_objects(cache_conn, cron_conn=None)
+        cron_conn.close()  # Same as cache_conn, close duplicate
+    else:
+        logger.info(f"Setting up components in cross-database mode: cron={get_cron_database_name()}, cache={get_cache_database_name()}")
+        setup_database_objects(cache_conn, cron_conn)
 
     job_name = "partitioncache_process_queue"
-    insert_initial_config(conn, job_name, table_prefix, queue_prefix, cache_backend, frequency, enabled, timeout)
+    
+    # Insert configuration in cron database for pg_cron job management
+    actual_cron_conn = cache_conn if get_cron_database_name() == get_cache_database_name() else cron_conn
+    insert_initial_config(actual_cron_conn, job_name, table_prefix, queue_prefix, cache_backend, frequency, enabled, timeout, target_database)
+    
+    # Also create minimal config in cache database for manual commands (without triggers)
+    if get_cron_database_name() != get_cache_database_name():
+        insert_cache_config(cache_conn, job_name, table_prefix, queue_prefix, cache_backend, frequency, enabled, timeout, target_database)
 
     if enabled and pg_cron_available:
-        logger.info("Setup complete. The processor job is created and scheduled via pg_cron.")
+        logger.info(f"Setup complete. The processor job is created and scheduled via pg_cron to run in {target_database}.")
     else:
         logger.info("Setup complete. The processor infrastructure is ready for manual processing.")
         if not pg_cron_available:
             logger.info("Note: pg_cron is not available. Use 'manual-process' command or enable pg_cron for automated processing.")
+
+    # Close connections
+    cache_conn.close()
+    if get_cron_database_name() != get_cache_database_name():
+        cron_conn.close()
 
 
 def get_processor_status(conn, queue_prefix: str):
@@ -669,7 +785,6 @@ def main():
     setup_parser.add_argument("--table-prefix", default=None, help="Table prefix for cache tables (default: based on env vars)")
     setup_parser.set_defaults(
         func=lambda args: handle_setup(
-            get_db_connection(),
             args.table_prefix or get_table_prefix_from_env(),
             get_queue_table_prefix_from_env(),
             get_cache_backend_from_env(),

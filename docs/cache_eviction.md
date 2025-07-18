@@ -20,12 +20,44 @@ The PostgreSQL Eviction Manager provides automatic, scheduled cache eviction usi
 - **Independent Operation**: Operates independently of the queue processor
 - **Comprehensive Logging**: Tracks all eviction activities with detailed logs
 - **Configuration Management**: Database-stored configuration with hot updates
+- **Cross-Database Support**: Works with pg_cron in separate database from cache data
+
+### Cross-Database Architecture Support
+
+**New in v2.0+**: The eviction manager now supports cross-database pg_cron configurations where:
+- **pg_cron** is installed in a central database (typically `postgres`)
+- **Cache databases** contain PartitionCache tables and eviction logic
+- **Jobs execute** in cache databases via `cron.schedule_in_database()`
+
+This architecture provides better isolation, security, and scalability by separating scheduling infrastructure from business data.
+
+#### Cross-Database Setup Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                      PostgreSQL Instance                               │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  ┌─────────────────┐                    ┌─────────────────────────┐    │
+│  │  pg_cron DB     │                    │     Cache Database      │    │
+│  │  (postgres)     │                    │    (geominedb)          │    │
+│  │                 │                    │                         │    │
+│  │ ┌─────────────┐ │ schedule_in_       │ ┌─────────────────────┐ │    │
+│  │ │  pg_cron    │ │ database()         │ │  Cache Tables       │ │    │
+│  │ │  Extension  │ │ ─────────────────→ │ │  Eviction Logic     │ │    │
+│  │ │  Eviction   │ │                    │ │  Log Tables         │ │    │
+│  │ │  Config     │ │                    │ │  Worker Functions   │ │    │
+│  │ └─────────────┘ │                    │ └─────────────────────┘ │    │
+│  └─────────────────┘                    └─────────────────────────┘    │
+└─────────────────────────────────────────────────────────────────────────┘
+```
 
 ### Prerequisites
 
 - PostgreSQL database with `pg_cron` extension
 - PostgreSQL cache backend (array, bit, or roaringbit)
 - Appropriate database permissions for creating functions and cron jobs
+- For cross-database setups: permissions to use `cron.schedule_in_database()`
 
 ### Quick Start
 
@@ -45,18 +77,59 @@ pcache-postgresql-eviction-manager status --table-prefix my_cache
 The eviction manager uses environment variables for database connection:
 
 ```bash
-# Database Configuration
+# Cache Database Configuration (where cache tables and eviction logic live)
 DB_HOST=localhost
 DB_PORT=5432
 DB_USER=cache_user
 DB_PASSWORD=cache_password
 DB_NAME=cache_database
 
+# pg_cron Database Configuration (can be different from cache database)
+PG_CRON_HOST=localhost                   # Default: same as DB_HOST
+PG_CRON_PORT=5432                       # Default: same as DB_PORT  
+PG_CRON_USER=cache_user                 # Default: same as DB_USER
+PG_CRON_PASSWORD=cache_password         # Default: same as DB_PASSWORD
+PG_CRON_DATABASE=postgres               # Default: postgres
+
 # Cache table prefix (auto-detected from environment if not specified)
 PG_ARRAY_CACHE_TABLE_PREFIX=my_cache
 # or PG_BIT_CACHE_TABLE_PREFIX=my_cache
 # or PG_ROARINGBIT_CACHE_TABLE_PREFIX=my_cache
 ```
+
+#### Cross-Database Setup Process
+
+1. **Grant pg_cron Permissions**:
+   ```sql
+   -- Connect to the pg_cron database (usually postgres)
+   psql -U your_username -d postgres
+   
+   -- Grant necessary permissions
+   GRANT USAGE ON SCHEMA cron TO your_username;
+   GRANT EXECUTE ON FUNCTION cron.schedule_in_database TO your_username;
+   GRANT EXECUTE ON FUNCTION cron.unschedule TO your_username;
+   GRANT SELECT ON cron.job TO your_username;
+   ```
+
+2. **Setup Eviction Manager**:
+   ```bash
+   # The CLI tool automatically handles cross-database setup
+   pcache-postgresql-eviction-manager setup --table-prefix my_cache
+   ```
+
+#### How Cross-Database Eviction Works
+
+1. **Setup Phase**: 
+   - Script connects to `postgres` database to install pg_cron configuration objects
+   - Creates eviction functions and log tables in `cache_database`
+
+2. **Job Scheduling**:
+   - Eviction jobs are stored in `postgres` database
+   - Jobs use `cron.schedule_in_database()` to execute in `cache_database`
+
+3. **Eviction Processing**:
+   - Jobs run in `cache_database` where cache tables exist
+   - Configuration is retrieved from `postgres` database via dblink
 
 ### Commands
 
