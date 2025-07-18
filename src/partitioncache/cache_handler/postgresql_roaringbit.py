@@ -75,30 +75,87 @@ class PostgreSQLRoaringBitCacheHandler(PostgreSQLAbstractCacheHandler):
             self.db.rollback()
             raise
 
-    def _ensure_partition_table(self, partition_key: str, datatype: str, **kwargs) -> None:
-        """Ensure a partition table exists."""
+    def _load_sql_functions(self) -> None:
+        """Load SQL functions from the cache handlers SQL file."""
         try:
-            # First ensure metadata table exists before trying to query it
-            self._ensure_metadata_table_exists()
+            from pathlib import Path
 
-            existing_datatype = self._get_partition_datatype(partition_key)
+            # Get the SQL file path for cache handlers
+            sql_cache_file = Path(__file__).parent / "postgresql_cache_handlers.sql"
 
-            if existing_datatype is None:
-                # Create new table
-                self._create_partition_table(partition_key)
+            if not sql_cache_file.exists():
+                logger.warning(f"SQL cache handlers file not found at {sql_cache_file}")
+                return
+
+            # Read and execute the SQL file
+            sql_cache_content = sql_cache_file.read_text()
+            self.cursor.execute(sql_cache_content)  # type: ignore[arg-type]
+            logger.debug("Successfully loaded SQL functions from cache handlers file")
         except Exception as e:
-            logger.error(f"Failed to ensure roaringbit partition table for {partition_key}: {e}")
-            # Rollback and recreate metadata table if needed
+            logger.debug(f"Failed to load SQL functions (this is OK if they're already loaded): {e}")
+
+    def _recreate_metadata_table(self, supported_datatypes: set[str]) -> None:
+        """
+        Recreate metadata table for roaringbit arrays.
+        Extends the base metadata table functionality.
+        """
+        try:
+            # Load SQL functions first
+            self._load_sql_functions()
+
+            # Create metadata table for roaringbit arrays (no bitsize column needed)
+            self.cursor.execute(
+                sql.SQL("""CREATE TABLE IF NOT EXISTS {0} (
+                    partition_key TEXT PRIMARY KEY,
+                    datatype TEXT NOT NULL CHECK (datatype = 'integer'),
+                    created_at TIMESTAMP DEFAULT now()
+                );""").format(sql.Identifier(self.tableprefix + "_partition_metadata"))
+            )
+
+            # Create queries table (same as base implementation)
+            self.cursor.execute(
+                sql.SQL("""CREATE TABLE IF NOT EXISTS {0} (
+                    query_hash TEXT NOT NULL,
+                    query TEXT NOT NULL,
+                    partition_key TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'ok' CHECK (status IN ('ok', 'timeout', 'failed')),
+                    last_seen TIMESTAMP NOT NULL DEFAULT now(),
+                    PRIMARY KEY (query_hash, partition_key)
+                );""").format(sql.Identifier(self.tableprefix + "_queries"))
+            )
+
+            self.db.commit()
+        except Exception as e:
+            logger.error(f"Failed to recreate roaringbit metadata table: {e}")
             try:
                 self.db.rollback()
-                logger.warning(f"Attempting to recreate roaringbit metadata table after error: {e}")
-                self._recreate_metadata_table(self.get_supported_datatypes())
-                self._create_partition_table(partition_key)
-            except Exception as recreate_error:
-                logger.error(f"Failed to recreate roaringbit partition table for {partition_key}: {recreate_error}")
-                # Avoid infinite retry loops
-                self.db.rollback()
-                raise
+            except Exception as rollback_error:
+                logger.error(f"Failed to rollback after metadata table creation error: {rollback_error}")
+            raise
+
+    def _ensure_partition_table(self, partition_key: str, datatype: str, **kwargs) -> None:
+        """Ensure a partition table exists using SQL bootstrap function."""
+        try:
+            # Load SQL functions first to ensure they're available
+            self._load_sql_functions()
+
+            # Use SQL bootstrap function to ensure metadata tables exist
+            self.cursor.execute(
+                sql.SQL("SELECT partitioncache_ensure_metadata_tables(%s)"),
+                (self.tableprefix,)
+            )
+
+            # Use SQL bootstrap function to create partition table and metadata entry
+            self.cursor.execute(
+                sql.SQL("SELECT partitioncache_bootstrap_partition(%s, %s, %s, %s)"),
+                (self.tableprefix, partition_key, datatype, "roaringbit")
+            )
+
+            self.db.commit()
+        except Exception as e:
+            logger.error(f"Failed to ensure roaringbit partition table for {partition_key}: {e}")
+            self.db.rollback()
+            raise
 
     def set_cache(
         self,
@@ -174,17 +231,33 @@ class PostgreSQLRoaringBitCacheHandler(PostgreSQLAbstractCacheHandler):
             return None
 
         table_name = f"{self.tableprefix}_cache_{partition_key}"
-        self.cursor.execute(
-            sql.SQL("SELECT partition_keys::bytea FROM {0} WHERE query_hash = %s").format(sql.Identifier(table_name)),
-            (key,),
-        )
-        result = self.cursor.fetchone()
-        if result is None or result[0] is None:
-            return None
+        try:
+            self.cursor.execute(
+                sql.SQL("SELECT partition_keys::bytea FROM {0} WHERE query_hash = %s").format(sql.Identifier(table_name)),
+                (key,),
+            )
+            result = self.cursor.fetchone()
+            if result is None or result[0] is None:
+                return None
 
-        # Deserialize roaring bitmap from bytes and return as BitMap
-        rb = BitMap.deserialize(result[0])
-        return rb
+            # Deserialize roaring bitmap from bytes and return as BitMap
+            rb = BitMap.deserialize(result[0])
+            return rb
+        except Exception as e:
+            # Cache table might not exist yet - this is OK, return None
+            if "does not exist" in str(e).lower() or "relation" in str(e).lower():
+                try:
+                    self.db.rollback()
+                except Exception:
+                    pass
+                return None
+            else:
+                logger.error(f"Failed to get value for key {key} in partition {partition_key}: {e}")
+                try:
+                    self.db.rollback()
+                except Exception:
+                    pass
+                return None
 
     def get_intersected(self, keys: set[str], partition_key: str = "partition_key") -> tuple[BitMap | None, int]:  # type: ignore
         """Get intersection from partition-specific table."""
@@ -194,23 +267,39 @@ class PostgreSQLRoaringBitCacheHandler(PostgreSQLAbstractCacheHandler):
 
         # Check which exist
         table_name = f"{self.tableprefix}_cache_{partition_key}"
-        query = sql.SQL("SELECT query_hash FROM {0} WHERE query_hash = ANY(%s) AND partition_keys IS NOT NULL").format(sql.Identifier(table_name))
-        self.cursor.execute(query, (list(keys),))
-        keys_set = {x[0] for x in self.cursor.fetchall()}
+        try:
+            query = sql.SQL("SELECT query_hash FROM {0} WHERE query_hash = ANY(%s) AND partition_keys IS NOT NULL").format(sql.Identifier(table_name))
+            self.cursor.execute(query, (list(keys),))
+            keys_set = {x[0] for x in self.cursor.fetchall()}
 
-        if not keys_set:
-            return None, 0
+            if not keys_set:
+                return None, 0
 
-        q = self.get_intersected_sql(partition_key)
-        self.cursor.execute(q, (list(keys_set),))
+            q = self.get_intersected_sql(partition_key)
+            self.cursor.execute(q, (list(keys_set),))
 
-        result = self.cursor.fetchone()
-        if result is None or result[0] is None:
-            return None, 0
+            result = self.cursor.fetchone()
+            if result is None or result[0] is None:
+                return None, 0
 
-        # Deserialize the intersected roaring bitmap and return as BitMap
-        rb = BitMap.deserialize(result[0])
-        return rb, len(keys_set)
+            # Deserialize the intersected roaring bitmap and return as BitMap
+            rb = BitMap.deserialize(result[0])
+            return rb, len(keys_set)
+        except Exception as e:
+            # Cache table might not exist yet - this is OK, return None
+            if "does not exist" in str(e).lower() or "relation" in str(e).lower():
+                try:
+                    self.db.rollback()
+                except Exception:
+                    pass
+                return None, 0
+            else:
+                logger.error(f"Failed to get intersected values for keys {keys} in partition {partition_key}: {e}")
+                try:
+                    self.db.rollback()
+                except Exception:
+                    pass
+                return None, 0
 
     def get_intersected_sql(self, partition_key: str = "partition_key") -> sql.Composed:
         """Get intersection SQL for partition-specific table."""

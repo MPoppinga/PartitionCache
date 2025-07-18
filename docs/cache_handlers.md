@@ -18,8 +18,9 @@ PartitionCache supports multiple cache backends with different performance chara
 
 #### PostgreSQL Bit Handler  
 - **Type**: `postgresql_bit`
-- **Storage**: Bit arrays (PostgreSQL bit strings)
+- **Storage**: Fixed-length bit arrays (PostgreSQL BIT(n) columns)
 - **Datatypes**: `integer` only
+- **Configuration**: Requires mandatory `PG_BIT_CACHE_BITSIZE` environment variable
 - **Best for**: Large integer datasets, memory efficiency if all integers are used as partition keys
 - **Memory**: Highly efficient for integers
 - **Scalability**: Excellent (database-native)
@@ -262,16 +263,34 @@ else:
 
 ### PostgreSQL Bit Handler
 
-Additional methods for bit size management:
+**Configuration Requirements:**
+The PostgreSQL bit handler requires a mandatory bitsize configuration:
+
+```bash
+# Required environment variable
+export PG_BIT_CACHE_BITSIZE=10000  # Must be set
+```
+
+**Fixed-Length Bit Arrays:**
+All cache tables use fixed-length `BIT(n)` columns for consistent BIT_AND operations:
 
 ```python
-# Create partition with custom bit size
+# Create partition with fixed bit size (determined by configuration)
 cache._create_partition_table("large_dataset", bitsize=50000)
 cache._create_partition_table("small_dataset", bitsize=1000)
 
 # Get bit size for partition
 bitsize = cache._get_partition_bitsize("large_dataset")  
-# Returns: 50000
+# Returns: 50000 (integer value, never None)
+```
+
+**Automatic Schema Updates:**
+Database triggers automatically update cache table schemas when bitsize changes:
+
+```python
+# Changing bitsize triggers schema update
+cache._set_partition_bitsize("large_dataset", 75000)
+# Automatically runs: ALTER TABLE cache_large_dataset ALTER COLUMN partition_keys TYPE BIT(75000)
 ```
 
 ### Variable Bit Sizes
@@ -407,7 +426,7 @@ if hasattr(cache, '_get_partition_bitsize'):
 CREATE TABLE cache_partition_metadata (
     partition_key TEXT PRIMARY KEY,
     datatype TEXT NOT NULL,
-    bitsize INTEGER,  -- Only for bit handler
+    bitsize INTEGER NOT NULL,  -- Required for bit handler
     created_at TIMESTAMP DEFAULT now()
 );
 ```
@@ -424,8 +443,8 @@ CREATE TABLE cache_{partition_key} (
 ```sql
 CREATE TABLE cache_{partition_key} (
     query_hash TEXT PRIMARY KEY,
-    partition_keys BIT({bitsize}),
-    partition_keys_count INTEGER NOT NULL GENERATED ALWAYS AS (length(replace(partition_keys::text, '0', ''))) STORED
+    partition_keys BIT({bitsize}),  -- Fixed-length bit array
+    partition_keys_count INTEGER GENERATED ALWAYS AS (length(replace(partition_keys::text, '0', ''))) STORED
 );
 ```
 

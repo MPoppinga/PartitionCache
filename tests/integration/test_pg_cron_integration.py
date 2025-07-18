@@ -69,8 +69,8 @@ class TestPgCronIntegration:
                     f"""
                     INSERT INTO {config_table}
                     (job_name, table_prefix, queue_prefix, cache_backend,
-                     frequency_seconds, enabled, timeout_seconds, max_parallel_jobs)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                     frequency_seconds, enabled, timeout_seconds, max_parallel_jobs, target_database)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (job_name)
                     DO UPDATE SET
                         enabled = EXCLUDED.enabled,
@@ -86,6 +86,7 @@ class TestPgCronIntegration:
                         True,  # enabled
                         300,  # timeout
                         1,  # single job for testing
+                        db_name,  # target_database
                     ),
                 )
                 db_session.commit()

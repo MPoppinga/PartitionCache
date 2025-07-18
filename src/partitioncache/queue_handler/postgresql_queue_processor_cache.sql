@@ -2,6 +2,9 @@
 -- This file contains components that must be installed in the cache/work database
 -- These components handle the actual queue processing and cache operations
 
+-- Note: Global cache handler functions must be loaded separately by Python
+-- The file postgresql_cache_handlers.sql contains required functions
+
 -- Function to initialize processor tables in cache database
 CREATE OR REPLACE FUNCTION partitioncache_initialize_cache_processor_tables(p_queue_prefix TEXT DEFAULT 'partitioncache_queue')
 RETURNS VOID AS $$
@@ -49,181 +52,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- Function to get the target cache table name for a partition
-CREATE OR REPLACE FUNCTION partitioncache_get_cache_table_name(p_table_prefix TEXT, p_partition_key TEXT)
-RETURNS TEXT AS $$
-BEGIN
-    IF p_table_prefix = '' OR p_table_prefix IS NULL THEN
-        RETURN 'cache_' || p_partition_key;
-    ELSE
-        RETURN p_table_prefix || '_cache_' || p_partition_key;
-    END IF;
-END;
-$$ LANGUAGE plpgsql IMMUTABLE;
-
--- Function to get the metadata table name
-CREATE OR REPLACE FUNCTION partitioncache_get_metadata_table_name(p_table_prefix TEXT)
-RETURNS TEXT AS $$
-BEGIN
-    IF p_table_prefix = '' OR p_table_prefix IS NULL THEN
-        RETURN 'partition_metadata';
-    ELSE
-        RETURN p_table_prefix || '_partition_metadata';
-    END IF;
-END;
-$$ LANGUAGE plpgsql IMMUTABLE;
-
--- Function to get the queries table name
-CREATE OR REPLACE FUNCTION partitioncache_get_queries_table_name(p_table_prefix TEXT)
-RETURNS TEXT AS $$
-BEGIN
-    IF p_table_prefix = '' OR p_table_prefix IS NULL THEN
-        RETURN 'queries';
-    ELSE
-        RETURN p_table_prefix || '_queries';
-    END IF;
-END;
-$$ LANGUAGE plpgsql IMMUTABLE;
-
--- Function to ensure metadata and queries tables exist with correct naming
-CREATE OR REPLACE FUNCTION partitioncache_ensure_metadata_tables(p_table_prefix TEXT)
-RETURNS VOID AS $$
-DECLARE
-    v_metadata_table TEXT;
-    v_queries_table TEXT;
-    v_cache_backend TEXT;
-BEGIN
-    v_metadata_table := partitioncache_get_metadata_table_name(p_table_prefix);
-    v_queries_table := partitioncache_get_queries_table_name(p_table_prefix);
-    
-    -- Determine cache backend type from table prefix
-    IF p_table_prefix LIKE '%_roaringbit%' THEN
-        v_cache_backend := 'roaringbit';
-    ELSIF p_table_prefix LIKE '%_bit%' THEN
-        v_cache_backend := 'bit';
-    ELSE
-        v_cache_backend := 'array';
-    END IF;
-    
-    -- Create metadata table
-    IF v_cache_backend = 'bit' THEN
-        EXECUTE format('
-            CREATE TABLE IF NOT EXISTS %I (
-                partition_key TEXT PRIMARY KEY,
-                datatype TEXT NOT NULL CHECK (datatype = ''integer''),
-                bitsize INTEGER DEFAULT NULL,
-                created_at TIMESTAMP DEFAULT now()
-            )', v_metadata_table);
-    ELSIF v_cache_backend = 'roaringbit' THEN
-        EXECUTE format('
-            CREATE TABLE IF NOT EXISTS %I (
-                partition_key TEXT PRIMARY KEY,
-                datatype TEXT NOT NULL CHECK (datatype = ''integer''),
-                created_at TIMESTAMP DEFAULT now()
-            )', v_metadata_table);
-    ELSE
-        EXECUTE format('
-            CREATE TABLE IF NOT EXISTS %I (
-                partition_key TEXT PRIMARY KEY,
-                datatype TEXT NOT NULL CHECK (datatype IN (''integer'', ''float'', ''text'', ''timestamp'')),
-                created_at TIMESTAMP DEFAULT now()
-            )', v_metadata_table);
-    END IF;
-    
-    -- Create queries table with status
-    EXECUTE format('
-        CREATE TABLE IF NOT EXISTS %I (
-            query_hash TEXT NOT NULL,
-            partition_key TEXT NOT NULL,
-            query TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT ''ok'' CHECK (status IN (''ok'', ''timeout'', ''failed'', ''limit'')),
-            last_seen TIMESTAMP NOT NULL DEFAULT now(),
-            PRIMARY KEY (query_hash, partition_key)
-        )', v_queries_table);
-END;
-$$ LANGUAGE plpgsql;
-
--- Function to bootstrap a partition (create metadata entry and cache table)
-CREATE OR REPLACE FUNCTION partitioncache_bootstrap_partition(
-    p_table_prefix TEXT, 
-    p_partition_key TEXT, 
-    p_datatype TEXT,
-    p_cache_backend TEXT,
-    p_bitsize INTEGER DEFAULT NULL
-)
-RETURNS BOOLEAN AS $$
-DECLARE
-    v_metadata_table TEXT;
-    v_cache_table TEXT;
-    v_partition_exists BOOLEAN;
-BEGIN
-    v_metadata_table := partitioncache_get_metadata_table_name(p_table_prefix);
-    v_cache_table := partitioncache_get_cache_table_name(p_table_prefix, p_partition_key);
-    
-    -- Check if partition already exists
-    EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I WHERE partition_key = %L)', v_metadata_table, p_partition_key)
-    INTO v_partition_exists;
-    
-    IF v_partition_exists THEN
-        RETURN true; -- Already exists, nothing to do
-    END IF;
-    
-    -- Create metadata entry based on cache backend
-    IF p_cache_backend = 'bit' THEN
-        -- For bit cache, include bitsize
-        EXECUTE format(
-            'INSERT INTO %I (partition_key, datatype, bitsize) VALUES (%L, %L, %L) ON CONFLICT(partition_key) DO NOTHING',
-            v_metadata_table, p_partition_key, p_datatype, p_bitsize
-        );
-        
-        -- Create bit cache table
-        EXECUTE format('
-            CREATE TABLE IF NOT EXISTS %I (
-                query_hash TEXT PRIMARY KEY,
-                partition_keys BIT VARYING,
-                partition_keys_count INTEGER GENERATED ALWAYS AS (length(replace(partition_keys::text, ''0'', ''''))) STORED
-            )', v_cache_table);
-    ELSIF p_cache_backend = 'roaringbit' THEN
-        -- For roaring bit cache
-        EXECUTE format(
-            'INSERT INTO %I (partition_key, datatype) VALUES (%L, %L) ON CONFLICT(partition_key) DO NOTHING',
-            v_metadata_table, p_partition_key, p_datatype
-        );
-        
-        -- Create roaring bitmap cache table (enable extension first)
-        EXECUTE 'CREATE EXTENSION IF NOT EXISTS roaringbitmap';
-        EXECUTE format('
-            CREATE TABLE IF NOT EXISTS %I (
-                query_hash TEXT PRIMARY KEY,
-                partition_keys roaringbitmap,
-                partition_keys_count INTEGER GENERATED ALWAYS AS (rb_cardinality(partition_keys)) STORED
-            )', v_cache_table);
-    ELSE -- 'array'
-        -- For array cache
-        EXECUTE format(
-            'INSERT INTO %I (partition_key, datatype) VALUES (%L, %L) ON CONFLICT(partition_key) DO NOTHING',
-            v_metadata_table, p_partition_key, p_datatype
-        );
-        
-        -- Create array cache table
-        EXECUTE format('
-            CREATE TABLE IF NOT EXISTS %I (
-                query_hash TEXT PRIMARY KEY,
-                partition_keys %s[],
-                partition_keys_count integer GENERATED ALWAYS AS (array_length(partition_keys, 1)) STORED
-            )', v_cache_table, 
-            CASE p_datatype 
-                WHEN 'integer' THEN 'INTEGER'
-                WHEN 'float' THEN 'REAL'
-                WHEN 'text' THEN 'TEXT'
-                WHEN 'timestamp' THEN 'TIMESTAMP'
-                ELSE 'TEXT'
-            END);
-    END IF;
-    
-    RETURN true;
-END;
-$$ LANGUAGE plpgsql;
+-- Note: Table naming and metadata functions are loaded from postgresql_cache_handlers.sql
 
 -- Main dispatcher function that will be called by pg_cron with parameters
 CREATE OR REPLACE FUNCTION partitioncache_run_single_job_with_params(
@@ -232,7 +61,8 @@ CREATE OR REPLACE FUNCTION partitioncache_run_single_job_with_params(
     p_queue_prefix TEXT,
     p_cache_backend TEXT,
     p_timeout_seconds INTEGER DEFAULT 1800,
-    p_result_limit INTEGER DEFAULT NULL
+    p_result_limit INTEGER DEFAULT NULL,
+    p_default_bitsize INTEGER DEFAULT NULL
 )
 RETURNS TABLE(dispatched_job_id TEXT, status TEXT) AS $$
 DECLARE
@@ -337,7 +167,8 @@ BEGIN
             p_queue_prefix,
             p_table_prefix,
             p_cache_backend,
-            'cron'
+            'cron',
+            p_default_bitsize
         );
         RAISE NOTICE 'Job processed %', dispatched_job_id;
     END;
@@ -357,7 +188,8 @@ CREATE OR REPLACE FUNCTION _partitioncache_execute_job(
     p_queue_prefix TEXT,
     p_table_prefix TEXT,
     p_cache_backend TEXT,
-    p_execution_source TEXT
+    p_execution_source TEXT,
+    p_default_bitsize INTEGER DEFAULT NULL
 )
 RETURNS BOOLEAN AS $$
 DECLARE
@@ -377,6 +209,7 @@ DECLARE
     v_already_processed BOOLEAN;
     v_timeout_seconds INTEGER;
     v_result_limit INTEGER;
+    v_default_bitsize INTEGER := p_default_bitsize;
 BEGIN
     v_job_id := 'job_' || p_item_id;
     v_start_time := clock_timestamp();
@@ -459,7 +292,16 @@ BEGIN
             BEGIN
                 IF p_cache_backend = 'bit' THEN
                     EXECUTE format('SELECT bitsize FROM %I WHERE partition_key = %L', v_metadata_table, p_partition_key) INTO v_bitsize_for_bootstrap;
-                    IF v_bitsize_for_bootstrap IS NULL THEN v_bitsize_for_bootstrap := 1000; END IF;
+                    IF v_bitsize_for_bootstrap IS NULL THEN
+                        IF v_default_bitsize IS NOT NULL THEN
+                            v_bitsize_for_bootstrap := v_default_bitsize;
+                        ELSE
+                            EXECUTE format('SELECT MAX(bitsize) FROM %I', v_metadata_table) INTO v_bitsize_for_bootstrap;
+                            IF v_bitsize_for_bootstrap IS NULL THEN
+                                v_bitsize_for_bootstrap := 1000;
+                            END IF;
+                        END IF;
+                    END IF;
                 END IF;
                 PERFORM partitioncache_bootstrap_partition(p_table_prefix, p_partition_key, v_datatype, p_cache_backend, v_bitsize_for_bootstrap);
             END;
@@ -472,14 +314,10 @@ BEGIN
                 'WITH bit_positions AS (
                     SELECT %s::INTEGER AS position
                     FROM (%s) AS query_result
-                    WHERE %s::INTEGER >= 0
-                ),
-                max_position AS (
-                    SELECT COALESCE(MAX(position), 0) AS max_pos FROM bit_positions
+                    WHERE %s::INTEGER >= 0 AND %s::INTEGER < %s
                 ),
                 bit_array AS (
-                    SELECT generate_series(0, max_pos) AS bit_index
-                    FROM max_position
+                    SELECT generate_series(0, %s - 1) AS bit_index
                 ),
                 bit_string AS (
                     SELECT string_agg(
@@ -492,8 +330,8 @@ BEGIN
                     ) AS bit_value
                     FROM bit_array
                 )
-                SELECT bit_value::BIT VARYING FROM bit_string',
-                p_partition_key, p_query, p_partition_key
+                SELECT bit_value::BIT(%s) FROM bit_string',
+                p_partition_key, p_query, p_partition_key, p_partition_key, v_bitsize, v_bitsize, v_bitsize
             );
             v_insert_query := format('INSERT INTO %I (query_hash, partition_keys) SELECT %L, (%s) ON CONFLICT (query_hash) DO UPDATE SET partition_keys = EXCLUDED.partition_keys', v_cache_table, p_query_hash, v_bit_query);
         ELSIF p_cache_backend = 'roaringbit' THEN
@@ -599,7 +437,7 @@ BEGIN
     v_config_table := COALESCE(current_setting('partitioncache.queue_prefix', true), 'partitioncache_queue') || '_processor_config';
     
     BEGIN
-        EXECUTE format('SELECT job_name, enabled, max_parallel_jobs, frequency_seconds, timeout_seconds, table_prefix, queue_prefix, cache_backend, target_database, result_limit FROM %I WHERE job_name = %L', 
+        EXECUTE format('SELECT job_name, enabled, max_parallel_jobs, frequency_seconds, timeout_seconds, table_prefix, queue_prefix, cache_backend, target_database, result_limit, default_bitsize FROM %I WHERE job_name = %L', 
                       v_config_table, v_job_name) INTO v_config;
     EXCEPTION WHEN OTHERS THEN
         v_config := NULL;
@@ -619,7 +457,7 @@ BEGIN
         LIMIT 1;
         
         IF v_config_table IS NOT NULL THEN
-            EXECUTE format('SELECT job_name, enabled, max_parallel_jobs, frequency_seconds, timeout_seconds, table_prefix, queue_prefix, cache_backend, target_database, result_limit FROM %I WHERE job_name = %L', 
+            EXECUTE format('SELECT job_name, enabled, max_parallel_jobs, frequency_seconds, timeout_seconds, table_prefix, queue_prefix, cache_backend, target_database, result_limit, default_bitsize FROM %I WHERE job_name = %L', 
                           v_config_table, v_job_name) INTO v_config;
         END IF;
         
@@ -637,7 +475,8 @@ BEGIN
             v_config.queue_prefix, 
             v_config.cache_backend,
             v_config.timeout_seconds,
-            v_config.result_limit
+            v_config.result_limit,
+            v_config.default_bitsize
         ) INTO v_result;
 
         -- If the queue is empty, exit the loop.

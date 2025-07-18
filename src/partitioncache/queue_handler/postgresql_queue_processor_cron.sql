@@ -24,6 +24,7 @@ BEGIN
             cache_backend TEXT NOT NULL,
             target_database TEXT NOT NULL, -- Database where work should be executed
             result_limit INTEGER DEFAULT NULL CHECK (result_limit IS NULL OR result_limit > 0), -- Limit number of partition keys, NULL = disabled
+            default_bitsize INTEGER DEFAULT NULL CHECK (default_bitsize IS NULL OR default_bitsize > 0),
             job_ids BIGINT[] DEFAULT ARRAY[]::BIGINT[], -- Store pg_cron job IDs for management
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )', v_config_table);
@@ -67,9 +68,9 @@ BEGIN
     v_timeout_statement := 'SET LOCAL statement_timeout = ' || (v_timeout_seconds * 1000)::TEXT;
 
     -- Build command to execute in target database with proper timeout and parameters
-    v_command := format('BEGIN; %s; SELECT * FROM partitioncache_run_single_job_with_params(%L, %L, %L, %L, %L, %L); COMMIT;', 
+    v_command := format('BEGIN; %s; SELECT * FROM partitioncache_run_single_job_with_params(%L, %L, %L, %L, %L, %L, %L); COMMIT;', 
                        v_timeout_statement, NEW.job_name, NEW.table_prefix, NEW.queue_prefix, 
-                       NEW.cache_backend, NEW.timeout_seconds, NEW.result_limit);
+                       NEW.cache_backend, NEW.timeout_seconds, NEW.result_limit, NEW.default_bitsize);
 
     -- First, unschedule existing jobs if this is an UPDATE
     IF (TG_OP = 'UPDATE' AND OLD.job_ids IS NOT NULL) THEN
@@ -176,6 +177,7 @@ CREATE OR REPLACE FUNCTION partitioncache_update_processor_config_cron(
     p_table_prefix TEXT DEFAULT NULL,
     p_target_database TEXT DEFAULT NULL,
     p_result_limit INTEGER DEFAULT NULL,
+    p_default_bitsize INTEGER DEFAULT NULL,
     p_queue_prefix TEXT DEFAULT 'partitioncache_queue'
 )
 RETURNS VOID AS $$
@@ -207,6 +209,9 @@ BEGIN
     END IF;
     IF p_result_limit IS NOT NULL THEN
         v_set_clauses := array_append(v_set_clauses, format('result_limit = %L', p_result_limit));
+    END IF;
+    IF p_default_bitsize IS NOT NULL THEN
+        v_set_clauses := array_append(v_set_clauses, format('default_bitsize = %L', p_default_bitsize));
     END IF;
 
     -- Only execute if there's something to update

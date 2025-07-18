@@ -284,7 +284,15 @@ def copy_cache(from_cache_type: str, to_cache_type: str, partition_key: str | No
             # Register partition in target if it doesn't exist
             try:
                 if to_cache.get_datatype(pk) is None:
-                    to_cache.register_partition_key(pk, datatype)
+                    # For postgresql_bit handlers, preserve bitsize if available
+                    kwargs = {}
+                    if hasattr(from_cache, "_get_partition_bitsize"):
+                        bitsize = from_cache._get_partition_bitsize(pk)  # type: ignore[attr-defined]
+                        if bitsize is not None:
+                            kwargs["bitsize"] = bitsize
+                            logger.info(f"Preserving bitsize {bitsize} for partition '{pk}'")
+
+                    to_cache.register_partition_key(pk, datatype, **kwargs)
                     partitions_registered += 1
                     logger.info(f"Registered partition '{pk}' with datatype '{datatype}'")
             except Exception as e:
@@ -373,7 +381,15 @@ def export_cache(cache_type: str, archive_file: str, partition_key: str | None =
                 else:
                     pk = str(partition_info)
                     datatype = cache.get_datatype(pk) or "unknown"
-                partition_metadata.append((pk, datatype))
+
+                # For postgresql_bit, also save bitsize
+                metadata_dict = {"partition_key": pk, "datatype": datatype}
+                if cache_type == "postgresql_bit" and hasattr(cache, "_get_partition_bitsize"):
+                    bitsize = cache._get_partition_bitsize(pk)  # type: ignore[attr-defined]
+                    if bitsize is not None:
+                        metadata_dict["bitsize"] = bitsize
+
+                partition_metadata.append(metadata_dict)
 
             # Export partition metadata as special entry
             pickle.dump({"__PARTITION_METADATA__": partition_metadata}, file, protocol=pickle.HIGHEST_PROTOCOL)
@@ -431,7 +447,7 @@ def export_cache(cache_type: str, archive_file: str, partition_key: str | None =
     cache.close()
 
 
-def restore_cache(cache_type: str, archive_file: str, target_partition_key: str | None = None):
+def restore_cache(cache_type: str, archive_file: str, target_partition_key: str | None = None, bitsize: int | None = None):
     cache = get_cache_handler(cache_type)
     restored = 0
     skipped_already_exists = 0
@@ -449,35 +465,53 @@ def restore_cache(cache_type: str, archive_file: str, target_partition_key: str 
                     logger.info(f"Found partition metadata for {len(partition_metadata)} partitions")
 
                     # Register partitions found in metadata
-                    partitions_to_register = set()
+                    partitions_to_register = []
 
-                    for pk, datatype in partition_metadata:
-                        # If target partition specified, register target with source datatype
+                    for metadata_item in partition_metadata:
+                        # Handle both old tuple format and new dict format
+                        if isinstance(metadata_item, dict):
+                            pk = metadata_item["partition_key"]
+                            datatype = metadata_item["datatype"]
+                            bitsize_metadata = metadata_item.get("bitsize")
+                        else:
+                            # Old tuple format (pk, datatype)
+                            pk, datatype = metadata_item
+                            bitsize_metadata = None
+
+                        # If target partition specified, register target with source metadata
                         if target_partition_key:
-                            # Register target partition with source partition's datatype
-                            partitions_to_register.add((target_partition_key, datatype))
+                            # Register target partition with source partition's metadata
+                            partitions_to_register.append((target_partition_key, datatype, bitsize_metadata))
                             break  # Only need first datatype when remapping
                         else:
                             # Register all original partitions
-                            partitions_to_register.add((pk, datatype))
+                            partitions_to_register.append((pk, datatype, bitsize_metadata))
 
                     # If target partition specified but not found in metadata, register with inferred type
                     if target_partition_key and not any(p[0] == target_partition_key for p in partitions_to_register):
                         # Will infer datatype from first data entry
-                        partitions_to_register.add((target_partition_key, None))
+                        partitions_to_register.append((target_partition_key, None, None))
 
-                    for effective_pk, datatype in partitions_to_register:
+                    for effective_pk, datatype, bitsize_meta in partitions_to_register:
                         if datatype is None:
                             continue  # Will be handled during data import
+
+                        # Determine final bitsize: metadata -> CLI param -> None
+                        final_bitsize: int | None = bitsize_meta
+                        if final_bitsize is None and bitsize is not None and cache_type == "postgresql_bit":
+                            final_bitsize = bitsize
 
                         try:
                             # Check if partition already exists
                             existing_datatype = cache.get_datatype(effective_pk)
                             if existing_datatype is None:
                                 # Register new partition
-                                cache.register_partition_key(effective_pk, datatype)
+                                kwargs: dict[str, int] = {}
+                                if final_bitsize is not None and cache_type == "postgresql_bit":
+                                    kwargs["bitsize"] = final_bitsize
+                                    logger.info(f"Restoring partition '{effective_pk}' with bitsize {final_bitsize}")
+                                cache.register_partition_key(effective_pk, datatype, **kwargs)
                                 partitions_registered += 1
-                                logger.info(f"Registered partition '{effective_pk}' with datatype '{datatype}'")
                             elif existing_datatype != datatype:
                                 logger.warning(f"Partition '{effective_pk}' exists with different datatype: '{existing_datatype}' vs '{datatype}'")
                         except Exception as e:
@@ -534,7 +568,20 @@ def restore_cache(cache_type: str, archive_file: str, target_partition_key: str 
                                 else:
                                     datatype = "text"  # default fallback
 
-                                cache.register_partition_key(effective_partition_key, datatype)
+                                # Handle bitsize for bit cache handlers
+                                kwargs = {}
+                                if hasattr(cache.underlying_handler, '_get_partition_bitsize'):
+                                    existing_bitsize = cache.underlying_handler._get_partition_bitsize(effective_partition_key)
+                                    if hasattr(args, 'bitsize') and args.bitsize is not None:
+                                        kwargs['bitsize'] = args.bitsize
+                                        if existing_bitsize is not None and existing_bitsize != args.bitsize:
+                                            logger.info(f"Updating bitsize from {existing_bitsize} to {args.bitsize} for partition '{effective_partition_key}'")
+                                            cache.underlying_handler._set_partition_bitsize(effective_partition_key, args.bitsize)
+                                    elif existing_bitsize is not None:
+                                        kwargs['bitsize'] = existing_bitsize
+                                elif hasattr(args, 'bitsize') and args.bitsize is not None:
+                                    kwargs['bitsize'] = args.bitsize
+                                cache.register_partition_key(effective_partition_key, datatype, **kwargs)
                                 partitions_registered += 1
                                 logger.info(f"Auto-registered partition '{effective_partition_key}' with datatype '{datatype}'")
                                 # Verify registration
@@ -843,6 +890,7 @@ def show_comprehensive_status() -> None:
                             elif backend.startswith("rocksdb_"):
                                 try:
                                     from partitioncache.cache_handler.rocks_db_abstract import RocksDBAbstractCacheHandler
+
                                     if isinstance(cache_handler, RocksDBAbstractCacheHandler):
                                         # Quick RocksDB access test
                                         if hasattr(cache_handler, "db") and hasattr(cache_handler.db, "iterkeys"):
@@ -1531,6 +1579,11 @@ valid environment variables. Use --env to load configuration from a custom file.
         dest="target_partition_key",
         help="Import only from specific partition or import to specific partition (default: preserve original partition keys)",
     )
+    cache_import_parser.add_argument(
+        "--bitsize",
+        type=int,
+        help="Bitsize for postgresql_bit target partition when it needs to be created",
+    )
 
     # Cache delete
     cache_delete_parser = cache_subparsers.add_parser("delete", help="Delete cache")
@@ -1632,7 +1685,12 @@ valid environment variables. Use --env to load configuration from a custom file.
                 export_cache(cache_type, args.archive_file, getattr(args, "partition_key", None))
             elif args.cache_command == "import":
                 cache_type = args.cache_type or get_cache_type_from_env()
-                restore_cache(cache_type, args.archive_file, getattr(args, "target_partition_key", None))
+                restore_cache(
+                    cache_type,
+                    args.archive_file,
+                    getattr(args, "target_partition_key", None),
+                    getattr(args, "bitsize", None),
+                )
             elif args.cache_command == "delete":
                 if args.all:
                     delete_all_caches()

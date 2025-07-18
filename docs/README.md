@@ -100,7 +100,7 @@ PartitionCache follows a modular architecture with distinct layers:
 ### Examples & Tutorials
 - **[Complete Workflow](complete_workflow_example.md)** - End-to-end tutorial
 - **[Cache Management CLI](manage_cache_cli.md)** - pcache-manage usage guide
-- **[Migration Guide](migration_guide.md)** - Backend migration procedures
+- **[Backend Migration](backend_migration.md)** - Backend migration procedures
 
 ## Key Concepts
 

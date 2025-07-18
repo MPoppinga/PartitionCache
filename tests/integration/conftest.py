@@ -226,6 +226,10 @@ def db_session(db_connection):
         # Clean cache tables (truncate instead of drop to preserve schema)
         for table_name in all_cache_tables:
             try:
+                # Skip metadata tables to preserve partition registration between tests
+                if table_name.endswith("_partition_metadata") or table_name.endswith("_queries"):
+                    # Only clean data tables, not metadata
+                    continue
                 # Try truncate first to preserve schema
                 cur.execute(f"TRUNCATE TABLE {table_name} RESTART IDENTITY CASCADE;")
             except Exception as e:
@@ -388,12 +392,14 @@ if os.getenv("REDIS_HOST"):
 def _is_rocksdb_available():
     """Check if RocksDB is available for testing."""
     import importlib.util
+
     return importlib.util.find_spec("rocksdb") is not None
 
 
 def _is_rocksdict_available():
     """Check if rocksdict is available for testing."""
     import importlib.util
+
     return importlib.util.find_spec("rocksdic") is not None
 
 
@@ -483,12 +489,17 @@ def cache_client(request, db_session):
 
             cache_handler = RocksDictCacheHandler(temp_dir)
         else:
-            cache_handler = get_cache_handler(cache_backend)
+            cache_handler = get_cache_handler(cache_backend, singleton=False)
 
         # Setup partition keys for testing
         for partition_key, datatype in TEST_PARTITION_KEYS:
             try:
-                cache_handler.register_partition_key(partition_key, datatype)
+                # For postgresql_bit backend, provide bitsize parameter that accommodates test data
+                # Test data includes zipcode 90210, so we need at least 100000 bits
+                if cache_backend == "postgresql_bit":
+                    cache_handler.register_partition_key(partition_key, datatype, bitsize=100000)
+                else:
+                    cache_handler.register_partition_key(partition_key, datatype)
             except Exception:
                 # Some backends might not need explicit registration
                 pass
@@ -505,37 +516,82 @@ def cache_client(request, db_session):
                 deleted_count = cache_handler.clear_all_cache_data()
                 logger.info(f"Cleared {deleted_count} Redis cache keys")
             else:
-                # Clear ALL test data completely (not limited to 50 keys)
-                for partition_key, _ in TEST_PARTITION_KEYS:
+                # For PostgreSQL backends, maintain consistency by dropping tables instead of just deleting data
+                # This prevents the issue where metadata exists but cache tables don't
+                if hasattr(cache_handler, "cursor") and hasattr(cache_handler, "db"):
                     try:
-                        # Check if partition exists before attempting cleanup
-                        if hasattr(cache_handler, "_get_partition_datatype"):
-                            # For PostgreSQL backends, check if partition exists
-                            if cache_handler._get_partition_datatype(partition_key) is None:
-                                continue  # Skip non-existent partitions
+                        # Get table prefix for this handler
+                        table_prefix = getattr(cache_handler, "tableprefix", "")
 
-                        # Get all keys and delete them all
-                        keys = cache_handler.get_all_keys(partition_key)
-                        if keys:
-                            # Delete all keys without limit for proper test isolation
-                            for key in list(keys):
-                                try:
-                                    cache_handler.delete(key, partition_key)
-                                except Exception:
-                                    pass  # Continue deleting other keys
+                        # Drop all cache tables and metadata tables together to maintain consistency
+                        with cache_handler.cursor:
+                            # Drop cache tables for each partition
+                            for partition_key, _ in TEST_PARTITION_KEYS:
+                                cache_table = f"{table_prefix}_cache_{partition_key}"
+                                cache_handler.cursor.execute(f"DROP TABLE IF EXISTS {cache_table} CASCADE;")
 
-                            # Double-check deletion worked (only if partition still exists)
-                            try:
-                                remaining_keys = cache_handler.get_all_keys(partition_key)
-                                if remaining_keys:
-                                    logger.warning(f"Failed to delete all keys for {partition_key}: {len(remaining_keys)} remaining")
-                            except Exception:
-                                # Partition might have been deleted during cleanup - this is OK
-                                pass
+                            # Drop metadata and queries tables
+                            cache_handler.cursor.execute(f"DROP TABLE IF EXISTS {table_prefix}_partition_metadata CASCADE;")
+                            cache_handler.cursor.execute(f"DROP TABLE IF EXISTS {table_prefix}_queries CASCADE;")
+
+                            cache_handler.db.commit()
+                            logger.debug(f"Dropped cache tables and metadata for {cache_backend}")
                     except Exception as e:
-                        # Only log warnings for unexpected errors, not missing tables
-                        if "does not exist" not in str(e).lower() and "relation" not in str(e).lower():
-                            logger.warning(f"Cache cleanup failed for {partition_key}: {e}")
+                        logger.warning(f"Failed to drop cache tables for {cache_backend}: {e}")
+                        # Fallback to old cleanup method
+                        for partition_key, _ in TEST_PARTITION_KEYS:
+                            try:
+                                # Check if partition exists before attempting cleanup
+                                if hasattr(cache_handler, "_get_partition_datatype"):
+                                    # For PostgreSQL backends, check if partition exists
+                                    if cache_handler._get_partition_datatype(partition_key) is None:
+                                        continue  # Skip non-existent partitions
+
+                                # Get all keys and delete them all
+                                keys = cache_handler.get_all_keys(partition_key)
+                                if keys:
+                                    # Delete all keys without limit for proper test isolation
+                                    for key in list(keys):
+                                        try:
+                                            cache_handler.delete(key, partition_key)
+                                        except Exception:
+                                            pass  # Continue deleting other keys
+                            except Exception as e:
+                                # Only log warnings for unexpected errors, not missing tables
+                                if "does not exist" not in str(e).lower() and "relation" not in str(e).lower():
+                                    logger.warning(f"Cache cleanup failed for {partition_key}: {e}")
+                else:
+                    # Non-PostgreSQL backends: use the old cleanup method
+                    for partition_key, _ in TEST_PARTITION_KEYS:
+                        try:
+                            # Check if partition exists before attempting cleanup
+                            if hasattr(cache_handler, "_get_partition_datatype"):
+                                # For PostgreSQL backends, check if partition exists
+                                if cache_handler._get_partition_datatype(partition_key) is None:
+                                    continue  # Skip non-existent partitions
+
+                            # Get all keys and delete them all
+                            keys = cache_handler.get_all_keys(partition_key)
+                            if keys:
+                                # Delete all keys without limit for proper test isolation
+                                for key in list(keys):
+                                    try:
+                                        cache_handler.delete(key, partition_key)
+                                    except Exception:
+                                        pass  # Continue deleting other keys
+
+                                # Double-check deletion worked (only if partition still exists)
+                                try:
+                                    remaining_keys = cache_handler.get_all_keys(partition_key)
+                                    if remaining_keys:
+                                        logger.warning(f"Failed to delete all keys for {partition_key}: {len(remaining_keys)} remaining")
+                                except Exception:
+                                    # Partition might have been deleted during cleanup - this is OK
+                                    pass
+                        except Exception as e:
+                            # Only log warnings for unexpected errors, not missing tables
+                            if "does not exist" not in str(e).lower() and "relation" not in str(e).lower():
+                                logger.warning(f"Cache cleanup failed for {partition_key}: {e}")
 
             # Properly close cache handler
             if hasattr(cache_handler, "close"):
@@ -631,13 +687,13 @@ def postgresql_queue_functions(db_connection):
 
     try:
         # Import the setup function
-        from partitioncache.cli.setup_postgresql_queue_processor import setup_database_objects
+        from partitioncache.cli.postgresql_queue_processor import setup_database_objects
 
         # Load the SQL functions into the database
-        # Only create pg_cron trigger if the extension is available
-        setup_database_objects(db_connection, include_pg_cron_trigger=pg_cron_available)
+        # The function automatically handles pg_cron setup if available
+        setup_database_objects(db_connection, cron_conn=None)
 
-        logger.info(f"PostgreSQL queue processor functions loaded successfully (pg_cron trigger: {pg_cron_available})")
+        logger.info(f"PostgreSQL queue processor functions loaded successfully (pg_cron available: {pg_cron_available})")
         return pg_cron_available  # Return whether pg_cron is available
 
     except ImportError as e:
@@ -679,19 +735,19 @@ def manual_queue_processor(db_session, db_connection, cache_client):
 
     # Load functions if needed (without pg_cron)
     if not functions_exist and db_connection:
-        from partitioncache.cli.setup_postgresql_queue_processor import setup_database_objects
+        from partitioncache.cli.postgresql_queue_processor import setup_database_objects
 
         setup_database_objects(db_connection, include_pg_cron_trigger=False)
 
     # Setup processor tables and config
-    from partitioncache.cli.setup_postgresql_queue_processor import get_queue_table_prefix_from_env, get_table_prefix_from_env
+    from partitioncache.cli.postgresql_queue_processor import get_queue_table_prefix_from_env, get_table_prefix_from_env
 
     queue_prefix = get_queue_table_prefix_from_env()
     table_prefix = get_table_prefix_from_env()
 
     with db_session.cursor() as cur:
         # Initialize processor tables
-        cur.execute("SELECT partitioncache_initialize_processor_tables(%s)", [queue_prefix])
+        cur.execute("SELECT partitioncache_initialize_cache_processor_tables(%s)", [queue_prefix])
 
         # Add processor configuration
         config_table = f"{queue_prefix}_processor_config"
@@ -699,13 +755,13 @@ def manual_queue_processor(db_session, db_connection, cache_client):
             f"""
             INSERT INTO {config_table}
             (job_name, enabled, max_parallel_jobs, frequency_seconds, timeout_seconds,
-             table_prefix, queue_prefix, cache_backend)
+             table_prefix, queue_prefix, cache_backend, target_database)
             VALUES ('partitioncache_process_queue', true, 1, 60, 30,
-                    %s, %s, 'array')
+                    %s, %s, 'array', %s)
             ON CONFLICT (job_name) DO UPDATE
             SET enabled = true, updated_at = NOW()
         """,
-            (table_prefix, queue_prefix),
+            (table_prefix, queue_prefix, os.getenv("DB_NAME", "partitioncache_integration")),
         )
 
         db_session.commit()
@@ -732,7 +788,7 @@ def postgresql_queue_processor(postgresql_queue_functions, db_session, cache_cli
     if not cache_backend.startswith("postgresql"):
         pytest.skip(f"PostgreSQL queue processor only works with PostgreSQL cache backends, not {cache_backend}")
 
-    from partitioncache.cli.setup_postgresql_queue_processor import get_queue_table_prefix_from_env, get_table_prefix_from_env
+    from partitioncache.cli.postgresql_queue_processor import get_queue_table_prefix_from_env, get_table_prefix_from_env
 
     queue_prefix = get_queue_table_prefix_from_env()
     table_prefix = get_table_prefix_from_env()
@@ -740,7 +796,7 @@ def postgresql_queue_processor(postgresql_queue_functions, db_session, cache_cli
 
     # Initialize processor tables
     with db_session.cursor() as cur:
-        cur.execute(f"SELECT partitioncache_initialize_processor_tables('{queue_prefix}')")
+        cur.execute(f"SELECT partitioncache_initialize_cache_processor_tables('{queue_prefix}')")
 
         # Add a test configuration for the processor
         config_table = f"{queue_prefix}_processor_config"
@@ -748,13 +804,13 @@ def postgresql_queue_processor(postgresql_queue_functions, db_session, cache_cli
             f"""
             INSERT INTO {config_table}
             (job_name, enabled, max_parallel_jobs, frequency_seconds, timeout_seconds,
-             table_prefix, queue_prefix, cache_backend)
+             table_prefix, queue_prefix, cache_backend, target_database)
             VALUES ('partitioncache_process_queue', true, 1, 60, 30,
-                    %s, %s, 'array')
+                    %s, %s, 'array', %s)
             ON CONFLICT (job_name) DO UPDATE
             SET timeout_seconds = 30, enabled = true, updated_at = NOW()
         """,
-            (table_prefix, queue_prefix),
+            (table_prefix, queue_prefix, os.getenv("DB_NAME", "partitioncache_integration")),
         )
         db_session.commit()
 

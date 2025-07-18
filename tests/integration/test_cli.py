@@ -177,7 +177,7 @@ class TestCLICommands:
 
     def test_pcache_postgresql_queue_processor_help(self):
         """Test pcache-postgresql-queue-processor help command."""
-        result = subprocess.run(["python", "-m", "partitioncache.cli.setup_postgresql_queue_processor", "--help"], capture_output=True, text=True, timeout=30)
+        result = subprocess.run(["python", "-m", "partitioncache.cli.postgresql_queue_processor", "--help"], capture_output=True, text=True, timeout=30)
 
         assert result.returncode == 0, f"Command failed: {result.stderr}"
         assert "postgresql" in result.stdout.lower() or "queue" in result.stdout.lower()

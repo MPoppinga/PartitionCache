@@ -138,17 +138,17 @@ def check_pg_cron_installed() -> bool:
 def setup_cron_eviction_objects(cron_conn, table_prefix: str):
     """Set up eviction cron database components (configuration tables and scheduling functions)."""
     logger.info("Setting up eviction cron database objects...")
-    
+
     # Read and execute cron SQL file
     sql_cron_content = SQL_CRON_FILE.read_text()
     with cron_conn.cursor() as cur:
         cur.execute(sql_cron_content)
-    
+
     # Initialize cron config table
     with cron_conn.cursor() as cur:
         cur.execute("SELECT partitioncache_initialize_eviction_cron_config_table(%s)", [table_prefix])
         cur.execute("SELECT partitioncache_create_eviction_cron_config_trigger(%s)", [table_prefix])
-    
+
     cron_conn.commit()
     logger.info("Eviction cron database objects created successfully")
 
@@ -173,7 +173,7 @@ def setup_cache_eviction_objects(cache_conn, table_prefix: str):
 def setup_database_objects(cache_conn, cron_conn, table_prefix: str):
     """Execute the SQL files to create all necessary database objects in both databases."""
     logger.info("Setting up cross-database eviction objects...")
-    
+
     if get_cron_database_name() == get_cache_database_name():
         logger.info("Using same database for cron and cache eviction operations")
         # Setup both components in the same database
@@ -183,9 +183,9 @@ def setup_database_objects(cache_conn, cron_conn, table_prefix: str):
         logger.info("Using separate databases for cron and cache eviction operations")
         # Setup cron components in cron database
         setup_cron_eviction_objects(cron_conn, table_prefix)
-        # Setup cache components in cache database  
+        # Setup cache components in cache database
         setup_cache_eviction_objects(cache_conn, table_prefix)
-    
+
     logger.info("Cross-database eviction setup completed successfully")
 
 
@@ -232,7 +232,7 @@ def insert_cache_eviction_config(cache_conn, job_name: str, table_prefix: str, f
                 """
             ).format(sql.Identifier(config_table))
         )
-        
+
         # Insert configuration for eviction functions to access
         cur.execute(
             sql.SQL(
@@ -318,18 +318,26 @@ def remove_all_eviction_objects(conn, table_prefix: str):
 
 
 def set_processor_enabled(conn, table_prefix: str, job_name: str, enabled: bool):
-    """Enable or disable the eviction job."""
+    """Enable or disable the eviction job by updating config table (trigger handles cron job)."""
     status = "Enabling" if enabled else "Disabling"
     logger.info(f"{status} cache eviction job...")
+
+    # Update config table in cron database - trigger will handle the cron job
+    cron_conn = get_pg_cron_connection()
     config_table = f"{table_prefix}_eviction_config"
-    with conn.cursor() as cur:
-        cur.execute(sql.SQL("UPDATE {} SET enabled = %s WHERE job_name = %s").format(sql.Identifier(config_table)), (enabled, job_name))
-    conn.commit()
-    logger.info(f"Cache eviction job {status.lower()}d.")
+
+    with cron_conn.cursor() as cur:
+        cur.execute(
+            sql.SQL("UPDATE {} SET enabled = %s, updated_at = NOW() WHERE job_name = %s").format(sql.Identifier(config_table)),
+            (enabled, job_name)
+        )
+    cron_conn.commit()
+    cron_conn.close()
+    logger.info(f"Cache eviction job {status.lower()}d successfully.")
 
 
 def update_processor_config(conn, table_prefix: str, job_name: str, **kwargs):
-    """Update processor configuration."""
+    """Update processor configuration in cron database (trigger handles cron job)."""
     config_table = f"{table_prefix}_eviction_config"
     updates = {k: v for k, v in kwargs.items() if v is not None}
 
@@ -337,26 +345,32 @@ def update_processor_config(conn, table_prefix: str, job_name: str, **kwargs):
         logger.warning("No configuration options provided to update.")
         return
 
+    # Always add updated_at
     set_clauses = sql.SQL(", ").join(sql.SQL("{} = {}").format(sql.Identifier(k), sql.Literal(v)) for k, v in updates.items())
+    set_clauses = sql.SQL("{}, updated_at = NOW()").format(set_clauses)
 
     logger.info(f"Updating eviction processor configuration for job '{job_name}'...")
-    with conn.cursor() as cur:
+
+    # Update config table in cron database - trigger will handle the cron job
+    cron_conn = get_pg_cron_connection()
+    with cron_conn.cursor() as cur:
         query = sql.SQL("UPDATE {} SET {} WHERE job_name = {}").format(sql.Identifier(config_table), set_clauses, sql.Literal(job_name))
         cur.execute(query)
 
-    conn.commit()
+    cron_conn.commit()
+    cron_conn.close()
     logger.info("Processor configuration updated successfully.")
 
 
 def handle_setup(table_prefix: str, frequency: int, enabled: bool, strategy: str, threshold: int):
     """Handle the main setup logic."""
     logger.info("Starting PostgreSQL cache eviction cross-database setup...")
-    
+
     # Get database connections
     cache_conn = get_db_connection()
     cron_conn = get_pg_cron_connection()
     target_database = get_cache_database_name()
-    
+
     if not check_pg_cron_installed():
         logger.error("pg_cron extension is not installed. Please install it first.")
         cache_conn.close()
@@ -373,13 +387,13 @@ def handle_setup(table_prefix: str, frequency: int, enabled: bool, strategy: str
         setup_database_objects(cache_conn, cron_conn, table_prefix)
 
     job_name = f"partitioncache_evict_{table_prefix}"
-    
+
     # Insert configuration in cron database for pg_cron job management only
     actual_cron_conn = cache_conn if get_cron_database_name() == get_cache_database_name() else cron_conn
     insert_initial_config(actual_cron_conn, job_name, table_prefix, frequency, enabled, strategy, threshold, target_database)
 
     logger.info("Setup complete. The eviction job is created and configured via the config table.")
-    
+
     # Close connections
     cache_conn.close()
     if get_cron_database_name() != get_cache_database_name():
@@ -468,36 +482,36 @@ def manual_run(table_prefix):
     """Manually run the eviction job - reads config from cron database."""
     job_name = f"partitioncache_evict_{table_prefix}"
     logger.info(f"Manually running eviction job '{job_name}'...")
-    
+
     # Get connections to read config from cron database and execute in cache database
     cache_conn = get_db_connection()
     cron_conn = get_pg_cron_connection()
-    
+
     try:
         # Read configuration from cron database
         config_table = f"{table_prefix}_eviction_config"
         actual_cron_conn = cache_conn if get_cron_database_name() == get_cache_database_name() else cron_conn
-        
+
         with actual_cron_conn.cursor() as cur:
             cur.execute(
                 sql.SQL("SELECT strategy, threshold FROM {} WHERE job_name = %s").format(sql.Identifier(config_table)),
                 [job_name]
             )
             config = cur.fetchone()
-            
+
             if not config:
                 logger.error(f"No configuration found for job '{job_name}' in cron database. Please run setup first.")
                 return
-            
+
             strategy, threshold = config
-        
+
         # Execute eviction in cache database using parameter-based function
         with cache_conn.cursor() as cur:
-            cur.execute("SELECT partitioncache_run_eviction_job_with_params(%s, %s, %s, %s)", 
+            cur.execute("SELECT partitioncache_run_eviction_job_with_params(%s, %s, %s, %s)",
                        (job_name, table_prefix, strategy, threshold))
         cache_conn.commit()
         logger.info("Manual eviction run complete. Check logs for details.")
-        
+
     finally:
         cache_conn.close()
         if get_cron_database_name() != get_cache_database_name():

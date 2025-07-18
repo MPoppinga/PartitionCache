@@ -91,8 +91,8 @@ class TestMultiPartitionFunctionality:
             handler.db = mock_db
 
             # Test bitsize management
-            mock_cursor.fetchone.return_value = None
-            assert handler._get_partition_bitsize("partition1") is None
+            mock_cursor.fetchone.return_value = (1000,)  # Mock existing bitsize
+            assert handler._get_partition_bitsize("partition1") == 1000
             handler._set_partition_bitsize("partition1", 2000)
 
             # Verify the update call was made

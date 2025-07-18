@@ -63,6 +63,12 @@ def add_cache_args(parser: argparse.ArgumentParser, require_partition_key: bool 
         help="Datatype of the partition key (if not specified, will be inferred)",
     )
 
+    cache_group.add_argument(
+        "--bitsize",
+        type=int,
+        help="Bitsize for bit cache handlers (default: uses handler default or environment variable)",
+    )
+
 
 def add_environment_args(parser: argparse.ArgumentParser) -> None:
     """

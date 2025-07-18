@@ -59,7 +59,7 @@ class EnvironmentConfigManager:
         return config
 
     @staticmethod
-    def get_postgresql_bit_config() -> dict[str, str | int | None]:
+    def get_postgresql_bit_config() -> dict[str, str | int]:
         """
         Get PostgreSQL bit cache handler configuration.
 
@@ -76,9 +76,11 @@ class EnvironmentConfigManager:
             raise ValueError("PG_BIT_CACHE_TABLE_PREFIX environment variable not set")
 
         bitsize = os.getenv("PG_BIT_CACHE_BITSIZE")
+        if not bitsize:
+            raise ValueError("PG_BIT_CACHE_BITSIZE environment variable not set")
 
         config["db_tableprefix"] = table_prefix
-        config["bitsize"] = int(bitsize) if bitsize else None
+        config["bitsize"] = int(bitsize)
         return config
 
     @staticmethod

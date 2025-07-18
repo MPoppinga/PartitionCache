@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 import pytest
 
-from partitioncache.cli.setup_postgresql_queue_processor import (
+from partitioncache.cli.postgresql_queue_processor import (
     check_and_grant_pg_cron_permissions,
     check_pg_cron_installed,
     get_pg_cron_connection,
@@ -19,30 +19,27 @@ class TestCrossDatabasePgCron:
     def test_cross_database_connection_with_env_vars(self):
         """Test that PG_CRON_* environment variables are used correctly."""
         # This test verifies environment variable usage without actual connection
-        with patch.dict(os.environ, {
-            "PG_CRON_HOST": "pgcron.example.com",
-            "PG_CRON_PORT": "5433",
-            "PG_CRON_USER": "cron_admin",
-            "PG_CRON_PASSWORD": "cron_secret",
-            "PG_CRON_DATABASE": "cron_management",
-            "DB_HOST": "app.example.com",
-            "DB_PORT": "5432",
-            "DB_USER": "app_user",
-            "DB_PASSWORD": "app_secret",
-            "DB_NAME": "app_db"
-        }):
+        with patch.dict(
+            os.environ,
+            {
+                "PG_CRON_HOST": "pgcron.example.com",
+                "PG_CRON_PORT": "5433",
+                "PG_CRON_USER": "cron_admin",
+                "PG_CRON_PASSWORD": "cron_secret",
+                "PG_CRON_DATABASE": "cron_management",
+                "DB_HOST": "app.example.com",
+                "DB_PORT": "5432",
+                "DB_USER": "app_user",
+                "DB_PASSWORD": "app_secret",
+                "DB_NAME": "app_db",
+            },
+        ):
             # Mock the connection to avoid actual database connection
-            with patch('psycopg.connect') as mock_connect:
+            with patch("psycopg.connect") as mock_connect:
                 get_pg_cron_connection()
 
                 # Verify it uses PG_CRON_* variables, not DB_* variables
-                mock_connect.assert_called_once_with(
-                    host="pgcron.example.com",
-                    port=5433,
-                    user="cron_admin",
-                    password="cron_secret",
-                    dbname="cron_management"
-                )
+                mock_connect.assert_called_once_with(host="pgcron.example.com", port=5433, user="cron_admin", password="cron_secret", dbname="cron_management")
 
     @pytest.mark.integration
     @pytest.mark.slow
@@ -92,12 +89,15 @@ class TestCrossDatabasePgCron:
 
             with db_session.cursor() as cur:
                 # Check that processor config table exists in work database
-                cur.execute("""
+                cur.execute(
+                    """
                     SELECT EXISTS (
                         SELECT 1 FROM information_schema.tables
                         WHERE table_name = %s
                     )
-                """, (f"{queue_prefix}_processor_config",))
+                """,
+                    (f"{queue_prefix}_processor_config",),
+                )
 
                 config_exists = cur.fetchone()[0]
                 assert config_exists, "Processor config table should exist in work database"
@@ -124,16 +124,13 @@ class TestCrossDatabasePgCron:
                 function_src = result[0]
 
                 # Verify the function uses schedule_in_database
-                assert "schedule_in_database" in function_src, \
-                    "Trigger should use cron.schedule_in_database for cross-database support"
+                assert "schedule_in_database" in function_src, "Trigger should use cron.schedule_in_database for cross-database support"
 
                 # Verify it stores job_id
-                assert "job_id" in function_src, \
-                    "Trigger should store job_id for cross-database job management"
+                assert "job_id" in function_src, "Trigger should store job_id for cross-database job management"
 
                 # Verify it gets current database
-                assert "current_database()" in function_src, \
-                    "Trigger should determine current database for cross-database scheduling"
+                assert "current_database()" in function_src, "Trigger should determine current database for cross-database scheduling"
 
     @pytest.mark.integration
     def test_fallback_to_db_vars(self):
@@ -145,13 +142,8 @@ class TestCrossDatabasePgCron:
                 env_backup[key] = os.environ.pop(key)
 
         try:
-            with patch.dict(os.environ, {
-                "DB_HOST": "fallback.example.com",
-                "DB_PORT": "5432",
-                "DB_USER": "fallback_user",
-                "DB_PASSWORD": "fallback_pass"
-            }):
-                with patch('psycopg.connect') as mock_connect:
+            with patch.dict(os.environ, {"DB_HOST": "fallback.example.com", "DB_PORT": "5432", "DB_USER": "fallback_user", "DB_PASSWORD": "fallback_pass"}):
+                with patch("psycopg.connect") as mock_connect:
                     get_pg_cron_connection()
 
                     # Should use DB_* variables as fallback
@@ -160,7 +152,7 @@ class TestCrossDatabasePgCron:
                         port=5432,
                         user="fallback_user",
                         password="fallback_pass",
-                        dbname="postgres"  # Default pg_cron database
+                        dbname="postgres",  # Default pg_cron database
                     )
         finally:
             # Restore environment

@@ -36,7 +36,7 @@ DECLARE
     v_schedule TEXT;
 BEGIN
     IF (TG_OP = 'DELETE') THEN
-        -- Unschedule job using stored job_id
+        -- Try to unschedule by job_id first
         IF OLD.job_id IS NOT NULL THEN
             BEGIN
                 PERFORM cron.unschedule(OLD.job_id);
@@ -44,6 +44,14 @@ BEGIN
                 RAISE NOTICE 'Could not unschedule job ID %: %', OLD.job_id, SQLERRM;
             END;
         END IF;
+        
+        -- Also try to unschedule by job name to ensure cleanup
+        BEGIN
+            PERFORM cron.unschedule(OLD.job_name);
+        EXCEPTION WHEN OTHERS THEN
+            RAISE NOTICE 'Could not unschedule job by name %: %', OLD.job_name, SQLERRM;
+        END;
+        
         RETURN OLD;
     END IF;
 
@@ -53,12 +61,22 @@ BEGIN
     v_command := format('SELECT partitioncache_run_eviction_job_with_params(%L, %L, %L, %L)', 
                        NEW.job_name, NEW.table_prefix, NEW.strategy, NEW.threshold);
 
-    -- First, unschedule existing job if this is an UPDATE
-    IF (TG_OP = 'UPDATE' AND OLD.job_id IS NOT NULL) THEN
+    -- Always remove existing job on UPDATE to ensure sync (handles external changes)
+    IF (TG_OP = 'UPDATE') THEN
+        -- Try to unschedule by job_id first
+        IF OLD.job_id IS NOT NULL THEN
+            BEGIN
+                PERFORM cron.unschedule(OLD.job_id);
+            EXCEPTION WHEN OTHERS THEN
+                RAISE NOTICE 'Could not unschedule job ID %: %', OLD.job_id, SQLERRM;
+            END;
+        END IF;
+        
+        -- Also try to unschedule by job name to catch externally modified jobs
         BEGIN
-            PERFORM cron.unschedule(OLD.job_id);
+            PERFORM cron.unschedule(OLD.job_name);
         EXCEPTION WHEN OTHERS THEN
-            RAISE NOTICE 'Could not unschedule job ID %: %', OLD.job_id, SQLERRM;
+            RAISE NOTICE 'Could not unschedule job by name %: %', OLD.job_name, SQLERRM;
         END;
     END IF;
 
@@ -82,10 +100,13 @@ BEGIN
             NEW.job_name,
             v_schedule,
             v_command,
-            v_target_database,
-            current_user,
-            NEW.enabled
+            v_target_database
         ) INTO v_job_id;
+        
+        -- Enable/disable the job after creation
+        IF NOT NEW.enabled THEN
+            PERFORM cron.alter_job(v_job_id, active => false);
+        END IF;
         
         -- Store the job ID for later management
         NEW.job_id := v_job_id;
@@ -119,71 +140,11 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- Function to enable or disable eviction (from cron database)
-CREATE OR REPLACE FUNCTION partitioncache_set_eviction_enabled_cron(
-    p_enabled BOOLEAN, 
-    p_table_prefix TEXT,
-    p_job_name TEXT
-)
-RETURNS VOID AS $$
-DECLARE
-    v_config_table TEXT;
-BEGIN
-    v_config_table := p_table_prefix || '_eviction_config';
-    EXECUTE format(
-        'UPDATE %I SET enabled = %L, updated_at = NOW() WHERE job_name = %L',
-        v_config_table, p_enabled, p_job_name
-    );
-END;
-$$ LANGUAGE plpgsql;
+-- Note: Enable/disable is handled by direct UPDATE to config table
+-- The trigger partitioncache_sync_eviction_cron_job() handles cron job management
 
--- Function to update eviction configuration (from cron database)
-CREATE OR REPLACE FUNCTION partitioncache_update_eviction_config_cron(
-    p_job_name TEXT,
-    p_table_prefix TEXT,
-    p_enabled BOOLEAN DEFAULT NULL,
-    p_frequency_minutes INTEGER DEFAULT NULL,
-    p_strategy TEXT DEFAULT NULL,
-    p_threshold INTEGER DEFAULT NULL,
-    p_target_database TEXT DEFAULT NULL
-)
-RETURNS VOID AS $$
-DECLARE
-    v_config_table TEXT;
-    v_update_sql TEXT;
-    v_set_clauses TEXT[] := '{}';
-BEGIN
-    v_config_table := p_table_prefix || '_eviction_config';
-
-    -- Build the SET clauses dynamically
-    IF p_enabled IS NOT NULL THEN
-        v_set_clauses := array_append(v_set_clauses, format('enabled = %L', p_enabled));
-    END IF;
-    IF p_frequency_minutes IS NOT NULL THEN
-        v_set_clauses := array_append(v_set_clauses, format('frequency_minutes = %L', p_frequency_minutes));
-    END IF;
-    IF p_strategy IS NOT NULL THEN
-        v_set_clauses := array_append(v_set_clauses, format('strategy = %L', p_strategy));
-    END IF;
-    IF p_threshold IS NOT NULL THEN
-        v_set_clauses := array_append(v_set_clauses, format('threshold = %L', p_threshold));
-    END IF;
-    IF p_target_database IS NOT NULL THEN
-        v_set_clauses := array_append(v_set_clauses, format('target_database = %L', p_target_database));
-    END IF;
-
-    -- Only execute if there's something to update
-    IF array_length(v_set_clauses, 1) > 0 THEN
-        v_update_sql := format(
-            'UPDATE %I SET %s, updated_at = NOW() WHERE job_name = %L',
-            v_config_table,
-            array_to_string(v_set_clauses, ', '),
-            p_job_name
-        );
-        EXECUTE v_update_sql;
-    END IF;
-END;
-$$ LANGUAGE plpgsql;
+-- Note: Configuration updates are handled by direct UPDATE to config table
+-- The trigger partitioncache_sync_eviction_cron_job() handles cron job management
 
 -- Function to get eviction status from cron database
 CREATE OR REPLACE FUNCTION partitioncache_get_eviction_status_cron(p_table_prefix TEXT, p_job_name TEXT)
