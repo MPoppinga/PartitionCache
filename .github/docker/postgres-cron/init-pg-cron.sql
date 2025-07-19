@@ -76,4 +76,4 @@ GRANT ALL PRIVILEGES ON test_spatial_points TO integration_user;
 GRANT USAGE, SELECT ON SEQUENCE test_spatial_points_id_seq TO integration_user;
 
 -- Note: PartitionCache queue processor functions are loaded at test runtime
--- via the setup_postgresql_queue_processor.py CLI tool
+-- via the postgresql_queue_processor.py CLI tool

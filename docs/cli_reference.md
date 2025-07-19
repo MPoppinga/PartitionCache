@@ -299,6 +299,7 @@ Advanced options for controlling how query variants are generated for better cac
 - Adds query fragments to `query_fragment_queue` for async processing
 - **Best for**: Production workloads, complex queries
 - **Processing**: Requires queue processor to be running
+- **Duplicate Handling**: Silently ignores duplicates (ON CONFLICT DO NOTHING)
 
 #### Original Queue Processing
 ```bash
@@ -307,6 +308,14 @@ Advanced options for controlling how query variants are generated for better cac
 - Adds complete query to `original_query_queue`
 - **Best for**: When you want the queue processor to handle decomposition
 - **Processing**: Queue processor will fragment and process automatically
+- **Duplicate Handling**: Silently ignores duplicates (ON CONFLICT DO NOTHING)
+
+#### Priority Queue Processing (PostgreSQL Only)
+When using the PostgreSQL queue handler API directly:
+- `push_to_*_queue_with_priority()` methods enable priority tracking
+- Duplicate entries increment priority counter
+- Non-blocking concurrency handling prevents deadlocks
+- Useful for tracking query popularity or processing priority
 
 ### Backend Configuration
 - `--queue-provider QUERY_QUEUE_PROVIDER` - Queue provider (`postgresql`, `redis`)

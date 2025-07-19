@@ -45,8 +45,9 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
         self.original_queue_table = f"{self.table_prefix}_original_query_queue"
         self.fragment_queue_table = f"{self.table_prefix}_query_fragment_queue"
 
-        # Initialize tables on first connection
+        # Initialize tables and functions on first connection
         self._initialize_tables()
+        self._deploy_non_blocking_functions()
 
     def _get_connection(self):
         """Get PostgreSQL connection with proper configuration."""
@@ -177,6 +178,118 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
             logger.error(f"Failed to initialize PostgreSQL queue tables: {e}")
             raise
 
+    def _deploy_non_blocking_functions(self):
+        """Deploy non-blocking queue upsert functions."""
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+
+            # Check if functions already exist
+            cursor.execute("""
+                SELECT routine_name
+                FROM information_schema.routines
+                WHERE routine_schema = 'public'
+                AND routine_name IN ('non_blocking_fragment_queue_upsert', 'non_blocking_original_queue_upsert')
+            """)
+            existing_functions = [row[0] for row in cursor.fetchall()]
+
+            if len(existing_functions) == 2:
+                logger.debug("Non-blocking queue functions already exist")
+                return
+
+            logger.info("Deploying non-blocking queue functions...")
+
+            # Load and execute the SQL functions from the same directory
+            from pathlib import Path
+
+            sql_file = Path(__file__).parent / "postgresql_queue_helper.sql"
+            if not sql_file.exists():
+                logger.warning(f"Non-blocking queue functions SQL file not found: {sql_file}")
+                return
+
+            with open(sql_file) as f:
+                sql_content = f.read()
+
+            # Execute the SQL to create functions
+            cursor.execute(sql_content)
+            conn.commit()
+
+            logger.info("Non-blocking queue functions deployed successfully")
+
+        except Exception as e:
+            logger.warning(f"Failed to deploy non-blocking queue functions (will use fallback): {e}")
+            # Don't raise - the system can work without these functions, just with potential blocking
+
+    def push_to_original_query_queue(self, query: str, partition_key: str, partition_datatype: str | None = None) -> bool:
+        """
+        Push an original query to the original query queue (implements AbstractQueueHandler interface).
+        Uses simple INSERT with ON CONFLICT DO NOTHING for maximum performance.
+
+        Args:
+            query (str): The original query to be pushed to the original query queue.
+            partition_key (str): The partition key for this query.
+            partition_datatype (str): The datatype of the partition key (default: None).
+
+        Returns:
+            bool: True if the query was pushed successfully, False otherwise.
+        """
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+
+            # Simple INSERT with ON CONFLICT DO NOTHING - no priority handling needed
+            cursor.execute(
+                sql.SQL("""
+                INSERT INTO {} (query, partition_key, partition_datatype, priority, updated_at, created_at)
+                VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                ON CONFLICT (query, partition_key) DO NOTHING
+            """).format(sql.Identifier(self.original_queue_table)),
+                (query, partition_key, partition_datatype, 1),
+            )
+            conn.commit()
+            logger.debug("Pushed query to PostgreSQL original query queue with ON CONFLICT DO NOTHING")
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to push query to PostgreSQL original query queue: {e}")
+            return False
+
+    def push_to_query_fragment_queue(self, query_hash_pairs: list[tuple[str, str]], partition_key: str, partition_datatype: str | None = None) -> bool:
+        """
+        Push query fragments to the fragment queue (implements AbstractQueueHandler interface).
+        Uses simple INSERT with ON CONFLICT DO NOTHING for maximum performance.
+
+        Args:
+            query_hash_pairs (List[Tuple[str, str]]): List of (query, hash) tuples to push.
+            partition_key (str): The partition key for these query fragments.
+            partition_datatype (str): The datatype of the partition key (default: None).
+
+        Returns:
+            bool: True if all fragments were pushed successfully, False otherwise.
+        """
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+
+            # Simple INSERT with ON CONFLICT DO NOTHING - no priority handling needed
+            for query, hash_value in query_hash_pairs:
+                cursor.execute(
+                    sql.SQL("""
+                    INSERT INTO {} (query, hash, partition_key, partition_datatype, priority, updated_at, created_at)
+                    VALUES (%s, %s, %s, %s, %s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    ON CONFLICT (hash, partition_key) DO NOTHING
+                """).format(sql.Identifier(self.fragment_queue_table)),
+                    (query, hash_value, partition_key, partition_datatype, 1),
+                )
+
+            conn.commit()
+            logger.debug(f"Pushed {len(query_hash_pairs)} query fragments to PostgreSQL queue with ON CONFLICT DO NOTHING")
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to push query fragments to PostgreSQL queue handler: {e}")
+            return False
+
     def push_to_original_query_queue_with_priority(self, query: str, partition_key: str, priority: int = 1, partition_datatype: str | None = None) -> bool:
         """
         Push an original query to the original query queue with specified priority.
@@ -194,21 +307,35 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
         try:
             conn = self._get_connection()
             cursor = conn.cursor()
-            cursor.execute(
-                sql.SQL("""
-                INSERT INTO {} (query, partition_key, partition_datatype, priority, updated_at)
-                VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP)
-                ON CONFLICT (query, partition_key)
-                DO UPDATE SET
-                    priority = {}.priority + 1,
-                    updated_at = CURRENT_TIMESTAMP
-            """).format(sql.Identifier(self.original_queue_table), sql.Identifier(self.original_queue_table)),
-                (query, partition_key, partition_datatype, priority),
-            )
 
-            conn.commit()
-            logger.debug("Pushed/updated query in PostgreSQL original query queue")
-            return True
+            # Try non-blocking upsert function first
+            try:
+                cursor.execute(
+                    "SELECT non_blocking_original_queue_upsert(%s, %s, %s, %s, %s)",
+                    (query, partition_key, partition_datatype, priority, self.original_queue_table)
+                )
+                result = cursor.fetchone()[0]
+                conn.commit()
+                logger.debug(f"Non-blocking original queue upsert result: {result}")
+                return True
+            except Exception as func_error:
+                # Fallback to traditional approach if function doesn't exist
+                logger.debug(f"Non-blocking function not available, using fallback: {func_error}")
+                cursor.execute(
+                    sql.SQL("""
+                    INSERT INTO {} (query, partition_key, partition_datatype, priority, updated_at)
+                    VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP)
+                    ON CONFLICT (query, partition_key)
+                    DO UPDATE SET
+                        priority = {}.priority + 1,
+                        updated_at = CURRENT_TIMESTAMP
+                """).format(sql.Identifier(self.original_queue_table), sql.Identifier(self.original_queue_table)),
+                    (query, partition_key, partition_datatype, priority),
+                )
+                conn.commit()
+                logger.debug("Used fallback original queue upsert")
+                return True
+
         except Exception as e:
             logger.error(f"Failed to push query to PostgreSQL original query queue: {e}")
             return False
@@ -218,7 +345,8 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
     ) -> bool:
         """
         Push query fragments with specified priority.
-        If a fragment already exists, increment its priority.
+        Uses non-blocking upsert to avoid concurrency issues with locked rows.
+        If a fragment already exists and is not being processed, increment its priority.
 
         Args:
             query_hash_pairs (List[Tuple[str, str]]): List of (query, hash) tuples to push.
@@ -230,28 +358,45 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
             bool: True if all fragments were pushed/updated successfully, False otherwise.
         """
         try:
-
             conn = self._get_connection()
             cursor = conn.cursor()
 
-            for query, hash_value in query_hash_pairs:
-                cursor.execute(
-                    sql.SQL("""
-                    INSERT INTO {} (query, hash, partition_key, partition_datatype, priority, updated_at)
-                    VALUES (%s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
-                    ON CONFLICT (hash, partition_key)
-                    DO UPDATE SET
-                        priority = {}.priority + 1,
-                        updated_at = CURRENT_TIMESTAMP
-                """).format(sql.Identifier(self.fragment_queue_table), sql.Identifier(self.fragment_queue_table)),
-                    (query, hash_value, partition_key, partition_datatype, priority),
-                )
+            # Try non-blocking upsert functions first
+            try:
+                results = []
+                for query, hash_value in query_hash_pairs:
+                    cursor.execute(
+                        "SELECT non_blocking_fragment_queue_upsert(%s, %s, %s, %s, %s, %s)",
+                        (hash_value, partition_key, partition_datatype, query, priority, self.fragment_queue_table)
+                    )
+                    result = cursor.fetchone()[0]
+                    results.append(result)
 
-            conn.commit()
-            logger.debug(f"Pushed/updated {len(query_hash_pairs)} query fragments in PostgreSQL query fragment queue")
-            return True
+                conn.commit()
+                logger.debug(f"Non-blocking fragment queue upsert results: {results}")
+                return True
+            except Exception as func_error:
+                # Fallback to traditional approach if function doesn't exist
+                logger.debug(f"Non-blocking function not available, using fallback: {func_error}")
+                for query, hash_value in query_hash_pairs:
+                    cursor.execute(
+                        sql.SQL("""
+                        INSERT INTO {} (query, hash, partition_key, partition_datatype, priority, updated_at)
+                        VALUES (%s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+                        ON CONFLICT (hash, partition_key)
+                        DO UPDATE SET
+                            priority = {}.priority + 1,
+                            updated_at = CURRENT_TIMESTAMP
+                    """).format(sql.Identifier(self.fragment_queue_table), sql.Identifier(self.fragment_queue_table)),
+                        (query, hash_value, partition_key, partition_datatype, priority),
+                    )
+
+                conn.commit()
+                logger.debug(f"Used fallback fragment queue upsert for {len(query_hash_pairs)} items")
+                return True
+
         except Exception as e:
-            logger.error(f"Failed to push query fragments to PostgreSQL query fragment queue: {e}")
+            logger.error(f"Failed to push query fragments to PostgreSQL queue handler: {e}")
             return False
 
     def pop_from_original_query_queue(self) -> tuple[str, str, str] | None:

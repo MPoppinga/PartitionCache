@@ -87,10 +87,19 @@ All cache handlers support multiple partition keys with independent datatypes:
 - Separate tables per partition: `{table_name}_cache_{partition_key}`
 - Metadata table: `{table_name}_partition_metadata` 
 - Shared queries table: `{table_name}_queries`
+- Queue integration: Dual-strategy operations for optimal performance
 
 **Redis/RocksDB Handlers:**
 - Namespaced keys: `cache:{partition_key}:{key}`
 - Metadata keys: `_partition_metadata:{partition_key}`
+
+### Queue Integration
+
+**PostgreSQL Queue Handler Features:**
+- **Regular Functions**: Use `INSERT ... ON CONFLICT DO NOTHING` for maximum performance
+- **Priority Functions**: Non-blocking priority increment with `FOR UPDATE NOWAIT`
+- **Automatic Deployment**: Non-blocking functions deployed during handler initialization
+- **Graceful Fallback**: System works without functions, just with potential blocking
 
 ### Usage Examples
 
