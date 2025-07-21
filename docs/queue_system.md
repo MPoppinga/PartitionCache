@@ -42,6 +42,9 @@ PartitionCache implements a sophisticated two-queue system that separates query 
 - Partition key tracking in dedicated columns
 - LISTEN/NOTIFY for real-time processing
 - Comprehensive indexing for optimal performance
+- **Dual-strategy queue operations** for optimal performance:
+  - Regular functions: `INSERT ... ON CONFLICT DO NOTHING` for maximum speed
+  - Priority functions: Non-blocking priority increment with concurrency handling
 
 **Configuration:**
 See [CLI Reference - Global Options](cli_reference.md#global-options) for complete environment setup.
@@ -87,15 +90,31 @@ See [CLI Reference - Global Options](cli_reference.md#global-options) for Redis 
 
 ## Queue Operations
 
+### PostgreSQL Queue Strategies
+
+PostgreSQL provider offers two operation strategies for different use cases:
+
+#### Strategy 1: Regular Queue Functions (Default)
+- **Method**: `INSERT ... ON CONFLICT DO NOTHING`
+- **Performance**: Maximum speed, no blocking
+- **Behavior**: Duplicates are silently ignored
+- **Use Case**: Basic queue population, high-throughput scenarios
+
+#### Strategy 2: Priority Queue Functions
+- **Method**: Non-blocking functions with `FOR UPDATE NOWAIT`
+- **Performance**: Slightly slower but handles concurrency gracefully
+- **Behavior**: Duplicate entries increment priority counter
+- **Use Case**: When tracking duplicate attempts or priority ordering matters
+
 ### Core Functions
 
 #### `push_to_original_query_queue(query: str, partition_key: str = "partition_key", partition_datatype: str | None = None, queue_provider: str | None = None)`
-Add original queries to the original query queue:
+Add original queries to the original query queue (uses Strategy 1):
 
 ```python
 import partitioncache
 
-# Add query with custom partition key
+# Add query with custom partition key (duplicates ignored)
 partitioncache.push_to_original_query_queue(
     query="SELECT * FROM users WHERE age > 25",
     partition_key="user_id",

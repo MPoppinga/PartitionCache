@@ -73,8 +73,8 @@ def test_set_cache(cache_handler):
             return "".join(str(b) for b in self.bits)
 
     with patch("partitioncache.cache_handler.postgresql_bit.bitarray", FakeBitArray):
-        cache_handler._get_partition_datatype = lambda pk: "integer"
-        cache_handler._get_partition_bitsize = lambda pk: 100
+        # Mock the new behavior: fetchone() should return a tuple with bitsize
+        cache_handler.cursor.fetchone.return_value = (100,)  # Return bitsize as tuple
         cache_handler.cursor.execute.reset_mock()
         cache_handler.db.commit.reset_mock()
         cache_handler.set_cache("key1", {1, 2, 3})

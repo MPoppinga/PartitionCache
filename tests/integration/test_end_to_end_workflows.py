@@ -35,6 +35,79 @@ def _compare_cache_values(retrieved, expected):
     return retrieved == expected
 
 
+def _extract_partition_values_from_query(query, partition_key="zipcode"):
+    """
+    Helper function to extract partition values from SQL queries for testing.
+
+    This is a test-specific helper that identifies common test patterns.
+    For production use, actual query execution should be used instead.
+
+    Args:
+        query: SQL query string
+        partition_key: The partition key column name
+
+    Returns:
+        set: Set of partition values that the query likely targets
+    """
+    # Known test data values for different partition keys
+    test_data_ranges = {
+        "zipcode": {1001, 1002, 90210, 10001, 20001},
+        "region": {"northeast", "west", "southeast"},
+        "store_id": {100, 200, 300, 400, 500, 700, 800}
+    }
+
+    available_values = test_data_ranges.get(partition_key, set())
+    query_upper = query.upper()
+
+    # Extract values mentioned in the query
+    extracted_values = set()
+
+    # For zipcode queries, look for numeric values in typical zipcode range
+    if partition_key == "zipcode":
+        import re
+        # Look for numbers that could be zipcodes
+        numbers = re.findall(r'\b(\d{4,5})\b', query)
+        for num_str in numbers:
+            num = int(num_str)
+            if num in available_values:
+                extracted_values.add(num)
+
+        # Handle BETWEEN clauses
+        between_match = re.search(r'BETWEEN\s+(\d+)\s+AND\s+(\d+)', query_upper)
+        if between_match:
+            lower = int(between_match.group(1))
+            upper = int(between_match.group(2))
+            # Add any test values that fall in this range
+            extracted_values.update(val for val in available_values if lower <= val <= upper)
+
+    # For text-based partition keys like region
+    elif partition_key == "region":
+        # Look for quoted strings that match our test regions
+        import re
+        quoted_strings = re.findall(r"'([^']+)'", query)
+        quoted_strings.extend(re.findall(r'"([^"]+)"', query))
+
+        for string_val in quoted_strings:
+            if string_val in available_values:
+                extracted_values.add(string_val)
+
+    # For numeric IDs like store_id
+    elif partition_key == "store_id":
+        import re
+        numbers = re.findall(r'\b(\d+)\b', query)
+        for num_str in numbers:
+            num = int(num_str)
+            if num in available_values:
+                extracted_values.add(num)
+
+    # Fallback: if no specific values found, return a reasonable default
+    if not extracted_values and available_values:
+        # Return a small subset for testing
+        extracted_values = set(list(available_values)[:2])
+
+    return extracted_values
+
+
 @pytest.fixture
 def e2e_cache_client(db_session):
     """
@@ -103,38 +176,26 @@ class TestEndToEndWorkflows:
                 cur.execute(query)
                 query_results = cur.fetchall()
 
-                # Extract zipcodes from results (assuming zipcode is first column or present)
-                if "zipcode" in query.lower():
-                    # For zipcode queries, extract zipcode values
+                # Extract partition values using helper function
+                if partition_key in query.lower():
+                    # Try to extract from actual results first
                     partition_values = set()
                     for row in query_results:
-                        # Find zipcode value in row (adapt based on query structure)
-                        if "COUNT" in query.upper():
-                            # Count queries don't return zipcode directly
-                            # Use known values that would match the query
-                            if "1001" in query and "1002" in query:
-                                partition_values.update({1001, 1002})
-                            elif "BETWEEN" in query.upper():
-                                partition_values.update({1001, 1002})  # Known values in range
-                            elif "1001" in query:
-                                partition_values.add(1001)
-                        else:
-                            # For regular queries, zipcode might be in first column
+                        # For non-COUNT queries, try to find partition values in results
+                        if "COUNT" not in query.upper():
                             try:
-                                zipcode = row[0] if isinstance(row[0], int) else None
-                                if zipcode and 1000 <= zipcode <= 99999:  # Valid zipcode range
-                                    partition_values.add(zipcode)
+                                # Look for partition values in any column
+                                for value in row:
+                                    if partition_key == "zipcode" and isinstance(value, int) and 1000 <= value <= 99999:
+                                        partition_values.add(value)
+                                    elif partition_key == "region" and isinstance(value, str):
+                                        partition_values.add(value)
                             except (IndexError, TypeError):
                                 pass
 
                     # If we couldn't extract from results, use query analysis
                     if not partition_values:
-                        if "1001" in query:
-                            partition_values.add(1001)
-                        if "1002" in query:
-                            partition_values.add(1002)
-                        if "BETWEEN 1000 AND 2000" in query.upper():
-                            partition_values.update({1001, 1002})
+                        partition_values = _extract_partition_values_from_query(query, partition_key)
 
             # Populate cache with discovered partition values
             for hash_key in hashes:
@@ -251,25 +312,8 @@ class TestEndToEndWorkflows:
 
                 hashes = generate_all_hashes(query, partition_key)
 
-                # Determine partition values based on query and partition type
-                if partition_key == "zipcode":
-                    if "1001" in query and "1002" in query:
-                        partition_values = {1001, 1002}
-                    elif "1001" in query:
-                        partition_values = {1001}
-                    elif "1002" in query:
-                        partition_values = {1002}
-                    else:
-                        partition_values = {1001}  # Default
-                else:  # region
-                    if "northeast" in query and "west" in query:
-                        partition_values = {"northeast", "west"}
-                    elif "northeast" in query:
-                        partition_values = {"northeast"}
-                    elif "west" in query:
-                        partition_values = {"west"}
-                    else:
-                        partition_values = {"northeast"}  # Default
+                # Determine partition values using helper function
+                partition_values = _extract_partition_values_from_query(query, partition_key)
 
                 # Populate cache
                 for hash_key in hashes:
@@ -295,9 +339,6 @@ class TestEndToEndWorkflows:
 
     def test_queue_to_cache_workflow(self, db_session, e2e_cache_client):
         """Test complete workflow from queue processing to cache application."""
-
-        # Backend name for diagnostics
-        getattr(e2e_cache_client, "__class__", type(e2e_cache_client)).__name__.lower()
 
         from partitioncache.queue import clear_all_queues, push_to_original_query_queue
 
@@ -353,10 +394,7 @@ class TestEndToEndWorkflows:
 
                 # If no values extracted, use query-based extraction
                 if not partition_values:
-                    if "1001" in query:
-                        partition_values.add(1001)
-                    if "BETWEEN 1000 AND 1500" in query.upper():
-                        partition_values.update({1001, 1002})
+                    partition_values = _extract_partition_values_from_query(query, partition_key)
 
             # Populate cache (simulate queue processor cache population)
             for hash_key in hashes:
@@ -428,18 +466,43 @@ class TestEndToEndWorkflows:
                 timeout=120,
             )
 
-            # May succeed or fail with configuration issues
+            # CLI add should succeed or fail with specific known issues
             if add_result.returncode != 0:
-                # Check if it's a configuration issue
-                assert any(keyword in add_result.stderr.lower() for keyword in ["configuration", "connection", "setup"])
+                # Be more specific about expected error conditions
+                error_output = (add_result.stdout + add_result.stderr).lower()
+
+                # Expected issues in test environment
+                expected_errors = [
+                    "no such table",  # Test data not set up
+                    "permission denied",  # Database permissions
+                    "connection refused",  # Database not available
+                    "database does not exist",  # Test DB setup issue
+                    "role does not exist",  # User setup issue
+                ]
+
+                has_expected_error = any(err in error_output for err in expected_errors)
+                if not has_expected_error:
+                    pytest.fail(f"CLI command failed with unexpected error: {add_result.stderr}")
 
             # Step 3: Check cache status via CLI
             count_result = subprocess.run(
                 ["python", "-m", "partitioncache.cli.manage_cache", "cache", "count"], capture_output=True, text=True, env=env, timeout=60
             )
 
-            # Should provide some information about cache status
-            assert count_result.returncode == 0 or "configuration" in count_result.stderr.lower()
+            # Should provide cache status information or fail with known issues
+            if count_result.returncode != 0:
+                error_output = (count_result.stdout + count_result.stderr).lower()
+                expected_errors = [
+                    "no such table",  # Cache tables not set up
+                    "permission denied",  # Database permissions
+                    "connection refused",  # Database not available
+                    "database does not exist",  # Test DB setup issue
+                    "role does not exist",  # User setup issue
+                ]
+
+                has_expected_error = any(err in error_output for err in expected_errors)
+                if not has_expected_error:
+                    pytest.fail(f"Cache count command failed with unexpected error: {count_result.stderr}")
 
             if count_result.returncode == 0:
                 # Should contain numerical information or cache statistics (check both stdout and stderr)

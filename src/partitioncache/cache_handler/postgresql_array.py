@@ -75,7 +75,7 @@ class PostgreSQLArrayCacheHandler(PostgreSQLAbstractCacheHandler):
                 logger.error(f"Failed to rollback transaction during table creation: {rollback_error}")
             raise
 
-    def _ensure_partition_table(self, partition_key: str, datatype: str, **kwargs) -> bool:
+    def _ensure_partition_table(self, partition_key: str, datatype: str, **kwargs):
         """Ensure a partition table exists with the correct datatype using SQL bootstrap function."""
         try:
             # Load SQL functions first to ensure they're available

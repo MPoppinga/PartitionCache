@@ -7,7 +7,6 @@ import os
 from logging import getLogger
 
 import partitioncache
-from partitioncache.cache_handler.helper import create_partitioncache_helper
 from partitioncache.cli.common_args import (
     add_cache_args,
     add_database_args,
@@ -135,12 +134,12 @@ def main():
             cache_handler = partitioncache.get_cache_handler(cache_backend, singleton=True)
             kwargs = {}
             if hasattr(cache_handler, '_get_partition_bitsize'):
-                existing_bitsize = cache_handler._get_partition_bitsize(args.partition_key)
+                existing_bitsize = cache_handler._get_partition_bitsize(args.partition_key) # type: ignore[attr-defined]
                 if args.bitsize is not None:
                     kwargs['bitsize'] = args.bitsize
                     if existing_bitsize is not None and existing_bitsize != args.bitsize:
                         logger.info(f"Updating bitsize from {existing_bitsize} to {args.bitsize} for partition '{args.partition_key}'")
-                        cache_handler._set_partition_bitsize(args.partition_key, args.bitsize)
+                        cache_handler._set_partition_bitsize(args.partition_key, args.bitsize) # type: ignore[attr-defined]
                 elif existing_bitsize is not None:
                     kwargs['bitsize'] = existing_bitsize
             elif hasattr(args, 'bitsize') and args.bitsize is not None:

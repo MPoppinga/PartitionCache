@@ -338,7 +338,7 @@ class TestDatabaseOperations:
         mock_conn.cursor.return_value.__exit__ = Mock(return_value=None)
 
         # Test inserting configuration
-        insert_initial_config(mock_conn, "partitioncache_process_queue", "partitioncache", "partitioncache_queue", "array", 1, True, 1800, "test_database")
+        insert_initial_config(mock_conn, "partitioncache_process_queue", "partitioncache", "partitioncache_queue", "array", 1, True, 1800, "test_database", None)
 
         # Should execute INSERT statement
         assert mock_cursor.execute.call_count == 1

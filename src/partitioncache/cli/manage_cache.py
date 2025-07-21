@@ -570,17 +570,17 @@ def restore_cache(cache_type: str, archive_file: str, target_partition_key: str 
 
                                 # Handle bitsize for bit cache handlers
                                 kwargs = {}
-                                if hasattr(cache.underlying_handler, '_get_partition_bitsize'):
-                                    existing_bitsize = cache.underlying_handler._get_partition_bitsize(effective_partition_key)
-                                    if hasattr(args, 'bitsize') and args.bitsize is not None:
-                                        kwargs['bitsize'] = args.bitsize
-                                        if existing_bitsize is not None and existing_bitsize != args.bitsize:
-                                            logger.info(f"Updating bitsize from {existing_bitsize} to {args.bitsize} for partition '{effective_partition_key}'")
-                                            cache.underlying_handler._set_partition_bitsize(effective_partition_key, args.bitsize)
+                                if hasattr(cache, '_get_partition_bitsize'):
+                                    existing_bitsize = cache._get_partition_bitsize(effective_partition_key)
+                                    if bitsize is not None:
+                                        kwargs['bitsize'] = bitsize
+                                        if existing_bitsize is not None and existing_bitsize != bitsize:
+                                            logger.info(f"Updating bitsize from {existing_bitsize} to {bitsize} for partition '{effective_partition_key}'")
+                                            cache._set_partition_bitsize(effective_partition_key, bitsize)
                                     elif existing_bitsize is not None:
                                         kwargs['bitsize'] = existing_bitsize
-                                elif hasattr(args, 'bitsize') and args.bitsize is not None:
-                                    kwargs['bitsize'] = args.bitsize
+                                elif bitsize is not None:
+                                    kwargs['bitsize'] = bitsize
                                 cache.register_partition_key(effective_partition_key, datatype, **kwargs)
                                 partitions_registered += 1
                                 logger.info(f"Auto-registered partition '{effective_partition_key}' with datatype '{datatype}'")

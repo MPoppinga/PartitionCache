@@ -136,10 +136,19 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
 
         self.db.commit()
 
-    def _ensure_partition_table(self, partition_key: str, datatype: str, **kwargs) -> bool:
-        """Ensure a partition table exists using SQL bootstrap function."""
+    def _ensure_partition_table(self, partition_key: str, datatype: str, **kwargs) -> tuple[bool, int]:
+        """Ensure a partition table exists using SQL bootstrap function with proper concurrency control.
+
+        Returns:
+            tuple: (success, actual_bitsize) - The actual bitsize that was set/retrieved
+        """
         bitsize = kwargs.get("bitsize", self.default_bitsize)
         try:
+            # Use advisory lock to prevent race conditions in schema creation
+            # Generate consistent lock ID from partition key
+            lock_id = hash(f"{self.tableprefix}_{partition_key}") % (2**31 - 1)
+            self.cursor.execute("SELECT pg_advisory_xact_lock(%s)", (lock_id,))
+
             # Load SQL functions first to ensure they're available
             self._load_sql_functions()
 
@@ -149,14 +158,28 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
                 (self.tableprefix,)
             )
 
-            # Use SQL bootstrap function to create partition table and metadata entry
+            # Atomically handle bitsize metadata with conflict resolution
+            # Allow bitsize to grow but prevent shrinking (which would break existing data)
+            self.cursor.execute(
+                sql.SQL("INSERT INTO {0} (partition_key, datatype, bitsize) VALUES (%s, %s, %s) "
+                        "ON CONFLICT (partition_key) DO UPDATE SET "
+                        "bitsize = GREATEST({0}.bitsize, EXCLUDED.bitsize) "
+                        "RETURNING bitsize").format(sql.Identifier(self.tableprefix + "_partition_metadata")),
+                (partition_key, datatype, bitsize)
+            )
+            result = self.cursor.fetchone()
+            if result is None:
+                raise ValueError(f"No bitsize found for partition {partition_key}")
+            actual_bitsize = result[0]
+
+            # Create partition table if needed (idempotent operation)
             self.cursor.execute(
                 sql.SQL("SELECT partitioncache_bootstrap_partition(%s, %s, %s, %s, %s)"),
-                (self.tableprefix, partition_key, datatype, "bit", bitsize)
+                (self.tableprefix, partition_key, datatype, "bit", actual_bitsize)
             )
 
             self.db.commit()
-            return True
+            return True, actual_bitsize
         except Exception as e:
             logger.error(f"Failed to ensure partition table for {partition_key}: {e}")
             self.db.rollback()
@@ -171,15 +194,7 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
             return True
 
         try:
-            # Ensure partition table exists
-            self._ensure_partition_table(partition_key, "integer")
-
-            # Get the fixed bitsize from metadata
-            bitsize = self._get_partition_bitsize(partition_key)
-            if bitsize is None:
-                raise ValueError(f"No bitsize found for partition {partition_key}")
-
-            # Convert all keys to integers and validate they fit in bitsize
+            # Convert all keys to integers first
             int_keys = []
             for k in partition_key_identifiers:
                 if isinstance(k, int):
@@ -189,13 +204,19 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
                 else:
                     raise ValueError(f"Only integer values are supported for bit arrays: {k} : {partition_key_identifiers}")
 
-            # Validate all keys fit within the bitsize
+            # Determine required bitsize based on data
             max_value = max(int_keys)
-            if max_value >= bitsize:
-                raise ValueError(f"Partition key {max_value} exceeds bitsize {bitsize} for partition {partition_key}")
+            required_bitsize = max(max_value + 1, self.default_bitsize)  # Ensure at least default size
 
-            # Create fixed-length bitarray
-            val = bitarray(bitsize)
+            # Atomically ensure partition table exists and get actual bitsize
+            _, actual_bitsize = self._ensure_partition_table(partition_key, "integer", bitsize=required_bitsize)
+
+            # Validate all keys fit within the actual bitsize
+            if max_value >= actual_bitsize:
+                raise ValueError(f"Partition key {max_value} exceeds bitsize {actual_bitsize} for partition {partition_key}")
+
+            # Create fixed-length bitarray using actual bitsize
+            val = bitarray(actual_bitsize)
             val.setall(0)
             for k in int_keys:
                 val[k] = 1
@@ -218,12 +239,11 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
             self.db.commit()
             return True
         except Exception as e:
-            logger.error(f"Failed to set partition key identifiers for hash {hash} in partition {partition_key}: {e}")
-            # Rollback the transaction to prevent "current transaction is aborted" error
+            logger.error(f"Failed to set partition key identifiers for hash {key} in partition {partition_key}: {e}")
             try:
                 self.db.rollback()
-            except Exception as rollback_error:
-                logger.error(f"Failed to rollback transaction: {rollback_error}")
+            except Exception:
+                pass  # Ignore rollback errors
             return False
 
     def get(self, key: str, partition_key: str = "partition_key") -> set[int] | None:
@@ -373,4 +393,5 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
             bitsize = kwargs["bitsize"]
         else:
             bitsize = self.default_bitsize
-        self._ensure_partition_table(partition_key, datatype, bitsize=bitsize)
+        # Use the new atomic _ensure_partition_table method (ignore return values)
+        _, _ = self._ensure_partition_table(partition_key, datatype, bitsize=bitsize)

@@ -133,7 +133,7 @@ class PostgreSQLRoaringBitCacheHandler(PostgreSQLAbstractCacheHandler):
                 logger.error(f"Failed to rollback after metadata table creation error: {rollback_error}")
             raise
 
-    def _ensure_partition_table(self, partition_key: str, datatype: str, **kwargs) -> None:
+    def _ensure_partition_table(self, partition_key: str, datatype: str, **kwargs) -> bool:
         """Ensure a partition table exists using SQL bootstrap function."""
         try:
             # Load SQL functions first to ensure they're available
@@ -152,10 +152,11 @@ class PostgreSQLRoaringBitCacheHandler(PostgreSQLAbstractCacheHandler):
             )
 
             self.db.commit()
+            return True
         except Exception as e:
             logger.error(f"Failed to ensure roaringbit partition table for {partition_key}: {e}")
             self.db.rollback()
-            raise
+            return False
 
     def set_cache(
         self,

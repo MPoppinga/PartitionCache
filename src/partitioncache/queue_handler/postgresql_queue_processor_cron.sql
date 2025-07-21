@@ -61,7 +61,7 @@ BEGIN
     END IF;
 
     v_job_base := NEW.job_name;
-    v_target_database := NEW.target_database; -- Use target database from config
+    v_target_database := COALESCE(NEW.target_database, current_database()); -- Use target database from config, fallback to current
     v_timeout_seconds := COALESCE(NEW.timeout_seconds, 1800);
 
     -- Set timeout for the target database session

@@ -749,15 +749,48 @@ def manual_queue_processor(db_session, db_connection, cache_client):
         # Initialize processor tables
         cur.execute("SELECT partitioncache_initialize_cache_processor_tables(%s)", [queue_prefix])
 
-        # Add processor configuration
+        # Create config table if it doesn't exist (needed for tests without pg_cron)
         config_table = f"{queue_prefix}_processor_config"
+        cur.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {config_table} (
+                job_name TEXT PRIMARY KEY,
+                enabled BOOLEAN NOT NULL DEFAULT false,
+                max_parallel_jobs INTEGER NOT NULL DEFAULT 2,
+                frequency_seconds INTEGER NOT NULL DEFAULT 1,
+                timeout_seconds INTEGER NOT NULL DEFAULT 1800,
+                table_prefix TEXT NOT NULL,
+                queue_prefix TEXT NOT NULL,
+                cache_backend TEXT NOT NULL,
+                target_database TEXT NOT NULL,
+                result_limit INTEGER DEFAULT NULL,
+                default_bitsize INTEGER DEFAULT NULL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        
+        # Add default_bitsize column if it doesn't exist (for existing tables)
+        cur.execute(
+            f"""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns 
+                    WHERE table_name = '{config_table}' AND column_name = 'default_bitsize'
+                ) THEN
+                    ALTER TABLE {config_table} ADD COLUMN default_bitsize INTEGER DEFAULT NULL;
+                END IF;
+            END $$;
+            """
+        )
         cur.execute(
             f"""
             INSERT INTO {config_table}
             (job_name, enabled, max_parallel_jobs, frequency_seconds, timeout_seconds,
-             table_prefix, queue_prefix, cache_backend, target_database)
+             table_prefix, queue_prefix, cache_backend, target_database, default_bitsize)
             VALUES ('partitioncache_process_queue', true, 1, 60, 30,
-                    %s, %s, 'array', %s)
+                    %s, %s, 'array', %s, NULL)
             ON CONFLICT (job_name) DO UPDATE
             SET enabled = true, updated_at = NOW()
         """,
@@ -800,17 +833,20 @@ def postgresql_queue_processor(postgresql_queue_functions, db_session, cache_cli
 
         # Add a test configuration for the processor
         config_table = f"{queue_prefix}_processor_config"
+        # Convert full backend names to simplified names for SQL functions
+        simplified_backend = cache_backend.replace("postgresql_", "") if cache_backend.startswith("postgresql_") else cache_backend
+        
         cur.execute(
             f"""
             INSERT INTO {config_table}
             (job_name, enabled, max_parallel_jobs, frequency_seconds, timeout_seconds,
              table_prefix, queue_prefix, cache_backend, target_database)
             VALUES ('partitioncache_process_queue', true, 1, 60, 30,
-                    %s, %s, 'array', %s)
+                    %s, %s, %s, %s)
             ON CONFLICT (job_name) DO UPDATE
-            SET timeout_seconds = 30, enabled = true, updated_at = NOW()
+            SET cache_backend = %s, timeout_seconds = 30, enabled = true, updated_at = NOW()
         """,
-            (table_prefix, queue_prefix, os.getenv("DB_NAME", "partitioncache_integration")),
+            (table_prefix, queue_prefix, simplified_backend, os.getenv("DB_NAME", "partitioncache_integration"), simplified_backend),
         )
         db_session.commit()
 

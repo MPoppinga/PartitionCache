@@ -113,7 +113,7 @@ class TestManageCacheCLI:
         with patch("partitioncache.cli.manage_cache.restore_cache") as mock_restore:
             with patch("sys.argv", ["manage_cache.py", "cache", "import", "--type", "postgresql_array", "--file", "backup.pkl"]):
                 main()
-                mock_restore.assert_called_once_with("postgresql_array", "backup.pkl", None)
+                mock_restore.assert_called_once_with("postgresql_array", "backup.pkl", None, None)
 
     def test_cache_delete_command(self):
         """Test the cache delete command."""
@@ -263,7 +263,7 @@ class TestManageCacheCLI:
             with patch("partitioncache.cli.manage_cache.get_cache_type_from_env", return_value="rocksdb_set"):
                 with patch("sys.argv", ["manage_cache.py", "cache", "import", "--file", "test.pkl"]):
                     main()
-                    mock_restore.assert_called_once_with("rocksdb_set", "test.pkl", None)
+                    mock_restore.assert_called_once_with("rocksdb_set", "test.pkl", None, None)
 
     def test_cache_delete_with_env_backend(self):
         """Test that cache delete uses environment CACHE_BACKEND when --type is omitted."""

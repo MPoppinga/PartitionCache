@@ -30,7 +30,14 @@ class RedisAbstractCacheHandler(AbstractCacheHandler):
         Initialize the cache handler with the given db name.
         This handler supports multiple partition keys but only integer and string datatypes.
         """
-        self.db = redis.Redis(host=db_host, port=db_port, db=db_name, password=db_password)
+        self.db = redis.Redis(
+            host=db_host,
+            port=db_port,
+            db=db_name,
+            password=db_password,
+            socket_connect_timeout=5,  # 5 second connection timeout
+            socket_timeout=5  # 5 second socket timeout
+        )
 
     def _get_partition_datatype(self, partition_key: str) -> str | None:
         """Get the datatype for a partition key from metadata."""
