@@ -244,9 +244,19 @@ BEGIN
                 -- Check if cache table exists
                 IF EXISTS (SELECT 1 FROM information_schema.tables
                           WHERE table_name = v_cache_table AND table_schema = ''public'') THEN
-                    -- ALTER the cache table to use new bitsize
+                    
+                    -- To alter BIT column type, we need to handle the generated column constraint
+                    -- Step 1: Drop the generated column temporarily
+                    EXECUTE format(''ALTER TABLE %%I DROP COLUMN IF EXISTS partition_keys_count'',
+                                 v_cache_table);
+                    
+                    -- Step 2: ALTER the cache table to use new bitsize
                     EXECUTE format(''ALTER TABLE %%I ALTER COLUMN partition_keys TYPE BIT(%%s)'',
                                  v_cache_table, NEW.bitsize);
+                    
+                    -- Step 3: Recreate the generated column
+                    EXECUTE format(''ALTER TABLE %%I ADD COLUMN partition_keys_count INTEGER GENERATED ALWAYS AS (length(replace(partition_keys::text, ''''0'''', ''''''''))) STORED'',
+                                 v_cache_table);
                 END IF;
             END IF;
             

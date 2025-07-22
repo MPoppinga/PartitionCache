@@ -201,8 +201,7 @@ class TestCLIIntegration:
         # Get the backend type from the request parameter
         backend_type = request.node.callspec.params["cache_client"]
 
-        if backend_type.startswith("rocksdb"):
-            pytest.skip(f"CLI tests not compatible with {backend_type} due to file locking")
+        # RocksDB backends are supported for CLI tests in the CI environment
 
         backend_suffix = backend_type.replace("_", "").replace("-", "")
         backend_suffix = backend_type.replace("_", "").replace("-", "")
@@ -284,8 +283,7 @@ class TestCLIIntegration:
         # Get the backend type from the request parameter
         backend_type = request.node.callspec.params["cache_client"]
 
-        if backend_type.startswith("rocksdb"):
-            pytest.skip(f"CLI tests not compatible with {backend_type} due to file locking")
+        # RocksDB backends are supported for CLI tests in the CI environment
 
         backend_suffix = backend_type.replace("_", "").replace("-", "")
         partition_key = f"region_id_{backend_suffix}"
@@ -416,8 +414,7 @@ class TestCLIIntegration:
         # Get the backend type from the request parameter
         backend_type = request.node.callspec.params["cache_client"]
 
-        if backend_type.startswith("rocksdb"):
-            pytest.skip(f"CLI tests not compatible with {backend_type} due to file locking")
+        # RocksDB backends are supported for CLI tests in the CI environment
 
         backend_suffix = backend_type.replace("_", "").replace("-", "")
         backend_suffix = backend_type.replace("_", "").replace("-", "")
