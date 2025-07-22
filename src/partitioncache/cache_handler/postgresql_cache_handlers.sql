@@ -125,9 +125,14 @@ BEGIN
             'UPDATE %I SET bitsize = GREATEST(bitsize, %L) WHERE partition_key = %L',
             v_metadata_table, p_bitsize, p_partition_key
         );
-        RETURN true;
-    ELSIF v_partition_exists THEN
-        RETURN true; -- Already exists, nothing to do for non-bit backends
+        -- Get the actual bitsize that will be used
+        EXECUTE format('SELECT bitsize FROM %I WHERE partition_key = %L', v_metadata_table, p_partition_key)
+        INTO p_bitsize;
+        -- Continue to ensure cache table exists with correct bitsize
+    ELSIF v_partition_exists AND p_cache_backend != 'bit' THEN
+        -- For non-bit backends, if metadata exists, table should exist too
+        -- But we'll verify by continuing (CREATE TABLE IF NOT EXISTS is safe)
+        NULL; -- Continue to table creation
     END IF;
     
     -- Create metadata entry based on cache backend
