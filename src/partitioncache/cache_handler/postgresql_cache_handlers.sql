@@ -118,8 +118,16 @@ BEGIN
     EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I WHERE partition_key = %L)', v_metadata_table, p_partition_key)
     INTO v_partition_exists;
     
-    IF v_partition_exists THEN
-        RETURN true; -- Already exists, nothing to do
+    -- For bit cache, handle bitsize conflicts by allowing growth
+    IF v_partition_exists AND p_cache_backend = 'bit' AND p_bitsize IS NOT NULL THEN
+        -- Update bitsize with GREATEST logic (allow growth, prevent shrinkage)
+        EXECUTE format(
+            'UPDATE %I SET bitsize = GREATEST(bitsize, %L) WHERE partition_key = %L',
+            v_metadata_table, p_bitsize, p_partition_key
+        );
+        RETURN true;
+    ELSIF v_partition_exists THEN
+        RETURN true; -- Already exists, nothing to do for non-bit backends
     END IF;
     
     -- Create metadata entry based on cache backend

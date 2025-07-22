@@ -158,25 +158,17 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
                 (self.tableprefix,)
             )
 
-            # Atomically handle bitsize metadata with conflict resolution
-            # Allow bitsize to grow but prevent shrinking (which would break existing data)
-            self.cursor.execute(
-                sql.SQL("INSERT INTO {0} (partition_key, datatype, bitsize) VALUES (%s, %s, %s) "
-                        "ON CONFLICT (partition_key) DO UPDATE SET "
-                        "bitsize = GREATEST({0}.bitsize, EXCLUDED.bitsize) "
-                        "RETURNING bitsize").format(sql.Identifier(self.tableprefix + "_partition_metadata")),
-                (partition_key, datatype, bitsize)
-            )
-            result = self.cursor.fetchone()
-            if result is None:
-                raise ValueError(f"No bitsize found for partition {partition_key}")
-            actual_bitsize = result[0]
-
-            # Create partition table if needed (idempotent operation)
+            # Use SQL bootstrap function to create partition table and metadata entry
+            # Let the bootstrap function handle metadata creation atomically
             self.cursor.execute(
                 sql.SQL("SELECT partitioncache_bootstrap_partition(%s, %s, %s, %s, %s)"),
-                (self.tableprefix, partition_key, datatype, "bit", actual_bitsize)
+                (self.tableprefix, partition_key, datatype, "bit", bitsize)
             )
+
+            # Get the actual bitsize that was set (for validation)
+            actual_bitsize = self._get_partition_bitsize(partition_key)
+            if actual_bitsize is None:
+                raise ValueError(f"No bitsize found for partition {partition_key} after bootstrap")
 
             self.db.commit()
             return True, actual_bitsize
