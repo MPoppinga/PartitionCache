@@ -8,7 +8,7 @@ from partitioncache.queue import get_queue_lengths, push_to_original_query_queue
 class TestQueueProcessor:
     """
     Test suite for queue processor functionality.
-    Tests the asynchronous processing pipeline from original query queue 
+    Tests the asynchronous processing pipeline from original query queue
     to query fragment queue processing.
     """
 
@@ -62,8 +62,8 @@ class TestQueueProcessor:
                 # Verify queue tables exist in database
                 with db_session.cursor() as cur:
                     cur.execute("""
-                        SELECT tablename FROM pg_tables 
-                        WHERE tablename LIKE '%queue%' 
+                        SELECT tablename FROM pg_tables
+                        WHERE tablename LIKE '%queue%'
                         AND schemaname = 'public';
                     """)
                     tables = cur.fetchall()
@@ -86,9 +86,9 @@ class TestQueueProcessor:
     def test_schedule_and_execute_task(self, db_session, wait_for_cron):
         """
         Test PostgreSQL pg_cron job scheduling and execution (PostgreSQL only).
-        
+
         This test specifically validates PostgreSQL's pg_cron integration:
-        1. Schedule a cron job to run every minute  
+        1. Schedule a cron job to run every minute
         2. Wait for execution (reduced to ~10 seconds for faster testing)
         3. Verify job execution and side effects
         """
@@ -119,7 +119,7 @@ class TestQueueProcessor:
         # Schedule a simple test job that inserts a record - run every 10 seconds for faster testing
         test_jobname = f"test_job_{int(time.time())}"
         test_command = f"""
-            INSERT INTO test_cron_results (message) 
+            INSERT INTO test_cron_results (message)
             VALUES ('Test executed at {test_jobname}');
         """
 
@@ -131,8 +131,8 @@ class TestQueueProcessor:
 
             # Verify job was scheduled
             cur.execute("""
-                SELECT jobname, command, active 
-                FROM cron.job 
+                SELECT jobname, command, active
+                FROM cron.job
                 WHERE jobname = %s;
             """, (test_jobname,))
 
@@ -147,8 +147,8 @@ class TestQueueProcessor:
         with db_session.cursor() as cur:
             # Check if our test record was inserted (this proves the job executed)
             cur.execute("""
-                SELECT message, created_at 
-                FROM test_cron_results 
+                SELECT message, created_at
+                FROM test_cron_results
                 WHERE message LIKE %s
                 ORDER BY created_at DESC
                 LIMIT 1;
@@ -162,7 +162,7 @@ class TestQueueProcessor:
                     # Try to get execution info from pg_cron (schema may vary by version)
                     cur.execute("""
                         SELECT jobid, runid, return_message, status
-                        FROM cron.job_run_details 
+                        FROM cron.job_run_details
                         ORDER BY start_time DESC
                         LIMIT 5;
                     """)
@@ -182,8 +182,8 @@ class TestQueueProcessor:
                 # Re-check for the result record after additional time
                 time.sleep(2)
                 cur.execute("""
-                    SELECT message, created_at 
-                    FROM test_cron_results 
+                    SELECT message, created_at
+                    FROM test_cron_results
                     WHERE message LIKE %s
                     ORDER BY created_at DESC
                     LIMIT 1;
@@ -253,8 +253,8 @@ class TestQueueProcessor:
 
             # Verify job was scheduled
             cur.execute("""
-                SELECT jobname, command, active 
-                FROM cron.job 
+                SELECT jobname, command, active
+                FROM cron.job
                 WHERE jobname = %s;
             """, (test_jobname,))
 
@@ -343,7 +343,7 @@ class TestQueueProcessor:
         first_hash = list(hashes)[0]
 
         # Test cache population with single hash
-        cache_client.set_set(first_hash, actual_zipcodes, partition_key)
+        cache_client.set_cache(first_hash, actual_zipcodes, partition_key)
 
         # Verify cache was populated
         cached_values = cache_client.get(first_hash, partition_key)
@@ -363,12 +363,12 @@ class TestQueueProcessor:
     def test_concurrent_queue_processing_simulation(self, db_session, cache_client):
         """
         Test concurrent queue processing simulation for non-PostgreSQL providers.
-        
+
         For Redis and other queue providers, demonstrates the pattern where:
         1. Queries are added to the queue
         2. A separate process would consume and process them
         3. Results are stored in cache
-        
+
         This simulates what would happen with proper concurrent processing.
         """
         from partitioncache.queue import clear_all_queues, get_queue_provider_name, pop_from_original_query_queue, reset_queue_handler
@@ -406,7 +406,7 @@ class TestQueueProcessor:
         processed_queries = []
         max_attempts = len(test_queries) + 2  # Safety limit
 
-        for attempt in range(max_attempts):
+        for _attempt in range(max_attempts):
             # Non-blocking pop to simulate worker processing
             result = pop_from_original_query_queue()
             if result is None:
@@ -423,7 +423,7 @@ class TestQueueProcessor:
                 # Simulate cache population with dummy data
                 first_hash = list(hashes)[0]
                 test_values = {1001, 1002}  # Dummy partition values
-                cache_client.set_set(first_hash, test_values, partition_key_from_queue)
+                cache_client.set_cache(first_hash, test_values, partition_key_from_queue)
 
                 # Verify cache was populated
                 cached_values = cache_client.get(first_hash, partition_key_from_queue)

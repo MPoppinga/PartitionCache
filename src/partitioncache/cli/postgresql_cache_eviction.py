@@ -23,15 +23,15 @@ Usage Examples:
 """
 
 import argparse
-import logging
 import os
 import sys
 from logging import getLogger
 from pathlib import Path
 
-import dotenv
 import psycopg
 from psycopg import sql
+
+from partitioncache.cli.common_args import add_environment_args, add_verbosity_args, configure_logging, load_environment_with_validation
 
 logger = getLogger("PartitionCache.PostgreSQLCacheEviction")
 
@@ -338,9 +338,11 @@ def manual_run(conn, table_prefix):
 
 def main():
     """Main function to handle CLI commands."""
+
     parser = argparse.ArgumentParser(description="Manage PostgreSQL cache eviction for PartitionCache.", formatter_class=argparse.RawTextHelpFormatter)
 
-    parser.add_argument("--env", default=".env", help="Path to the .env file to load.")
+    add_environment_args(parser)
+    add_verbosity_args(parser)
     # Table prefix is required for most commands
     parser.add_argument("--table-prefix", help="Table prefix for cache tables (e.g., 'my_cache'). Can also be set via env vars.")
 
@@ -380,8 +382,11 @@ def main():
 
     args = parser.parse_args()
 
-    # Load .env file
-    dotenv.load_dotenv(dotenv_path=args.env)
+    # Configure logging based on verbosity
+    configure_logging(args)
+
+    # Load environment variables
+    load_environment_with_validation(args.env_file)
 
     # Only validate environment for actual commands, not help
     is_valid, message = validate_environment()

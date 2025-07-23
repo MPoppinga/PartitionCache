@@ -139,7 +139,7 @@ class TestEndToEndWorkflows:
             # Populate cache with discovered partition values
             for hash_key in hashes:
                 if partition_values:
-                    e2e_cache_client.set_set(hash_key, partition_values, partition_key)
+                    e2e_cache_client.set_cache(hash_key, partition_values, partition_key)
 
             # Step 3: Test cache application
             cached_partition_keys, num_subqueries, num_hits = partitioncache.get_partition_keys(
@@ -273,7 +273,7 @@ class TestEndToEndWorkflows:
 
                 # Populate cache
                 for hash_key in hashes:
-                    e2e_cache_client.set_set(hash_key, partition_values, partition_key)
+                    e2e_cache_client.set_cache(hash_key, partition_values, partition_key)
 
                 # Test cache retrieval
                 cached_keys, _, hits = partitioncache.get_partition_keys(
@@ -297,7 +297,7 @@ class TestEndToEndWorkflows:
         """Test complete workflow from queue processing to cache application."""
 
         # Backend name for diagnostics
-        backend_name = getattr(e2e_cache_client, "__class__", type(e2e_cache_client)).__name__.lower()
+        getattr(e2e_cache_client, "__class__", type(e2e_cache_client)).__name__.lower()
 
         from partitioncache.queue import clear_all_queues, push_to_original_query_queue
 
@@ -361,7 +361,7 @@ class TestEndToEndWorkflows:
             # Populate cache (simulate queue processor cache population)
             for hash_key in hashes:
                 if partition_values:
-                    e2e_cache_client.set_set(hash_key, partition_values, partition_key)
+                    e2e_cache_client.set_cache(hash_key, partition_values, partition_key)
 
         # Step 3: Test cache application for new queries
         test_query = "SELECT population FROM test_locations WHERE zipcode = 1001;"
@@ -465,9 +465,9 @@ class TestEndToEndWorkflows:
             (
                 "complex",
                 """
-                SELECT l1.name, l1.population 
-                FROM test_locations l1 
-                JOIN test_locations l2 ON l1.region = l2.region 
+                SELECT l1.name, l1.population
+                FROM test_locations l1
+                JOIN test_locations l2 ON l1.region = l2.region
                 WHERE l1.zipcode = 1001;
             """,
             ),
@@ -493,7 +493,7 @@ class TestEndToEndWorkflows:
             # Use test data partition values
             test_partition_values = {1001, 1002, 90210}
             for hash_key in hashes:
-                e2e_cache_client.set_set(hash_key, test_partition_values, partition_key)
+                e2e_cache_client.set_cache(hash_key, test_partition_values, partition_key)
 
             # Measure cache-enabled performance
             start_time = time.time()
@@ -594,7 +594,7 @@ class TestEndToEndWorkflows:
             # Use expected results as cache data
             for hash_key in hashes:
                 if expected_results[i]:
-                    e2e_cache_client.set_set(hash_key, expected_results[i], partition_key)
+                    e2e_cache_client.set_cache(hash_key, expected_results[i], partition_key)
 
             # Retrieve from cache
             cached_keys, _, hits = partitioncache.get_partition_keys(

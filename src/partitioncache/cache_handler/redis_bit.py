@@ -77,27 +77,6 @@ class RedisBitCacheHandler(RedisAbstractCacheHandler):
         bitval = bitarray(value.decode())  # type: ignore
         return set(bitval.search(bitarray("1")))
 
-    def filter_existing_keys(self, keys: set, partition_key: str = "partition_key") -> set:
-        """
-        Checks in Redis which of the keys exists in cache and returns the set of existing keys.
-        """
-        # Check if partition exists
-        datatype = self._get_partition_datatype(partition_key)
-        if datatype is None:
-            return set()
-
-        pipe = self.db.pipeline()
-        cache_keys = [self._get_cache_key(key, partition_key) for key in keys]
-        for cache_key in cache_keys:
-            pipe.type(cache_key)
-        key_types = pipe.execute()
-
-        existing_keys = set()
-        for key, key_type in zip(keys, key_types, strict=False):
-            if key_type == b"string":
-                existing_keys.add(key)
-        return existing_keys
-
     def get_intersected(self, keys: set[str], partition_key: str = "partition_key") -> tuple[set[int] | set[str] | set[float] | set[datetime] | None, int]:
         """
         Returns the intersection of all sets in the cache that are associated with the given keys.
@@ -131,9 +110,9 @@ class RedisBitCacheHandler(RedisAbstractCacheHandler):
             self.db.delete(temp_key)
             return set(bitval.search(bitarray("1"))), valid_keys_count
 
-    def set_set(self, key: str, value: set[int] | set[str] | set[float] | set[datetime], partition_key: str = "partition_key") -> bool:
-        """Store a set in the cache for a specific partition key. Only integer values are supported."""
-        if not value:
+    def set_cache(self, key: str, partition_key_identifiers: set[int] | set[str] | set[float] | set[datetime], partition_key: str = "partition_key") -> bool:
+        """Store a set of partition key identifiers in the cache for a specific partition key. Only integer values are supported."""
+        if not partition_key_identifiers:
             return True
         # Ensure partition exists with correct datatype and bitsize
         self._ensure_partition_exists(partition_key)
@@ -144,7 +123,7 @@ class RedisBitCacheHandler(RedisAbstractCacheHandler):
             self._set_partition_metadata(partition_key, "integer", bitsize)
         val = bitarray(bitsize)
         try:
-            for k in value:
+            for k in partition_key_identifiers:
                 if isinstance(k, int):
                     val[k] = 1
                 elif isinstance(k, str):
@@ -152,13 +131,13 @@ class RedisBitCacheHandler(RedisAbstractCacheHandler):
                 else:
                     raise ValueError("Only integer values are supported")
         except (IndexError, ValueError):
-            raise ValueError(f"Value {value} is out of range for bitarray of size {bitsize}") from None
+            raise ValueError(f"Partition key identifiers {partition_key_identifiers} is out of range for bitarray of size {bitsize}") from None
         try:
             cache_key = self._get_cache_key(key, partition_key)
             self.db.set(cache_key, val.to01())
             return True
         except Exception as e:
-            logger.error(f"Failed to set value for key {key} in partition {partition_key}: {e}")
+            logger.error(f"Failed to set partition key identifiers for hash {key} in partition {partition_key}: {e}")
             return False
 
     def register_partition_key(self, partition_key: str, datatype: str, **kwargs) -> None:

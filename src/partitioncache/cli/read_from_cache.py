@@ -4,7 +4,7 @@ CLI tool to read partition keys from the cache for a given query.
 
 import argparse
 import sys
-from logging import WARNING, getLogger
+from logging import getLogger
 
 import partitioncache
 from partitioncache.cli.common_args import (
@@ -65,9 +65,9 @@ def main(file=sys.stdout):
         )
 
         # Log cache hit statistics
-        logger.info(f"Found {num_subqueries} subqueries")
-        logger.info(f"Cache hits: {num_hits}")
-        logger.info(f"Partition keys: {partition_keys}")
+        logger.debug(f"Found {num_subqueries} subqueries")
+        logger.debug(f"Cache hits: {num_hits}")
+        logger.debug(f"Partition keys: {partition_keys}")
 
         if partition_keys is None:
             logger.warning("No partition keys found in cache")

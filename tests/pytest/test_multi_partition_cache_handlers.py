@@ -39,7 +39,7 @@ class TestMultiPartitionFunctionality:
             ]
 
             # Test storing different datatypes in different partitions
-            handler.set_set("key1", {1, 2, 3}, partition_key="partition1")
+            handler.set_cache("key1", {1, 2, 3}, partition_key="partition1")
             # Note: PostgreSQL array handler currently only supports integer settype
 
             # Verify separate table creation
@@ -68,12 +68,12 @@ class TestMultiPartitionFunctionality:
             mock_cursor.fetchone.return_value = ("integer",)
 
             # First call should work
-            handler.set_set("key1", {1, 2, 3}, partition_key="test_partition")
+            handler.set_cache("key1", {1, 2, 3}, partition_key="test_partition")
 
             # Second call with different datatype should fail
             # Note: This test would need to be adapted based on actual handler support
             # For now, testing with same type but different data
-            handler.set_set("key2", {4, 5, 6}, partition_key="test_partition")
+            handler.set_cache("key2", {4, 5, 6}, partition_key="test_partition")
 
     def test_variable_bitsize_postgresql_bit(self):
         """Test variable bitsize per partition in PostgreSQL bit handler."""
@@ -149,8 +149,8 @@ class TestMultiPartitionFunctionality:
             ]
 
             # Should get different data for different partitions
-            result1 = handler.get("same_key", partition_key="partition1")
-            result2 = handler.get("same_key", partition_key="partition2")
+            handler.get("same_key", partition_key="partition1")
+            handler.get("same_key", partition_key="partition2")
 
             # Verify separate table queries were made
             select_calls = [call for call in mock_cursor.execute.call_args_list
@@ -173,7 +173,7 @@ class TestMultiPartitionFunctionality:
             mock_db.type.return_value = b"set"
             mock_db.smembers.return_value = {b"1", b"2", b"3"}
 
-            result = handler.get("test_key", partition_key="test_partition")
+            handler.get("test_key", partition_key="test_partition")
 
             # Verify namespaced key was used
             expected_metadata_key = '_partition_metadata:test_partition'
@@ -184,7 +184,7 @@ class TestMultiPartitionFunctionality:
         """Test that all cache handlers properly support partition_key parameter."""
 
         # All handler classes should have partition_key parameters
-        handler_methods = ['get', 'set_set', 'exists', 'delete', 'get_all_keys']
+        handler_methods = ['get', 'set_cache', 'exists', 'delete', 'get_all_keys']
 
         # Test one handler as representative
         with patch("psycopg.connect"):
@@ -220,12 +220,12 @@ class TestMultiPartitionFunctionality:
             handler.cursor = mock_cursor
             handler.db = mock_db
 
-            for datatype, settype, test_data in test_cases:
+            for datatype, _settype, test_data in test_cases:
                 # Mock partition doesn't exist
                 mock_cursor.fetchone.return_value = None
 
                 # Should work without error
                 try:
-                    handler.set_set(f"key_{datatype}", test_data, partition_key=f"partition_{datatype}")
+                    handler.set_cache(f"key_{datatype}", test_data, partition_key=f"partition_{datatype}")
                 except Exception as e:
                     pytest.fail(f"Failed to set {datatype} data: {e}")

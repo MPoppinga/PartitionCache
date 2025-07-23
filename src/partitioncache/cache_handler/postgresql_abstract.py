@@ -154,9 +154,7 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
     def get_query(self, key: str, partition_key: str = "partition_key") -> str | None:
         """Retrieve the query text associated with the given key."""
         try:
-            query_sql = sql.SQL(
-                "SELECT query FROM {0} WHERE query_hash = %s AND partition_key = %s"
-            ).format(sql.Identifier(self.tableprefix + "_queries"))
+            query_sql = sql.SQL("SELECT query FROM {0} WHERE query_hash = %s AND partition_key = %s").format(sql.Identifier(self.tableprefix + "_queries"))
 
             self.cursor.execute(query_sql, (key, partition_key))
             result = self.cursor.fetchone()
@@ -168,9 +166,9 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
     def get_all_queries(self, partition_key: str) -> list[tuple[str, str]]:
         """Retrieve all query hash and text pairs for a specific partition."""
         try:
-            query_sql = sql.SQL(
-                "SELECT query_hash, query FROM {0} WHERE partition_key = %s ORDER BY last_seen DESC"
-            ).format(sql.Identifier(self.tableprefix + "_queries"))
+            query_sql = sql.SQL("SELECT query_hash, query FROM {0} WHERE partition_key = %s ORDER BY last_seen DESC").format(
+                sql.Identifier(self.tableprefix + "_queries")
+            )
 
             self.cursor.execute(query_sql, (partition_key,))
             return self.cursor.fetchall()
@@ -229,17 +227,26 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
             return True
         return False
 
-    def exists(self, key: str, partition_key: str = "partition_key") -> bool:
-        """Check if key exists in partition-specific cache."""
+    def exists(self, key: str, partition_key: str = "partition_key", check_query: bool = False) -> bool:
+        """Check if hash exists in partition-specific cache and optionally validate query status."""
         try:
             datatype = self._get_partition_datatype(partition_key)
             if datatype is None:
                 return False
 
-            table_name = f"{self.tableprefix}_cache_{partition_key}"
-            self.cursor.execute(sql.SQL("SELECT 1 FROM {0} WHERE query_hash = %s").format(sql.Identifier(table_name)), (key,))
-            result = self.cursor.fetchone()
-            return result is not None
+            if not check_query:
+                # Fast mode: Check cache table existence only
+                return self._check_cache_exists(key, partition_key)
+            else:
+                # Query mode: Check query metadata first
+                query_status = self.get_query_status(key, partition_key)
+                if query_status is None:
+                    return False  # No query -> False
+                elif query_status == "ok":
+                    # Query OK -> also check cache entry exists
+                    return self._check_cache_exists(key, partition_key)
+                else:  # timeout or failed
+                    return True  # Query has error status -> True (no cache check)
         except Exception as e:
             # If table doesn't exist or other error, rollback to prevent transaction abort
             try:
@@ -249,28 +256,71 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
                     return False
                 else:
                     # Other error - log and rollback
-                    logger.error(f"Failed to check existence for key {key} in partition {partition_key}: {e}")
+                    logger.error(f"Failed to check existence for hash {key} in partition {partition_key}: {e}")
                     self.db.rollback()
                     return False
             except Exception:
                 # Rollback failed - return False anyway
                 return False
 
-    def filter_existing_keys(self, keys: set, partition_key: str = "partition_key") -> set:
+    def _check_cache_exists(self, key: str, partition_key: str) -> bool:
+        """Helper method to check if a hash exists in the cache table."""
+        table_name = f"{self.tableprefix}_cache_{partition_key}"
+        self.cursor.execute(
+            sql.SQL("""
+                SELECT 1 FROM {cache_table}
+                WHERE query_hash = %s
+            """).format(cache_table=sql.Identifier(table_name)),
+            (key,),
+        )
+        result = self.cursor.fetchone()
+        return result is not None
+
+    def filter_existing_keys(self, keys: set, partition_key: str = "partition_key", check_query: bool = False) -> set:
         """Return the set of keys that exist in the partition-specific cache."""
         try:
             datatype = self._get_partition_datatype(partition_key)
             if datatype is None:
                 return set()
 
-            table_name = f"{self.tableprefix}_cache_{partition_key}"
-            self.cursor.execute(
-                sql.SQL("SELECT query_hash FROM {0} WHERE query_hash = ANY(%s) AND partition_keys IS NOT NULL").format(sql.Identifier(table_name)),
-                [list(keys)],
-            )
-            keys_set = {x[0] for x in self.cursor.fetchall()}
-            logger.info(f"Found {len(keys_set)} existing hashkeys for partition {partition_key}")
-            return keys_set
+            if not check_query:
+                # Fast mode: Check cache table existence only
+                table_name = f"{self.tableprefix}_cache_{partition_key}"
+                self.cursor.execute(
+                    sql.SQL("""
+                        SELECT query_hash FROM {cache_table}
+                        WHERE query_hash = ANY(%s) AND partition_keys IS NOT NULL
+                    """).format(cache_table=sql.Identifier(table_name)),
+                    (list(keys),),
+                )
+                keys_set = {x[0] for x in self.cursor.fetchall()}
+                logger.info(f"Found {len(keys_set)} existing hashkeys for partition {partition_key}")
+                return keys_set
+            else:
+                # Query mode: Check each key's query status
+                existing_keys = set()
+                table_name = f"{self.tableprefix}_cache_{partition_key}"
+
+                for key in keys:
+                    query_status = self.get_query_status(key, partition_key)
+                    if query_status is None:
+                        continue  # No query -> exclude key
+                    elif query_status == "ok":
+                        # Query OK -> also check cache entry exists
+                        self.cursor.execute(
+                            sql.SQL("""
+                                SELECT 1 FROM {cache_table}
+                                WHERE query_hash = %s
+                            """).format(cache_table=sql.Identifier(table_name)),
+                            (key,),
+                        )
+                        if self.cursor.fetchone():
+                            existing_keys.add(key)
+                    else:  # timeout or failed
+                        existing_keys.add(key)  # Query has error status -> include key
+
+                logger.info(f"Found {len(existing_keys)} existing hashkeys for partition {partition_key}")
+                return existing_keys
         except Exception as e:
             logger.error(f"Failed to filter existing keys in partition {partition_key}: {e}")
             return set()
@@ -406,8 +456,51 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
             raise ValueError(f"Handler supports only {self.get_supported_datatypes()} datatypes, got: {datatype}")
         self._ensure_partition_table(partition_key, datatype, **kwargs)
 
+    def set_query_status(self, key: str, partition_key: str = "partition_key", status: str = "ok") -> bool:
+        """Set the status of a query in the queries table."""
+        try:
+            # Valid statuses based on the CHECK constraint
+            valid_statuses = {"ok", "timeout", "failed"}
+            if status not in valid_statuses:
+                raise ValueError(f"Invalid status '{status}'. Must be one of: {valid_statuses}")
+
+            query_sql = sql.SQL("UPDATE {0} SET status = %s, last_seen = now() WHERE query_hash = %s AND partition_key = %s").format(
+                sql.Identifier(self.tableprefix + "_queries")
+            )
+
+            self.cursor.execute(query_sql, (status, key, partition_key))
+            rows_affected = self.cursor.rowcount
+
+            if rows_affected == 0:
+                # Query doesn't exist in queries table, try to insert it with the status
+                # This handles cases where set_query_status is called before set_query
+                logger.warning(f"Query {key} not found in queries table, cannot set status to {status}")
+                return False
+
+            self.db.commit()
+            return True
+        except Exception as e:
+            logger.error(f"Failed to set query status for key {key}: {e}")
+            try:
+                self.db.rollback()
+            except Exception as rollback_error:
+                logger.error(f"Failed to rollback transaction: {rollback_error}")
+            return False
+
+    def get_query_status(self, key: str, partition_key: str = "partition_key") -> str | None:
+        """Get the status of a query from the queries table."""
+        try:
+            query_sql = sql.SQL("SELECT status FROM {0} WHERE query_hash = %s AND partition_key = %s").format(sql.Identifier(self.tableprefix + "_queries"))
+
+            self.cursor.execute(query_sql, (key, partition_key))
+            result = self.cursor.fetchone()
+            return result[0] if result else None
+        except Exception as e:
+            logger.debug(f"Failed to get query status for key {key}: {e}")
+            return None
+
     @abstractmethod
-    def _ensure_partition_table(self, partition_key: str, datatype: str, **kwargs) -> None:
+    def _ensure_partition_table(self, partition_key: str, datatype: str, **kwargs) -> bool:
         """Ensure a partition table exists. Must be implemented by subclasses."""
         pass
 

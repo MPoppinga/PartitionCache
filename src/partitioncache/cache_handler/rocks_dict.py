@@ -16,6 +16,7 @@ class RocksDictCacheHandler(AbstractCacheHandler):
 
     _instance = None
     _refcount = 0
+    _current_path = None
 
     @classmethod
     def get_supported_datatypes(cls) -> set[str]:
@@ -73,7 +74,7 @@ class RocksDictCacheHandler(AbstractCacheHandler):
 
         return result
 
-    def exists(self, key: str, partition_key: str = "partition_key") -> bool:
+    def exists(self, key: str, partition_key: str = "partition_key", check_query: bool = False) -> bool:
         """
         Returns True if the key exists in the partition-specific cache, otherwise False.
         """
@@ -82,12 +83,26 @@ class RocksDictCacheHandler(AbstractCacheHandler):
         if datatype is None:
             return False
 
-        cache_key = self._get_cache_key(key, partition_key)
-        return cache_key in self.db
+        if not check_query:
+            # Fast mode: Check cache existence only
+            cache_key = self._get_cache_key(key, partition_key)
+            return cache_key in self.db
+        else:
+            # Query mode: Check query metadata first
+            query_status = self.get_query_status(key, partition_key)
+            if query_status is None:
+                return False  # No query -> False
+            elif query_status == "ok":
+                # Query OK -> also check cache entry exists
+                cache_key = self._get_cache_key(key, partition_key)
+                return cache_key in self.db
+            else:  # timeout or failed
+                return True  # Query has error status -> True (no cache check)
 
-    def filter_existing_keys(self, keys: set, partition_key: str = "partition_key") -> set:
+    def filter_existing_keys(self, keys: set, partition_key: str = "partition_key", check_query: bool = False) -> set:
         """
         Checks in RocksDict which of the keys exists in cache and returns the set of existing keys.
+        For RocksDict, this checks cache existence and optionally query metadata.
         """
         # Check if partition exists
         datatype = self._get_partition_datatype(partition_key)
@@ -96,9 +111,24 @@ class RocksDictCacheHandler(AbstractCacheHandler):
 
         existing_keys = set()
         for key in keys:
-            cache_key = self._get_cache_key(key, partition_key)
-            if cache_key in self.db:
-                existing_keys.add(key)
+            if not check_query:
+                # Fast mode: Check cache existence only
+                cache_key = self._get_cache_key(key, partition_key)
+                if cache_key in self.db:
+                    existing_keys.add(key)
+            else:
+                # Query mode: Check query status first
+                query_status = self.get_query_status(key, partition_key)
+                if query_status is None:
+                    continue  # No query -> exclude key
+                elif query_status == "ok":
+                    # Query OK -> also check cache entry exists
+                    cache_key = self._get_cache_key(key, partition_key)
+                    if cache_key in self.db:
+                        existing_keys.add(key)
+                else:  # timeout or failed
+                    existing_keys.add(key)  # Query has error status -> include key
+
         return existing_keys
 
     def get_intersected(self, keys: set[str], partition_key: str = "partition_key") -> tuple[set[int] | set[str] | set[float] | set[datetime] | None, int]:
@@ -124,9 +154,9 @@ class RocksDictCacheHandler(AbstractCacheHandler):
                 count_match += 1
         return result, count_match
 
-    def set_set(self, key: str, value: set[int] | set[str] | set[float] | set[datetime], partition_key: str = "partition_key") -> bool:
+    def set_cache(self, key: str, partition_key_identifiers: set[int] | set[str] | set[float] | set[datetime], partition_key: str = "partition_key") -> bool:
         """
-        Store a set in the database for a specific partition key. RocksDict will handle serialization.
+        Store a set of partition key identifiers in the database for a specific partition key. RocksDict will handle serialization.
         """
         # Try to get datatype from metadata
         existing_datatype = self._get_partition_datatype(partition_key)
@@ -135,8 +165,8 @@ class RocksDictCacheHandler(AbstractCacheHandler):
                 raise ValueError(f"Unsupported datatype in metadata: {existing_datatype}")
             datatype = existing_datatype
         else:
-            # Infer from value type
-            sample = next(iter(value))
+            # Infer from partition key identifiers type
+            sample = next(iter(partition_key_identifiers))
             if isinstance(sample, int):
                 datatype = "integer"
             elif isinstance(sample, float):
@@ -146,13 +176,13 @@ class RocksDictCacheHandler(AbstractCacheHandler):
             elif isinstance(sample, datetime):
                 datatype = "timestamp"
             else:
-                raise ValueError(f"Unsupported value type: {type(sample)}")
+                raise ValueError(f"Unsupported partition key identifier type: {type(sample)}")
             self._set_partition_datatype(partition_key, datatype)
-        val = value
+        val = partition_key_identifiers
 
         try:
             cache_key = self._get_cache_key(key, partition_key)
-            logger.info(f"saving {len(val)} values in cache {cache_key}")
+            logger.info(f"saving {len(val)} partition key identifiers in cache {cache_key}")
             self.db[cache_key] = val
             return True
         except Exception:
@@ -197,6 +227,15 @@ class RocksDictCacheHandler(AbstractCacheHandler):
             query_key = f"query:{partition_key}:{key}"
             if query_key in self.db:
                 del self.db[query_key]
+
+            # Delete termination bits
+            limit_key = self._get_cache_key(f"_LIMIT_{key}", partition_key)
+            timeout_key = self._get_cache_key(f"_TIMEOUT_{key}", partition_key)
+            if limit_key in self.db:
+                del self.db[limit_key]
+            if timeout_key in self.db:
+                del self.db[timeout_key]
+
             return True
         except Exception:
             return False
@@ -205,7 +244,7 @@ class RocksDictCacheHandler(AbstractCacheHandler):
         """Store a query in the cache associated with the given key."""
         try:
             query_key = f"query:{partition_key}:{key}"
-            query_data = {"query": querytext, "partition_key": partition_key, "last_seen": datetime.now().isoformat()}
+            query_data = {"query": querytext, "partition_key": partition_key, "last_seen": datetime.now().isoformat(), "status": "ok"}
             self.db[query_key] = query_data
             return True
         except Exception:
@@ -229,6 +268,7 @@ class RocksDictCacheHandler(AbstractCacheHandler):
             queries = []
 
             for key in self.db.keys():
+                key = str(key)
                 if key.startswith(prefix):
                     query_data = self.db.get(key)
                     if query_data and isinstance(query_data, dict) and "query" in query_data:
@@ -246,7 +286,11 @@ class RocksDictCacheHandler(AbstractCacheHandler):
         """
         self._refcount -= 1
         if self._refcount <= 0:
-            self.db.close()
+            try:
+                self.db.close()
+            except Exception:
+                # DB might already be closed, ignore
+                pass
             self._instance = None
             self._refcount = 0
 
@@ -287,14 +331,112 @@ class RocksDictCacheHandler(AbstractCacheHandler):
 
     @classmethod
     def get_instance(cls, db_path: str, read_only: bool = False):
-        if cls._instance is None:
+        # Check if we need a new instance due to path change
+        if cls._instance is None or cls._current_path != db_path:
+            if cls._instance is not None:
+                # Close existing instance if path changed
+                try:
+                    cls._instance.db.close()
+                except Exception:
+                    pass
+                cls._instance = None
+                cls._refcount = 0
             cls._instance = cls(db_path, read_only=read_only)
+            cls._current_path = db_path
         cls._refcount += 1
         return cls._instance
 
     def get_datatype(self, partition_key: str) -> str | None:
         """Get the datatype of the cache handler. If the partition key is not set, return None."""
         return self._get_partition_datatype(partition_key)
+
+    def set_query_status(self, key: str, partition_key: str = "partition_key", status: str = "ok") -> bool:
+        """Set the status of a query using termination bits for RocksDict backend."""
+        try:
+            # Valid statuses
+            valid_statuses = {"ok", "timeout", "failed"}
+            if status not in valid_statuses:
+                raise ValueError(f"Invalid status '{status}'. Must be one of: {valid_statuses}")
+
+            # Get termination bit keys
+            limit_key = self._get_cache_key(f"_LIMIT_{key}", partition_key)
+            timeout_key = self._get_cache_key(f"_TIMEOUT_{key}", partition_key)
+
+            if status == "ok":
+                # Remove any existing termination bits
+                if limit_key in self.db:
+                    del self.db[limit_key]
+                if timeout_key in self.db:
+                    del self.db[timeout_key]
+                # Update query metadata if it exists
+                query_key = f"query:{partition_key}:{key}"
+                query_data = self.db.get(query_key)
+                if query_data and isinstance(query_data, dict):
+                    query_data["status"] = "ok"
+                    query_data["last_seen"] = datetime.now().isoformat()
+                    self.db[query_key] = query_data
+            elif status == "failed":
+                # Set limit termination bit
+                self.db[limit_key] = "NULL"
+                # Remove timeout bit if it exists
+                if timeout_key in self.db:
+                    del self.db[timeout_key]
+                # Update query metadata if it exists
+                query_key = f"query:{partition_key}:{key}"
+                query_data = self.db.get(query_key)
+                if query_data and isinstance(query_data, dict):
+                    query_data["status"] = "failed"
+                    query_data["last_seen"] = datetime.now().isoformat()
+                    self.db[query_key] = query_data
+            elif status == "timeout":
+                # Set timeout termination bit
+                self.db[timeout_key] = "NULL"
+                # Remove limit bit if it exists
+                if limit_key in self.db:
+                    del self.db[limit_key]
+                # Update query metadata if it exists
+                query_key = f"query:{partition_key}:{key}"
+                query_data = self.db.get(query_key)
+                if query_data and isinstance(query_data, dict):
+                    query_data["status"] = "timeout"
+                    query_data["last_seen"] = datetime.now().isoformat()
+                    self.db[query_key] = query_data
+
+            return True
+        except Exception as e:
+            logger.error(f"Failed to set query status for key {key}: {e}")
+            return False
+
+    def get_query_status(self, key: str, partition_key: str = "partition_key") -> str | None:
+        """Get the status of a query from termination bits for RocksDict backend."""
+        try:
+            # Check termination bits first
+            limit_key = self._get_cache_key(f"_LIMIT_{key}", partition_key)
+            timeout_key = self._get_cache_key(f"_TIMEOUT_{key}", partition_key)
+
+            if limit_key in self.db:
+                return "failed"
+            elif timeout_key in self.db:
+                return "timeout"
+
+            # Check query metadata for status
+            query_key = f"query:{partition_key}:{key}"
+            query_data = self.db.get(query_key)
+            if query_data and isinstance(query_data, dict):
+                status = query_data.get("status")
+                if status:
+                    return status
+                # If no status field, assume ok if query exists
+                return "ok"
+
+            # Check if cache entry exists
+            cache_key = self._get_cache_key(key, partition_key)
+            if cache_key in self.db:
+                return "ok"
+
+            return None
+        except Exception:
+            return None
 
     def register_partition_key(self, partition_key: str, datatype: str, **kwargs) -> None:
         """Register a partition key with the cache handler."""

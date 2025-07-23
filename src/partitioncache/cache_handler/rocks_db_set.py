@@ -81,33 +81,33 @@ class RocksDBCacheHandler(RocksDBAbstractCacheHandler):
         """
         return b",".join(i.encode() for i in values)
 
-    def set_set(self, key: str, value: set[int] | set[str] | set[float] | set[datetime], partition_key: str = "partition_key") -> bool:
-        """Store a set in the cache for a specific partition key."""
+    def set_cache(self, key: str, partition_key_identifiers: set[int] | set[str] | set[float] | set[datetime], partition_key: str = "partition_key") -> bool:
+        """Store a set of partition key identifiers in the cache for a specific partition key."""
         # Try to get datatype from metadata
         existing_datatype = self._get_partition_datatype(partition_key)
         if existing_datatype is not None:
             if existing_datatype == "integer":
-                struct_value = self._format_int_set(value)  # type: ignore
+                struct_value = self._format_int_set(partition_key_identifiers)  # type: ignore
             elif existing_datatype == "text":
-                struct_value = self._format_str_set(value)  # type: ignore
+                struct_value = self._format_str_set(partition_key_identifiers)  # type: ignore
             else:
                 raise ValueError(f"Unsupported datatype in metadata: {existing_datatype}")
             datatype = existing_datatype
         else:
-            # Infer from value type
-            sample = next(iter(value))
+            # Infer from partition key identifiers type
+            sample = next(iter(partition_key_identifiers))
             if isinstance(sample, int):
                 datatype = "integer"
-                struct_value = self._format_int_set(value)  # type: ignore
+                struct_value = self._format_int_set(partition_key_identifiers)  # type: ignore
             elif isinstance(sample, str):
                 datatype = "text"
-                struct_value = self._format_str_set(value)  # type: ignore
+                struct_value = self._format_str_set(partition_key_identifiers)  # type: ignore
             else:
-                raise ValueError(f"Unsupported value type: {type(sample)}")
+                raise ValueError(f"Unsupported partition key identifier type: {type(sample)}")
             self._set_partition_datatype(partition_key, datatype)
         try:
             cache_key = self._get_cache_key(key, partition_key)
-            logger.info(f"saving {len(value)} values in cache {cache_key}")
+            logger.info(f"saving {len(partition_key_identifiers)} partition key identifiers in cache {cache_key}")
             self.db.put(cache_key.encode(), struct_value, sync=True)
             return True
         except Exception:

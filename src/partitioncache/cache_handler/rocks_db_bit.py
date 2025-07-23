@@ -100,9 +100,9 @@ class RocksDBBitCacheHandler(RocksDBAbstractCacheHandler):
         else:
             return set(result.search(bitarray("1"))), count_match
 
-    def set_set(self, key: str, value: set[int] | set[str] | set[float] | set[datetime], partition_key: str = "partition_key") -> bool:
-        """Store a set in the cache for a specific partition key. Only integer values are supported."""
-        if not value:
+    def set_cache(self, key: str, partition_key_identifiers: set[int] | set[str] | set[float] | set[datetime], partition_key: str = "partition_key") -> bool:
+        """Store a set of partition key identifiers in the cache for a specific partition key. Only integer values are supported."""
+        if not partition_key_identifiers:
             return True
         # Ensure partition exists with correct datatype and bitsize
         self._ensure_partition_exists(partition_key)
@@ -114,7 +114,7 @@ class RocksDBBitCacheHandler(RocksDBAbstractCacheHandler):
 
         bitval = bitarray(bitsize)
         try:
-            for k in value:
+            for k in partition_key_identifiers:
                 if isinstance(k, int):
                     bitval[k] = 1
                 elif isinstance(k, str):
@@ -125,7 +125,7 @@ class RocksDBBitCacheHandler(RocksDBAbstractCacheHandler):
                 else:
                     raise ValueError(f"RocksDB bit handler only supports integer values. Got {type(k)}: {k}")
         except IndexError:
-            raise ValueError(f"Value {value} is out of range for bitarray of size {bitsize}") from None
+            raise ValueError(f"Partition key identifiers {partition_key_identifiers} is out of range for bitarray of size {bitsize}") from None
         try:
             cache_key = self._get_cache_key(key, partition_key)
             self.db.put(cache_key.encode(), bitval.tobytes(), sync=True)

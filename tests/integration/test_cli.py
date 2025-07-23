@@ -205,8 +205,6 @@ class TestCLIIntegration:
             pytest.skip(f"CLI tests not compatible with {backend_type} due to file locking")
 
         backend_suffix = backend_type.replace("_", "").replace("-", "")
-        partition_key = f"region_id_{backend_suffix}"
-        hash_key = f"query_test_hash_{backend_suffix}"
         backend_suffix = backend_type.replace("_", "").replace("-", "")
         test_partition = f"test_city_{backend_suffix}"
         test_hash = f"test_hash_{backend_suffix}"
@@ -270,7 +268,7 @@ class TestCLIIntegration:
 
         # Add some test data to cache using unique keys
         cache_client.register_partition_key(test_partition, "integer")
-        cache_client.set_set(test_hash, {1, 2, 3}, test_partition)
+        cache_client.set_cache(test_hash, {1, 2, 3}, test_partition)
         cache_client.set_query(test_hash, f"SELECT * FROM test WHERE {test_partition} IN (1,2,3)", test_partition)
 
         # Test cache overview
@@ -350,7 +348,7 @@ class TestCLIIntegration:
         # Setup test data
         cache_client.register_partition_key(partition_key, "integer")
         test_query = f"SELECT * FROM locations WHERE {partition_key} IN (10,20,30)"
-        cache_client.set_set(hash_key, {10, 20, 30}, partition_key)
+        cache_client.set_cache(hash_key, {10, 20, 30}, partition_key)
         cache_client.set_query(hash_key, test_query, partition_key)
 
         if backend_type.startswith("rocksdb"):
@@ -422,8 +420,6 @@ class TestCLIIntegration:
             pytest.skip(f"CLI tests not compatible with {backend_type} due to file locking")
 
         backend_suffix = backend_type.replace("_", "").replace("-", "")
-        partition_key = f"region_id_{backend_suffix}"
-        hash_key = f"query_test_hash_{backend_suffix}"
         backend_suffix = backend_type.replace("_", "").replace("-", "")
         city_partition = f"city_id_{backend_suffix}"
         state_partition = f"state_id_{backend_suffix}"
@@ -492,10 +488,10 @@ class TestCLIIntegration:
         cache_client.register_partition_key(state_partition, "integer")
 
         # Add data to both partitions using unique keys
-        cache_client.set_set(city_hash, {1, 2, 3}, city_partition)
+        cache_client.set_cache(city_hash, {1, 2, 3}, city_partition)
         cache_client.set_query(city_hash, f"SELECT * FROM test WHERE {city_partition} IN (1,2,3)", city_partition)
 
-        cache_client.set_set(state_hash, {100, 200}, state_partition)
+        cache_client.set_cache(state_hash, {100, 200}, state_partition)
         cache_client.set_query(state_hash, f"SELECT * FROM test WHERE {state_partition} IN (100,200)", state_partition)
 
         # Create temporary export file
@@ -654,8 +650,9 @@ class TestCLIIntegration:
             )
 
             # Should succeed or show SQL error (not file/configuration error)
-            # Check stdout for successful env file loading
-            assert "loaded environment from" in result.stdout.lower(), "Should show env file was loaded"
+            # Check that cache handler was created (indicates env file was loaded successfully)
+            output_text = (result.stdout + result.stderr).lower()
+            assert "created partition cache handler" in output_text, "Should show cache handler was created"
 
             if result.returncode != 0:
                 # Should be SQL error (table doesn't exist) not configuration error

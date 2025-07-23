@@ -67,12 +67,12 @@ class TestPgCronIntegration:
                 # Insert/update configuration with our unique job name
                 cur.execute(
                     f"""
-                    INSERT INTO {config_table} 
-                    (job_name, table_prefix, queue_prefix, cache_backend, 
+                    INSERT INTO {config_table}
+                    (job_name, table_prefix, queue_prefix, cache_backend,
                      frequency_seconds, enabled, timeout_seconds, max_parallel_jobs)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (job_name) 
-                    DO UPDATE SET 
+                    ON CONFLICT (job_name)
+                    DO UPDATE SET
                         enabled = EXCLUDED.enabled,
                         frequency_seconds = EXCLUDED.frequency_seconds,
                         updated_at = NOW()
@@ -150,7 +150,7 @@ class TestPgCronIntegration:
             log_table = f"{queue_prefix}_processor_log"
             with db_session.cursor() as cur:
                 cur.execute(f"""
-                    SELECT job_id, status, execution_source, created_at 
+                    SELECT job_id, status, execution_source, created_at
                     FROM {log_table}
                     WHERE created_at > NOW() - INTERVAL '1 minute'
                     ORDER BY created_at DESC
@@ -219,7 +219,7 @@ class TestPgCronIntegration:
         try:
             # Create two test jobs with different prefixes
             with db_session.cursor() as cur:
-                for i, prefix in enumerate([job_prefix_1, job_prefix_2]):
+                for _i, prefix in enumerate([job_prefix_1, job_prefix_2]):
                     job_name = f"{prefix}_job"
                     cur.execute("SELECT cron.schedule(%s, '* * * * *', 'SELECT 1;')", (job_name,))
 

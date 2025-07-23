@@ -11,11 +11,11 @@ from partitioncache.cache_handler.abstract import AbstractCacheHandler
 def _compare_cache_values(retrieved, expected):
     """
     Helper function to compare cache values across different backend types.
-    
+
     Args:
         retrieved: Value returned from cache backend (could be set, BitMap, etc.)
         expected: Expected set value
-    
+
     Returns:
         bool: True if values are equivalent
     """
@@ -28,7 +28,7 @@ def _compare_cache_values(retrieved, expected):
         pass
 
     # Handle regular sets and other types
-    if hasattr(retrieved, '__iter__') and not isinstance(retrieved, (str, bytes)):
+    if hasattr(retrieved, '__iter__') and not isinstance(retrieved, str | bytes):
         return set(retrieved) == expected
 
     return retrieved == expected
@@ -51,7 +51,7 @@ class TestCachePerformance:
 
         # Measure set operation
         start_time = time.time()
-        success = cache_client.set_set(cache_key, large_set, partition_key)
+        success = cache_client.set_cache(cache_key, large_set, partition_key)
         set_time = time.time() - start_time
 
         assert success, "Failed to set large set"
@@ -80,7 +80,7 @@ class TestCachePerformance:
         for i in range(num_operations):
             cache_key = f"perf_small_{i}"
             test_set = {10000 + i, 10001 + i}
-            cache_client.set_set(cache_key, test_set, partition_key)
+            cache_client.set_cache(cache_key, test_set, partition_key)
 
         total_time = time.time() - start_time
         ops_per_second = num_operations / total_time
@@ -111,7 +111,7 @@ class TestCachePerformance:
             cache_key = f"intersect_perf_{i}"
             # Create sets with 80% overlap
             test_set = set(random.sample(list(base_values), set_size))
-            cache_client.set_set(cache_key, test_set, partition_key)
+            cache_client.set_cache(cache_key, test_set, partition_key)
             cache_keys.append(cache_key)
 
         # Measure intersection performance
@@ -131,7 +131,7 @@ class TestCachePerformance:
         # Store the same values in many cache entries
         for i in range(100):
             cache_key = f"duplicate_{i}"
-            cache_client.set_set(cache_key, common_values, partition_key)
+            cache_client.set_cache(cache_key, common_values, partition_key)
 
         # Verify all entries exist and are retrievable
         for i in range(100):
@@ -162,7 +162,7 @@ class TestCacheConcurrency:
             for i in range(operations_per_thread):
                 cache_key = f"concurrent_{thread_id}_{i}"
                 test_set = {thread_id * 1000 + i}
-                if cache_client.set_set(cache_key, test_set, partition_key):
+                if cache_client.set_cache(cache_key, test_set, partition_key):
                     successful_keys.append(cache_key)
             return successful_keys
 
@@ -188,7 +188,7 @@ class TestCacheConcurrency:
         # Pre-populate some shared data
         for key in shared_keys:
             test_set = {1000 + hash(key) % 1000}
-            cache_client.set_set(key, test_set, partition_key)
+            cache_client.set_cache(key, test_set, partition_key)
 
         def read_worker() -> int:
             """Worker function for concurrent reads."""
@@ -212,7 +212,7 @@ class TestCacheConcurrency:
                 try:
                     key = f"writer_{random.randint(1000, 9999)}_{i}"
                     test_set = {random.randint(2000, 3000)}
-                    if cache_client.set_set(key, test_set, partition_key):
+                    if cache_client.set_cache(key, test_set, partition_key):
                         successful_writes += 1
                     time.sleep(0.002)  # Small delay to reduce contention
                 except Exception:
@@ -256,7 +256,7 @@ class TestCacheStress:
                 set_size = 1000 * (i + 1)  # 1K, 2K, 3K... up to 10K
                 large_set = set(range(i * 10000, i * 10000 + set_size))
 
-                success = cache_client.set_set(cache_key, large_set, partition_key)
+                success = cache_client.set_cache(cache_key, large_set, partition_key)
                 if success:
                     large_sets.append((cache_key, large_set))
                 else:
@@ -289,7 +289,7 @@ class TestCacheStress:
             test_set = {i}
 
             # Set, verify, delete
-            cache_client.set_set(cache_key, test_set, partition_key)
+            cache_client.set_cache(cache_key, test_set, partition_key)
             retrieved = cache_client.get(cache_key, partition_key)
             # Use utility function for backend-agnostic comparison
             from .test_utils import normalize_cache_result
@@ -318,7 +318,7 @@ class TestCacheStress:
             cache_key = f"edge_{case_name}"
 
             try:
-                success = cache_client.set_set(cache_key, test_set, partition_key)
+                success = cache_client.set_cache(cache_key, test_set, partition_key)
                 if success:
                     retrieved = cache_client.get(cache_key, partition_key)
                     assert retrieved == test_set, f"Edge case {case_name} failed"
@@ -350,7 +350,7 @@ class TestCacheRealWorldScenarios:
 
             # Populate cache with results
             for hash_key in hashes:
-                cache_client.set_set(hash_key, expected_zipcodes, partition_key)
+                cache_client.set_cache(hash_key, expected_zipcodes, partition_key)
 
             # Verify cache retrieval
             partition_keys, _, hits = partitioncache.get_partition_keys(
@@ -378,7 +378,7 @@ class TestCacheRealWorldScenarios:
             cache_key = f"eviction_test_{i}"
             test_set = {1000 + i}
 
-            if cache_client.set_set(cache_key, test_set, partition_key):
+            if cache_client.set_cache(cache_key, test_set, partition_key):
                 cache_entries.append((cache_key, test_set))
 
         # Verify a reasonable number were stored
@@ -426,8 +426,8 @@ class TestCacheRealWorldScenarios:
             pass  # May already be registered
 
         # Store same cache key with different partition keys
-        cache_client.set_set(cache_key, zipcode_values, zipcode_key)
-        cache_client.set_set(cache_key, region_values, region_key)
+        cache_client.set_cache(cache_key, zipcode_values, zipcode_key)
+        cache_client.set_cache(cache_key, region_values, region_key)
 
         # Verify isolation - each partition should return its own values
         retrieved_zipcodes = cache_client.get(cache_key, zipcode_key)

@@ -100,13 +100,21 @@ def test_get_set_invalid_type(cache_handler, mock_redis):
 
 def test_exists_true(cache_handler, mock_redis):
     cache_key = "cache:partition_key:existing_key"
+    limit_key = "cache:partition_key:_LIMIT_existing_key"
+    timeout_key = "cache:partition_key:_TIMEOUT_existing_key"
     metadata_key = "_partition_metadata:partition_key"
     # First call for metadata check
     mock_redis.type.return_value = b"string"
     mock_redis.get.side_effect = lambda k: b"integer" if k == metadata_key else None
-    mock_redis.exists.return_value = 1
+    # exists() will be called for cache_key, limit_key, and timeout_key
+    def mock_exists(key):
+        if key == cache_key:
+            return 1  # Cache exists
+        elif key in [limit_key, timeout_key]:
+            return 0  # No termination bits
+        return 0
+    mock_redis.exists.side_effect = mock_exists
     assert cache_handler.exists("existing_key") is True
-    mock_redis.exists.assert_called_with(cache_key)
 
 
 def test_exists_false(cache_handler, mock_redis):
@@ -119,19 +127,19 @@ def test_exists_false(cache_handler, mock_redis):
     mock_redis.exists.assert_called_with(cache_key)
 
 
-def test_set_set_int(cache_handler, mock_redis):
+def test_set_cache_int(cache_handler, mock_redis):
     cache_key = "cache:partition_key:int_set_key"
 
     # Mock the _get_partition_datatype method directly
     cache_handler._get_partition_datatype = Mock(return_value="integer")
 
-    cache_handler.set_set("int_set_key", {1, 2, 3})
+    cache_handler.set_cache("int_set_key", {1, 2, 3})
     mock_redis.sadd.assert_called_with(cache_key, "1", "2", "3")
 
 
-def test_set_set_invalid_type(cache_handler, mock_redis):
+def test_set_cache_invalid_type(cache_handler, mock_redis):
     with pytest.raises(ValueError):
-        cache_handler.set_set("invalid_set_key", {1.1, 2.2, 3.3})
+        cache_handler.set_cache("invalid_set_key", {1.1, 2.2, 3.3})
 
 
 def test_set_null(cache_handler, mock_redis):

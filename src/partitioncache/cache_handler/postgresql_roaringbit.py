@@ -100,22 +100,22 @@ class PostgreSQLRoaringBitCacheHandler(PostgreSQLAbstractCacheHandler):
                 self.db.rollback()
                 raise
 
-    def set_set(
+    def set_cache(
         self,
         key: str,
-        value: set[int] | set[str] | set[float] | set[datetime] | BitMap | bitarray | list,
+        partition_key_identifiers: set[int] | set[str] | set[float] | set[datetime] | BitMap | bitarray | list,
         partition_key: str = "partition_key",
     ) -> bool:
         """
-        Set the value of the given key in the cache for a specific partition key.
+        Set the partition key identifiers of the given key in the cache for a specific partition key.
         Only integer values are supported for roaring bitmaps.
 
         Args:
             key: The cache key
-            value: Can be a set of integers, a BitMap, a bitarray, or a list of integers
-            partition_key: The partition key identifier
+            partition_key_identifiers: Can be a set of integers, a BitMap, a bitarray, or a list of integers
+            partition_key: The partition key (column) identifier
         """
-        if not value:
+        if not partition_key_identifiers:
             return True
 
         try:
@@ -123,19 +123,19 @@ class PostgreSQLRoaringBitCacheHandler(PostgreSQLAbstractCacheHandler):
             self._ensure_partition_table(partition_key, "integer")
 
             # Convert input to a list of integers for rb_build
-            if isinstance(value, BitMap):
-                value_list = list(value)
-            elif isinstance(value, bitarray):
-                value_list = [i for i, bit in enumerate(value) if bit]
-            elif isinstance(value, list | set):
+            if isinstance(partition_key_identifiers, BitMap):
+                value_list = list(partition_key_identifiers)
+            elif isinstance(partition_key_identifiers, bitarray):
+                value_list = [i for i, bit in enumerate(partition_key_identifiers) if bit]
+            elif isinstance(partition_key_identifiers, list | set):
                 # Validate that all items can be converted to integers without loss
                 value_list = []
-                for item in value:
+                for item in partition_key_identifiers:
                     if not isinstance(item, int) and isinstance(item, float) and not item.is_integer():
                         raise ValueError("Only integer values are supported for roaring bitmaps")
                     value_list.append(int(item))  # type: ignore
             else:
-                raise ValueError(f"Unsupported value type for roaring bitmap: {type(value)}")
+                raise ValueError(f"Unsupported partition key identifier type for roaring bitmap: {type(partition_key_identifiers)}")
 
             table_name = f"{self.tableprefix}_cache_{partition_key}"
             self.cursor.execute(
@@ -144,13 +144,22 @@ class PostgreSQLRoaringBitCacheHandler(PostgreSQLAbstractCacheHandler):
                 ).format(sql.Identifier(table_name)),
                 (key, value_list),
             )
+
+            # Also create entry in queries table for exists() method to work properly
+            self.cursor.execute(
+                sql.SQL(
+                    "INSERT INTO {0} (query_hash, partition_key, query) VALUES (%s, %s, %s) ON CONFLICT (query_hash, partition_key) DO UPDATE SET last_seen = now()"
+                ).format(sql.Identifier(self.tableprefix + "_queries")),
+                (key, partition_key, ""),  # Empty query text for cache entries
+            )
+
             self.db.commit()
             return True
         except ValueError as e:
-            logger.error(f"Invalid value for key {key} in partition {partition_key}: {e}")
+            logger.error(f"Invalid partition key identifiers for key {key} in partition {partition_key}: {e}")
             raise e
         except Exception as e:
-            logger.error("Failed to set value for key %s in partition %s: %s", key, partition_key, e)
+            logger.error("Failed to set partition key identifiers for key %s in partition %s: %s", key, partition_key, e)
             try:
                 self.db.rollback()
             except Exception as rollback_error:

@@ -22,7 +22,7 @@ class TestCacheLifecycle:
         test_values = {1001, 1002, 90210}
 
         # Set values in cache
-        success = cache_client.set_set(cache_key, test_values, partition_key)
+        success = cache_client.set_cache(cache_key, test_values, partition_key)
         assert success, "Failed to set values in cache"
 
         # Retrieve values from cache
@@ -47,7 +47,7 @@ class TestCacheLifecycle:
         test_values = {"northeast", "west", "southeast"}
 
         # Set values in cache
-        success = cache_client.set_set(cache_key, test_values, partition_key)
+        success = cache_client.set_cache(cache_key, test_values, partition_key)
         assert success, "Failed to set values in cache"
 
         # Retrieve values from cache
@@ -78,7 +78,7 @@ class TestCacheLifecycle:
         assert not cache_client.exists(cache_key, partition_key)
 
         # Set values and check existence
-        cache_client.set_set(cache_key, test_values, partition_key)
+        cache_client.set_cache(cache_key, test_values, partition_key)
         assert cache_client.exists(cache_key, partition_key)
 
     def test_update_value(self, cache_client: AbstractCacheHandler):
@@ -89,7 +89,7 @@ class TestCacheLifecycle:
         updated_values = {1001, 1002, 90210, 10001}
 
         # Set initial values
-        cache_client.set_set(cache_key, initial_values, partition_key)
+        cache_client.set_cache(cache_key, initial_values, partition_key)
         retrieved_initial = cache_client.get(cache_key, partition_key)
 
         # Convert BitMap to set for comparison if necessary
@@ -99,7 +99,7 @@ class TestCacheLifecycle:
         assert retrieved_initial == initial_values
 
         # Update with new values
-        cache_client.set_set(cache_key, updated_values, partition_key)
+        cache_client.set_cache(cache_key, updated_values, partition_key)
         retrieved_updated = cache_client.get(cache_key, partition_key)
 
         # Convert BitMap to set for comparison if necessary
@@ -115,7 +115,7 @@ class TestCacheLifecycle:
         test_values = {1001, 1002}
 
         # Set and verify values exist
-        cache_client.set_set(cache_key, test_values, partition_key)
+        cache_client.set_cache(cache_key, test_values, partition_key)
         assert cache_client.exists(cache_key, partition_key)
 
         # Delete and verify removal
@@ -146,9 +146,9 @@ class TestCacheLifecycle:
         partition_key = "zipcode"
 
         # Set up multiple cache entries with overlapping values
-        cache_client.set_set("hash_1", {1001, 1002, 90210}, partition_key)
-        cache_client.set_set("hash_2", {1001, 90210, 10001}, partition_key)
-        cache_client.set_set("hash_3", {90210, 10001, 20001}, partition_key)
+        cache_client.set_cache("hash_1", {1001, 1002, 90210}, partition_key)
+        cache_client.set_cache("hash_2", {1001, 90210, 10001}, partition_key)
+        cache_client.set_cache("hash_3", {90210, 10001, 20001}, partition_key)
 
         # Test intersection of two keys
         keys_to_intersect = {"hash_1", "hash_2"}
@@ -179,8 +179,8 @@ class TestCacheLifecycle:
         partition_key = "zipcode"
 
         # Set up some cache entries
-        cache_client.set_set("existing_1", {1001}, partition_key)
-        cache_client.set_set("existing_2", {1002}, partition_key)
+        cache_client.set_cache("existing_1", {1001}, partition_key)
+        cache_client.set_cache("existing_2", {1002}, partition_key)
 
         # Test filtering
         candidate_keys = {"existing_1", "existing_2", "non_existent_1", "non_existent_2"}
@@ -196,7 +196,7 @@ class TestCacheLifecycle:
         # Set up multiple cache entries
         test_keys = ["all_keys_1", "all_keys_2", "all_keys_3"]
         for key in test_keys:
-            cache_client.set_set(key, {1001}, partition_key)
+            cache_client.set_cache(key, {1001}, partition_key)
 
         # Get all keys
         all_keys = cache_client.get_all_keys(partition_key)
@@ -213,7 +213,7 @@ class TestCacheLifecycle:
 
         # Some backends might handle empty sets differently
         try:
-            success = cache_client.set_set(cache_key, empty_set, partition_key)
+            success = cache_client.set_cache(cache_key, empty_set, partition_key)
             if success:
                 retrieved = cache_client.get(cache_key, partition_key)
 
@@ -248,7 +248,7 @@ class TestCacheIntegration:
         # Populate cache with test data
         test_partition_values = {1001, 1002}
         for hash_key in hashes:
-            cache_client.set_set(hash_key, test_partition_values, partition_key)
+            cache_client.set_cache(hash_key, test_partition_values, partition_key)
 
         # Use PartitionCache API to get partition keys
         partition_keys, num_subqueries, num_hits = partitioncache.get_partition_keys(
@@ -281,7 +281,7 @@ class TestCacheIntegration:
         test_values = {1001, 1002}
 
         for hash_key in hashes:
-            cache_client.set_set(hash_key, test_values, partition_key)
+            cache_client.set_cache(hash_key, test_values, partition_key)
 
         # Apply cache using lazy method
         enhanced_query, stats = partitioncache.apply_cache_lazy(

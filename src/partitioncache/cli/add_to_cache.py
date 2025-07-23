@@ -12,8 +12,12 @@ from partitioncache.cli.common_args import (
     add_database_args,
     add_environment_args,
     add_queue_args,
+    add_variant_generation_args,
+    add_verbosity_args,
+    configure_logging,
     get_database_connection_params,
     load_environment_with_validation,
+    parse_variant_generation_json_args,
     resolve_cache_backend,
 )
 from partitioncache.db_handler import get_db_handler
@@ -35,6 +39,7 @@ def main():
         help="Do not recompose the query before adding to cache, the query is added as is to the cache or fragment queue"
     )
 
+
     # Execution mode configuration
     mode_group = parser.add_argument_group("execution mode")
     mode_group.add_argument("--queue", action="store_true", help="Add query to fragment queue instead of executing directly")
@@ -45,12 +50,20 @@ def main():
     add_cache_args(parser, require_partition_key=True)
     add_database_args(parser)
     add_queue_args(parser)
+    add_variant_generation_args(parser)
     add_environment_args(parser)
+    add_verbosity_args(parser)
 
     args = parser.parse_args()
 
+    # Configure logging based on verbosity
+    configure_logging(args)
+
     # Load environment variables with validation
     load_environment_with_validation(args.env_file)
+
+    # Parse JSON arguments for constraint modifications
+    add_constraints, remove_constraints_all, remove_constraints_add = parse_variant_generation_json_args(args)
 
     # Validate mutually exclusive options for execution mode
     queue_options = [args.queue, args.direct, args.queue_original]
@@ -86,12 +99,20 @@ def main():
             query_hash_pairs = generate_all_query_hash_pairs(
                 query,
                 args.partition_key,
-                min_component_size=1,
-                follow_graph=True,
+                min_component_size=args.min_component_size,
+                follow_graph=args.follow_graph,
                 keep_all_attributes=True,
+                auto_detect_star_join=not args.no_auto_detect_star_join,
+                max_component_size=args.max_component_size,
+                star_join_table=args.star_join_table,
+                warn_no_partition_key=not args.no_warn_partition_key,
+                bucket_steps=args.bucket_steps,
+                add_constraints=add_constraints,
+                remove_constraints_all=remove_constraints_all,
+                remove_constraints_add=remove_constraints_add,
             )
             success = partitioncache.push_to_query_fragment_queue(query_hash_pairs, args.partition_key, args.partition_datatype, queue_provider)
-        else:
+        else: # Compute fragments and add to fragment queue
             query = clean_query(query)
             query_hash_pairs = [(query, hash_query(query))]
             success = partitioncache.push_to_query_fragment_queue(query_hash_pairs, args.partition_key, args.partition_datatype, queue_provider)
@@ -125,36 +146,44 @@ def main():
                 raise ValueError(f"Unsupported database backend: {args.db_backend}")
 
             if not args.no_recompose:
-                logger.info("Recomposing query")
+                logger.debug("Recomposing query")
 
                 # Generate query-hash pairs
                 query_hash_pairs = generate_all_query_hash_pairs(
                     query,
                     args.partition_key,
-                    min_component_size=1,
-                    follow_graph=True,
+                    min_component_size=args.min_component_size,
+                    follow_graph=args.follow_graph,
                     keep_all_attributes=True,
+                    auto_detect_star_join=not args.no_auto_detect_star_join,
+                    max_component_size=args.max_component_size,
+                    star_join_table=args.star_join_table,
+                    warn_no_partition_key=not args.no_warn_partition_key,
+                    bucket_steps=args.bucket_steps,
+                    add_constraints=add_constraints,
+                    remove_constraints_all=remove_constraints_all,
+                    remove_constraints_add=remove_constraints_add,
                 )
 
             else:
                 query = clean_query(query)
                 query_hash_pairs = [(query, hash_query(query))]
 
-            logger.info(f"Found {len(query_hash_pairs)} subqueries to process")
+            logger.debug(f"Found {len(query_hash_pairs)} subqueries to process")
 
             # Process each query-hash pair
             for query, hash_value in query_hash_pairs:
                 if cache.exists(hash_value):
-                    logger.info(f"Query {hash_value} already in cache")
+                    logger.debug(f"Query {hash_value} already in cache")
                     cache.set_query(hash_value, query)
                     continue
 
                 # Execute query and store results
                 result = set(db_handler.execute(query))
                 if result:
-                    cache.set_set(hash_value, result)
+                    cache.set_cache(hash_value, result)
                     cache.set_query(hash_value, query)
-                    logger.info(f"Stored query {hash_value} with {len(result)} results")
+                    logger.debug(f"Stored query {hash_value} with {len(result)} results")
                 else:
                     logger.warning(f"Query {hash_value} returned no results")
 

@@ -246,6 +246,36 @@ pcache-add [options] --partition-key PARTITION_KEY {--direct|--queue|--queue-ori
   - **With flag**: Adds the complete query directly to cache/queue
   - **Use case**: When you want to cache the exact query without optimization
 
+### Variant Generation Configuration
+Advanced options for controlling how query variants are generated for better cache coverage:
+
+#### Distance Normalization
+- `--bucket-steps FLOAT` - Step size for normalizing distance conditions
+  - **Default**: `1.0` (or `PARTITION_CACHE_BUCKET_STEPS` environment variable)
+  - **Purpose**: Controls bucketing of distance ranges for better cache hits
+  - **Example**: With `--bucket-steps 0.5`, distance `BETWEEN 1.6 AND 3.6` becomes `BETWEEN 1.5 AND 4.0`
+
+#### Constraint Modification
+- `--add-constraints JSON` - Add constraints to specific tables
+  - **Format**: JSON object mapping table names to constraint conditions
+  - **Example**: `'{"points": "size = 4", "regions": "active = true"}'`
+  - **Purpose**: Create additional query variants with extra constraints
+  - **Environment**: `PARTITION_CACHE_ADD_CONSTRAINTS`
+
+- `--remove-constraints-all JSON` - Remove attributes from all query variants
+  - **Format**: JSON array of attribute names to remove
+  - **Example**: `'["color", "category"]'`
+  - **Purpose**: Generalize queries by removing specific filters
+  - **Environment**: `PARTITION_CACHE_REMOVE_CONSTRAINTS_ALL`
+
+- `--remove-constraints-add JSON` - Remove attributes creating additional variants
+  - **Format**: JSON array of attribute names to remove
+  - **Example**: `'["size", "priority"]'`
+  - **Purpose**: Generate variants both with and without specific constraints
+  - **Environment**: `PARTITION_CACHE_REMOVE_CONSTRAINTS_ADD`
+
+**Processing Order**: Constraint modifications are applied in the order: `remove-constraints-all` → `remove-constraints-add` → `add-constraints`, enabling replacement scenarios.
+
 ### Partition Configuration (Required)
 - `--partition-key PARTITION_KEY` - Name of the partition key column (**Required**)
 - `--partition-datatype {integer,float,text,timestamp}` - Partition key datatype
@@ -321,6 +351,20 @@ pcache-add --queue --no-recompose \
   --query "SELECT * FROM users WHERE city_id IN (1,2,3)" \
   --partition-key "city_id"
 ```
+
+**Advanced variant generation:**
+```bash
+pcache-add --direct \
+  --query "SELECT * FROM points WHERE distance BETWEEN 1.6 AND 3.6 AND size = 4" \
+  --partition-key "region_id" \
+  --bucket-steps 0.5 \
+  --add-constraints '{"points": "active = true"}' \
+  --remove-constraints-add '["size"]'
+```
+This generates multiple variants:
+- Original query with normalized distance (`BETWEEN 1.5 AND 4.0`)
+- Variants with and without `size = 4` constraint
+- Variants with added `active = true` constraint
 
 ---
 
@@ -409,6 +453,11 @@ pcache-monitor [options]
 - `--max-processes MAX_PROCESSES` - Maximum number of worker processes
   - **Default**: CPU count
   - **Use case**: Control resource usage and concurrency
+- `--max-pending-jobs MAX_PENDING_JOBS` - Maximum number of jobs to keep in pending buffer
+  - **Default**: 2 * max_processes
+  - **Purpose**: Limit memory usage by controlling how many queue items are consumed into memory
+  - **Behavior**: When buffer is full, items remain in persistent queue until processing capacity becomes available
+  - **Recommended**: 1-4x max_processes for optimal performance
 - `--long-running-query-timeout LONG_RUNNING_QUERY_TIMEOUT` - Query timeout in seconds
   - **Default**: 300 seconds
   - **Purpose**: Prevent hanging queries from blocking processing
@@ -426,6 +475,47 @@ pcache-monitor [options]
   - **Optimized**: Uses LISTEN/NOTIFY for PostgreSQL, native blocking for Redis
   - **Simple**: Uses regular polling with sleep intervals
   - **Use case**: Troubleshooting or compatibility issues
+
+### Cache Optimization Options for fragment queries in queue
+- `--enable-cache-optimization` - Enable cache-aware optimization for fragment queries
+  - **Default**: Disabled
+  - **Purpose**: Check existing cache entries to restrict search space before execution
+  - **Benefit**: Reduces database load by applying IN/subquery restrictions
+- `--cache-optimization-method {IN,VALUES,IN_SUBQUERY,TMP_TABLE_IN,TMP_TABLE_JOIN}` - Method for applying cache restrictions
+  - **Default**: `IN`
+  - **`IN`**: Simple IN clause with partition keys
+  - **`VALUES`**: IN clause with VALUES construct
+  - **`IN_SUBQUERY`**: IN clause with lazy subquery (recommended for large result sets)
+  - **`TMP_TABLE_IN`**: Create temp table and use IN subquery
+  - **`TMP_TABLE_JOIN`**: Create temp table and JOIN
+- `--min-cache-hits MIN_CACHE_HITS` - Minimum cache hits required for non-lazy optimization
+  - **Default**: 1
+  - **Note**: Only applies to non-lazy methods (IN, VALUES)
+  - **Purpose**: Avoid optimization overhead for minimal cache hits
+- `--prefer-lazy-optimization` / `--no-prefer-lazy-optimization` - Prefer lazy methods when available
+  - **Default**: `--prefer-lazy-optimization` (enabled)
+  - **Purpose**: Use more efficient lazy subqueries with PostgreSQL backends
+  - **Note**: Lazy methods don't materialize results upfront
+
+### Variant Generation Configuration
+Controls how query variants are generated when processing original queries from the queue:
+
+#### Distance Normalization
+- `--bucket-steps FLOAT` - Step size for normalizing distance conditions
+  - **Default**: `1.0` (or `PARTITION_CACHE_BUCKET_STEPS` environment variable)
+
+#### Constraint Modification
+- `--add-constraints JSON` - Add constraints to specific tables
+  - **Format**: JSON object mapping table names to constraint conditions
+  - **Environment**: `PARTITION_CACHE_ADD_CONSTRAINTS`
+
+- `--remove-constraints-all JSON` - Remove attributes from all query variants
+  - **Format**: JSON array of attribute names to remove
+  - **Environment**: `PARTITION_CACHE_REMOVE_CONSTRAINTS_ALL`
+
+- `--remove-constraints-add JSON` - Remove attributes creating additional variants
+  - **Format**: JSON array of attribute names to remove
+  - **Environment**: `PARTITION_CACHE_REMOVE_CONSTRAINTS_ADD`
 
 ### Configuration
 - `--env ENV` - Environment file path
@@ -447,6 +537,7 @@ pcache-monitor \
 pcache-monitor \
   --cache-backend "redis_set" \
   --max-processes 8 \
+  --max-pending-jobs 16 \
   --long-running-query-timeout 600 \
   --status-log-interval 30
 ```
@@ -458,6 +549,46 @@ pcache-monitor \
   --max-processes 1 \
   --disable-optimized-polling \
   --status-log-interval 5
+```
+
+**Advanced variant generation:**
+```bash
+pcache-monitor \
+  --cache-backend "postgresql_array" \
+  --max-processes 4 \
+  --bucket-steps 0.5 \
+  --add-constraints '{"points": "active = true"}' \
+  --remove-constraints-add '["size", "category"]'
+```
+
+**Memory-constrained setup:**
+```bash
+pcache-monitor \
+  --cache-backend "postgresql_array" \
+  --max-processes 4 \
+  --max-pending-jobs 4 \
+  --limit 1000 \
+  --status-log-interval 15
+```
+
+**Cache-optimized setup:**
+```bash
+pcache-monitor \
+  --cache-backend "postgresql_array" \
+  --enable-cache-optimization \
+  --cache-optimization-method IN_SUBQUERY \
+  --max-processes 8
+```
+
+**Cache-optimized with thresholds:**
+```bash
+pcache-monitor \
+  --cache-backend "redis_set" \
+  --enable-cache-optimization \
+  --cache-optimization-method IN \
+  --min-cache-hits 5 \
+  --no-prefer-lazy-optimization \
+  --max-processes 4
 ```
 
 ---

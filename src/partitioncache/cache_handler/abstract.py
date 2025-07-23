@@ -1,5 +1,8 @@
 from abc import ABC, abstractmethod
 from datetime import datetime
+from logging import getLogger
+
+logger = getLogger("PartitionCache")
 
 
 class AbstractCacheHandler(ABC):
@@ -92,28 +95,35 @@ class AbstractCacheHandler(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def exists(self, key: str, partition_key: str = "partition_key") -> bool:
+    def exists(self, key: str, partition_key: str = "partition_key", check_query: bool = False) -> bool:
         """
         Check if a key exists in the cache.
 
         Args:
-            key (str): The key to check.
-            partition_key (str, optional): The partition key. Defaults to "partition_key".
+            key (str): The hash to check.
+            partition_key (str, optional): The partition key (column). Defaults to "partition_key".
+            check_query (bool, optional): If False, only check cache entry existence (fast).
+                                         If True, check query metadata first:
+                                         - If query doesn't exist: return False
+                                         - If query exists with 'ok' status: also check cache entry exists
+                                         - If query exists with 'timeout'/'failed' status: return True (no cache check)
+                                         Defaults to False.
 
         Returns:
-            bool: True if the key exists, False otherwise.
+            bool: True if the hash exists (and meets criteria), False otherwise.
         """
         raise NotImplementedError
 
     @abstractmethod
-    def set_set(self, key: str, value: set[int] | set[str] | set[float] | set[datetime], partition_key: str = "partition_key") -> bool:
+    def set_cache(self, key: str, partition_key_identifiers: set[int] | set[str] | set[float] | set[datetime], partition_key: str = "partition_key") -> bool:
         """
-        Store a set in the cache associated with the given key. The type is inferred from the metadata table, or if not present, from the type of value.
+        Store a set of partition key identifiers in the cache associated with the given key.
+        The type is inferred from the metadata table, or if not present, from the type of partition_key_identifiers.
 
         Args:
-            key (str): The key to associate with the set.
-            value (set[int] | set[str] | set[float] | set[datetime]): The set to store.
-            partition_key (str, optional): The partition key namespace. Defaults to "partition_key".
+            key (str): The key to associate with the partition key identifiers.
+            partition_key_identifiers (set[int] | set[str] | set[float] | set[datetime]): The set of partition key identifiers to store.
+            partition_key (str, optional): The partition key (column) namespace. Defaults to "partition_key".
 
         Returns:
             bool: True if the operation was successful, False otherwise.
@@ -178,16 +188,22 @@ class AbstractCacheHandler(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def filter_existing_keys(self, keys: set, partition_key: str = "partition_key") -> set:
+    def filter_existing_keys(self, keys: set, partition_key: str = "partition_key", check_query: bool = False) -> set:
         """
         Filter and return the set of keys that exist in the cache of the given set.
 
         Args:
-            keys (set): A set of keys to verify.
-            partition_key (str, optional): The partition key. Defaults to "partition_key".
+            keys (set): A set of hashes to verify.
+            partition_key (str, optional): The partition key (column). Defaults to "partition_key".
+            check_query (bool, optional): If False, only check cache entry existence (fast).
+                                         If True, check query metadata first:
+                                         - If query doesn't exist: exclude hash
+                                         - If query exists with 'ok' status: also check cache entry exists
+                                         - If query exists with 'timeout'/'failed' status: include hash (no cache check)
+                                         Defaults to False.
 
         Returns:
-            set: The subset set of keys that exist in the cache.
+            set: The subset set of hashes that exist in the cache (and meet criteria).
         """
         raise NotImplementedError
 
@@ -269,6 +285,76 @@ class AbstractCacheHandler(ABC):
         Get an instance of the cache handler.
         """
         raise NotImplementedError
+
+    @abstractmethod
+    def set_query_status(self, key: str, partition_key: str = "partition_key", status: str = "ok") -> bool:
+        """
+        Set the status of a query in the cache.
+
+        Args:
+            key (str): The query hash to set status for.
+            partition_key (str, optional): The partition key. Defaults to "partition_key".
+            status (str, optional): The status to set ('ok', 'timeout', 'failed'). Defaults to "ok".
+
+        Returns:
+            bool: True if the operation was successful, False otherwise.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_query_status(self, key: str, partition_key: str = "partition_key") -> str | None:
+        """
+        Get the status of a query from the cache.
+
+        Args:
+            key (str): The query hash to check.
+            partition_key (str, optional): The partition key. Defaults to "partition_key".
+
+        Returns:
+            str | None: The status ('ok', 'timeout', 'failed') or None if not found.
+        """
+        raise NotImplementedError
+
+    def set_entry(
+        self,
+        key: str,
+        partition_key_identifiers: set[int] | set[str] | set[float] | set[datetime],
+        query_text: str,
+        partition_key: str = "partition_key",
+        force_update: bool = False,
+    ) -> bool:
+        """
+        High-level method that atomically stores cache data and query metadata.
+
+        This is the preferred way to populate the cache as it ensures both cache data
+        and query metadata are stored consistently.
+
+        Args:
+            key (str): Cache key (query hash).
+            partition_key_identifiers (set): Set of partition key identifiers to cache.
+            query_text (str): SQL query text to store.
+            partition_key (str, optional): Partition key (column) namespace. Defaults to "partition_key".
+            force_update (bool, optional): If True, always update cache data.
+                                          If False, only update metadata if cache entry exists.
+                                          Defaults to False.
+
+        Returns:
+            bool: True if successful, False otherwise.
+        """
+        try:
+            # Check if entry already exists
+            if not force_update and self.exists(key, partition_key, check_query=True):
+                # Entry exists, only update query metadata
+                return self.set_query(key, query_text, partition_key)
+            else:
+                # Entry doesn't exist or force_update=True, set both
+                success_data = self.set_cache(key, partition_key_identifiers, partition_key)
+                success_query = self.set_query(key, query_text, partition_key)
+                return success_data and success_query
+        except Exception as e:
+            # Log error but don't raise exception to maintain API consistency
+            logger.error(f"Failed to set cache entry for key {key}: {e}")
+            return False
 
 
 class AbstractCacheHandler_Lazy(AbstractCacheHandler):

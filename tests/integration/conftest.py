@@ -215,7 +215,7 @@ def db_session(db_connection):
         for prefix in cache_prefixes:
             cur.execute(
                 """
-                SELECT tablename FROM pg_tables 
+                SELECT tablename FROM pg_tables
                 WHERE tablename LIKE %s AND schemaname = 'public';
             """,
                 (prefix,),
@@ -387,22 +387,14 @@ if os.getenv("REDIS_HOST"):
 # Add RocksDB backends if available
 def _is_rocksdb_available():
     """Check if RocksDB is available for testing."""
-    try:
-        import rocksdb
-
-        return True
-    except ImportError:
-        return False
+    import importlib.util
+    return importlib.util.find_spec("rocksdb") is not None
 
 
 def _is_rocksdict_available():
     """Check if rocksdict is available for testing."""
-    try:
-        import rocksdic
-
-        return True
-    except ImportError:
-        return False
+    import importlib.util
+    return importlib.util.find_spec("rocksdic") is not None
 
 
 # Add RocksDB backends if the module is available
@@ -591,8 +583,8 @@ def sample_queries():
         "region_filter": "SELECT * FROM test_locations WHERE region = 'northeast';",
         "complex_join": """
             SELECT l1.name, l1.population, l2.name as nearby
-            FROM test_locations l1 
-            JOIN test_locations l2 ON l1.region = l2.region 
+            FROM test_locations l1
+            JOIN test_locations l2 ON l1.region = l2.region
             WHERE l1.zipcode = 1001 AND l2.zipcode != l1.zipcode;
         """,
     }
@@ -679,7 +671,7 @@ def manual_queue_processor(db_session, db_connection, cache_client):
     with db_session.cursor() as cur:
         cur.execute("""
             SELECT EXISTS (
-                SELECT 1 FROM pg_proc 
+                SELECT 1 FROM pg_proc
                 WHERE proname = 'partitioncache_manual_process_queue'
             )
         """)
@@ -705,12 +697,12 @@ def manual_queue_processor(db_session, db_connection, cache_client):
         config_table = f"{queue_prefix}_processor_config"
         cur.execute(
             f"""
-            INSERT INTO {config_table} 
-            (job_name, enabled, max_parallel_jobs, frequency_seconds, timeout_seconds, 
+            INSERT INTO {config_table}
+            (job_name, enabled, max_parallel_jobs, frequency_seconds, timeout_seconds,
              table_prefix, queue_prefix, cache_backend)
-            VALUES ('partitioncache_process_queue', true, 1, 60, 30, 
+            VALUES ('partitioncache_process_queue', true, 1, 60, 30,
                     %s, %s, 'array')
-            ON CONFLICT (job_name) DO UPDATE 
+            ON CONFLICT (job_name) DO UPDATE
             SET enabled = true, updated_at = NOW()
         """,
             (table_prefix, queue_prefix),
@@ -754,12 +746,12 @@ def postgresql_queue_processor(postgresql_queue_functions, db_session, cache_cli
         config_table = f"{queue_prefix}_processor_config"
         cur.execute(
             f"""
-            INSERT INTO {config_table} 
-            (job_name, enabled, max_parallel_jobs, frequency_seconds, timeout_seconds, 
+            INSERT INTO {config_table}
+            (job_name, enabled, max_parallel_jobs, frequency_seconds, timeout_seconds,
              table_prefix, queue_prefix, cache_backend)
-            VALUES ('partitioncache_process_queue', true, 1, 60, 30, 
+            VALUES ('partitioncache_process_queue', true, 1, 60, 30,
                     %s, %s, 'array')
-            ON CONFLICT (job_name) DO UPDATE 
+            ON CONFLICT (job_name) DO UPDATE
             SET timeout_seconds = 30, enabled = true, updated_at = NOW()
         """,
             (table_prefix, queue_prefix),

@@ -132,7 +132,7 @@ partition_key = "price"
 
 # Store float values
 float_values = {19.99, 29.99, 39.99}
-cache_handler.set_set("query_hash", float_values, partition_key)
+cache_handler.set_cache("query_hash", float_values, partition_key)
 
 # Retrieve values
 result = cache_handler.get("query_hash", partition_key)

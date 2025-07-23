@@ -8,6 +8,7 @@ with automatic datatype validation and consistent interfaces.
 from datetime import datetime
 
 from partitioncache.apply_cache import (
+    apply_cache,
     apply_cache_lazy,
     extend_query_with_partition_keys,
     extend_query_with_partition_keys_lazy,
@@ -81,6 +82,7 @@ __all__ = [
     "extend_query_with_partition_keys",
     "extend_query_with_partition_keys_lazy",
     "apply_cache_lazy",
+    "apply_cache",
     "push_to_original_query_queue",
     "push_to_query_fragment_queue",
     "get_queue_lengths",

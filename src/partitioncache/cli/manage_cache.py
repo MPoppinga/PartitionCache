@@ -1,5 +1,4 @@
 import argparse
-import logging
 import os
 import pickle
 import sys
@@ -10,6 +9,7 @@ from tqdm import tqdm
 
 from partitioncache.cache_handler import get_cache_handler
 from partitioncache.cache_handler.abstract import AbstractCacheHandler
+from partitioncache.cache_handler.redis_abstract import RedisAbstractCacheHandler
 from partitioncache.cli.common_args import add_environment_args, add_verbosity_args, configure_logging, load_environment_with_validation
 from partitioncache.queue import get_queue_lengths
 from partitioncache.queue_handler import get_queue_handler
@@ -181,7 +181,7 @@ def validate_environment() -> bool:
             # Try to create a cache handler to validate configuration
             cache_handler = get_cache_handler(cache_backend)
             cache_handler.close()
-            logger.info(f"✓ Cache backend '{cache_backend}' configuration is valid")
+            logger.debug(f"✓ Cache backend '{cache_backend}' configuration is valid")
         except Exception as e:
             issues.append(f"Cache backend '{cache_backend}' configuration error: {e}")
 
@@ -191,7 +191,7 @@ def validate_environment() -> bool:
         # Try to create a queue handler to validate configuration
         queue_handler = get_queue_handler(queue_provider)
         queue_handler.close()
-        logger.info(f"✓ Queue provider '{queue_provider}' configuration is valid")
+        logger.debug(f"✓ Queue provider '{queue_provider}' configuration is valid")
     except Exception as e:
         issues.append(f"Queue provider '{queue_provider}' configuration error: {e}")
 
@@ -201,7 +201,7 @@ def validate_environment() -> bool:
             logger.error(f"  - {issue}")
         return False
     else:
-        logger.info("✓ Environment validation passed")
+        logger.debug("✓ Environment validation passed")
         return True
 
 
@@ -218,7 +218,7 @@ def check_table_status() -> None:
         lengths = queue_handler.get_queue_lengths()
         queue_handler.close()
 
-        logger.info(f"✓ Queue tables ({queue_provider}) are accessible")
+        logger.debug(f"✓ Queue tables ({queue_provider}) are accessible")
         logger.info(f"  - Original query queue: {lengths.get('original_query_queue', 0)} items")
         logger.info(f"  - Query fragment queue: {lengths.get('query_fragment_queue', 0)} items")
 
@@ -234,10 +234,10 @@ def check_table_status() -> None:
         # Try to access metadata functionality
         try:
             partitions = cache_handler.get_partition_keys()  # type: ignore
-            logger.info(f"✓ Cache metadata tables ({cache_backend}) are accessible")
+            logger.debug(f"✓ Cache metadata tables ({cache_backend}) are accessible")
             logger.info(f"  - Found {len(partitions)} partition keys")
         except AttributeError:
-            logger.info(f"✓ Cache backend ({cache_backend}) is accessible")
+            logger.debug(f"✓ Cache backend ({cache_backend}) is accessible")
 
         cache_handler.close()
 
@@ -310,7 +310,7 @@ def copy_cache(from_cache_type: str, to_cache_type: str, partition_key: str | No
                     if not to_cache.exists(key, current_partition_key):
                         value = from_cache.get(key, current_partition_key)
                         if value is not None:
-                            to_cache.set_set(key, value, current_partition_key)
+                            to_cache.set_cache(key, value, current_partition_key)
                             added += 1
                     else:
                         skipped += 1
@@ -452,10 +452,11 @@ def restore_cache(cache_type: str, archive_file: str, target_partition_key: str 
                     partitions_to_register = set()
 
                     for pk, datatype in partition_metadata:
-                        # If target partition specified, we'll register it when needed
+                        # If target partition specified, register target with source datatype
                         if target_partition_key:
-                            if pk == target_partition_key:
-                                partitions_to_register.add((target_partition_key, datatype))
+                            # Register target partition with source partition's datatype
+                            partitions_to_register.add((target_partition_key, datatype))
+                            break  # Only need first datatype when remapping
                         else:
                             # Register all original partitions
                             partitions_to_register.add((pk, datatype))
@@ -490,9 +491,8 @@ def restore_cache(cache_type: str, archive_file: str, target_partition_key: str 
 
                     queries_restored = 0
                     for query_hash, query_text, source_partition_key in queries_metadata:
-                        # Skip if filtering by specific partition and this doesn't match
-                        if target_partition_key and source_partition_key != target_partition_key:
-                            continue
+                        # Note: When target_partition_key is specified, we're remapping
+                        # So we should NOT skip entries - we import them to the target partition
 
                         # Use target partition if specified, otherwise use source partition
                         effective_partition_key = target_partition_key if target_partition_key else source_partition_key
@@ -513,10 +513,8 @@ def restore_cache(cache_type: str, archive_file: str, target_partition_key: str 
                     value = data["value"]
                     source_partition_key = data["partition_key"]
 
-                    # Skip if filtering by specific partition and this doesn't match
-                    if target_partition_key and source_partition_key != target_partition_key:
-                        skipped_partition_filtered += 1
-                        continue
+                    # Note: When target_partition_key is specified, we're remapping
+                    # So we should NOT skip entries - we import them to the target partition
 
                     # Use target partition if specified, otherwise use source partition
                     effective_partition_key = target_partition_key if target_partition_key else source_partition_key
@@ -539,11 +537,15 @@ def restore_cache(cache_type: str, archive_file: str, target_partition_key: str 
                                 cache.register_partition_key(effective_partition_key, datatype)
                                 partitions_registered += 1
                                 logger.info(f"Auto-registered partition '{effective_partition_key}' with datatype '{datatype}'")
+                                # Verify registration
+                                actual_datatype = cache.get_datatype(effective_partition_key)
+                                if actual_datatype != datatype:
+                                    logger.error(f"Registration verification failed: expected '{datatype}', got '{actual_datatype}'")
                     except Exception as e:
                         logger.warning(f"Could not register partition '{effective_partition_key}': {e}")
 
                     if not cache.exists(key, effective_partition_key):
-                        cache.set_set(key, value, effective_partition_key)
+                        cache.set_cache(key, value, effective_partition_key)
                         restored += 1
                     else:
                         skipped_already_exists += 1
@@ -576,7 +578,7 @@ def restore_cache(cache_type: str, archive_file: str, target_partition_key: str 
                         logger.warning(f"Could not auto-register partition: {e}")
 
                     if not cache.exists(key, partition_key):
-                        cache.set_set(key, value, partition_key)
+                        cache.set_cache(key, value, partition_key)
                         restored += 1
                     else:
                         skipped_already_exists += 1
@@ -867,14 +869,20 @@ def show_comprehensive_status() -> None:
                     if backend.startswith(("redis_", "rocksdb_")):
                         # Test basic connectivity first - this will fail fast if service unavailable
                         try:
-                            if backend.startswith("redis_"):
+                            if isinstance(cache_handler, RedisAbstractCacheHandler):
                                 # Quick Redis ping with timeout
                                 if hasattr(cache_handler, "db") and hasattr(cache_handler.db, "ping"):
                                     cache_handler.db.ping()  # type: ignore[attr-defined]
                             elif backend.startswith("rocksdb_"):
-                                # Quick RocksDB access test
-                                if hasattr(cache_handler, "db") and hasattr(cache_handler.db, "iterkeys"):
-                                    _ = list(cache_handler.db.iterkeys())[:1]  # type: ignore[attr-defined]
+                                try:
+                                    from partitioncache.cache_handler.rocks_db_abstract import RocksDBAbstractCacheHandler
+                                    if isinstance(cache_handler, RocksDBAbstractCacheHandler):
+                                        # Quick RocksDB access test
+                                        if hasattr(cache_handler, "db") and hasattr(cache_handler.db, "iterkeys"):
+                                            _ = list(cache_handler.db.iterkeys())[:1]  # type: ignore[attr-defined]
+                                except ImportError:
+                                    # RocksDB module not available, skip connectivity test
+                                    pass
                         except Exception as conn_error:
                             cache_handler.close()
                             raise Exception(f"Connection failed: {conn_error}") from conn_error
