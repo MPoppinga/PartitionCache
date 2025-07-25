@@ -1,7 +1,3 @@
--- Non-blocking queue upsert functions for PartitionCache
--- Solves concurrency issues with ON CONFLICT + FOR UPDATE SKIP LOCKED
--- Uses FOR UPDATE NOWAIT to avoid blocking when rows are being processed
-
 -- Function for fragment queue (hash, partition_key constraint)
 CREATE OR REPLACE FUNCTION non_blocking_fragment_queue_upsert(
     p_hash TEXT,
@@ -133,40 +129,79 @@ EXCEPTION
 END;
 $$ LANGUAGE plpgsql;
 
--- Helper function to create the functions with custom table names
-CREATE OR REPLACE FUNCTION create_non_blocking_queue_functions(
-    p_original_queue_table TEXT,
-    p_fragment_queue_table TEXT
-) RETURNS VOID AS $$
+
+-- Batch function for fragment queue (wrapper for non_blocking_fragment_queue_upsert)
+CREATE OR REPLACE FUNCTION non_blocking_fragment_queue_batch_upsert(
+    p_hashes TEXT[],
+    p_partition_keys TEXT[], 
+    p_partition_datatypes TEXT[],
+    p_queries TEXT[],
+    p_priorities INT[] DEFAULT NULL,
+    p_queue_table TEXT DEFAULT 'partitioncache_fragmentqueue'
+) RETURNS TABLE(idx INT, hash TEXT, partition_key TEXT, status TEXT) AS $$
+DECLARE
+    v_array_length INT;
+    v_idx INT;
+    v_status TEXT;
 BEGIN
-    -- This function allows creating the upsert functions with custom table names
-    -- for different PartitionCache configurations
+    -- Validate array lengths
+    v_array_length := array_length(p_hashes, 1);
     
-    EXECUTE format($func$
-        CREATE OR REPLACE FUNCTION non_blocking_fragment_queue_upsert_%s(
-            p_hash TEXT, p_partition_key TEXT, p_partition_datatype TEXT,
-            p_query TEXT, p_priority INT DEFAULT 1
-        ) RETURNS TEXT AS $inner$
-        BEGIN
-            RETURN non_blocking_fragment_queue_upsert(p_hash, p_partition_key, p_partition_datatype, p_query, p_priority, %L);
-        END;
-        $inner$ LANGUAGE plpgsql;
-    $func$, replace(p_fragment_queue_table, 'partitioncache_', ''), p_fragment_queue_table);
+    IF v_array_length IS NULL OR v_array_length = 0 THEN
+        RETURN;
+    END IF;
     
-    EXECUTE format($func$
-        CREATE OR REPLACE FUNCTION non_blocking_original_queue_upsert_%s(
-            p_query TEXT, p_partition_key TEXT, p_partition_datatype TEXT, 
-            p_priority INT DEFAULT 1
-        ) RETURNS TEXT AS $inner$
-        BEGIN
-            RETURN non_blocking_original_queue_upsert(p_query, p_partition_key, p_partition_datatype, p_priority, %L);
-        END;
-        $inner$ LANGUAGE plpgsql;
-    $func$, replace(p_original_queue_table, 'partitioncache_', ''), p_original_queue_table);
+    IF array_length(p_partition_keys, 1) != v_array_length OR
+       array_length(p_partition_datatypes, 1) != v_array_length OR
+       array_length(p_queries, 1) != v_array_length OR
+       (p_priorities IS NOT NULL AND array_length(p_priorities, 1) != v_array_length) THEN
+        RAISE EXCEPTION 'All input arrays must have the same length';
+    END IF;
     
-    RAISE NOTICE 'Created non-blocking queue functions for tables: % and %', p_original_queue_table, p_fragment_queue_table;
+    -- Process each item using the existing function
+    FOR v_idx IN 1..v_array_length LOOP
+        v_status := non_blocking_fragment_queue_upsert(
+            p_hashes[v_idx],
+            p_partition_keys[v_idx],
+            p_partition_datatypes[v_idx],
+            p_queries[v_idx],
+            COALESCE(p_priorities[v_idx], 1),
+            p_queue_table
+        );
+        
+        -- Return result for this item
+        RETURN QUERY SELECT v_idx, p_hashes[v_idx], p_partition_keys[v_idx], v_status;
+    END LOOP;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Overloaded version with default queue table and priorities
+CREATE OR REPLACE FUNCTION non_blocking_fragment_queue_batch_upsert(
+    p_hashes TEXT[],
+    p_partition_keys TEXT[], 
+    p_partition_datatypes TEXT[],
+    p_queries TEXT[]
+) RETURNS TABLE(idx INT, hash TEXT, partition_key TEXT, status TEXT) AS $$
+BEGIN
+    RETURN QUERY
+    SELECT * FROM non_blocking_fragment_queue_batch_upsert(
+        p_hashes,
+        p_partition_keys,
+        p_partition_datatypes,
+        p_queries,
+        NULL::INT[],
+        'partitioncache_fragmentqueue'
+    );
 END;
 $$ LANGUAGE plpgsql;
 
 -- Example usage:
--- SELECT create_non_blocking_queue_functions('partitioncache_originalqueue', 'partitioncache_fragmentqueue');
+
+-- Batch usage example:
+-- SELECT * FROM non_blocking_fragment_queue_batch_upsert(
+--     ARRAY['hash1', 'hash2', 'hash3'],
+--     ARRAY['city_id', 'city_id', 'city_id'],
+--     ARRAY['integer', 'integer', 'integer'],
+--     ARRAY['SELECT * FROM table1', 'SELECT * FROM table2', 'SELECT * FROM table3'],
+--     ARRAY[1, 2, 1]
+-- );

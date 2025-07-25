@@ -96,10 +96,11 @@ All cache handlers support multiple partition keys with independent datatypes:
 ### Queue Integration
 
 **PostgreSQL Queue Handler Features:**
-- **Regular Functions**: Use `INSERT ... ON CONFLICT DO NOTHING` for maximum performance
-- **Priority Functions**: Non-blocking priority increment with `FOR UPDATE NOWAIT`
+- **Non-blocking Operations**: All queue operations use non-blocking upsert functions
+- **Batch Processing**: Fragment queues use efficient batch upsert for multiple items
+- **Priority Management**: Duplicate entries increment priority for better scheduling
 - **Automatic Deployment**: Non-blocking functions deployed during handler initialization
-- **Graceful Fallback**: System works without functions, just with potential blocking
+- **Graceful Fallback**: System works without functions, using traditional upsert methods
 
 ### Usage Examples
 

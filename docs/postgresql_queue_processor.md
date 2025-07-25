@@ -8,7 +8,7 @@ This approach offers significant advantages in reliability, performance, and ope
 
 ### Cross-Database Architecture Support
 
-**New in v2.0+**: PartitionCache now supports cross-database pg_cron configurations where:
+PartitionCache supports cross-database pg_cron configurations where:
 - **pg_cron** is installed in a central database (typically `postgres`)
 - **Work databases** contain PartitionCache tables and business logic
 - **Jobs execute** in work databases via `cron.schedule_in_database()`

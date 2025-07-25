@@ -24,7 +24,7 @@ The PostgreSQL Eviction Manager provides automatic, scheduled cache eviction usi
 
 ### Cross-Database Architecture Support
 
-**New in v2.0+**: The eviction manager now supports cross-database pg_cron configurations where:
+The eviction manager supports cross-database pg_cron configurations where:
 - **pg_cron** is installed in a central database (typically `postgres`)
 - **Cache databases** contain PartitionCache tables and eviction logic
 - **Jobs execute** in cache databases via `cron.schedule_in_database()`

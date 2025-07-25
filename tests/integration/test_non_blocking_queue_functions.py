@@ -4,8 +4,6 @@ Tests concurrent behavior and verifies the functions handle locking correctly.
 """
 
 import threading
-import time
-from unittest.mock import patch
 
 import pytest
 
@@ -223,20 +221,20 @@ class TestNonBlockingQueueFunctions:
         assert lengths["query_fragment_queue"] == 2
 
     def test_regular_vs_priority_queue_behavior(self, postgresql_handler, db_connection):
-        """Test the difference between regular and priority queue functions."""
+        """Test that both regular and priority queue functions now use proper upsert behavior."""
         cursor = db_connection.cursor()
 
-        # Test regular functions (ON CONFLICT DO NOTHING)
+        # Test regular functions now use proper upsert (no longer ON CONFLICT DO NOTHING)
         success1 = postgresql_handler.push_to_original_query_queue("SELECT regular", "test_partition", "text")
         success2 = postgresql_handler.push_to_original_query_queue("SELECT regular", "test_partition", "text")  # Same query
         assert success1 and success2
 
-        # Check priority remains 1 for regular function
+        # Check priority is now incremented for regular function too (no more ON CONFLICT DO NOTHING)
         cursor.execute(f"SELECT priority FROM {postgresql_handler.original_queue_table} WHERE query = %s", ("SELECT regular",))
         priority = cursor.fetchone()[0]
-        assert priority == 1, "Regular function should not increment priority"
+        assert priority == 2, "Regular function now properly increments priority on duplicate"
 
-        # Test priority functions (non-blocking with increment)
+        # Test priority functions (same behavior as regular functions now)
         success1 = postgresql_handler.push_to_original_query_queue_with_priority("SELECT priority", "test_partition", 1, "text")
         success2 = postgresql_handler.push_to_original_query_queue_with_priority("SELECT priority", "test_partition", 1, "text")  # Same query
         assert success1 and success2
@@ -246,13 +244,13 @@ class TestNonBlockingQueueFunctions:
         priority = cursor.fetchone()[0]
         assert priority > 1, "Priority function should increment priority on duplicate"
 
-        # Test fragment queue behavior
+        # Test fragment queue behavior - now both functions use proper upsert
         success1 = postgresql_handler.push_to_query_fragment_queue([("SELECT frag", "regular_hash")], "test_partition", "text")
         success2 = postgresql_handler.push_to_query_fragment_queue([("SELECT frag", "regular_hash")], "test_partition", "text")  # Same
 
         cursor.execute(f"SELECT priority FROM {postgresql_handler.fragment_queue_table} WHERE hash = %s", ("regular_hash",))
         priority_regular = cursor.fetchone()[0]
-        assert priority_regular == 1, "Regular fragment function should not increment priority"
+        assert priority_regular == 2, "Regular fragment function now properly increments priority on duplicate"
 
         success1 = postgresql_handler.push_to_query_fragment_queue_with_priority([("SELECT frag2", "priority_hash")], "test_partition", 1, "text")
         success2 = postgresql_handler.push_to_query_fragment_queue_with_priority([("SELECT frag2", "priority_hash")], "test_partition", 1, "text")  # Same

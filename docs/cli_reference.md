@@ -299,7 +299,7 @@ Advanced options for controlling how query variants are generated for better cac
 - Adds query fragments to `query_fragment_queue` for async processing
 - **Best for**: Production workloads, complex queries
 - **Processing**: Requires queue processor to be running
-- **Duplicate Handling**: Silently ignores duplicates (ON CONFLICT DO NOTHING)
+- **Duplicate Handling**: Uses non-blocking upsert with priority increment
 
 #### Original Queue Processing
 ```bash
@@ -308,14 +308,14 @@ Advanced options for controlling how query variants are generated for better cac
 - Adds complete query to `original_query_queue`
 - **Best for**: When you want the queue processor to handle decomposition
 - **Processing**: Queue processor will fragment and process automatically
-- **Duplicate Handling**: Silently ignores duplicates (ON CONFLICT DO NOTHING)
+- **Duplicate Handling**: Uses non-blocking upsert with priority increment
 
-#### Priority Queue Processing (PostgreSQL Only)
-When using the PostgreSQL queue handler API directly:
-- `push_to_*_queue_with_priority()` methods enable priority tracking
-- Duplicate entries increment priority counter
-- Non-blocking concurrency handling prevents deadlocks
-- Useful for tracking query popularity or processing priority
+#### Queue Operations (PostgreSQL)
+All queue operations now use non-blocking upsert functions:
+- **Batch Processing**: Fragment queues use efficient batch operations
+- **Priority Management**: Duplicate entries increment priority counter
+- **Concurrency Safe**: No blocking on concurrent insertions
+- **Performance**: Optimal throughput with proper concurrency handling
 
 ### Backend Configuration
 - `--queue-provider QUERY_QUEUE_PROVIDER` - Queue provider (`postgresql`, `redis`)
@@ -485,11 +485,15 @@ pcache-monitor [options]
   - **Simple**: Uses regular polling with sleep intervals
   - **Use case**: Troubleshooting or compatibility issues
 
-### Cache Optimization Options for fragment queries in queue
+### Cache Optimization Options
+
+Cache-aware optimization leverages existing cache entries to restrict the search space of new queries before execution. When enabled, the monitor analyzes incoming fragment queries to identify potential cache matches, checks existing cache entries for overlapping conditions, applies restrictions to queries using cached partition keys, and preserves original queries in the cache while executing optimized versions. This approach significantly reduces database load by constraining queries to known partition key sets.
+
 - `--enable-cache-optimization` - Enable cache-aware optimization for fragment queries
   - **Default**: Disabled
   - **Purpose**: Check existing cache entries to restrict search space before execution
   - **Benefit**: Reduces database load by applying IN/subquery restrictions
+  - **Algorithm**: Generates subquery variants, checks cache for existing entries, applies restrictions if cache hits meet threshold
 - `--cache-optimization-method {IN,VALUES,IN_SUBQUERY,TMP_TABLE_IN,TMP_TABLE_JOIN}` - Method for applying cache restrictions
   - **Default**: `IN`
   - **`IN`**: Simple IN clause with partition keys
@@ -505,6 +509,7 @@ pcache-monitor [options]
   - **Default**: `--prefer-lazy-optimization` (enabled)
   - **Purpose**: Use more efficient lazy subqueries with PostgreSQL backends
   - **Note**: Lazy methods don't materialize results upfront
+  - **Backend Support**: PostgreSQL (Array, Bit, RoaringBit) supports lazy optimization; Redis and RocksDB backends use standard methods only
 
 ### Variant Generation Configuration
 Controls how query variants are generated when processing original queries from the queue:

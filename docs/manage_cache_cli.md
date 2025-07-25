@@ -107,6 +107,18 @@ pcache-manage cache count --all
 - `--type CACHE_TYPE`: Cache type (default: from CACHE_BACKEND env var) - e.g., postgresql_array, redis_set, rocksdb_set
 - `--all`: Count all cache types
 
+#### `cache overview`
+Show detailed partition overview with statistics.
+
+```bash
+# Show partition overview (uses CACHE_BACKEND from environment)
+pcache-manage cache overview
+```
+
+- Displays partition keys, datatypes, and entry counts
+- Shows cache utilization statistics
+- Provides comprehensive cache status information
+
 #### `cache copy`
 Copy cache from one type to another.
 
@@ -336,10 +348,12 @@ pcache-manage maintenance partition --delete old_partition
 Supported cache types:
 - `postgresql_array`: PostgreSQL with array storage
 - `postgresql_bit`: PostgreSQL with bit storage
+- `postgresql_roaringbit`: PostgreSQL with RoaringBitmap storage
 - `redis_set`: Redis with set storage
 - `redis_bit`: Redis with bit storage
 - `rocksdb_set`: RocksDB with set storage
 - `rocksdb_bit`: RocksDB with bit storage
+- `rocksdict`: RocksDB with dictionary-based storage
 
 ## Environment Variables
 

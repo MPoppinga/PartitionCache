@@ -1,6 +1,6 @@
 # Cross-Database pg_cron Setup for PartitionCache
 
-This document provides comprehensive guidance for setting up pg_cron with PartitionCache in a cross-database configuration, where pg_cron is installed in one database (typically `postgres`) and jobs execute in work databases (e.g., `partition_cache_db`, `osm_example_db`).
+This document provides comprehensive guidance for setting up pg_cron with PartitionCache in a cross-database configuration, where pg_cron is installed in one database (deafult  `postgres` or designated `cron`) and jobs execute in work databases (e.g., `partition_cache_db`, `osm_example_db`).
 
 ## Architecture Overview
 

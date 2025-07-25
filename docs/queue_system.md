@@ -42,9 +42,10 @@ PartitionCache implements a sophisticated two-queue system that separates query 
 - Partition key tracking in dedicated columns
 - LISTEN/NOTIFY for real-time processing
 - Comprehensive indexing for optimal performance
-- **Dual-strategy queue operations** for optimal performance:
-  - Regular functions: `INSERT ... ON CONFLICT DO NOTHING` for maximum speed
-  - Priority functions: Non-blocking priority increment with concurrency handling
+- **Non-blocking queue operations** for optimal performance:
+  - All queue operations use non-blocking upsert functions for proper concurrency handling
+  - Batch processing for fragment queues improves performance on large query sets
+  - Priority increment for duplicates ensures important queries get processed first
 
 **Configuration:**
 See [CLI Reference - Global Options](cli_reference.md#global-options) for complete environment setup.
@@ -90,21 +91,39 @@ See [CLI Reference - Global Options](cli_reference.md#global-options) for Redis 
 
 ## Queue Operations
 
-### PostgreSQL Queue Strategies
+### PostgreSQL Queue Operations
 
-PostgreSQL provider offers two operation strategies for different use cases:
+All PostgreSQL queue operations now use a unified approach for optimal performance and reliability:
 
-#### Strategy 1: Regular Queue Functions (Default)
-- **Method**: `INSERT ... ON CONFLICT DO NOTHING`
-- **Performance**: Maximum speed, no blocking
-- **Behavior**: Duplicates are silently ignored
-- **Use Case**: Basic queue population, high-throughput scenarios
+#### Non-blocking Queue Functions
+- **Method**: Non-blocking functions with `FOR UPDATE SKIP LOCKED`
+- **Performance**: Optimal throughput with proper concurrency handling  
+- **Behavior**: Duplicate entries increment priority counter appropriately
+- **Batch Support**: Fragment queues use efficient batch upsert operations
+- **Fallback**: Graceful degradation to traditional upsert if functions unavailable
 
-#### Strategy 2: Priority Queue Functions
-- **Method**: Non-blocking functions with `FOR UPDATE NOWAIT`
-- **Performance**: Slightly slower but handles concurrency gracefully
-- **Behavior**: Duplicate entries increment priority counter
-- **Use Case**: When tracking duplicate attempts or priority ordering matters
+#### Key Benefits
+- **No Blocking**: Avoids row-level locks that could stall high-concurrency scenarios
+- **Priority Management**: Ensures frequently requested queries get higher priority
+- **Batch Efficiency**: Processes multiple fragments in single database calls
+- **Concurrency Safe**: Proper handling of concurrent insertions and updates
+
+**Technical Implementation:**
+The priority functions use PostgreSQL's `FOR UPDATE NOWAIT` to avoid blocking when encountering rows locked by `FOR UPDATE SKIP LOCKED`. The non-blocking approach:
+1. Tries `SELECT ... FOR UPDATE NOWAIT` to check if row exists
+2. If row exists and unlocked → UPDATE priority
+3. If row doesn't exist → INSERT with ON CONFLICT handling
+4. If row is locked → Return 'skipped_locked'
+5. Handle concurrent INSERT races → Return 'skipped_concurrent'
+
+**Python API for Priority Operations:**
+```python
+# Strategy 2: Priority operations
+handler.push_to_original_query_queue_with_priority(query, partition_key, priority)
+handler.push_to_query_fragment_queue_with_priority(query_hash_pairs, partition_key, priority)
+```
+
+The non-blocking functions (`non_blocking_fragment_queue_upsert()`, `non_blocking_original_queue_upsert()`) are automatically deployed during PostgreSQL queue handler initialization from `postgresql_queue_helper.sql`.
 
 ### Core Functions
 

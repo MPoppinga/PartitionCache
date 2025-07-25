@@ -19,7 +19,7 @@ partitioncache/
 
 ### Cache Management
 
-#### `create_cache_helper(cache_type: str, partition_key: str, datatype: str | None) -> PartitionCacheHelper`
+#### `create_cache_helper(cache_type: str, partition_key: str, datatype: str | None, **kwargs) -> PartitionCacheHelper`
 
 Creates a cache helper with automatic validation and configuration.
 
@@ -27,6 +27,7 @@ Creates a cache helper with automatic validation and configuration.
 - `cache_type` (str): Backend type (`postgresql_array`, `redis_set`, etc.)
 - `partition_key` (str): Default partition key name
 - `datatype` (str | None): Data type (`integer`, `float`, `text`, `timestamp`). Can be `None` if the partition key is already registered.
+- `**kwargs`: Additional configuration options (e.g., bitsize for bit handlers)
 
 **Returns:**
 - `PartitionCacheHelper`: Configured cache helper instance
@@ -86,7 +87,7 @@ if 'float' in backends['postgresql_array']:
 
 ### Query Processing
 
-#### `get_partition_keys(query: str, cache_handler: AbstractCacheHandler, partition_key: str, min_component_size=2, canonicalize_queries=False)`
+#### `get_partition_keys(query: str, cache_handler: AbstractCacheHandler, partition_key: str, min_component_size=2, canonicalize_queries=False, auto_detect_star_join: bool = True, star_join_table: str | None = None, bucket_steps: float = 1.0, add_constraints: dict[str, str] | None = None, remove_constraints_all: list[str] | None = None, remove_constraints_add: list[str] | None = None)`
 
 Retrieves cached partition keys for a query with comprehensive statistics.
 
@@ -96,6 +97,12 @@ Retrieves cached partition keys for a query with comprehensive statistics.
 - `partition_key` (str): Partition column name
 - `min_component_size` (int): The minimum number of tables in the partial queries.
 - `canonicalize_queries` (bool): If True, the query is canonicalized before hashing.
+- `auto_detect_star_join` (bool): Whether to auto-detect star-join tables (default: True)
+- `star_join_table` (str | None): Explicitly specified star-join table alias or name
+- `bucket_steps` (float): Step size for normalizing distance conditions (default: 1.0)
+- `add_constraints` (dict[str, str] | None): Dict mapping table names to constraints to add
+- `remove_constraints_all` (list[str] | None): List of attribute names to remove from all query variants
+- `remove_constraints_add` (list[str] | None): List of attribute names to remove, creating additional variants
 
 **Returns:**
 - `Tuple[Set, int, int]`: (partition_keys, subqueries_generated, cache_hits)
@@ -532,61 +539,31 @@ for hash_value in hashes:
     print(f"Hash: {hash_value}")
 ```
 
-### `normalize_query(query)`
-
-Normalizes SQL query for consistent hashing.
-
-**Example:**
-```python
-from partitioncache.query_processor import normalize_query
-
-# Normalize for consistent comparison
-normalized = normalize_query("SELECT   *   FROM users WHERE age>25")
-# Returns: "SELECT * FROM users WHERE age > 25"
-```
-
 ## Error Handling
 
-### Exception Classes
+PartitionCache uses standard Python exceptions for error handling. Most operations return boolean values or None to indicate success/failure states.
 
-#### `PartitionCacheError`
-
-Base exception for PartitionCache-specific errors.
-
-#### `ValidationError`
-
-Raised for datatype or configuration validation errors.
-
-#### `BackendError`
-
-Raised for cache backend-specific errors.
-
-### Error Handling Patterns
+### Common Error Patterns
 
 ```python
 import partitioncache
-from partitioncache.exceptions import PartitionCacheError, ValidationError
 
 try:
     # Cache operations
     cache = partitioncache.create_cache_helper("postgresql_array", "user_id", "integer")
     result = cache.get("query_hash")
     
-except ValidationError as e:
-    print(f"Configuration error: {e}")
-    # Handle validation issues
-    
-except BackendError as e:
-    print(f"Backend error: {e}")
-    # Handle cache backend issues
-    
-except PartitionCacheError as e:
-    print(f"General PartitionCache error: {e}")
-    # Handle other PartitionCache issues
+    # Check operation success
+    if not cache.set_cache("key1", {1, 2, 3}):
+        print("Failed to store data in cache")
+        
+except ValueError as e:
+    print(f"Configuration or validation error: {e}")
+    # Handle datatype mismatches, invalid parameters
     
 except Exception as e:
     print(f"Unexpected error: {e}")
-    # Handle unexpected issues
+    # Handle database connection issues, etc.
 ```
 
 ## Configuration and Environment

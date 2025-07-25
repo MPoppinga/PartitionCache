@@ -571,12 +571,12 @@ def restore_cache(cache_type: str, archive_file: str, target_partition_key: str 
                                 # Handle bitsize for bit cache handlers
                                 kwargs = {}
                                 if hasattr(cache, '_get_partition_bitsize'):
-                                    existing_bitsize = cache._get_partition_bitsize(effective_partition_key)
+                                    existing_bitsize = cache._get_partition_bitsize(effective_partition_key)  # type: ignore[attr-defined]
                                     if bitsize is not None:
                                         kwargs['bitsize'] = bitsize
                                         if existing_bitsize is not None and existing_bitsize != bitsize:
                                             logger.info(f"Updating bitsize from {existing_bitsize} to {bitsize} for partition '{effective_partition_key}'")
-                                            cache._set_partition_bitsize(effective_partition_key, bitsize)
+                                            cache._set_partition_bitsize(effective_partition_key, bitsize)  # type: ignore[attr-defined]
                                     elif existing_bitsize is not None:
                                         kwargs['bitsize'] = existing_bitsize
                                 elif bitsize is not None:
