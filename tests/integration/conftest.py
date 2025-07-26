@@ -759,27 +759,46 @@ def manual_queue_processor(db_session, db_connection, cache_client):
                 max_parallel_jobs INTEGER NOT NULL DEFAULT 2,
                 frequency_seconds INTEGER NOT NULL DEFAULT 1,
                 timeout_seconds INTEGER NOT NULL DEFAULT 1800,
+                stale_after_seconds INTEGER NOT NULL DEFAULT 3600,
                 table_prefix TEXT NOT NULL,
                 queue_prefix TEXT NOT NULL,
                 cache_backend TEXT NOT NULL,
                 target_database TEXT NOT NULL,
                 result_limit INTEGER DEFAULT NULL,
                 default_bitsize INTEGER DEFAULT NULL,
+                job_ids BIGINT[] DEFAULT ARRAY[]::BIGINT[],
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
             """
         )
         
-        # Add default_bitsize column if it doesn't exist (for existing tables)
+        # Add missing columns if they don't exist (for existing tables)
         cur.execute(
             f"""
             DO $$
             BEGIN
+                -- Add default_bitsize column
                 IF NOT EXISTS (
                     SELECT 1 FROM information_schema.columns 
                     WHERE table_name = '{config_table}' AND column_name = 'default_bitsize'
                 ) THEN
                     ALTER TABLE {config_table} ADD COLUMN default_bitsize INTEGER DEFAULT NULL;
+                END IF;
+                
+                -- Add stale_after_seconds column
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns 
+                    WHERE table_name = '{config_table}' AND column_name = 'stale_after_seconds'
+                ) THEN
+                    ALTER TABLE {config_table} ADD COLUMN stale_after_seconds INTEGER NOT NULL DEFAULT 3600;
+                END IF;
+                
+                -- Add job_ids column
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns 
+                    WHERE table_name = '{config_table}' AND column_name = 'job_ids'
+                ) THEN
+                    ALTER TABLE {config_table} ADD COLUMN job_ids BIGINT[] DEFAULT ARRAY[]::BIGINT[];
                 END IF;
             END $$;
             """

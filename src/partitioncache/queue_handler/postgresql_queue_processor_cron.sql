@@ -45,7 +45,31 @@ DECLARE
     v_new_job_ids BIGINT[] := ARRAY[]::BIGINT[];
     v_old_job_id BIGINT;
     v_schedule TEXT;
+    v_pg_cron_available BOOLEAN := FALSE;
 BEGIN
+    -- Check if pg_cron extension is available
+    BEGIN
+        PERFORM 1 FROM pg_extension WHERE extname = 'pg_cron';
+        IF FOUND THEN
+            v_pg_cron_available := TRUE;
+        END IF;
+    EXCEPTION WHEN OTHERS THEN
+        v_pg_cron_available := FALSE;
+    END;
+
+    -- If pg_cron is not available, skip cron operations but allow trigger to proceed
+    IF NOT v_pg_cron_available THEN
+        RAISE NOTICE 'pg_cron extension not available, skipping cron job synchronization for job: %', 
+            CASE WHEN TG_OP = 'DELETE' THEN OLD.job_name ELSE NEW.job_name END;
+        
+        -- Clear job_ids array since no jobs can be scheduled
+        IF TG_OP != 'DELETE' THEN
+            NEW.job_ids := ARRAY[]::BIGINT[];
+        END IF;
+        
+        RETURN CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END;
+    END IF;
+
     IF (TG_OP = 'DELETE') THEN
         -- Unschedule all jobs stored in job_ids array
         IF OLD.job_ids IS NOT NULL THEN
@@ -103,6 +127,7 @@ BEGIN
                 END IF;
             END IF;
             
+            -- This should only be reached if pg_cron is available (checked above)
             SELECT cron.schedule_in_database(
                 v_job_name,
                 v_schedule,
@@ -246,38 +271,76 @@ RETURNS TABLE(
 ) AS $$
 DECLARE
     v_config_table TEXT;
+    v_pg_cron_available BOOLEAN := FALSE;
 BEGIN
     v_config_table := p_queue_prefix || '_processor_config';
 
-    RETURN QUERY
-    EXECUTE format(
-        'WITH cron_jobs AS (
+    -- Check if pg_cron extension is available
+    BEGIN
+        PERFORM 1 FROM pg_extension WHERE extname = 'pg_cron';
+        IF FOUND THEN
+            v_pg_cron_available := TRUE;
+        END IF;
+    EXCEPTION WHEN OTHERS THEN
+        v_pg_cron_available := FALSE;
+    END;
+
+    IF v_pg_cron_available THEN
+        -- Query with cron.job table
+        RETURN QUERY
+        EXECUTE format(
+            'WITH cron_jobs AS (
+                SELECT
+                    active,
+                    schedule,
+                    command
+                FROM cron.job
+                WHERE jobname LIKE %L || %L
+            )
             SELECT
-                active,
-                schedule,
-                command
-            FROM cron.job
-            WHERE jobname LIKE %L || %L
-        )
-        SELECT
-            conf.job_name,
-            conf.enabled,
-            conf.max_parallel_jobs,
-            conf.frequency_seconds,
-            conf.timeout_seconds,
-            conf.table_prefix,
-            conf.queue_prefix,
-            conf.cache_backend,
-            conf.target_database,
-            conf.updated_at,
-            (SELECT bool_or(active) FROM cron_jobs) as job_is_active,
-            (SELECT schedule FROM cron_jobs LIMIT 1) as job_schedule,
-            (SELECT command FROM cron_jobs LIMIT 1) as job_command
-        FROM
-            %I conf
-        WHERE
-            conf.job_name = %L',
-        p_job_name, '_%', v_config_table, p_job_name
-    );
+                conf.job_name,
+                conf.enabled,
+                conf.max_parallel_jobs,
+                conf.frequency_seconds,
+                conf.timeout_seconds,
+                conf.table_prefix,
+                conf.queue_prefix,
+                conf.cache_backend,
+                conf.target_database,
+                conf.updated_at,
+                (SELECT bool_or(active) FROM cron_jobs) as job_is_active,
+                (SELECT schedule FROM cron_jobs LIMIT 1) as job_schedule,
+                (SELECT command FROM cron_jobs LIMIT 1) as job_command
+            FROM
+                %I conf
+            WHERE
+                conf.job_name = %L',
+            p_job_name, '_%', v_config_table, p_job_name
+        );
+    ELSE
+        -- Query without cron.job table when pg_cron is not available
+        RETURN QUERY
+        EXECUTE format(
+            'SELECT
+                conf.job_name,
+                conf.enabled,
+                conf.max_parallel_jobs,
+                conf.frequency_seconds,
+                conf.timeout_seconds,
+                conf.table_prefix,
+                conf.queue_prefix,
+                conf.cache_backend,
+                conf.target_database,
+                conf.updated_at,
+                FALSE as job_is_active,
+                NULL::TEXT as job_schedule,
+                NULL::TEXT as job_command
+            FROM
+                %I conf
+            WHERE
+                conf.job_name = %L',
+            v_config_table, p_job_name
+        );
+    END IF;
 END;
 $$ LANGUAGE plpgsql;
