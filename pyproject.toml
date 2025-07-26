@@ -59,6 +59,8 @@ license-files = ["COPYING", "COPYING.LESSER"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+timeout = 300  # 5 minutes maximum per test
+timeout_method = "thread"
 
 [project.scripts]
 pcache-manage = "partitioncache.cli.manage_cache:main"

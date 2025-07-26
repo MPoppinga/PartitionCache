@@ -369,11 +369,22 @@ def db_session(db_connection):
         pass
 
     with conn.cursor() as cur:
-        # Remove any test cron jobs
+        # Remove any test cron jobs with timeout protection
         try:
-            cur.execute("DELETE FROM cron.job WHERE jobname LIKE 'test_%';")
+            # Check if cron.job table exists before cleanup
+            cur.execute("""
+                SELECT EXISTS (
+                    SELECT FROM information_schema.tables
+                    WHERE table_schema = 'cron' AND table_name = 'job'
+                );
+            """)
+            if cur.fetchone()[0]:
+                # Set a statement timeout to prevent hanging during cleanup
+                cur.execute("SET LOCAL statement_timeout = '5s';")
+                cur.execute("DELETE FROM cron.job WHERE jobname LIKE 'test_%';")
         except Exception:
-            pass  # pg_cron might not be available
+            # If cleanup fails or times out, don't let it break the test suite
+            pass
 
 
 # Base backends that should always be available
@@ -771,7 +782,7 @@ def manual_queue_processor(db_session, db_connection, cache_client):
             )
             """
         )
-        
+
         # Add missing columns if they don't exist (for existing tables)
         cur.execute(
             f"""
@@ -779,23 +790,23 @@ def manual_queue_processor(db_session, db_connection, cache_client):
             BEGIN
                 -- Add default_bitsize column
                 IF NOT EXISTS (
-                    SELECT 1 FROM information_schema.columns 
+                    SELECT 1 FROM information_schema.columns
                     WHERE table_name = '{config_table}' AND column_name = 'default_bitsize'
                 ) THEN
                     ALTER TABLE {config_table} ADD COLUMN default_bitsize INTEGER DEFAULT NULL;
                 END IF;
-                
+
                 -- Add stale_after_seconds column
                 IF NOT EXISTS (
-                    SELECT 1 FROM information_schema.columns 
+                    SELECT 1 FROM information_schema.columns
                     WHERE table_name = '{config_table}' AND column_name = 'stale_after_seconds'
                 ) THEN
                     ALTER TABLE {config_table} ADD COLUMN stale_after_seconds INTEGER NOT NULL DEFAULT 3600;
                 END IF;
-                
+
                 -- Add job_ids column
                 IF NOT EXISTS (
-                    SELECT 1 FROM information_schema.columns 
+                    SELECT 1 FROM information_schema.columns
                     WHERE table_name = '{config_table}' AND column_name = 'job_ids'
                 ) THEN
                     ALTER TABLE {config_table} ADD COLUMN job_ids BIGINT[] DEFAULT ARRAY[]::BIGINT[];
@@ -854,7 +865,7 @@ def postgresql_queue_processor(postgresql_queue_functions, db_session, cache_cli
         config_table = f"{queue_prefix}_processor_config"
         # Convert full backend names to simplified names for SQL functions
         simplified_backend = cache_backend.replace("postgresql_", "") if cache_backend.startswith("postgresql_") else cache_backend
-        
+
         cur.execute(
             f"""
             INSERT INTO {config_table}
