@@ -51,6 +51,12 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
 
     def _get_connection(self):
         """Get PostgreSQL connection with proper configuration."""
+        # Always create fresh connections to avoid transaction state pollution
+        # that can cause hanging in concurrent scenarios
+        return psycopg.connect(host=self.host, port=self.port, user=self.user, password=self.password, dbname=self.dbname)
+
+    def _get_persistent_connection(self):
+        """Get a persistent connection for initialization tasks only."""
         if self._connection is None or self._connection.closed:
             self._connection = psycopg.connect(host=self.host, port=self.port, user=self.user, password=self.password, dbname=self.dbname)
         return self._connection
@@ -58,7 +64,7 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
     def _initialize_tables(self):
         """Initialize PostgreSQL tables for queue storage."""
         try:
-            conn = self._get_connection()
+            conn = self._get_persistent_connection()
             cursor = conn.cursor()
 
             # Create original query queue table with partition_key and priority
@@ -188,7 +194,7 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
     def _deploy_non_blocking_functions(self):
         """Deploy non-blocking queue upsert functions."""
         try:
-            conn = self._get_connection()
+            conn = self._get_persistent_connection()
             cursor = conn.cursor()
 
             # Check if functions already exist
@@ -241,6 +247,7 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
         Returns:
             bool: True if the query was pushed successfully, False otherwise.
         """
+        conn = None
         try:
             conn = self._get_connection()
             cursor = conn.cursor()
@@ -275,6 +282,13 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
         except Exception as e:
             logger.error(f"Failed to push query to PostgreSQL original query queue: {e}")
             return False
+        finally:
+            # Ensure fresh connection is properly closed
+            if conn and not conn.closed:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     def push_to_query_fragment_queue(self, query_hash_pairs: list[tuple[str, str]], partition_key: str, partition_datatype: str | None = None) -> bool:
         """
@@ -292,6 +306,7 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
         if not query_hash_pairs:
             return True
 
+        conn = None
         try:
             conn = self._get_connection()
             cursor = conn.cursor()
@@ -339,6 +354,13 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
         except Exception as e:
             logger.error(f"Failed to push query fragments to PostgreSQL queue handler: {e}")
             return False
+        finally:
+            # Ensure fresh connection is properly closed
+            if conn and not conn.closed:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     def push_to_original_query_queue_with_priority(self, query: str, partition_key: str, priority: int = 1, partition_datatype: str | None = None) -> bool:
         """
@@ -354,6 +376,7 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
         Returns:
             bool: True if the query was pushed/updated successfully, False otherwise.
         """
+        conn = None
         try:
             conn = self._get_connection()
             cursor = conn.cursor()
@@ -389,6 +412,13 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
         except Exception as e:
             logger.error(f"Failed to push query to PostgreSQL original query queue: {e}")
             return False
+        finally:
+            # Ensure fresh connection is properly closed
+            if conn and not conn.closed:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     def push_to_query_fragment_queue_with_priority(
         self, query_hash_pairs: list[tuple[str, str]], partition_key: str, priority: int = 1, partition_datatype: str | None = None
@@ -410,6 +440,7 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
         if not query_hash_pairs:
             return True
 
+        conn = None
         try:
             conn = self._get_connection()
             cursor = conn.cursor()
@@ -457,6 +488,13 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
         except Exception as e:
             logger.error(f"Failed to push query fragments to PostgreSQL queue handler: {e}")
             return False
+        finally:
+            # Ensure fresh connection is properly closed
+            if conn and not conn.closed:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     def pop_from_original_query_queue(self) -> tuple[str, str, str] | None:
         """
