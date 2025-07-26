@@ -157,20 +157,38 @@ RETURNS VOID AS $$
 DECLARE
     v_config_table TEXT;
     v_trigger_name TEXT;
+    v_pg_cron_available BOOLEAN := FALSE;
 BEGIN
     v_config_table := p_queue_prefix || '_processor_config';
     v_trigger_name := 'trg_sync_cron_job_' || replace(v_config_table, '.', '_');
 
+    -- Check if pg_cron extension is available
+    BEGIN
+        PERFORM 1 FROM pg_extension WHERE extname = 'pg_cron';
+        IF FOUND THEN
+            v_pg_cron_available := TRUE;
+        END IF;
+    EXCEPTION WHEN OTHERS THEN
+        v_pg_cron_available := FALSE;
+    END;
+
     -- Drop existing trigger to ensure idempotency
     EXECUTE format('DROP TRIGGER IF EXISTS %I ON %I', v_trigger_name, v_config_table);
 
-    -- Create the trigger
-    EXECUTE format('
-        CREATE TRIGGER %I
-        BEFORE INSERT OR UPDATE OR DELETE ON %I
-        FOR EACH ROW
-        EXECUTE FUNCTION partitioncache_sync_cron_job()
-    ', v_trigger_name, v_config_table);
+    -- Only create the trigger if pg_cron is available
+    IF v_pg_cron_available THEN
+        -- Create the trigger
+        EXECUTE format('
+            CREATE TRIGGER %I
+            BEFORE INSERT OR UPDATE OR DELETE ON %I
+            FOR EACH ROW
+            EXECUTE FUNCTION partitioncache_sync_cron_job()
+        ', v_trigger_name, v_config_table);
+        
+        RAISE NOTICE 'Created pg_cron trigger % for table %', v_trigger_name, v_config_table;
+    ELSE
+        RAISE NOTICE 'pg_cron extension not available, skipping trigger creation for table %', v_config_table;
+    END IF;
 END;
 $$ LANGUAGE plpgsql;
 
