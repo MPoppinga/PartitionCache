@@ -748,7 +748,7 @@ def manual_queue_processor(db_session, db_connection, cache_client):
     if not functions_exist and db_connection:
         from partitioncache.cli.postgresql_queue_processor import setup_database_objects
 
-        setup_database_objects(db_connection, include_pg_cron_trigger=False)
+        setup_database_objects(db_connection)
 
     # Setup processor tables and config
     from partitioncache.cli.postgresql_queue_processor import get_queue_table_prefix_from_env, get_table_prefix_from_env

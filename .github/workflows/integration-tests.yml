@@ -293,6 +293,11 @@ jobs:
         # Exclude pg_cron tests from regular runs (they run in dedicated job)
         PYTEST_FLAGS="$PYTEST_FLAGS --ignore=tests/integration/test_pg_cron_integration.py"
         
+        # Exclude CLI tests that require pg_cron from queue processing runs  
+        if [[ "${{ matrix.pattern }}" == "queue" ]]; then
+          PYTEST_FLAGS="$PYTEST_FLAGS -k 'not test_postgresql_queue_processor_enable_disable_workflow'"
+        fi
+        
         if [[ "${{ matrix.parallel }}" == "true" ]]; then
           PYTEST_FLAGS="$PYTEST_FLAGS --parallel"
         fi

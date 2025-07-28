@@ -886,11 +886,11 @@ class TestPostgreSQLQueueProcessorCLI:
         if queue_provider != "postgresql":
             pytest.skip("This test requires PostgreSQL queue provider")
 
-        # Check if pg_cron extension is available
+        # Check if pg_cron extension is installed (not just available)
         with db_session.cursor() as cur:
-            cur.execute("SELECT 1 FROM pg_available_extensions WHERE name = 'pg_cron'")
+            cur.execute("SELECT 1 FROM pg_extension WHERE extname = 'pg_cron'")
             if not cur.fetchone():
-                pytest.skip("pg_cron extension not available")
+                pytest.skip("pg_cron extension not installed - this test should only run in cli-tools-tests job")
 
         # Use existing test environment - trust that CI has set up the environment properly
         env = os.environ.copy()
