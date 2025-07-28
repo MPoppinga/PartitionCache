@@ -43,6 +43,7 @@ show_help() {
     echo "  --ignore PATH        Ignore path/file from tests (can be used multiple times)"
     echo "  --list-backends      List all available cache backends"
     echo "  --pytest-args ARGS   Pass additional arguments to pytest"
+    echo "  -k EXPRESSION        Filter tests by pytest expression (e.g., 'not test_name')"
     echo "  --help, -h           Show this help message"
     echo ""
     echo "Test Patterns:"
@@ -62,6 +63,7 @@ show_help() {
     echo "  $0 --no-setup --pattern queue   # Run queue tests assuming services are running"
     echo "  $0 --ci --parallel              # Run in CI mode with parallel execution"
     echo "  $0 --ignore=tests/integration/test_pg_cron_integration.py # Exclude pg_cron tests"
+    echo "  $0 -k 'not test_name'           # Exclude specific test by name using pytest filter"
 }
 
 # Function to list available backends
@@ -410,6 +412,15 @@ while [[ $# -gt 0 ]]; do
             ;;
         --pytest-args)
             PYTEST_ARGS="$2"
+            shift 2
+            ;;
+        -k)
+            # Handle pytest -k parameter directly
+            if [ -z "$2" ]; then
+                echo -e "${RED}❌ Option -k requires an argument${NC}"
+                exit 1
+            fi
+            PYTEST_ARGS="$PYTEST_ARGS -k '$2'"
             shift 2
             ;;
         --help|-h)
