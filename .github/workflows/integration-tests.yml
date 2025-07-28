@@ -128,14 +128,6 @@ jobs:
             parallel: false
             requires_redis: false
             job_index: 4
-          - name: "CLI Tools"
-            pattern: "test_cli"
-            suffix: "cli"
-            backend_type: "postgresql_array"
-            database_suffix: "cli"
-            parallel: false
-            requires_redis: false
-            job_index: 5
 
     services:
       postgres:
@@ -315,6 +307,103 @@ jobs:
         path: |
           /tmp/ci_rocksdb*/
           /tmp/ci_rocksdict*/
+        retention-days: 7
+        if-no-files-found: ignore
+
+
+  cli-tools-tests:
+    name: CLI Tools Tests (pg_cron)
+    runs-on: ubuntu-latest
+    needs: [build-postgres-image, integration-tests]
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
+    
+    services:
+      postgres:
+        image: ghcr.io/mpoppinga/postgres-test-extensions:${{ needs.build-postgres-image.outputs.image-tag }}
+        env:
+          POSTGRES_USER: integration_user
+          POSTGRES_PASSWORD: integration_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U integration_user -d postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      UNIQUE_DB_NAME: partitioncache_integration
+      CACHE_BACKEND: postgresql_array
+      PG_HOST: localhost
+      PG_PORT: 5432
+      PG_USER: integration_user
+      PG_PASSWORD: integration_password
+      DB_HOST: localhost
+      DB_PORT: 5432
+      DB_USER: integration_user
+      DB_PASSWORD: integration_password
+      PG_QUEUE_HOST: localhost
+      PG_QUEUE_PORT: 5432
+      PG_QUEUE_USER: integration_user
+      PG_QUEUE_PASSWORD: integration_password
+      QUERY_QUEUE_PROVIDER: postgresql
+      PG_ARRAY_CACHE_TABLE_PREFIX: ci_array_cache_cli
+      PG_QUEUE_TABLE_PREFIX: ci_queue_cli
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Setup micromamba
+      uses: mamba-org/setup-micromamba@v1
+      with:
+        micromamba-version: 'latest'
+        environment-file: .github/micromamba-env.yml
+        init-shell: >-
+          bash
+        cache-environment: false
+        post-cleanup: 'all'
+
+    - name: Install PartitionCache
+      shell: micromamba-shell {0}
+      run: |
+        pip install -e ".[testing,db]"
+
+    - name: Verify and configure pg_cron database
+      shell: micromamba-shell {0}
+      run: |
+        echo "Waiting for PostgreSQL..."
+        for i in {1..30}; do
+          if python -c "import psycopg; psycopg.connect('postgresql://integration_user:integration_password@localhost:5432/postgres')" 2>/dev/null; then
+            echo "PostgreSQL ready"
+            break
+          fi
+          sleep 2
+        done
+
+        echo "Using partitioncache_integration database for pg_cron compatibility"
+        echo "Verifying pg_cron database exists and is configured..."
+        python scripts/create_clean_test_database.py --require-pg-cron
+
+        # Set the database name for subsequent steps
+        echo "PG_DBNAME=partitioncache_integration" >> $GITHUB_ENV
+        echo "DB_NAME=partitioncache_integration" >> $GITHUB_ENV
+        echo "PG_QUEUE_DB=partitioncache_integration" >> $GITHUB_ENV
+        echo "PG_CRON_DATABASE=partitioncache_integration" >> $GITHUB_ENV
+
+    - name: Run CLI tests
+      shell: micromamba-shell {0}
+      run: |
+        PYTEST_FLAGS="--ci --pattern test_cli --verbose"
+        ./scripts/run_integration_tests.sh $PYTEST_FLAGS --no-setup
+
+    - name: Upload CLI test artifacts
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: cli-test-results
+        path: |
+          test-logs/
         retention-days: 7
         if-no-files-found: ignore
 
@@ -668,7 +757,7 @@ jobs:
   test-summary:
     name: Test Summary
     runs-on: ubuntu-latest
-    needs: [integration-tests, e2e-tests, performance-tests, pg-cron-tests]
+    needs: [integration-tests, cli-tools-tests, e2e-tests, performance-tests, pg-cron-tests]
     if: always()
     
     steps:
@@ -681,6 +770,13 @@ jobs:
           echo "Integration tests: PASSED"
         else
           echo "Integration tests: FAILED"
+          exit 1
+        fi
+        
+        if [[ "${{ needs.cli-tools-tests.result }}" == "success" ]]; then
+          echo "CLI Tools tests: PASSED"
+        else
+          echo "CLI Tools tests: FAILED"
           exit 1
         fi
         
