@@ -253,6 +253,7 @@ jobs:
         echo "PG_DBNAME=$UNIQUE_DB_NAME" >> $GITHUB_ENV
         echo "DB_NAME=$UNIQUE_DB_NAME" >> $GITHUB_ENV
         echo "PG_QUEUE_DB=$UNIQUE_DB_NAME" >> $GITHUB_ENV
+        echo "PG_CRON_DATABASE=$UNIQUE_DB_NAME" >> $GITHUB_ENV
 
         if [[ "${{ matrix.requires_redis }}" == "true" ]]; then
           echo "Waiting for Redis..."
@@ -413,6 +414,7 @@ jobs:
         echo "PG_DBNAME=$UNIQUE_DB_NAME" >> $GITHUB_ENV
         echo "DB_NAME=$UNIQUE_DB_NAME" >> $GITHUB_ENV
         echo "PG_QUEUE_DB=$UNIQUE_DB_NAME" >> $GITHUB_ENV
+        echo "PG_CRON_DATABASE=$UNIQUE_DB_NAME" >> $GITHUB_ENV
 
     - name: Run E2E tests
       shell: micromamba-shell {0}
@@ -532,6 +534,7 @@ jobs:
         # Set the database name for subsequent steps
         echo "PG_DBNAME=$UNIQUE_DB_NAME" >> $GITHUB_ENV
         echo "DB_NAME=$UNIQUE_DB_NAME" >> $GITHUB_ENV
+        echo "PG_CRON_DATABASE=$UNIQUE_DB_NAME" >> $GITHUB_ENV
 
     - name: Run performance tests
       shell: micromamba-shell {0}
@@ -628,6 +631,7 @@ jobs:
         echo "PG_DBNAME=$UNIQUE_DB_NAME" >> $GITHUB_ENV
         echo "DB_NAME=$UNIQUE_DB_NAME" >> $GITHUB_ENV
         echo "PG_QUEUE_DB=$UNIQUE_DB_NAME" >> $GITHUB_ENV
+        echo "PG_CRON_DATABASE=$UNIQUE_DB_NAME" >> $GITHUB_ENV
 
     - name: Verify pg_cron extension
       shell: micromamba-shell {0}
