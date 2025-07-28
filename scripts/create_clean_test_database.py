@@ -30,8 +30,25 @@ def create_clean_database(unique_db: str, conn_str: str) -> None:
 def setup_database_extensions_and_tables(unique_db: str) -> None:
     """Set up extensions and tables in the newly created database."""
     # Connect to the new database and set up extensions and tables
-    db_conn_str = f"postgresql://integration_user:integration_password@localhost:{os.getenv('PG_PORT', '5432')}/{unique_db}"
-    with psycopg.connect(db_conn_str, autocommit=True) as conn:
+    conn_str_postgres = f"postgresql://integration_user:integration_password@localhost:{os.getenv('PG_PORT', '5432')}/postgres"
+    conn_str_target_db = f"postgresql://integration_user:integration_password@localhost:{os.getenv('PG_PORT', '5432')}/{unique_db}"
+
+    # Connect to 'postgres' database to drop/create the target database
+    with psycopg.connect(conn_str_postgres, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            # Drop database if it exists
+            cur.execute(sql.SQL("SELECT 1 FROM pg_database WHERE datname = %s"), (unique_db,))
+            if cur.fetchone():
+                print(f"Dropping existing database: {unique_db}")
+                cur.execute(sql.SQL("DROP DATABASE {} WITH (FORCE);").format(sql.Identifier(unique_db)))
+
+            # Create clean database
+            print(f"Creating clean database: {unique_db}")
+            cur.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(unique_db)))
+            print(f"Successfully created database: {unique_db}")
+
+    # Connect to the newly created database to set up extensions and tables
+    with psycopg.connect(conn_str_target_db, autocommit=True) as conn:
         with conn.cursor() as cur:
             print("Setting up extensions...")
             # Create roaringbitmap extension (always available)
@@ -149,12 +166,9 @@ def main():
         print("ERROR: UNIQUE_DB_NAME environment variable not set")
         sys.exit(1)
 
-    conn_str = f"postgresql://integration_user:integration_password@localhost:{os.getenv('PG_PORT', '5432')}/postgres"
-
     try:
-        create_clean_database(unique_db, conn_str)
         setup_database_extensions_and_tables(unique_db)
-        print(f"Successfully created and configured database: {unique_db}")
+        print(f"Successfully configured database: {unique_db}")
     except Exception as e:
         print(f"Error creating database: {e}")
         sys.exit(1)

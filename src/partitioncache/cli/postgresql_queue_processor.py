@@ -463,7 +463,7 @@ def enable_processor(conn, queue_prefix: str):
     """Enable the queue processor job."""
     logger.info("Enabling queue processor...")
     with conn.cursor() as cur:
-        cur.execute("SELECT partitioncache_set_processor_enabled(true, %s, 'partitioncache_process_queue')", [queue_prefix])
+        cur.execute("SELECT partitioncache_set_processor_enabled_cron(true, %s, 'partitioncache_process_queue')", [queue_prefix])
     conn.commit()
     logger.info("Queue processor enabled.")
 
@@ -472,7 +472,7 @@ def disable_processor(conn, queue_prefix: str):
     """Disable the queue processor job."""
     logger.info("Disabling queue processor...")
     with conn.cursor() as cur:
-        cur.execute("SELECT partitioncache_set_processor_enabled(false, %s, 'partitioncache_process_queue')", [queue_prefix])
+        cur.execute("SELECT partitioncache_set_processor_enabled_cron(false, %s, 'partitioncache_process_queue')", [queue_prefix])
     conn.commit()
     logger.info("Queue processor disabled.")
 

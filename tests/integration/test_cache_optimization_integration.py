@@ -8,9 +8,7 @@ Tests the complete cache optimization workflow including:
 - Different optimization methods
 """
 
-import os
 import subprocess
-import tempfile
 import time
 
 import pytest
@@ -28,7 +26,7 @@ def cache_optimization_setup(cache_client, request):
     # Skip if not PostgreSQL backend (queue operations require PostgreSQL)
     # Use a simpler approach: check the cache_client type directly
     cache_backend = cache_client.__class__.__name__.lower()
-    
+
     # Also check the string representation for fallback
     if "postgresql" not in cache_backend:
         cache_repr = str(cache_client).lower()
@@ -106,7 +104,7 @@ class TestCacheOptimizationIntegration:
         try:
             # Run for a short time to process the query
             result = subprocess.run(
-                ["pcache-monitor", "--max-processes", "1", "--close", "--status-log-interval", "1"], 
+                ["pcache-monitor", "--max-processes", "1", "--close", "--status-log-interval", "1"],
                 capture_output=True, text=True, timeout=15
             )
 

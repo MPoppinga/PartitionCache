@@ -409,3 +409,91 @@ class TestCLIIntegration:
 
         assert exc_info.value.code == 1
         mock_get_conn.assert_not_called()
+
+
+class TestProcessorEnableDisable:
+    """Test enable/disable processor functionality."""
+
+    @patch("partitioncache.cli.postgresql_queue_processor.get_db_connection")
+    def test_enable_processor_success(self, mock_get_conn):
+        """Test successful processor enable."""
+        from partitioncache.cli.postgresql_queue_processor import enable_processor
+
+        # Setup mocks
+        mock_conn = Mock()
+        mock_cursor = Mock()
+        mock_get_conn.return_value = mock_conn
+        mock_conn.cursor.return_value.__enter__ = Mock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = Mock(return_value=None)
+        mock_conn.commit = Mock()
+
+        # Call the function
+        enable_processor(mock_conn, "test_queue_prefix")
+
+        # Verify the correct function was called
+        mock_cursor.execute.assert_called_once_with(
+            "SELECT partitioncache_set_processor_enabled_cron(true, %s, 'partitioncache_process_queue')",
+            ["test_queue_prefix"]
+        )
+        mock_conn.commit.assert_called_once()
+
+    @patch("partitioncache.cli.postgresql_queue_processor.get_db_connection")
+    def test_disable_processor_success(self, mock_get_conn):
+        """Test successful processor disable."""
+        from partitioncache.cli.postgresql_queue_processor import disable_processor
+
+        # Setup mocks
+        mock_conn = Mock()
+        mock_cursor = Mock()
+        mock_get_conn.return_value = mock_conn
+        mock_conn.cursor.return_value.__enter__ = Mock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = Mock(return_value=None)
+        mock_conn.commit = Mock()
+
+        # Call the function
+        disable_processor(mock_conn, "test_queue_prefix")
+
+        # Verify the correct function was called
+        mock_cursor.execute.assert_called_once_with(
+            "SELECT partitioncache_set_processor_enabled_cron(false, %s, 'partitioncache_process_queue')",
+            ["test_queue_prefix"]
+        )
+        mock_conn.commit.assert_called_once()
+
+    @patch("partitioncache.cli.postgresql_queue_processor.get_db_connection")
+    def test_enable_processor_database_error(self, mock_get_conn):
+        """Test enable processor handles database errors."""
+        from partitioncache.cli.postgresql_queue_processor import enable_processor
+
+        # Setup mocks
+        mock_conn = Mock()
+        mock_cursor = Mock()
+        mock_get_conn.return_value = mock_conn
+        mock_conn.cursor.return_value.__enter__ = Mock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = Mock(return_value=None)
+        
+        # Simulate database error
+        mock_cursor.execute.side_effect = Exception("Function does not exist")
+
+        # Call should raise the exception
+        with pytest.raises(Exception, match="Function does not exist"):
+            enable_processor(mock_conn, "test_queue_prefix")
+
+    @patch("partitioncache.cli.postgresql_queue_processor.get_db_connection")
+    def test_disable_processor_database_error(self, mock_get_conn):
+        """Test disable processor handles database errors.""" 
+        from partitioncache.cli.postgresql_queue_processor import disable_processor
+
+        # Setup mocks
+        mock_conn = Mock()
+        mock_cursor = Mock()
+        mock_get_conn.return_value = mock_conn
+        mock_conn.cursor.return_value.__enter__ = Mock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = Mock(return_value=None)
+        
+        # Simulate database error
+        mock_cursor.execute.side_effect = Exception("Function does not exist")
+
+        # Call should raise the exception
+        with pytest.raises(Exception, match="Function does not exist"):
+            disable_processor(mock_conn, "test_queue_prefix")

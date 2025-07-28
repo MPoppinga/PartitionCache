@@ -117,7 +117,7 @@ class TestMetadataTableCreation:
             if "CHECK (datatype = 'integer')" in str(call):
                 roaringbit_metadata_call = call
                 break
-        
+
         assert roaringbit_metadata_call is not None, "RoaringBit specific metadata table creation not found"
         metadata_sql = str(roaringbit_metadata_call)
 

@@ -370,12 +370,12 @@ main() {
     start_services "$SERVICES"
     create_env_config "$SERVICES"
     test_connections "$SERVICES"
-    echo -e "${YELLOW}🔨 Creating clean test database...${NC}"
-    export UNIQUE_DB_NAME=partitioncache_integration
-    
-    # Load environment using clean loader
+    # Load environment variables for the current script execution
     source scripts/load_env.sh
     load_and_export_env .env.integration
+
+    echo -e "${YELLOW}🔨 Creating clean test database...${NC}"
+    export UNIQUE_DB_NAME=partitioncache_integration
     
     # Verify required variables are set
     verify_env_vars PG_HOST PG_PORT PG_USER PG_PASSWORD

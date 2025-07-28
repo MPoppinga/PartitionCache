@@ -171,7 +171,7 @@ class TestQueryFragmentProcessor:
             mcq_module.args = mock_args
 
             try:
-                # Create constraint args tuple  
+                # Create constraint args tuple
                 constraint_args = (None, None, None)  # (add_constraints, remove_constraints_all, remove_constraints_add)
                 query_fragment_processor(mock_args, constraint_args)
             finally:
