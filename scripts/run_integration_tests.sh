@@ -428,24 +428,6 @@ while [[ $# -gt 0 ]]; do
             exit 0
             ;;
         *)
-            # Handle cases where -k expression gets split during shell expansion
-            if [[ "$1" =~ ^(not|and|or|\() ]] || [[ "$1" =~ test.*\'?$ ]] || [[ "$1" =~ ^test_ ]]; then
-                # This looks like a pytest -k expression that got split
-                # Try to reconstruct it by consuming arguments until we find a complete expression
-                K_EXPRESSION="$1"
-                shift
-                
-                # Keep consuming arguments that look like they're part of the -k expression
-                while [[ $# -gt 0 ]] && [[ ! "$1" =~ ^-- ]] && [[ ! "$1" =~ ^-[a-zA-Z] ]]; do
-                    K_EXPRESSION="$K_EXPRESSION $1"
-                    shift
-                done
-                
-                # Add the reconstructed expression to pytest args
-                PYTEST_ARGS="$PYTEST_ARGS -k \"$K_EXPRESSION\""
-                continue
-            fi
-            
             echo -e "${RED}❌ Unknown option: $1${NC}"
             show_help
             exit 1
