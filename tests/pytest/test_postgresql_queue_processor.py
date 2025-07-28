@@ -471,7 +471,7 @@ class TestProcessorEnableDisable:
         mock_get_conn.return_value = mock_conn
         mock_conn.cursor.return_value.__enter__ = Mock(return_value=mock_cursor)
         mock_conn.cursor.return_value.__exit__ = Mock(return_value=None)
-        
+
         # Simulate database error
         mock_cursor.execute.side_effect = Exception("Function does not exist")
 
@@ -481,7 +481,7 @@ class TestProcessorEnableDisable:
 
     @patch("partitioncache.cli.postgresql_queue_processor.get_db_connection")
     def test_disable_processor_database_error(self, mock_get_conn):
-        """Test disable processor handles database errors.""" 
+        """Test disable processor handles database errors."""
         from partitioncache.cli.postgresql_queue_processor import disable_processor
 
         # Setup mocks
@@ -490,7 +490,7 @@ class TestProcessorEnableDisable:
         mock_get_conn.return_value = mock_conn
         mock_conn.cursor.return_value.__enter__ = Mock(return_value=mock_cursor)
         mock_conn.cursor.return_value.__exit__ = Mock(return_value=None)
-        
+
         # Simulate database error
         mock_cursor.execute.side_effect = Exception("Function does not exist")
 

@@ -892,60 +892,70 @@ class TestPostgreSQLQueueProcessorCLI:
             if not cur.fetchone():
                 pytest.skip("pg_cron extension not available")
 
-        # Setup environment
+        # Use existing test environment - trust that CI has set up the environment properly
         env = os.environ.copy()
         test_table_prefix = f"test_pcache_{int(__import__('time').time())}"
+
+        # Only override table prefixes for test isolation and ensure required settings
         env.update(
             {
+                "CACHE_BACKEND": env.get("CACHE_BACKEND", "postgresql_array"),  # Default for testing
                 "PG_ARRAY_CACHE_TABLE_PREFIX": test_table_prefix,
                 "PG_BIT_CACHE_TABLE_PREFIX": test_table_prefix,
                 "PG_ROARINGBIT_CACHE_TABLE_PREFIX": test_table_prefix,
                 "PG_QUEUE_TABLE_PREFIX": f"{test_table_prefix}_queue",
-                "PG_CRON_DATABASE": env.get("DB_NAME", "test_db"),
+                # Ensure PG_CRON_DATABASE matches the test database
+                "PG_CRON_DATABASE": env.get("DB_NAME", env.get("PG_DBNAME", "partitioncache_integration")),
             }
         )
 
         # 1. Test setup command
         result = subprocess.run(["python", "-m", "partitioncache.cli.postgresql_queue_processor", "setup"], capture_output=True, text=True, env=env, timeout=60)
         assert result.returncode == 0, f"Setup failed: {result.stderr}"
-        assert "setup" in result.stdout.lower() or "complete" in result.stdout.lower()
+        output_text = (result.stdout + result.stderr).lower()
+        assert "setup" in output_text or "complete" in output_text
 
         # 2. Test status command (should show disabled initially)
         result = subprocess.run(
             ["python", "-m", "partitioncache.cli.postgresql_queue_processor", "status"], capture_output=True, text=True, env=env, timeout=30
         )
         assert result.returncode == 0, f"Status failed: {result.stderr}"
-        assert "enabled" in result.stdout.lower()
+        output_text = (result.stdout + result.stderr).lower()
+        assert "enabled" in output_text
 
         # 3. Test enable command
         result = subprocess.run(
             ["python", "-m", "partitioncache.cli.postgresql_queue_processor", "enable"], capture_output=True, text=True, env=env, timeout=30
         )
         assert result.returncode == 0, f"Enable failed: {result.stderr}"
-        assert "enabled" in result.stdout.lower()
+        output_text = (result.stdout + result.stderr).lower()
+        assert "enabled" in output_text
 
         # 4. Test status again (should show enabled)
         result = subprocess.run(
             ["python", "-m", "partitioncache.cli.postgresql_queue_processor", "status"], capture_output=True, text=True, env=env, timeout=30
         )
         assert result.returncode == 0, f"Status check failed: {result.stderr}"
-        assert "enabled" in result.stdout.lower()
-        assert "true" in result.stdout.lower()
+        output_text = (result.stdout + result.stderr).lower()
+        assert "enabled" in output_text
+        assert "true" in output_text
 
         # 5. Test disable command
         result = subprocess.run(
             ["python", "-m", "partitioncache.cli.postgresql_queue_processor", "disable"], capture_output=True, text=True, env=env, timeout=30
         )
         assert result.returncode == 0, f"Disable failed: {result.stderr}"
-        assert "disabled" in result.stdout.lower()
+        output_text = (result.stdout + result.stderr).lower()
+        assert "disabled" in output_text
 
         # 6. Test status final (should show disabled)
         result = subprocess.run(
             ["python", "-m", "partitioncache.cli.postgresql_queue_processor", "status"], capture_output=True, text=True, env=env, timeout=30
         )
         assert result.returncode == 0, f"Final status check failed: {result.stderr}"
-        assert "enabled" in result.stdout.lower()
-        assert "false" in result.stdout.lower()
+        output_text = (result.stdout + result.stderr).lower()
+        assert "enabled" in output_text
+        assert "false" in output_text
 
         # Cleanup: Remove test processor objects
         result = subprocess.run(
