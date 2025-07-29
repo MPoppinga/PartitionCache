@@ -6,3 +6,4 @@ dependencies:
   - python=3.12
   - pip
   - python-rocksdb  # Only conda-specific dependency for reliable RocksDB builds
+  - duckdb  # DuckDB for query acceleration testing

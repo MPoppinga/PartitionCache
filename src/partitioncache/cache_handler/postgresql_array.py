@@ -3,6 +3,7 @@ from datetime import datetime
 from logging import getLogger
 
 from psycopg import sql
+from psycopg.errors import IntegrityError
 
 from partitioncache.cache_handler.postgresql_abstract import PostgreSQLAbstractCacheHandler
 
@@ -239,6 +240,78 @@ class PostgreSQLArrayCacheHandler(PostgreSQLAbstractCacheHandler):
         except Exception as e:
             logger.error(f"Failed to get lazy intersection in partition {partition_key}: {e}")
             return None, 0
+
+    def set_cache_lazy(self, key: str, query: str, partition_key: str = "partition_key") -> bool:
+        """
+        Store partition key identifiers in cache by executing the provided query directly.
+
+        Args:
+            key: Cache key (query hash)
+            query: SQL query that returns partition key values to cache
+            partition_key: Partition key namespace
+
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            # Security check
+            if "DELETE " in query.upper() or "DROP " in query.upper():
+                logger.error("Query contains DELETE or DROP")
+                return False
+
+            # Get partition datatype
+            datatype = self._get_partition_datatype(partition_key)
+            if datatype is None:
+                logger.error(f"Partition key '{partition_key}' not registered")
+                return False
+
+            table_name = f"{self.tableprefix}_cache_{partition_key}"
+
+            # Build lazy insertion query
+            lazy_insert_query = sql.SQL(
+                """
+                INSERT INTO {table_name} (query_hash, partition_keys)
+                SELECT {key}, ARRAY(SELECT {partition_col} FROM ({query}) AS query_result)
+                ON CONFLICT (query_hash) DO UPDATE SET
+                    partition_keys = EXCLUDED.partition_keys
+                """
+            ).format(
+                table_name=sql.Identifier(table_name),
+                key=sql.Literal(key),
+                partition_col=sql.Identifier(partition_key),
+                query=sql.SQL(query)
+            )
+
+            self.cursor.execute(lazy_insert_query)
+            self.db.commit()
+
+            # Also store in queries table for existence checks
+            try:
+                queries_table = f"{self.tableprefix}_queries"
+                self.cursor.execute(
+                    sql.SQL("INSERT INTO {table} (query_hash, partition_key, query) VALUES (%s, %s, %s)").format(
+                        table=sql.Identifier(queries_table)
+                    ),
+                    (key, partition_key, "")
+                )
+                self.db.commit()
+            except IntegrityError:
+                # Update if insert fails
+                self.cursor.execute(
+                    sql.SQL("UPDATE {table} SET last_seen = now() WHERE query_hash = %s AND partition_key = %s").format(
+                        table=sql.Identifier(queries_table)
+                    ),
+                    (key, partition_key)
+                )
+                self.db.commit()
+
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to set cache lazily for key {key}: {e}")
+            if not self.db.closed:
+                self.db.rollback()
+            return False
 
     def get_intersected_sql(self, keys: set[str], partition_key: str, datatype: str) -> sql.Composed:
         """Return the query for intersection of all sets in the partition-specific cache."""

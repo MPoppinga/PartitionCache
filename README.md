@@ -17,7 +17,7 @@ Partition-based query optimization middleware for heavily partitioned datasets. 
 ## Key Features
 
 - **Multi-Partition Support**: Manage multiple partition keys with different datatypes
-- **Multiple cache backends**: PostgreSQL arrays/bits/roaringbitmap, Redis sets/bits, RocksDB variants
+- **Multiple cache backends**: PostgreSQL arrays/bits/roaringbitmap, Redis sets/bits, DuckDB BITSTRING, RocksDB variants
 - **Intelligent Queue System**: Two-tier queue architecture with priority support and blocking operations
 - **Database-native processing** with pg_cron integration
 - **Cache Eviction Management**: Automatic cleanup with pg_cron integration

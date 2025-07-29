@@ -75,5 +75,13 @@ def get_cache_handler(cache_type: str, singleton: bool = False) -> AbstractCache
             return RocksDictCacheHandler.get_instance(**config)  # type: ignore[no-any-return]
         else:
             return RocksDictCacheHandler(**config)  # type: ignore[no-any-return]
+    elif cache_type == "duckdb_bit":
+        from partitioncache.cache_handler.duckdb_bit import DuckDBBitCacheHandler
+
+        config = EnvironmentConfigManager.get_duckdb_bit_config()
+        if singleton:
+            return DuckDBBitCacheHandler.get_instance(**config)  # type: ignore[no-any-return]
+        else:
+            return DuckDBBitCacheHandler(**config)  # type: ignore[no-any-return]
     else:
         raise ValueError(f"Unsupported cache type: {cache_type}")

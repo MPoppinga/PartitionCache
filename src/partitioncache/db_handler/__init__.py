@@ -6,7 +6,7 @@ def get_db_handler(db_type: str, **kwargs) -> AbstractDBHandler:
     Factory function to create database handlers.
 
     Args:
-        db_type: Type of database ('sqlite', 'mysql', 'postgres')
+        db_type: Type of database ('sqlite', 'mysql', 'postgres', 'duckdb')
         **kwargs: Arguments to pass to the handler constructor
 
     Returns:
@@ -24,6 +24,10 @@ def get_db_handler(db_type: str, **kwargs) -> AbstractDBHandler:
         from partitioncache.db_handler.postgres import PostgresDBHandler
 
         return PostgresDBHandler(**kwargs)
+    if db_type.lower() == "duckdb":
+        from partitioncache.db_handler.duckdb import DuckDBHandler
 
-    supported = ["sqlite", "mysql", "postgres"]
+        return DuckDBHandler(**kwargs)
+
+    supported = ["sqlite", "mysql", "postgres", "duckdb"]
     raise ValueError(f"Unsupported database type: {db_type}. Options: {', '.join(supported)}")

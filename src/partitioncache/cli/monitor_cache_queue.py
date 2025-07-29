@@ -33,6 +33,7 @@ from partitioncache.cli.common_args import (
     resolve_cache_backend,
 )
 from partitioncache.db_handler import get_db_handler
+from partitioncache.query_accelerator import create_query_accelerator
 from partitioncache.query_processor import generate_all_query_hash_pairs
 from partitioncache.queue import (
     get_queue_lengths,
@@ -47,6 +48,9 @@ from partitioncache.queue import (
 logger = getLogger("PartitionCache")
 
 args: argparse.Namespace
+
+# Global query accelerator instance
+query_accelerator = None
 
 # Initialize threading components
 status_lock = threading.Lock()
@@ -247,42 +251,7 @@ def run_and_store_query(query: str, query_hash: str, partition_key: str, partiti
                 query, query_hash, partition_key, partition_datatype, cache_handler, args
             )
 
-        # Get database connection parameters
-        db_connection_params = get_database_connection_params(args)
-
-        if args.db_backend == "postgresql":
-            db_connection_params["timeout"] = args.long_running_query_timeout
-            db_handler = get_db_handler("postgres", **db_connection_params)
-        elif args.db_backend == "mysql":
-            db_handler = get_db_handler("mysql", **db_connection_params)
-        elif args.db_backend == "sqlite":
-            db_handler = get_db_handler("sqlite", **db_connection_params)
-        else:
-            raise AssertionError("No db backend specified, querying not possible")
-
-        try:
-            t = time.perf_counter()
-            result = set(db_handler.execute(query_to_execute))
-
-            # Apply limit if specified
-            if args.limit is not None and result is not None and len(result) >= args.limit:
-                logger.info(f"Query {query_hash} limited to {args.limit} partition keys")
-                cache_handler.set_query_status(query_hash, partition_key, "failed")  # Set failed status for limit exceeded
-                return True
-
-        except psycopg.OperationalError as e:
-            if "statement timeout" in str(e):
-                logger.info(f"Query {query_hash} is a long running query")
-                cache_handler.set_query_status(query_hash, partition_key, "timeout")  # Set timeout status
-                return True
-            else:
-                raise e
-
-        logger.debug(f"Running query {query_hash} for partition_key: {partition_key} (datatype: {partition_datatype})")
-        logger.debug(f"Query {query_hash} returned {len(result)} results")
-        logger.debug(f"Query {query_hash} took {time.perf_counter() - t} seconds")
-        db_handler.close()
-
+        # Register partition key first if datatype is provided
         if partition_datatype is not None:
             # Handle bitsize for bit cache handlers
             kwargs = {}
@@ -301,6 +270,142 @@ def run_and_store_query(query: str, query_hash: str, partition_key: str, partiti
             elif hasattr(args, 'bitsize') and args.bitsize is not None:
                 kwargs['bitsize'] = args.bitsize
             cache_handler.register_partition_key(partition_key, partition_datatype, **kwargs)
+
+        # Check if lazy insertion is available and beneficial
+        use_lazy_insertion = hasattr(cache_handler, 'set_cache_lazy') and hasattr(cache_handler, 'set_entry_lazy')
+
+        if use_lazy_insertion:
+            # Use lazy insertion - don't execute query in Python, let the cache handler do it directly
+            logger.debug(f"Using lazy insertion for query {query_hash}")
+
+            try:
+                # Apply limit check in the query if specified
+                if args.limit is not None:
+                    # Check if result would exceed limit by counting rows
+                    # First, get database connection to count rows
+                    db_connection_params = get_database_connection_params(args)
+                    if args.db_backend == "postgresql":
+                        db_connection_params["timeout"] = args.long_running_query_timeout
+                        db_handler = get_db_handler("postgres", **db_connection_params)
+                    elif args.db_backend == "mysql":
+                        db_handler = get_db_handler("mysql", **db_connection_params)
+                    elif args.db_backend == "sqlite":
+                        db_handler = get_db_handler("sqlite", **db_connection_params)
+                    else:
+                        raise AssertionError("No db backend specified, querying not possible")
+
+                    # Count results to check limit
+                    count_query = f"SELECT COUNT(*) FROM ({query_to_execute}) AS count_result"
+                    try:
+                        count_result = list(db_handler.execute(count_query))
+                        result_count = count_result[0] if count_result else 0
+
+                        if result_count >= args.limit:
+                            logger.info(f"Query {query_hash} would return {result_count} rows, exceeding limit {args.limit}")
+                            cache_handler.set_query_status(query_hash, partition_key, "failed")
+                            db_handler.close()
+                            return True
+                    except Exception as count_error:
+                        logger.warning(f"Failed to count results for limit check: {count_error}, proceeding with lazy insertion")
+                    finally:
+                        db_handler.close()
+
+                # Use lazy insertion with the optimized query
+                success = cache_handler.set_entry_lazy(original_hash, query_to_execute, original_query, partition_key)
+
+                if success:
+                    logger.debug(f"Lazily stored {original_hash} in cache")
+                    if optimization_applied:
+                        logger.info(
+                            f"Query {original_hash} executed with lazy insertion and cache optimization: {optimization_stats['cache_hits']} hits, method={optimization_stats['method_used']}"
+                        )
+                    else:
+                        logger.debug(f"Query {original_hash} executed with lazy insertion")
+                    return True
+                else:
+                    logger.warning(f"Lazy insertion failed for {original_hash}, falling back to traditional method")
+                    # Fall through to traditional method
+
+            except psycopg.OperationalError as e:
+                if "statement timeout" in str(e):
+                    logger.info(f"Query {query_hash} is a long running query (detected during lazy insertion)")
+                    cache_handler.set_query_status(query_hash, partition_key, "timeout")
+                    return True
+                else:
+                    logger.warning(f"Lazy insertion error for {original_hash}: {e}, falling back to traditional method")
+                    # Fall through to traditional method
+            except Exception as lazy_error:
+                logger.warning(f"Lazy insertion failed for {original_hash}: {lazy_error}, falling back to traditional method")
+                # Fall through to traditional method
+
+        # Traditional method: execute query in Python then store results
+        logger.debug(f"Using traditional insertion for query {query_hash}")
+
+        # Try DuckDB acceleration first, then fallback to standard database handler
+        global query_accelerator
+        if args.enable_duckdb_acceleration and query_accelerator and args.db_backend == "postgresql":
+            try:
+                logger.debug(f"Attempting DuckDB acceleration for query {query_hash}")
+                t = time.perf_counter()
+                result = query_accelerator.execute_query(query_to_execute)
+
+                logger.debug(f"DuckDB accelerated query {query_hash} took {time.perf_counter() - t:.3f}s")
+
+            except Exception as accel_error:
+                logger.warning(f"DuckDB acceleration failed for query {query_hash}: {accel_error}")
+                logger.debug("Falling back to standard PostgreSQL execution")
+
+                # Fallback to standard database handler
+                db_connection_params = get_database_connection_params(args)
+                db_connection_params["timeout"] = args.long_running_query_timeout
+                db_handler = get_db_handler("postgres", **db_connection_params)
+
+                try:
+                    t = time.perf_counter()
+                    result = set(db_handler.execute(query_to_execute))
+                except Exception as db_error:
+                    db_handler.close()
+                    raise db_error
+                finally:
+                    db_handler.close()
+        else:
+            # Standard database handler execution
+            db_connection_params = get_database_connection_params(args)
+
+            if args.db_backend == "postgresql":
+                db_connection_params["timeout"] = args.long_running_query_timeout
+                db_handler = get_db_handler("postgres", **db_connection_params)
+            elif args.db_backend == "mysql":
+                db_handler = get_db_handler("mysql", **db_connection_params)
+            elif args.db_backend == "sqlite":
+                db_handler = get_db_handler("sqlite", **db_connection_params)
+            else:
+                raise AssertionError("No db backend specified, querying not possible")
+
+            try:
+                t = time.perf_counter()
+                result = set(db_handler.execute(query_to_execute))
+
+                logger.debug(f"Standard database query {query_hash} took {time.perf_counter() - t:.3f}s")
+
+            except psycopg.OperationalError as e:
+                if "statement timeout" in str(e):
+                    logger.info(f"Query {query_hash} is a long running query")
+                    cache_handler.set_query_status(query_hash, partition_key, "timeout")  # Set timeout status
+                    return True
+                else:
+                    raise e
+            finally:
+                db_handler.close()
+
+        # Apply limit if specified (for both accelerated and standard execution)
+        if args.limit is not None and result is not None and len(result) >= args.limit:
+            logger.info(f"Query {query_hash} limited to {args.limit} partition keys")
+            cache_handler.set_query_status(query_hash, partition_key, "failed")  # Set failed status for limit exceeded
+            return True
+
+        logger.debug(f"Running query {query_hash} for partition_key: {partition_key} (datatype: {partition_datatype})")
+        logger.debug(f"Query {query_hash} returned {len(result)} results")
 
         # Always store with original hash and query (not the optimized version)
         cache_handler.set_cache(original_hash, result, partition_key)
@@ -620,6 +725,38 @@ def main():
     cache_group.add_argument("--cache-backend", type=str, help="Cache backend to use (if not specified, uses CACHE_BACKEND environment variable)")
     cache_group.add_argument("--bitsize", type=int, help="Bitsize for bit cache handlers (default: uses handler default or environment variable)")
 
+    # DuckDB query acceleration options
+    acceleration_group = parser.add_argument_group("query acceleration options")
+    acceleration_group.add_argument(
+        "--enable-duckdb-acceleration",
+        action="store_true",
+        default=False,
+        help="Enable DuckDB in-memory query acceleration for PostgreSQL queries"
+    )
+    acceleration_group.add_argument(
+        "--preload-tables",
+        type=str,
+        help="Comma-separated list of PostgreSQL tables to preload into DuckDB for faster queries"
+    )
+    acceleration_group.add_argument(
+        "--duckdb-memory-limit",
+        type=str,
+        default="2GB",
+        help="Memory limit for DuckDB instance (default: 2GB)"
+    )
+    acceleration_group.add_argument(
+        "--duckdb-threads",
+        type=int,
+        default=4,
+        help="Number of threads for DuckDB processing (default: 4)"
+    )
+    acceleration_group.add_argument(
+        "--disable-acceleration-stats",
+        action="store_true",
+        default=False,
+        help="Disable DuckDB acceleration performance statistics logging"
+    )
+
     global args
     args = parser.parse_args()
 
@@ -669,6 +806,51 @@ def main():
         logger.error("Set QUERY_QUEUE_PROVIDER to 'redis' to use Redis instead of PostgreSQL")
         raise
 
+    # Initialize DuckDB query accelerator if enabled
+    global query_accelerator
+    if args.enable_duckdb_acceleration:
+        if args.db_backend != "postgresql":
+            logger.warning("DuckDB acceleration only supports PostgreSQL backend, disabling acceleration")
+            args.enable_duckdb_acceleration = False
+        else:
+            logger.info("Initializing DuckDB query accelerator...")
+
+            # Parse preload tables
+            preload_tables = []
+            if args.preload_tables:
+                preload_tables = [table.strip() for table in args.preload_tables.split(",") if table.strip()]
+                logger.info(f"Will preload {len(preload_tables)} tables: {preload_tables}")
+
+            # Get database connection parameters for accelerator
+            db_connection_params = get_database_connection_params(args)
+
+            try:
+                query_accelerator = create_query_accelerator(
+                    postgresql_connection_params=db_connection_params,
+                    preload_tables=preload_tables,
+                    duckdb_memory_limit=args.duckdb_memory_limit,
+                    duckdb_threads=args.duckdb_threads,
+                    enable_statistics=not args.disable_acceleration_stats
+                )
+
+                if query_accelerator:
+                    # Preload tables if specified
+                    if preload_tables:
+                        success = query_accelerator.preload_tables()
+                        if not success:
+                            logger.warning("Failed to preload some tables, acceleration may be suboptimal")
+
+                    logger.info("DuckDB query accelerator initialized successfully")
+                else:
+                    logger.warning("Failed to initialize DuckDB query accelerator, disabling acceleration")
+                    args.enable_duckdb_acceleration = False
+
+            except Exception as e:
+                logger.error(f"Failed to initialize DuckDB query accelerator: {e}")
+                logger.warning("Disabling DuckDB acceleration due to initialization failure")
+                args.enable_duckdb_acceleration = False
+                query_accelerator = None
+
     logger.info("Starting two-threaded queue monitoring system:")
     logger.info("- Thread 1: Process original queries into fragments")
     logger.info("- Thread 2: Execute fragments from query fragment queue with enhanced consumption control")
@@ -680,6 +862,19 @@ def main():
         logger.info("- Using regular polling (optimized polling disabled)")
     else:
         logger.info("- Using optimized polling with blocking queue operations")
+
+    # Log DuckDB acceleration status
+    if args.enable_duckdb_acceleration and query_accelerator:
+        logger.info("- DuckDB query acceleration ENABLED:")
+        logger.info(f"  - Memory limit: {args.duckdb_memory_limit}")
+        logger.info(f"  - Threads: {args.duckdb_threads}")
+        if preload_tables:
+            logger.info(f"  - Preloaded tables: {len(preload_tables)} ({', '.join(preload_tables)})")
+        else:
+            logger.info("  - No tables preloaded")
+        logger.info(f"  - Statistics: {'disabled' if args.disable_acceleration_stats else 'enabled'}")
+    else:
+        logger.info("- DuckDB query acceleration DISABLED")
 
     if args.enable_cache_optimization and not args.disable_cache_optimization:
         logger.info("- Cache optimization ENABLED:")
@@ -700,6 +895,12 @@ def main():
 
     # Wait for fragment processor thread to finish
     fragment_processor_thread.join(timeout=5)
+
+    # Clean up query accelerator
+    if query_accelerator:
+        logger.info("Shutting down DuckDB query accelerator...")
+        query_accelerator.close()
+
     logger.info("Monitor cache queue shutting down")
 
 
