@@ -4,6 +4,7 @@ Script to create a clean test database with all required extensions and tables.
 Replaces template database functionality with direct database creation.
 """
 
+import argparse
 import os
 import sys
 
@@ -27,28 +28,60 @@ def create_clean_database(unique_db: str, conn_str: str) -> None:
             print(f"Successfully created database: {unique_db}")
 
 
-def setup_database_extensions_and_tables(unique_db: str) -> None:
+def setup_database_extensions_and_tables(unique_db: str, require_pg_cron: bool = False) -> None:
     """Set up extensions and tables in the newly created database."""
     # Connect to the new database and set up extensions and tables
-    db_conn_str = f"postgresql://integration_user:integration_password@localhost:{os.getenv('PG_PORT', '5432')}/{unique_db}"
-    with psycopg.connect(db_conn_str, autocommit=True) as conn:
+    conn_str_postgres = f"postgresql://integration_user:integration_password@localhost:{os.getenv('PG_PORT', '5432')}/postgres"
+    conn_str_target_db = f"postgresql://integration_user:integration_password@localhost:{os.getenv('PG_PORT', '5432')}/{unique_db}"
+
+    # Connect to 'postgres' database to drop/create the target database
+    with psycopg.connect(conn_str_postgres, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            # Drop database if it exists
+            cur.execute(sql.SQL("SELECT 1 FROM pg_database WHERE datname = %s"), (unique_db,))
+            if cur.fetchone():
+                print(f"Dropping existing database: {unique_db}")
+                cur.execute(sql.SQL("DROP DATABASE {} WITH (FORCE);").format(sql.Identifier(unique_db)))
+
+            # Create clean database
+            print(f"Creating clean database: {unique_db}")
+            cur.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(unique_db)))
+            print(f"Successfully created database: {unique_db}")
+
+    # Connect to the newly created database to set up extensions and tables
+    with psycopg.connect(conn_str_target_db, autocommit=True) as conn:
         with conn.cursor() as cur:
             print("Setting up extensions...")
             # Create roaringbitmap extension (always available)
             cur.execute("CREATE EXTENSION IF NOT EXISTS roaringbitmap;")
 
-            # Try to create pg_cron extension (may fail if not the designated cron database)
-            try:
-                cur.execute("CREATE EXTENSION IF NOT EXISTS pg_cron;")
-                print("pg_cron extension created successfully")
+            # Handle pg_cron extension based on requirements
+            if require_pg_cron:
+                # For tests that require pg_cron, verify it exists
+                cur.execute("SELECT 1 FROM pg_extension WHERE extname = 'pg_cron'")
+                if cur.fetchone():
+                    print("✅ pg_cron extension verified (required for this test)")
+                    # Grant necessary permissions for pg_cron
+                    cur.execute("GRANT USAGE ON SCHEMA cron TO integration_user;")
+                    cur.execute("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA cron TO integration_user;")
+                    cur.execute("GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA cron TO integration_user;")
+                else:
+                    print("❌ pg_cron extension REQUIRED but not found!")
+                    print(f"Note: This database ({unique_db}) must be the same as cron.database_name in PostgreSQL config")
+                    raise Exception(f"pg_cron extension required but not available in database {unique_db}")
+            else:
+                # Try to create pg_cron extension (may fail if not the designated cron database)
+                try:
+                    cur.execute("CREATE EXTENSION IF NOT EXISTS pg_cron;")
+                    print("pg_cron extension created successfully")
 
-                # Grant necessary permissions for pg_cron only if extension was created
-                cur.execute("GRANT USAGE ON SCHEMA cron TO integration_user;")
-                cur.execute("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA cron TO integration_user;")
-                cur.execute("GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA cron TO integration_user;")
-            except Exception as e:
-                print(f"pg_cron extension not created (this may be expected): {e}")
-                print("Note: pg_cron can only be created in the database specified by cron.database_name")
+                    # Grant necessary permissions for pg_cron only if extension was created
+                    cur.execute("GRANT USAGE ON SCHEMA cron TO integration_user;")
+                    cur.execute("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA cron TO integration_user;")
+                    cur.execute("GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA cron TO integration_user;")
+                except Exception as e:
+                    print(f"pg_cron extension not created (this may be expected): {e}")
+                    print("Note: pg_cron can only be created in the database specified by cron.database_name")
 
             print("Creating test tables...")
             # Create test tables needed for integration tests
@@ -144,17 +177,19 @@ def setup_database_extensions_and_tables(unique_db: str) -> None:
 
 def main():
     """Main function to create and setup database."""
+    parser = argparse.ArgumentParser(description="Create clean test database with extensions")
+    parser.add_argument("--require-pg-cron", action="store_true",
+                        help="Require pg_cron extension to be available (fail if not found)")
+    args = parser.parse_args()
+
     unique_db = os.environ.get("UNIQUE_DB_NAME")
     if not unique_db:
         print("ERROR: UNIQUE_DB_NAME environment variable not set")
         sys.exit(1)
 
-    conn_str = f"postgresql://integration_user:integration_password@localhost:{os.getenv('PG_PORT', '5432')}/postgres"
-
     try:
-        create_clean_database(unique_db, conn_str)
-        setup_database_extensions_and_tables(unique_db)
-        print(f"Successfully created and configured database: {unique_db}")
+        setup_database_extensions_and_tables(unique_db, require_pg_cron=args.require_pg_cron)
+        print(f"Successfully configured database: {unique_db}")
     except Exception as e:
         print(f"Error creating database: {e}")
         sys.exit(1)

@@ -34,14 +34,20 @@ DataType = int | str | float | datetime
 DataSet = set[int] | set[str] | set[float] | set[datetime]
 
 
-def create_cache_helper(cache_type: str, partition_key: str, datatype: str | None) -> PartitionCacheHelper:
+def create_cache_helper(cache_type: str, partition_key: str, datatype: str | None, **kwargs) -> PartitionCacheHelper:
     """
     Create a partition cache handler
+
+    Args:
+        cache_type: The cache backend type
+        partition_key: The partition key name
+        datatype: The datatype for the partition
+        **kwargs: Additional configuration options (e.g., bitsize for bit handlers)
     """
 
     # Create the underlying cache handler first
     cache_handler = get_cache_handler(cache_type, singleton=True)
-    return create_partitioncache_helper(cache_handler, partition_key, datatype)
+    return create_partitioncache_helper(cache_handler, partition_key, datatype, **kwargs)
 
 
 def list_cache_types() -> dict[str, list[str]]:

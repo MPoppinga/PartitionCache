@@ -177,7 +177,7 @@ class TestCLICommands:
 
     def test_pcache_postgresql_queue_processor_help(self):
         """Test pcache-postgresql-queue-processor help command."""
-        result = subprocess.run(["python", "-m", "partitioncache.cli.setup_postgresql_queue_processor", "--help"], capture_output=True, text=True, timeout=30)
+        result = subprocess.run(["python", "-m", "partitioncache.cli.postgresql_queue_processor", "--help"], capture_output=True, text=True, timeout=30)
 
         assert result.returncode == 0, f"Command failed: {result.stderr}"
         assert "postgresql" in result.stdout.lower() or "queue" in result.stdout.lower()
@@ -201,8 +201,9 @@ class TestCLIIntegration:
         # Get the backend type from the request parameter
         backend_type = request.node.callspec.params["cache_client"]
 
+        # Skip RocksDB backends for CLI tests due to file locking conflicts with subprocess calls
         if backend_type.startswith("rocksdb"):
-            pytest.skip(f"CLI tests not compatible with {backend_type} due to file locking")
+            pytest.skip(f"CLI tests not compatible with {backend_type} due to file locking conflicts between test fixtures and subprocess calls")
 
         backend_suffix = backend_type.replace("_", "").replace("-", "")
         backend_suffix = backend_type.replace("_", "").replace("-", "")
@@ -284,8 +285,9 @@ class TestCLIIntegration:
         # Get the backend type from the request parameter
         backend_type = request.node.callspec.params["cache_client"]
 
+        # Skip RocksDB backends for CLI tests due to file locking conflicts with subprocess calls
         if backend_type.startswith("rocksdb"):
-            pytest.skip(f"CLI tests not compatible with {backend_type} due to file locking")
+            pytest.skip(f"CLI tests not compatible with {backend_type} due to file locking conflicts between test fixtures and subprocess calls")
 
         backend_suffix = backend_type.replace("_", "").replace("-", "")
         partition_key = f"region_id_{backend_suffix}"
@@ -416,8 +418,9 @@ class TestCLIIntegration:
         # Get the backend type from the request parameter
         backend_type = request.node.callspec.params["cache_client"]
 
+        # Skip RocksDB backends for CLI tests due to file locking conflicts with subprocess calls
         if backend_type.startswith("rocksdb"):
-            pytest.skip(f"CLI tests not compatible with {backend_type} due to file locking")
+            pytest.skip(f"CLI tests not compatible with {backend_type} due to file locking conflicts between test fixtures and subprocess calls")
 
         backend_suffix = backend_type.replace("_", "").replace("-", "")
         backend_suffix = backend_type.replace("_", "").replace("-", "")
@@ -862,3 +865,115 @@ class TestCLIPerformance:
 
             assert result.returncode == 0, f"Command {' '.join(cmd)} failed: {result.stderr}"
             assert len(result.stdout) > 0, f"Command {' '.join(cmd)} produced no output"
+
+
+class TestPostgreSQLQueueProcessorCLI:
+    """Test PostgreSQL queue processor CLI commands."""
+
+    @pytest.mark.slow
+    def test_postgresql_queue_processor_enable_disable_workflow(self, db_session):
+        """Test the complete enable/disable workflow for PostgreSQL queue processor."""
+        import os
+        import subprocess
+
+        # Only run for PostgreSQL backends
+        cache_backend = os.getenv("CACHE_BACKEND", "postgresql_array")
+        if not cache_backend.startswith("postgresql"):
+            pytest.skip("This test requires PostgreSQL cache backend")
+
+        # Only run if pg_cron is available
+        queue_provider = os.getenv("QUERY_QUEUE_PROVIDER", "postgresql")
+        if queue_provider != "postgresql":
+            pytest.skip("This test requires PostgreSQL queue provider")
+
+        # Check if pg_cron extension is installed (not just available)
+        with db_session.cursor() as cur:
+            cur.execute("SELECT 1 FROM pg_extension WHERE extname = 'pg_cron'")
+            if not cur.fetchone():
+                pytest.skip("pg_cron extension not installed - this test should only run in cli-tools-tests job")
+
+        # Use existing test environment - trust that CI has set up the environment properly
+        env = os.environ.copy()
+        test_table_prefix = f"test_pcache_{int(__import__('time').time())}"
+
+        # Only override table prefixes for test isolation and ensure required settings
+        env.update(
+            {
+                "CACHE_BACKEND": env.get("CACHE_BACKEND", "postgresql_array"),  # Default for testing
+                "PG_ARRAY_CACHE_TABLE_PREFIX": test_table_prefix,
+                "PG_BIT_CACHE_TABLE_PREFIX": test_table_prefix,
+                "PG_ROARINGBIT_CACHE_TABLE_PREFIX": test_table_prefix,
+                "PG_QUEUE_TABLE_PREFIX": f"{test_table_prefix}_queue",
+                # Ensure PG_CRON_DATABASE matches the test database
+                "PG_CRON_DATABASE": env.get("DB_NAME", env.get("PG_DBNAME", "partitioncache_integration")),
+            }
+        )
+
+        # 1. Test setup command
+        result = subprocess.run(["python", "-m", "partitioncache.cli.postgresql_queue_processor", "setup"], capture_output=True, text=True, env=env, timeout=60)
+        assert result.returncode == 0, f"Setup failed: {result.stderr}"
+        output_text = (result.stdout + result.stderr).lower()
+        assert "setup" in output_text or "complete" in output_text
+
+        # 2. Test status command (should show disabled initially)
+        result = subprocess.run(
+            ["python", "-m", "partitioncache.cli.postgresql_queue_processor", "status"], capture_output=True, text=True, env=env, timeout=30
+        )
+        assert result.returncode == 0, f"Status failed: {result.stderr}"
+        output_text = (result.stdout + result.stderr).lower()
+        assert "enabled" in output_text
+
+        # 3. Test enable command
+        result = subprocess.run(
+            ["python", "-m", "partitioncache.cli.postgresql_queue_processor", "enable"], capture_output=True, text=True, env=env, timeout=30
+        )
+        assert result.returncode == 0, f"Enable failed: {result.stderr}"
+        output_text = (result.stdout + result.stderr).lower()
+        assert "enabled" in output_text
+
+        # 4. Test status again (should show enabled)
+        result = subprocess.run(
+            ["python", "-m", "partitioncache.cli.postgresql_queue_processor", "status"], capture_output=True, text=True, env=env, timeout=30
+        )
+        assert result.returncode == 0, f"Status check failed: {result.stderr}"
+        output_text = (result.stdout + result.stderr).lower()
+        assert "enabled" in output_text
+        assert "true" in output_text
+
+        # 5. Test disable command
+        result = subprocess.run(
+            ["python", "-m", "partitioncache.cli.postgresql_queue_processor", "disable"], capture_output=True, text=True, env=env, timeout=30
+        )
+        assert result.returncode == 0, f"Disable failed: {result.stderr}"
+        output_text = (result.stdout + result.stderr).lower()
+        assert "disabled" in output_text
+
+        # 6. Test status final (should show disabled)
+        result = subprocess.run(
+            ["python", "-m", "partitioncache.cli.postgresql_queue_processor", "status"], capture_output=True, text=True, env=env, timeout=30
+        )
+        assert result.returncode == 0, f"Final status check failed: {result.stderr}"
+        output_text = (result.stdout + result.stderr).lower()
+        assert "enabled" in output_text
+        assert "false" in output_text
+
+        # Cleanup: Remove test processor objects
+        result = subprocess.run(
+            ["python", "-m", "partitioncache.cli.postgresql_queue_processor", "remove"], capture_output=True, text=True, env=env, timeout=30
+        )
+        # Remove command may fail if objects don't exist, that's OK
+
+    def test_postgresql_queue_processor_help_commands(self):
+        """Test that all PostgreSQL queue processor help commands work."""
+        commands = [
+            ["python", "-m", "partitioncache.cli.postgresql_queue_processor", "--help"],
+            ["python", "-m", "partitioncache.cli.postgresql_queue_processor", "setup", "--help"],
+            ["python", "-m", "partitioncache.cli.postgresql_queue_processor", "status", "--help"],
+            ["python", "-m", "partitioncache.cli.postgresql_queue_processor", "enable", "--help"],
+            ["python", "-m", "partitioncache.cli.postgresql_queue_processor", "disable", "--help"],
+        ]
+
+        for cmd in commands:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            assert result.returncode == 0, f"Help command {' '.join(cmd)} failed: {result.stderr}"
+            assert len(result.stdout) > 0, f"Help command {' '.join(cmd)} produced no output"

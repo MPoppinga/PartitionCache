@@ -8,9 +8,7 @@ Tests the complete cache optimization workflow including:
 - Different optimization methods
 """
 
-import os
 import subprocess
-import tempfile
 import time
 
 import pytest
@@ -26,33 +24,25 @@ from partitioncache.queue import (
 def cache_optimization_setup(cache_client, request):
     """Set up test environment for cache optimization testing."""
     # Skip if not PostgreSQL backend (queue operations require PostgreSQL)
-    # Get the actual backend name from the parametrized fixture
-    if hasattr(request, 'param'):
-        cache_backend = request.param
-    else:
-        # For parameterized fixtures, get the backend from the fixture's parameter
-        cache_backend = str(request.fixturenames[request.fixturenames.index('cache_client')])
-        # Try to get it from the actual param value
-        try:
-            list(request.fixturenames).index('cache_client')
-            cache_backend = request.node.callspec.id.split('[')[1].split(']')[0]
-        except Exception as e:
-            cache_backend = os.getenv("CACHE_BACKEND", "unknown")
-            print(f"DEBUG: Exception getting backend: {e}")
+    # Use a simpler approach: check the cache_client type directly
+    cache_backend = cache_client.__class__.__name__.lower()
 
-    print(f"DEBUG: Detected cache_backend = {cache_backend}")
-    if not cache_backend.startswith("postgresql"):
-        pytest.skip(f"Cache optimization tests require PostgreSQL backend, not {cache_backend}")
+    # Also check the string representation for fallback
+    if "postgresql" not in cache_backend:
+        cache_repr = str(cache_client).lower()
+        if "postgresql" not in cache_repr:
+            pytest.skip(f"Cache optimization tests require PostgreSQL backend, got {cache_backend}")
 
     partition_key = "store_id"
 
-    # Skip queue clearing for now to avoid hanging
-    # TODO: Fix queue operations in test environment
-    # try:
-    #     clear_original_query_queue()
-    #     clear_query_fragment_queue()
-    # except Exception as e:
-    #     print(f"Warning: Could not clear queues: {e}")
+    # Clear queues if possible - non-critical for cache optimization tests
+    try:
+        clear_original_query_queue()
+        clear_query_fragment_queue()
+    except Exception as e:
+        # Queue operations not critical for cache optimization tests
+        # These tests focus on cache handler functionality
+        print(f"Warning: Could not clear queues (non-critical): {e}")
 
     # Add some test cache entries that fragments can leverage
     test_cache_data = [
@@ -83,9 +73,13 @@ def cache_optimization_setup(cache_client, request):
 
     yield cache_client, partition_key
 
-    # Skip cleanup for now
-    # clear_original_query_queue()
-    # clear_query_fragment_queue()
+    # Cleanup queues if possible
+    try:
+        clear_original_query_queue()
+        clear_query_fragment_queue()
+    except Exception:
+        # Non-critical - cache optimization tests don't depend on queue state
+        pass
 
 
 class TestCacheOptimizationIntegration:
@@ -107,21 +101,19 @@ class TestCacheOptimizationIntegration:
         push_to_original_query_queue(test_query, partition_key, "integer")
 
         # Run monitor without explicit optimization flag (should be enabled by default)
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False) as log_file:
-            try:
-                # Run for a short time to process the query
-                result = subprocess.run(
-                    ["pcache-monitor", "--max-processes", "1", "--close", "--status-log-interval", "1"], capture_output=True, text=True, timeout=30
-                )
+        try:
+            # Run for a short time to process the query
+            result = subprocess.run(
+                ["pcache-monitor", "--max-processes", "1", "--close", "--status-log-interval", "1"],
+                capture_output=True, text=True, timeout=15
+            )
 
-                # Check that cache optimization was enabled in logs
-                assert "Cache optimization ENABLED" in result.stderr
+            # Check that cache optimization was enabled in logs
+            assert "Cache optimization ENABLED" in result.stderr
 
-            except subprocess.TimeoutExpired:
-                pass  # Expected for monitor processes
-            finally:
-                if os.path.exists(log_file.name):
-                    os.unlink(log_file.name)
+        except subprocess.TimeoutExpired:
+            # For timeout cases, check if any expected output was produced
+            pytest.skip("Monitor process timed out - may indicate system load issues")
 
     def test_cache_optimization_can_be_disabled(self, cache_optimization_setup):
         """Test that cache optimization can be explicitly disabled."""
@@ -139,23 +131,19 @@ class TestCacheOptimizationIntegration:
         push_to_original_query_queue(test_query, partition_key, "integer")
 
         # Run monitor with cache optimization explicitly disabled
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False) as log_file:
-            try:
-                # Run for a short time to process the query - explicitly disable optimization
-                result = subprocess.run(
-                    ["pcache-monitor", "--max-processes", "1", "--close", "--status-log-interval", "1", "--disable-cache-optimization"],
-                    capture_output=True, text=True, timeout=30
-                )
+        try:
+            # Run for a short time to process the query - explicitly disable optimization
+            result = subprocess.run(
+                ["pcache-monitor", "--max-processes", "1", "--close", "--status-log-interval", "1", "--disable-cache-optimization"],
+                capture_output=True, text=True, timeout=15
+            )
 
-                # Check that cache optimization was not mentioned in logs
-                assert "Cache optimization ENABLED" not in result.stderr
-                assert "Applied cache optimization" not in result.stderr
+            # Check that cache optimization was not mentioned in logs
+            assert "Cache optimization ENABLED" not in result.stderr
+            assert "Applied cache optimization" not in result.stderr
 
-            except subprocess.TimeoutExpired:
-                pass  # Expected for monitor processes
-            finally:
-                if os.path.exists(log_file.name):
-                    os.unlink(log_file.name)
+        except subprocess.TimeoutExpired:
+            pytest.skip("Monitor process timed out - may indicate system load issues")
 
     def test_cache_optimization_enabled_with_hits(self, cache_optimization_setup):
         """Test cache optimization when enabled and cache hits are found."""

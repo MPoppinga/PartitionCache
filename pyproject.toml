@@ -59,13 +59,15 @@ license-files = ["COPYING", "COPYING.LESSER"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+timeout = 300  # 5 minutes maximum per test
+timeout_method = "thread"
 
 [project.scripts]
 pcache-manage = "partitioncache.cli.manage_cache:main"
 pcache-add = "partitioncache.cli.add_to_cache:main"
 pcache-read = "partitioncache.cli.read_from_cache:main"
 pcache-monitor = "partitioncache.cli.monitor_cache_queue:main"
-pcache-postgresql-queue-processor = "partitioncache.cli.setup_postgresql_queue_processor:main"
+pcache-postgresql-queue-processor = "partitioncache.cli.postgresql_queue_processor:main"
 pcache-postgresql-eviction-manager = "partitioncache.cli.postgresql_cache_eviction:main"
 
 [tool.mypy]

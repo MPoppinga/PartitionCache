@@ -13,7 +13,7 @@ class EnvironmentConfigManager:
     """Centralized environment variable management for cache handlers."""
 
     @staticmethod
-    def get_postgresql_config() -> dict[str, Any]:
+    def get_postgresql_config() -> dict[str, str | int]:
         """
         Get PostgreSQL connection configuration from environment variables.
 
@@ -23,7 +23,7 @@ class EnvironmentConfigManager:
         Raises:
             ValueError: If required environment variables are missing
         """
-        config = {}
+        config: dict[str, str | int] = {}
 
         # Required variables
         required_vars = ["DB_NAME", "DB_HOST", "DB_USER", "DB_PASSWORD", "DB_PORT"]
@@ -59,7 +59,7 @@ class EnvironmentConfigManager:
         return config
 
     @staticmethod
-    def get_postgresql_bit_config() -> dict[str, Any]:
+    def get_postgresql_bit_config() -> dict[str, str | int]:
         """
         Get PostgreSQL bit cache handler configuration.
 

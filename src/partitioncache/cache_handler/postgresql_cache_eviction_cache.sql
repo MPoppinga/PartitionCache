@@ -1,18 +1,32 @@
--- PartitionCache PostgreSQL Cache Eviction Processor
--- This file contains all the necessary SQL objects to evict cache entries directly within PostgreSQL
--- using pg_cron for scheduling.
---
--- Architecture Overview:
--- A single cron job runs periodically, triggering the main eviction function.
--- This function reads from a configuration table to determine the eviction strategy
--- and then applies it to all relevant cache partitions.
---
--- Main Components:
--- - Eviction Config Table: Stores settings like enabled, frequency, strategy, and threshold.
--- - Eviction Log Table: Records all eviction actions for monitoring.
--- - partitioncache_run_eviction_job(): The main function called by cron to orchestrate eviction.
--- - _partitioncache_evict_..._from_partition(): Internal functions that implement the specific eviction strategies.
--- - Cron Sync Trigger: Automatically manages the pg_cron job based on changes to the config table.
+-- PartitionCache PostgreSQL Cache Eviction - Cache Database Components
+-- This file contains components that must be installed in the cache/work database
+-- These components handle the actual eviction processing
+
+-- Function to initialize eviction log table in cache database
+CREATE OR REPLACE FUNCTION partitioncache_initialize_eviction_cache_log_table(p_table_prefix TEXT)
+RETURNS VOID AS $$
+DECLARE
+    v_log_table TEXT;
+BEGIN
+    v_log_table := p_table_prefix || '_eviction_log';
+
+    -- Log table for eviction history (lives in cache database)
+    EXECUTE format('
+        CREATE TABLE IF NOT EXISTS %I (
+            id SERIAL PRIMARY KEY,
+            job_name TEXT NOT NULL,
+            partition_key TEXT NOT NULL,
+            queries_removed_count INTEGER,
+            status TEXT NOT NULL CHECK (status IN (''success'', ''failed'')),
+            message TEXT,
+            execution_time_ms NUMERIC(10,3),
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )', v_log_table);
+    
+    EXECUTE format('CREATE INDEX IF NOT EXISTS idx_%s_created_at ON %I(created_at DESC)',
+        replace(v_log_table, '.', '_'), v_log_table);
+END;
+$$ LANGUAGE plpgsql;
 
 -- Helper function to get the queries table name
 CREATE OR REPLACE FUNCTION partitioncache_get_queries_table_name(p_table_prefix TEXT)
@@ -49,98 +63,6 @@ BEGIN
     END IF;
 END;
 $$ LANGUAGE plpgsql IMMUTABLE;
-
-
--- Function to initialize eviction processor tables
-CREATE OR REPLACE FUNCTION partitioncache_initialize_eviction_tables(p_table_prefix TEXT)
-RETURNS VOID AS $$
-DECLARE
-    v_config_table TEXT;
-    v_log_table TEXT;
-BEGIN
-    v_config_table := p_table_prefix || '_eviction_config';
-    v_log_table := p_table_prefix || '_eviction_log';
-
-    -- Configuration table for the eviction processor
-    EXECUTE format('
-        CREATE TABLE IF NOT EXISTS %I (
-            job_name TEXT PRIMARY KEY,
-            enabled BOOLEAN NOT NULL DEFAULT false,
-            frequency_minutes INTEGER NOT NULL DEFAULT 60 CHECK (frequency_minutes > 0),
-            strategy TEXT NOT NULL DEFAULT ''oldest'' CHECK (strategy IN (''oldest'', ''largest'')),
-            threshold INTEGER NOT NULL DEFAULT 1000 CHECK (threshold > 0),
-            table_prefix TEXT NOT NULL,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )', v_config_table);
-
-    -- Log table for eviction history
-    EXECUTE format('
-        CREATE TABLE IF NOT EXISTS %I (
-            id SERIAL PRIMARY KEY,
-            job_name TEXT NOT NULL,
-            partition_key TEXT NOT NULL,
-            queries_removed_count INTEGER,
-            status TEXT NOT NULL CHECK (status IN (''success'', ''failed'')),
-            message TEXT,
-            execution_time_ms NUMERIC(10,3),
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )', v_log_table);
-    
-    EXECUTE format('CREATE INDEX IF NOT EXISTS idx_%s_created_at ON %I(created_at DESC)',
-        replace(v_log_table, '.', '_'), v_log_table);
-END;
-$$ LANGUAGE plpgsql;
-
-
--- Trigger function to synchronize config with cron.job for eviction
-CREATE OR REPLACE FUNCTION partitioncache_sync_eviction_cron_job()
-RETURNS TRIGGER AS $$
-DECLARE
-    v_command TEXT;
-BEGIN
-    IF (TG_OP = 'DELETE') THEN
-        DELETE FROM cron.job WHERE jobname = OLD.job_name;
-        RETURN OLD;
-    END IF;
-
-    -- Build the command to be executed by cron
-    v_command := format('SELECT partitioncache_run_eviction_job(%L, %L)', NEW.job_name, NEW.table_prefix);
-
-    IF (TG_OP = 'INSERT') THEN
-        INSERT INTO cron.job (jobname, schedule, command, active)
-        VALUES (NEW.job_name, CONCAT(NEW.frequency_minutes, ' minutes'), v_command, NEW.enabled);
-    ELSIF (TG_OP = 'UPDATE') THEN
-        UPDATE cron.job
-        SET schedule = CONCAT(NEW.frequency_minutes, ' minutes'),
-            command = v_command,
-            active = NEW.enabled
-        WHERE jobname = NEW.job_name;
-    END IF;
-
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
--- Function to attach the trigger to the eviction config table
-CREATE OR REPLACE FUNCTION partitioncache_create_eviction_config_trigger(p_table_prefix TEXT)
-RETURNS VOID AS $$
-DECLARE
-    v_config_table TEXT;
-    v_trigger_name TEXT;
-BEGIN
-    v_config_table := p_table_prefix || '_eviction_config';
-    v_trigger_name := 'trg_sync_eviction_cron_job_' || replace(v_config_table, '.', '_');
-
-    EXECUTE format('DROP TRIGGER IF EXISTS %I ON %I', v_trigger_name, v_config_table);
-
-    EXECUTE format('
-        CREATE TRIGGER %I
-        AFTER INSERT OR UPDATE OR DELETE ON %I
-        FOR EACH ROW
-        EXECUTE FUNCTION partitioncache_sync_eviction_cron_job()
-    ', v_trigger_name, v_config_table);
-END;
-$$ LANGUAGE plpgsql;
 
 -- Eviction strategy: Remove the oldest entries if count exceeds threshold
 CREATE OR REPLACE FUNCTION _partitioncache_evict_oldest_from_partition(
@@ -266,28 +188,24 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-
--- Main eviction function called by cron
-CREATE OR REPLACE FUNCTION partitioncache_run_eviction_job(p_job_name TEXT, p_table_prefix TEXT)
+-- Main eviction function called by cron with parameters (executed in cache database)
+CREATE OR REPLACE FUNCTION partitioncache_run_eviction_job_with_params(
+    p_job_name TEXT, 
+    p_table_prefix TEXT,
+    p_strategy TEXT,
+    p_threshold INTEGER
+)
 RETURNS VOID AS $$
 DECLARE
-    v_config RECORD;
     v_metadata_table TEXT;
     v_partition RECORD;
     v_start_time TIMESTAMP;
-    v_config_table TEXT;
     v_log_table TEXT;
 BEGIN
     v_start_time := clock_timestamp();
-    v_config_table := p_table_prefix || '_eviction_config';
     v_log_table := p_table_prefix || '_eviction_log';
-
-    -- Get configuration for this job
-    EXECUTE format('SELECT * FROM %I WHERE job_name = %L', v_config_table, p_job_name) INTO v_config;
-    IF v_config IS NULL THEN
-        RAISE WARNING 'No configuration found for eviction job %', p_job_name;
-        RETURN;
-    END IF;
+    
+    -- No configuration lookup needed - all parameters passed directly
 
     v_metadata_table := partitioncache_get_metadata_table_name(p_table_prefix);
 
@@ -302,10 +220,10 @@ BEGIN
     FOR v_partition IN EXECUTE format('SELECT partition_key FROM %I', v_metadata_table)
     LOOP
         BEGIN
-            IF v_config.strategy = 'oldest' THEN
-                PERFORM _partitioncache_evict_oldest_from_partition(p_job_name, p_table_prefix, v_partition.partition_key, v_config.threshold);
-            ELSIF v_config.strategy = 'largest' THEN
-                PERFORM _partitioncache_evict_largest_from_partition(p_job_name, p_table_prefix, v_partition.partition_key, v_config.threshold);
+            IF p_strategy = 'oldest' THEN
+                PERFORM _partitioncache_evict_oldest_from_partition(p_job_name, p_table_prefix, v_partition.partition_key, p_threshold);
+            ELSIF p_strategy = 'largest' THEN
+                PERFORM _partitioncache_evict_largest_from_partition(p_job_name, p_table_prefix, v_partition.partition_key, p_threshold);
             END IF;
         EXCEPTION WHEN OTHERS THEN
             EXECUTE format('INSERT INTO %I (job_name, partition_key, queries_removed_count, status, message) VALUES (%L, %L, 0, ''failed'', %L)',
@@ -315,34 +233,23 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+-- Note: No backward compatibility wrapper needed since manual commands 
+-- read config from cron database and call parameter-based function directly
 
--- Function to remove all eviction-related objects
-CREATE OR REPLACE FUNCTION partitioncache_remove_eviction_objects(p_table_prefix TEXT)
+-- Function to remove all eviction-related objects from cache database
+CREATE OR REPLACE FUNCTION partitioncache_remove_eviction_cache_objects(p_table_prefix TEXT)
 RETURNS VOID AS $$
 DECLARE
-    v_config_table TEXT;
     v_log_table TEXT;
-    v_job_name TEXT;
 BEGIN
-    v_config_table := p_table_prefix || '_eviction_config';
     v_log_table := p_table_prefix || '_eviction_log';
 
-    -- Get job name to remove from cron.job
-    EXECUTE format('SELECT job_name FROM %I LIMIT 1', v_config_table) INTO v_job_name;
-    IF v_job_name IS NOT NULL THEN
-        DELETE FROM cron.job WHERE jobname = v_job_name;
-    END IF;
-
-    EXECUTE format('DROP TABLE IF EXISTS %I CASCADE', v_config_table);
     EXECUTE format('DROP TABLE IF EXISTS %I CASCADE', v_log_table);
 
-    -- Drop functions, be careful if they are shared
-    -- For now, this is kept self-contained
-    DROP FUNCTION IF EXISTS partitioncache_run_eviction_job(TEXT, TEXT);
+    -- Drop cache-specific functions
+    DROP FUNCTION IF EXISTS partitioncache_run_eviction_job_with_params(TEXT, TEXT, TEXT, INTEGER);
     DROP FUNCTION IF EXISTS _partitioncache_evict_oldest_from_partition(TEXT, TEXT, TEXT, INTEGER);
     DROP FUNCTION IF EXISTS _partitioncache_evict_largest_from_partition(TEXT, TEXT, TEXT, INTEGER);
-    DROP FUNCTION IF EXISTS partitioncache_sync_eviction_cron_job();
-    DROP FUNCTION IF EXISTS partitioncache_create_eviction_config_trigger(TEXT);
-    DROP FUNCTION IF EXISTS partitioncache_initialize_eviction_tables(TEXT);
+    DROP FUNCTION IF EXISTS partitioncache_initialize_eviction_cache_log_table(TEXT);
 END;
-$$ LANGUAGE plpgsql; 
+$$ LANGUAGE plpgsql;

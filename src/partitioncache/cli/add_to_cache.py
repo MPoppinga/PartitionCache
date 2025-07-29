@@ -130,8 +130,21 @@ def main():
             # Resolve cache backend and database connection
             cache_backend = resolve_cache_backend(args)
 
-            # Initialize cache handler using API
-            cache = partitioncache.create_cache_helper(cache_backend, args.partition_key, args.partition_datatype)
+            # Initialize cache handler using API with proper bitsize handling
+            cache_handler = partitioncache.get_cache_handler(cache_backend, singleton=True)
+            kwargs = {}
+            if hasattr(cache_handler, '_get_partition_bitsize'):
+                existing_bitsize = cache_handler._get_partition_bitsize(args.partition_key) # type: ignore[attr-defined]
+                if args.bitsize is not None:
+                    kwargs['bitsize'] = args.bitsize
+                    if existing_bitsize is not None and existing_bitsize != args.bitsize:
+                        logger.info(f"Updating bitsize from {existing_bitsize} to {args.bitsize} for partition '{args.partition_key}'")
+                        cache_handler._set_partition_bitsize(args.partition_key, args.bitsize) # type: ignore[attr-defined]
+                elif existing_bitsize is not None:
+                    kwargs['bitsize'] = existing_bitsize
+            elif hasattr(args, 'bitsize') and args.bitsize is not None:
+                kwargs['bitsize'] = args.bitsize
+            cache = partitioncache.create_partitioncache_helper(cache_handler, args.partition_key, args.partition_datatype, **kwargs)
 
             # Get database handler using common connection parameters
             db_connection_params = get_database_connection_params(args)

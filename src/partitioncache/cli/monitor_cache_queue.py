@@ -284,7 +284,23 @@ def run_and_store_query(query: str, query_hash: str, partition_key: str, partiti
         db_handler.close()
 
         if partition_datatype is not None:
-            cache_handler.register_partition_key(partition_key, partition_datatype)
+            # Handle bitsize for bit cache handlers
+            kwargs = {}
+            if hasattr(cache_handler, '_get_partition_bitsize'):
+                existing_bitsize = cache_handler._get_partition_bitsize(partition_key) # type: ignore[attr-defined]
+                if args.bitsize is not None:
+                    # CLI override
+                    kwargs['bitsize'] = args.bitsize
+                    if existing_bitsize is not None and existing_bitsize != args.bitsize:
+                        logger.info(f"Updating bitsize from {existing_bitsize} to {args.bitsize} for partition '{partition_key}'")
+                        cache_handler._set_partition_bitsize(partition_key, args.bitsize) # type: ignore[attr-defined]
+                elif existing_bitsize is not None:
+                    # Use existing
+                    kwargs['bitsize'] = existing_bitsize
+                # else: use handler default
+            elif hasattr(args, 'bitsize') and args.bitsize is not None:
+                kwargs['bitsize'] = args.bitsize
+            cache_handler.register_partition_key(partition_key, partition_datatype, **kwargs)
 
         # Always store with original hash and query (not the optimized version)
         cache_handler.set_cache(original_hash, result, partition_key)
@@ -599,8 +615,10 @@ def main():
     add_variant_generation_args(parser)
     add_verbosity_args(parser)
 
-    # Cache backend argument (not using add_cache_args because this tool doesn't need partition args)
-    parser.add_argument("--cache-backend", type=str, help="Cache backend to use (if not specified, uses CACHE_BACKEND environment variable)")
+    # Cache backend argument with bitsize support
+    cache_group = parser.add_argument_group("cache configuration")
+    cache_group.add_argument("--cache-backend", type=str, help="Cache backend to use (if not specified, uses CACHE_BACKEND environment variable)")
+    cache_group.add_argument("--bitsize", type=int, help="Bitsize for bit cache handlers (default: uses handler default or environment variable)")
 
     global args
     args = parser.parse_args()

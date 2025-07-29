@@ -500,7 +500,7 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
             return None
 
     @abstractmethod
-    def _ensure_partition_table(self, partition_key: str, datatype: str, **kwargs) -> bool:
+    def _ensure_partition_table(self, partition_key: str, datatype: str, **kwargs)-> bool | tuple[bool, int]:
         """Ensure a partition table exists. Must be implemented by subclasses."""
         pass
 

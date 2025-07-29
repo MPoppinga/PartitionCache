@@ -44,6 +44,8 @@ class RedisQueueHandler(AbstractQueueHandler):
                 "host": self.host,
                 "port": self.port,
                 "db": self.db,
+                "socket_connect_timeout": 5,  # 5 second connection timeout
+                "socket_timeout": 5,  # 5 second socket timeout
             }
 
             if self.password:

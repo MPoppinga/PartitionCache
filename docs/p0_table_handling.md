@@ -147,17 +147,55 @@ pcache-add \
 
 ### API Parameters
 
+The star-join parameters are available in all major PartitionCache API functions:
+
+#### `apply_cache_lazy()` - Recommended API
 ```python
-generate_partial_queries(
-    query,
-    partition_key,
+import partitioncache
+
+enhanced_query, stats = partitioncache.apply_cache_lazy(
+    query="SELECT * FROM users u, orders o, p0_city p0 WHERE ...",
+    cache_handler=cache.underlying_handler,
+    partition_key="city_id",
+    method="TMP_TABLE_IN",
     auto_detect_star_join=True,      # Enable smart star-join detection (default)
-    star_join_table='star_table',    # Explicitly mark ONE table as star-join
+    star_join_table="p0",            # Explicitly mark table by alias
     min_component_size=2,            # Min tables per variant (including star-join)
-    max_component_size=3,            # Max tables per variant (including star-join)
-    warn_no_partition_key=True       # Warn about tables not using partition key
+    # ... other parameters
 )
 ```
+
+#### `get_partition_keys()` - Cache Lookup
+```python
+import partitioncache
+
+partition_keys, subqueries, hits = partitioncache.get_partition_keys(
+    query="SELECT * FROM users u, orders o, p0_city p0 WHERE ...",
+    cache_handler=cache.underlying_handler,
+    partition_key="city_id",
+    auto_detect_star_join=True,      # Enable smart star-join detection (default)
+    star_join_table="p0_city",       # Explicitly mark table by name
+    min_component_size=2,            # Min tables per variant
+    # ... other parameters
+)
+```
+
+#### `extend_query_with_partition_keys()` - Query Enhancement
+```python
+import partitioncache
+
+optimized_query = partitioncache.extend_query_with_partition_keys(
+    query="SELECT * FROM users u, orders o, p0_city p0 WHERE ...",
+    partition_keys={1, 5, 10, 15, 20},
+    partition_key="city_id",
+    method="IN",
+    p0_alias="p0",                   # Use detected star-join table alias
+)
+```
+
+All functions support the same star-join parameters:
+- `auto_detect_star_join: bool = True` - Enable smart star-join detection
+- `star_join_table: str | None = None` - Explicitly mark ONE table as star-join (by alias or name)
 
 ## When to Use Star-Join Optimization
 

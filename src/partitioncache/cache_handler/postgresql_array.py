@@ -23,113 +23,51 @@ class PostgreSQLArrayCacheHandler(PostgreSQLAbstractCacheHandler):
     def __init__(self, db_name, db_host, db_user, db_password, db_port, db_tableprefix) -> None:
         super().__init__(db_name, db_host, db_user, db_password, db_port, db_tableprefix)
 
-        # Ensure intarray extension is present for integer-specific operators and indexes.
+        # Load SQL functions first
+        self._load_sql_functions()
+
+        # Setup array-specific extensions and aggregates
         try:
-            self.cursor.execute("CREATE EXTENSION IF NOT EXISTS intarray;")
+            self.cursor.execute("SELECT partitioncache_setup_array_extensions()")
+            result = self.cursor.fetchone()
+            self.array_intersect_agg_available = result[0] if result else False
             self.db.commit()
         except Exception as e:
-            logger.warning(f"Failed to create intarray extension (this is optional but recommended for integer intersections): {e}")
-
-        self.array_intersect_agg_available = False
-
-        # Create custom aggregate for array intersection if it doesn't exist.
-        try:
-            self.cursor.execute(
-                """
-                CREATE OR REPLACE FUNCTION _array_intersect(anyarray, anyarray)
-                RETURNS anyarray AS $$
-                    SELECT CASE
-                        WHEN $1 IS NULL THEN $2
-                        WHEN $2 IS NULL THEN $1
-                        ELSE ARRAY(SELECT unnest($1) INTERSECT SELECT unnest($2) ORDER BY 1)
-                    END;
-                $$ LANGUAGE sql IMMUTABLE;
-            """
-            )
-            # Drop aggregate if it exists to recreate it, as CREATE AGGREGATE IF NOT EXISTS is not available.
-            self.cursor.execute("DROP AGGREGATE IF EXISTS array_intersect_agg(anyarray);")
-            self.cursor.execute(
-                """
-                CREATE AGGREGATE array_intersect_agg(anyarray) (
-                    SFUNC = _array_intersect,
-                    STYPE = anyarray
-                );
-            """
-            )
-            self.db.commit()
-            self.array_intersect_agg_available = True
-        except Exception as e:
-            logger.warning(f"Failed to create custom array_intersect_agg. Performance for non-integer arrays might be suboptimal. Error: {e}")
+            logger.warning(f"Failed to setup array extensions. Performance might be suboptimal. Error: {e}")
+            self.array_intersect_agg_available = False
             if self.db.closed is False:
                 self.db.rollback()
 
-    def _create_partition_table(self, partition_key: str, datatype: str) -> None:
-        """Create a cache table for a specific partition key with appropriate datatype."""
-        table_name = f"{self.tableprefix}_cache_{partition_key}"
-
-        # Determine the appropriate SQL datatype for the array column
-        if datatype == "integer":
-            sql_datatype = "INTEGER[]"
-        elif datatype == "float":
-            sql_datatype = "NUMERIC[]"
-        elif datatype == "text":
-            sql_datatype = "TEXT[]"
-        elif datatype == "timestamp":
-            sql_datatype = "TIMESTAMP[]"
-        else:
-            raise ValueError(f"Unsupported datatype: {datatype}")
-
+    def _load_sql_functions(self) -> None:
+        """Load SQL functions from the cache handlers SQL file."""
         try:
-            # Create the cache table
+            from pathlib import Path
+
+            # Get the SQL file path for cache handlers
+            sql_cache_file = Path(__file__).parent / "postgresql_cache_handlers.sql"
+
+            if not sql_cache_file.exists():
+                logger.warning(f"SQL cache handlers file not found at {sql_cache_file}")
+                return
+
+            # Read and execute the SQL file
+            sql_cache_content = sql_cache_file.read_text()
+            self.cursor.execute(sql_cache_content)  # type: ignore[arg-type]
+            logger.debug("Successfully loaded SQL functions from cache handlers file")
+        except Exception as e:
+            logger.debug(f"Failed to load SQL functions (this is OK if they're already loaded): {e}")
+
+    def _create_partition_table(self, partition_key: str, datatype: str) -> None:
+        """Create a cache table for a specific partition key using SQL bootstrap function."""
+        try:
+            # Use SQL bootstrap function to create partition table and metadata entry
             self.cursor.execute(
-                sql.SQL("""CREATE TABLE IF NOT EXISTS {0} (
-                    query_hash TEXT PRIMARY KEY,
-                    partition_keys {1},
-                    partition_keys_count integer GENERATED ALWAYS AS (
-                        CASE
-                            WHEN partition_keys IS NULL THEN NULL
-                            ELSE cardinality(partition_keys)
-                        END
-                    ) STORED
-                );""").format(sql.Identifier(table_name), sql.SQL(sql_datatype))
+                sql.SQL("SELECT partitioncache_bootstrap_partition(%s, %s, %s, %s)"),
+                (self.tableprefix, partition_key, datatype, "array")
             )
-
-            # Create appropriate index based on datatype
-            if datatype == "integer":
-                # Use intarray-specific GIN index for integers - with error handling
-                try:
-                    self.cursor.execute(
-                        sql.SQL("CREATE INDEX IF NOT EXISTS {0} ON {1} USING GIN (partition_keys gin__int_ops);").format(
-                            sql.Identifier(f"idx_{table_name}_partition_keys"), sql.Identifier(table_name)
-                        )
-                    )
-                except Exception as index_error:
-                    logger.warning(f"Failed to create intarray GIN index, falling back to standard GIN index: {index_error}")
-                    # Fallback to standard GIN index if intarray fails
-                    self.cursor.execute(
-                        sql.SQL("CREATE INDEX IF NOT EXISTS {0} ON {1} USING GIN (partition_keys);").format(
-                            sql.Identifier(f"idx_{table_name}_partition_keys"), sql.Identifier(table_name)
-                        )
-                    )
-            else:
-                # Use standard GIN index for other types
-                self.cursor.execute(
-                    sql.SQL("CREATE INDEX IF NOT EXISTS {0} ON {1} USING GIN (partition_keys);").format(
-                        sql.Identifier(f"idx_{table_name}_partition_keys"), sql.Identifier(table_name)
-                    )
-                )
-
-            # Insert metadata
-            self.cursor.execute(
-                sql.SQL("INSERT INTO {0} (partition_key, datatype) VALUES (%s, %s) ON CONFLICT (partition_key) DO NOTHING").format(
-                    sql.Identifier(self.tableprefix + "_partition_metadata")
-                ),
-                (partition_key, datatype),
-            )
-
             self.db.commit()
         except Exception as e:
-            logger.error(f"Failed to create partition table {table_name}: {e}")
+            logger.error(f"Failed to create partition table for {partition_key}: {e}")
             # Rollback the transaction to prevent "current transaction is aborted" error
             try:
                 self.db.rollback()
@@ -137,17 +75,43 @@ class PostgreSQLArrayCacheHandler(PostgreSQLAbstractCacheHandler):
                 logger.error(f"Failed to rollback transaction during table creation: {rollback_error}")
             raise
 
-    def _ensure_partition_table(self, partition_key: str, datatype: str, **kwargs) -> bool:
-        """Ensure a partition table exists with the correct datatype."""
-        existing_datatype = self._get_partition_datatype(partition_key)
+    def _ensure_partition_table(self, partition_key: str, datatype: str, **kwargs):
+        """Ensure a partition table exists with the correct datatype using SQL bootstrap function."""
+        try:
+            # Load SQL functions first to ensure they're available
+            self._load_sql_functions()
 
-        if existing_datatype is None:
-            # Create new table
-            self._create_partition_table(partition_key, datatype)
+            # Use SQL bootstrap function to ensure metadata tables exist
+            self.cursor.execute(
+                sql.SQL("SELECT partitioncache_ensure_metadata_tables(%s)"),
+                (self.tableprefix,)
+            )
+
+            # Check if partition already exists and validate datatype
+            existing_datatype = self._get_partition_datatype(partition_key)
+            if existing_datatype is not None and existing_datatype != datatype:
+                raise ValueError(f"Partition key '{partition_key}' already exists with datatype '{existing_datatype}', cannot use datatype '{datatype}'")
+
+            # Use SQL bootstrap function to create partition table and metadata entry
+            self.cursor.execute(
+                sql.SQL("SELECT partitioncache_bootstrap_partition(%s, %s, %s, %s)"),
+                (self.tableprefix, partition_key, datatype, "array")
+            )
+
+            self.db.commit()
             return True
-        elif existing_datatype != datatype:
-            raise ValueError(f"Partition key '{partition_key}' already exists with datatype '{existing_datatype}', cannot use datatype '{datatype}'")
-        return True
+        except Exception as e:
+            logger.error(f"Failed to ensure partition table for {partition_key}: {e}")
+            # Rollback and retry with manual table creation as fallback
+            try:
+                self.db.rollback()
+                logger.warning(f"Attempting manual table creation after bootstrap failure: {e}")
+                self._create_partition_table(partition_key, datatype)
+            except Exception as recreate_error:
+                logger.error(f"Failed to create partition table for {partition_key}: {recreate_error}")
+                self.db.rollback()
+                raise
+            return True
 
     def set_cache(self, key: str, partition_key_identifiers: set[int] | set[str] | set[float] | set[datetime], partition_key: str = "partition_key") -> bool:
         """Store partition key identifiers in the cache for a specific partition key (column)."""

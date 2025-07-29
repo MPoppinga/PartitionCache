@@ -90,9 +90,7 @@ PartitionCache follows a modular architecture with distinct layers:
 ### Operations
 - **[Queue System](queue_system.md)** - Two-queue architecture and providers
 - **[PostgreSQL Queue Processor](postgresql_queue_processor.md)** - pg_cron integration
-- **[Cache Optimization](cache_optimization.md)** - Cache-aware query optimization in pcache-monitor
 - **[Cache Eviction](cache_eviction.md)** - Automatic cleanup strategies
-- **[Production Deployment](production_deployment.md)** - Configuration and best practices
 
 ### Development
 - **[Integration Test Guide](integration_test_guide.md)** - Testing documentation
@@ -100,7 +98,8 @@ PartitionCache follows a modular architecture with distinct layers:
 ### Examples & Tutorials
 - **[Complete Workflow](complete_workflow_example.md)** - End-to-end tutorial
 - **[Cache Management CLI](manage_cache_cli.md)** - pcache-manage usage guide
-- **[Migration Guide](migration_guide.md)** - Backend migration procedures
+- **[P0 Table Handling](p0_table_handling.md)** - Star-join query optimization
+- **[pg_cron Cross-Database Setup](pg_cron_cross_database_setup.md)** - Advanced PostgreSQL configuration
 
 ## Key Concepts
 
@@ -122,8 +121,11 @@ PartitionCache uses sophisticated query decomposition to maximize cache effectiv
 |---------|---------|-------|------|-----------|
 | postgresql_array | ✅ | ✅ | ✅ | ✅ |
 | postgresql_bit | ✅ | ❌ | ❌ | ❌ |
+| postgresql_roaringbit | ✅ | ❌ | ❌ | ❌ |
 | redis_set | ✅ | ❌ | ✅ | ❌ |
+| redis_bit | ✅ | ❌ | ❌ | ❌ |
 | rocksdb_set | ✅ | ❌ | ✅ | ❌ |
+| rocksdb_bit | ✅ | ❌ | ❌ | ❌ |
 | rocksdict | ✅ | ✅ | ✅ | ✅ |
 
 ## Configuration
@@ -136,12 +138,46 @@ CACHE_BACKEND=postgresql_array
 DB_HOST=localhost
 DB_PORT=5432
 DB_NAME=app_database
+DB_USER=app_user
+DB_PASSWORD=secure_password
 
 # Queue settings
 QUERY_QUEUE_PROVIDER=postgresql
+PG_QUEUE_HOST=localhost
+PG_QUEUE_PORT=5432
+PG_QUEUE_DB=app_database
+
+# Optional table prefixes
+PG_ARRAY_CACHE_TABLE_PREFIX=partitioncache
+PG_QUEUE_TABLE_PREFIX=partitioncache_queue
 ```
 
-Look at the [.env.example](../.env.example) file for more details. See [Production Deployment Guide](production_deployment.md) for complete configuration options.
+Look at the [.env.example](../.env.example) file for more details.
+
+## Production Operations
+
+### Essential Deployment Steps
+1. **Database Setup**: Install pg_cron extension for PostgreSQL-based deployments
+2. **Environment Configuration**: Set all required environment variables
+3. **Infrastructure Setup**: `pcache-manage setup all`
+4. **Queue Processing**: Enable `pcache-postgresql-queue-processor` or run `pcache-monitor`
+5. **Cache Eviction**: Configure `pcache-postgresql-eviction-manager` for automatic cleanup
+
+### Performance Recommendations
+- **PostgreSQL**: Use connection pooling, proper indexing, and pg_cron for processing
+- **Redis**: Configure memory limits with appropriate eviction policies
+- **Monitoring**: Track queue depths, cache hit rates, and processing performance
+
+### Security Best Practices
+- Use dedicated database users with minimal permissions
+- Enable SSL/TLS for all database connections
+- Validate and sanitize all queries before caching
+- Never store sensitive data in cache keys or values
+
+### Maintenance Tasks
+- **Daily**: Monitor queue depths and processing rates
+- **Weekly**: Run `pcache-manage maintenance prune` to clean old logs
+- **Monthly**: Review cache utilization and adjust eviction policies
 
 ## CLI Tools
 

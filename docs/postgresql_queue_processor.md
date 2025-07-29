@@ -6,6 +6,127 @@ The PostgreSQL Queue Processor provides a sophisticated database-native approach
 
 This approach offers significant advantages in reliability, performance, and operational simplicity by eliminating external dependencies and providing comprehensive monitoring and logging capabilities.
 
+### Cross-Database Architecture Support
+
+PartitionCache supports cross-database pg_cron configurations where:
+- **pg_cron** is installed in a central database (typically `postgres`)
+- **Work databases** contain PartitionCache tables and business logic
+- **Jobs execute** in work databases via `cron.schedule_in_database()`
+
+This architecture provides better isolation, security, and scalability.
+
+#### Cross-Database Setup Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                      PostgreSQL Instance                               │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  ┌─────────────────┐                    ┌─────────────────────────┐    │
+│  │  pg_cron DB     │                    │     Cache Database      │    │
+│  │  (postgres)     │                    │    (geominedb)          │    │
+│  │                 │                    │                         │    │
+│  │ ┌─────────────┐ │ schedule_in_       │ ┌─────────────────────┐ │    │
+│  │ │  pg_cron    │ │ database()         │ │  Queue Tables       │ │    │
+│  │ │  Extension  │ │ ─────────────────→ │ │  Cache Tables       │ │    │
+│  │ │  Config     │ │                    │ │  Processor Functions│ │    │
+│  │ │  Tables     │ │                    │ │  Business Logic     │ │    │
+│  │ └─────────────┘ │                    │ └─────────────────────┘ │    │
+│  └─────────────────┘                    └─────────────────────────┘    │
+│                                         └─────────────────────────┘    │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Environment Configuration
+
+```bash
+# Cache Database (where queues and cache are stored)
+DB_HOST=localhost
+DB_PORT=5432
+DB_USER=your_username
+DB_PASSWORD=your_password
+DB_NAME=geominedb
+
+# Queue Database (must be same as cache database)
+PG_QUEUE_HOST=localhost
+PG_QUEUE_PORT=5432
+PG_QUEUE_USER=your_username
+PG_QUEUE_PASSWORD=your_password
+PG_QUEUE_DB=geominedb
+
+# pg_cron Database (can be different from cache database)
+PG_CRON_HOST=localhost                   # Default: same as DB_HOST
+PG_CRON_PORT=5432                       # Default: same as DB_PORT
+PG_CRON_USER=your_username              # Default: same as DB_USER
+PG_CRON_PASSWORD=your_password          # Default: same as DB_PASSWORD
+PG_CRON_DATABASE=postgres               # Default: postgres
+
+# Cache Backend Configuration
+CACHE_BACKEND=postgresql_array
+PG_ARRAY_CACHE_TABLE_PREFIX=partitioncache
+```
+
+#### Setup Steps
+
+1. **Install pg_cron Extension**:
+   ```sql
+   -- Connect to the pg_cron database (usually postgres)
+   psql -U your_username -d postgres
+   
+   -- Install pg_cron extension
+   CREATE EXTENSION IF NOT EXISTS pg_cron;
+   ```
+
+2. **Grant Permissions**:
+   ```sql
+   -- Grant necessary permissions to your user
+   GRANT USAGE ON SCHEMA cron TO your_username;
+   GRANT EXECUTE ON FUNCTION cron.schedule_in_database TO your_username;
+   GRANT EXECUTE ON FUNCTION cron.unschedule TO your_username;
+   GRANT EXECUTE ON FUNCTION cron.alter_job TO your_username;
+   GRANT SELECT ON cron.job TO your_username;
+   ```
+
+3. **Setup PartitionCache**:
+   ```bash
+   # Setup the PostgreSQL queue processor
+   pcache-postgresql-queue-processor setup --enable-after-setup
+   
+   # Verify setup
+   pcache-postgresql-queue-processor status
+   ```
+
+#### How Cross-Database Processing Works
+
+1. **Setup Phase**: 
+   - Script connects to `postgres` database to install pg_cron configuration objects
+   - Creates processor functions and queue tables in `geominedb`
+
+2. **Job Scheduling**:
+   - pg_cron jobs are stored in `postgres` database  
+   - Jobs use `cron.schedule_in_database()` to execute in `geominedb`
+
+3. **Processing**:
+   - Jobs run in `geominedb` where queues and cache tables exist
+   - Configuration is retrieved from `postgres` database via dblink
+   - All business logic executes in the cache database
+
+#### Validation
+
+The system validates that:
+- ✅ Queue and cache databases are the same instance
+- ✅ pg_cron database can be different from cache database
+- ✅ All required environment variables are set
+- ✅ dblink extension is available for cross-database queries
+- ✅ Cross-database permissions are properly configured
+
+#### Benefits
+
+1. **Isolation**: pg_cron infrastructure separate from business data
+2. **Scalability**: Single pg_cron can serve multiple work databases
+3. **Security**: Different permission models for scheduling vs. execution
+4. **Maintenance**: Easier to manage pg_cron without affecting business databases
+
 ## Architecture Overview
 
 ```
@@ -162,15 +283,15 @@ SELECT * FROM partitioncache_get_processor_status('partitioncache_queue', 'parti
 - **queue_length**: Number of items waiting in queue
 - **last_seen**: Timestamp of last processor activity
 
-#### `partitioncache_set_processor_enabled(p_enabled, p_queue_prefix, p_job_name)`
+#### `partitioncache_set_processor_enabled_cron(p_enabled, p_queue_prefix, p_job_name)`
 Enable or disable the processor:
 
 ```sql
 -- Enable processor
-SELECT partitioncache_set_processor_enabled(true, 'partitioncache_queue', 'partitioncache_process_queue');
+SELECT partitioncache_set_processor_enabled_cron(true, 'partitioncache_queue', 'partitioncache_process_queue');
 
 -- Disable processor  
-SELECT partitioncache_set_processor_enabled(false, 'partitioncache_queue', 'partitioncache_process_queue');
+SELECT partitioncache_set_processor_enabled_cron(false, 'partitioncache_queue', 'partitioncache_process_queue');
 ```
 
 ### Configuration Management
@@ -282,6 +403,7 @@ PG_BIT_CACHE_TABLE_PREFIX=my_custom_prefix
 # Default if not specified
 # Uses 'partitioncache' as prefix
 ```
+
 
 ### Processor Configuration
 

@@ -28,7 +28,7 @@ class PartitionCacheHelper:
     reducing repetitive parameter passing and enabling early validation.
     """
 
-    def __init__(self, cache_handler: AbstractCacheHandler, partition_key: str, settype: str | None):
+    def __init__(self, cache_handler: AbstractCacheHandler, partition_key: str, settype: str | None, **kwargs):
         """
         Initialize the partition cache handler wrapper.
 
@@ -36,7 +36,7 @@ class PartitionCacheHelper:
             cache_handler: The underlying cache handler instance
             partition_key: The partition key for this wrapper
             settype: The datatype string for values (e.g., 'int', 'str', 'float', 'datetime')
-            cache_handler_type: Optional cache handler type for early validation
+            **kwargs: Additional configuration options (e.g., bitsize for bit handlers)
 
         Raises:
             ValueError: If the cache handler doesn't support the specified datatype
@@ -58,8 +58,8 @@ class PartitionCacheHelper:
                     raise ValueError(f"Datatype mismatch: {known_datatype} != {settype}")
 
             else:
-                # initialize the cache handler with the settype
-                self._cache_handler.register_partition_key(partition_key, settype)
+                # initialize the cache handler with the settype and additional kwargs
+                self._cache_handler.register_partition_key(partition_key, settype, **kwargs)
                 self._settype = settype
 
         if self._settype is None:
@@ -327,7 +327,7 @@ class LazyPartitionCacheHelper(PartitionCacheHelper):
     Wrapper for cache handlers that support lazy intersection.
     """
 
-    def __init__(self, cache_handler: AbstractCacheHandler_Lazy, partition_key: str, settype: str | None):
+    def __init__(self, cache_handler: AbstractCacheHandler_Lazy, partition_key: str, settype: str | None, **kwargs):
         """
         Initialize the lazy partition cache handler wrapper.
 
@@ -335,9 +335,9 @@ class LazyPartitionCacheHelper(PartitionCacheHelper):
             cache_handler: The underlying lazy cache handler instance
             partition_key: The partition key for this wrapper
             settype: The Python type for values (int, str, float, datetime)
-            cache_handler_type: Optional cache handler type for early validation
+            **kwargs: Additional configuration options (e.g., bitsize for bit handlers)
         """
-        super().__init__(cache_handler, partition_key, settype)
+        super().__init__(cache_handler, partition_key, settype, **kwargs)
 
         self._cache_handler: AbstractCacheHandler_Lazy = cache_handler
 
@@ -358,7 +358,7 @@ class LazyPartitionCacheHelper(PartitionCacheHelper):
             return None, 0
 
 
-def create_partitioncache_helper(cache_handler: AbstractCacheHandler, partition_key: str, settype: str | None) -> PartitionCacheHelper:
+def create_partitioncache_helper(cache_handler: AbstractCacheHandler, partition_key: str, settype: str | None, **kwargs) -> PartitionCacheHelper:
     """
     Factory function to create the appropriate partition handler.
 
@@ -366,12 +366,12 @@ def create_partitioncache_helper(cache_handler: AbstractCacheHandler, partition_
         cache_handler: The underlying cache handler instance
         partition_key: The partition key for this wrapper
         settype: The Python type for values (int, str, float, datetime)
-        cache_handler_type: Optional cache handler type for early validation
+        **kwargs: Additional configuration options (e.g., bitsize for bit handlers)
 
     Returns:
         PartitionCacheHandler or LazyPartitionCacheHandler instance
     """
     if isinstance(cache_handler, AbstractCacheHandler_Lazy):
-        return LazyPartitionCacheHelper(cache_handler, partition_key, settype)
+        return LazyPartitionCacheHelper(cache_handler, partition_key, settype, **kwargs)
     else:
-        return PartitionCacheHelper(cache_handler, partition_key, settype)
+        return PartitionCacheHelper(cache_handler, partition_key, settype, **kwargs)

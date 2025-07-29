@@ -84,7 +84,7 @@ class TestMetadataTableCreation:
         # Should contain bitsize column and integer constraint
         assert "bitsize" in metadata_sql
         assert "integer" in metadata_sql
-        assert "DEFAULT 1000" in metadata_sql or "1000" in metadata_sql
+        assert "DEFAULT NULL" in metadata_sql or "bitsize INTEGER" in metadata_sql
 
         handler.close()
 
@@ -107,17 +107,23 @@ class TestMetadataTableCreation:
 
         # Check that only integer datatype is supported
         execute_calls = [call[0][0] for call in mock_cursor.execute.call_args_list]
-        metadata_calls = [call for call in execute_calls if "partition_metadata" in str(call)]
+        # Look for the specific roaringbit metadata table creation, not the general SQL function
+        metadata_calls = [call for call in execute_calls if "partition_metadata" in str(call) and "CREATE TABLE IF NOT EXISTS" in str(call)]
 
         assert len(metadata_calls) > 0, "Metadata table creation should be called"
-        metadata_sql = str(metadata_calls[0])
+        # Find the specific roaringbit metadata table creation with CHECK constraint
+        roaringbit_metadata_call = None
+        for call in metadata_calls:
+            if "CHECK (datatype = 'integer')" in str(call):
+                roaringbit_metadata_call = call
+                break
+
+        assert roaringbit_metadata_call is not None, "RoaringBit specific metadata table creation not found"
+        metadata_sql = str(roaringbit_metadata_call)
 
         # Should contain only integer constraint
         assert "integer" in metadata_sql
-        # Should not contain other datatypes
-        assert "float" not in metadata_sql
-        assert "text" not in metadata_sql
-        assert "timestamp" not in metadata_sql
+        assert "CHECK (datatype = 'integer')" in metadata_sql
 
         handler.close()
 

@@ -17,13 +17,14 @@ Different cache handlers support different datatypes:
 |---------------|---------|-------|------|-----------|
 | postgresql_array | ✓ | ✓ | ✓ | ✓ |
 | postgresql_bit | ✓ | ✗ | ✗ | ✗ |
+| postgresql_roaringbit | ✓ | ✗ | ✗ | ✗ |
 | redis_set | ✓ | ✗ | ✓ | ✗ |
 | redis_bit | ✓ | ✗ | ✗ | ✗ |
 | rocksdb_set | ✓ | ✗ | ✓ | ✗ |
 | rocksdb_bit | ✓ | ✗ | ✗ | ✗ |
 | rocksdict | ✓ | ✓ | ✓ | ✓ |
 
-**Note**: Bit-based handlers (postgresql_bit, redis_bit, rocksdb_bit) only support integers due to their underlying storage mechanism.
+**Note**: Bit-based handlers (postgresql_bit, postgresql_roaringbit, redis_bit, rocksdb_bit) only support integers due to their underlying storage mechanism.
 
 ## CLI Tool Usage
 
