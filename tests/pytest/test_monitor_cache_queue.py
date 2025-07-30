@@ -70,6 +70,7 @@ def mock_args():
     args.status_log_interval = 10
     args.disable_optimized_polling = False
     args.force_recalculate = False
+    args.log_query_times = None
     return args
 
 
@@ -360,6 +361,55 @@ class TestRunAndStoreQuery:
                         delattr(mcq_module, "args")
 
         assert result is False
+
+    @patch("partitioncache.cli.monitor_cache_queue.get_cache_handler")
+    @patch("partitioncache.cli.monitor_cache_queue.get_db_handler")
+    def test_log_query_times_functionality(self, mock_get_db, mock_get_cache, mock_args, tmp_path):
+        """Test that query times are logged when --log-query-times is specified."""
+        # Setup mocks
+        mock_cache = Mock()
+        # Make sure the mock doesn't have lazy insertion methods
+        del mock_cache.set_cache_lazy
+        del mock_cache.set_entry_lazy
+        mock_get_cache.return_value = mock_cache
+
+        mock_db = Mock()
+        mock_db.execute.return_value = [1, 2, 3]
+        mock_get_db.return_value = mock_db
+
+        # Set up log file path
+        log_file = tmp_path / "query_times.csv"
+        mock_args.log_query_times = str(log_file)
+
+        # Monkey patch args into the module
+        import partitioncache.cli.monitor_cache_queue as mcq_module
+
+        original_args = getattr(mcq_module, "args", None)
+        mcq_module.args = mock_args
+
+        try:
+            result = run_and_store_query("SELECT * FROM test", "test_hash", "test_partition_key", "integer")
+        finally:
+            # Restore original args
+            if original_args is not None:
+                mcq_module.args = original_args
+            else:
+                delattr(mcq_module, "args")
+
+        assert result is True
+
+        # Verify log file was created and contains the expected entry
+        assert log_file.exists()
+        log_content = log_file.read_text()
+        assert log_content.startswith("test_hash,")
+        
+        # Verify the execution time is a valid float
+        lines = log_content.strip().split('\n')
+        assert len(lines) == 1
+        hash_part, time_part = lines[0].split(',')
+        assert hash_part == "test_hash"
+        execution_time = float(time_part)
+        assert execution_time >= 0
 
 
 class TestPrintStatus:

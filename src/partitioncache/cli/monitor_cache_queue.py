@@ -57,6 +57,30 @@ status_lock = threading.Lock()
 active_futures: list[str] = []
 pending_jobs: list[tuple[str, str, str, str]] = []  # (query, hash, partition_key, partition_datatype)
 pool: concurrent.futures.ThreadPoolExecutor | None = None  # Initialize pool as None
+
+# Query time logging lock and file handle
+query_time_lock = threading.Lock()
+query_time_file = None
+
+
+def log_query_time(query_hash: str, execution_time: float) -> None:
+    """
+    Log query hash and execution time to the specified log file.
+
+    Args:
+        query_hash: The hash identifier of the query
+        execution_time: Execution time in seconds
+    """
+    if not hasattr(args, 'log_query_times') or not args.log_query_times:
+        return
+
+    try:
+        with query_time_lock:
+            with open(args.log_query_times, 'a', encoding='utf-8') as f:
+                f.write(f"{query_hash},{execution_time:.6f}\n")
+                f.flush()  # Ensure immediate write
+    except Exception as e:
+        logger.warning(f"Failed to log query time for {query_hash}: {e}")
 exit_event = threading.Event()  # Create an event to signal exit
 fragment_processor_exit = threading.Event()  # Exit signal for fragment processor
 
@@ -311,10 +335,13 @@ def run_and_store_query(query: str, query_hash: str, partition_key: str, partiti
                         db_handler.close()
 
                 # Use lazy insertion with the optimized query
+                t = time.perf_counter()
                 success = cache_handler.set_entry_lazy(original_hash, query_to_execute, original_query, partition_key)
+                execution_time = time.perf_counter() - t
 
                 if success:
-                    logger.debug(f"Lazily stored {original_hash} in cache")
+                    logger.debug(f"Lazily stored {original_hash} in cache in {execution_time:.3f}s")
+                    log_query_time(query_hash, execution_time)
                     if optimization_applied:
                         logger.info(
                             f"Query {original_hash} executed with lazy insertion and cache optimization: {optimization_stats['cache_hits']} hits, method={optimization_stats['method_used']}"
@@ -349,7 +376,9 @@ def run_and_store_query(query: str, query_hash: str, partition_key: str, partiti
                 t = time.perf_counter()
                 result = query_accelerator.execute_query(query_to_execute)
 
-                logger.debug(f"DuckDB accelerated query {query_hash} took {time.perf_counter() - t:.3f}s")
+                execution_time = time.perf_counter() - t
+                logger.debug(f"DuckDB accelerated query {query_hash} took {execution_time:.3f}s")
+                log_query_time(query_hash, execution_time)
 
             except Exception as accel_error:
                 logger.warning(f"DuckDB acceleration failed for query {query_hash}: {accel_error}")
@@ -363,6 +392,10 @@ def run_and_store_query(query: str, query_hash: str, partition_key: str, partiti
                 try:
                     t = time.perf_counter()
                     result = set(db_handler.execute(query_to_execute))
+
+                    execution_time = time.perf_counter() - t
+                    logger.debug(f"Fallback PostgreSQL query {query_hash} took {execution_time:.3f}s")
+                    log_query_time(query_hash, execution_time)
                 except Exception as db_error:
                     db_handler.close()
                     raise db_error
@@ -386,7 +419,9 @@ def run_and_store_query(query: str, query_hash: str, partition_key: str, partiti
                 t = time.perf_counter()
                 result = set(db_handler.execute(query_to_execute))
 
-                logger.debug(f"Standard database query {query_hash} took {time.perf_counter() - t:.3f}s")
+                execution_time = time.perf_counter() - t
+                logger.debug(f"Standard database query {query_hash} took {execution_time:.3f}s")
+                log_query_time(query_hash, execution_time)
 
             except psycopg.OperationalError as e:
                 if "statement timeout" in str(e):
@@ -696,6 +731,7 @@ def main():
     processing_group.add_argument("--disable-optimized-polling", action="store_true", help="Disable optimized polling and use simple polling")
     processing_group.add_argument("--max-pending-jobs", type=int, help="Maximum number of jobs to keep in pending buffer (default: 2 * max_processes)")
     processing_group.add_argument("--force-recalculate", action="store_true", default=False, help="Force recalculation of queries even if they already exist in cache")
+    processing_group.add_argument("--log-query-times", type=str, help="Log query hash and execution time to specified file in CSV format: <hash>,<seconds>")
 
     # Cache optimization configuration
     optimization_group = parser.add_argument_group("cache optimization options")
