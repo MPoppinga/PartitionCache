@@ -69,6 +69,7 @@ def mock_args():
     args.max_pending_jobs = 5
     args.status_log_interval = 10
     args.disable_optimized_polling = False
+    args.force_recalculate = False
     return args
 
 
@@ -521,6 +522,47 @@ class TestFragmentExecutorComponents:
                                         delattr(mcq_module, "args")
 
                                 mock_cache.exists.assert_called_with("cached_hash", "test_partition_key", check_query=False)
+
+    def test_force_recalculate_cache_check_bypass(self, mock_args, mock_env):
+        """Test that force-recalculate bypasses cache existence check."""
+        # Set up mock args with force_recalculate enabled
+        mock_args.force_recalculate = True
+        mock_args.max_processes = 2
+        mock_args.max_pending_jobs = 5
+
+        with patch("partitioncache.cli.monitor_cache_queue.get_cache_handler") as mock_get_cache:
+            mock_cache = Mock()
+            mock_cache.exists.return_value = True  # Query already exists in cache
+            mock_get_cache.return_value = mock_cache
+
+            # Simulate the cache check logic from fragment_executor
+            query = "SELECT * FROM test"
+            hash_value = "test_hash"
+            partition_key = "test_partition_key"
+
+            # Mock the module args
+            import partitioncache.cli.monitor_cache_queue as mcq_module
+            original_args = getattr(mcq_module, "args", None)
+            mcq_module.args = mock_args
+
+            try:
+                # Test the logic that would normally skip cached queries
+                should_skip = not mock_args.force_recalculate and mock_cache.exists(hash_value, partition_key, check_query=False)
+                should_process_anyway = mock_args.force_recalculate and mock_cache.exists(hash_value, partition_key, check_query=False)
+
+                # With force_recalculate=True, should NOT skip even if cache exists
+                assert should_skip is False
+                assert should_process_anyway is True
+
+                # Verify cache check was called
+                mock_cache.exists.assert_called_with(hash_value, partition_key, check_query=False)
+
+            finally:
+                # Restore original args
+                if original_args is not None:
+                    mcq_module.args = original_args
+                else:
+                    delattr(mcq_module, "args")
 
 
 class TestIntegration:

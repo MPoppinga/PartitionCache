@@ -611,10 +611,13 @@ def fragment_executor():
                 logger.debug(f"Found fragment in fragment queue: {hash_value} for partition_key: {partition_key} (datatype: {partition_datatype})")
 
                 # Check if already in cache with valid status (unified approach)
-                if main_cache_handler.exists(hash_value, partition_key, check_query=False):
+                # Skip this check if force-recalculate is enabled
+                if not args.force_recalculate and main_cache_handler.exists(hash_value, partition_key, check_query=False):
                     logger.debug(f"Query {hash_value} already in cache with valid status")
                     main_cache_handler.set_query(hash_value, query, partition_key)  # update the query last_seen
                     continue
+                elif args.force_recalculate and main_cache_handler.exists(hash_value, partition_key, check_query=False):
+                    logger.debug(f"Query {hash_value} exists in cache but force-recalculate is enabled - processing anyway")
 
                 if hash_value in active_futures or any(job[1] == hash_value for job in pending_jobs):
                     logger.debug(f"Query {hash_value} already in process")
@@ -692,6 +695,7 @@ def main():
     )
     processing_group.add_argument("--disable-optimized-polling", action="store_true", help="Disable optimized polling and use simple polling")
     processing_group.add_argument("--max-pending-jobs", type=int, help="Maximum number of jobs to keep in pending buffer (default: 2 * max_processes)")
+    processing_group.add_argument("--force-recalculate", action="store_true", default=False, help="Force recalculation of queries even if they already exist in cache")
 
     # Cache optimization configuration
     optimization_group = parser.add_argument_group("cache optimization options")
