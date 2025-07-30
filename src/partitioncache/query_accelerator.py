@@ -327,7 +327,7 @@ class DuckDBQueryAccelerator:
         # Calculate derived metrics
         total_queries = stats["queries_accelerated"] + stats["queries_fallback"]
         stats["total_queries"] = total_queries
-        
+
         # Always include acceleration_rate (default to 0.0 if no queries)
         if total_queries > 0:
             stats["acceleration_rate"] = stats["queries_accelerated"] / total_queries
@@ -347,7 +347,7 @@ class DuckDBQueryAccelerator:
 
         # Add last_query_time (always include, default to 0.0)
         stats["last_query_time"] = getattr(self, '_last_query_time', 0.0)
-        
+
         stats["initialized"] = self._initialized
         stats["preload_completed"] = self._preload_completed
 

@@ -19,7 +19,7 @@ class TestDuckDBQueryAccelerator:
         """Test graceful handling when DuckDB is not available."""
         # Mock DuckDB to raise ImportError when connect is called
         mock_duckdb.connect.side_effect = ImportError("No module named 'duckdb'")
-        
+
         from partitioncache.query_accelerator import create_query_accelerator
 
         # Should return None when initialization fails
@@ -182,7 +182,7 @@ class TestDuckDBQueryAccelerator:
         mock_duckdb.connect.return_value = mock_duckdb_conn
         # Let initialization succeed, but make query execution fail
         mock_duckdb_conn.execute.side_effect = [
-            None,  # First call for "SET memory_limit = '2GB'" 
+            None,  # First call for "SET memory_limit = '2GB'"
             None,  # Second call for "SET threads = 4"
             None,  # Third call for "INSTALL postgres"
             None,  # Fourth call for "LOAD postgres"

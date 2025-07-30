@@ -55,12 +55,16 @@ def mock_args():
     args.add_constraints = None
     args.remove_constraints_all = None
     args.remove_constraints_add = None
-    # Add cache optimization args (defaults from CLI)
-    args.enable_cache_optimization = True
-    args.disable_cache_optimization = False
-    args.cache_optimization_method = "IN"
+    # Add cache optimization args - disable by default for tests
+    args.enable_cache_optimization = False
+    args.disable_cache_optimization = True
     args.min_cache_hits = 1
+    args.cache_optimization_method = "IN"
     args.prefer_lazy_optimization = True
+    # Add DuckDB acceleration args
+    args.enable_duckdb_acceleration = False
+    # Add bitsize arg
+    args.bitsize = None
     # Add other processing args
     args.max_pending_jobs = 5
     args.status_log_interval = 10
@@ -233,6 +237,10 @@ class TestRunAndStoreQuery:
         """Test successful query execution and storage."""
         # Setup mocks
         mock_cache = Mock()
+        # Make sure the mock doesn't have lazy insertion methods
+        # so it uses the traditional path
+        del mock_cache.set_cache_lazy
+        del mock_cache.set_entry_lazy
         mock_get_cache.return_value = mock_cache
 
         mock_db = Mock()
@@ -265,6 +273,9 @@ class TestRunAndStoreQuery:
         mock_args.limit = 2
 
         mock_cache = Mock()
+        # Make sure the mock doesn't have lazy insertion methods
+        del mock_cache.set_cache_lazy
+        del mock_cache.set_entry_lazy
         mock_get_cache.return_value = mock_cache
 
         mock_db = Mock()
@@ -297,6 +308,9 @@ class TestRunAndStoreQuery:
         import psycopg
 
         mock_cache = Mock()
+        # Make sure the mock doesn't have lazy insertion methods
+        del mock_cache.set_cache_lazy
+        del mock_cache.set_entry_lazy
         mock_get_cache.return_value = mock_cache
 
         mock_db = Mock()
