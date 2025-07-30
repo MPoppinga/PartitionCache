@@ -13,6 +13,7 @@ Features:
 - Configurable table preloading and connection management
 """
 
+import threading
 import time
 from logging import getLogger
 from typing import Any
@@ -73,6 +74,9 @@ class DuckDBQueryAccelerator:
             "preload_time": 0.0,
             "connection_errors": 0
         }
+
+        # Thread safety lock for concurrent access
+        self._query_lock = threading.RLock()
 
         # Connection objects
         self.duckdb_conn: duckdb.DuckDBPyConnection | None = None
@@ -164,16 +168,15 @@ class DuckDBQueryAccelerator:
         preload_start = time.perf_counter()
 
         try:
-            # Build PostgreSQL connection string for DuckDB
+            # Install and load PostgreSQL extension if not already loaded
+            self.duckdb_conn.execute("INSTALL postgres")
+            self.duckdb_conn.execute("LOAD postgres")
+
+            # Build connection string for DuckDB PostgreSQL extension
             pg_conn_str = self._build_duckdb_postgres_connection_string()
 
-            # Create PostgreSQL connection in DuckDB
-            self.duckdb_conn.execute(f"""
-                CREATE SECRET postgres_secret (
-                    TYPE POSTGRES,
-                    CONNECTION '{pg_conn_str}'
-                )
-            """)
+            # Attach PostgreSQL database to DuckDB
+            self.duckdb_conn.execute(f"ATTACH '{pg_conn_str}' AS postgres_db (TYPE POSTGRES)")
 
             tables_loaded = 0
 
@@ -187,9 +190,10 @@ class DuckDBQueryAccelerator:
                         continue
 
                     # Create table in DuckDB by copying from PostgreSQL
+                    # Use the attached PostgreSQL database
                     self.duckdb_conn.execute(f"""
                         CREATE TABLE {table_name} AS
-                        SELECT * FROM postgres_query('postgres_secret', 'SELECT * FROM {table_name}')
+                        SELECT * FROM postgres_db.{table_name}
                     """)
 
                     # Get row count for logging
@@ -260,33 +264,37 @@ class DuckDBQueryAccelerator:
         Returns:
             Set of query results
         """
-        if not self._initialized:
-            logger.debug("Accelerator not initialized, using fallback")
-            return self._execute_fallback(query)
+        with self._query_lock:
+            if not self._initialized:
+                logger.debug("Accelerator not initialized, using fallback")
+                self.stats["queries_fallback"] += 1
+                return self._execute_fallback(query)
 
-        try:
-            # Try DuckDB acceleration first
-            start_time = time.perf_counter()
+            try:
+                # Try DuckDB acceleration first
+                start_time = time.perf_counter()
 
-            logger.debug(f"Executing query with DuckDB acceleration: {query[:100]}...")
+                logger.debug(f"Executing query with DuckDB acceleration: {query[:100]}...")
 
-            # Execute query in DuckDB
-            result = self.duckdb_conn.execute(query).fetchall()
+                # Execute query in DuckDB
+                result = self.duckdb_conn.execute(query).fetchall()
 
-            # Convert to set for compatibility
-            result_set = {row[0] if len(row) == 1 else row for row in result}
+                # Convert to set for compatibility
+                result_set = {row[0] if len(row) == 1 else row for row in result}
 
-            duration = time.perf_counter() - start_time
-            self.stats["queries_accelerated"] += 1
-            self.stats["total_acceleration_time"] += duration
-            self._last_query_time = duration
+                duration = time.perf_counter() - start_time
+                self.stats["queries_accelerated"] += 1
+                self.stats["total_acceleration_time"] += duration
+                self._last_query_time = duration
 
-            logger.debug(f"DuckDB query completed in {duration:.3f}s, returned {len(result_set)} results")
-            return result_set
+                logger.debug(f"DuckDB query completed in {duration:.3f}s, returned {len(result_set)} results")
+                return result_set
 
-        except Exception as e:
-            logger.warning(f"DuckDB query failed, falling back to PostgreSQL: {e}")
-            return self._execute_fallback(query)
+            except Exception as e:
+                logger.warning(f"DuckDB query failed, falling back to PostgreSQL: {e}")
+                # Increment fallback counter since we're attempting fallback
+                self.stats["queries_fallback"] += 1
+                return self._execute_fallback(query)
 
     def _execute_fallback(self, query: str) -> set[Any]:
         """Execute query using PostgreSQL fallback."""
@@ -303,7 +311,6 @@ class DuckDBQueryAccelerator:
             result_set = {row[0] if len(row) == 1 else row for row in result}
 
             duration = time.perf_counter() - start_time
-            self.stats["queries_fallback"] += 1
             self.stats["total_fallback_time"] += duration
             self._last_query_time = duration
 

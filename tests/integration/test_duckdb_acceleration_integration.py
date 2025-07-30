@@ -14,39 +14,46 @@ from partitioncache.cli.common_args import get_database_connection_params
 from partitioncache.query_accelerator import DuckDBQueryAccelerator, create_query_accelerator
 
 
+@pytest.fixture(scope="module")
+def postgresql_params():
+    """Get PostgreSQL connection parameters from environment."""
+    # Mock args object for get_database_connection_params
+    class MockArgs:
+        def __init__(self):
+            self.db_host = os.getenv("DB_HOST", "localhost")
+            self.db_port = int(os.getenv("DB_PORT", "5432"))
+            self.db_user = os.getenv("DB_USER", "test_user")
+            self.db_password = os.getenv("DB_PASSWORD", "test_password")
+            self.db_name = os.getenv("DB_NAME", "test_db")
+            self.db_backend = "postgresql"
+
+    mock_args = MockArgs()
+
+    # Skip if PostgreSQL not available
+    try:
+        import psycopg
+        # Use a short timeout to avoid hanging
+        conn = psycopg.connect(
+            host=mock_args.db_host,
+            port=mock_args.db_port,
+            user=mock_args.db_user,
+            password=mock_args.db_password,
+            dbname=mock_args.db_name,
+            connect_timeout=5  # 5 second timeout
+        )
+        conn.close()
+    except Exception:
+        pytest.skip("PostgreSQL not available for integration tests")
+
+    params = get_database_connection_params(mock_args)
+    # Add connection timeout to prevent hanging in CI/local environments
+    params['connect_timeout'] = 5
+    return params
+
+
 @pytest.mark.integration
 class TestDuckDBAccelerationIntegration:
     """Integration tests for DuckDB query acceleration."""
-
-    @pytest.fixture(scope="class")
-    def postgresql_params(self):
-        """Get PostgreSQL connection parameters from environment."""
-        # Mock args object for get_database_connection_params
-        class MockArgs:
-            def __init__(self):
-                self.db_host = os.getenv("DB_HOST", "localhost")
-                self.db_port = int(os.getenv("DB_PORT", "5432"))
-                self.db_user = os.getenv("DB_USER", "test_user")
-                self.db_password = os.getenv("DB_PASSWORD", "test_password")
-                self.db_name = os.getenv("DB_NAME", "test_db")
-                self.db_backend = "postgresql"
-
-        mock_args = MockArgs()
-
-        # Skip if PostgreSQL not available
-        try:
-            import psycopg
-            psycopg.connect(
-                host=mock_args.db_host,
-                port=mock_args.db_port,
-                user=mock_args.db_user,
-                password=mock_args.db_password,
-                dbname=mock_args.db_name
-            ).close()
-        except Exception:
-            pytest.skip("PostgreSQL not available for integration tests")
-
-        return get_database_connection_params(mock_args)
 
     @pytest.fixture(scope="class")
     def test_table_setup(self, postgresql_params):
@@ -197,13 +204,16 @@ class TestDuckDBAccelerationIntegration:
             preload_tables=[]
         )
 
-        # Query a table that doesn't exist in DuckDB but exists in PostgreSQL
-        # This should trigger fallback
-        query = "SELECT 1 as test_value"
+        # Query using PostgreSQL-specific function that doesn't exist in DuckDB
+        # This should trigger fallback to PostgreSQL
+        query = "SELECT pg_backend_pid() as test_value"
         result = accelerator.execute_query(query)
 
         assert isinstance(result, set)
-        assert 1 in result
+        assert len(result) == 1
+        # Should contain a process ID (integer)
+        pid = next(iter(result))
+        assert isinstance(pid, int) and pid > 0
 
         # Check that fallback was used
         stats = accelerator.get_statistics()
@@ -652,36 +662,6 @@ class TestDuckDBAccelerationPerformance:
 @pytest.mark.integration
 class TestDuckDBAccelerationMonitorIntegration:
     """Tests specifically for pcache-monitor integration scenarios."""
-
-    @pytest.fixture(scope="class")
-    def postgresql_params(self):
-        """Get PostgreSQL connection parameters from environment."""
-        # Mock args object for get_database_connection_params
-        class MockArgs:
-            def __init__(self):
-                self.db_host = os.getenv("DB_HOST", "localhost")
-                self.db_port = int(os.getenv("DB_PORT", "5432"))
-                self.db_user = os.getenv("DB_USER", "test_user")
-                self.db_password = os.getenv("DB_PASSWORD", "test_password")
-                self.db_name = os.getenv("DB_NAME", "test_db")
-                self.db_backend = "postgresql"
-
-        mock_args = MockArgs()
-
-        # Skip if PostgreSQL not available
-        try:
-            import psycopg
-            psycopg.connect(
-                host=mock_args.db_host,
-                port=mock_args.db_port,
-                user=mock_args.db_user,
-                password=mock_args.db_password,
-                dbname=mock_args.db_name
-            ).close()
-        except Exception:
-            pytest.skip("PostgreSQL not available for integration tests")
-
-        return get_database_connection_params(mock_args)
 
     def test_monitor_integration_with_cache_handlers(self, postgresql_params):
         """Test acceleration with different cache handler backends."""
