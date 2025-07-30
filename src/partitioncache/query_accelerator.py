@@ -58,7 +58,7 @@ class DuckDBQueryAccelerator:
             enable_statistics: Whether to collect performance statistics
         """
         self.postgresql_params = postgresql_connection_params
-        self.preload_tables = preload_tables or []
+        self.tables_to_preload = preload_tables or []
         self.duckdb_memory_limit = duckdb_memory_limit
         self.duckdb_threads = duckdb_threads
         self.enable_statistics = enable_statistics
@@ -79,10 +79,11 @@ class DuckDBQueryAccelerator:
         self.postgresql_conn: psycopg.Connection | None = None
         self._initialized = False
         self._preload_completed = False
+        self._last_query_time = 0.0
 
     def __repr__(self) -> str:
         """Return string representation."""
-        return f"DuckDBQueryAccelerator(preloaded_tables={len(self.preload_tables)}, initialized={self._initialized})"
+        return f"DuckDBQueryAccelerator(preloaded_tables={len(self.tables_to_preload)}, initialized={self._initialized})"
 
     def initialize(self) -> bool:
         """
@@ -151,7 +152,7 @@ class DuckDBQueryAccelerator:
         Returns:
             bool: True if preloading successful, False otherwise
         """
-        if not self._initialized or not self.preload_tables:
+        if not self._initialized or not self.tables_to_preload:
             logger.debug("No tables to preload or accelerator not initialized")
             return True
 
@@ -159,7 +160,7 @@ class DuckDBQueryAccelerator:
             logger.debug("Tables already preloaded")
             return True
 
-        logger.info(f"Preloading {len(self.preload_tables)} tables into DuckDB...")
+        logger.info(f"Preloading {len(self.tables_to_preload)} tables into DuckDB...")
         preload_start = time.perf_counter()
 
         try:
@@ -176,7 +177,7 @@ class DuckDBQueryAccelerator:
 
             tables_loaded = 0
 
-            for table_name in self.preload_tables:
+            for table_name in self.tables_to_preload:
                 try:
                     logger.debug(f"Preloading table: {table_name}")
 
@@ -207,7 +208,7 @@ class DuckDBQueryAccelerator:
             self.stats["preload_time"] = preload_duration
             self._preload_completed = True
 
-            logger.info(f"Successfully preloaded {tables_loaded}/{len(self.preload_tables)} tables in {preload_duration:.2f}s")
+            logger.info(f"Successfully preloaded {tables_loaded}/{len(self.tables_to_preload)} tables in {preload_duration:.2f}s")
             return True
 
         except Exception as e:
@@ -278,6 +279,7 @@ class DuckDBQueryAccelerator:
             duration = time.perf_counter() - start_time
             self.stats["queries_accelerated"] += 1
             self.stats["total_acceleration_time"] += duration
+            self._last_query_time = duration
 
             logger.debug(f"DuckDB query completed in {duration:.3f}s, returned {len(result_set)} results")
             return result_set
@@ -303,6 +305,7 @@ class DuckDBQueryAccelerator:
             duration = time.perf_counter() - start_time
             self.stats["queries_fallback"] += 1
             self.stats["total_fallback_time"] += duration
+            self._last_query_time = duration
 
             logger.debug(f"PostgreSQL fallback completed in {duration:.3f}s, returned {len(result_set)} results")
             return result_set
@@ -323,16 +326,28 @@ class DuckDBQueryAccelerator:
 
         # Calculate derived metrics
         total_queries = stats["queries_accelerated"] + stats["queries_fallback"]
+        stats["total_queries"] = total_queries
+        
+        # Always include acceleration_rate (default to 0.0 if no queries)
         if total_queries > 0:
             stats["acceleration_rate"] = stats["queries_accelerated"] / total_queries
+        else:
+            stats["acceleration_rate"] = 0.0
 
-            if stats["queries_accelerated"] > 0:
-                stats["avg_acceleration_time"] = stats["total_acceleration_time"] / stats["queries_accelerated"]
+        # Always include average times (default to 0.0 if no queries)
+        if stats["queries_accelerated"] > 0:
+            stats["avg_acceleration_time"] = stats["total_acceleration_time"] / stats["queries_accelerated"]
+        else:
+            stats["avg_acceleration_time"] = 0.0
 
-            if stats["queries_fallback"] > 0:
-                stats["avg_fallback_time"] = stats["total_fallback_time"] / stats["queries_fallback"]
+        if stats["queries_fallback"] > 0:
+            stats["avg_fallback_time"] = stats["total_fallback_time"] / stats["queries_fallback"]
+        else:
+            stats["avg_fallback_time"] = 0.0
 
-        stats["total_queries"] = total_queries
+        # Add last_query_time (always include, default to 0.0)
+        stats["last_query_time"] = getattr(self, '_last_query_time', 0.0)
+        
         stats["initialized"] = self._initialized
         stats["preload_completed"] = self._preload_completed
 

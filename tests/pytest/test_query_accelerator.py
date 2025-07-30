@@ -13,16 +13,18 @@ import pytest
 class TestDuckDBQueryAccelerator:
     """Test suite for DuckDB query accelerator implementation."""
 
-    def test_duckdb_import_error_handling(self):
+    @patch('partitioncache.query_accelerator.duckdb')
+    @patch('partitioncache.query_accelerator.psycopg')
+    def test_duckdb_import_error_handling(self, mock_psycopg, mock_duckdb):
         """Test graceful handling when DuckDB is not available."""
-        # Since the module imports duckdb directly, this test verifies that
-        # import errors would be caught at module level
-        with patch('partitioncache.query_accelerator.duckdb', side_effect=ImportError("No module named 'duckdb'")):
-            from partitioncache.query_accelerator import create_query_accelerator
+        # Mock DuckDB to raise ImportError when connect is called
+        mock_duckdb.connect.side_effect = ImportError("No module named 'duckdb'")
+        
+        from partitioncache.query_accelerator import create_query_accelerator
 
-            # Should return None when initialization fails
-            result = create_query_accelerator({"host": "localhost"})
-            assert result is None
+        # Should return None when initialization fails
+        result = create_query_accelerator({"host": "localhost"})
+        assert result is None
 
     @patch('partitioncache.query_accelerator.duckdb')
     @patch('partitioncache.query_accelerator.psycopg')
@@ -88,7 +90,7 @@ class TestDuckDBQueryAccelerator:
         accelerator.initialize()
 
         # Verify configuration
-        assert accelerator.preload_tables == ["table1", "table2"]
+        assert accelerator.tables_to_preload == ["table1", "table2"]
         assert accelerator.duckdb_memory_limit == "2GB"
         assert accelerator.duckdb_threads == 8
         assert accelerator.enable_statistics is True
@@ -119,6 +121,9 @@ class TestDuckDBQueryAccelerator:
         )
 
         accelerator.initialize()
+
+        # Mock table existence check
+        accelerator._table_exists_in_postgresql = Mock(return_value=True)
 
         # Test table preloading
         result = accelerator.preload_tables()
@@ -172,16 +177,27 @@ class TestDuckDBQueryAccelerator:
         """Test fallback to PostgreSQL when DuckDB query fails."""
         from partitioncache.query_accelerator import DuckDBQueryAccelerator
 
-        # Mock DuckDB connection that raises an error
+        # Mock DuckDB connection - allow initialization but fail during query execution
         mock_duckdb_conn = Mock()
         mock_duckdb.connect.return_value = mock_duckdb_conn
-        mock_duckdb_conn.execute.side_effect = Exception("DuckDB query failed")
+        # Let initialization succeed, but make query execution fail
+        mock_duckdb_conn.execute.side_effect = [
+            None,  # First call for "SET memory_limit = '2GB'" 
+            None,  # Second call for "SET threads = 4"
+            None,  # Third call for "INSTALL postgres"
+            None,  # Fourth call for "LOAD postgres"
+            Exception("DuckDB query failed")  # Fifth call (actual query) fails
+        ]
 
         # Mock PostgreSQL connection with successful result
         mock_pg_conn = Mock()
         mock_psycopg.connect.return_value = mock_pg_conn
         mock_pg_cursor = Mock()
-        mock_pg_conn.cursor.return_value.__enter__.return_value = mock_pg_cursor
+        # Properly mock the context manager protocol
+        mock_cursor_context = Mock()
+        mock_cursor_context.__enter__ = Mock(return_value=mock_pg_cursor)
+        mock_cursor_context.__exit__ = Mock(return_value=None)
+        mock_pg_conn.cursor.return_value = mock_cursor_context
         mock_pg_cursor.fetchall.return_value = [(4,), (5,), (6,)]
 
         postgresql_params = {"host": "localhost", "port": 5432, "user": "test", "password": "test", "dbname": "test"}
@@ -225,8 +241,11 @@ class TestDuckDBQueryAccelerator:
 
         accelerator.initialize()
         # Mock the preload_tables method to avoid the 'list' object error
-        accelerator.preload_tables = Mock(return_value=True)
-        accelerator._preload_completed = True
+        def mock_preload_tables():
+            accelerator.stats["tables_preloaded"] = 2  # Match the number of tables in preload_tables
+            accelerator._preload_completed = True
+            return True
+        accelerator.preload_tables = Mock(side_effect=mock_preload_tables)
         accelerator.preload_tables()
 
         # Test initial statistics
@@ -307,7 +326,7 @@ class TestDuckDBQueryAccelerator:
         assert accelerator is not None
         assert accelerator._initialized is True
         assert accelerator.duckdb_memory_limit == "512MB"
-        assert accelerator.preload_tables == ["test_table"]
+        assert accelerator.tables_to_preload == ["test_table"]
 
     def test_error_handling_with_statistics_disabled(self):
         """Test error handling when statistics are disabled."""
