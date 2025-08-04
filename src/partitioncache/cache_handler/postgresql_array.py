@@ -21,8 +21,8 @@ class PostgreSQLArrayCacheHandler(PostgreSQLAbstractCacheHandler):
     def __repr__(self) -> str:
         return "postgresql_array"
 
-    def __init__(self, db_name, db_host, db_user, db_password, db_port, db_tableprefix) -> None:
-        super().__init__(db_name, db_host, db_user, db_password, db_port, db_tableprefix)
+    def __init__(self, db_name, db_host, db_user, db_password, db_port, db_tableprefix, timeout: str = "0") -> None:
+        super().__init__(db_name, db_host, db_user, db_password, db_port, db_tableprefix, timeout)
 
         # Load SQL functions first
         self._load_sql_functions()
@@ -279,15 +279,15 @@ class PostgreSQLArrayCacheHandler(PostgreSQLAbstractCacheHandler):
                 table_name=sql.Identifier(table_name),
                 key=sql.Literal(key),
                 partition_col=sql.Identifier(partition_key),
-                query=sql.SQL(query)
+                query=sql.SQL(query)  # type: ignore[arg-type]
             )
 
             self.cursor.execute(lazy_insert_query)
             self.db.commit()
 
             # Also store in queries table for existence checks
+            queries_table = f"{self.tableprefix}_queries"
             try:
-                queries_table = f"{self.tableprefix}_queries"
                 self.cursor.execute(
                     sql.SQL("INSERT INTO {table} (query_hash, partition_key, query) VALUES (%s, %s, %s)").format(
                         table=sql.Identifier(queries_table)
