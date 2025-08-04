@@ -40,7 +40,8 @@ logger = getLogger("PartitionCache.PostgreSQLQueueProcessor")
 SQL_HANDLERS_FILE = Path(__file__).parent.parent / "cache_handler" / "postgresql_cache_handlers.sql"
 SQL_CRON_FILE = Path(__file__).parent.parent / "queue_handler" / "postgresql_queue_processor_cron.sql"
 SQL_CACHE_FILE = Path(__file__).parent.parent / "queue_handler" / "postgresql_queue_processor_cache.sql"
-SQL_INFO_FILE = Path(__file__).parent.parent / "queue_handler" / "postgresql_queue_processor_info.sql"
+SQL_CRON_STATUS_FILE = Path(__file__).parent.parent / "queue_handler" / "postgresql_queue_processor_cron_status.sql"
+SQL_CACHE_INFO_FILE = Path(__file__).parent.parent / "queue_handler" / "postgresql_queue_processor_cache_info.sql"
 
 
 def get_cache_backend_from_env() -> str:
@@ -253,6 +254,11 @@ def setup_cron_database_objects(cron_conn):
     with cron_conn.cursor() as cur:
         cur.execute(sql_cron_content)
 
+    # Read and execute cron status SQL file (status functions need access to cron.job table)
+    sql_cron_status_content = SQL_CRON_STATUS_FILE.read_text()
+    with cron_conn.cursor() as cur:
+        cur.execute(sql_cron_status_content)
+
     # Initialize cron config table
     queue_prefix = get_queue_table_prefix_from_env()
     with cron_conn.cursor() as cur:
@@ -302,10 +308,10 @@ def setup_cache_database_objects(cache_conn):
     with cache_conn.cursor() as cur:
         cur.execute(sql_cache_content)
 
-    # Read and execute info SQL file
-    sql_info_content = SQL_INFO_FILE.read_text()
+    # Read and execute cache info SQL file (cache and queue info functions)
+    sql_cache_info_content = SQL_CACHE_INFO_FILE.read_text()
     with cache_conn.cursor() as cur:
-        cur.execute(sql_info_content)
+        cur.execute(sql_cache_info_content)
 
     # Initialize cache processor tables
     queue_prefix = get_queue_table_prefix_from_env()
@@ -459,22 +465,30 @@ def remove_all_processor_objects(conn, queue_prefix: str):
     logger.info("All processor objects and functions removed.")
 
 
-def enable_processor(conn, queue_prefix: str):
+def enable_processor(queue_prefix: str):
     """Enable the queue processor job."""
     logger.info("Enabling queue processor...")
-    with conn.cursor() as cur:
-        cur.execute("SELECT partitioncache_set_processor_enabled_cron(true, %s, 'partitioncache_process_queue')", [queue_prefix])
-    conn.commit()
-    logger.info("Queue processor enabled.")
+    conn = get_pg_cron_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT partitioncache_set_processor_enabled_cron(true, %s, 'partitioncache_process_queue')", [queue_prefix])
+        conn.commit()
+        logger.info("Queue processor enabled.")
+    finally:
+        conn.close()
 
 
-def disable_processor(conn, queue_prefix: str):
+def disable_processor(queue_prefix: str):
     """Disable the queue processor job."""
     logger.info("Disabling queue processor...")
-    with conn.cursor() as cur:
-        cur.execute("SELECT partitioncache_set_processor_enabled_cron(false, %s, 'partitioncache_process_queue')", [queue_prefix])
-    conn.commit()
-    logger.info("Queue processor disabled.")
+    conn = get_pg_cron_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT partitioncache_set_processor_enabled_cron(false, %s, 'partitioncache_process_queue')", [queue_prefix])
+        conn.commit()
+        logger.info("Queue processor disabled.")
+    finally:
+        conn.close()
 
 
 def update_processor_config(
@@ -568,38 +582,50 @@ def handle_setup(table_prefix: str, queue_prefix: str, cache_backend: str, frequ
         cron_conn.close()
 
 
-def get_processor_status(conn, queue_prefix: str):
-    """Get basic processor status."""
+def get_processor_status(queue_prefix: str):
+    """Get basic processor status from cron database."""
     logger.info("Fetching processor status...")
-    with conn.cursor() as cur:
-        cur.execute("SELECT * FROM partitioncache_get_processor_status(%s, %s)", [queue_prefix, "partitioncache_process_queue"])
-        status = cur.fetchone()
-        if status:
-            columns = [desc[0] for desc in cur.description]
-            return dict(zip(columns, status, strict=False))
+    conn = get_pg_cron_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM partitioncache_get_processor_status(%s, %s)", [queue_prefix, "partitioncache_process_queue"])
+            status = cur.fetchone()            # type: ignore[assignment]
+            if status:
+                columns = [desc[0] for desc in cur.description]  # type: ignore[attr-defined]
+                return dict(zip(columns, status, strict=False))
+    finally:
+        conn.close()
     return None
 
 
-def get_processor_status_detailed(conn, table_prefix: str, queue_prefix: str):
-    """Get detailed processor status."""
+def get_processor_status_detailed(table_prefix: str, queue_prefix: str):
+    """Get detailed processor status from cron database."""
     logger.info("Fetching detailed processor status...")
-    with conn.cursor() as cur:
-        cur.execute("SELECT * FROM partitioncache_get_processor_status_detailed(%s, %s, %s)", [table_prefix, queue_prefix, "partitioncache_process_queue"])
-        status = cur.fetchone()
-        if status:
-            columns = [desc[0] for desc in cur.description]
-            return dict(zip(columns, status, strict=False))
+    conn = get_pg_cron_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM partitioncache_get_processor_status_detailed(%s, %s, %s)", [table_prefix, queue_prefix, "partitioncache_process_queue"])
+            status = cur.fetchone()
+            if status:
+                columns = [desc[0] for desc in cur.description]  # type: ignore[attr-defined]
+                return dict(zip(columns, status, strict=False))
+    finally:
+        conn.close()
     return None
 
 
-def get_queue_and_cache_info(conn, table_prefix: str, queue_prefix: str):
-    """Get detailed queue and cache info for all partitions."""
+def get_queue_and_cache_info(table_prefix: str, queue_prefix: str):
+    """Get detailed queue and cache info for all partitions from cache database."""
     logger.info("Fetching queue and cache info...")
-    with conn.cursor() as cur:
-        cur.execute("SELECT * FROM partitioncache_get_queue_and_cache_info(%s, %s)", [table_prefix, queue_prefix])
-        results = cur.fetchall()
-        columns = [desc[0] for desc in cur.description]
-        return [dict(zip(columns, row, strict=False)) for row in results]
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM partitioncache_get_queue_and_cache_info(%s, %s)", [table_prefix, queue_prefix])
+            results = cur.fetchall()
+            columns = [desc[0] for desc in cur.description]  # type: ignore[attr-defined]
+            return [dict(zip(columns, row, strict=False)) for row in results]
+    finally:
+        conn.close()
 
 
 def print_status(status):
@@ -647,13 +673,6 @@ def print_detailed_status(status):
     print(f"  Success (last 5m):  {status.get('recent_successes_5m', 'N/A')}")
     print(f"  Failures (last 5m): {status.get('recent_failures_5m', 'N/A')}")
 
-    print("\n[Cache Architecture Summary]")
-    print(f"  Total Partitions:      {status.get('total_partitions', 'N/A')}")
-    print(f"  Created Caches:        {status.get('partitions_with_cache', 'N/A')}")
-    print(f"    - RoaringBit:        {status.get('roaringbit_partitions', 'N/A')}")
-    print(f"    - Bit:               {status.get('bit_cache_partitions', 'N/A')}")
-    print(f"    - Array:             {status.get('array_cache_partitions', 'N/A')}")
-    print(f"  Uncreated Caches:      {status.get('uncreated_cache_partitions', 'N/A')}")
 
     print("\n[Recent Logs (limit 10)]")
     recent_logs = status.get("recent_logs")
@@ -810,11 +829,11 @@ def main():
 
     # enable command
     parser_enable = subparsers.add_parser("enable", help="Enable the queue processor job")
-    parser_enable.set_defaults(func=lambda args: enable_processor(get_db_connection(), get_queue_table_prefix_from_env()))
+    parser_enable.set_defaults(func=lambda args: enable_processor(get_queue_table_prefix_from_env()))
 
     # disable command
     parser_disable = subparsers.add_parser("disable", help="Disable the queue processor job")
-    parser_disable.set_defaults(func=lambda args: disable_processor(get_db_connection(), get_queue_table_prefix_from_env()))
+    parser_disable.set_defaults(func=lambda args: disable_processor(get_queue_table_prefix_from_env()))
 
     # update-config command
     parser_update = subparsers.add_parser("update-config", help="Update processor configuration")
@@ -842,7 +861,6 @@ def main():
     parser_status.set_defaults(
         func=lambda args: print_status(
             get_processor_status(
-                get_db_connection(),
                 get_queue_table_prefix_from_env(),
             )
         )
@@ -853,7 +871,6 @@ def main():
     parser_status_detailed.set_defaults(
         func=lambda args: print_detailed_status(
             get_processor_status_detailed(
-                get_db_connection(),
                 get_table_prefix_from_env(),
                 get_queue_table_prefix_from_env(),
             )
@@ -866,7 +883,6 @@ def main():
     parser_queue_info.set_defaults(
         func=lambda args: print_queue_and_cache_info(
             get_queue_and_cache_info(
-                get_db_connection(),
                 args.table_prefix or get_table_prefix_from_env(),
                 get_queue_table_prefix_from_env(),
             )
