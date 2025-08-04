@@ -242,16 +242,19 @@ class DuckDBQueryAccelerator:
         return conn_str
 
     def _table_exists_in_postgresql(self, table_name: str) -> bool:
-        """Check if table exists in PostgreSQL."""
+        """Check if table, view, or materialized view exists in PostgreSQL."""
         try:
             with self.postgresql_conn.cursor() as cursor:
-                cursor.execute(
-                    "SELECT 1 FROM information_schema.tables WHERE table_name = %s",
-                    (table_name,)
-                )
+                # Check for tables and views in information_schema.tables
+                cursor.execute("SELECT 1 FROM information_schema.tables WHERE table_name = %s", (table_name,))
+                if cursor.fetchone() is not None:
+                    return True
+
+                # Check for materialized views in pg_matviews
+                cursor.execute("SELECT 1 FROM pg_matviews WHERE matviewname = %s", (table_name,))
                 return cursor.fetchone() is not None
         except Exception as e:
-            logger.debug(f"Failed to check table existence for {table_name}: {e}")
+            logger.debug(f"Failed to check table/view existence for {table_name}: {e}")
             return False
 
     def execute_query(self, query: str) -> set[Any]:
