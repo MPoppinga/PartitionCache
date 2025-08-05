@@ -8,7 +8,6 @@ import datetime
 import os
 import threading
 import time
-from logging import getLogger
 
 import psycopg
 
@@ -25,13 +24,13 @@ from partitioncache.cli.common_args import (
     add_environment_args,
     add_variant_generation_args,
     add_verbosity_args,
-    configure_logging,
     get_database_connection_params,
     load_environment_with_validation,
     parse_variant_generation_json_args,
     resolve_cache_backend,
 )
 from partitioncache.db_handler import get_db_handler
+from partitioncache.logging_utils import configure_enhanced_logging, get_thread_aware_logger
 from partitioncache.query_accelerator import create_query_accelerator
 from partitioncache.query_processor import generate_all_query_hash_pairs
 from partitioncache.queue import (
@@ -43,7 +42,7 @@ from partitioncache.queue import (
     push_to_query_fragment_queue,
 )
 
-logger = getLogger("PartitionCache")
+logger = get_thread_aware_logger("PartitionCache")
 
 args: argparse.Namespace
 
@@ -312,23 +311,23 @@ def run_and_store_query(query: str, query_hash: str, partition_key: str, partiti
         if partition_datatype is not None:
             logger.info(f"REGISTERING PARTITION KEY: Starting for {query_hash}, key={partition_key}, datatype={partition_datatype}")
             kwargs = {}
-            if hasattr(cache_handler, '_get_partition_bitsize'):
-                existing_bitsize = cache_handler._get_partition_bitsize(partition_key) # type: ignore[attr-defined]
+            if hasattr(cache_handler, "_get_partition_bitsize"):
+                existing_bitsize = cache_handler._get_partition_bitsize(partition_key)  # type: ignore[attr-defined]
                 if args.bitsize is not None:
-                    kwargs['bitsize'] = args.bitsize
+                    kwargs["bitsize"] = args.bitsize
                     if existing_bitsize is not None and existing_bitsize != args.bitsize:
                         logger.info(f"Updating bitsize from {existing_bitsize} to {args.bitsize} for partition '{partition_key}'")
-                        cache_handler._set_partition_bitsize(partition_key, args.bitsize) # type: ignore[attr-defined]
+                        cache_handler._set_partition_bitsize(partition_key, args.bitsize)  # type: ignore[attr-defined]
                 elif existing_bitsize is not None:
                     # Use existing
-                    kwargs['bitsize'] = existing_bitsize
+                    kwargs["bitsize"] = existing_bitsize
                 # else: use handler default
-            elif hasattr(args, 'bitsize') and args.bitsize is not None:
-                kwargs['bitsize'] = args.bitsize
+            elif hasattr(args, "bitsize") and args.bitsize is not None:
+                kwargs["bitsize"] = args.bitsize
             cache_handler.register_partition_key(partition_key, partition_datatype, **kwargs)
             logger.info(f"PARTITION KEY REGISTERED: Successfully registered for {query_hash}")
 
-        lazy_insertion_available = hasattr(cache_handler, 'set_cache_lazy') and hasattr(cache_handler, 'set_entry_lazy')
+        lazy_insertion_available = hasattr(cache_handler, "set_cache_lazy") and hasattr(cache_handler, "set_entry_lazy")
         use_lazy_insertion = (
             lazy_insertion_available and not args.force_recalculate and args.long_running_query_timeout == "0" and not args.disable_lazy_insertion
         )
@@ -378,33 +377,38 @@ def run_and_store_query(query: str, query_hash: str, partition_key: str, partiti
             else:
                 raise AssertionError("No db backend specified, querying not possible")
 
-            execution_start = time.time()
+            execution_start = time.perf_counter()
             try:
                 # Use DuckDB acceleration when available and enabled
                 global query_accelerator
-                if (query_accelerator and
-                    args.enable_duckdb_acceleration and
-                    args.db_backend == "postgresql"):
+                if query_accelerator and args.enable_duckdb_acceleration and args.db_backend == "postgresql":
                     logger.info(f"Executing query via DuckDB acceleration with timeout={args.long_running_query_timeout}s")
                     result = query_accelerator.execute_query(query_to_execute)
+                    execution_time = time.perf_counter() - execution_start
+                    logger.info(f"DuckDB acceleration result: {len(result)} rows in {execution_time:.3f}s")
                 else:
                     logger.info(f"Executing query via standard database handler with timeout={args.long_running_query_timeout}s")
                     result = set(db_handler.execute(query_to_execute))
-                execution_time = time.time() - execution_start
-                logger.info(f"Query {query_hash} returned {len(result)} results in {execution_time:.3f}s")
+                    execution_time = time.perf_counter() - execution_start
+                    logger.info(f"Query {query_hash} returned {len(result)} results in {execution_time:.3f}s")
+
                 log_query_time(query_hash, execution_time)
 
                 if args.limit is not None and result is not None and len(result) >= args.limit:
                     logger.info(f"Query {query_hash} limited to {args.limit} partition keys")
                     cache_handler.set_query_status(query_hash, partition_key, "failed")
                 else:
-                    cache_handler.set_cache(original_hash, result, partition_key)
-                    cache_handler.set_query(original_hash, original_query, partition_key)
-                    logger.debug(f"Successfully stored {original_hash} in cache with {len(result)} results")
+                    success_cache = cache_handler.set_cache(original_hash, result, partition_key)
+                    success_query = cache_handler.set_query(original_hash, original_query, partition_key)
+                    if success_cache and success_query:
+                        logger.debug(f"Successfully stored {original_hash} in cache with {len(result)} results")
+                    else:
+                        logger.error(f"Failed to store {original_hash} in cache (cache_success={success_cache}, query_success={success_query})")
+                        cache_handler.set_query_status(original_hash, partition_key, "failed")
                 success = True
 
             except psycopg.OperationalError as e:
-                execution_time = time.time() - execution_start if "execution_start" in locals() else 0
+                execution_time = time.perf_counter() - execution_start if "execution_start" in locals() else 0
                 error_msg = str(e).lower()
                 if "timeout" in error_msg or "cancel" in error_msg:
                     logger.warning(f"QUERY TIMEOUT: Query {query_hash} was cancelled due to timeout after {execution_time:.2f}s")
@@ -722,20 +726,17 @@ def main():
         "--duckdb-database-path",
         type=str,
         default="/tmp/partitioncache_accel.duckdb",
-        help="Path to DuckDB database file (default: /tmp/partitioncache_accel.duckdb, use ':memory:' for in-memory)"
+        help="Path to DuckDB database file (default: /tmp/partitioncache_accel.duckdb, use ':memory:' for in-memory)",
     )
     acceleration_group.add_argument(
-        "--force-reload-tables",
-        action="store_true",
-        default=False,
-        help="Force reload tables from PostgreSQL even if they exist in DuckDB"
+        "--force-reload-tables", action="store_true", default=False, help="Force reload tables from PostgreSQL even if they exist in DuckDB"
     )
 
     global args
     args = parser.parse_args()
 
-    # Configure logging based on verbosity
-    configure_logging(args)
+    # Configure enhanced logging with thread-aware formatting
+    configure_enhanced_logging(verbose=getattr(args, "verbose", False), quiet=getattr(args, "quiet", False), logger_name="PartitionCache")
 
     logger.info(f"Starting main, Current Time: {datetime.datetime.now()}")
     if args.db_backend is None:
@@ -793,6 +794,7 @@ def main():
                     enable_statistics=not args.disable_acceleration_stats,
                     duckdb_database_path=args.duckdb_database_path,
                     force_reload_tables=args.force_reload_tables,
+                    query_timeout=float(args.long_running_query_timeout),
                 )
 
                 if query_accelerator:

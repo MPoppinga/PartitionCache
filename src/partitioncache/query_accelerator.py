@@ -13,15 +13,17 @@ Features:
 - Configurable table preloading and connection management
 """
 
+import concurrent.futures
 import threading
 import time
-from logging import getLogger
 from typing import Any
 
 import duckdb
 import psycopg
 
-logger = getLogger("PartitionCache")
+from partitioncache.logging_utils import get_thread_aware_logger
+
+logger = get_thread_aware_logger("PartitionCache")
 
 
 class DuckDBQueryAccelerator:
@@ -48,7 +50,8 @@ class DuckDBQueryAccelerator:
         duckdb_threads: int = 4,
         enable_statistics: bool = True,
         duckdb_database_path: str = "/tmp/partitioncache_accel.duckdb",
-        force_reload_tables: bool = False
+        force_reload_tables: bool = False,
+        query_timeout: float = 0
     ):
         """
         Initialize DuckDB query accelerator.
@@ -61,6 +64,7 @@ class DuckDBQueryAccelerator:
             enable_statistics: Whether to collect performance statistics
             duckdb_database_path: Path to DuckDB database file (':memory:' for in-memory)
             force_reload_tables: Force reload tables from PostgreSQL even if they exist in DuckDB
+            query_timeout: Query timeout in seconds (0 = no timeout)
         """
         self.postgresql_params = postgresql_connection_params
         self.tables_to_preload = preload_tables or []
@@ -69,11 +73,13 @@ class DuckDBQueryAccelerator:
         self.enable_statistics = enable_statistics
         self.duckdb_database_path = duckdb_database_path
         self.force_reload_tables = force_reload_tables
+        self.query_timeout = query_timeout
 
         # Performance statistics
         self.stats = {
             "queries_accelerated": 0,
             "queries_fallback": 0,
+            "queries_timeout": 0,
             "total_acceleration_time": 0.0,
             "total_fallback_time": 0.0,
             "tables_preloaded": 0,
@@ -81,8 +87,10 @@ class DuckDBQueryAccelerator:
             "connection_errors": 0
         }
 
-        # Thread safety lock for concurrent access
-        self._query_lock = threading.RLock()
+        # DuckDB thread safety: Each thread uses its own cursor from the connection
+        # No global lock needed when using thread-local cursors properly
+        # Small lock only for statistics updates (minimal contention)
+        self._stats_lock = threading.Lock()
 
         # Connection objects
         self.duckdb_conn: duckdb.DuckDBPyConnection | None = None
@@ -94,6 +102,16 @@ class DuckDBQueryAccelerator:
     def __repr__(self) -> str:
         """Return string representation."""
         return f"DuckDBQueryAccelerator(preloaded_tables={len(self.tables_to_preload)}, initialized={self._initialized})"
+
+    def _update_stats(self, **updates: Any) -> None:
+        """Thread-safe statistics update."""
+        with self._stats_lock:
+            for key, value in updates.items():
+                if key in self.stats:
+                    if isinstance(value, int | float) and isinstance(self.stats[key], int | float):
+                        self.stats[key] += value
+                    else:
+                        self.stats[key] = value
 
     def initialize(self) -> bool:
         """
@@ -126,7 +144,7 @@ class DuckDBQueryAccelerator:
 
         except Exception as e:
             logger.error(f"Failed to initialize DuckDB query accelerator: {e}")
-            self.stats["connection_errors"] += 1
+            self._update_stats(connection_errors=1)
             self._cleanup_connections()
             return False
 
@@ -152,7 +170,7 @@ class DuckDBQueryAccelerator:
 
         except Exception as e:
             logger.error(f"Failed to connect to PostgreSQL for accelerator: {e}")
-            self.stats["connection_errors"] += 1
+            self._update_stats(connection_errors=1)
             raise
 
     def preload_tables(self) -> bool:
@@ -222,8 +240,9 @@ class DuckDBQueryAccelerator:
                     continue
 
             preload_duration = time.perf_counter() - preload_start
-            self.stats["tables_preloaded"] = tables_loaded
-            self.stats["preload_time"] = preload_duration
+            with self._stats_lock:
+                self.stats["tables_preloaded"] = tables_loaded
+                self.stats["preload_time"] = preload_duration
             self._preload_completed = True
 
             logger.info(f"Successfully preloaded {tables_loaded}/{len(self.tables_to_preload)} tables in {preload_duration:.2f}s")
@@ -231,7 +250,7 @@ class DuckDBQueryAccelerator:
 
         except Exception as e:
             logger.error(f"Failed to preload tables: {e}")
-            self.stats["connection_errors"] += 1
+            self._update_stats(connection_errors=1)
             return False
 
     def _build_duckdb_postgres_connection_string(self) -> str:
@@ -299,37 +318,113 @@ class DuckDBQueryAccelerator:
         Returns:
             Set of query results
         """
-        with self._query_lock:
-            if not self._initialized:
-                logger.debug("Accelerator not initialized, using fallback")
-                self.stats["queries_fallback"] += 1
-                return self._execute_fallback(query)
+        if not self._initialized:
+            logger.debug("Accelerator not initialized, using fallback")
+            self._update_stats(queries_fallback=1)
+            return self._execute_fallback(query)
 
-            try:
-                # Try DuckDB acceleration first
-                start_time = time.perf_counter()
+        try:
+            # Try DuckDB acceleration first with timeout support
+            start_time = time.perf_counter()
 
-                logger.debug(f"Executing query with DuckDB acceleration: {query[:100]}...")
+            logger.debug(f"Executing query with DuckDB acceleration:(timeout = {self.query_timeout}s) {query[:100]}...")
 
-                # Execute query in DuckDB
-                result = self.duckdb_conn.execute(query).fetchall()
-
-                # Convert to set for compatibility
+            if self.query_timeout > 0:
+                # Use thread-in-thread approach for timeout
+                result_set = self._execute_with_timeout(query)
+            else:
+                # Execute query with thread-local cursor
+                cursor = self.duckdb_conn.cursor()
+                result = cursor.execute(query).fetchall()
                 result_set = {row[0] if len(row) == 1 else row for row in result}
+                cursor.close()
 
-                duration = time.perf_counter() - start_time
-                self.stats["queries_accelerated"] += 1
-                self.stats["total_acceleration_time"] += duration
-                self._last_query_time = duration
+            duration = time.perf_counter() - start_time
+            self._update_stats(queries_accelerated=1, total_acceleration_time=duration)
+            self._last_query_time = duration
 
-                logger.debug(f"DuckDB query completed in {duration:.3f}s, returned {len(result_set)} results")
-                return result_set
+            logger.debug(f"DuckDB query completed in {duration:.3f}s, returned {len(result_set)} results")
+            return result_set
 
+        except concurrent.futures.TimeoutError:
+            logger.warning(f"DuckDB query timed out after {self.query_timeout}s, falling back to PostgreSQL")
+            self._update_stats(queries_timeout=1, queries_fallback=1)
+            return self._execute_fallback(query)
+        except Exception as e:
+            logger.warning(f"DuckDB query failed, falling back to PostgreSQL: {e}")
+            # Increment fallback counter since we're attempting fallback
+            self._update_stats(queries_fallback=1)
+            return self._execute_fallback(query)
+
+    def _execute_with_timeout(self, query: str) -> set[Any]:
+        """
+        Execute DuckDB query with timeout using simple threading approach.
+
+        Args:
+            query: SQL query to execute
+
+        Returns:
+            Set of query results
+
+        Raises:
+            concurrent.futures.TimeoutError: If query times out
+        """
+        result_container = {"result": None, "exception": None, "completed": False}
+
+        def _duckdb_query_worker():
+            """Worker function that executes the DuckDB query."""
+            cursor = None
+            try:
+                # Create thread-local cursor for thread safety
+                cursor = self.duckdb_conn.cursor()
+                result = cursor.execute(query).fetchall()
+                result_container["result"] = {row[0] if len(row) == 1 else row for row in result}
+                result_container["completed"] = True
+                logger.debug(f"DuckDB query worker completed successfully with {len(result)} rows")
             except Exception as e:
-                logger.warning(f"DuckDB query failed, falling back to PostgreSQL: {e}")
-                # Increment fallback counter since we're attempting fallback
-                self.stats["queries_fallback"] += 1
-                return self._execute_fallback(query)
+                logger.debug(f"DuckDB query worker failed: {e}")
+                result_container["exception"] = e
+                result_container["completed"] = True
+            finally:
+                if cursor:
+                    try:
+                        cursor.close()
+                    except Exception:
+                        pass
+
+        # Start the worker thread as daemon to avoid blocking main thread
+        worker_thread = threading.Thread(target=_duckdb_query_worker, daemon=True)
+        worker_thread.start()
+        logger.debug(f"Started DuckDB query worker thread with {self.query_timeout}s timeout")
+
+        # Wait for completion with timeout
+        worker_thread.join(timeout=self.query_timeout)
+
+        if worker_thread.is_alive():
+            # Query timed out - attempt to interrupt connection
+            logger.warning(f"DuckDB query timed out after {self.query_timeout}s, attempting to interrupt")
+            try:
+                if self.duckdb_conn:
+                    self.duckdb_conn.interrupt()
+                    logger.debug("DuckDB connection interrupted successfully")
+            except Exception as interrupt_error:
+                logger.debug(f"Failed to interrupt DuckDB connection: {interrupt_error}")
+
+            # Wait a bit more for graceful cleanup
+            worker_thread.join(timeout=1.0)
+
+            # Raise timeout error to trigger fallback
+            raise concurrent.futures.TimeoutError(f"Query timed out after {self.query_timeout} seconds")
+
+        # Check if worker thread completed successfully
+        if not result_container["completed"]:
+            raise Exception("Query execution failed - worker thread did not complete")
+
+        # Check for exceptions in worker thread
+        if result_container["exception"]:
+            raise result_container["exception"]
+
+        return result_container["result"]
 
     def _execute_fallback(self, query: str) -> set[Any]:
         """Execute query using PostgreSQL fallback."""
@@ -346,7 +441,7 @@ class DuckDBQueryAccelerator:
             result_set = {row[0] if len(row) == 1 else row for row in result}
 
             duration = time.perf_counter() - start_time
-            self.stats["total_fallback_time"] += duration
+            self._update_stats(total_fallback_time=duration)
             self._last_query_time = duration
 
             logger.debug(f"PostgreSQL fallback completed in {duration:.3f}s, returned {len(result_set)} results")
@@ -354,7 +449,7 @@ class DuckDBQueryAccelerator:
 
         except Exception as e:
             logger.error(f"Both DuckDB and PostgreSQL queries failed: {e}")
-            self.stats["connection_errors"] += 1
+            self._update_stats(connection_errors=1)
             raise
 
     def get_statistics(self) -> dict[str, Any]:
@@ -364,7 +459,8 @@ class DuckDBQueryAccelerator:
         Returns:
             Dict containing performance metrics
         """
-        stats = self.stats.copy()
+        with self._stats_lock:
+            stats = self.stats.copy()
 
         # Calculate derived metrics
         total_queries = stats["queries_accelerated"] + stats["queries_fallback"]
@@ -459,6 +555,7 @@ class DuckDBQueryAccelerator:
 def create_query_accelerator(
     postgresql_connection_params: dict[str, Any],
     preload_tables: list[str] | None = None,
+    query_timeout: float = 0,
     **kwargs
 ) -> DuckDBQueryAccelerator | None:
     """
@@ -467,6 +564,7 @@ def create_query_accelerator(
     Args:
         postgresql_connection_params: PostgreSQL connection parameters
         preload_tables: List of table names to preload
+        query_timeout: Query timeout in seconds (0 = no timeout)
         **kwargs: Additional accelerator configuration options
 
     Returns:
@@ -476,6 +574,7 @@ def create_query_accelerator(
         accelerator = DuckDBQueryAccelerator(
             postgresql_connection_params=postgresql_connection_params,
             preload_tables=preload_tables,
+            query_timeout=query_timeout,
             **kwargs
         )
 
