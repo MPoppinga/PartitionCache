@@ -335,65 +335,34 @@ def run_and_store_query(query: str, query_hash: str, partition_key: str, partiti
 
         if use_lazy_insertion:
             logger.info(f"STARTING LAZY INSERTION: Beginning lazy insertion for query {query_hash}")
-            if args.limit is not None:
-                db_connection_params = get_database_connection_params(args)
-                if args.db_backend == "postgresql":
-                    db_connection_params["timeout"] = args.long_running_query_timeout
-                    db_handler = get_db_handler("postgres", **db_connection_params)
-                elif args.db_backend == "mysql":
-                    db_handler = get_db_handler("mysql", **db_connection_params)
-                elif args.db_backend == "sqlite":
-                    db_handler = get_db_handler("sqlite", **db_connection_params)
-                else:
-                    raise AssertionError("No db backend specified, querying not possible")
 
-                count_query = f"SELECT COUNT(*) FROM ({query_to_execute}) AS count_result"
-                try:
-                    t_count = time.perf_counter()
-                    count_result = list(db_handler.execute(count_query))
-                    count_execution_time = time.perf_counter() - t_count
-                    log_query_time(f"{query_hash}_count", count_execution_time)
-                    result_count = count_result[0] if count_result else 0
-
-                    if result_count >= args.limit:
-                        logger.info(f"Query {query_hash} would return {result_count} rows, exceeding limit {args.limit}")
-                        cache_handler.set_query_status(query_hash, partition_key, "failed")
-                        success = True
-                except Exception as count_error:
-                    logger.warning(f"Failed to count results for limit check: {count_error}, proceeding with lazy insertion")
-                finally:
-                    if db_handler:
-                        db_handler.close()
-                        db_handler = None
-
-            if not success:
-                logger.info(f"EXECUTING LAZY INSERTION: Calling set_entry_lazy for {query_hash}")
-                t = time.perf_counter()
-                try:
-                    if isinstance(cache_handler, AbstractCacheHandler_Lazy):
-                        lazy_success = cache_handler.set_entry_lazy(original_hash, query_to_execute, original_query, partition_key)
-                        execution_time = time.perf_counter() - t
-                        if lazy_success:
-                            logger.info(f"✅ LAZY INSERTION SUCCESS: Lazily stored {original_hash} in cache in {execution_time:.3f}s")
-                            log_query_time(query_hash, execution_time)
-                            success = True
-                        else:
-                            logger.warning(f"⚠️ LAZY INSERTION FAILED: Lazy insertion failed for {original_hash}, falling back to traditional method")
-                            log_query_time(f"{query_hash}_lazy_failed", execution_time)
-                except psycopg.OperationalError as e:
+            logger.info(f"EXECUTING LAZY INSERTION: Calling set_entry_lazy for {query_hash}")
+            t = time.perf_counter()
+            try:
+                if isinstance(cache_handler, AbstractCacheHandler_Lazy):
+                    lazy_success = cache_handler.set_entry_lazy(original_hash, query_to_execute, original_query, partition_key)
                     execution_time = time.perf_counter() - t
-                    if "statement timeout" in str(e) or "query_canceled" in str(e):
-                        logger.info(f"Query {query_hash} is a long running query (detected during lazy insertion)")
-                        log_query_time(f"{query_hash}_timeout", execution_time)
-                        cache_handler.set_query_status(query_hash, partition_key, "timeout")
+                    if lazy_success:
+                        logger.info(f"✅ LAZY INSERTION SUCCESS: Lazily stored {original_hash} in cache in {execution_time:.3f}s")
+                        log_query_time(query_hash, execution_time)
                         success = True
                     else:
-                        logger.error(f"Lazy insertion operational error for {original_hash}: {e}, falling back to traditional method")
-                        log_query_time(f"{query_hash}_lazy_exception", execution_time)
-                except Exception as lazy_insert_error:
-                    execution_time = time.perf_counter() - t
-                    logger.error(f"Lazy insertion exception for {original_hash}: {lazy_insert_error}, falling back to traditional method")
+                        logger.warning(f"⚠️ LAZY INSERTION FAILED: Lazy insertion failed for {original_hash}, falling back to traditional method")
+                        log_query_time(f"{query_hash}_lazy_failed", execution_time)
+            except psycopg.OperationalError as e:
+                execution_time = time.perf_counter() - t
+                if "statement timeout" in str(e) or "query_canceled" in str(e):
+                    logger.info(f"Query {query_hash} is a long running query (detected during lazy insertion)")
+                    log_query_time(f"{query_hash}_timeout", execution_time)
+                    cache_handler.set_query_status(query_hash, partition_key, "timeout")
+                    success = True
+                else:
+                    logger.error(f"Lazy insertion operational error for {original_hash}: {e}, falling back to traditional method")
                     log_query_time(f"{query_hash}_lazy_exception", execution_time)
+            except Exception as lazy_insert_error:
+                execution_time = time.perf_counter() - t
+                logger.error(f"Lazy insertion exception for {original_hash}: {lazy_insert_error}, falling back to traditional method")
+                log_query_time(f"{query_hash}_lazy_exception", execution_time)
 
         if not use_lazy_insertion or not success:
             logger.info(f"Beginning calculation for cache population for query {query_hash}")
@@ -411,9 +380,16 @@ def run_and_store_query(query: str, query_hash: str, partition_key: str, partiti
 
             execution_start = time.time()
             try:
-                logger.info(f"Sending query to database with timeout={args.long_running_query_timeout}s")
-
-                result = set(db_handler.execute(query_to_execute))
+                # Use DuckDB acceleration when available and enabled
+                global query_accelerator
+                if (query_accelerator and
+                    args.enable_duckdb_acceleration and
+                    args.db_backend == "postgresql"):
+                    logger.info(f"Executing query via DuckDB acceleration with timeout={args.long_running_query_timeout}s")
+                    result = query_accelerator.execute_query(query_to_execute)
+                else:
+                    logger.info(f"Executing query via standard database handler with timeout={args.long_running_query_timeout}s")
+                    result = set(db_handler.execute(query_to_execute))
                 execution_time = time.time() - execution_start
                 logger.info(f"Query {query_hash} returned {len(result)} results in {execution_time:.3f}s")
                 log_query_time(query_hash, execution_time)
@@ -742,6 +718,18 @@ def main():
     acceleration_group.add_argument(
         "--disable-acceleration-stats", action="store_true", default=False, help="Disable DuckDB acceleration performance statistics logging"
     )
+    acceleration_group.add_argument(
+        "--duckdb-database-path",
+        type=str,
+        default="/tmp/partitioncache_accel.duckdb",
+        help="Path to DuckDB database file (default: /tmp/partitioncache_accel.duckdb, use ':memory:' for in-memory)"
+    )
+    acceleration_group.add_argument(
+        "--force-reload-tables",
+        action="store_true",
+        default=False,
+        help="Force reload tables from PostgreSQL even if they exist in DuckDB"
+    )
 
     global args
     args = parser.parse_args()
@@ -803,6 +791,8 @@ def main():
                     duckdb_memory_limit=args.duckdb_memory_limit,
                     duckdb_threads=args.duckdb_threads,
                     enable_statistics=not args.disable_acceleration_stats,
+                    duckdb_database_path=args.duckdb_database_path,
+                    force_reload_tables=args.force_reload_tables,
                 )
 
                 if query_accelerator:

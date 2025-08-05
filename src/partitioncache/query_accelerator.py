@@ -46,7 +46,9 @@ class DuckDBQueryAccelerator:
         preload_tables: list[str] | None = None,
         duckdb_memory_limit: str = "2GB",
         duckdb_threads: int = 4,
-        enable_statistics: bool = True
+        enable_statistics: bool = True,
+        duckdb_database_path: str = "/tmp/partitioncache_accel.duckdb",
+        force_reload_tables: bool = False
     ):
         """
         Initialize DuckDB query accelerator.
@@ -57,12 +59,16 @@ class DuckDBQueryAccelerator:
             duckdb_memory_limit: Memory limit for DuckDB instance
             duckdb_threads: Number of threads for DuckDB
             enable_statistics: Whether to collect performance statistics
+            duckdb_database_path: Path to DuckDB database file (':memory:' for in-memory)
+            force_reload_tables: Force reload tables from PostgreSQL even if they exist in DuckDB
         """
         self.postgresql_params = postgresql_connection_params
         self.tables_to_preload = preload_tables or []
         self.duckdb_memory_limit = duckdb_memory_limit
         self.duckdb_threads = duckdb_threads
         self.enable_statistics = enable_statistics
+        self.duckdb_database_path = duckdb_database_path
+        self.force_reload_tables = force_reload_tables
 
         # Performance statistics
         self.stats = {
@@ -97,10 +103,10 @@ class DuckDBQueryAccelerator:
             bool: True if initialization successful, False otherwise
         """
         try:
-            logger.info("Initializing DuckDB query accelerator...")
+            logger.info(f"Initializing DuckDB query accelerator with database: {self.duckdb_database_path}")
 
-            # Create in-memory DuckDB connection
-            self.duckdb_conn = duckdb.connect(":memory:")
+            # Create DuckDB connection (file-based or in-memory)
+            self.duckdb_conn = duckdb.connect(self.duckdb_database_path)
 
             # Configure DuckDB settings
             self.duckdb_conn.execute(f"SET memory_limit = '{self.duckdb_memory_limit}'")
@@ -162,6 +168,14 @@ class DuckDBQueryAccelerator:
 
         if self._preload_completed:
             logger.debug("Tables already preloaded")
+            return True
+
+        # Check if using persistent database and tables already exist (unless forced to reload)
+        if (self.duckdb_database_path != ":memory:" and
+            not self.force_reload_tables and
+            self._tables_exist_in_duckdb()):
+            logger.info("Tables already exist in DuckDB, skipping PostgreSQL reload")
+            self._preload_completed = True
             return True
 
         logger.info(f"Preloading {len(self.tables_to_preload)} tables into DuckDB...")
@@ -255,6 +269,24 @@ class DuckDBQueryAccelerator:
                 return cursor.fetchone() is not None
         except Exception as e:
             logger.debug(f"Failed to check table/view existence for {table_name}: {e}")
+            return False
+
+    def _tables_exist_in_duckdb(self) -> bool:
+        """Check if all preload tables exist in DuckDB."""
+        try:
+            for table_name in self.tables_to_preload:
+                # Query DuckDB's information schema to check if table exists
+                result = self.duckdb_conn.execute(
+                    "SELECT 1 FROM information_schema.tables WHERE table_name = ?",
+                    (table_name,)
+                ).fetchone()
+                if result is None:
+                    logger.debug(f"Table {table_name} not found in DuckDB")
+                    return False
+            logger.debug(f"All {len(self.tables_to_preload)} tables exist in DuckDB")
+            return True
+        except Exception as e:
+            logger.debug(f"Failed to check table existence in DuckDB: {e}")
             return False
 
     def execute_query(self, query: str) -> set[Any]:

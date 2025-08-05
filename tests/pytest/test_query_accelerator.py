@@ -52,7 +52,8 @@ class TestDuckDBQueryAccelerator:
             postgresql_connection_params=postgresql_params,
             preload_tables=["test_table"],
             duckdb_memory_limit="1GB",
-            duckdb_threads=2
+            duckdb_threads=2,
+            duckdb_database_path=":memory:"
         )
 
         # Test initialization
@@ -117,13 +118,15 @@ class TestDuckDBQueryAccelerator:
         accelerator = DuckDBQueryAccelerator(
             postgresql_connection_params=postgresql_params,
             preload_tables=["test_table"],
-            enable_statistics=True
+            enable_statistics=True,
+            duckdb_database_path=":memory:"  # Use memory database to ensure fresh state
         )
 
         accelerator.initialize()
 
-        # Mock table existence check
+        # Mock table existence checks
         accelerator._table_exists_in_postgresql = Mock(return_value=True)
+        accelerator._tables_exist_in_duckdb = Mock(return_value=False)  # Force reload from PostgreSQL
 
         # Test table preloading
         result = accelerator.preload_tables()
