@@ -1,6 +1,7 @@
 misc
 data
 
+sm_filter*
 
 *.sqlite
 *.png

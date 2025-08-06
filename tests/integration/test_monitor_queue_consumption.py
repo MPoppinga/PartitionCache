@@ -13,7 +13,6 @@ import pytest
 from partitioncache.cli.monitor_cache_queue import (
     get_timeout_for_state,
     print_enhanced_status,
-    process_pending_job_if_available,
 )
 
 
@@ -24,19 +23,19 @@ class TestQueueConsumptionLogic:
         """Test timeout calculation for normal operation."""
         # Normal operation: can consume, not exiting, no errors
         timeout = get_timeout_for_state(can_consume=True, exit_event_set=False, error_count=0)
-        assert timeout == 60.0, "Should use long timeout for efficient blocking"
+        assert timeout == 10.0, "Should use 10s timeout for efficient blocking with periodic status checks"
 
     def test_timeout_for_state_capacity_wait(self):
         """Test timeout calculation when waiting for capacity."""
         # Waiting for capacity: cannot consume, not exiting, no errors
         timeout = get_timeout_for_state(can_consume=False, exit_event_set=False, error_count=0)
-        assert timeout == 1.0, "Should use short timeout when waiting for capacity"
+        assert timeout == 0.1, "Should use short timeout when waiting for capacity"
 
     def test_timeout_for_state_shutdown(self):
         """Test timeout calculation during shutdown."""
         # Shutdown: exit event set
         timeout = get_timeout_for_state(can_consume=True, exit_event_set=True, error_count=0)
-        assert timeout == 0.5, "Should use very short timeout during shutdown"
+        assert timeout == 0.1, "Should use very short timeout during shutdown"
 
     def test_timeout_for_state_error_recovery(self):
         """Test timeout calculation with exponential backoff for errors."""
@@ -45,9 +44,9 @@ class TestQueueConsumptionLogic:
         timeout2 = get_timeout_for_state(can_consume=False, exit_event_set=False, error_count=2)
         timeout3 = get_timeout_for_state(can_consume=False, exit_event_set=False, error_count=3)
 
-        assert timeout1 == 1.0, "First error should use base timeout"
-        assert timeout2 == 2.0, "Second error should double timeout"
-        assert timeout3 == 4.0, "Third error should continue exponential backoff"
+        assert timeout1 == 1.0, "First error should use 0.5 * 2^1 = 1.0"
+        assert timeout2 == 2.0, "Second error should use 0.5 * 2^2 = 2.0"
+        assert timeout3 == 4.0, "Third error should use 0.5 * 2^3 = 4.0"
 
         # Test maximum backoff
         timeout_max = get_timeout_for_state(can_consume=False, exit_event_set=False, error_count=10)
@@ -64,13 +63,13 @@ class TestQueueConsumptionLogic:
         }
 
         # Test with waiting reason
-        print_enhanced_status(5, 10, queue_lengths, "Waiting for thread capacity")
+        print_enhanced_status(5, queue_lengths, "Waiting for thread capacity")
 
         # Check log message contains all expected information
         assert len(caplog.records) > 0, "Should have captured log message"
         log_message = caplog.records[-1].message
         assert "Active: 5" in log_message
-        assert "Pending: 10" in log_message
+        # Pending is no longer part of the status message
         assert "Fragment Queue: 25" in log_message
         assert "Original Queue: 15" in log_message
         assert "Waiting for thread capacity" in log_message
@@ -86,12 +85,12 @@ class TestQueueConsumptionLogic:
         }
 
         # Test without waiting reason
-        print_enhanced_status(2, 3, queue_lengths, None)
+        print_enhanced_status(2, queue_lengths, None)
 
         assert len(caplog.records) > 0, "Should have captured log message"
         log_message = caplog.records[-1].message
         assert "Active: 2" in log_message
-        assert "Pending: 3" in log_message
+        # Pending is no longer part of the status message
         assert "Fragment Queue: 5" in log_message
         assert "Original Queue: 0" in log_message
         # Should not contain " - " when no waiting reason
@@ -100,12 +99,6 @@ class TestQueueConsumptionLogic:
 
 class TestPendingJobProcessing:
     """Test pending job processing functionality."""
-
-    @patch('partitioncache.cli.monitor_cache_queue.pool', None)
-    def test_process_pending_job_no_pool(self):
-        """Test that function returns False when pool is None."""
-        result = process_pending_job_if_available()
-        assert result is False, "Should return False when no pool is available"
 
     def test_pending_job_processing_logic(self):
         """Test the conceptual logic of pending job processing."""
