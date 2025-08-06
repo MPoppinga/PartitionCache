@@ -13,6 +13,7 @@ Features:
 - High-performance analytical queries
 """
 
+import re
 import threading
 from datetime import datetime
 from logging import getLogger
@@ -22,6 +23,28 @@ import duckdb
 from partitioncache.cache_handler.abstract import AbstractCacheHandler_Lazy
 
 logger = getLogger("PartitionCache")
+
+
+def validate_identifier(identifier: str, identifier_type: str = "identifier") -> None:
+    """
+    Validate SQL identifier (table name, column name, etc.) to prevent SQL injection.
+
+    Args:
+        identifier: The identifier to validate
+        identifier_type: Type of identifier for error messages
+
+    Raises:
+        ValueError: If identifier contains invalid characters
+    """
+    # Allow alphanumeric, underscore, and hyphen
+    if not re.match(r"^[a-zA-Z0-9_-]+$", identifier):
+        msg = f"Invalid {identifier_type}: '{identifier}'. Only alphanumeric characters, underscores, and hyphens are allowed."
+        raise ValueError(msg)
+
+    # Check length
+    if len(identifier) > 128:
+        msg = f"{identifier_type} too long: '{identifier}'. Maximum length is 128 characters."
+        raise ValueError(msg)
 
 
 class DuckDBBitCacheHandler(AbstractCacheHandler_Lazy):
@@ -67,6 +90,9 @@ class DuckDBBitCacheHandler(AbstractCacheHandler_Lazy):
             table_prefix: Prefix for cache tables
             bitsize: Default bitsize for bit arrays
         """
+        # Validate table prefix to prevent SQL injection
+        validate_identifier(table_prefix, "table prefix")
+
         self.database = database
         self.table_prefix = table_prefix
         self.default_bitsize = bitsize
@@ -85,6 +111,22 @@ class DuckDBBitCacheHandler(AbstractCacheHandler_Lazy):
     def __repr__(self) -> str:
         """Return string representation."""
         return "duckdb_bit"
+
+    def _get_safe_table_name(self, partition_key: str) -> str:
+        """
+        Get safe table name for partition after validation.
+
+        Args:
+            partition_key: Partition key name
+
+        Returns:
+            str: Safe table name
+
+        Raises:
+            ValueError: If partition key contains invalid characters
+        """
+        validate_identifier(partition_key, "partition key")
+        return f"{self.table_prefix}_cache_{partition_key}"
 
     @classmethod
     def get_supported_datatypes(cls) -> set[str]:
@@ -134,7 +176,8 @@ class DuckDBBitCacheHandler(AbstractCacheHandler_Lazy):
             bool: True if successful
         """
         try:
-            table_name = f"{self.table_prefix}_cache_{partition_key}"
+            # Get safe table name (includes validation)
+            table_name = self._get_safe_table_name(partition_key)
 
             # Create cache table with native DuckDB BITSTRING
             self.conn.execute(f"""
@@ -148,18 +191,24 @@ class DuckDBBitCacheHandler(AbstractCacheHandler_Lazy):
 
             # Insert metadata - use INSERT OR REPLACE for DuckDB compatibility
             try:
-                self.conn.execute(f"""
+                self.conn.execute(
+                    f"""
                     INSERT INTO {self.table_prefix}_partition_metadata
                     (partition_key, datatype, bitsize)
                     VALUES (?, 'integer', ?)
-                """, (partition_key, bitsize))
-            except Exception:
-                # Update existing entry if insert fails
-                self.conn.execute(f"""
+                """,
+                    (partition_key, bitsize),
+                )
+            except duckdb.ConstraintException:
+                # Update existing entry if insert fails due to primary key constraint
+                self.conn.execute(
+                    f"""
                     UPDATE {self.table_prefix}_partition_metadata
                     SET bitsize = ?
                     WHERE partition_key = ?
-                """, (bitsize, partition_key))
+                """,
+                    (bitsize, partition_key),
+                )
 
             return True
 
@@ -173,10 +222,13 @@ class DuckDBBitCacheHandler(AbstractCacheHandler_Lazy):
     def _get_partition_bitsize(self, partition_key: str) -> int | None:
         """Get bitsize for a partition from metadata."""
         try:
-            result = self.conn.execute(f"""
+            result = self.conn.execute(
+                f"""
                 SELECT bitsize FROM {self.table_prefix}_partition_metadata
                 WHERE partition_key = ?
-            """, (partition_key,)).fetchone()
+            """,
+                (partition_key,),
+            ).fetchone()
 
             return result[0] if result else None
         except Exception:
@@ -217,6 +269,107 @@ class DuckDBBitCacheHandler(AbstractCacheHandler_Lazy):
         if not self._ensure_partition_table(partition_key, bitsize):
             raise RuntimeError(f"Failed to register partition key: {partition_key}")
 
+    def _convert_to_integers(self, partition_key_identifiers: set[int] | set[str] | set[float] | set[datetime]) -> list[int] | None:
+        """
+        Convert partition key identifiers to integers.
+
+        Args:
+            partition_key_identifiers: Set of values to convert
+
+        Returns:
+            List of integers or None if conversion fails
+        """
+        int_keys = []
+        for k in partition_key_identifiers:
+            if isinstance(k, int):
+                int_keys.append(k)
+            elif isinstance(k, str):
+                try:
+                    int_keys.append(int(k))
+                except ValueError:
+                    logger.error(f"Cannot convert to integer: {k}")
+                    return None
+            else:
+                logger.error(f"Only integer values supported for bit arrays: {k}")
+                return None
+        return int_keys
+
+    def _validate_and_prepare_bitsize(self, int_keys: list[int], partition_key: str) -> int | None:
+        """
+        Validate and prepare bitsize for the partition.
+
+        Args:
+            int_keys: List of integer keys
+            partition_key: Partition key name
+
+        Returns:
+            Actual bitsize or None if validation fails
+        """
+        max_value = max(int_keys)
+        existing_bitsize = self._get_partition_bitsize(partition_key)
+
+        if existing_bitsize is None:
+            # Create new partition with appropriate bitsize
+            required_bitsize = max(max_value + 1, self.default_bitsize)
+            if not self._ensure_partition_table(partition_key, required_bitsize):
+                return None
+            return required_bitsize
+        else:
+            # Validate values fit in existing bitsize
+            if max_value >= existing_bitsize:
+                logger.error(f"Value {max_value} exceeds bitsize {existing_bitsize} for partition {partition_key}")
+                return None
+            return existing_bitsize
+
+    def _build_bitstring_expression(self, int_keys: list[int], bitsize: int) -> str:
+        """
+        Build DuckDB BITSTRING expression for the given integer keys.
+
+        Args:
+            int_keys: List of integer keys
+            bitsize: Size of the bitstring
+
+        Returns:
+            SQL expression for creating the bitstring
+        """
+        bitstring_expr = "REPEAT('0', ?)::BITSTRING"
+
+        # Set bits for each integer value using DuckDB's set_bit function
+        for k in int_keys:
+            bitstring_expr = f"set_bit({bitstring_expr}, {k}, 1)"
+
+        return bitstring_expr
+
+    def _store_cache_entry(self, table_name: str, key: str, bitstring_expr: str, bitsize: int, count: int) -> None:
+        """
+        Store or update cache entry in the table.
+
+        Args:
+            table_name: Name of the cache table
+            key: Cache key
+            bitstring_expr: SQL expression for bitstring
+            bitsize: Size of the bitstring
+            count: Number of partition keys
+        """
+        try:
+            self.conn.execute(
+                f"""
+                INSERT INTO {table_name} (query_hash, partition_keys, partition_keys_count)
+                VALUES (?, {bitstring_expr}, ?)
+            """,
+                (key, bitsize, count),
+            )
+        except duckdb.ConstraintException:
+            # If insert fails due to primary key constraint, do update
+            self.conn.execute(
+                f"""
+                UPDATE {table_name}
+                SET partition_keys = {bitstring_expr}, partition_keys_count = ?
+                WHERE query_hash = ?
+            """,
+                (bitsize, count, key),
+            )
+
     def set_cache(self, key: str, partition_key_identifiers: set[int] | set[str] | set[float] | set[datetime], partition_key: str = "partition_key") -> bool:
         """
         Store partition key identifiers as DuckDB BITSTRING.
@@ -236,76 +389,41 @@ class DuckDBBitCacheHandler(AbstractCacheHandler_Lazy):
 
         try:
             # Convert all values to integers
-            int_keys = []
-            for k in partition_key_identifiers:
-                if isinstance(k, int):
-                    int_keys.append(k)
-                elif isinstance(k, str):
-                    try:
-                        int_keys.append(int(k))
-                    except ValueError:
-                        logger.error(f"Cannot convert to integer: {k}")
-                        return False
-                else:
-                    logger.error(f"Only integer values supported for bit arrays: {k}")
-                    return False
-
-            # Get or determine bitsize
-            max_value = max(int_keys)
-            existing_bitsize = self._get_partition_bitsize(partition_key)
-
-            if existing_bitsize is None:
-                # Create new partition with appropriate bitsize
-                required_bitsize = max(max_value + 1, self.default_bitsize)
-                if not self._ensure_partition_table(partition_key, required_bitsize):
-                    return False
-                actual_bitsize = required_bitsize
-            else:
-                actual_bitsize = existing_bitsize
-
-            # Validate values fit in bitsize
-            if max_value >= actual_bitsize:
-                logger.error(f"Value {max_value} exceeds bitsize {actual_bitsize} for partition {partition_key}")
+            int_keys = self._convert_to_integers(partition_key_identifiers)
+            if int_keys is None:
                 return False
 
-            # Create DuckDB BITSTRING using native operations
-            table_name = f"{self.table_prefix}_cache_{partition_key}"
+            # Validate and prepare bitsize
+            actual_bitsize = self._validate_and_prepare_bitsize(int_keys, partition_key)
+            if actual_bitsize is None:
+                return False
 
-            # Create a bitstring with bits set for each integer value
-            # We'll use DuckDB's bitstring operations to set bits
-            bitstring_expr = "REPEAT('0', ?)::BITSTRING"
+            # Build bitstring expression
+            bitstring_expr = self._build_bitstring_expression(int_keys, actual_bitsize)
 
-            # Set bits for each integer value using DuckDB's set_bit function
-            for k in int_keys:
-                bitstring_expr = f"set_bit({bitstring_expr}, {k}, 1)"
-
-            # First try to insert
-            try:
-                self.conn.execute(f"""
-                    INSERT INTO {table_name} (query_hash, partition_keys, partition_keys_count)
-                    VALUES (?, {bitstring_expr}, ?)
-                """, (key, actual_bitsize, len(int_keys)))
-            except Exception:
-                # If insert fails, do update
-                self.conn.execute(f"""
-                    UPDATE {table_name}
-                    SET partition_keys = {bitstring_expr}, partition_keys_count = ?
-                    WHERE query_hash = ?
-                """, (actual_bitsize, len(int_keys), key))
+            # Store cache entry
+            table_name = self._get_safe_table_name(partition_key)
+            self._store_cache_entry(table_name, key, bitstring_expr, actual_bitsize, len(int_keys))
 
             # Also store in queries table for existence checks
             try:
-                self.conn.execute(f"""
+                self.conn.execute(
+                    f"""
                     INSERT INTO {self.table_prefix}_queries (query_hash, partition_key, query)
                     VALUES (?, ?, '')
-                """, (key, partition_key))
-            except Exception:
-                # Update if insert fails
-                self.conn.execute(f"""
+                """,
+                    (key, partition_key),
+                )
+            except duckdb.ConstraintException:
+                # Update if insert fails due to primary key constraint
+                self.conn.execute(
+                    f"""
                     UPDATE {self.table_prefix}_queries
                     SET last_seen = now()
                     WHERE query_hash = ? AND partition_key = ?
-                """, (key, partition_key))
+                """,
+                    (key, partition_key),
+                )
 
             return True
 
@@ -325,10 +443,11 @@ class DuckDBBitCacheHandler(AbstractCacheHandler_Lazy):
             Set of integer partition keys or None if not found
         """
         try:
-            table_name = f"{self.table_prefix}_cache_{partition_key}"
+            table_name = self._get_safe_table_name(partition_key)
 
             # Use DuckDB's native bitstring functions to extract set bits
-            result = self.conn.execute(f"""
+            result = self.conn.execute(
+                f"""
                 WITH bit_positions AS (
                     SELECT
                         range(bit_length(partition_keys)) AS pos_array
@@ -382,8 +501,8 @@ class DuckDBBitCacheHandler(AbstractCacheHandler_Lazy):
                 return result, 1
 
             # Multiple keys - use DuckDB's BIT_AND aggregate for intersection
-            table_name = f"{self.table_prefix}_cache_{partition_key}"
-            key_placeholders = ','.join('?' * len(existing_keys))
+            table_name = self._get_safe_table_name(partition_key)
+            key_placeholders = ",".join("?" * len(existing_keys))
 
             # Use BIT_AND aggregate to compute intersection of all bitstrings
             intersection_query = f"""
@@ -432,7 +551,7 @@ class DuckDBBitCacheHandler(AbstractCacheHandler_Lazy):
             if not existing_keys:
                 return None, 0
 
-            table_name = f"{self.table_prefix}_cache_{partition_key}"
+            table_name = self._get_safe_table_name(partition_key)
             key_list = list(existing_keys)
 
             if len(key_list) == 1:
@@ -514,7 +633,7 @@ class DuckDBBitCacheHandler(AbstractCacheHandler_Lazy):
             else:
                 actual_bitsize = existing_bitsize
 
-            table_name = f"{self.table_prefix}_cache_{partition_key}"
+            table_name = self._get_safe_table_name(partition_key)
 
             # Create DuckDB BITSTRING using lazy query execution
             # Build a query that creates the bitstring from the input query results
@@ -555,17 +674,23 @@ class DuckDBBitCacheHandler(AbstractCacheHandler_Lazy):
 
             # Also store in queries table for existence checks
             try:
-                self.conn.execute(f"""
+                self.conn.execute(
+                    f"""
                     INSERT INTO {self.table_prefix}_queries (query_hash, partition_key, query)
                     VALUES (?, ?, '')
-                """, (key, partition_key))
-            except Exception:
-                # Update if insert fails
-                self.conn.execute(f"""
+                """,
+                    (key, partition_key),
+                )
+            except duckdb.ConstraintException:
+                # Update if insert fails due to primary key constraint
+                self.conn.execute(
+                    f"""
                     UPDATE {self.table_prefix}_queries
                     SET last_seen = now()
                     WHERE query_hash = ? AND partition_key = ?
-                """, (key, partition_key))
+                """,
+                    (key, partition_key),
+                )
 
             return True
 
@@ -591,14 +716,17 @@ class DuckDBBitCacheHandler(AbstractCacheHandler_Lazy):
                 status = self.get_query_status(key, partition_key)
                 if status is None:
                     return False
-                if status in ('timeout', 'failed'):
+                if status in ("timeout", "failed"):
                     return True  # Don't check cache for failed queries
 
             # Check cache entry
-            table_name = f"{self.table_prefix}_cache_{partition_key}"
-            result = self.conn.execute(f"""
+            table_name = self._get_safe_table_name(partition_key)
+            result = self.conn.execute(
+                f"""
                 SELECT 1 FROM {table_name} WHERE query_hash = ?
-            """, (key,)).fetchone()
+            """,
+                (key,),
+            ).fetchone()
 
             return result is not None
 
@@ -617,18 +745,24 @@ class DuckDBBitCacheHandler(AbstractCacheHandler_Lazy):
             bool: True if successful
         """
         try:
-            table_name = f"{self.table_prefix}_cache_{partition_key}"
+            table_name = self._get_safe_table_name(partition_key)
 
             # Delete from cache table
-            self.conn.execute(f"""
+            self.conn.execute(
+                f"""
                 DELETE FROM {table_name} WHERE query_hash = ?
-            """, (key,))
+            """,
+                (key,),
+            )
 
             # Delete from queries table
-            self.conn.execute(f"""
+            self.conn.execute(
+                f"""
                 DELETE FROM {self.table_prefix}_queries
                 WHERE query_hash = ? AND partition_key = ?
-            """, (key, partition_key))
+            """,
+                (key, partition_key),
+            )
 
             return True
 
@@ -652,13 +786,16 @@ class DuckDBBitCacheHandler(AbstractCacheHandler_Lazy):
             if not self._get_partition_bitsize(partition_key):
                 self.register_partition_key(partition_key, "integer")
 
-            table_name = f"{self.table_prefix}_cache_{partition_key}"
-            self.conn.execute(f"""
+            table_name = self._get_safe_table_name(partition_key)
+            self.conn.execute(
+                f"""
                 INSERT INTO {table_name} (query_hash, partition_keys, partition_keys_count)
                 VALUES (?, NULL, NULL)
                 ON CONFLICT (query_hash) DO UPDATE SET
                 partition_keys = NULL, partition_keys_count = NULL
-            """, (key,))
+            """,
+                (key,),
+            )
 
             return True
 
@@ -678,10 +815,13 @@ class DuckDBBitCacheHandler(AbstractCacheHandler_Lazy):
             bool: True if null
         """
         try:
-            table_name = f"{self.table_prefix}_cache_{partition_key}"
-            result = self.conn.execute(f"""
+            table_name = self._get_safe_table_name(partition_key)
+            result = self.conn.execute(
+                f"""
                 SELECT partition_keys FROM {table_name} WHERE query_hash = ?
-            """, (key,)).fetchone()
+            """,
+                (key,),
+            ).fetchone()
 
             return result is not None and result[0] is None
 
@@ -706,28 +846,37 @@ class DuckDBBitCacheHandler(AbstractCacheHandler_Lazy):
         try:
             if check_query:
                 # Check queries table first
-                result = self.conn.execute(f"""
+                result = self.conn.execute(
+                    f"""
                     SELECT query_hash FROM {self.table_prefix}_queries
-                    WHERE query_hash IN ({','.join('?' * len(keys))})
+                    WHERE query_hash IN ({",".join("?" * len(keys))})
                     AND partition_key = ?
                     AND status IN ('ok', 'timeout', 'failed')
-                """, tuple(keys) + (partition_key,)).fetchall()
+                """,
+                    tuple(keys) + (partition_key,),
+                ).fetchall()
 
                 query_keys = {row[0] for row in result}
 
                 # For 'ok' status, also check cache exists
-                ok_keys = self.conn.execute(f"""
+                ok_keys = self.conn.execute(
+                    f"""
                     SELECT query_hash FROM {self.table_prefix}_queries
-                    WHERE query_hash IN ({','.join('?' * len(query_keys))})
+                    WHERE query_hash IN ({",".join("?" * len(query_keys))})
                     AND partition_key = ? AND status = 'ok'
-                """, tuple(query_keys) + (partition_key,)).fetchall()
+                """,
+                    tuple(query_keys) + (partition_key,),
+                ).fetchall()
 
                 if ok_keys:
-                    table_name = f"{self.table_prefix}_cache_{partition_key}"
-                    cache_keys = self.conn.execute(f"""
+                    table_name = self._get_safe_table_name(partition_key)
+                    cache_keys = self.conn.execute(
+                        f"""
                         SELECT query_hash FROM {table_name}
-                        WHERE query_hash IN ({','.join('?' * len(ok_keys))})
-                    """, tuple(row[0] for row in ok_keys)).fetchall()
+                        WHERE query_hash IN ({",".join("?" * len(ok_keys))})
+                    """,
+                        tuple(row[0] for row in ok_keys),
+                    ).fetchall()
 
                     existing_cache_keys = {row[0] for row in cache_keys}
                 else:
@@ -739,11 +888,14 @@ class DuckDBBitCacheHandler(AbstractCacheHandler_Lazy):
 
             else:
                 # Just check cache table
-                table_name = f"{self.table_prefix}_cache_{partition_key}"
-                result = self.conn.execute(f"""
+                table_name = self._get_safe_table_name(partition_key)
+                result = self.conn.execute(
+                    f"""
                     SELECT query_hash FROM {table_name}
-                    WHERE query_hash IN ({','.join('?' * len(keys))})
-                """, tuple(keys)).fetchall()
+                    WHERE query_hash IN ({",".join("?" * len(keys))})
+                """,
+                    tuple(keys),
+                ).fetchall()
 
                 return {row[0] for row in result}
 
@@ -762,7 +914,7 @@ class DuckDBBitCacheHandler(AbstractCacheHandler_Lazy):
             List of cache keys
         """
         try:
-            table_name = f"{self.table_prefix}_cache_{partition_key}"
+            table_name = self._get_safe_table_name(partition_key)
             result = self.conn.execute(f"""
                 SELECT query_hash FROM {table_name} ORDER BY created_at DESC
             """).fetchall()
@@ -785,12 +937,15 @@ class DuckDBBitCacheHandler(AbstractCacheHandler_Lazy):
             bool: True if successful
         """
         try:
-            self.conn.execute(f"""
+            self.conn.execute(
+                f"""
                 INSERT INTO {self.table_prefix}_queries (query_hash, partition_key, query)
                 VALUES (?, ?, ?)
                 ON CONFLICT (query_hash, partition_key) DO UPDATE SET
                 query = EXCLUDED.query, last_seen = now()
-            """, (key, partition_key, querytext))
+            """,
+                (key, partition_key, querytext),
+            )
 
             return True
 
@@ -810,10 +965,13 @@ class DuckDBBitCacheHandler(AbstractCacheHandler_Lazy):
             Query text or None if not found
         """
         try:
-            result = self.conn.execute(f"""
+            result = self.conn.execute(
+                f"""
                 SELECT query FROM {self.table_prefix}_queries
                 WHERE query_hash = ? AND partition_key = ?
-            """, (key, partition_key)).fetchone()
+            """,
+                (key, partition_key),
+            ).fetchone()
 
             return result[0] if result else None
 
@@ -831,10 +989,13 @@ class DuckDBBitCacheHandler(AbstractCacheHandler_Lazy):
             List of (query_hash, query_text) tuples
         """
         try:
-            result = self.conn.execute(f"""
+            result = self.conn.execute(
+                f"""
                 SELECT query_hash, query FROM {self.table_prefix}_queries
                 WHERE partition_key = ? ORDER BY last_seen DESC
-            """, (partition_key,)).fetchall()
+            """,
+                (partition_key,),
+            ).fetchall()
 
             return result
 
@@ -854,11 +1015,14 @@ class DuckDBBitCacheHandler(AbstractCacheHandler_Lazy):
             bool: True if successful
         """
         try:
-            self.conn.execute(f"""
+            self.conn.execute(
+                f"""
                 UPDATE {self.table_prefix}_queries
                 SET status = ?, last_seen = now()
                 WHERE query_hash = ? AND partition_key = ?
-            """, (status, key, partition_key))
+            """,
+                (status, key, partition_key),
+            )
 
             return True
 
@@ -878,10 +1042,13 @@ class DuckDBBitCacheHandler(AbstractCacheHandler_Lazy):
             Status string or None if not found
         """
         try:
-            result = self.conn.execute(f"""
+            result = self.conn.execute(
+                f"""
                 SELECT status FROM {self.table_prefix}_queries
                 WHERE query_hash = ? AND partition_key = ?
-            """, (key, partition_key)).fetchone()
+            """,
+                (key, partition_key),
+            ).fetchone()
 
             return result[0] if result else None
 

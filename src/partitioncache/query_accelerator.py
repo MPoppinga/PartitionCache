@@ -14,6 +14,7 @@ Features:
 """
 
 import concurrent.futures
+import re
 import threading
 import time
 from typing import Any
@@ -24,6 +25,27 @@ import psycopg
 from partitioncache.logging_utils import get_thread_aware_logger
 
 logger = get_thread_aware_logger("PartitionCache")
+
+
+def validate_table_name(table_name: str) -> None:
+    """
+    Validate table name to prevent SQL injection.
+
+    Args:
+        table_name: The table name to validate
+
+    Raises:
+        ValueError: If table name contains invalid characters
+    """
+    # Allow alphanumeric, underscore, and basic punctuation that's safe in SQL identifiers
+    if not re.match(r"^[a-zA-Z0-9_\-\.]+$", table_name):
+        msg = f"Invalid table name: '{table_name}'. Only alphanumeric characters, underscores, hyphens, and dots are allowed."
+        raise ValueError(msg)
+
+    # Check length
+    if len(table_name) > 128:
+        msg = f"Table name too long: '{table_name}'. Maximum length is 128 characters."
+        raise ValueError(msg)
 
 
 class DuckDBQueryAccelerator:
@@ -51,7 +73,7 @@ class DuckDBQueryAccelerator:
         enable_statistics: bool = True,
         duckdb_database_path: str = "/tmp/partitioncache_accel.duckdb",
         force_reload_tables: bool = False,
-        query_timeout: float = 0
+        query_timeout: float = 0,
     ):
         """
         Initialize DuckDB query accelerator.
@@ -84,7 +106,7 @@ class DuckDBQueryAccelerator:
             "total_fallback_time": 0.0,
             "tables_preloaded": 0,
             "preload_time": 0.0,
-            "connection_errors": 0
+            "connection_errors": 0,
         }
 
         # DuckDB thread safety: Each thread uses its own cursor from the connection
@@ -189,9 +211,7 @@ class DuckDBQueryAccelerator:
             return True
 
         # Check if using persistent database and tables already exist (unless forced to reload)
-        if (self.duckdb_database_path != ":memory:" and
-            not self.force_reload_tables and
-            self._tables_exist_in_duckdb()):
+        if self.duckdb_database_path != ":memory:" and not self.force_reload_tables and self._tables_exist_in_duckdb():
             logger.info("Tables already exist in DuckDB, skipping PostgreSQL reload")
             self._preload_completed = True
             return True
@@ -231,6 +251,9 @@ class DuckDBQueryAccelerator:
 
             for table_name in self.tables_to_preload:
                 try:
+                    # Validate table name to prevent SQL injection
+                    validate_table_name(table_name)
+
                     logger.debug(f"Preloading table: {table_name}")
 
                     # Validate table exists in PostgreSQL
@@ -241,6 +264,7 @@ class DuckDBQueryAccelerator:
                     # Drop existing table if force reload is enabled or in memory mode
                     if self.force_reload_tables or self.duckdb_database_path == ":memory:":
                         try:
+                            # Table name is safe after validation
                             self.duckdb_conn.execute(f"DROP TABLE IF EXISTS {table_name}")
                             logger.debug(f"Dropped existing table {table_name} for reload")
                         except Exception:
@@ -249,6 +273,7 @@ class DuckDBQueryAccelerator:
                     # Create table in DuckDB by copying from PostgreSQL
                     # Use CREATE OR REPLACE for better handling
                     try:
+                        # Table names are safe after validation
                         self.duckdb_conn.execute(f"""
                             CREATE OR REPLACE TABLE {table_name} AS
                             SELECT * FROM postgres_db.{table_name}
@@ -264,6 +289,7 @@ class DuckDBQueryAccelerator:
                             raise
 
                     # Get row count for logging
+                    # Table name is safe after validation
                     result = self.duckdb_conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()
                     row_count = result[0] if result else 0
 
@@ -330,10 +356,7 @@ class DuckDBQueryAccelerator:
         try:
             for table_name in self.tables_to_preload:
                 # Query DuckDB's information schema to check if table exists
-                result = self.duckdb_conn.execute(
-                    "SELECT 1 FROM information_schema.tables WHERE table_name = ?",
-                    (table_name,)
-                ).fetchone()
+                result = self.duckdb_conn.execute("SELECT 1 FROM information_schema.tables WHERE table_name = ?", (table_name,)).fetchone()
                 if result is None:
                     logger.debug(f"Table {table_name} not found in DuckDB")
                     return False
@@ -449,11 +472,13 @@ class DuckDBQueryAccelerator:
             worker_thread.join(timeout=1.0)
 
             # Raise timeout error to trigger fallback
-            raise concurrent.futures.TimeoutError(f"Query timed out after {self.query_timeout} seconds")
+            timeout_msg = f"Query timed out after {self.query_timeout} seconds"
+            raise concurrent.futures.TimeoutError(timeout_msg)
 
         # Check if worker thread completed successfully
         if not result_container["completed"]:
-            raise Exception("Query execution failed - worker thread did not complete")
+            error_msg = "Query execution failed - worker thread did not complete"
+            raise Exception(error_msg)
 
         # Check for exceptions in worker thread
         if result_container["exception"]:
@@ -519,7 +544,7 @@ class DuckDBQueryAccelerator:
             stats["avg_fallback_time"] = 0.0
 
         # Add last_query_time (always include, default to 0.0)
-        stats["last_query_time"] = getattr(self, '_last_query_time', 0.0)
+        stats["last_query_time"] = getattr(self, "_last_query_time", 0.0)
 
         stats["initialized"] = self._initialized
         stats["preload_completed"] = self._preload_completed
@@ -588,10 +613,7 @@ class DuckDBQueryAccelerator:
 
 
 def create_query_accelerator(
-    postgresql_connection_params: dict[str, Any],
-    preload_tables: list[str] | None = None,
-    query_timeout: float = 0,
-    **kwargs
+    postgresql_connection_params: dict[str, Any], preload_tables: list[str] | None = None, query_timeout: float = 0, **kwargs
 ) -> DuckDBQueryAccelerator | None:
     """
     Factory function to create and initialize a DuckDB query accelerator.
@@ -607,10 +629,7 @@ def create_query_accelerator(
     """
     try:
         accelerator = DuckDBQueryAccelerator(
-            postgresql_connection_params=postgresql_connection_params,
-            preload_tables=preload_tables,
-            query_timeout=query_timeout,
-            **kwargs
+            postgresql_connection_params=postgresql_connection_params, preload_tables=preload_tables, query_timeout=query_timeout, **kwargs
         )
 
         if accelerator.initialize():
