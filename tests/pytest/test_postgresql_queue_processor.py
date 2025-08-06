@@ -228,16 +228,18 @@ class TestProcessorStatus:
             ("recent_failures",),
         ]
 
-        status = get_processor_status(mock_conn, "partitioncache_queue")
+        # Patch get_pg_cron_connection to return our mock connection
+        with patch("partitioncache.cli.postgresql_queue_processor.get_pg_cron_connection", return_value=mock_conn):
+            status = get_processor_status("partitioncache_queue")
 
-        assert status is not None
-        assert status["enabled"] is True
-        assert status["max_parallel_jobs"] == 5
-        assert status["frequency_seconds"] == 1
-        assert status["active_jobs"] == 2
-        assert status["queue_length"] == 10
-        assert status["recent_successes"] == 50
-        assert status["recent_failures"] == 3
+            assert status is not None
+            assert status["enabled"] is True
+            assert status["max_parallel_jobs"] == 5
+            assert status["frequency_seconds"] == 1
+            assert status["active_jobs"] == 2
+            assert status["queue_length"] == 10
+            assert status["recent_successes"] == 50
+            assert status["recent_failures"] == 3
 
     def test_get_processor_status_not_initialized(self):
         """Test status when processor not initialized."""
@@ -247,8 +249,10 @@ class TestProcessorStatus:
         mock_conn.cursor.return_value.__exit__ = Mock(return_value=None)
         mock_cursor.fetchone.return_value = None
 
-        status = get_processor_status(mock_conn, "partitioncache_queue")
-        assert status is None
+        # Patch get_pg_cron_connection to return our mock connection
+        with patch("partitioncache.cli.postgresql_queue_processor.get_pg_cron_connection", return_value=mock_conn):
+            status = get_processor_status("partitioncache_queue")
+            assert status is None
 
 
 class TestSQLFile:
@@ -354,7 +358,7 @@ class TestCLIIntegration:
     """Test CLI integration points."""
 
     @patch("partitioncache.cli.postgresql_queue_processor.get_queue_table_prefix_from_env")
-    @patch("partitioncache.cli.postgresql_queue_processor.get_db_connection")
+    @patch("partitioncache.cli.postgresql_queue_processor.get_pg_cron_connection")
     @patch("partitioncache.cli.postgresql_queue_processor.validate_environment")
     @patch("partitioncache.cli.postgresql_queue_processor.load_environment_with_validation")
     def test_main_status_command(self, mock_load_env, mock_validate, mock_get_conn, mock_get_queue_prefix):
@@ -428,7 +432,8 @@ class TestProcessorEnableDisable:
         mock_conn.commit = Mock()
 
         # Call the function
-        enable_processor(mock_conn, "test_queue_prefix")
+        with patch("partitioncache.cli.postgresql_queue_processor.get_pg_cron_connection", return_value=mock_conn):
+            enable_processor("test_queue_prefix")
 
         # Verify the correct function was called
         mock_cursor.execute.assert_called_once_with(
@@ -451,7 +456,8 @@ class TestProcessorEnableDisable:
         mock_conn.commit = Mock()
 
         # Call the function
-        disable_processor(mock_conn, "test_queue_prefix")
+        with patch("partitioncache.cli.postgresql_queue_processor.get_pg_cron_connection", return_value=mock_conn):
+            disable_processor("test_queue_prefix")
 
         # Verify the correct function was called
         mock_cursor.execute.assert_called_once_with(
@@ -476,8 +482,9 @@ class TestProcessorEnableDisable:
         mock_cursor.execute.side_effect = Exception("Function does not exist")
 
         # Call should raise the exception
-        with pytest.raises(Exception, match="Function does not exist"):
-            enable_processor(mock_conn, "test_queue_prefix")
+        with patch("partitioncache.cli.postgresql_queue_processor.get_pg_cron_connection", return_value=mock_conn):
+            with pytest.raises(Exception, match="Function does not exist"):
+                enable_processor("test_queue_prefix")
 
     @patch("partitioncache.cli.postgresql_queue_processor.get_db_connection")
     def test_disable_processor_database_error(self, mock_get_conn):
@@ -495,5 +502,6 @@ class TestProcessorEnableDisable:
         mock_cursor.execute.side_effect = Exception("Function does not exist")
 
         # Call should raise the exception
-        with pytest.raises(Exception, match="Function does not exist"):
-            disable_processor(mock_conn, "test_queue_prefix")
+        with patch("partitioncache.cli.postgresql_queue_processor.get_pg_cron_connection", return_value=mock_conn):
+            with pytest.raises(Exception, match="Function does not exist"):
+                disable_processor("test_queue_prefix")

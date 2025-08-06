@@ -61,7 +61,7 @@ class TestDuckDBBitCacheHandler:
         with patch("duckdb.connect", return_value=mock_duckdb_conn):
             from partitioncache.cache_handler.duckdb_bit import DuckDBBitCacheHandler
 
-            handler = DuckDBBitCacheHandler(database=":memory:", table_prefix="cache", bitsize=1000)
+            DuckDBBitCacheHandler(database=":memory:", table_prefix="cache", bitsize=1000)
 
             # Should create metadata and queries tables
             calls = mock_duckdb_conn.execute.call_args_list

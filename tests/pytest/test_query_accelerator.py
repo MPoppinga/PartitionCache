@@ -144,9 +144,23 @@ class TestDuckDBQueryAccelerator:
         # Mock DuckDB connection and results
         mock_duckdb_conn = Mock()
         mock_duckdb.connect.return_value = mock_duckdb_conn
-        mock_duckdb_conn.execute.return_value.fetchall.return_value = [(1,), (2,), (3,)]
+        # Fix: Set up both direct execute and cursor().execute paths
+        mock_result = Mock()
+        mock_result.fetchall.return_value = [(1,), (2,), (3,)]
+        # Direct execute path
+        mock_duckdb_conn.execute.return_value = mock_result
+        # Cursor execute path
+        mock_cursor = Mock()
+        mock_cursor.execute.return_value = mock_result
+        mock_cursor.close.return_value = None
+        mock_duckdb_conn.cursor.return_value = mock_cursor
 
-        mock_psycopg.connect.return_value = Mock()
+        # Mock PostgreSQL connection with context manager support for cursor
+        mock_pg_conn = Mock()
+        mock_pg_cursor = Mock()
+        mock_pg_conn.cursor.return_value.__enter__ = Mock(return_value=mock_pg_cursor)
+        mock_pg_conn.cursor.return_value.__exit__ = Mock(return_value=None)
+        mock_psycopg.connect.return_value = mock_pg_conn
 
         postgresql_params = {"host": "localhost", "port": 5432, "user": "test", "password": "test", "dbname": "test"}
 
@@ -367,7 +381,6 @@ class TestDuckDBQueryAccelerator:
     @patch("partitioncache.query_accelerator.psycopg")
     def test_query_timeout_fallback(self, mock_psycopg, mock_duckdb, mock_thread_class):
         """Test query timeout triggers fallback to PostgreSQL."""
-        import concurrent.futures
         from partitioncache.query_accelerator import DuckDBQueryAccelerator
 
         # Mock DuckDB connection

@@ -34,6 +34,13 @@ def mock_cursor():
 
 @pytest.fixture
 def cache_handler(mock_db, mock_cursor):
+    # Set up mock cursor to return None for metadata table check
+    mock_cursor.fetchone.return_value = None
+    mock_cursor.fetchall.return_value = []
+    mock_db.cursor.return_value = mock_cursor
+    mock_db.commit.return_value = None
+    mock_db.rollback.return_value = None
+
     with patch("psycopg.connect", return_value=mock_db):
         handler = PostgreSQLBitCacheHandler(
             db_name="test_db",
@@ -44,8 +51,9 @@ def cache_handler(mock_db, mock_cursor):
             db_tableprefix="test_bit_cache_table",
             bitsize=100,
         )
-        handler.cursor.return_value = mock_cursor  # type: ignore
-        handler.db.return_value = mock_db  # type: ignore
+        # Replace the cursor with our mock
+        handler.cursor = mock_cursor
+        handler.db = mock_db
         return handler
 
 

@@ -100,9 +100,14 @@ class TestBitsizeExpansionFix:
         partition_key_identifiers = {1283828}  # The problematic value
         partition_key = "pocket_key"
 
-        # Mock the sequence of calls that would happen
+        # Verify the calculation logic that caused the original bug
         max_value = max(partition_key_identifiers)
         required_bitsize = max_value + 1  # 1283829
+
+        # The bug was that existing bitsize of 1283828 was considered sufficient for max_value 1283828
+        # But validation would fail because max_value >= actual_bitsize (1283828 >= 1283828)
+        assert max_value == 1283828
+        assert required_bitsize == 1283829
 
         # Mock existing partition with insufficient bitsize initially
         cache_handler._get_partition_bitsize = Mock(side_effect=[1283828, 1283828, 1283829])
