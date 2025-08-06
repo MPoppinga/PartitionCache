@@ -207,8 +207,25 @@ class DuckDBQueryAccelerator:
             # Build connection string for DuckDB PostgreSQL extension
             pg_conn_str = self._build_duckdb_postgres_connection_string()
 
-            # Attach PostgreSQL database to DuckDB
-            self.duckdb_conn.execute(f"ATTACH '{pg_conn_str}' AS postgres_db (TYPE POSTGRES)")
+            # Check if postgres_db is already attached (for persistent databases)
+            try:
+                # Try to query if the database exists
+                result = self.duckdb_conn.execute("SELECT 1 FROM duckdb_databases() WHERE database_name = 'postgres_db'").fetchone()
+                if result is None:
+                    # Not attached, attach it now
+                    self.duckdb_conn.execute(f"ATTACH '{pg_conn_str}' AS postgres_db (TYPE POSTGRES)")
+                else:
+                    logger.debug("PostgreSQL database already attached as postgres_db")
+            except Exception:
+                # If the check fails, try to attach (for older DuckDB versions)
+                try:
+                    self.duckdb_conn.execute(f"ATTACH '{pg_conn_str}' AS postgres_db (TYPE POSTGRES)")
+                except Exception as attach_error:
+                    # If attach fails with "already exists", that's OK
+                    if "already exists" in str(attach_error):
+                        logger.debug("PostgreSQL database already attached as postgres_db")
+                    else:
+                        raise
 
             tables_loaded = 0
 
@@ -221,12 +238,30 @@ class DuckDBQueryAccelerator:
                         logger.warning(f"Table {table_name} does not exist in PostgreSQL, skipping")
                         continue
 
+                    # Drop existing table if force reload is enabled or in memory mode
+                    if self.force_reload_tables or self.duckdb_database_path == ":memory:":
+                        try:
+                            self.duckdb_conn.execute(f"DROP TABLE IF EXISTS {table_name}")
+                            logger.debug(f"Dropped existing table {table_name} for reload")
+                        except Exception:
+                            pass  # Table might not exist
+
                     # Create table in DuckDB by copying from PostgreSQL
-                    # Use the attached PostgreSQL database
-                    self.duckdb_conn.execute(f"""
-                        CREATE TABLE {table_name} AS
-                        SELECT * FROM postgres_db.{table_name}
-                    """)
+                    # Use CREATE OR REPLACE for better handling
+                    try:
+                        self.duckdb_conn.execute(f"""
+                            CREATE OR REPLACE TABLE {table_name} AS
+                            SELECT * FROM postgres_db.{table_name}
+                        """)
+                    except Exception as create_error:
+                        # If CREATE OR REPLACE is not supported, try regular CREATE
+                        if "CREATE OR REPLACE" in str(create_error):
+                            self.duckdb_conn.execute(f"""
+                                CREATE TABLE {table_name} AS
+                                SELECT * FROM postgres_db.{table_name}
+                            """)
+                        else:
+                            raise
 
                     # Get row count for logging
                     result = self.duckdb_conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()

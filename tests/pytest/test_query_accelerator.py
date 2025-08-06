@@ -122,17 +122,38 @@ class TestDuckDBQueryAccelerator:
         accelerator._table_exists_in_postgresql = Mock(return_value=True)
         accelerator._tables_exist_in_duckdb = Mock(return_value=False)  # Force reload from PostgreSQL
 
+        # Set up mock for the database check and table creation
+        # The execute method needs to return different results for different queries
+        execute_results = []
+        def mock_execute(query, *args, **kwargs):
+            result = Mock()
+            if "duckdb_databases()" in query:
+                # Database check query - return None to indicate not attached
+                result.fetchone.return_value = None
+            elif "CREATE" in query and "TABLE" in query:
+                # Table creation succeeds
+                result.fetchone.return_value = None
+            elif "SELECT COUNT" in query:
+                # Count query returns a row count
+                result.fetchone.return_value = (100,)
+            else:
+                # Default for other queries
+                result.fetchone.return_value = None
+            execute_results.append(query)
+            return result
+        
+        mock_duckdb_conn.execute.side_effect = mock_execute
+
         # Test table preloading
         result = accelerator.preload_tables()
         assert result is True
         assert accelerator._preload_completed is True
 
         # Verify PostgreSQL extension was installed and table was created
-        execute_calls = mock_duckdb_conn.execute.call_args_list
-        install_calls = [call for call in execute_calls if "INSTALL" in str(call)]
+        install_calls = [query for query in execute_results if "INSTALL" in query]
         assert len(install_calls) >= 1  # Should install postgres extension
 
-        create_calls = [call for call in execute_calls if "CREATE TABLE" in str(call)]
+        create_calls = [query for query in execute_results if "CREATE" in query and "TABLE" in query]
         assert len(create_calls) >= 1  # Should create table from PostgreSQL
 
     @patch("partitioncache.query_accelerator.duckdb")

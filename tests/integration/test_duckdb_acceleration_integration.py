@@ -136,7 +136,8 @@ class TestDuckDBAccelerationIntegration:
         accelerator = create_query_accelerator(
             postgresql_connection_params=postgresql_params,
             preload_tables=[],
-            duckdb_memory_limit="512MB"
+            duckdb_memory_limit="512MB",
+            duckdb_database_path=":memory:"
         )
 
         assert accelerator is not None
@@ -149,7 +150,8 @@ class TestDuckDBAccelerationIntegration:
         accelerator = create_query_accelerator(
             postgresql_connection_params=postgresql_params,
             preload_tables=[test_table_setup],
-            duckdb_memory_limit="1GB"
+            duckdb_memory_limit="1GB",
+            duckdb_database_path=":memory:"
         )
 
         assert accelerator is not None
@@ -175,7 +177,8 @@ class TestDuckDBAccelerationIntegration:
         """Test basic query acceleration functionality."""
         accelerator = create_query_accelerator(
             postgresql_connection_params=postgresql_params,
-            preload_tables=[test_table_setup]
+            preload_tables=[test_table_setup],
+            duckdb_database_path=":memory:"
         )
 
         # Preload tables
@@ -201,7 +204,8 @@ class TestDuckDBAccelerationIntegration:
         """Test fallback to PostgreSQL when DuckDB queries fail."""
         accelerator = create_query_accelerator(
             postgresql_connection_params=postgresql_params,
-            preload_tables=[]
+            preload_tables=[],
+            duckdb_database_path=":memory:"
         )
 
         # Query using PostgreSQL-specific function that doesn't exist in DuckDB
@@ -226,7 +230,8 @@ class TestDuckDBAccelerationIntegration:
         # Create accelerator with preloaded table
         accelerator = create_query_accelerator(
             postgresql_connection_params=postgresql_params,
-            preload_tables=[test_table_setup]
+            preload_tables=[test_table_setup],
+            duckdb_database_path=":memory:"
         )
         accelerator.preload_tables()
 
@@ -286,7 +291,8 @@ class TestDuckDBAccelerationIntegration:
         # Test with invalid table preloading
         valid_accelerator = create_query_accelerator(
             postgresql_connection_params=postgresql_params,
-            preload_tables=["nonexistent_table"]
+            preload_tables=["nonexistent_table"],
+            duckdb_database_path=":memory:"
         )
 
         # Should still initialize but preloading should handle missing table
@@ -322,7 +328,8 @@ class TestDuckDBAccelerationIntegration:
         accelerator = create_query_accelerator(
             postgresql_connection_params=postgresql_params,
             preload_tables=[test_table_setup],
-            enable_statistics=True
+            enable_statistics=True,
+            duckdb_database_path=":memory:"  # Use in-memory for test isolation
         )
 
         accelerator.preload_tables()
@@ -368,7 +375,8 @@ class TestDuckDBAccelerationIntegration:
             accelerator = create_query_accelerator(
                 postgresql_connection_params=postgresql_params,
                 duckdb_memory_limit=memory_limit,
-                preload_tables=[]
+                preload_tables=[],
+                duckdb_database_path=":memory:"
             )
 
             assert accelerator.duckdb_memory_limit == memory_limit
@@ -384,7 +392,8 @@ class TestDuckDBAccelerationIntegration:
         # Simulate the monitor workflow integration
         accelerator = create_query_accelerator(
             postgresql_connection_params=postgresql_params,
-            preload_tables=[test_table_setup]
+            preload_tables=[test_table_setup],
+            duckdb_database_path=":memory:"
         )
 
         accelerator.preload_tables()
@@ -415,7 +424,8 @@ class TestDuckDBAccelerationIntegration:
 
         accelerator = create_query_accelerator(
             postgresql_connection_params=postgresql_params,
-            preload_tables=[test_table_setup]
+            preload_tables=[test_table_setup],
+            duckdb_database_path=":memory:"
         )
 
         accelerator.preload_tables()
@@ -458,7 +468,8 @@ class TestDuckDBAccelerationIntegration:
         """Test handling of large result sets."""
         accelerator = create_query_accelerator(
             postgresql_connection_params=postgresql_params,
-            preload_tables=[test_table_setup]
+            preload_tables=[test_table_setup],
+            duckdb_database_path=":memory:"
         )
 
         accelerator.preload_tables()
@@ -481,7 +492,8 @@ class TestDuckDBAccelerationIntegration:
         """Test complex SQL queries with multiple conditions."""
         accelerator = create_query_accelerator(
             postgresql_connection_params=postgresql_params,
-            preload_tables=[test_table_setup]
+            preload_tables=[test_table_setup],
+            duckdb_database_path=":memory:"
         )
 
         accelerator.preload_tables()
@@ -515,7 +527,8 @@ class TestDuckDBAccelerationIntegration:
             accelerator = create_query_accelerator(
                 postgresql_connection_params=postgresql_params,
                 duckdb_threads=thread_count,
-                preload_tables=[]
+                preload_tables=[],
+                duckdb_database_path=":memory:"
             )
 
             assert accelerator.duckdb_threads == thread_count
@@ -592,7 +605,8 @@ class TestDuckDBAccelerationPerformance:
         accelerator = create_query_accelerator(
             postgresql_connection_params=postgresql_params,
             preload_tables=[large_dataset_setup],
-            duckdb_memory_limit="2GB"
+            duckdb_memory_limit="2GB",
+            duckdb_database_path=":memory:"
         )
 
         accelerator.preload_tables()
@@ -634,7 +648,8 @@ class TestDuckDBAccelerationPerformance:
         """Test performance on aggregation queries."""
         accelerator = create_query_accelerator(
             postgresql_connection_params=postgresql_params,
-            preload_tables=[large_dataset_setup]
+            preload_tables=[large_dataset_setup],
+            duckdb_database_path=":memory:"
         )
 
         accelerator.preload_tables()
@@ -672,7 +687,8 @@ class TestDuckDBAccelerationMonitorIntegration:
 
         accelerator = create_query_accelerator(
             postgresql_connection_params=postgresql_params,
-            preload_tables=[]
+            preload_tables=[],
+            duckdb_database_path=":memory:"
         )
 
         # Simulate monitor query execution
@@ -722,7 +738,8 @@ class TestDuckDBAccelerationMonitorIntegration:
         # Test acceleration with this data
         accelerator = create_query_accelerator(
             postgresql_connection_params=postgresql_params,
-            preload_tables=["monitor_test_data"]
+            preload_tables=["monitor_test_data"],
+            duckdb_database_path=":memory:"  # Use in-memory for test isolation
         )
 
         accelerator.preload_tables()
@@ -759,7 +776,8 @@ class TestDuckDBAccelerationMonitorIntegration:
         """Test error recovery scenarios in monitor context."""
         accelerator = create_query_accelerator(
             postgresql_connection_params=postgresql_params,
-            preload_tables=["nonexistent_table"]  # This will cause preload warnings
+            preload_tables=["nonexistent_table"],  # This will cause preload warnings
+            duckdb_database_path=":memory:"
         )
 
         # Even with preload warnings, accelerator should work
