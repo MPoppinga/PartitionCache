@@ -45,6 +45,7 @@ def get_queue_handler(provider: str | None = None) -> AbstractQueueHandler:
             user=str(os.getenv("PG_QUEUE_USER")),
             password=str(os.getenv("PG_QUEUE_PASSWORD")),
             dbname=str(os.getenv("PG_QUEUE_DB")),
+            table_prefix=str(os.getenv("PG_QUEUE_TABLE_PREFIX", "partitioncache_queue")),
         )
 
     elif provider == "redis":

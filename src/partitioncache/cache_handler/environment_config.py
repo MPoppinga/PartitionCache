@@ -176,6 +176,39 @@ class EnvironmentConfigManager:
         return config
 
     @staticmethod
+    def get_duckdb_bit_config() -> dict[str, Any]:
+        """
+        Get DuckDB bit cache handler configuration.
+
+        Returns:
+            Dictionary with configuration parameters
+
+        Environment Variables:
+            DUCKDB_BIT_PATH: Path to DuckDB database file (default: ":memory:")
+            DUCKDB_BIT_TABLE_PREFIX: Table prefix for cache tables (default: "partitioncache")
+            DUCKDB_BIT_BITSIZE: Default bitsize for DuckDB BITSTRING (default: "100000")
+
+        Note:
+            This handler uses DuckDB's native BITSTRING data type with native
+            bitwise operations and BIT_AND aggregates for optimal performance.
+        """
+        config = {}
+
+        # Database path (optional, defaults to in-memory)
+        db_path = os.getenv("DUCKDB_BIT_PATH", ":memory:")
+        config["database"] = db_path
+
+        # Table prefix (optional)
+        table_prefix = os.getenv("DUCKDB_BIT_TABLE_PREFIX", "partitioncache")
+        config["table_prefix"] = table_prefix
+
+        # Bitsize (optional)
+        bitsize = os.getenv("DUCKDB_BIT_BITSIZE", "100000")
+        config["bitsize"] = int(bitsize)
+
+        return config
+
+    @staticmethod
     def get_rocksdb_config(cache_type: str) -> dict[str, Any]:
         """
         Get RocksDB configuration from environment variables.
@@ -253,6 +286,8 @@ class EnvironmentConfigManager:
                 EnvironmentConfigManager.get_rocksdb_config("bit")
             elif cache_type == "rocksdict":
                 EnvironmentConfigManager.get_rocksdb_config("dict")
+            elif cache_type == "duckdb_bit":
+                EnvironmentConfigManager.get_duckdb_bit_config()
             else:
                 raise ValueError(f"Unsupported cache type: {cache_type}")
 

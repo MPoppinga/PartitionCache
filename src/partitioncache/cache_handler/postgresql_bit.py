@@ -1,8 +1,10 @@
+import time
 from datetime import datetime
 from logging import getLogger
 
 from bitarray import bitarray
 from psycopg import sql
+from psycopg.errors import IntegrityError
 
 from partitioncache.cache_handler.postgresql_abstract import PostgreSQLAbstractCacheHandler
 
@@ -13,13 +15,18 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
     def __repr__(self) -> str:
         return "postgresql_bit"
 
-    def __init__(self, db_name: str, db_host: str, db_user: str, db_password: str, db_port: str | int, db_tableprefix: str, bitsize: int) -> None:
+    def __init__(
+        self, db_name: str, db_host: str, db_user: str, db_password: str, db_port: str | int, db_tableprefix: str, bitsize: int, timeout: str = "0"
+    ) -> None:
         """
         Initialize the cache handler with the given db name.
         This handler supports multiple partition keys but only integer datatypes (for bit arrays).
+
+        Args:
+            timeout: Statement timeout in seconds (default: "0" for no timeout)
         """
         self.default_bitsize = bitsize
-        super().__init__(db_name, db_host, db_user, db_password, db_port, db_tableprefix)
+        super().__init__(db_name, db_host, db_user, db_password, db_port, db_tableprefix, timeout)
 
     def _recreate_metadata_table(self, supported_datatypes: set[str]) -> None:
         """
@@ -27,6 +34,18 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
         Extends the base metadata table functionality.
         """
         try:
+            # Check if the metadata table already exists
+            self.cursor.execute(sql.SQL("SELECT to_regclass('{0}')").format(sql.Identifier(self.tableprefix + "_partition_metadata")))
+            result = self.cursor.fetchone()
+            # Handle both real database results and mock objects
+            try:
+                if result and result[0]:
+                    return
+            except (TypeError, AttributeError):
+                # If result is a Mock or doesn't support subscripting, continue with table creation
+                pass
+
+            logger.warning(f"! Setting up {self.tableprefix} cache handler: Loading SQL functions")
             # Load SQL functions first
             self._load_sql_functions()
 
@@ -39,6 +58,7 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
                     created_at TIMESTAMP DEFAULT now()
                 );""").format(sql.Identifier(self.tableprefix + "_partition_metadata"))
             )
+            logger.info("BIT METADATA: Bit metadata table created successfully")
 
             # Create queries table (same as base implementation)
             self.cursor.execute(
@@ -51,9 +71,11 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
                     PRIMARY KEY (query_hash, partition_key)
                 );""").format(sql.Identifier(self.tableprefix + "_queries"))
             )
+            logger.info("BIT METADATA: Queries table created successfully")
 
             # Create trigger function for handling bitsize changes (now that SQL functions are loaded)
             self._create_bitsize_trigger()
+            logger.info("BIT METADATA: Bitsize trigger created successfully")
 
             self.db.commit()
         except Exception as e:
@@ -94,18 +116,22 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
 
             # Read and execute the SQL file
             sql_cache_content = sql_cache_file.read_text()
+            logger.info(f"LOADING SQL: Executing SQL functions file ({len(sql_cache_content)} chars)")
             self.cursor.execute(sql_cache_content)  # type: ignore[arg-type]
-            logger.debug("Successfully loaded SQL functions from cache handlers file")
+            logger.info("LOADING SQL: SQL functions executed successfully")
         except Exception as e:
-            logger.debug(f"Failed to load SQL functions (this is OK if they're already loaded): {e}")
+            logger.warning(f"Failed to load SQL functions (this is OK if they're already loaded): {e}")
 
     def _create_bitsize_trigger(self) -> None:
         """Create trigger function and trigger for handling bitsize changes."""
         try:
+            logger.info(f"TRIGGER: Calling partitioncache_create_bitsize_trigger for {self.tableprefix}")
             # Call the SQL function to create the trigger
             self.cursor.execute(sql.SQL("SELECT partitioncache_create_bitsize_trigger(%s)"), (self.tableprefix,))
+            # TODO Need additional testing
+            logger.info(f"TRIGGER: Bitsize trigger created successfully for {self.tableprefix}")
         except Exception as e:
-            logger.error(f"Failed to create bitsize trigger: {e}")
+            logger.error(f"TRIGGER: Failed to create bitsize trigger for {self.tableprefix}: {e}")
             raise
 
     def _create_partition_table(self, partition_key: str, bitsize: int) -> None:
@@ -144,10 +170,43 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
         """
         bitsize = kwargs.get("bitsize", self.default_bitsize)
         try:
+            # Check if partition already exists with sufficient bitsize
+            existing_bitsize = self._get_partition_bitsize(partition_key)
+            if existing_bitsize is not None and existing_bitsize >= bitsize:
+                return True, existing_bitsize
+
             # Use advisory lock to prevent race conditions in schema creation
             # Generate consistent lock ID from partition key
             lock_id = hash(f"{self.tableprefix}_{partition_key}") % (2**31 - 1)
-            self.cursor.execute("SELECT pg_advisory_xact_lock(%s)", (lock_id,))
+            logger.info(f"ACQUIRING ADVISORY LOCK: {lock_id} for partition {partition_key}")
+
+            # Try to acquire lock with timeout
+            self.cursor.execute("SELECT pg_try_advisory_xact_lock(%s)", (lock_id,))
+            result = self.cursor.fetchone()
+            lock_acquired = result[0] if result else False
+
+            if not lock_acquired:
+                # Another thread is creating this partition, wait and check if it's done
+                logger.info(f"Skipping partition creation: Another thread is creating {partition_key}")
+
+                for _ in range(10):  # Wait up to 10 seconds
+                    time.sleep(1)
+                    existing_bitsize = self._get_partition_bitsize(partition_key)
+                    if existing_bitsize is not None and existing_bitsize >= bitsize:
+                        logger.info(f"PARTITION CREATED BY OTHER THREAD: {partition_key} with bitsize {existing_bitsize}")
+                        return True, existing_bitsize
+                    elif existing_bitsize is not None:
+                        logger.info(f"PARTITION CREATED BY OTHER THREAD BUT INSUFFICIENT: {partition_key} bitsize {existing_bitsize} < required {bitsize}")
+                        break  # Exit loop and try to acquire lock to expand
+
+                # If still not created, try to acquire lock blocking
+                logger.info(f"FALLBACK TO BLOCKING LOCK: {lock_id} for partition {partition_key}")
+                self.cursor.execute("SELECT pg_advisory_xact_lock(%s)", (lock_id,))
+
+            # Double-check if partition was created while waiting for lock
+            existing_bitsize = self._get_partition_bitsize(partition_key)
+            if existing_bitsize is not None and existing_bitsize >= bitsize:
+                return True, existing_bitsize
 
             # Load SQL functions first to ensure they're available
             self._load_sql_functions()
@@ -170,6 +229,7 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
             if actual_bitsize is None:
                 raise ValueError(f"No bitsize found for partition {partition_key} after bootstrap")
 
+            logger.info(f"PARTITION BOOTSTRAP COMPLETED: {partition_key} with bitsize {actual_bitsize}")
             self.db.commit()
             return True, actual_bitsize
         except Exception as e:
@@ -371,6 +431,104 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
         )
 
         return r, len(filtered_keys)
+
+    def set_cache_lazy(self, key: str, query: str, partition_key: str = "partition_key") -> bool:
+        """
+        Store partition key identifiers in cache by executing the provided query directly.
+
+        Args:
+            key: Cache key (query hash)
+            query: SQL query that returns partition key values to cache
+            partition_key: Partition key namespace
+
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            # Security check
+            if "DELETE " in query.upper() or "DROP " in query.upper():
+                logger.error("Query contains DELETE or DROP")
+                return False
+
+            # Get partition bitsize - assumes integer datatype
+            datatype = self._get_partition_datatype(partition_key)
+            if datatype is None or datatype != "integer":
+                logger.error(f"Partition key '{partition_key}' not registered with integer datatype")
+                return False
+
+            bitsize = self._get_partition_bitsize(partition_key)
+            if bitsize is None:
+                logger.error(f"No bitsize found for partition key '{partition_key}'")
+                return False
+
+            table_name = f"{self.tableprefix}_cache_{partition_key}"
+
+            # Build lazy insertion query that creates a bit array from query results
+            lazy_insert_query = sql.SQL(
+                """
+                WITH query_result AS (
+                    {query}
+                ),
+                bit_positions AS (
+                    SELECT {partition_col}::INTEGER AS position
+                    FROM query_result
+                    WHERE {partition_col}::INTEGER >= 0 AND {partition_col}::INTEGER < {bitsize}
+                ),
+                bit_array AS (
+                    SELECT generate_series(0, {bitsize} - 1) AS bit_index
+                ),
+                bit_string AS (
+                    SELECT string_agg(
+                        CASE WHEN bit_array.bit_index IN (SELECT position FROM bit_positions)
+                             THEN '1'
+                             ELSE '0'
+                        END,
+                        ''
+                        ORDER BY bit_array.bit_index
+                    ) AS bit_value
+                    FROM bit_array
+                )
+                INSERT INTO {table_name} (query_hash, partition_keys)
+                SELECT {key}, bit_value::BIT({bitsize})
+                FROM bit_string
+                ON CONFLICT (query_hash) DO UPDATE SET
+                    partition_keys = EXCLUDED.partition_keys
+                """
+            ).format(
+                query=sql.SQL(query),  # type: ignore[arg-type]
+                partition_col=sql.Identifier(partition_key),
+                bitsize=sql.Literal(bitsize),
+                table_name=sql.Identifier(table_name),
+                key=sql.Literal(key)
+            )
+
+            self.cursor.execute(lazy_insert_query)
+
+            # Also store in queries table for existence checks
+            try:
+                self.cursor.execute(
+                    sql.SQL("INSERT INTO {table} (query_hash, partition_key, query) VALUES (%s, %s, %s)").format(
+                        table=sql.Identifier(self.tableprefix + "_queries")
+                    ),
+                    (key, partition_key, "")
+                )
+            except IntegrityError:
+                # Update if insert fails
+                self.cursor.execute(
+                    sql.SQL("UPDATE {table} SET last_seen = now() WHERE query_hash = %s AND partition_key = %s").format(
+                        table=sql.Identifier(self.tableprefix + "_queries")
+                    ),
+                    (key, partition_key)
+                )
+
+            self.db.commit()
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to set cache lazily for key {key}: {e}")
+            if not self.db.closed:
+                self.db.rollback()
+            return False
 
     @classmethod
     def get_supported_datatypes(cls) -> set[str]:

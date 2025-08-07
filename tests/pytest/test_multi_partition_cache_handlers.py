@@ -82,6 +82,11 @@ class TestMultiPartitionFunctionality:
             mock_cursor = Mock()
             mock_connect.return_value = mock_db
             mock_db.cursor.return_value = mock_cursor
+            mock_db.commit.return_value = None
+            mock_db.rollback.return_value = None
+            # Configure mock for metadata table check - returns None initially
+            mock_cursor.fetchone.return_value = None
+            mock_cursor.fetchall.return_value = []
 
             handler = PostgreSQLBitCacheHandler(
                 db_name="test", db_host="localhost", db_user="user",
@@ -90,7 +95,7 @@ class TestMultiPartitionFunctionality:
             handler.cursor = mock_cursor
             handler.db = mock_db
 
-            # Test bitsize management
+            # Test bitsize management - now set the return value for actual test
             mock_cursor.fetchone.return_value = (1000,)  # Mock existing bitsize
             assert handler._get_partition_bitsize("partition1") == 1000
             handler._set_partition_bitsize("partition1", 2000)

@@ -3,6 +3,7 @@ from logging import getLogger
 
 from bitarray import bitarray
 from psycopg import sql
+from psycopg.errors import IntegrityError
 from pyroaring import BitMap
 
 from partitioncache.cache_handler.postgresql_abstract import PostgreSQLAbstractCacheHandler
@@ -350,6 +351,76 @@ class PostgreSQLRoaringBitCacheHandler(PostgreSQLAbstractCacheHandler):
         )
 
         return r, len(filtered_keys)
+
+    def set_cache_lazy(self, key: str, query: str, partition_key: str = "partition_key") -> bool:
+        """
+        Store partition key identifiers in cache by executing the provided query directly.
+
+        Args:
+            key: Cache key (query hash)
+            query: SQL query that returns partition key values to cache
+            partition_key: Partition key namespace
+
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            # Security check
+            if "DELETE " in query.upper() or "DROP " in query.upper():
+                logger.error("Query contains DELETE or DROP")
+                return False
+
+            # Get partition datatype - must be integer for roaring bitmaps
+            datatype = self._get_partition_datatype(partition_key)
+            if datatype is None or datatype != "integer":
+                logger.error(f"Partition key '{partition_key}' not registered with integer datatype")
+                return False
+
+            table_name = f"{self.tableprefix}_cache_{partition_key}"
+
+            # Build lazy insertion query using roaring bitmap aggregation
+            lazy_insert_query = sql.SQL(
+                """
+                INSERT INTO {table_name} (query_hash, partition_keys)
+                SELECT {key}, rb_build_agg({partition_col}::INTEGER)
+                FROM ({query}) AS query_result
+                ON CONFLICT (query_hash) DO UPDATE SET
+                    partition_keys = EXCLUDED.partition_keys
+                """
+            ).format(
+                table_name=sql.Identifier(table_name),
+                key=sql.Literal(key),
+                partition_col=sql.Identifier(partition_key),
+                query=sql.SQL(query)
+            )
+
+            self.cursor.execute(lazy_insert_query)
+
+            # Also store in queries table for existence checks
+            try:
+                self.cursor.execute(
+                    sql.SQL("INSERT INTO {table} (query_hash, partition_key, query) VALUES (%s, %s, %s)").format(
+                        table=sql.Identifier(self.tableprefix + "_queries")
+                    ),
+                    (key, partition_key, "")
+                )
+            except IntegrityError:
+                # Update if insert fails
+                self.cursor.execute(
+                    sql.SQL("UPDATE {table} SET last_seen = now() WHERE query_hash = %s AND partition_key = %s").format(
+                        table=sql.Identifier(self.tableprefix + "_queries")
+                    ),
+                    (key, partition_key)
+                )
+
+            self.db.commit()
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to set cache lazily for key {key}: {e}")
+            if not self.db.closed:
+                self.db.rollback()
+            return False
 
     @classmethod
     def get_supported_datatypes(cls) -> set[str]:

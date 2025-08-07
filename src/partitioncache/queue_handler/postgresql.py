@@ -2,13 +2,12 @@
 PostgreSQL queue handler implementation.
 """
 
-import os
 import select
 import time
 from logging import getLogger
 
 import psycopg
-import psycopg.sql as sql
+from psycopg import sql
 
 from partitioncache.queue_handler.abstract import AbstractPriorityQueueHandler
 
@@ -16,12 +15,7 @@ logger = getLogger("PartitionCache")
 
 
 class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
-    """
-    PostgreSQL implementation of the priority queue handler.
-    Uses PostgreSQL tables for original query and query fragment queues with priority support.
-    """
-
-    def __init__(self, host: str, port: int, user: str, password: str, dbname: str):
+    def __init__(self, host: str, port: int, user: str, password: str, dbname: str, table_prefix: str):
         """
         Initialize the PostgreSQL queue handler.
 
@@ -39,8 +33,6 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
         self.dbname = dbname
         self._connection = None
 
-        # Get table prefix from environment variable
-        table_prefix = os.getenv("PG_QUEUE_TABLE_PREFIX", "partitioncache_queue")
         self.table_prefix = table_prefix
         self.original_queue_table = f"{self.table_prefix}_original_query_queue"
         self.fragment_queue_table = f"{self.table_prefix}_query_fragment_queue"
@@ -48,6 +40,8 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
         # Initialize tables and functions on first connection
         self._initialize_tables()
         self._deploy_non_blocking_functions()
+
+        logger.info(f"PostgreSQLQueueHandler initialized for tables {self.original_queue_table} and {self.fragment_queue_table}")
 
     def _get_connection(self):
         """Get PostgreSQL connection with proper configuration."""
@@ -66,6 +60,11 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
         try:
             conn = self._get_persistent_connection()
             cursor = conn.cursor()
+
+            # Check if the original query queue table already exists
+            cursor.execute(sql.SQL("SELECT to_regclass('{0}')").format(sql.Identifier(self.original_queue_table)))
+            if cursor.fetchone()[0]:
+                return
 
             # Create original query queue table with partition_key and priority
             cursor.execute(
@@ -775,6 +774,7 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
         Returns:
             dict: Dictionary with 'original_query_queue' and 'query_fragment_queue' queue lengths.
         """
+        conn = None
         try:
             conn = self._get_connection()
             cursor = conn.cursor()
@@ -788,9 +788,19 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
             query_fragment_count = query_fragment_result[0] if query_fragment_result else 0
 
             return {"original_query_queue": original_query_count, "query_fragment_queue": query_fragment_count}
+        except (psycopg.OperationalError, psycopg.DatabaseError, OSError) as e:
+            logger.warning(f"Failed to get PostgreSQL queue lengths (connection issue): {e}")
+            return {"original_query_queue": 0, "query_fragment_queue": 0}
         except Exception as e:
             logger.error(f"Failed to get PostgreSQL queue lengths: {e}")
             return {"original_query_queue": 0, "query_fragment_queue": 0}
+        finally:
+            # Ensure connection is properly closed
+            if conn and not conn.closed:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     def clear_original_query_queue(self) -> int:
         """

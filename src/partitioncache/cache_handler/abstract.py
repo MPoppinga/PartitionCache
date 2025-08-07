@@ -359,7 +359,7 @@ class AbstractCacheHandler(ABC):
 
 class AbstractCacheHandler_Lazy(AbstractCacheHandler):
     """
-    Abstract class for cache handlers that support lazy intersection.
+    Abstract class for cache handlers that support lazy intersection and lazy insertion.
     """
 
     @abstractmethod
@@ -377,3 +377,67 @@ class AbstractCacheHandler_Lazy(AbstractCacheHandler):
             partition_key (str, optional): The partition key. Defaults to "partition_key".
         """
         raise NotImplementedError
+
+    @abstractmethod
+    def set_cache_lazy(self, key: str, query: str, partition_key: str = "partition_key") -> bool:
+        """
+        Store partition key identifiers in cache by executing the provided query directly.
+
+        This method allows inserting cache data without moving partition keys through Python,
+        providing better performance for large result sets. The query should return
+        partition key values that will be stored in the cache.
+
+        Args:
+            key (str): Cache key (query hash).
+            query (str): SQL query that returns partition key values to cache.
+            partition_key (str, optional): Partition key namespace. Defaults to "partition_key".
+
+        Returns:
+            bool: True if successful, False otherwise.
+
+        Note:
+            The query should return a single column containing partition key values.
+            For safety, queries containing DELETE or DROP statements will be rejected.
+        """
+        raise NotImplementedError
+
+    def set_entry_lazy(
+        self,
+        key: str,
+        query: str,
+        query_text: str,
+        partition_key: str = "partition_key",
+        force_update: bool = False,
+    ) -> bool:
+        """
+        High-level method that atomically stores cache data using lazy insertion and query metadata.
+
+        This is the preferred way to populate the cache with lazy insertion as it ensures both
+        cache data and query metadata are stored consistently without moving data through Python.
+
+        Args:
+            key (str): Cache key (query hash).
+            query (str): SQL query that returns partition key values to cache.
+            query_text (str): SQL query text to store for metadata.
+            partition_key (str, optional): Partition key namespace. Defaults to "partition_key".
+            force_update (bool, optional): If True, always update cache data.
+                                          If False, only update metadata if cache entry exists.
+                                          Defaults to False.
+
+        Returns:
+            bool: True if successful, False otherwise.
+        """
+        try:
+            # Check if entry already exists
+            if not force_update and self.exists(key, partition_key, check_query=True):
+                # Entry exists, only update query metadata
+                return self.set_query(key, query_text, partition_key)
+            else:
+                # Entry doesn't exist or force_update=True, set both
+                success_data = self.set_cache_lazy(key, query, partition_key)
+                success_query = self.set_query(key, query_text, partition_key)
+                return success_data and success_query
+        except Exception as e:
+            # Log error but don't raise exception to maintain API consistency
+            logger.error(f"Failed to set cache entry lazily for key {key}: {e}")
+            return False

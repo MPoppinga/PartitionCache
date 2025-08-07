@@ -450,7 +450,7 @@ pcache-monitor [options]
 ```
 
 ### Backend Configuration
-- `--db-backend {postgresql,mysql,sqlite}` - Database backend type
+- `--db-backend {postgresql,mysql,sqlite,duckdb}` - Database backend type
   - **Default**: `postgresql`
 - `--cache-backend CACHE_BACKEND` - Cache backend type
   - **Default**: From environment
@@ -494,6 +494,12 @@ Cache-aware optimization leverages existing cache entries to restrict the search
   - **Purpose**: Check existing cache entries to restrict search space before execution
   - **Benefit**: Reduces database load by applying IN/subquery restrictions
   - **Algorithm**: Generates subquery variants, checks cache for existing entries, applies restrictions if cache hits meet threshold
+- `--force-recalculate` - Force recalculation of cache entries even if they already exist
+  - **Default**: Disabled
+  - **Purpose**: Refresh existing cache entries with updated data from the source database
+  - **Use case**: When underlying data has changed and cache needs to be updated
+  - **Behavior**: Skips cache existence check and always executes queries to populate cache
+  - **Performance**: Increases execution time but ensures cache freshness
 - `--cache-optimization-method {IN,VALUES,IN_SUBQUERY,TMP_TABLE_IN,TMP_TABLE_JOIN}` - Method for applying cache restrictions
   - **Default**: `IN`
   - **`IN`**: Simple IN clause with partition keys
@@ -603,6 +609,23 @@ pcache-monitor \
   --min-cache-hits 5 \
   --no-prefer-lazy-optimization \
   --max-processes 4
+```
+
+**Force cache refresh when data has changed:**
+```bash
+pcache-monitor \
+  --cache-backend "postgresql_array" \
+  --force-recalculate \
+  --max-processes 4
+```
+
+**Debug with query timing logs:**
+```bash
+pcache-monitor \
+  --cache-backend "postgresql_array" \
+  --max-processes 2 \
+  --log-query-times execution_times.csv \
+  --disable-cache-optimization
 ```
 
 ---

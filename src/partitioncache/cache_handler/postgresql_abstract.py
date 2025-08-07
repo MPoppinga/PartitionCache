@@ -26,18 +26,22 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
         cls._refcount += 1
         return cls._instance
 
-    def __init__(self, db_name: str, db_host: str, db_user: str, db_password: str, db_port: str | int, db_tableprefix: str) -> None:
+    def __init__(self, db_name: str, db_host: str, db_user: str, db_password: str, db_port: str | int, db_tableprefix: str, timeout: str = "0") -> None:
         """
         Initialize the cache handler with the given db name.
         This handler supports multiple partition keys with datatypes: integer, float, text, timestamp.
         Creates distinct tables per partition key based on datatype.
+
+        Args:
+            timeout: Statement timeout in seconds (default: "0" for no timeout)
         """
-        self.db = psycopg.connect(dbname=db_name, host=db_host, password=db_password, port=db_port, user=db_user)
+        self.db = psycopg.connect(dbname=db_name, host=db_host, password=db_password, port=db_port, user=db_user, options=f"-c statement_timeout={int(timeout)*1000}" )
         self.tableprefix = db_tableprefix
         self.cursor = self.db.cursor()
 
         # Create metadata tables with supported datatypes
         self._recreate_metadata_table(self.get_supported_datatypes())
+        logger.info(f"CACHE_HANDLER {self.__class__.__name__}: Initialization complete for tableprefix={db_tableprefix}")
 
     def _recreate_metadata_table(self, supported_datatypes: set[str]) -> None:
         """
@@ -58,6 +62,7 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
                     created_at TIMESTAMP DEFAULT now()
                 );""").format(sql.Identifier(self.tableprefix + "_partition_metadata"), datatype_constraint)
             )
+            logger.info("METADATA: Partition metadata table created successfully")
 
             # Create queries table
             self.cursor.execute(
