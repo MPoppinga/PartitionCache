@@ -272,7 +272,8 @@ Processes individual queue items:
 Returns comprehensive processor status:
 
 ```sql
-SELECT * FROM partitioncache_get_processor_status('partitioncache_queue', 'partitioncache_process_queue');
+-- Use the base job name including the database suffix
+SELECT * FROM partitioncache_get_processor_status('partitioncache_queue', 'partitioncache_process_queue_<db_name>');
 ```
 
 **Returns:**
@@ -288,21 +289,21 @@ Enable or disable the processor:
 
 ```sql
 -- Enable processor
-SELECT partitioncache_set_processor_enabled_cron(true, 'partitioncache_queue', 'partitioncache_process_queue');
+SELECT partitioncache_set_processor_enabled_cron(true, 'partitioncache_queue', 'partitioncache_process_queue_<db_name>');
 
 -- Disable processor  
-SELECT partitioncache_set_processor_enabled_cron(false, 'partitioncache_queue', 'partitioncache_process_queue');
+SELECT partitioncache_set_processor_enabled_cron(false, 'partitioncache_queue', 'partitioncache_process_queue_<db_name>');
 ```
 
 ### Configuration Management
 
-#### `partitioncache_update_processor_config(...)`
+#### `partitioncache_update_processor_config_cron(...)`
 Update processor configuration:
 
 ```sql
 -- Set max parallel jobs to 3, frequency to 5 seconds
-SELECT partitioncache_update_processor_config(
-    'partitioncache_process_queue', 
+SELECT partitioncache_update_processor_config_cron(
+    'partitioncache_process_queue_<db_name>', 
     NULL, -- enabled (keep current)
     3,    -- max_parallel_jobs
     5,    -- frequency_seconds

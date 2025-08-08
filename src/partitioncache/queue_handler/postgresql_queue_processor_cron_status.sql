@@ -1,5 +1,5 @@
 -- Function to get basic processor status
-CREATE OR REPLACE FUNCTION partitioncache_get_processor_status(p_queue_prefix TEXT, p_job_name TEXT DEFAULT 'partitioncache_process_queue')
+CREATE OR REPLACE FUNCTION partitioncache_get_processor_status(p_queue_prefix TEXT, p_job_name TEXT)
 RETURNS TABLE(
     job_name TEXT,
     enabled BOOLEAN,
@@ -54,7 +54,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 -- Enhanced processor status function with queue information
-CREATE OR REPLACE FUNCTION partitioncache_get_processor_status_detailed(p_table_prefix TEXT, p_queue_prefix TEXT, p_job_name TEXT DEFAULT 'partitioncache_process_queue')
+CREATE OR REPLACE FUNCTION partitioncache_get_processor_status_detailed(p_table_prefix TEXT, p_queue_prefix TEXT, p_job_name TEXT)
 RETURNS TABLE(
     -- Basic processor status
     job_name TEXT,

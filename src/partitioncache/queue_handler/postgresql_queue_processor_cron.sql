@@ -196,7 +196,7 @@ $$ LANGUAGE plpgsql;
 CREATE OR REPLACE FUNCTION partitioncache_set_processor_enabled_cron(
     p_enabled BOOLEAN, 
     p_queue_prefix TEXT DEFAULT 'partitioncache_queue', 
-    p_job_name TEXT DEFAULT 'partitioncache_process_queue'
+    p_job_name TEXT
 )
 RETURNS VOID AS $$
 DECLARE
@@ -271,7 +271,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 -- Function to get processor status from cron database
-CREATE OR REPLACE FUNCTION partitioncache_get_processor_status_cron(p_queue_prefix TEXT, p_job_name TEXT DEFAULT 'partitioncache_process_queue')
+CREATE OR REPLACE FUNCTION partitioncache_get_processor_status_cron(p_queue_prefix TEXT, p_job_name TEXT)
 RETURNS TABLE(
     job_name TEXT,
     enabled BOOLEAN,

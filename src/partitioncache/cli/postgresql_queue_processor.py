@@ -200,12 +200,15 @@ def check_and_grant_pg_cron_permissions() -> tuple[bool, str]:
                 work_user = os.getenv("DB_USER")
 
                 # Check if user has required permissions
-                cur.execute("""
+                cur.execute(
+                    """
                     SELECT
                         has_schema_privilege(%s, 'cron', 'USAGE') as schema_usage,
                         has_function_privilege(%s, 'cron.schedule_in_database(text,text,text,text,text,boolean)', 'EXECUTE') as schedule_exec,
                         has_function_privilege(%s, 'cron.unschedule(bigint)', 'EXECUTE') as unschedule_exec
-                """, (work_user, work_user, work_user))
+                """,
+                    (work_user, work_user, work_user),
+                )
 
                 perms = cur.fetchone()
                 if not perms:
@@ -346,7 +349,18 @@ def setup_database_objects(cache_conn, cron_conn=None):
     logger.info("Cross-database setup completed successfully")
 
 
-def insert_initial_config(cron_conn, job_name: str, table_prefix: str, queue_prefix: str, cache_backend: str, frequency: int, enabled: bool, timeout: int, target_database: str, default_bitsize: int | None):
+def insert_initial_config(
+    cron_conn,
+    job_name: str,
+    table_prefix: str,
+    queue_prefix: str,
+    cache_backend: str,
+    frequency: int,
+    enabled: bool,
+    timeout: int,
+    target_database: str,
+    default_bitsize: int | None,
+):
     """Insert the initial configuration row in cron database which will trigger the cron job creation."""
     logger.info(f"Inserting initial config for job '{job_name}' in cron database")
     config_table = f"{queue_prefix}_processor_config"
@@ -368,7 +382,18 @@ def insert_initial_config(cron_conn, job_name: str, table_prefix: str, queue_pre
     logger.info("Initial configuration inserted successfully in cron database. Cron job should be synced.")
 
 
-def insert_cache_config(cache_conn, job_name: str, table_prefix: str, queue_prefix: str, cache_backend: str, frequency: int, enabled: bool, timeout: int, target_database: str, default_bitsize: int | None):
+def insert_cache_config(
+    cache_conn,
+    job_name: str,
+    table_prefix: str,
+    queue_prefix: str,
+    cache_backend: str,
+    frequency: int,
+    enabled: bool,
+    timeout: int,
+    target_database: str,
+    default_bitsize: int | None,
+):
     """Insert configuration in cache database for worker function access (eliminates need for dblink)."""
     logger.info(f"Inserting config for job '{job_name}' in cache database for worker functions")
     config_table = f"{queue_prefix}_processor_config"
@@ -427,6 +452,10 @@ def remove_all_processor_objects(conn, queue_prefix: str):
     log_table = f"{queue_prefix}_processor_log"
     active_jobs_table = f"{queue_prefix}_active_jobs"
 
+    # Get the database name to construct the job name pattern
+    target_database = get_cache_database_name()
+    job_name_pattern = f"partitioncache_process_queue_{target_database}%"
+
     with conn.cursor() as cur:
         # Drop processor-specific tables first. The DELETE trigger on the config
         # table will unschedule the cron job automatically.
@@ -437,9 +466,21 @@ def remove_all_processor_objects(conn, queue_prefix: str):
         cur.execute(sql.SQL("DROP TABLE IF EXISTS {} CASCADE").format(sql.Identifier(active_jobs_table)))
         logger.info(f"Dropped table '{active_jobs_table}'")
 
-        # Explicitly remove any remaining cron.job entry (in case trigger wasn't present)
-        cur.execute("DELETE FROM cron.job WHERE jobname = %s", ["partitioncache_process_queue"])  # best-effort
+    # Explicitly remove any remaining cron.job entries for this database (in case trigger wasn't present)
+    # Use the pg_cron database connection when it's different from the cache database
+    if get_cron_database_name() == get_cache_database_name():
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM cron.job WHERE jobname LIKE %s", [job_name_pattern])  # best-effort
+    else:
+        cron_conn = get_pg_cron_connection()
+        try:
+            with cron_conn.cursor() as cron_cur:
+                cron_cur.execute("DELETE FROM cron.job WHERE jobname LIKE %s", [job_name_pattern])
+            cron_conn.commit()
+        finally:
+            cron_conn.close()
 
+    with conn.cursor() as cur:
         # Dynamically drop all functions beginning with 'partitioncache_'
         logger.info("Dropping all functions with prefix 'partitioncache_' …")
         cur.execute(
@@ -469,11 +510,13 @@ def enable_processor(queue_prefix: str):
     """Enable the queue processor job."""
     logger.info("Enabling queue processor...")
     conn = get_pg_cron_connection()
+    target_database = get_cache_database_name()
+    job_name = f"partitioncache_process_queue_{target_database}"
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT partitioncache_set_processor_enabled_cron(true, %s, 'partitioncache_process_queue')", [queue_prefix])
+            cur.execute("SELECT partitioncache_set_processor_enabled_cron(true, %s, %s)", [queue_prefix, job_name])
         conn.commit()
-        logger.info("Queue processor enabled.")
+        logger.info(f"Queue processor '{job_name}' enabled.")
     finally:
         conn.close()
 
@@ -482,11 +525,13 @@ def disable_processor(queue_prefix: str):
     """Disable the queue processor job."""
     logger.info("Disabling queue processor...")
     conn = get_pg_cron_connection()
+    target_database = get_cache_database_name()
+    job_name = f"partitioncache_process_queue_{target_database}"
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT partitioncache_set_processor_enabled_cron(false, %s, 'partitioncache_process_queue')", [queue_prefix])
+            cur.execute("SELECT partitioncache_set_processor_enabled_cron(false, %s, %s)", [queue_prefix, job_name])
         conn.commit()
-        logger.info("Queue processor disabled.")
+        logger.info(f"Queue processor '{job_name}' disabled.")
     finally:
         conn.close()
 
@@ -509,11 +554,12 @@ def update_processor_config(
     if queue_prefix is None:
         queue_prefix = get_queue_table_prefix_from_env()
 
-    job_name = "partitioncache_process_queue"
+    target_database = get_cache_database_name()
+    job_name = f"partitioncache_process_queue_{target_database}"
     logger.info(f"Updating processor configuration for job '{job_name}'...")
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT partitioncache_update_processor_config(%s, %s, %s, %s, %s, %s, %s, %s)",
+            "SELECT partitioncache_update_processor_config_cron(%s, %s, %s, %s, %s, %s, %s, %s)",
             (job_name, enabled, max_parallel_jobs, frequency, timeout, table_prefix, result_limit, queue_prefix),
         )
     conn.commit()
@@ -559,7 +605,7 @@ def handle_setup(table_prefix: str, queue_prefix: str, cache_backend: str, frequ
         logger.info(f"Setting up components in cross-database mode: cron={get_cron_database_name()}, cache={get_cache_database_name()}")
         setup_database_objects(cache_conn, cron_conn)
 
-    job_name = "partitioncache_process_queue"
+    job_name = f"partitioncache_process_queue_{target_database}"
 
     # Insert configuration in cron database for pg_cron job management
     actual_cron_conn = cache_conn if get_cron_database_name() == get_cache_database_name() else cron_conn
@@ -586,10 +632,12 @@ def get_processor_status(queue_prefix: str):
     """Get basic processor status from cron database."""
     logger.info("Fetching processor status...")
     conn = get_pg_cron_connection()
+    target_database = get_cache_database_name()
+    job_name = f"partitioncache_process_queue_{target_database}"
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT * FROM partitioncache_get_processor_status(%s, %s)", [queue_prefix, "partitioncache_process_queue"])
-            status = cur.fetchone()            # type: ignore[assignment]
+            cur.execute("SELECT * FROM partitioncache_get_processor_status(%s, %s)", [queue_prefix, job_name])
+            status = cur.fetchone()  # type: ignore[assignment]
             if status:
                 columns = [desc[0] for desc in cur.description]  # type: ignore[attr-defined]
                 return dict(zip(columns, status, strict=False))
@@ -602,9 +650,11 @@ def get_processor_status_detailed(table_prefix: str, queue_prefix: str):
     """Get detailed processor status from cron database."""
     logger.info("Fetching detailed processor status...")
     conn = get_pg_cron_connection()
+    target_database = get_cache_database_name()
+    job_name = f"partitioncache_process_queue_{target_database}"
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT * FROM partitioncache_get_processor_status_detailed(%s, %s, %s)", [table_prefix, queue_prefix, "partitioncache_process_queue"])
+            cur.execute("SELECT * FROM partitioncache_get_processor_status_detailed(%s, %s, %s)", [table_prefix, queue_prefix, job_name])
             status = cur.fetchone()
             if status:
                 columns = [desc[0] for desc in cur.description]  # type: ignore[attr-defined]
@@ -672,7 +722,6 @@ def print_detailed_status(status):
     print(f"  Queue Length:       {status.get('queue_length', 'N/A')}")
     print(f"  Success (last 5m):  {status.get('recent_successes_5m', 'N/A')}")
     print(f"  Failures (last 5m): {status.get('recent_failures_5m', 'N/A')}")
-
 
     print("\n[Recent Logs (limit 10)]")
     recent_logs = status.get("recent_logs")
@@ -845,7 +894,7 @@ def main():
     parser_update.add_argument("--result-limit", type=int, help="New result limit for queries (NULL to disable)")
     parser_update.set_defaults(
         func=lambda args: update_processor_config(
-            get_db_connection(),
+            get_pg_cron_connection(),
             enabled=args.enable,
             max_parallel_jobs=args.max_parallel_jobs,
             frequency=args.frequency,
@@ -905,9 +954,8 @@ def main():
     # check-permissions command
     parser_perms = subparsers.add_parser("check-permissions", help="Check and optionally grant pg_cron permissions")
     parser_perms.set_defaults(
-        func=lambda args: (lambda:
-            print("Checking pg_cron permissions...") or
-            (lambda result: print(f"Result: {result[1]}"))(check_and_grant_pg_cron_permissions())
+        func=lambda args: (
+            lambda: print("Checking pg_cron permissions...") or (lambda result: print(f"Result: {result[1]}"))(check_and_grant_pg_cron_permissions())
         )()
     )
 
