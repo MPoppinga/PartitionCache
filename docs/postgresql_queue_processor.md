@@ -6,6 +6,14 @@ The PostgreSQL Queue Processor provides a sophisticated database-native approach
 
 This approach offers significant advantages in reliability, performance, and operational simplicity by eliminating external dependencies and providing comprehensive monitoring and logging capabilities.
 
+### Dynamic Job Naming
+
+PostgreSQL queue processor functions support **automatic database-specific job naming**:
+
+- **Simple Usage**: Omit job names and they'll be automatically constructed as `partitioncache_process_queue_<current_database>`
+- **Advanced Usage**: Explicitly specify job names for fine-grained control
+- **Multi-Database Support**: Different databases can run processors simultaneously without conflicts
+
 ### Cross-Database Architecture Support
 
 PartitionCache supports cross-database pg_cron configurations where:
@@ -272,7 +280,10 @@ Processes individual queue items:
 Returns comprehensive processor status:
 
 ```sql
--- Use the base job name including the database suffix
+-- Simple usage (job name automatically constructed from current database)
+SELECT * FROM partitioncache_get_processor_status('partitioncache_queue');
+
+-- Advanced usage with explicit job name
 SELECT * FROM partitioncache_get_processor_status('partitioncache_queue', 'partitioncache_process_queue_<db_name>');
 ```
 
@@ -284,15 +295,17 @@ SELECT * FROM partitioncache_get_processor_status('partitioncache_queue', 'parti
 - **queue_length**: Number of items waiting in queue
 - **last_seen**: Timestamp of last processor activity
 
-#### `partitioncache_set_processor_enabled_cron(p_enabled, p_job_name, p_queue_prefix)`
+#### `partitioncache_set_processor_enabled_cron(p_enabled, p_queue_prefix, p_job_name)`
 Enable or disable the processor:
 
 ```sql
--- Enable processor
-SELECT partitioncache_set_processor_enabled_cron(true, 'partitioncache_process_queue_<db_name>', 'partitioncache_queue');
+-- Simple usage (job name automatically constructed from current database)
+SELECT partitioncache_set_processor_enabled_cron(true, 'partitioncache_queue');
+SELECT partitioncache_set_processor_enabled_cron(false, 'partitioncache_queue');
 
--- Disable processor  
-SELECT partitioncache_set_processor_enabled_cron(false, 'partitioncache_process_queue_<db_name>', 'partitioncache_queue');
+-- Advanced usage with explicit job name
+SELECT partitioncache_set_processor_enabled_cron(true, 'partitioncache_queue', 'partitioncache_process_queue_<db_name>');
+SELECT partitioncache_set_processor_enabled_cron(false, 'partitioncache_queue', 'partitioncache_process_queue_<db_name>');
 ```
 
 ### Configuration Management
@@ -301,25 +314,47 @@ SELECT partitioncache_set_processor_enabled_cron(false, 'partitioncache_process_
 Update processor configuration:
 
 ```sql
--- Set max parallel jobs to 3, frequency to 5 seconds
+-- Simple usage (job name automatically constructed from current database)
 SELECT partitioncache_update_processor_config_cron(
-    'partitioncache_process_queue_<db_name>', 
+    NULL, -- job_name (auto-constructed from current database)
     NULL, -- enabled (keep current)
     3,    -- max_parallel_jobs
     5,    -- frequency_seconds
     1800, -- timeout_seconds
     'partitioncache', -- table_prefix
+    NULL, -- target_database (optional)
+    100,  -- result_limit (optional)
+    NULL, -- default_bitsize (optional)
+    'partitioncache_queue' -- queue_prefix
+);
+
+-- Advanced usage with explicit job name
+SELECT partitioncache_update_processor_config_cron(
+    'partitioncache_process_queue_mydb', -- explicit job_name
+    true, -- enabled
+    3,    -- max_parallel_jobs
+    5,    -- frequency_seconds
+    1800, -- timeout_seconds
+    'partitioncache', -- table_prefix
+    'mydb', -- target_database
+    100,  -- result_limit
+    10000, -- default_bitsize
     'partitioncache_queue' -- queue_prefix
 );
 ```
 
-#### `partitioncache_manual_process_queue(p_count)`
+#### `partitioncache_manual_process_queue(p_count, p_job_name)`
 Manually process queue items:
 
 ```sql
--- Process up to 5 queue items immediately
+-- Simple usage (job name automatically constructed from current database)
 SELECT partitioncache_manual_process_queue(5);
+
+-- Advanced usage with explicit job name
+SELECT partitioncache_manual_process_queue(10, 'partitioncache_process_queue_<db_name>');
 ```
+
+**Note**: Job names are automatically constructed from the current database when not explicitly provided, enabling multi-database deployments.
 
 ## Processing State Machine
 
