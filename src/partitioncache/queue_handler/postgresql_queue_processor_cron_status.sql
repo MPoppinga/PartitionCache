@@ -1,5 +1,5 @@
 -- Function to get basic processor status
-CREATE OR REPLACE FUNCTION partitioncache_get_processor_status(p_queue_prefix TEXT, p_job_name TEXT)
+CREATE OR REPLACE FUNCTION partitioncache_get_processor_status(p_queue_prefix TEXT, p_job_name TEXT DEFAULT NULL)
 RETURNS TABLE(
     job_name TEXT,
     enabled BOOLEAN,
@@ -17,8 +17,12 @@ RETURNS TABLE(
 ) AS $$
 DECLARE
     v_config_table TEXT;
+    v_job_name TEXT;
 BEGIN
     v_config_table := p_queue_prefix || '_processor_config';
+    
+    -- Dynamic job name construction if not provided
+    v_job_name := COALESCE(p_job_name, 'partitioncache_process_queue_' || current_database());
 
     RETURN QUERY
     EXECUTE format(
@@ -48,13 +52,13 @@ BEGIN
             %I conf
         WHERE
             conf.job_name = %L',
-        p_job_name, '_%', v_config_table, p_job_name
+        v_job_name, '_%', v_config_table, v_job_name
     );
 END;
 $$ LANGUAGE plpgsql;
 
 -- Enhanced processor status function with queue information
-CREATE OR REPLACE FUNCTION partitioncache_get_processor_status_detailed(p_table_prefix TEXT, p_queue_prefix TEXT, p_job_name TEXT)
+CREATE OR REPLACE FUNCTION partitioncache_get_processor_status_detailed(p_table_prefix TEXT, p_queue_prefix TEXT, p_job_name TEXT DEFAULT NULL)
 RETURNS TABLE(
     -- Basic processor status
     job_name TEXT,
@@ -75,9 +79,13 @@ RETURNS TABLE(
 DECLARE
     v_queue_table TEXT;
     v_config_table TEXT;
+    v_job_name TEXT;
 BEGIN
     v_queue_table := p_queue_prefix || '_query_fragment_queue';
     v_config_table := p_queue_prefix || '_processor_config';
+    
+    -- Dynamic job name construction if not provided
+    v_job_name := COALESCE(p_job_name, 'partitioncache_process_queue_' || current_database());
 
     RETURN QUERY
     EXECUTE format(
@@ -96,7 +104,7 @@ BEGIN
             NULL::JSON as active_job_details
         FROM
             partitioncache_get_processor_status(%L, %L) s',
-        p_queue_prefix, p_job_name
+        p_queue_prefix, v_job_name
     );
 END;
 

@@ -510,13 +510,11 @@ def enable_processor(queue_prefix: str):
     """Enable the queue processor job."""
     logger.info("Enabling queue processor...")
     conn = get_pg_cron_connection()
-    target_database = get_cache_database_name()
-    job_name = f"partitioncache_process_queue_{target_database}"
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT partitioncache_set_processor_enabled_cron(true, %s, %s)", [job_name, queue_prefix])
+            cur.execute("SELECT partitioncache_set_processor_enabled_cron(true, %s)", [queue_prefix])
         conn.commit()
-        logger.info(f"Queue processor '{job_name}' enabled.")
+        logger.info("Queue processor enabled.")
     finally:
         conn.close()
 
@@ -525,13 +523,11 @@ def disable_processor(queue_prefix: str):
     """Disable the queue processor job."""
     logger.info("Disabling queue processor...")
     conn = get_pg_cron_connection()
-    target_database = get_cache_database_name()
-    job_name = f"partitioncache_process_queue_{target_database}"
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT partitioncache_set_processor_enabled_cron(false, %s, %s)", [job_name, queue_prefix])
+            cur.execute("SELECT partitioncache_set_processor_enabled_cron(false, %s)", [queue_prefix])
         conn.commit()
-        logger.info(f"Queue processor '{job_name}' disabled.")
+        logger.info("Queue processor disabled.")
     finally:
         conn.close()
 
@@ -554,13 +550,11 @@ def update_processor_config(
     if queue_prefix is None:
         queue_prefix = get_queue_table_prefix_from_env()
 
-    target_database = get_cache_database_name()
-    job_name = f"partitioncache_process_queue_{target_database}"
-    logger.info(f"Updating processor configuration for job '{job_name}'...")
+    logger.info("Updating processor configuration...")
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT partitioncache_update_processor_config_cron(%s, %s, %s, %s, %s, %s, %s, %s)",
-            (job_name, enabled, max_parallel_jobs, frequency, timeout, table_prefix, result_limit, queue_prefix),
+            "SELECT partitioncache_update_processor_config_cron(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            (None, enabled, max_parallel_jobs, frequency, timeout, table_prefix, None, result_limit, None, queue_prefix),
         )
     conn.commit()
     logger.info("Processor configuration updated successfully.")
@@ -632,11 +626,9 @@ def get_processor_status(queue_prefix: str):
     """Get basic processor status from cron database."""
     logger.info("Fetching processor status...")
     conn = get_pg_cron_connection()
-    target_database = get_cache_database_name()
-    job_name = f"partitioncache_process_queue_{target_database}"
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT * FROM partitioncache_get_processor_status(%s, %s)", [queue_prefix, job_name])
+            cur.execute("SELECT * FROM partitioncache_get_processor_status(%s)", [queue_prefix])
             status = cur.fetchone()  # type: ignore[assignment]
             if status:
                 columns = [desc[0] for desc in cur.description]  # type: ignore[attr-defined]
@@ -650,11 +642,9 @@ def get_processor_status_detailed(table_prefix: str, queue_prefix: str):
     """Get detailed processor status from cron database."""
     logger.info("Fetching detailed processor status...")
     conn = get_pg_cron_connection()
-    target_database = get_cache_database_name()
-    job_name = f"partitioncache_process_queue_{target_database}"
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT * FROM partitioncache_get_processor_status_detailed(%s, %s, %s)", [table_prefix, queue_prefix, job_name])
+            cur.execute("SELECT * FROM partitioncache_get_processor_status_detailed(%s, %s)", [table_prefix, queue_prefix])
             status = cur.fetchone()
             if status:
                 columns = [desc[0] for desc in cur.description]  # type: ignore[attr-defined]

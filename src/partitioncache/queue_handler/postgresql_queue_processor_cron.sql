@@ -195,24 +195,29 @@ $$ LANGUAGE plpgsql;
 -- Function to enable or disable the queue processor (from cron database)
 CREATE OR REPLACE FUNCTION partitioncache_set_processor_enabled_cron(
     p_enabled BOOLEAN, 
-    p_job_name TEXT,
-    p_queue_prefix TEXT DEFAULT 'partitioncache_queue'
+    p_queue_prefix TEXT DEFAULT 'partitioncache_queue',
+    p_job_name TEXT DEFAULT NULL
 )
 RETURNS VOID AS $$
 DECLARE
     v_config_table TEXT;
+    v_job_name TEXT;
 BEGIN
     v_config_table := p_queue_prefix || '_processor_config';
+    
+    -- Dynamic job name construction if not provided
+    v_job_name := COALESCE(p_job_name, 'partitioncache_process_queue_' || current_database());
+    
     EXECUTE format(
         'UPDATE %I SET enabled = %L, updated_at = NOW() WHERE job_name = %L',
-        v_config_table, p_enabled, p_job_name
+        v_config_table, p_enabled, v_job_name
     );
 END;
 $$ LANGUAGE plpgsql;
 
 -- Function to update processor configuration (from cron database)
 CREATE OR REPLACE FUNCTION partitioncache_update_processor_config_cron(
-    p_job_name TEXT,
+    p_job_name TEXT DEFAULT NULL,
     p_enabled BOOLEAN DEFAULT NULL, 
     p_max_parallel_jobs INTEGER DEFAULT NULL,
     p_frequency_seconds INTEGER DEFAULT NULL,
@@ -228,8 +233,12 @@ DECLARE
     v_config_table TEXT;
     v_update_sql TEXT;
     v_set_clauses TEXT[] := '{}';
+    v_job_name TEXT;
 BEGIN
     v_config_table := p_queue_prefix || '_processor_config';
+    
+    -- Dynamic job name construction if not provided
+    v_job_name := COALESCE(p_job_name, 'partitioncache_process_queue_' || current_database());
 
     -- Build the SET clauses dynamically
     IF p_enabled IS NOT NULL THEN
@@ -263,7 +272,7 @@ BEGIN
             'UPDATE %I SET %s, updated_at = NOW() WHERE job_name = %L',
             v_config_table,
             array_to_string(v_set_clauses, ', '),
-            p_job_name
+            v_job_name
         );
         EXECUTE v_update_sql;
     END IF;
