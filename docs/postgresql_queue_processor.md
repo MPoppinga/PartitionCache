@@ -284,15 +284,15 @@ SELECT * FROM partitioncache_get_processor_status('partitioncache_queue', 'parti
 - **queue_length**: Number of items waiting in queue
 - **last_seen**: Timestamp of last processor activity
 
-#### `partitioncache_set_processor_enabled_cron(p_enabled, p_queue_prefix, p_job_name)`
+#### `partitioncache_set_processor_enabled_cron(p_enabled, p_job_name, p_queue_prefix)`
 Enable or disable the processor:
 
 ```sql
 -- Enable processor
-SELECT partitioncache_set_processor_enabled_cron(true, 'partitioncache_queue', 'partitioncache_process_queue_<db_name>');
+SELECT partitioncache_set_processor_enabled_cron(true, 'partitioncache_process_queue_<db_name>', 'partitioncache_queue');
 
 -- Disable processor  
-SELECT partitioncache_set_processor_enabled_cron(false, 'partitioncache_queue', 'partitioncache_process_queue_<db_name>');
+SELECT partitioncache_set_processor_enabled_cron(false, 'partitioncache_process_queue_<db_name>', 'partitioncache_queue');
 ```
 
 ### Configuration Management

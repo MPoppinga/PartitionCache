@@ -442,7 +442,7 @@ class TestProcessorEnableDisable:
         # Verify the correct function was called with dynamic job name
         mock_cursor.execute.assert_called_once_with(
             "SELECT partitioncache_set_processor_enabled_cron(true, %s, %s)",
-            ["test_queue_prefix", "partitioncache_process_queue_test_database"]
+            ["partitioncache_process_queue_test_database", "test_queue_prefix"]
         )
         mock_conn.commit.assert_called_once()
 
@@ -468,7 +468,7 @@ class TestProcessorEnableDisable:
         # Verify the correct function was called with dynamic job name
         mock_cursor.execute.assert_called_once_with(
             "SELECT partitioncache_set_processor_enabled_cron(false, %s, %s)",
-            ["test_queue_prefix", "partitioncache_process_queue_test_database"]
+            ["partitioncache_process_queue_test_database", "test_queue_prefix"]
         )
         mock_conn.commit.assert_called_once()
 

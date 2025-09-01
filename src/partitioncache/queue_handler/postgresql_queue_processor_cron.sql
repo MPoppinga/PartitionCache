@@ -195,8 +195,8 @@ $$ LANGUAGE plpgsql;
 -- Function to enable or disable the queue processor (from cron database)
 CREATE OR REPLACE FUNCTION partitioncache_set_processor_enabled_cron(
     p_enabled BOOLEAN, 
-    p_queue_prefix TEXT DEFAULT 'partitioncache_queue', 
-    p_job_name TEXT
+    p_job_name TEXT,
+    p_queue_prefix TEXT DEFAULT 'partitioncache_queue'
 )
 RETURNS VOID AS $$
 DECLARE
