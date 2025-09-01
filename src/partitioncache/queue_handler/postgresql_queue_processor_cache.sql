@@ -533,7 +533,7 @@ BEGIN
         EXCEPTION WHEN OTHERS THEN
             v_config := NULL;
         END;
-    END;
+    END IF;
     
     -- If still no local config found, try to find any config table
     IF v_config IS NULL THEN
