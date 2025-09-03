@@ -43,24 +43,17 @@ def clean_query(query: str) -> str:
         str: Cleaned and normalized query suitable for cache variant generation
     """
 
-    # Remove trailing semicolons (they're not part of the SQL statement)
-    query = query.rstrip().rstrip(";")
-
-    # Remove single-line comments BEFORE whitespace normalization to avoid eating whole query
-    query = re.sub(r"--.*", "", query)
-
-    # Now normalize whitespace and equals spacing
     query = re.sub(r"\s+", " ", query)
     query = re.sub(r"\s*=\s*", "=", query)
 
-    # Parse the query (be tolerant: if parsing fails, skip heavy normalization)
-    try:
-        parsed = sqlglot.parse_one(query)
-    except Exception as e:
-        logger.warning(f"Failed to parse query during clean_query: {e}. Returning minimally cleaned SQL.")
-        # Minimal cleanup without AST normalization to avoid losing valid SQL
-        query = query.strip().rstrip(";")
-        return query
+    # Remove trailing semicolons (they're not part of the SQL statement)
+    query = query.rstrip().rstrip(";")
+
+    # Remove comment
+    query = re.sub(r"--.*", "", query)
+
+    # Parse the query
+    parsed = sqlglot.parse_one(query)
 
     # Normalize the query (building CNF)
     parsed = sqlglot.optimizer.normalize.normalize(parsed)
@@ -186,67 +179,21 @@ def extract_conjunctive_conditions(sql: str) -> list[str]:
     """
     Returns all conjunctive conditions from a query.
     """
-    try:
-        parsed = sqlglot.parse_one(sql)
-        where_clause = parsed.find(exp.Where)
-        conditions = []
+    parsed = sqlglot.parse_one(sql)
+    where_clause = parsed.find(exp.Where)
+    conditions = []
 
-        def extract_conditions_from_expression(expression):
-            if isinstance(expression, exp.And):
-                extract_conditions_from_expression(expression.left)
-                extract_conditions_from_expression(expression.right)
-            else:
-                conditions.append(expression.sql())
+    def extract_conditions_from_expression(expression):
+        if isinstance(expression, exp.And):
+            extract_conditions_from_expression(expression.left)
+            extract_conditions_from_expression(expression.right)
+        else:
+            conditions.append(expression.sql())
 
-        if where_clause:
-            extract_conditions_from_expression(where_clause.this)
-        return conditions
-    except Exception as e:
-        logger.warning(f"Failed to parse SQL for condition extraction: {e}. Using regex fallback.")
-        # Fallback: extract WHERE ... up to GROUP BY/ORDER BY/LIMIT
-        lower = sql.lower()
-        where_idx = lower.find(" where ")
-        if where_idx == -1:
-            return []
-        tail = sql[where_idx + 7:]
-        # Find terminators
-        end_positions = [
-            p for p in [
-                tail.lower().find(" group by "),
-                tail.lower().find(" order by "),
-                tail.lower().find(" limit "),
-            ] if p != -1
-        ]
-        end = min(end_positions) if end_positions else len(tail)
-        where_str = tail[:end].strip()
-        # Simple split on AND at top level (non-parenthesized). Approximate.
-        parts = []
-        buf = []
-        depth = 0
-        i = 0
-        while i < len(where_str):
-            ch = where_str[i]
-            if ch == '(':
-                depth += 1
-                buf.append(ch)
-                i += 1
-                continue
-            if ch == ')':
-                depth = max(0, depth - 1)
-                buf.append(ch)
-                i += 1
-                continue
-            if depth == 0 and where_str[i:i+4].lower() == ' and':
-                parts.append(''.join(buf).strip())
-                buf = []
-                i += 4
-                continue
-            buf.append(ch)
-            i += 1
-        if buf:
-            parts.append(''.join(buf).strip())
-        # Filter empties
-        return [p for p in parts if p]
+    if where_clause:
+        extract_conditions_from_expression(where_clause.this)
+
+    return conditions
 
 
 def extract_and_group_query_conditions(
@@ -272,40 +219,26 @@ def extract_and_group_query_conditions(
     or_conditions: dict[tuple, list[str]] = defaultdict(list)  # {(table_alias1, table_alias2, ...): [conditions(w/alias)]}
     partition_key_joins: dict[tuple[str, str], list[str]] = defaultdict(list)  # Track PK joins for star detection
 
-    # Build table alias mapping robustly using SQLGlot (works for comma and JOIN syntax)
-    alias_to_table_map: dict[str, str] = {}
-    table_aliases: list[str] = []
-    try:
-        parsed_query = sqlglot.parse_one(query)
-        for table_expr in parsed_query.find_all(exp.Table):
-            table_name = table_expr.name
-            if table_expr.alias:
-                # Prefer explicit alias if present
-                alias = table_expr.alias.this.name
-            else:
-                # Fallback to table name as alias when no alias is provided
-                alias = table_name
+    # get tables
+    tables = re.split("FROM|WHERE", query, flags=re.IGNORECASE)[1]
+    tables = tables.split(",")
+    tables = [x.strip() for x in tables]
 
-            # Preserve insertion order and avoid duplicates
-            if alias not in alias_to_table_map:
-                alias_to_table_map[alias] = table_name
-                table_aliases.append(alias)
-    except Exception as e:
-        # Fallback to simple parsing if SQLGlot fails for any reason
-        logger.warning(f"Falling back to regex-based table extraction due to SQL parse error: {e}")
-        tables = re.split("FROM|WHERE", query, flags=re.IGNORECASE)[1]
-        tables = [x.strip() for x in tables.split(",")]
-        for table_spec in tables:
-            parts = re.split(r"\s+(?:AS\s+)?", table_spec, flags=re.IGNORECASE)
-            if len(parts) >= 2:
-                table_name = parts[0]
-                alias = parts[-1]
-            else:
-                table_name = parts[0]
-                alias = parts[0]
-            if alias not in alias_to_table_map:
-                alias_to_table_map[alias] = table_name
-                table_aliases.append(alias)
+    # Create mapping of aliases to table names
+    alias_to_table_map: dict[str, str] = {}
+    table_aliases = []
+
+    for table_spec in tables:
+        parts = re.split(r"\s+(?:AS\s+)?", table_spec, flags=re.IGNORECASE)
+        if len(parts) >= 2:
+            table_name = parts[0]
+            alias = parts[-1]
+        else:
+            table_name = parts[0]
+            alias = parts[0]
+
+        table_aliases.append(alias)
+        alias_to_table_map[alias] = table_name
 
     # warn if more than one table is used
     unique_tables = set(alias_to_table_map.values())
@@ -988,7 +921,7 @@ def generate_partial_queries(
             sub = sub.strip()
             ret.append(sub)
 
-    # Process each query with sqlglot, but if parsing fails, include the raw SQL fragment
+    # Process each query with sqlglot, skipping non-SQL fragments
     result = []
     for q in ret:
         try:
@@ -997,8 +930,9 @@ def generate_partial_queries(
             sql_result = simplified.sql()
             result.append(sql_result)
         except Exception:
-            # Include minimally cleaned fragment to avoid dropping valid SQL
-            result.append(q.strip().rstrip(";"))
+            # If parsing fails, skip this fragment
+            logger.error(f"Failed to parse query: {q}")
+            continue
 
     return result
 
@@ -1475,11 +1409,7 @@ def generate_all_query_hash_pairs(
     query_set.update(query_set_diff_combinations)
 
     # Create bucket variant with normalized distances (Example: 1.6 - 3.6 -> 1 - 4 WITH bucket_steps = 1)
-    try:
-        nor_dist_query = normalize_distance_conditions(query, bucket_steps=bucket_steps)
-    except Exception as e:
-        logger.warning(f"Distance normalization failed, proceeding without normalized variant: {e}")
-        nor_dist_query = query
+    nor_dist_query = normalize_distance_conditions(query, bucket_steps=bucket_steps)
 
     query_set.update(
         set(
