@@ -80,9 +80,9 @@ class TestMultipleTablePrefixes:
                     SELECT job_name, table_prefix 
                     FROM {config_table} 
                     WHERE target_database = %s 
-                    AND job_name LIKE 'partitioncache_process_queue_%'
+                    AND job_name LIKE %s
                     ORDER BY job_name
-                """, (target_database,))
+                """, (target_database, 'partitioncache_process_queue_%'))
                 
                 actual_jobs = cur.fetchall()
                 
