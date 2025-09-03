@@ -277,14 +277,14 @@ Processes individual queue items:
 
 ### Monitoring Functions
 
-#### `partitioncache_get_processor_status(p_queue_prefix, p_job_name)`
+#### `partitioncache_get_processor_status(p_queue_prefix, p_target_database)`
 Returns comprehensive processor status:
 
 ```sql
 -- Simple usage (provide target database for job name construction)
 SELECT * FROM partitioncache_get_processor_status('partitioncache_queue', 'myapp_db');
 
--- Advanced usage with explicit job name
+-- Advanced usage with explicit job name (optional third parameter)
 SELECT * FROM partitioncache_get_processor_status('partitioncache_queue', 'myapp_db', 'partitioncache_process_queue_myapp_db');
 ```
 
@@ -296,7 +296,7 @@ SELECT * FROM partitioncache_get_processor_status('partitioncache_queue', 'myapp
 - **queue_length**: Number of items waiting in queue
 - **last_seen**: Timestamp of last processor activity
 
-#### `partitioncache_set_processor_enabled_cron(p_enabled, p_queue_prefix, p_job_name)`
+#### `partitioncache_set_processor_enabled_cron(p_enabled, p_queue_prefix, p_target_database)`
 Enable or disable the processor:
 
 ```sql
@@ -304,7 +304,7 @@ Enable or disable the processor:
 SELECT partitioncache_set_processor_enabled_cron(true, 'partitioncache_queue', 'myapp_db');
 SELECT partitioncache_set_processor_enabled_cron(false, 'partitioncache_queue', 'myapp_db');
 
--- Advanced usage with explicit job name
+-- Advanced usage with explicit job name (optional fourth parameter)
 SELECT partitioncache_set_processor_enabled_cron(true, 'partitioncache_queue', 'myapp_db', 'partitioncache_process_queue_myapp_db');
 SELECT partitioncache_set_processor_enabled_cron(false, 'partitioncache_queue', 'myapp_db', 'partitioncache_process_queue_myapp_db');
 ```

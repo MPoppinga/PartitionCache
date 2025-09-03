@@ -200,15 +200,12 @@ def check_and_grant_pg_cron_permissions() -> tuple[bool, str]:
                 work_user = os.getenv("DB_USER")
 
                 # Check if user has required permissions
-                cur.execute(
-                    """
+                cur.execute("""
                     SELECT
                         has_schema_privilege(%s, 'cron', 'USAGE') as schema_usage,
                         has_function_privilege(%s, 'cron.schedule_in_database(text,text,text,text,text,boolean)', 'EXECUTE') as schedule_exec,
                         has_function_privilege(%s, 'cron.unschedule(bigint)', 'EXECUTE') as unschedule_exec
-                """,
-                    (work_user, work_user, work_user),
-                )
+                """, (work_user, work_user, work_user))
 
                 perms = cur.fetchone()
                 if not perms:
@@ -603,12 +600,9 @@ def handle_setup(table_prefix: str, queue_prefix: str, cache_backend: str, frequ
 
     # Include table_prefix to support multiple processors per database
     # Extract suffix from table_prefix, handling edge cases carefully
-    if table_prefix is None:
-        # For None, use simple naming without suffix
+    if table_prefix is None or table_prefix.strip() == '':
+        # For None or empty string, use simple naming without suffix
         job_name = f"partitioncache_process_queue_{target_database}"
-    elif table_prefix.strip() == '':
-        # For empty string, use 'empty' suffix to distinguish from None
-        job_name = f"partitioncache_process_queue_{target_database}_empty"
     elif table_prefix == 'partitioncache':
         table_suffix = 'base'  # Special case for exact match
         job_name = f"partitioncache_process_queue_{target_database}_{table_suffix}"
@@ -965,8 +959,9 @@ def main():
     parser_perms = subparsers.add_parser("check-permissions", help="Check and optionally grant pg_cron permissions")
     parser_perms.set_defaults(
         func=lambda args: (
-            lambda: print("Checking pg_cron permissions...") or (lambda result: print(f"Result: {result[1]}"))(check_and_grant_pg_cron_permissions())
-        )()
+            print("Checking pg_cron permissions...") or
+            print(f"Result: {check_and_grant_pg_cron_permissions()[1]}")
+        )
     )
 
     # manual-process command
