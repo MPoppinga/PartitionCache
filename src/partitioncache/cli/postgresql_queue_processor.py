@@ -510,9 +510,10 @@ def enable_processor(queue_prefix: str):
     """Enable the queue processor job."""
     logger.info("Enabling queue processor...")
     conn = get_pg_cron_connection()
+    target_database = get_cache_database_name()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT partitioncache_set_processor_enabled_cron(true, %s)", [queue_prefix])
+            cur.execute("SELECT partitioncache_set_processor_enabled_cron(true, %s, %s)", [queue_prefix, target_database])
         conn.commit()
         logger.info("Queue processor enabled.")
     finally:
@@ -523,9 +524,10 @@ def disable_processor(queue_prefix: str):
     """Disable the queue processor job."""
     logger.info("Disabling queue processor...")
     conn = get_pg_cron_connection()
+    target_database = get_cache_database_name()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT partitioncache_set_processor_enabled_cron(false, %s)", [queue_prefix])
+            cur.execute("SELECT partitioncache_set_processor_enabled_cron(false, %s, %s)", [queue_prefix, target_database])
         conn.commit()
         logger.info("Queue processor disabled.")
     finally:
@@ -599,7 +601,23 @@ def handle_setup(table_prefix: str, queue_prefix: str, cache_backend: str, frequ
         logger.info(f"Setting up components in cross-database mode: cron={get_cron_database_name()}, cache={get_cache_database_name()}")
         setup_database_objects(cache_conn, cron_conn)
 
-    job_name = f"partitioncache_process_queue_{target_database}"
+    # Include table_prefix to support multiple processors per database
+    # Extract suffix from table_prefix, handling edge cases carefully
+    if table_prefix is None:
+        # For None, use simple naming without suffix
+        job_name = f"partitioncache_process_queue_{target_database}"
+    elif table_prefix.strip() == '':
+        # For empty string, use 'empty' suffix to distinguish from None
+        job_name = f"partitioncache_process_queue_{target_database}_empty"
+    elif table_prefix == 'partitioncache':
+        table_suffix = 'base'  # Special case for exact match
+        job_name = f"partitioncache_process_queue_{target_database}_{table_suffix}"
+    elif table_prefix.startswith('partitioncache_'):
+        table_suffix = table_prefix[len('partitioncache_'):].replace('_', '') or 'empty'
+        job_name = f"partitioncache_process_queue_{target_database}_{table_suffix}"
+    else:
+        table_suffix = table_prefix.replace('_', '') or 'custom'
+        job_name = f"partitioncache_process_queue_{target_database}_{table_suffix}"
 
     # Insert configuration in cron database for pg_cron job management
     actual_cron_conn = cache_conn if get_cron_database_name() == get_cache_database_name() else cron_conn
@@ -626,9 +644,10 @@ def get_processor_status(queue_prefix: str):
     """Get basic processor status from cron database."""
     logger.info("Fetching processor status...")
     conn = get_pg_cron_connection()
+    target_database = get_cache_database_name()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT * FROM partitioncache_get_processor_status(%s)", [queue_prefix])
+            cur.execute("SELECT * FROM partitioncache_get_processor_status(%s, %s)", [queue_prefix, target_database])
             status = cur.fetchone()  # type: ignore[assignment]
             if status:
                 columns = [desc[0] for desc in cur.description]  # type: ignore[attr-defined]
@@ -642,9 +661,10 @@ def get_processor_status_detailed(table_prefix: str, queue_prefix: str):
     """Get detailed processor status from cron database."""
     logger.info("Fetching detailed processor status...")
     conn = get_pg_cron_connection()
+    target_database = get_cache_database_name()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT * FROM partitioncache_get_processor_status_detailed(%s, %s)", [table_prefix, queue_prefix])
+            cur.execute("SELECT * FROM partitioncache_get_processor_status_detailed(%s, %s, %s)", [table_prefix, queue_prefix, target_database])
             status = cur.fetchone()
             if status:
                 columns = [desc[0] for desc in cur.description]  # type: ignore[attr-defined]

@@ -192,21 +192,90 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+-- Helper function to construct job names consistently with Python setup logic
+CREATE OR REPLACE FUNCTION partitioncache_construct_job_name(
+    p_target_database TEXT,
+    p_table_prefix TEXT DEFAULT NULL
+)
+RETURNS TEXT AS $$
+DECLARE
+    v_table_suffix TEXT;
+BEGIN
+    IF p_table_prefix IS NOT NULL THEN
+        -- Extract suffix from table_prefix using same logic as Python
+        IF p_table_prefix = 'partitioncache' THEN
+            v_table_suffix := 'base';  -- Special case for exact match
+        ELSIF p_table_prefix LIKE 'partitioncache_%' THEN
+            v_table_suffix := substring(p_table_prefix from 16);  -- Skip 'partitioncache_' (15 chars + 1)
+            v_table_suffix := regexp_replace(v_table_suffix, '_', '', 'g');
+            IF v_table_suffix = '' THEN
+                v_table_suffix := 'empty';
+            END IF;
+        ELSE
+            v_table_suffix := regexp_replace(p_table_prefix, '_', '', 'g');
+            IF v_table_suffix = '' THEN
+                v_table_suffix := 'custom';
+            END IF;
+        END IF;
+        
+        RETURN 'partitioncache_process_queue_' || p_target_database || '_' || v_table_suffix;
+    ELSE
+        -- Fallback for single table prefix per database
+        RETURN 'partitioncache_process_queue_' || p_target_database;
+    END IF;
+END;
+$$ LANGUAGE plpgsql;
+
 -- Function to enable or disable the queue processor (from cron database)
 CREATE OR REPLACE FUNCTION partitioncache_set_processor_enabled_cron(
     p_enabled BOOLEAN, 
     p_queue_prefix TEXT DEFAULT 'partitioncache_queue',
+    p_target_database TEXT DEFAULT NULL,
     p_job_name TEXT DEFAULT NULL
 )
 RETURNS VOID AS $$
 DECLARE
     v_config_table TEXT;
     v_job_name TEXT;
+    v_target_db TEXT;
 BEGIN
     v_config_table := p_queue_prefix || '_processor_config';
     
-    -- Dynamic job name construction if not provided
-    v_job_name := COALESCE(p_job_name, 'partitioncache_process_queue_' || current_database());
+    -- Determine target database
+    v_target_db := p_target_database;
+    IF v_target_db IS NULL THEN
+        -- Try to get from existing config if not provided
+        BEGIN
+            EXECUTE format('SELECT target_database FROM %I LIMIT 1', v_config_table) INTO v_target_db;
+        EXCEPTION WHEN OTHERS THEN
+            RAISE EXCEPTION 'target_database is required when config table is empty or inaccessible';
+        END;
+    END IF;
+    
+    -- Dynamic job name construction using helper function
+    IF p_job_name IS NOT NULL THEN
+        v_job_name := p_job_name;
+    ELSE
+        -- Try to find a config entry for this target database to get table_prefix
+        DECLARE
+            v_table_prefix TEXT;
+            v_found_configs INTEGER := 0;
+        BEGIN
+            EXECUTE format('SELECT COUNT(*), MAX(table_prefix) FROM %I WHERE target_database = %L', 
+                          v_config_table, v_target_db) INTO v_found_configs, v_table_prefix;
+            
+            IF v_found_configs = 1 THEN
+                -- Single config found - use table_prefix for job name construction
+                v_job_name := partitioncache_construct_job_name(v_target_db, v_table_prefix);
+            ELSIF v_found_configs > 1 THEN
+                -- Multiple configs - ambiguous, require explicit job_name
+                RAISE EXCEPTION 'Multiple processor configurations found for database %. Please specify explicit job_name parameter.', v_target_db;
+            ELSE
+                -- No configs found - use simple naming
+                v_job_name := partitioncache_construct_job_name(v_target_db, NULL);
+            END IF;
+        END;
+    END IF;
     
     EXECUTE format(
         'UPDATE %I SET enabled = %L, updated_at = NOW() WHERE job_name = %L',
@@ -234,11 +303,45 @@ DECLARE
     v_update_sql TEXT;
     v_set_clauses TEXT[] := '{}';
     v_job_name TEXT;
+    v_target_db TEXT;
 BEGIN
     v_config_table := p_queue_prefix || '_processor_config';
     
-    -- Dynamic job name construction if not provided
-    v_job_name := COALESCE(p_job_name, 'partitioncache_process_queue_' || current_database());
+    -- Determine target database for job name construction
+    v_target_db := p_target_database;
+    IF v_target_db IS NULL AND p_job_name IS NULL THEN
+        -- Need target database to construct job name
+        BEGIN
+            EXECUTE format('SELECT target_database FROM %I LIMIT 1', v_config_table) INTO v_target_db;
+        EXCEPTION WHEN OTHERS THEN
+            RAISE EXCEPTION 'target_database is required when job_name is not provided and config is empty';
+        END;
+    END IF;
+    
+    -- Dynamic job name construction using helper function
+    IF p_job_name IS NOT NULL THEN
+        v_job_name := p_job_name;
+    ELSE
+        -- Try to find a config entry for this target database to get table_prefix
+        DECLARE
+            v_table_prefix TEXT;
+            v_found_configs INTEGER := 0;
+        BEGIN
+            EXECUTE format('SELECT COUNT(*), MAX(table_prefix) FROM %I WHERE target_database = %L', 
+                          v_config_table, v_target_db) INTO v_found_configs, v_table_prefix;
+            
+            IF v_found_configs = 1 THEN
+                -- Single config found - use table_prefix for job name construction
+                v_job_name := partitioncache_construct_job_name(v_target_db, v_table_prefix);
+            ELSIF v_found_configs > 1 THEN
+                -- Multiple configs - ambiguous, require explicit job_name
+                RAISE EXCEPTION 'Multiple processor configurations found for database %. Please specify explicit job_name parameter.', v_target_db;
+            ELSE
+                -- No configs found - use simple naming
+                v_job_name := partitioncache_construct_job_name(v_target_db, NULL);
+            END IF;
+        END;
+    END IF;
 
     -- Build the SET clauses dynamically
     IF p_enabled IS NOT NULL THEN

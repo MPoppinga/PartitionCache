@@ -1,5 +1,58 @@
+-- Helper function to resolve job name from parameters
+CREATE OR REPLACE FUNCTION partitioncache_resolve_job_name(
+    p_queue_prefix TEXT,
+    p_target_database TEXT DEFAULT NULL,
+    p_job_name TEXT DEFAULT NULL
+)
+RETURNS TEXT AS $$
+DECLARE
+    v_config_table TEXT;
+    v_job_name TEXT;
+    v_target_db TEXT;
+BEGIN
+    v_config_table := p_queue_prefix || '_processor_config';
+    
+    -- Determine job name to search for
+    IF p_job_name IS NOT NULL THEN
+        RETURN p_job_name;
+    ELSIF p_target_database IS NOT NULL THEN
+        -- Try to find a config entry for this target database to get table_prefix
+        DECLARE
+            v_table_prefix TEXT;
+            v_found_configs INTEGER := 0;
+        BEGIN
+            EXECUTE format('SELECT COUNT(*), MAX(table_prefix) FROM %I WHERE target_database = %L', 
+                          v_config_table, p_target_database) INTO v_found_configs, v_table_prefix;
+            
+            IF v_found_configs = 1 THEN
+                -- Single config found - use table_prefix for job name construction
+                RETURN partitioncache_construct_job_name(p_target_database, v_table_prefix);
+            ELSIF v_found_configs > 1 THEN
+                -- Multiple configs - ambiguous, require explicit job_name
+                RAISE EXCEPTION 'Multiple processor configurations found for database %. Please specify explicit job_name parameter.', p_target_database;
+            ELSE
+                -- No configs found - use simple naming
+                RETURN partitioncache_construct_job_name(p_target_database, NULL);
+            END IF;
+        END;
+    ELSE
+        -- Try to get from config if neither provided
+        BEGIN
+            EXECUTE format('SELECT target_database FROM %I LIMIT 1', v_config_table) INTO v_target_db;
+            RETURN partitioncache_construct_job_name(v_target_db, NULL);
+        EXCEPTION WHEN OTHERS THEN
+            RAISE EXCEPTION 'Either target_database or job_name must be provided when config is empty';
+        END;
+    END IF;
+END;
+$$ LANGUAGE plpgsql;
+
 -- Function to get basic processor status
-CREATE OR REPLACE FUNCTION partitioncache_get_processor_status(p_queue_prefix TEXT, p_job_name TEXT DEFAULT NULL)
+CREATE OR REPLACE FUNCTION partitioncache_get_processor_status(
+    p_queue_prefix TEXT, 
+    p_target_database TEXT DEFAULT NULL,
+    p_job_name TEXT DEFAULT NULL
+)
 RETURNS TABLE(
     job_name TEXT,
     enabled BOOLEAN,
@@ -20,9 +73,7 @@ DECLARE
     v_job_name TEXT;
 BEGIN
     v_config_table := p_queue_prefix || '_processor_config';
-    
-    -- Dynamic job name construction if not provided
-    v_job_name := COALESCE(p_job_name, 'partitioncache_process_queue_' || current_database());
+    v_job_name := partitioncache_resolve_job_name(p_queue_prefix, p_target_database, p_job_name);
 
     RETURN QUERY
     EXECUTE format(
@@ -58,7 +109,12 @@ END;
 $$ LANGUAGE plpgsql;
 
 -- Enhanced processor status function with queue information
-CREATE OR REPLACE FUNCTION partitioncache_get_processor_status_detailed(p_table_prefix TEXT, p_queue_prefix TEXT, p_job_name TEXT DEFAULT NULL)
+CREATE OR REPLACE FUNCTION partitioncache_get_processor_status_detailed(
+    p_table_prefix TEXT, 
+    p_queue_prefix TEXT, 
+    p_target_database TEXT DEFAULT NULL,
+    p_job_name TEXT DEFAULT NULL
+)
 RETURNS TABLE(
     -- Basic processor status
     job_name TEXT,
@@ -83,9 +139,7 @@ DECLARE
 BEGIN
     v_queue_table := p_queue_prefix || '_query_fragment_queue';
     v_config_table := p_queue_prefix || '_processor_config';
-    
-    -- Dynamic job name construction if not provided
-    v_job_name := COALESCE(p_job_name, 'partitioncache_process_queue_' || current_database());
+    v_job_name := partitioncache_resolve_job_name(p_queue_prefix, p_target_database, p_job_name);
 
     RETURN QUERY
     EXECUTE format(
@@ -103,8 +157,8 @@ BEGIN
             NULL::JSON as recent_logs,
             NULL::JSON as active_job_details
         FROM
-            partitioncache_get_processor_status(%L, %L) s',
-        p_queue_prefix, v_job_name
+            partitioncache_get_processor_status(%L, %L, %L) s',
+        p_queue_prefix, p_target_database, v_job_name
     );
 END;
 

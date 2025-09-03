@@ -8,11 +8,12 @@ This approach offers significant advantages in reliability, performance, and ope
 
 ### Dynamic Job Naming
 
-PostgreSQL queue processor functions support **automatic database-specific job naming**:
+PostgreSQL queue processor functions support **database-specific job naming**:
 
-- **Simple Usage**: Omit job names and they'll be automatically constructed as `partitioncache_process_queue_<current_database>`
-- **Advanced Usage**: Explicitly specify job names for fine-grained control
+- **Required Parameter**: Functions now require `target_database` parameter to construct job names correctly
+- **Job Name Pattern**: Job names are constructed as `partitioncache_process_queue_<target_database>`
 - **Multi-Database Support**: Different databases can run processors simultaneously without conflicts
+- **Cross-Database Safety**: Ensures correct job naming even when pg_cron runs in a different database
 
 ### Cross-Database Architecture Support
 
@@ -280,11 +281,11 @@ Processes individual queue items:
 Returns comprehensive processor status:
 
 ```sql
--- Simple usage (job name automatically constructed from current database)
-SELECT * FROM partitioncache_get_processor_status('partitioncache_queue');
+-- Simple usage (provide target database for job name construction)
+SELECT * FROM partitioncache_get_processor_status('partitioncache_queue', 'myapp_db');
 
 -- Advanced usage with explicit job name
-SELECT * FROM partitioncache_get_processor_status('partitioncache_queue', 'partitioncache_process_queue_<db_name>');
+SELECT * FROM partitioncache_get_processor_status('partitioncache_queue', 'myapp_db', 'partitioncache_process_queue_myapp_db');
 ```
 
 **Returns:**
@@ -299,13 +300,13 @@ SELECT * FROM partitioncache_get_processor_status('partitioncache_queue', 'parti
 Enable or disable the processor:
 
 ```sql
--- Simple usage (job name automatically constructed from current database)
-SELECT partitioncache_set_processor_enabled_cron(true, 'partitioncache_queue');
-SELECT partitioncache_set_processor_enabled_cron(false, 'partitioncache_queue');
+-- Simple usage (provide target database for job name construction)
+SELECT partitioncache_set_processor_enabled_cron(true, 'partitioncache_queue', 'myapp_db');
+SELECT partitioncache_set_processor_enabled_cron(false, 'partitioncache_queue', 'myapp_db');
 
 -- Advanced usage with explicit job name
-SELECT partitioncache_set_processor_enabled_cron(true, 'partitioncache_queue', 'partitioncache_process_queue_<db_name>');
-SELECT partitioncache_set_processor_enabled_cron(false, 'partitioncache_queue', 'partitioncache_process_queue_<db_name>');
+SELECT partitioncache_set_processor_enabled_cron(true, 'partitioncache_queue', 'myapp_db', 'partitioncache_process_queue_myapp_db');
+SELECT partitioncache_set_processor_enabled_cron(false, 'partitioncache_queue', 'myapp_db', 'partitioncache_process_queue_myapp_db');
 ```
 
 ### Configuration Management
