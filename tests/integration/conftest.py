@@ -411,7 +411,7 @@ def _is_rocksdict_available():
     """Check if rocksdict is available for testing."""
     import importlib.util
 
-    return importlib.util.find_spec("rocksdic") is not None
+    return importlib.util.find_spec("rocksdict") is not None
 
 
 # Add RocksDB backends if the module is available

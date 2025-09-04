@@ -93,7 +93,7 @@ def get_queue_table_prefix_from_env() -> str:
 
 def get_cache_database_name() -> str:
     """Get the cache database name from environment."""
-    return os.getenv("DB_NAME", "geominedb2_pdb")
+    return os.getenv("DB_NAME", "postgres")
 
 
 def get_cron_database_name() -> str:
@@ -118,17 +118,17 @@ def construct_processor_job_name(target_database: str, table_prefix: str | None)
     """
     base_name = f"partitioncache_process_queue_{target_database}"
 
-    if not table_prefix or table_prefix.strip() == '':
+    if not table_prefix or table_prefix.strip() == "":
         # No suffix for null/empty prefix
         job_name = base_name
     else:
         # Extract and clean suffix based on prefix pattern
-        if table_prefix == 'partitioncache':
-            suffix = 'default'
-        elif table_prefix.startswith('partitioncache_'):
-            suffix = table_prefix[len('partitioncache_'):].replace('_', '') or 'default'
+        if table_prefix == "partitioncache":
+            suffix = "default"
+        elif table_prefix.startswith("partitioncache_"):
+            suffix = table_prefix[len("partitioncache_") :].replace("_", "") or "default"
         else:
-            suffix = table_prefix.replace('_', '') or 'custom'
+            suffix = table_prefix.replace("_", "") or "custom"
 
         job_name = f"{base_name}_{suffix}"
 
@@ -241,12 +241,15 @@ def check_and_grant_pg_cron_permissions() -> tuple[bool, str]:
                 work_user = os.getenv("DB_USER")
 
                 # Check if user has required permissions
-                cur.execute("""
+                cur.execute(
+                    """
                     SELECT
                         has_schema_privilege(%s, 'cron', 'USAGE') as schema_usage,
                         has_function_privilege(%s, 'cron.schedule_in_database(text,text,text,text,text,boolean)', 'EXECUTE') as schedule_exec,
                         has_function_privilege(%s, 'cron.unschedule(bigint)', 'EXECUTE') as unschedule_exec
-                """, (work_user, work_user, work_user))
+                """,
+                    (work_user, work_user, work_user),
+                )
 
                 perms = cur.fetchone()
                 if not perms:
@@ -988,6 +991,7 @@ def main():
 
     # check-permissions command
     parser_perms = subparsers.add_parser("check-permissions", help="Check and optionally grant pg_cron permissions")
+
     def check_permissions_command(args):
         print("Checking pg_cron permissions...")
         result = check_and_grant_pg_cron_permissions()

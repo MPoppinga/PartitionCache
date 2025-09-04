@@ -71,40 +71,77 @@ RETURNS TABLE(
 DECLARE
     v_config_table TEXT;
     v_job_name TEXT;
+    v_pg_cron_available BOOLEAN := FALSE;
 BEGIN
     v_config_table := p_queue_prefix || '_processor_config';
     v_job_name := partitioncache_resolve_job_name(p_queue_prefix, p_target_database, p_job_name);
 
-    RETURN QUERY
-    EXECUTE format(
-        'WITH cron_jobs AS (
+    -- Check if pg_cron extension is available
+    BEGIN
+        PERFORM 1 FROM pg_extension WHERE extname = 'pg_cron';
+        IF FOUND THEN
+            v_pg_cron_available := TRUE;
+        END IF;
+    EXCEPTION WHEN OTHERS THEN
+        v_pg_cron_available := FALSE;
+    END;
+
+    IF v_pg_cron_available THEN
+        RETURN QUERY
+        EXECUTE format(
+            'WITH cron_jobs AS (
+                SELECT
+                    active,
+                    schedule,
+                    command
+                FROM cron.job
+                WHERE jobname LIKE %L || %L
+            )
             SELECT
-                active,
-                schedule,
-                command
-            FROM cron.job
-            WHERE jobname LIKE %L || %L
-        )
-        SELECT
-            conf.job_name,
-            conf.enabled,
-            conf.max_parallel_jobs,
-            conf.frequency_seconds,
-            conf.timeout_seconds,
-            conf.table_prefix,
-            conf.queue_prefix,
-            conf.cache_backend,
-            conf.updated_at,
-            (SELECT bool_or(active) FROM cron_jobs) as job_is_active,
-            (SELECT schedule FROM cron_jobs LIMIT 1) as job_schedule,
-            (SELECT command FROM cron_jobs LIMIT 1) as job_command,
-            0::INTEGER
-        FROM
-            %I conf
-        WHERE
-            conf.job_name = %L',
-        v_job_name, '_%', v_config_table, v_job_name
-    );
+                conf.job_name,
+                conf.enabled,
+                conf.max_parallel_jobs,
+                conf.frequency_seconds,
+                conf.timeout_seconds,
+                conf.table_prefix,
+                conf.queue_prefix,
+                conf.cache_backend,
+                conf.updated_at,
+                (SELECT bool_or(active) FROM cron_jobs) as job_is_active,
+                (SELECT schedule FROM cron_jobs LIMIT 1) as job_schedule,
+                (SELECT command FROM cron_jobs LIMIT 1) as job_command,
+                0::INTEGER
+            FROM
+                %I conf
+            WHERE
+                conf.job_name = %L',
+            v_job_name, '_%', v_config_table, v_job_name
+        );
+    ELSE
+        -- Fallback when pg_cron is not available: return config with inactive cron info
+        RETURN QUERY
+        EXECUTE format(
+            'SELECT
+                conf.job_name,
+                conf.enabled,
+                conf.max_parallel_jobs,
+                conf.frequency_seconds,
+                conf.timeout_seconds,
+                conf.table_prefix,
+                conf.queue_prefix,
+                conf.cache_backend,
+                conf.updated_at,
+                FALSE as job_is_active,
+                NULL::TEXT as job_schedule,
+                NULL::TEXT as job_command,
+                0::INTEGER
+            FROM
+                %I conf
+            WHERE
+                conf.job_name = %L',
+            v_config_table, v_job_name
+        );
+    END IF;
 END;
 $$ LANGUAGE plpgsql;
 
