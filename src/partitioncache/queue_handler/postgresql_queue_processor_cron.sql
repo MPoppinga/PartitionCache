@@ -212,9 +212,11 @@ BEGIN
                 v_table_suffix := 'default';  -- Use 'default' for empty suffix (consistent with Python)
             END IF;
         ELSE
+            -- For non-standard table prefixes (not starting with 'partitioncache')
+            -- remove underscores and use 'custom' as fallback for empty results
             v_table_suffix := regexp_replace(p_table_prefix, '_', '', 'g');
             IF v_table_suffix = '' THEN
-                v_table_suffix := 'custom';
+                v_table_suffix := 'custom';  -- Fallback for edge cases with only underscores
             END IF;
         END IF;
         

@@ -600,6 +600,8 @@ def handle_setup(table_prefix: str, queue_prefix: str, cache_backend: str, frequ
 
     # Include table_prefix to support multiple processors per database
     # Extract suffix from table_prefix, handling edge cases carefully
+    # NOTE: Job name construction logic is intentionally duplicated in SQL
+    # (partitioncache_construct_job_name) for consistency and maintainability
     if table_prefix is None or table_prefix.strip() == '':
         # For None or empty string, use simple naming without suffix
         job_name = f"partitioncache_process_queue_{target_database}"
@@ -610,6 +612,8 @@ def handle_setup(table_prefix: str, queue_prefix: str, cache_backend: str, frequ
         table_suffix = table_prefix[len('partitioncache_'):].replace('_', '') or 'default'
         job_name = f"partitioncache_process_queue_{target_database}_{table_suffix}"
     else:
+        # For non-standard table prefixes (not starting with 'partitioncache')
+        # remove underscores and use 'custom' as fallback for empty results
         table_suffix = table_prefix.replace('_', '') or 'custom'
         job_name = f"partitioncache_process_queue_{target_database}_{table_suffix}"
 
