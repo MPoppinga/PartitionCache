@@ -104,33 +104,42 @@ def get_cron_database_name() -> str:
 def construct_processor_job_name(target_database: str, table_prefix: str | None) -> str:
     """
     Construct a processor job name from database and table prefix.
-    
+
     This mirrors the SQL partitioncache_construct_job_name() function logic
     to ensure consistency between Python and SQL job naming.
-    
+
     Args:
         target_database: The target database name
         table_prefix: Optional table prefix for multiple processors per database
-        
+
     Returns:
         The constructed job name following the pattern:
         partitioncache_process_queue_<database>[_<suffix>]
     """
     base_name = f"partitioncache_process_queue_{target_database}"
-    
+
     if not table_prefix or table_prefix.strip() == '':
         # No suffix for null/empty prefix
-        return base_name
-    
-    # Extract and clean suffix based on prefix pattern
-    if table_prefix == 'partitioncache':
-        suffix = 'default'
-    elif table_prefix.startswith('partitioncache_'):
-        suffix = table_prefix[len('partitioncache_'):].replace('_', '') or 'default'
+        job_name = base_name
     else:
-        suffix = table_prefix.replace('_', '') or 'custom'
-    
-    return f"{base_name}_{suffix}"
+        # Extract and clean suffix based on prefix pattern
+        if table_prefix == 'partitioncache':
+            suffix = 'default'
+        elif table_prefix.startswith('partitioncache_'):
+            suffix = table_prefix[len('partitioncache_'):].replace('_', '') or 'default'
+        else:
+            suffix = table_prefix.replace('_', '') or 'custom'
+
+        job_name = f"{base_name}_{suffix}"
+
+    # PostgreSQL identifier length limit is 63 characters
+    if len(job_name) > 63:
+        # Truncate and add warning
+        truncated_name = job_name[:63]
+        logger.warning(f"Job name '{job_name}' exceeds PostgreSQL 63-character limit. Truncating to '{truncated_name}'")
+        return truncated_name
+
+    return job_name
 
 
 def validate_environment() -> tuple[bool, str]:

@@ -21,7 +21,7 @@ class TestMultipleTablePrefixes:
         3. No configuration conflicts between different processors
         """
         from partitioncache.cli.postgresql_queue_processor import (
-            insert_initial_config, 
+            construct_processor_job_name,
             get_cache_database_name,
             get_queue_table_prefix_from_env
         )
@@ -46,11 +46,10 @@ class TestMultipleTablePrefixes:
             "custom_cache"
         ]
         
-        # Generate expected job names using same logic as Python setup
+        # Generate expected job names using the actual function
         expected_jobs = []
         for table_prefix in test_prefixes:
-            table_suffix = table_prefix.replace('partitioncache', '').replace('_', '') or 'default'
-            job_name = f"partitioncache_process_queue_{target_database}_{table_suffix}"
+            job_name = construct_processor_job_name(target_database, table_prefix)
             expected_jobs.append((table_prefix, job_name))
         
         timestamp = int(time.time())

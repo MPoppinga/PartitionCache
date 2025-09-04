@@ -511,18 +511,19 @@ BEGIN
     -- Get current database name for dynamic job name
     v_current_db := current_database();
     
-    -- Use provided job name or construct default based on current database
-    v_job_name := COALESCE(p_job_name, 'partitioncache_process_queue_' || v_current_db);
-    
     -- Try to get configuration from local config table first
     v_config_table := COALESCE(current_setting('partitioncache.queue_prefix', true), 'partitioncache_queue') || '_processor_config';
     
-    BEGIN
-        EXECUTE format('SELECT job_name, enabled, max_parallel_jobs, frequency_seconds, timeout_seconds, table_prefix, queue_prefix, cache_backend, target_database, result_limit, default_bitsize FROM %I WHERE job_name = %L', 
-                      v_config_table, v_job_name) INTO v_config;
-    EXCEPTION WHEN OTHERS THEN
-        v_config := NULL;
-    END;
+    -- If job name provided, try exact match first
+    IF p_job_name IS NOT NULL THEN
+        v_job_name := p_job_name;
+        BEGIN
+            EXECUTE format('SELECT job_name, enabled, max_parallel_jobs, frequency_seconds, timeout_seconds, table_prefix, queue_prefix, cache_backend, target_database, result_limit, default_bitsize FROM %I WHERE job_name = %L', 
+                          v_config_table, v_job_name) INTO v_config;
+        EXCEPTION WHEN OTHERS THEN
+            v_config := NULL;
+        END;
+    END IF;
     
     -- If no config found with exact name, try to find config for current database
     IF v_config IS NULL THEN
@@ -549,11 +550,13 @@ BEGIN
         LIMIT 1;
         
         IF v_config_table IS NOT NULL THEN
-            -- Try exact match first
-            EXECUTE format('SELECT job_name, enabled, max_parallel_jobs, frequency_seconds, timeout_seconds, table_prefix, queue_prefix, cache_backend, target_database, result_limit, default_bitsize FROM %I WHERE job_name = %L', 
-                          v_config_table, v_job_name) INTO v_config;
+            -- Try exact match first if job_name was provided
+            IF p_job_name IS NOT NULL THEN
+                EXECUTE format('SELECT job_name, enabled, max_parallel_jobs, frequency_seconds, timeout_seconds, table_prefix, queue_prefix, cache_backend, target_database, result_limit, default_bitsize FROM %I WHERE job_name = %L', 
+                              v_config_table, v_job_name) INTO v_config;
+            END IF;
             
-            -- If no exact match, try pattern match for current database
+            -- If no config found yet, try pattern match for current database
             IF v_config IS NULL THEN
                 EXECUTE format('SELECT job_name, enabled, max_parallel_jobs, frequency_seconds, timeout_seconds, table_prefix, queue_prefix, cache_backend, target_database, result_limit, default_bitsize FROM %I WHERE job_name LIKE %L AND (target_database = %L OR target_database = current_database()) LIMIT 1', 
                               v_config_table, 'partitioncache_process_queue_' || v_current_db || '%', v_current_db) INTO v_config;

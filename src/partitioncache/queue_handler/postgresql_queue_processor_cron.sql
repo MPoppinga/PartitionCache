@@ -200,6 +200,7 @@ CREATE OR REPLACE FUNCTION partitioncache_construct_job_name(
 RETURNS TEXT AS $$
 DECLARE
     v_table_suffix TEXT;
+    v_job_name TEXT;
 BEGIN
     IF p_table_prefix IS NOT NULL THEN
         -- Extract suffix from table_prefix using same logic as Python
@@ -220,11 +221,20 @@ BEGIN
             END IF;
         END IF;
         
-        RETURN 'partitioncache_process_queue_' || p_target_database || '_' || v_table_suffix;
+        v_job_name := 'partitioncache_process_queue_' || p_target_database || '_' || v_table_suffix;
     ELSE
         -- Fallback for single table prefix per database
-        RETURN 'partitioncache_process_queue_' || p_target_database;
+        v_job_name := 'partitioncache_process_queue_' || p_target_database;
     END IF;
+    
+    -- Check PostgreSQL identifier length limit (63 characters)
+    IF length(v_job_name) > 63 THEN
+        RAISE WARNING 'Job name ''%'' exceeds PostgreSQL 63-character limit. Truncating to ''%''', 
+                      v_job_name, substring(v_job_name from 1 for 63);
+        v_job_name := substring(v_job_name from 1 for 63);
+    END IF;
+    
+    RETURN v_job_name;
 END;
 $$ LANGUAGE plpgsql;
 
