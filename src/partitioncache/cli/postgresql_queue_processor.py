@@ -101,6 +101,38 @@ def get_cron_database_name() -> str:
     return os.getenv("PG_CRON_DATABASE", "postgres")
 
 
+def construct_processor_job_name(target_database: str, table_prefix: str | None) -> str:
+    """
+    Construct a processor job name from database and table prefix.
+    
+    This mirrors the SQL partitioncache_construct_job_name() function logic
+    to ensure consistency between Python and SQL job naming.
+    
+    Args:
+        target_database: The target database name
+        table_prefix: Optional table prefix for multiple processors per database
+        
+    Returns:
+        The constructed job name following the pattern:
+        partitioncache_process_queue_<database>[_<suffix>]
+    """
+    base_name = f"partitioncache_process_queue_{target_database}"
+    
+    if not table_prefix or table_prefix.strip() == '':
+        # No suffix for null/empty prefix
+        return base_name
+    
+    # Extract and clean suffix based on prefix pattern
+    if table_prefix == 'partitioncache':
+        suffix = 'default'
+    elif table_prefix.startswith('partitioncache_'):
+        suffix = table_prefix[len('partitioncache_'):].replace('_', '') or 'default'
+    else:
+        suffix = table_prefix.replace('_', '') or 'custom'
+    
+    return f"{base_name}_{suffix}"
+
+
 def validate_environment() -> tuple[bool, str]:
     """Validate that all required environment variables are set and consistent."""
     required_vars = {
@@ -451,6 +483,7 @@ def remove_all_processor_objects(conn, queue_prefix: str):
 
     # Get the database name to construct the job name pattern
     target_database = get_cache_database_name()
+    # Match all processor jobs for this database
     job_name_pattern = f"partitioncache_process_queue_{target_database}%"
 
     with conn.cursor() as cur:
@@ -598,24 +631,9 @@ def handle_setup(table_prefix: str, queue_prefix: str, cache_backend: str, frequ
         logger.info(f"Setting up components in cross-database mode: cron={get_cron_database_name()}, cache={get_cache_database_name()}")
         setup_database_objects(cache_conn, cron_conn)
 
-    # Include table_prefix to support multiple processors per database
-    # Extract suffix from table_prefix, handling edge cases carefully
-    # NOTE: Job name construction logic is intentionally duplicated in SQL
-    # (partitioncache_construct_job_name) for consistency and maintainability
-    if table_prefix is None or table_prefix.strip() == '':
-        # For None or empty string, use simple naming without suffix
-        job_name = f"partitioncache_process_queue_{target_database}"
-    elif table_prefix == 'partitioncache':
-        table_suffix = 'default'  # Special case for exact match
-        job_name = f"partitioncache_process_queue_{target_database}_{table_suffix}"
-    elif table_prefix.startswith('partitioncache_'):
-        table_suffix = table_prefix[len('partitioncache_'):].replace('_', '') or 'default'
-        job_name = f"partitioncache_process_queue_{target_database}_{table_suffix}"
-    else:
-        # For non-standard table prefixes (not starting with 'partitioncache')
-        # remove underscores and use 'custom' as fallback for empty results
-        table_suffix = table_prefix.replace('_', '') or 'custom'
-        job_name = f"partitioncache_process_queue_{target_database}_{table_suffix}"
+    # Construct job name using simplified logic when we have full context
+    # The SQL helper function handles discovery scenarios where table_prefix is unknown
+    job_name = construct_processor_job_name(target_database, table_prefix)
 
     # Insert configuration in cron database for pg_cron job management
     actual_cron_conn = cache_conn if get_cron_database_name() == get_cache_database_name() else cron_conn
