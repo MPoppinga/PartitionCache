@@ -2,6 +2,59 @@
 -- This file contains components that must be installed in the pg_cron database
 -- These components handle eviction job scheduling via pg_cron
 
+-- Function to construct a unique eviction job name based on database and table prefix
+-- This ensures multiple eviction managers can coexist for different databases and table prefixes
+CREATE OR REPLACE FUNCTION partitioncache_construct_eviction_job_name(
+    p_target_database TEXT,
+    p_table_prefix TEXT DEFAULT NULL
+) RETURNS TEXT AS $$
+DECLARE
+    v_job_name TEXT;
+    v_table_suffix TEXT;
+BEGIN
+    -- Base name includes the database
+    v_job_name := 'partitioncache_evict_' || p_target_database;
+    
+    IF p_table_prefix IS NOT NULL AND p_table_prefix != '' THEN
+        -- Extract suffix from table prefix (e.g., 'partitioncache_cache1' -> 'cache1')
+        -- Special case: if table_prefix is just underscores or doesn't contain 'partitioncache'
+        IF REPLACE(p_table_prefix, '_', '') = '' OR POSITION('partitioncache' IN p_table_prefix) = 0 THEN
+            -- This is a custom prefix (not standard partitioncache pattern)
+            v_table_suffix := REPLACE(p_table_prefix, '_', '');
+            IF v_table_suffix = '' THEN
+                v_table_suffix := 'custom';
+            END IF;
+        ELSE
+            -- Remove 'partitioncache' prefix and any underscores
+            v_table_suffix := REPLACE(REPLACE(p_table_prefix, 'partitioncache', ''), '_', '');
+            IF v_table_suffix = '' THEN
+                v_table_suffix := 'default';
+            END IF;
+        END IF;
+        v_job_name := v_job_name || '_' || v_table_suffix;
+    END IF;
+    
+    -- PostgreSQL identifiers have a 63-character limit
+    -- If we exceed this, truncate intelligently to preserve uniqueness
+    IF LENGTH(v_job_name) > 63 THEN
+        -- For eviction jobs, preserve the suffix which differentiates table prefixes
+        -- Check if there's a suffix (underscore in the last 25 chars)
+        IF POSITION('_' IN SUBSTRING(v_job_name FROM LENGTH(v_job_name) - 24)) > 0 THEN
+            -- Try to keep first 40 chars + '...' + last 20 chars
+            v_job_name := SUBSTRING(v_job_name FROM 1 FOR 40) || '...' || 
+                         SUBSTRING(v_job_name FROM LENGTH(v_job_name) - 19);
+        ELSE
+            -- No clear suffix, just truncate to 63 chars
+            v_job_name := SUBSTRING(v_job_name FROM 1 FOR 63);
+        END IF;
+        
+        RAISE WARNING 'Job name exceeds PostgreSQL 63-character limit. Truncating to: %', v_job_name;
+    END IF;
+    
+    RETURN v_job_name;
+END;
+$$ LANGUAGE plpgsql IMMUTABLE;
+
 -- Function to initialize eviction configuration table in cron database
 CREATE OR REPLACE FUNCTION partitioncache_initialize_eviction_cron_config_table(p_table_prefix TEXT)
 RETURNS VOID AS $$
