@@ -604,10 +604,10 @@ def handle_setup(table_prefix: str, queue_prefix: str, cache_backend: str, frequ
         # For None or empty string, use simple naming without suffix
         job_name = f"partitioncache_process_queue_{target_database}"
     elif table_prefix == 'partitioncache':
-        table_suffix = 'base'  # Special case for exact match
+        table_suffix = 'default'  # Special case for exact match
         job_name = f"partitioncache_process_queue_{target_database}_{table_suffix}"
     elif table_prefix.startswith('partitioncache_'):
-        table_suffix = table_prefix[len('partitioncache_'):].replace('_', '') or 'empty'
+        table_suffix = table_prefix[len('partitioncache_'):].replace('_', '') or 'default'
         job_name = f"partitioncache_process_queue_{target_database}_{table_suffix}"
     else:
         table_suffix = table_prefix.replace('_', '') or 'custom'
@@ -957,12 +957,12 @@ def main():
 
     # check-permissions command
     parser_perms = subparsers.add_parser("check-permissions", help="Check and optionally grant pg_cron permissions")
-    parser_perms.set_defaults(
-        func=lambda args: (
-            print("Checking pg_cron permissions...") or
-            print(f"Result: {check_and_grant_pg_cron_permissions()[1]}")
-        )
-    )
+    def check_permissions_command(args):
+        print("Checking pg_cron permissions...")
+        result = check_and_grant_pg_cron_permissions()
+        print(f"Result: {result[1]}")
+
+    parser_perms.set_defaults(func=check_permissions_command)
 
     # manual-process command
     parser_manual = subparsers.add_parser("manual-process", help="Manually trigger processing of queue items for testing")

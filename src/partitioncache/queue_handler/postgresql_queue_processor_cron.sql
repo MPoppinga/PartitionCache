@@ -204,12 +204,12 @@ BEGIN
     IF p_table_prefix IS NOT NULL THEN
         -- Extract suffix from table_prefix using same logic as Python
         IF p_table_prefix = 'partitioncache' THEN
-            v_table_suffix := 'base';  -- Special case for exact match
+            v_table_suffix := 'default';  -- Special case for exact match (consistent with Python)
         ELSIF p_table_prefix LIKE 'partitioncache_%' THEN
-            v_table_suffix := substring(p_table_prefix from 16);  -- Skip 'partitioncache_' (15 chars + 1)
+            v_table_suffix := substring(p_table_prefix from (length('partitioncache_') + 1));  -- Skip 'partitioncache_' prefix dynamically
             v_table_suffix := regexp_replace(v_table_suffix, '_', '', 'g');
             IF v_table_suffix = '' THEN
-                v_table_suffix := 'empty';
+                v_table_suffix := 'default';  -- Use 'default' for empty suffix (consistent with Python)
             END IF;
         ELSE
             v_table_suffix := regexp_replace(p_table_prefix, '_', '', 'g');
