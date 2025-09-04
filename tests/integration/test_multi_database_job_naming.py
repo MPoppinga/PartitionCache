@@ -1,0 +1,216 @@
+"""Integration tests for multi-database job naming functionality."""
+
+
+import pytest
+
+from partitioncache.cli.postgresql_queue_processor import construct_processor_job_name, get_queue_table_prefix_from_env
+
+
+class TestMultiDatabaseJobNaming:
+    """Test suite for multi-database job naming and conflict prevention."""
+
+    def test_job_name_construction_variations(self):
+        """Test job name construction with various database names and table prefixes."""
+        # Test cases: (database_name, table_prefix, expected_job_name)
+        test_cases = [
+            # Simple database names
+            ("mydb", None, "partitioncache_process_queue_mydb"),
+            ("mydb", "partitioncache", "partitioncache_process_queue_mydb_default"),
+            ("mydb", "partitioncache_cache1", "partitioncache_process_queue_mydb_cache1"),
+            ("mydb", "custom_prefix", "partitioncache_process_queue_mydb_customprefix"),
+
+            # Database names with underscores
+            ("my_app_db", None, "partitioncache_process_queue_my_app_db"),
+            ("my_app_db", "partitioncache", "partitioncache_process_queue_my_app_db_default"),
+
+            # Edge cases
+            ("db", "partitioncache_", "partitioncache_process_queue_db_default"),
+            ("db", "_", "partitioncache_process_queue_db_custom"),
+
+            # Long names that should trigger truncation warning - will preserve suffix
+            ("very_long_database_name_that_exceeds_limit", "partitioncache_with_long_suffix",
+             None),  # Skip exact match test for truncated names, just verify length limit
+        ]
+
+        for db_name, table_prefix, expected_name in test_cases:
+            actual_name = construct_processor_job_name(db_name, table_prefix)
+
+            # For long names, check truncation
+            if expected_name is None:
+                # Just verify it's within the limit
+                assert len(actual_name) <= 63, f"Job name not truncated: {actual_name}"
+                # And that it preserves some suffix info if possible
+                if table_prefix and "suffix" in table_prefix:
+                    assert "suffix" in actual_name or "..." in actual_name, f"Suffix not preserved in truncation: {actual_name}"
+            else:
+                assert actual_name == expected_name, f"Mismatch for ({db_name}, {table_prefix}): expected {expected_name}, got {actual_name}"
+
+    def test_job_name_uniqueness_across_databases(self):
+        """Test that different databases get unique job names even with same table prefix."""
+        databases = ["db1", "db2", "production", "staging"]
+        table_prefix = "partitioncache_cache"
+
+        job_names = []
+        for db in databases:
+            job_name = construct_processor_job_name(db, table_prefix)
+            job_names.append(job_name)
+
+        # All job names should be unique
+        assert len(job_names) == len(set(job_names)), f"Duplicate job names found: {job_names}"
+
+        # All should contain the database name
+        for db, job_name in zip(databases, job_names, strict=False):
+            assert db in job_name, f"Database '{db}' not in job name '{job_name}'"
+
+    def test_job_name_uniqueness_same_database_different_prefixes(self):
+        """Test that same database with different prefixes gets unique job names."""
+        database = "testdb"
+        prefixes = [
+            None,
+            "partitioncache",
+            "partitioncache_cache1",
+            "partitioncache_cache2",
+            "custom_cache",
+            "another_prefix"
+        ]
+
+        job_names = []
+        for prefix in prefixes:
+            job_name = construct_processor_job_name(database, prefix)
+            job_names.append(job_name)
+
+        # All job names should be unique
+        assert len(job_names) == len(set(job_names)), f"Duplicate job names found: {job_names}"
+
+    def test_job_name_truncation_warning(self, caplog):
+        """Test that overly long job names trigger a warning and are truncated."""
+        import logging
+
+        # Create a really long database name
+        long_db = "extremely_long_database_name_that_will_definitely_exceed_postgresql_limit"
+        long_prefix = "partitioncache_another_very_long_suffix_here"
+
+        with caplog.at_level(logging.WARNING):
+            job_name = construct_processor_job_name(long_db, long_prefix)
+
+        # Check the job name was truncated
+        assert len(job_name) == 63, f"Job name not truncated to 63 chars: {len(job_name)}"
+
+        # Check that a warning was logged
+        assert "exceeds PostgreSQL 63-character limit" in caplog.text
+        assert "Truncating to" in caplog.text
+
+    @pytest.mark.integration
+    def test_sql_function_consistency(self, db_session):
+        """Test that SQL and Python functions produce the same job names."""
+        from partitioncache.queue import get_queue_provider_name
+
+        # Only run for PostgreSQL queue provider
+        if get_queue_provider_name() != "postgresql":
+            pytest.skip("This test is specific to PostgreSQL queue processor")
+
+        # Test cases for consistency check
+        test_cases = [
+            ("testdb", "partitioncache"),
+            ("testdb", "partitioncache_cache1"),
+            ("testdb", "custom_prefix"),
+            ("testdb", None),
+        ]
+
+        for db_name, table_prefix in test_cases:
+            # Get Python result
+            python_job_name = construct_processor_job_name(db_name, table_prefix)
+
+            # Get SQL result
+            with db_session.cursor() as cur:
+                if table_prefix:
+                    cur.execute(
+                        "SELECT partitioncache_construct_job_name(%s, %s)",
+                        (db_name, table_prefix)
+                    )
+                else:
+                    cur.execute(
+                        "SELECT partitioncache_construct_job_name(%s, NULL)",
+                        (db_name,)
+                    )
+                sql_job_name = cur.fetchone()[0]
+
+            # Both should produce the same result
+            assert python_job_name == sql_job_name, \
+                f"Mismatch for ({db_name}, {table_prefix}): Python={python_job_name}, SQL={sql_job_name}"
+
+    @pytest.mark.integration
+    @pytest.mark.slow
+    def test_multi_database_no_conflicts(self, db_session):
+        """Test that multiple databases can have processors without job name conflicts."""
+        from partitioncache.queue import get_queue_provider_name
+
+        # Only run for PostgreSQL queue provider
+        if get_queue_provider_name() != "postgresql":
+            pytest.skip("This test is specific to PostgreSQL queue processor")
+
+        queue_prefix = get_queue_table_prefix_from_env()
+        config_table = f"{queue_prefix}_processor_config"
+
+        # Simulate multiple databases with same table prefix
+        test_databases = ["app_db1", "app_db2", "app_db3"]
+        table_prefix = "partitioncache_cache"
+
+        # Generate job configurations for each database
+        configs = []
+        for db in test_databases:
+            job_name = construct_processor_job_name(db, table_prefix)
+            configs.append({
+                "job_name": job_name,
+                "target_database": db,
+                "table_prefix": table_prefix
+            })
+
+        try:
+            # Insert all configurations
+            for config in configs:
+                with db_session.cursor() as cur:
+                    cur.execute(f"""
+                        INSERT INTO {config_table}
+                        (job_name, table_prefix, queue_prefix, cache_backend, frequency_seconds,
+                         enabled, timeout_seconds, target_database)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (job_name) DO NOTHING
+                    """, (
+                        config["job_name"], config["table_prefix"], queue_prefix,
+                        "array", 60, False, 1800, config["target_database"]
+                    ))
+            db_session.commit()
+
+            # Verify all were inserted successfully
+            with db_session.cursor() as cur:
+                cur.execute(f"""
+                    SELECT job_name, target_database
+                    FROM {config_table}
+                    WHERE job_name IN %s
+                """, (tuple(c["job_name"] for c in configs),))
+
+                results = cur.fetchall()
+
+                # Should have one entry per database
+                assert len(results) == len(test_databases), \
+                    f"Expected {len(test_databases)} configs, got {len(results)}"
+
+                # Each should have unique job name
+                job_names = [r[0] for r in results]
+                assert len(job_names) == len(set(job_names)), \
+                    f"Duplicate job names found: {job_names}"
+
+                # Each should reference correct database
+                for job_name, target_db in results:
+                    assert target_db in job_name, \
+                        f"Job name '{job_name}' doesn't contain database '{target_db}'"
+
+        finally:
+            # Cleanup test data
+            with db_session.cursor() as cur:
+                cur.execute(f"""
+                    DELETE FROM {config_table}
+                    WHERE job_name IN %s
+                """, (tuple(c["job_name"] for c in configs),))
+            db_session.commit()

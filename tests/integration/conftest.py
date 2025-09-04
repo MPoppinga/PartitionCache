@@ -411,7 +411,7 @@ def _is_rocksdict_available():
     """Check if rocksdict is available for testing."""
     import importlib.util
 
-    return importlib.util.find_spec("rocksdic") is not None
+    return importlib.util.find_spec("rocksdict") is not None
 
 
 # Add RocksDB backends if the module is available
@@ -814,17 +814,19 @@ def manual_queue_processor(db_session, db_connection, cache_client):
             END $$;
             """
         )
+        db_name = os.getenv("DB_NAME", "partitioncache_integration")
+        job_name = f"partitioncache_process_queue_{db_name}"
         cur.execute(
             f"""
             INSERT INTO {config_table}
             (job_name, enabled, max_parallel_jobs, frequency_seconds, timeout_seconds,
              table_prefix, queue_prefix, cache_backend, target_database, default_bitsize)
-            VALUES ('partitioncache_process_queue', true, 1, 60, 30,
+            VALUES (%s, true, 1, 60, 30,
                     %s, %s, 'array', %s, NULL)
             ON CONFLICT (job_name) DO UPDATE
             SET enabled = true, updated_at = NOW()
         """,
-            (table_prefix, queue_prefix, os.getenv("DB_NAME", "partitioncache_integration")),
+            (job_name, table_prefix, queue_prefix, db_name),
         )
 
         db_session.commit()
@@ -866,17 +868,19 @@ def postgresql_queue_processor(postgresql_queue_functions, db_session, cache_cli
         # Convert full backend names to simplified names for SQL functions
         simplified_backend = cache_backend.replace("postgresql_", "") if cache_backend.startswith("postgresql_") else cache_backend
 
+        db_name = os.getenv("DB_NAME", "partitioncache_integration")
+        job_name = f"partitioncache_process_queue_{db_name}"
         cur.execute(
             f"""
             INSERT INTO {config_table}
             (job_name, enabled, max_parallel_jobs, frequency_seconds, timeout_seconds,
              table_prefix, queue_prefix, cache_backend, target_database)
-            VALUES ('partitioncache_process_queue', true, 1, 60, 30,
+            VALUES (%s, true, 1, 60, 30,
                     %s, %s, %s, %s)
             ON CONFLICT (job_name) DO UPDATE
             SET cache_backend = %s, timeout_seconds = 30, enabled = true, updated_at = NOW()
         """,
-            (table_prefix, queue_prefix, simplified_backend, os.getenv("DB_NAME", "partitioncache_integration"), simplified_backend),
+            (job_name, table_prefix, queue_prefix, simplified_backend, db_name, simplified_backend),
         )
         db_session.commit()
 

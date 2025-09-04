@@ -1,7 +1,7 @@
 """Tests for PostgreSQL direct queue processor."""
 
 import os
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, patch
 
 import pytest
 
@@ -341,8 +341,8 @@ class TestDatabaseOperations:
         mock_conn.cursor.return_value.__enter__ = Mock(return_value=mock_cursor)
         mock_conn.cursor.return_value.__exit__ = Mock(return_value=None)
 
-        # Test inserting configuration
-        insert_initial_config(mock_conn, "partitioncache_process_queue", "partitioncache", "partitioncache_queue", "array", 1, True, 1800, "test_database", None)
+        # Test inserting configuration with dynamic job name
+        insert_initial_config(mock_conn, "partitioncache_process_queue_test_database", "partitioncache", "partitioncache_queue", "array", 1, True, 1800, "test_database", None)
 
         # Should execute INSERT statement
         assert mock_cursor.execute.call_count == 1
@@ -357,11 +357,12 @@ class TestDatabaseOperations:
 class TestCLIIntegration:
     """Test CLI integration points."""
 
+    @patch("partitioncache.cli.postgresql_queue_processor.get_cache_database_name")
     @patch("partitioncache.cli.postgresql_queue_processor.get_queue_table_prefix_from_env")
     @patch("partitioncache.cli.postgresql_queue_processor.get_pg_cron_connection")
     @patch("partitioncache.cli.postgresql_queue_processor.validate_environment")
     @patch("partitioncache.cli.postgresql_queue_processor.load_environment_with_validation")
-    def test_main_status_command(self, mock_load_env, mock_validate, mock_get_conn, mock_get_queue_prefix):
+    def test_main_status_command(self, mock_load_env, mock_validate, mock_get_conn, mock_get_queue_prefix, mock_get_cache_db):
         """Test the status command."""
         from partitioncache.cli.postgresql_queue_processor import main
 
@@ -370,6 +371,7 @@ class TestCLIIntegration:
 
         # Mock environment functions
         mock_get_queue_prefix.return_value = "partitioncache_queue"
+        mock_get_cache_db.return_value = "test_db"
 
         # Mock database connection
         mock_conn = Mock()
@@ -392,9 +394,9 @@ class TestCLIIntegration:
         with patch("sys.argv", ["postgresql_queue_processor.py", "status"]):
             main()
 
-        # Should execute status query with queue prefix only
+        # Should execute status query with new signature including target_database
         mock_cursor.execute.assert_called_with(
-            "SELECT * FROM partitioncache_get_processor_status(%s, %s)", ["partitioncache_queue", "partitioncache_process_queue"]
+            "SELECT * FROM partitioncache_get_processor_status(%s, %s)", ["partitioncache_queue", "test_db"]
         )
 
     @patch("partitioncache.cli.postgresql_queue_processor.get_db_connection")
@@ -418,12 +420,14 @@ class TestCLIIntegration:
 class TestProcessorEnableDisable:
     """Test enable/disable processor functionality."""
 
+    @patch("partitioncache.cli.postgresql_queue_processor.get_cache_database_name")
     @patch("partitioncache.cli.postgresql_queue_processor.get_db_connection")
-    def test_enable_processor_success(self, mock_get_conn):
+    def test_enable_processor_success(self, mock_get_conn, mock_get_cache_db):
         """Test successful processor enable."""
         from partitioncache.cli.postgresql_queue_processor import enable_processor
 
         # Setup mocks
+        mock_get_cache_db.return_value = "test_db"
         mock_conn = Mock()
         mock_cursor = Mock()
         mock_get_conn.return_value = mock_conn
@@ -435,19 +439,21 @@ class TestProcessorEnableDisable:
         with patch("partitioncache.cli.postgresql_queue_processor.get_pg_cron_connection", return_value=mock_conn):
             enable_processor("test_queue_prefix")
 
-        # Verify the correct function was called
+        # Verify the correct function was called with new signature including target_database
         mock_cursor.execute.assert_called_once_with(
-            "SELECT partitioncache_set_processor_enabled_cron(true, %s, 'partitioncache_process_queue')",
-            ["test_queue_prefix"]
+            "SELECT partitioncache_set_processor_enabled_cron(true, %s, %s)",
+            ["test_queue_prefix", "test_db"]  # test_db from mock_get_cache_db
         )
         mock_conn.commit.assert_called_once()
 
+    @patch("partitioncache.cli.postgresql_queue_processor.get_cache_database_name")
     @patch("partitioncache.cli.postgresql_queue_processor.get_db_connection")
-    def test_disable_processor_success(self, mock_get_conn):
+    def test_disable_processor_success(self, mock_get_conn, mock_get_cache_db):
         """Test successful processor disable."""
         from partitioncache.cli.postgresql_queue_processor import disable_processor
 
         # Setup mocks
+        mock_get_cache_db.return_value = "test_db"
         mock_conn = Mock()
         mock_cursor = Mock()
         mock_get_conn.return_value = mock_conn
@@ -459,10 +465,10 @@ class TestProcessorEnableDisable:
         with patch("partitioncache.cli.postgresql_queue_processor.get_pg_cron_connection", return_value=mock_conn):
             disable_processor("test_queue_prefix")
 
-        # Verify the correct function was called
+        # Verify the correct function was called with new signature including target_database
         mock_cursor.execute.assert_called_once_with(
-            "SELECT partitioncache_set_processor_enabled_cron(false, %s, 'partitioncache_process_queue')",
-            ["test_queue_prefix"]
+            "SELECT partitioncache_set_processor_enabled_cron(false, %s, %s)",
+            ["test_queue_prefix", "test_db"]  # test_db from mock_get_cache_db
         )
         mock_conn.commit.assert_called_once()
 

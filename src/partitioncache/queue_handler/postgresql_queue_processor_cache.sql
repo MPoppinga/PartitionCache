@@ -168,6 +168,7 @@ BEGIN
             p_table_prefix,
             p_cache_backend,
             'cron',
+            p_timeout_seconds,
             p_default_bitsize
         );
         RAISE NOTICE 'Job processed %', dispatched_job_id;
@@ -189,6 +190,7 @@ CREATE OR REPLACE FUNCTION _partitioncache_execute_job(
     p_table_prefix TEXT,
     p_cache_backend TEXT,
     p_execution_source TEXT,
+    p_timeout_seconds INTEGER DEFAULT 1800,
     p_default_bitsize INTEGER DEFAULT NULL
 )
 RETURNS BOOLEAN AS $$
@@ -219,8 +221,8 @@ BEGIN
     v_log_table := p_queue_prefix || '_processor_log';
     v_queries_table := partitioncache_get_queries_table_name(p_table_prefix);
     
-    -- Default timeout and result_limit (config comes from cron database)
-    v_timeout_seconds := 1800;
+    -- Use passed timeout parameter
+    v_timeout_seconds := COALESCE(p_timeout_seconds, 1800);
     v_result_limit := NULL;
     
     BEGIN
@@ -496,26 +498,45 @@ $$ LANGUAGE plpgsql;
 -- read config from cron database and call parameter-based function directly
 
 -- Manual processing function for testing - reads config and calls parameter-based function
-CREATE OR REPLACE FUNCTION partitioncache_manual_process_queue(p_count INTEGER DEFAULT 100)
+CREATE OR REPLACE FUNCTION partitioncache_manual_process_queue(p_count INTEGER DEFAULT 100, p_job_name TEXT DEFAULT NULL)
 RETURNS TABLE(processed_count INTEGER, message TEXT) AS $$
 DECLARE
     v_total INTEGER := 0;
     v_result RECORD;
-    v_job_name TEXT := 'partitioncache_process_queue';
+    v_job_name TEXT;
     v_config RECORD;
     v_config_table TEXT;
+    v_current_db TEXT;
 BEGIN
+    -- Get current database name for dynamic job name
+    v_current_db := current_database();
+    
     -- Try to get configuration from local config table first
     v_config_table := COALESCE(current_setting('partitioncache.queue_prefix', true), 'partitioncache_queue') || '_processor_config';
     
-    BEGIN
-        EXECUTE format('SELECT job_name, enabled, max_parallel_jobs, frequency_seconds, timeout_seconds, table_prefix, queue_prefix, cache_backend, target_database, result_limit, default_bitsize FROM %I WHERE job_name = %L', 
-                      v_config_table, v_job_name) INTO v_config;
-    EXCEPTION WHEN OTHERS THEN
-        v_config := NULL;
-    END;
+    -- If job name provided, try exact match first
+    IF p_job_name IS NOT NULL THEN
+        v_job_name := p_job_name;
+        BEGIN
+            EXECUTE format('SELECT job_name, enabled, max_parallel_jobs, frequency_seconds, timeout_seconds, table_prefix, queue_prefix, cache_backend, target_database, result_limit, default_bitsize FROM %I WHERE job_name = %L', 
+                          v_config_table, v_job_name) INTO v_config;
+        EXCEPTION WHEN OTHERS THEN
+            v_config := NULL;
+        END;
+    END IF;
     
-    -- If no local config found, try to find any config table
+    -- If no config found with exact name, try to find config for current database
+    IF v_config IS NULL THEN
+        BEGIN
+            -- Look for any job starting with the pattern for this database
+            EXECUTE format('SELECT job_name, enabled, max_parallel_jobs, frequency_seconds, timeout_seconds, table_prefix, queue_prefix, cache_backend, target_database, result_limit, default_bitsize FROM %I WHERE job_name LIKE %L AND (target_database = %L OR target_database = current_database()) LIMIT 1', 
+                          v_config_table, 'partitioncache_process_queue_' || v_current_db || '%', v_current_db) INTO v_config;
+        EXCEPTION WHEN OTHERS THEN
+            v_config := NULL;
+        END;
+    END IF;
+    
+    -- If still no local config found, try to find any config table
     IF v_config IS NULL THEN
         SELECT tablename INTO v_config_table
         FROM pg_tables 
@@ -529,8 +550,17 @@ BEGIN
         LIMIT 1;
         
         IF v_config_table IS NOT NULL THEN
-            EXECUTE format('SELECT job_name, enabled, max_parallel_jobs, frequency_seconds, timeout_seconds, table_prefix, queue_prefix, cache_backend, target_database, result_limit, default_bitsize FROM %I WHERE job_name = %L', 
-                          v_config_table, v_job_name) INTO v_config;
+            -- Try exact match first if job_name was provided
+            IF p_job_name IS NOT NULL THEN
+                EXECUTE format('SELECT job_name, enabled, max_parallel_jobs, frequency_seconds, timeout_seconds, table_prefix, queue_prefix, cache_backend, target_database, result_limit, default_bitsize FROM %I WHERE job_name = %L', 
+                              v_config_table, v_job_name) INTO v_config;
+            END IF;
+            
+            -- If no config found yet, try pattern match for current database
+            IF v_config IS NULL THEN
+                EXECUTE format('SELECT job_name, enabled, max_parallel_jobs, frequency_seconds, timeout_seconds, table_prefix, queue_prefix, cache_backend, target_database, result_limit, default_bitsize FROM %I WHERE job_name LIKE %L AND (target_database = %L OR target_database = current_database()) LIMIT 1', 
+                              v_config_table, 'partitioncache_process_queue_' || v_current_db || '%', v_current_db) INTO v_config;
+            END IF;
         END IF;
         
         IF v_config IS NULL THEN
@@ -542,7 +572,7 @@ BEGIN
     FOR i IN 1..p_count LOOP
         -- Call the parameter-based function with config values
         SELECT * FROM partitioncache_run_single_job_with_params(
-            v_job_name,
+            v_config.job_name,  -- Use the actual job_name from config
             v_config.table_prefix,
             v_config.queue_prefix, 
             v_config.cache_backend,
