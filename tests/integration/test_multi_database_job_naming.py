@@ -27,17 +27,21 @@ class TestMultiDatabaseJobNaming:
             ("db", "partitioncache_", "partitioncache_process_queue_db_default"),
             ("db", "_", "partitioncache_process_queue_db_custom"),
 
-            # Long names that should trigger truncation warning
+            # Long names that should trigger truncation warning - will preserve suffix
             ("very_long_database_name_that_exceeds_limit", "partitioncache_with_long_suffix",
-             "partitioncache_process_queue_very_long_database_name_that_excee"),  # Truncated at 63 chars (note: 'excee' not 'exc')
+             None),  # Skip exact match test for truncated names, just verify length limit
         ]
 
         for db_name, table_prefix, expected_name in test_cases:
             actual_name = construct_processor_job_name(db_name, table_prefix)
 
             # For long names, check truncation
-            if len(expected_name) == 63:
+            if expected_name is None:
+                # Just verify it's within the limit
                 assert len(actual_name) <= 63, f"Job name not truncated: {actual_name}"
+                # And that it preserves some suffix info if possible
+                if table_prefix and "suffix" in table_prefix:
+                    assert "suffix" in actual_name or "..." in actual_name, f"Suffix not preserved in truncation: {actual_name}"
             else:
                 assert actual_name == expected_name, f"Mismatch for ({db_name}, {table_prefix}): expected {expected_name}, got {actual_name}"
 
