@@ -27,23 +27,16 @@ class TestMultiDatabaseJobNaming:
             ("db", "partitioncache_", "partitioncache_process_queue_db_default"),
             ("db", "_", "partitioncache_process_queue_db_custom"),
 
-            # Long names that should trigger truncation warning - will preserve suffix
+            # Long names are now preserved without truncation
             ("very_long_database_name_that_exceeds_limit", "partitioncache_with_long_suffix",
-             None),  # Skip exact match test for truncated names, just verify length limit
+             "partitioncache_process_queue_very_long_database_name_that_exceeds_limit_withlongsuffix")
         ]
 
         for db_name, table_prefix, expected_name in test_cases:
             actual_name = construct_processor_job_name(db_name, table_prefix)
 
-            # For long names, check truncation
-            if expected_name is None:
-                # Just verify it's within the limit
-                assert len(actual_name) <= 63, f"Job name not truncated: {actual_name}"
-                # And that it preserves some suffix info if possible
-                if table_prefix and "suffix" in table_prefix:
-                    assert "suffix" in actual_name or "..." in actual_name, f"Suffix not preserved in truncation: {actual_name}"
-            else:
-                assert actual_name == expected_name, f"Mismatch for ({db_name}, {table_prefix}): expected {expected_name}, got {actual_name}"
+            # All names should match exactly (no truncation)
+            assert actual_name == expected_name, f"Mismatch for ({db_name}, {table_prefix}): expected {expected_name}, got {actual_name}"
 
     def test_job_name_uniqueness_across_databases(self):
         """Test that different databases get unique job names even with same table prefix."""
@@ -82,23 +75,21 @@ class TestMultiDatabaseJobNaming:
         # All job names should be unique
         assert len(job_names) == len(set(job_names)), f"Duplicate job names found: {job_names}"
 
-    def test_job_name_truncation_warning(self, caplog):
-        """Test that overly long job names trigger a warning and are truncated."""
-        import logging
-
+    def test_job_name_no_length_limit(self):
+        """Test that long job names are preserved without truncation."""
         # Create a really long database name
-        long_db = "extremely_long_database_name_that_will_definitely_exceed_postgresql_limit"
+        long_db = "extremely_long_database_name_that_will_definitely_exceed_previous_postgresql_limit"
         long_prefix = "partitioncache_another_very_long_suffix_here"
 
-        with caplog.at_level(logging.WARNING):
-            job_name = construct_processor_job_name(long_db, long_prefix)
+        job_name = construct_processor_job_name(long_db, long_prefix)
 
-        # Check the job name was truncated
-        assert len(job_name) == 63, f"Job name not truncated to 63 chars: {len(job_name)}"
+        # Check the full job name is preserved (no truncation)
+        expected_suffix = long_prefix.replace('partitioncache', '').replace('_', '') or 'default'  
+        expected_name = f"partitioncache_process_queue_{long_db}_{expected_suffix}"
+        assert job_name == expected_name, f"Job name was unexpectedly modified: {job_name}"
 
-        # Check that a warning was logged
-        assert "exceeds PostgreSQL 63-character limit" in caplog.text
-        assert "Truncating to" in caplog.text
+        # Verify it's longer than the old 63-char "limit"
+        assert len(job_name) > 63, f"Job name should be longer than 63 chars: {len(job_name)}"
 
     @pytest.mark.integration
     def test_sql_function_consistency(self, db_session):

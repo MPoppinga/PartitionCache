@@ -34,22 +34,6 @@ BEGIN
         v_job_name := v_job_name || '_' || v_table_suffix;
     END IF;
     
-    -- PostgreSQL identifiers have a 63-character limit
-    -- If we exceed this, truncate intelligently to preserve uniqueness
-    IF LENGTH(v_job_name) > 63 THEN
-        -- For eviction jobs, preserve the suffix which differentiates table prefixes
-        -- Check if there's a suffix (underscore in the last 25 chars)
-        IF POSITION('_' IN SUBSTRING(v_job_name FROM LENGTH(v_job_name) - 24)) > 0 THEN
-            -- Try to keep first 40 chars + '...' + last 20 chars
-            v_job_name := SUBSTRING(v_job_name FROM 1 FOR 40) || '...' || 
-                         SUBSTRING(v_job_name FROM LENGTH(v_job_name) - 19);
-        ELSE
-            -- No clear suffix, just truncate to 63 chars
-            v_job_name := SUBSTRING(v_job_name FROM 1 FOR 63);
-        END IF;
-        
-        RAISE WARNING 'Job name exceeds PostgreSQL 63-character limit. Truncating to: %', v_job_name;
-    END IF;
     
     RETURN v_job_name;
 END;

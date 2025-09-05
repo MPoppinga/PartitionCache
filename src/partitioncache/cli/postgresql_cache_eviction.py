@@ -79,27 +79,6 @@ def construct_eviction_job_name(target_database: str, table_prefix: str | None) 
 
         job_name = f"{base_name}_{table_suffix}"
 
-    # PostgreSQL identifiers have a 63-character limit
-    # If we exceed this, truncate intelligently to preserve uniqueness
-    if len(job_name) > 63:
-        # For eviction jobs, preserve the suffix which differentiates table prefixes
-        # Check if there's a suffix (underscore in the last part)
-        if "_" in job_name[-25:]:  # Check last 25 chars for a suffix
-            # Try to keep first 40 chars + "..." + last 20 chars
-            truncated_name = job_name[:40] + "..." + job_name[-20:]
-            logger.warning(
-                f"Job name '{job_name}' exceeds PostgreSQL 63-character limit. "
-                f"Truncating to '{truncated_name}'"
-            )
-            job_name = truncated_name
-        else:
-            # No clear suffix, just truncate
-            truncated_name = job_name[:63]
-            logger.warning(
-                f"Job name '{job_name}' exceeds PostgreSQL 63-character limit. "
-                f"Truncating to '{truncated_name}'"
-            )
-            job_name = truncated_name
 
     return job_name
 
@@ -595,7 +574,12 @@ def main():
     # Table prefix is required for most commands
     parser.add_argument("--table-prefix", help="Table prefix for cache tables (e.g., 'my_cache'). Can also be set via env vars.")
 
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers = parser.add_subparsers(
+        title="commands",
+        description="Available commands",
+        dest="command",
+        help="Additional help for each command"
+    )
 
     # setup command
     setup_parser = subparsers.add_parser("setup", help="Setup database objects and pg_cron job for eviction")
@@ -630,6 +614,11 @@ def main():
     subparsers.add_parser("manual-run", help="Manually trigger the eviction job once")
 
     args = parser.parse_args()
+
+    # If no command provided, show help
+    if not args.command:
+        parser.print_help()
+        sys.exit(0)
 
     # Configure logging based on verbosity
     configure_logging(args)

@@ -132,31 +132,6 @@ def construct_processor_job_name(target_database: str, table_prefix: str | None)
 
         job_name = f"{base_name}_{suffix}"
 
-    # PostgreSQL identifier length limit is 63 characters
-    if len(job_name) > 63:
-        # For uniqueness, preserve suffix if possible by truncating from the middle
-        # Keep first 40 chars and last 20 chars with separator
-        if "_" in job_name[-25:]:  # Check if there's a suffix in the last part
-            # Try to preserve the full suffix
-            suffix_start = job_name.rfind("_")
-            suffix = job_name[suffix_start:]
-            if len(suffix) <= 20:
-                # Truncate the middle part to fit
-                prefix_part = job_name[:60 - len(suffix)]
-                truncated_name = prefix_part + "..." + suffix
-                if len(truncated_name) > 63:
-                    truncated_name = job_name[:40] + "..." + job_name[-20:]
-            else:
-                truncated_name = job_name[:40] + "..." + job_name[-20:]
-        else:
-            truncated_name = job_name[:60] + "..."
-
-        # Ensure it's exactly 63 chars or less
-        if len(truncated_name) > 63:
-            truncated_name = truncated_name[:63]
-
-        logger.warning(f"Job name '{job_name}' exceeds PostgreSQL 63-character limit. Truncating to '{truncated_name}'")
-        return truncated_name
 
     return job_name
 
@@ -896,15 +871,13 @@ def main():
     add_environment_args(parser)
     add_verbosity_args(parser)
 
-    # Parse environment arguments early to load config
-    env_args, _ = parser.parse_known_args()
-
-    # Configure logging based on verbosity
-    configure_logging(env_args)
-
-    # Load environment variables
-    load_environment_with_validation(env_args.env_file)
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    # Add subparsers BEFORE parse_known_args so help can see them
+    subparsers = parser.add_subparsers(
+        title="commands",
+        description="Available commands",
+        dest="command",
+        help="Additional help for each command"
+    )
 
     # setup command
     setup_parser = subparsers.add_parser("setup", help="Setup database objects and pg_cron job")
@@ -1032,6 +1005,12 @@ def main():
     try:
         # Parse all arguments and execute the corresponding function
         args = parser.parse_args()
+
+        # Configure logging based on verbosity
+        configure_logging(args)
+
+        # Load environment variables
+        load_environment_with_validation(args.env_file)
 
         # Only validate environment for non-help commands
         if hasattr(args, "func"):
