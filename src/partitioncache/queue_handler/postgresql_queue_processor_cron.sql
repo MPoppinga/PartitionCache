@@ -227,46 +227,6 @@ BEGIN
         v_job_name := 'partitioncache_process_queue_' || p_target_database;
     END IF;
     
-    -- Check PostgreSQL identifier length limit (63 characters)
-    IF length(v_job_name) > 63 THEN
-        -- For uniqueness, preserve suffix if possible by truncating from the middle
-        DECLARE
-            v_suffix_pos INTEGER;
-            v_suffix TEXT;
-            v_truncated TEXT;
-        BEGIN
-            -- Find the last underscore position
-            v_suffix_pos := position('_' in reverse(v_job_name));
-            
-            IF v_suffix_pos > 0 AND v_suffix_pos <= 25 THEN
-                -- Extract suffix from the end
-                v_suffix := substring(v_job_name from (length(v_job_name) - v_suffix_pos + 1));
-                
-                IF length(v_suffix) <= 20 THEN
-                    -- Try to preserve the full suffix
-                    v_truncated := substring(v_job_name from 1 for (60 - length(v_suffix))) || '...' || v_suffix;
-                    IF length(v_truncated) > 63 THEN
-                        v_truncated := substring(v_job_name from 1 for 40) || '...' || substring(v_job_name from (length(v_job_name) - 19));
-                    END IF;
-                ELSE
-                    -- Suffix too long, use standard truncation
-                    v_truncated := substring(v_job_name from 1 for 40) || '...' || substring(v_job_name from (length(v_job_name) - 19));
-                END IF;
-            ELSE
-                -- No clear suffix, just truncate
-                v_truncated := substring(v_job_name from 1 for 60) || '...';
-            END IF;
-            
-            -- Ensure it's exactly 63 chars or less
-            IF length(v_truncated) > 63 THEN
-                v_truncated := substring(v_truncated from 1 for 63);
-            END IF;
-            
-            RAISE WARNING 'Job name ''%'' exceeds PostgreSQL 63-character limit. Truncating to ''%''', 
-                          v_job_name, v_truncated;
-            v_job_name := v_truncated;
-        END;
-    END IF;
     
     RETURN v_job_name;
 END;

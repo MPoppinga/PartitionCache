@@ -40,6 +40,49 @@ SQL_CRON_FILE = Path(__file__).parent.parent / "cache_handler" / "postgresql_cac
 SQL_CACHE_FILE = Path(__file__).parent.parent / "cache_handler" / "postgresql_cache_eviction_cache.sql"
 
 
+def construct_eviction_job_name(target_database: str, table_prefix: str | None) -> str:
+    """
+    Construct a unique job name for the eviction manager based on database and table prefix.
+
+    This ensures multiple eviction managers can coexist for different databases and table prefixes.
+    The job name follows the pattern: partitioncache_evict_<database>[_<suffix>]
+
+    Args:
+        target_database: The target database name
+        table_prefix: The table prefix (e.g., 'partitioncache_cache1')
+
+    Returns:
+        A unique job name for the eviction configuration
+
+    Examples:
+        >>> construct_eviction_job_name("mydb", "partitioncache_cache1")
+        'partitioncache_evict_mydb_cache1'
+        >>> construct_eviction_job_name("mydb", "partitioncache")
+        'partitioncache_evict_mydb_default'
+        >>> construct_eviction_job_name("mydb", None)
+        'partitioncache_evict_mydb'
+    """
+    # Base name includes the database
+    base_name = f"partitioncache_evict_{target_database}"
+
+    if not table_prefix:
+        job_name = base_name
+    else:
+        # Extract suffix from table prefix (e.g., 'partitioncache_cache1' -> 'cache1')
+        # Special case: if table_prefix is just underscores or doesn't contain 'partitioncache'
+        if not table_prefix.replace('_', '') or 'partitioncache' not in table_prefix:
+            # This is a custom prefix (not standard partitioncache pattern)
+            table_suffix = table_prefix.replace('_', '') or 'custom'
+        else:
+            # Remove 'partitioncache' prefix and any underscores
+            table_suffix = table_prefix.replace('partitioncache', '').replace('_', '') or 'default'
+
+        job_name = f"{base_name}_{table_suffix}"
+
+
+    return job_name
+
+
 def get_table_prefix(args) -> str:
     """Get the table prefix from args or environment."""
     if args.table_prefix:
@@ -275,7 +318,8 @@ def check_eviction_job_exists() -> bool:
         else:
             table_prefix = os.getenv("PG_ROARINGBIT_CACHE_TABLE_PREFIX", "partitioncache")
 
-        job_name = f"partitioncache_evict_{table_prefix}"
+        target_database = os.getenv("DB_NAME")
+        job_name = construct_eviction_job_name(target_database, table_prefix)
         config_table = f"{table_prefix}_eviction_config"
 
         with conn.cursor() as cur:
@@ -386,7 +430,7 @@ def handle_setup(table_prefix: str, frequency: int, enabled: bool, strategy: str
         logger.info(f"Setting up eviction components in cross-database mode: cron={get_cron_database_name()}, cache={get_cache_database_name()}")
         setup_database_objects(cache_conn, cron_conn, table_prefix)
 
-    job_name = f"partitioncache_evict_{table_prefix}"
+    job_name = construct_eviction_job_name(target_database, table_prefix)
 
     # Insert configuration in cron database for pg_cron job management only
     actual_cron_conn = cache_conn if get_cron_database_name() == get_cache_database_name() else cron_conn
@@ -404,7 +448,8 @@ def get_processor_status(conn, table_prefix: str):
     """Get basic processor status."""
     logger.info("Fetching eviction processor status...")
     config_table = f"{table_prefix}_eviction_config"
-    job_name = f"partitioncache_evict_{table_prefix}"
+    target_database = get_cache_database_name()
+    job_name = construct_eviction_job_name(target_database, table_prefix)
 
     with conn.cursor() as cur:
         try:
@@ -480,7 +525,8 @@ def view_logs(conn, table_prefix: str, limit: int = 20):
 
 def manual_run(table_prefix):
     """Manually run the eviction job - reads config from cron database."""
-    job_name = f"partitioncache_evict_{table_prefix}"
+    target_database = get_cache_database_name()
+    job_name = construct_eviction_job_name(target_database, table_prefix)
     logger.info(f"Manually running eviction job '{job_name}'...")
 
     # Get connections to read config from cron database and execute in cache database
@@ -528,7 +574,12 @@ def main():
     # Table prefix is required for most commands
     parser.add_argument("--table-prefix", help="Table prefix for cache tables (e.g., 'my_cache'). Can also be set via env vars.")
 
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers = parser.add_subparsers(
+        title="commands",
+        description="Available commands",
+        dest="command",
+        help="Additional help for each command"
+    )
 
     # setup command
     setup_parser = subparsers.add_parser("setup", help="Setup database objects and pg_cron job for eviction")
@@ -564,6 +615,11 @@ def main():
 
     args = parser.parse_args()
 
+    # If no command provided, show help
+    if not args.command:
+        parser.print_help()
+        sys.exit(0)
+
     # Configure logging based on verbosity
     configure_logging(args)
 
@@ -578,7 +634,8 @@ def main():
 
     try:
         table_prefix = get_table_prefix(args)
-        job_name = f"partitioncache_evict_{table_prefix}"
+        target_database = get_cache_database_name()
+        job_name = construct_eviction_job_name(target_database, table_prefix)
         conn = get_db_connection()
 
         if args.command == "setup":
