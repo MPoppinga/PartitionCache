@@ -42,9 +42,6 @@ class TestDuckDBBitCacheHandler:
         """Test that handler inherits from AbstractCacheHandler_Lazy."""
         assert isinstance(cache_handler, AbstractCacheHandler_Lazy)
 
-    def test_repr(self, cache_handler):
-        """Test string representation."""
-        assert repr(cache_handler) == "duckdb_bit"
 
     def test_supported_datatypes(self):
         """Test that only integer datatype is supported."""

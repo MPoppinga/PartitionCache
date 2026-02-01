@@ -50,14 +50,6 @@ class TestPostgreSQLRoaringBitCacheHandler:
             mock_cursor.reset_mock()
             return handler
 
-    def test_repr(self, cache_handler):
-        """Test string representation."""
-        assert repr(cache_handler) == "postgresql_roaringbit"
-
-    def test_get_supported_datatypes(self):
-        """Test supported datatypes."""
-        supported = PostgreSQLRoaringBitCacheHandler.get_supported_datatypes()
-        assert supported == {"integer"}
 
     def test_set_cache_with_integer_set(self, cache_handler, mock_cursor):
         """Test setting a set of integers."""

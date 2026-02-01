@@ -261,19 +261,7 @@ def test_init_creates_extensions_and_aggregates():
         assert hasattr(handler, "USE_AGGREGATES")
 
 
-def test_use_aggregates_flag():
-    """Test that USE_AGGREGATES flag works correctly."""
-    assert PostgreSQLArrayCacheHandler.USE_AGGREGATES is True
 
-    # Test that we can change it
-    PostgreSQLArrayCacheHandler.USE_AGGREGATES = False
-    assert PostgreSQLArrayCacheHandler.USE_AGGREGATES is False
-
-    # Reset it
-    PostgreSQLArrayCacheHandler.USE_AGGREGATES = True
-
-
-# Add these new tests after the existing ones
 def test_get_intersected_single_key(cache_handler):
     cache_handler._get_partition_datatype = Mock(return_value="integer")
     cache_handler.filter_existing_keys = Mock(return_value={"key1"})

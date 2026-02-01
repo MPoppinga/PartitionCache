@@ -19,6 +19,7 @@ def pytest_configure(config):
     config.addinivalue_line("markers", "stress: marks tests as stress tests")
     config.addinivalue_line("markers", "concurrent: marks tests as concurrency tests")
     config.addinivalue_line("markers", "serial: marks tests that should run serially to avoid concurrency issues")
+    config.addinivalue_line("markers", "integration: marks tests as integration tests")
 
 
 # Test data based on OSM example pattern but simplified (no PostGIS)
@@ -885,3 +886,41 @@ def postgresql_queue_processor(postgresql_queue_functions, db_session, cache_cli
         db_session.commit()
 
     return {"queue_prefix": queue_prefix, "table_prefix": table_prefix, "config_table": config_table, "pg_cron_available": pg_cron_available}
+
+
+@pytest.fixture(scope="session")
+def postgresql_params():
+    """
+    Session-scoped fixture providing PostgreSQL connection parameters.
+
+    Returns a dict with connection parameters or skips if PostgreSQL is unavailable.
+    """
+    from partitioncache.cli.common_args import get_database_connection_params
+
+    # Mock args object for get_database_connection_params
+    class MockArgs:
+        def __init__(self):
+            self.db_host = os.getenv("DB_HOST", os.getenv("PG_HOST", "localhost"))
+            self.db_port = int(os.getenv("DB_PORT", os.getenv("PG_PORT", "5432")))
+            self.db_user = os.getenv("DB_USER", os.getenv("PG_USER", "integration_user"))
+            self.db_password = os.getenv("DB_PASSWORD", os.getenv("PG_PASSWORD", "test_password"))
+            self.db_name = os.getenv("DB_NAME", os.getenv("PG_DBNAME", "partitioncache_integration"))
+            self.db_backend = "postgresql"
+
+    mock_args = MockArgs()
+
+    # Skip if PostgreSQL not available
+    try:
+        conn = psycopg.connect(
+            host=mock_args.db_host,
+            port=mock_args.db_port,
+            user=mock_args.db_user,
+            password=mock_args.db_password,
+            dbname=mock_args.db_name,
+            connect_timeout=10
+        )
+        conn.close()
+    except Exception as e:
+        pytest.skip(f"PostgreSQL not available for integration tests: {e}")
+
+    return get_database_connection_params(mock_args)

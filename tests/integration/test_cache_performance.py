@@ -139,7 +139,7 @@ class TestCachePerformance:
             assert cache_client.exists(cache_key, partition_key)
             retrieved = cache_client.get(cache_key, partition_key)
             # Use utility function for backend-agnostic comparison
-            from .test_utils import normalize_cache_result
+            from .utils import normalize_cache_result
             normalized_retrieved = normalize_cache_result(retrieved)
             assert normalized_retrieved == common_values, f"Cached value mismatch for duplicate_{i}: {normalized_retrieved} != {common_values}"
 
@@ -267,7 +267,7 @@ class TestCacheStress:
             for cache_key, expected_set in large_sets:
                 retrieved = cache_client.get(cache_key, partition_key)
                 # Use utility function for backend-agnostic comparison
-                from .test_utils import normalize_cache_result
+                from .utils import normalize_cache_result
                 normalized_retrieved = normalize_cache_result(retrieved)
                 assert normalized_retrieved == expected_set, f"Failed to retrieve {cache_key}: {normalized_retrieved} != {expected_set}"
 
@@ -292,7 +292,7 @@ class TestCacheStress:
             cache_client.set_cache(cache_key, test_set, partition_key)
             retrieved = cache_client.get(cache_key, partition_key)
             # Use utility function for backend-agnostic comparison
-            from .test_utils import normalize_cache_result
+            from .utils import normalize_cache_result
             normalized_retrieved = normalize_cache_result(retrieved)
             if normalized_retrieved == test_set:
                 cache_client.delete(cache_key, partition_key)
@@ -363,7 +363,7 @@ class TestCacheRealWorldScenarios:
             assert hits > 0, f"No cache hits for query: {query}"
 
             # Use utility function for backend-agnostic comparison
-            from .test_utils import normalize_cache_result
+            from .utils import normalize_cache_result
             actual_set = normalize_cache_result(partition_keys)
 
             assert actual_set == expected_zipcodes, f"Unexpected results for: {query}"
@@ -389,7 +389,7 @@ class TestCacheRealWorldScenarios:
         for cache_key, expected_set in recent_entries:
             retrieved = cache_client.get(cache_key, partition_key)
             # Use utility function for backend-agnostic comparison
-            from .test_utils import normalize_cache_result
+            from .utils import normalize_cache_result
             normalized_retrieved = normalize_cache_result(retrieved)
             assert normalized_retrieved == expected_set, f"Lost recent entry: {cache_key}"
 
@@ -434,7 +434,7 @@ class TestCacheRealWorldScenarios:
         retrieved_regions = cache_client.get(cache_key, region_key)
 
         # Use utility function for backend-agnostic comparison
-        from .test_utils import normalize_cache_result
+        from .utils import normalize_cache_result
         normalized_zipcodes = normalize_cache_result(retrieved_zipcodes)
         normalized_regions = normalize_cache_result(retrieved_regions)
 
