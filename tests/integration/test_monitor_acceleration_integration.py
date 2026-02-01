@@ -12,42 +12,12 @@ import time
 
 import pytest
 
-from partitioncache.cli.common_args import get_database_connection_params
-
 
 @pytest.mark.integration
 class TestMonitorAccelerationIntegration:
     """Integration tests for monitor with DuckDB acceleration."""
 
-    @pytest.fixture(scope="class")
-    def postgresql_params(self):
-        """Get PostgreSQL connection parameters from environment."""
-        # Mock args object for get_database_connection_params
-        class MockArgs:
-            def __init__(self):
-                self.db_host = os.getenv("DB_HOST", "localhost")
-                self.db_port = int(os.getenv("DB_PORT", "5432"))
-                self.db_user = os.getenv("DB_USER", "test_user")
-                self.db_password = os.getenv("DB_PASSWORD", "test_password")
-                self.db_name = os.getenv("DB_NAME", "test_db")
-                self.db_backend = "postgresql"
-
-        mock_args = MockArgs()
-
-        # Skip if PostgreSQL not available
-        try:
-            import psycopg
-            psycopg.connect(
-                host=mock_args.db_host,
-                port=mock_args.db_port,
-                user=mock_args.db_user,
-                password=mock_args.db_password,
-                dbname=mock_args.db_name
-            ).close()
-        except Exception:
-            pytest.skip("PostgreSQL not available for integration tests")
-
-        return get_database_connection_params(mock_args)
+    # postgresql_params fixture is provided by conftest.py
 
     @pytest.fixture(scope="class")
     def test_data_setup(self, postgresql_params):

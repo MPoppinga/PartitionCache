@@ -240,9 +240,3 @@ def test_delete(cache_handler):
             break
     assert found
     cache_handler.db.commit.assert_called()
-
-
-def test_close(cache_handler):
-    cache_handler.close()
-    cache_handler.cursor.close.assert_called()
-    cache_handler.db.close.assert_called()

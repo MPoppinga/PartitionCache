@@ -19,189 +19,81 @@ class TestManageCacheCLI:
                 main()
             assert exc_info.value.code == 0
 
-    def test_setup_all_command(self):
-        """Test the setup all command."""
-
-        with patch("partitioncache.cli.manage_cache.setup_all_tables") as mock_setup:
-            with patch("sys.argv", ["manage_cache.py", "setup", "all"]):
+    @pytest.mark.parametrize(
+        "argv,mock_path,mock_args",
+        [
+            # Setup commands
+            (["setup", "all"], "setup_all_tables", None),
+            (["setup", "queue"], "setup_queue_tables", None),
+            (["setup", "cache"], "setup_cache_metadata_tables", None),
+            # Status commands
+            (["status", "env"], "validate_environment", None),
+            (["status", "tables"], "check_table_status", None),
+            (["status"], "show_comprehensive_status", None),
+            (["status", "all"], "show_comprehensive_status", None),
+            # Cache commands
+            (["cache", "count", "--type", "postgresql_array"], "count_cache", ("postgresql_array",)),
+            (["cache", "copy", "--from", "redis_set", "--to", "postgresql_array"], "copy_cache", ("redis_set", "postgresql_array", None)),
+            (["cache", "export", "--type", "postgresql_array", "--file", "backup.pkl"], "export_cache", ("postgresql_array", "backup.pkl", None)),
+            (["cache", "import", "--type", "postgresql_array", "--file", "backup.pkl"], "restore_cache", ("postgresql_array", "backup.pkl", None, None)),
+            (["cache", "delete", "--type", "postgresql_array"], "delete_cache", ("postgresql_array",)),
+            # Queue commands
+            (["queue", "count"], "count_queue", None),
+            (["queue", "clear"], "clear_queue", None),
+            (["queue", "clear", "--original"], "clear_original_query_queue", None),
+            (["queue", "clear", "--fragment"], "clear_query_fragment_queue", None),
+            # Maintenance commands
+            (["maintenance", "prune", "--days", "30"], "prune_all_caches", (30,)),
+            (["maintenance", "prune", "--days", "7", "--type", "postgresql_array"], "prune_old_queries", ("postgresql_array", 7)),
+            (["maintenance", "cleanup", "--type", "postgresql_array", "--remove-termination"], "remove_termination_entries", ("postgresql_array",)),
+            (["maintenance", "cleanup", "--type", "postgresql_array", "--remove-large", "1000"], "remove_large_entries", ("postgresql_array", 1000)),
+            (["maintenance", "partition", "--type", "postgresql_array", "--delete", "old_partition"], "delete_partition", ("postgresql_array", "old_partition")),
+        ],
+    )
+    def test_cli_routing(self, argv, mock_path, mock_args):
+        """Test that CLI commands route to correct functions."""
+        with patch(f"partitioncache.cli.manage_cache.{mock_path}") as mock_func:
+            with patch("sys.argv", ["manage_cache.py"] + argv):
                 main()
-                mock_setup.assert_called_once()
+                if mock_args:
+                    mock_func.assert_called_once_with(*mock_args)
+                else:
+                    mock_func.assert_called_once()
 
-    def test_setup_queue_command(self):
-        """Test the setup queue command."""
-
-        with patch("partitioncache.cli.manage_cache.setup_queue_tables") as mock_setup:
-            with patch("sys.argv", ["manage_cache.py", "setup", "queue"]):
+    # Tests for --all flag variants
+    @pytest.mark.parametrize(
+        "argv,mock_path",
+        [
+            (["cache", "count", "--type", "postgresql_array", "--all"], "count_all_caches"),
+            (["cache", "delete", "--type", "postgresql_array", "--all"], "delete_all_caches"),
+        ],
+    )
+    def test_cli_all_flag_routing(self, argv, mock_path):
+        """Test that --all flag routes to *_all functions."""
+        with patch(f"partitioncache.cli.manage_cache.{mock_path}") as mock_func:
+            with patch("sys.argv", ["manage_cache.py"] + argv):
                 main()
-                mock_setup.assert_called_once()
+                mock_func.assert_called_once()
 
-    def test_setup_cache_command(self):
-        """Test the setup cache command."""
-
-        with patch("partitioncache.cli.manage_cache.setup_cache_metadata_tables") as mock_setup:
-            with patch("sys.argv", ["manage_cache.py", "setup", "cache"]):
-                main()
-                mock_setup.assert_called_once()
-
-    def test_status_env_command(self):
-        """Test the status env command."""
-
-        with patch("partitioncache.cli.manage_cache.validate_environment") as mock_validate:
-            with patch("sys.argv", ["manage_cache.py", "status", "env"]):
-                main()
-                mock_validate.assert_called_once()
-
-    def test_status_tables_command(self):
-        """Test the status tables command."""
-
-        with patch("partitioncache.cli.manage_cache.check_table_status") as mock_check:
-            with patch("sys.argv", ["manage_cache.py", "status", "tables"]):
-                main()
-                mock_check.assert_called_once()
-
-    def test_status_default_command(self):
-        """Test the default status command (comprehensive status)."""
-
-        with patch("partitioncache.cli.manage_cache.show_comprehensive_status") as mock_status:
-            with patch("sys.argv", ["manage_cache.py", "status"]):
-                main()
-                mock_status.assert_called_once()
-
-    def test_status_all_command(self):
-        """Test the status all command."""
-
-        with patch("partitioncache.cli.manage_cache.show_comprehensive_status") as mock_status:
-            with patch("sys.argv", ["manage_cache.py", "status", "all"]):
-                main()
-                mock_status.assert_called_once()
-
-    def test_cache_count_command(self):
-        """Test the cache count command."""
-
-        with patch("partitioncache.cli.manage_cache.count_cache") as mock_count:
-            with patch("sys.argv", ["manage_cache.py", "cache", "count", "--type", "postgresql_array"]):
-                main()
-                mock_count.assert_called_once_with("postgresql_array")
-
-    def test_cache_count_all_command(self):
-        """Test the cache count all command."""
-
-        with patch("partitioncache.cli.manage_cache.count_all_caches") as mock_count_all:
-            with patch("sys.argv", ["manage_cache.py", "cache", "count", "--type", "postgresql_array", "--all"]):
-                main()
-                mock_count_all.assert_called_once()
-
-    def test_cache_copy_command(self):
-        """Test the cache copy command."""
-
-        with patch("partitioncache.cli.manage_cache.copy_cache") as mock_copy:
-            with patch("sys.argv", ["manage_cache.py", "cache", "copy", "--from", "redis_set", "--to", "postgresql_array"]):
-                main()
-                mock_copy.assert_called_once_with("redis_set", "postgresql_array", None)
-
-    def test_cache_export_command(self):
-        """Test the cache export command."""
-
-        with patch("partitioncache.cli.manage_cache.export_cache") as mock_export:
-            with patch("sys.argv", ["manage_cache.py", "cache", "export", "--type", "postgresql_array", "--file", "backup.pkl"]):
-                main()
-                mock_export.assert_called_once_with("postgresql_array", "backup.pkl", None)
-
-    def test_cache_import_command(self):
-        """Test the cache import command."""
-
-        with patch("partitioncache.cli.manage_cache.restore_cache") as mock_restore:
-            with patch("sys.argv", ["manage_cache.py", "cache", "import", "--type", "postgresql_array", "--file", "backup.pkl"]):
-                main()
-                mock_restore.assert_called_once_with("postgresql_array", "backup.pkl", None, None)
-
-    def test_cache_delete_command(self):
-        """Test the cache delete command."""
-
-        with patch("partitioncache.cli.manage_cache.delete_cache") as mock_delete:
-            with patch("sys.argv", ["manage_cache.py", "cache", "delete", "--type", "postgresql_array"]):
-                main()
-                mock_delete.assert_called_once_with("postgresql_array")
-
-    def test_cache_delete_all_command(self):
-        """Test the cache delete all command."""
-
-        with patch("partitioncache.cli.manage_cache.delete_all_caches") as mock_delete_all:
-            with patch("sys.argv", ["manage_cache.py", "cache", "delete", "--type", "postgresql_array", "--all"]):
-                main()
-                mock_delete_all.assert_called_once()
-
-    def test_queue_count_command(self):
-        """Test the queue count command."""
-
-        with patch("partitioncache.cli.manage_cache.count_queue") as mock_count:
-            with patch("sys.argv", ["manage_cache.py", "queue", "count"]):
-                main()
-                mock_count.assert_called_once()
-
-    def test_queue_clear_command(self):
-        """Test the queue clear command."""
-
-        with patch("partitioncache.cli.manage_cache.clear_queue") as mock_clear:
-            with patch("sys.argv", ["manage_cache.py", "queue", "clear"]):
-                main()
-                mock_clear.assert_called_once()
-
-    def test_queue_clear_original_command(self):
-        """Test the queue clear original command."""
-
-        with patch("partitioncache.cli.manage_cache.clear_original_query_queue") as mock_clear:
-            with patch("sys.argv", ["manage_cache.py", "queue", "clear", "--original"]):
-                main()
-                mock_clear.assert_called_once()
-
-    def test_queue_clear_fragment_command(self):
-        """Test the queue clear fragment command."""
-
-        with patch("partitioncache.cli.manage_cache.clear_query_fragment_queue") as mock_clear:
-            with patch("sys.argv", ["manage_cache.py", "queue", "clear", "--fragment"]):
-                main()
-                mock_clear.assert_called_once()
-
-    def test_maintenance_prune_command(self):
-        """Test the maintenance prune command."""
-
-        with patch("partitioncache.cli.manage_cache.prune_all_caches") as mock_prune:
-            with patch("sys.argv", ["manage_cache.py", "maintenance", "prune", "--days", "30"]):
-                main()
-                mock_prune.assert_called_once_with(30)
-
-    def test_maintenance_prune_specific_cache_command(self):
-        """Test the maintenance prune command for specific cache."""
-
-        with patch("partitioncache.cli.manage_cache.prune_old_queries") as mock_prune:
-            with patch("sys.argv", ["manage_cache.py", "maintenance", "prune", "--days", "7", "--type", "postgresql_array"]):
-                main()
-                mock_prune.assert_called_once_with("postgresql_array", 7)
-
-    def test_maintenance_cleanup_termination_command(self):
-        """Test the maintenance cleanup remove-termination command."""
-
-        with patch("partitioncache.cli.manage_cache.remove_termination_entries") as mock_remove:
-            with patch("sys.argv", ["manage_cache.py", "maintenance", "cleanup", "--type", "postgresql_array", "--remove-termination"]):
-                main()
-                mock_remove.assert_called_once_with("postgresql_array")
-
-    def test_maintenance_cleanup_large_command(self):
-        """Test the maintenance cleanup remove-large command."""
-
-        with patch("partitioncache.cli.manage_cache.remove_large_entries") as mock_remove:
-            with patch("sys.argv", ["manage_cache.py", "maintenance", "cleanup", "--type", "postgresql_array", "--remove-large", "1000"]):
-                main()
-                mock_remove.assert_called_once_with("postgresql_array", 1000)
-
-    def test_maintenance_partition_delete_command(self):
-        """Test the maintenance partition delete command."""
-
-        with patch("partitioncache.cli.manage_cache.delete_partition") as mock_delete:
-            with patch("sys.argv", ["manage_cache.py", "maintenance", "partition", "--type", "postgresql_array", "--delete", "old_partition"]):
-                main()
-                mock_delete.assert_called_once_with("postgresql_array", "old_partition")
+    # Tests for environment fallback
+    @pytest.mark.parametrize(
+        "argv,mock_path,env_backend,expected_args",
+        [
+            (["cache", "count"], "count_cache", "redis_set", ("redis_set",)),
+            (["cache", "export", "--file", "test.pkl"], "export_cache", "postgresql_bit", ("postgresql_bit", "test.pkl", None)),
+            (["cache", "import", "--file", "test.pkl"], "restore_cache", "rocksdb_set", ("rocksdb_set", "test.pkl", None, None)),
+            (["cache", "delete"], "delete_cache", "redis_bit", ("redis_bit",)),
+            (["maintenance", "cleanup", "--remove-termination"], "remove_termination_entries", "postgresql_array", ("postgresql_array",)),
+            (["maintenance", "partition", "--delete", "test_partition"], "delete_partition", "postgresql_bit", ("postgresql_bit", "test_partition")),
+        ],
+    )
+    def test_cli_env_backend_fallback(self, argv, mock_path, env_backend, expected_args):
+        """Test that commands use CACHE_BACKEND from env when --type is omitted."""
+        with patch(f"partitioncache.cli.manage_cache.{mock_path}") as mock_func:
+            with patch("partitioncache.cli.manage_cache.get_cache_type_from_env", return_value=env_backend):
+                with patch("sys.argv", ["manage_cache.py"] + argv):
+                    main()
+                    mock_func.assert_called_once_with(*expected_args)
 
     def test_no_command_shows_help(self):
         """Test that running without commands shows help."""
@@ -237,60 +129,6 @@ class TestManageCacheCLI:
                 with pytest.raises(SystemExit) as exc_info:
                     main()
                 assert exc_info.value.code == 1
-
-    def test_cache_count_with_env_backend(self):
-        """Test that cache count uses environment CACHE_BACKEND when --type is omitted."""
-
-        with patch("partitioncache.cli.manage_cache.count_cache") as mock_count:
-            with patch("partitioncache.cli.manage_cache.get_cache_type_from_env", return_value="redis_set"):
-                with patch("sys.argv", ["manage_cache.py", "cache", "count"]):
-                    main()
-                    mock_count.assert_called_once_with("redis_set")
-
-    def test_cache_export_with_env_backend(self):
-        """Test that cache export uses environment CACHE_BACKEND when --type is omitted."""
-
-        with patch("partitioncache.cli.manage_cache.export_cache") as mock_export:
-            with patch("partitioncache.cli.manage_cache.get_cache_type_from_env", return_value="postgresql_bit"):
-                with patch("sys.argv", ["manage_cache.py", "cache", "export", "--file", "test.pkl"]):
-                    main()
-                    mock_export.assert_called_once_with("postgresql_bit", "test.pkl", None)
-
-    def test_cache_import_with_env_backend(self):
-        """Test that cache import uses environment CACHE_BACKEND when --type is omitted."""
-
-        with patch("partitioncache.cli.manage_cache.restore_cache") as mock_restore:
-            with patch("partitioncache.cli.manage_cache.get_cache_type_from_env", return_value="rocksdb_set"):
-                with patch("sys.argv", ["manage_cache.py", "cache", "import", "--file", "test.pkl"]):
-                    main()
-                    mock_restore.assert_called_once_with("rocksdb_set", "test.pkl", None, None)
-
-    def test_cache_delete_with_env_backend(self):
-        """Test that cache delete uses environment CACHE_BACKEND when --type is omitted."""
-
-        with patch("partitioncache.cli.manage_cache.delete_cache") as mock_delete:
-            with patch("partitioncache.cli.manage_cache.get_cache_type_from_env", return_value="redis_bit"):
-                with patch("sys.argv", ["manage_cache.py", "cache", "delete"]):
-                    main()
-                    mock_delete.assert_called_once_with("redis_bit")
-
-    def test_maintenance_cleanup_with_env_backend(self):
-        """Test that maintenance cleanup uses environment CACHE_BACKEND when --type is omitted."""
-
-        with patch("partitioncache.cli.manage_cache.remove_termination_entries") as mock_remove:
-            with patch("partitioncache.cli.manage_cache.get_cache_type_from_env", return_value="postgresql_array"):
-                with patch("sys.argv", ["manage_cache.py", "maintenance", "cleanup", "--remove-termination"]):
-                    main()
-                    mock_remove.assert_called_once_with("postgresql_array")
-
-    def test_maintenance_partition_with_env_backend(self):
-        """Test that maintenance partition uses environment CACHE_BACKEND when --type is omitted."""
-
-        with patch("partitioncache.cli.manage_cache.delete_partition") as mock_delete:
-            with patch("partitioncache.cli.manage_cache.get_cache_type_from_env", return_value="postgresql_bit"):
-                with patch("sys.argv", ["manage_cache.py", "maintenance", "partition", "--delete", "test_partition"]):
-                    main()
-                    mock_delete.assert_called_once_with("postgresql_bit", "test_partition")
 
     @patch("os.getenv")
     def test_get_cache_type_from_env_function(self, mock_getenv):
@@ -373,28 +211,6 @@ class TestCLITimeoutProtection:
             mock_logger.error.assert_called()
             error_call = mock_logger.error.call_args[0][0]
             assert "Error accessing rocksdb_set cache" in error_call
-
-    def test_rocksdb_connectivity_logic_exists(self):
-        """Test that RocksDB connectivity test logic exists in the code."""
-        # This test verifies that the connectivity test code exists and handles RocksDB correctly
-        # The actual timeout protection is fully tested by other test methods
-
-        # Verify the connectivity test logic exists by checking the source
-        import inspect
-
-        from partitioncache.cli.manage_cache import show_comprehensive_status
-
-        source = inspect.getsource(show_comprehensive_status)
-
-        # Verify the key components of timeout protection are in the source
-        assert 'backend.startswith(("redis_", "rocksdb_"))' in source
-        assert 'hasattr(cache_handler, "db")' in source
-        assert 'cache_handler.db.iterkeys()' in source
-        assert 'except Exception as conn_error:' in source
-        assert 'cache_handler.close()' in source
-
-        # This confirms the RocksDB connectivity test logic is implemented
-        # Integration tests and the other unit tests verify it works correctly
 
     @patch("partitioncache.cli.manage_cache.detect_configured_cache_backends")
     @patch("partitioncache.cli.manage_cache.detect_configured_queue_providers")

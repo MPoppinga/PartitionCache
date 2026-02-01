@@ -4,7 +4,7 @@ import tempfile
 
 import pytest
 
-from .test_utils import compare_cache_values
+from .utils import compare_cache_values
 
 
 class TestCLICommands:

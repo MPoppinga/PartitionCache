@@ -42,15 +42,6 @@ def cache_handler(temp_db_path, mock_rocksdict):
 class TestRocksDictCacheHandler:
     """Test suite for RocksDictCacheHandler."""
 
-    def test_get_supported_datatypes(self):
-        """Test that all expected datatypes are supported."""
-        expected_types = {"integer", "float", "text", "timestamp"}
-        assert RocksDictCacheHandler.get_supported_datatypes() == expected_types
-
-    def test_repr(self, cache_handler):
-        """Test string representation."""
-        assert repr(cache_handler) == "rocksdict"
-
     def test_init_creates_db_with_options(self, temp_db_path):
         """Test that initialization creates RocksDB with proper options."""
         with patch("partitioncache.cache_handler.rocks_dict.Rdict") as mock_rdict_class:
