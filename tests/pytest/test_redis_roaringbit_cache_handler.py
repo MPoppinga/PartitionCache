@@ -64,8 +64,11 @@ def test_get_no_partition(cache_handler, mock_redis):
 
 def test_get_intersected_single_key(cache_handler, mock_redis):
     cache_handler._get_partition_datatype = lambda pk: "integer"
-    mock_redis.pipeline.return_value = pipe = Mock()
-    pipe.execute.return_value = [b"string"]
+    type_pipe = Mock()
+    type_pipe.execute.return_value = [b"string"]
+    marker_pipe = Mock()
+    marker_pipe.execute.return_value = [b"\x01"]
+    mock_redis.pipeline.side_effect = [type_pipe, marker_pipe]
     bm = BitMap([1, 3, 5])
     mock_redis.mget.return_value = [bm.serialize()]
     result, count = cache_handler.get_intersected({"key1"})
@@ -76,8 +79,11 @@ def test_get_intersected_single_key(cache_handler, mock_redis):
 
 def test_get_intersected_multiple_keys(cache_handler, mock_redis):
     cache_handler._get_partition_datatype = lambda pk: "integer"
-    mock_redis.pipeline.return_value = pipe = Mock()
-    pipe.execute.return_value = [b"string", b"string", b"hash"]
+    type_pipe = Mock()
+    type_pipe.execute.return_value = [b"string", b"string", b"hash"]
+    marker_pipe = Mock()
+    marker_pipe.execute.return_value = [b"\x01", b"\x01"]
+    mock_redis.pipeline.side_effect = [type_pipe, marker_pipe]
 
     bm1 = BitMap([1, 2, 3, 4])
     bm2 = BitMap([3, 4, 5, 6])
@@ -89,10 +95,30 @@ def test_get_intersected_multiple_keys(cache_handler, mock_redis):
     assert count == 2
 
 
+def test_get_intersected_excludes_null_marker_from_count(cache_handler, mock_redis):
+    cache_handler._get_partition_datatype = lambda pk: "integer"
+    type_pipe = Mock()
+    type_pipe.execute.return_value = [b"string", b"string", b"none"]
+    marker_pipe = Mock()
+    marker_pipe.execute.return_value = [b"\x00", b"\x01"]
+    mock_redis.pipeline.side_effect = [type_pipe, marker_pipe]
+
+    bm = BitMap([1, 3, 5])
+    mock_redis.mget.return_value = [bm.serialize()]
+
+    result, count = cache_handler.get_intersected({"key1", "key2", "key3"})
+    assert isinstance(result, BitMap)
+    assert result == bm
+    assert count == 1
+
+
 def test_get_intersected_empty(cache_handler, mock_redis):
     cache_handler._get_partition_datatype = lambda pk: "integer"
-    mock_redis.pipeline.return_value = pipe = Mock()
-    pipe.execute.return_value = [b"none", b"none"]
+    type_pipe = Mock()
+    type_pipe.execute.return_value = [b"none", b"none"]
+    marker_pipe = Mock()
+    marker_pipe.execute.return_value = []
+    mock_redis.pipeline.side_effect = [type_pipe, marker_pipe]
     result, count = cache_handler.get_intersected({"key1", "key2"})
     assert result is None
     assert count == 0

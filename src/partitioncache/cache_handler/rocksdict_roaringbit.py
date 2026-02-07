@@ -92,7 +92,7 @@ class RocksDictRoaringBitCacheHandler(RocksDictAbstractCacheHandler):
 
         try:
             cache_key = self._get_cache_key(key, partition_key)
-            logger.info(f"saving {len(bm)} partition key identifiers in cache {cache_key}")
+            logger.debug(f"saving {len(bm)} partition key identifiers in cache {cache_key}")
             self.db[cache_key] = bm.serialize()
             return True
         except Exception:

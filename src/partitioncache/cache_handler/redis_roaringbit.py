@@ -51,12 +51,19 @@ class RedisRoaringBitCacheHandler(RedisAbstractCacheHandler):
         cache_keys = [self._get_cache_key(key, partition_key) for key in keys]
 
         # Use pipeline to check key types
-        pipe = self.db.pipeline()
+        type_pipe = self.db.pipeline()
         for cache_key in cache_keys:
-            pipe.type(cache_key)
-        key_types = pipe.execute()
+            type_pipe.type(cache_key)
+        key_types = type_pipe.execute()
 
-        valid_cache_keys = [cache_key for cache_key, key_type in zip(cache_keys, key_types, strict=False) if key_type == b"string"]
+        string_cache_keys = [cache_key for cache_key, key_type in zip(cache_keys, key_types, strict=False) if key_type == b"string"]
+
+        # Filter out null markers (first byte == \x00)
+        marker_pipe = self.db.pipeline()
+        for cache_key in string_cache_keys:
+            marker_pipe.getrange(cache_key, 0, 0)
+        first_bytes = marker_pipe.execute() if string_cache_keys else []
+        valid_cache_keys = [cache_key for cache_key, first_byte in zip(string_cache_keys, first_bytes, strict=False) if first_byte != b"\x00"]
 
         if not valid_cache_keys:
             return None, 0
