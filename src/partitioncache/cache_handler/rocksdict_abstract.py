@@ -181,18 +181,37 @@ class RocksDictAbstractCacheHandler(AbstractCacheHandler):
 
     def close(self) -> None:
         """Close the RocksDict database."""
-        self._refcount -= 1
-        if self._refcount <= 0:
+        cls = type(self)
+        cls._refcount -= 1
+        if cls._refcount <= 0:
             try:
                 self.db.close()
             except Exception:
                 pass
-            self._instance = None
-            self._refcount = 0
+            cls._instance = None
+            cls._refcount = 0
 
     def compact(self) -> None:
         """Compact the database to optimize storage."""
         self.db.compact_range(None, None)
+
+    def clear_all_cache_data(self) -> int:
+        """Clear all cache-related data from this RocksDict database.
+
+        Returns:
+            Number of keys deleted
+        """
+        deleted_count = 0
+        try:
+            patterns = ["cache:", "query:", "_partition_metadata:"]
+            for key in list(self.db.keys()):
+                if any(str(key).startswith(p) for p in patterns):
+                    del self.db[key]
+                    deleted_count += 1
+            return deleted_count
+        except Exception as e:
+            logger.error(f"Failed to clear cache data: {e}")
+            return deleted_count
 
     def get_all_keys(self, partition_key: str) -> list:
         """Get all keys from the RocksDict cache for a specific partition key."""

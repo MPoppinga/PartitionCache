@@ -86,13 +86,18 @@ class RedisBitCacheHandler(RedisAbstractCacheHandler):
         if datatype is None:
             return None, 0
 
-        pipe = self.db.pipeline()
+        type_pipe = self.db.pipeline()
         cache_keys = [self._get_cache_key(key, partition_key) for key in keys]
         for cache_key in cache_keys:
-            pipe.type(cache_key)
-        key_types = pipe.execute()
+            type_pipe.type(cache_key)
+        key_types = type_pipe.execute()
+        string_cache_keys: list[str] = [cache_key for cache_key, key_type in zip(cache_keys, key_types, strict=False) if key_type == b"string"]
 
-        valid_cache_keys: list[str] = [cache_key for cache_key, key_type in zip(cache_keys, key_types, strict=False) if key_type == b"string"]
+        marker_pipe = self.db.pipeline()
+        for cache_key in string_cache_keys:
+            marker_pipe.getrange(cache_key, 0, 0)
+        first_bytes = marker_pipe.execute() if string_cache_keys else []
+        valid_cache_keys: list[str] = [cache_key for cache_key, first_byte in zip(string_cache_keys, first_bytes, strict=False) if first_byte != b"\x00"]
         valid_keys_count = len(valid_cache_keys)
 
         randuuid = str(uuid.uuid4())

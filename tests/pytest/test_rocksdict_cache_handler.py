@@ -391,10 +391,10 @@ class TestRocksDictCacheHandler:
 
     def test_close_multiple_references(self, cache_handler, mock_rocksdict):
         """Test closing with multiple references."""
-        cache_handler._refcount = 2
+        RocksDictCacheHandler._refcount = 2
         cache_handler.close()
         mock_rocksdict.close.assert_not_called()
-        assert cache_handler._refcount == 1
+        assert RocksDictCacheHandler._refcount == 1
 
     def test_compact(self, cache_handler, mock_rocksdict):
         """Test database compaction."""
@@ -448,6 +448,18 @@ class TestRocksDictCacheHandler:
 
             assert instance1 is instance2
             assert RocksDictCacheHandler._refcount == 2
+
+    def test_close_clears_singleton(self, temp_db_path):
+        """After close(), get_instance() should return a new instance."""
+        with patch("partitioncache.cache_handler.rocksdict_abstract.Rdict"):
+            RocksDictCacheHandler._instance = None
+            RocksDictCacheHandler._refcount = 0
+
+            inst1 = RocksDictCacheHandler.get_instance(temp_db_path)
+            inst1.close()
+
+            inst2 = RocksDictCacheHandler.get_instance(temp_db_path)
+            assert inst1 is not inst2  # Must be a fresh instance
 
     def test_get_datatype(self, cache_handler, mock_rocksdict):
         """Test getting datatype for partition."""

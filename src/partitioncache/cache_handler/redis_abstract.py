@@ -197,11 +197,12 @@ class RedisAbstractCacheHandler(AbstractCacheHandler):
             return []
 
     def close(self) -> None:
-        self._refcount -= 1
-        if self._refcount <= 0:
+        cls = type(self)
+        cls._refcount -= 1
+        if cls._refcount <= 0:
             self.db.close()
-            self._instance = None
-            self._refcount = 0
+            cls._instance = None
+            cls._refcount = 0
 
     def get_all_keys(self, partition_key: str) -> list:
         """Get all keys for a specific partition key."""

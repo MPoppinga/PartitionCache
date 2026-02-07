@@ -225,6 +225,18 @@ class TestRocksDictRoaringBitCacheHandler:
             assert instance1 is instance2
             assert RocksDictRoaringBitCacheHandler._refcount == 2
 
+    def test_close_clears_singleton(self):
+        """After close(), get_instance() should return a new instance."""
+        with patch("partitioncache.cache_handler.rocksdict_abstract.Rdict"):
+            RocksDictRoaringBitCacheHandler._instance = None
+            RocksDictRoaringBitCacheHandler._refcount = 0
+
+            inst1 = RocksDictRoaringBitCacheHandler.get_instance("/tmp/test_close")
+            inst1.close()
+
+            inst2 = RocksDictRoaringBitCacheHandler.get_instance("/tmp/test_close")
+            assert inst1 is not inst2  # Must be a fresh instance
+
     def test_register_partition_key_valid(self, cache_handler, mock_rocksdict):
         cache_handler.register_partition_key("new_partition", "integer")
         mock_rocksdict.__setitem__.assert_called_with("_partition_metadata:new_partition", "integer")
