@@ -397,7 +397,7 @@ CACHE_BACKENDS = [
 
 # Add Redis backends if available
 if os.getenv("REDIS_HOST"):
-    CACHE_BACKENDS.extend(["redis_set", "redis_bit"])
+    CACHE_BACKENDS.extend(["redis_set", "redis_bit", "redis_roaringbit"])
 
 
 # Add RocksDB backends if available
@@ -422,6 +422,7 @@ if _is_rocksdb_available():
 # Add rocksdict backend if available (should always be available via pip)
 if _is_rocksdict_available():
     CACHE_BACKENDS.append("rocksdict")
+    CACHE_BACKENDS.append("rocksdict_roaringbit")
 
 
 @pytest.fixture(params=CACHE_BACKENDS)
@@ -475,6 +476,8 @@ def cache_client(request, db_session):
             os.environ["REDIS_BIT_DB"] = "1"
         if not os.getenv("REDIS_SET_DB"):
             os.environ["REDIS_SET_DB"] = "2"  # Use different database for redis_set
+        if not os.getenv("REDIS_ROARINGBIT_DB"):
+            os.environ["REDIS_ROARINGBIT_DB"] = "3"  # Use different database for redis_roaringbit
         if not os.getenv("REDIS_BIT_BITSIZE"):
             os.environ["REDIS_BIT_BITSIZE"] = "200000"
 
@@ -491,6 +494,9 @@ def cache_client(request, db_session):
     elif cache_backend == "rocksdict":
         temp_dir = tempfile.mkdtemp(prefix="rocksdict_test_")
         # rocksdict uses the db_path parameter directly, no env vars needed
+    elif cache_backend == "rocksdict_roaringbit":
+        temp_dir = tempfile.mkdtemp(prefix="rocksdict_roaringbit_test_")
+        # rocksdict_roaringbit uses the db_path parameter directly, no env vars needed
 
     try:
         # Create cache handler
@@ -500,6 +506,11 @@ def cache_client(request, db_session):
             from partitioncache.cache_handler.rocks_dict import RocksDictCacheHandler
 
             cache_handler = RocksDictCacheHandler(temp_dir)
+        elif cache_backend == "rocksdict_roaringbit":
+            temp_dir = tempfile.mkdtemp(prefix="rocksdict_roaringbit_test_")
+            from partitioncache.cache_handler.rocksdict_roaringbit import RocksDictRoaringBitCacheHandler
+
+            cache_handler = RocksDictRoaringBitCacheHandler(temp_dir)
         else:
             cache_handler = get_cache_handler(cache_backend, singleton=False)
 
@@ -625,7 +636,7 @@ def cache_client(request, db_session):
                 del os.environ[env_var]
 
         # Clean up temporary directories for RocksDB backends
-        if cache_backend in ["rocksdb_set", "rocksdb_bit", "rocksdict"]:
+        if cache_backend in ["rocksdb_set", "rocksdb_bit", "rocksdict", "rocksdict_roaringbit"]:
             try:
                 import shutil
 

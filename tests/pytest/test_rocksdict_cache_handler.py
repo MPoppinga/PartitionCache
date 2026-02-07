@@ -34,7 +34,7 @@ def mock_rocksdict():
 @pytest.fixture
 def cache_handler(temp_db_path, mock_rocksdict):
     """Create RocksDictCacheHandler with mocked RocksDict."""
-    with patch("partitioncache.cache_handler.rocks_dict.Rdict", return_value=mock_rocksdict):
+    with patch("partitioncache.cache_handler.rocksdict_abstract.Rdict", return_value=mock_rocksdict):
         handler = RocksDictCacheHandler(temp_db_path)
         return handler
 
@@ -44,7 +44,7 @@ class TestRocksDictCacheHandler:
 
     def test_init_creates_db_with_options(self, temp_db_path):
         """Test that initialization creates RocksDB with proper options."""
-        with patch("partitioncache.cache_handler.rocks_dict.Rdict") as mock_rdict_class:
+        with patch("partitioncache.cache_handler.rocksdict_abstract.Rdict") as mock_rdict_class:
             mock_rdict = MagicMock()
             mock_rdict_class.return_value = mock_rdict
 
@@ -438,7 +438,7 @@ class TestRocksDictCacheHandler:
 
     def test_get_instance_singleton(self, temp_db_path):
         """Test get_instance singleton behavior."""
-        with patch("partitioncache.cache_handler.rocks_dict.Rdict"):
+        with patch("partitioncache.cache_handler.rocksdict_abstract.Rdict"):
             # Reset class variables
             RocksDictCacheHandler._instance = None
             RocksDictCacheHandler._refcount = 0

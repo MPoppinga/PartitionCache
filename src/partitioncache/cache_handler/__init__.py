@@ -67,6 +67,14 @@ def get_cache_handler(cache_type: str, singleton: bool = False) -> AbstractCache
             return PostgreSQLRoaringBitCacheHandler.get_instance(**config)  # type: ignore[no-any-return]
         else:
             return PostgreSQLRoaringBitCacheHandler(**config)  # type: ignore[no-any-return]
+    elif cache_type == "redis_roaringbit":
+        from partitioncache.cache_handler.redis_roaringbit import RedisRoaringBitCacheHandler
+
+        config = EnvironmentConfigManager.get_redis_config("roaringbit")
+        if singleton:
+            return RedisRoaringBitCacheHandler.get_instance(**config)  # type: ignore[no-any-return]
+        else:
+            return RedisRoaringBitCacheHandler(**config)  # type: ignore[no-any-return]
     elif cache_type == "rocksdict":
         from partitioncache.cache_handler.rocks_dict import RocksDictCacheHandler
 
@@ -75,6 +83,14 @@ def get_cache_handler(cache_type: str, singleton: bool = False) -> AbstractCache
             return RocksDictCacheHandler.get_instance(**config)  # type: ignore[no-any-return]
         else:
             return RocksDictCacheHandler(**config)  # type: ignore[no-any-return]
+    elif cache_type == "rocksdict_roaringbit":
+        from partitioncache.cache_handler.rocksdict_roaringbit import RocksDictRoaringBitCacheHandler
+
+        config = EnvironmentConfigManager.get_rocksdb_config("roaringbit")
+        if singleton:
+            return RocksDictRoaringBitCacheHandler.get_instance(**config)  # type: ignore[no-any-return]
+        else:
+            return RocksDictRoaringBitCacheHandler(**config)  # type: ignore[no-any-return]
     elif cache_type == "duckdb_bit":
         from partitioncache.cache_handler.duckdb_bit import DuckDBBitCacheHandler
 
