@@ -655,7 +655,8 @@ def generate_partial_queries(
     )
 
     # Emit warnings for tables not using partition key if requested
-    if warn_no_partition_key:
+    # Skip warning in spatial mode — partition_key is a namespace, not a column
+    if warn_no_partition_key and not geometry_column:
         for alias in table_aliases:
             if alias == detected_star_join_alias:
                 continue  # Star-join tables are expected to use partition key

@@ -9,6 +9,7 @@ Tests cover:
 - Handler WKB generation: get_spatial_filter (non-lazy)
 """
 
+import sys
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -25,6 +26,10 @@ from partitioncache.query_processor import (
     generate_all_query_hash_pairs,
     generate_partial_queries,
 )
+
+# Get the actual module object (not the function) since partitioncache.__init__
+# shadows the module attribute with `from partitioncache.apply_cache import apply_cache`
+_apply_cache_module = sys.modules["partitioncache.apply_cache"]
 
 # =============================================================================
 # Tests for query_processor.py changes
@@ -263,7 +268,7 @@ class TestApplyCacheLazySpatialMode:
         handler.get_spatial_filter_lazy = MagicMock(return_value=spatial_filter)
         return handler
 
-    @patch("partitioncache.apply_cache.generate_all_hashes")
+    @patch.object(_apply_cache_module, "generate_all_hashes")
     def test_spatial_mode_calls_get_spatial_filter_lazy(self, mock_hashes):
         """When geometry_column is set, should call get_spatial_filter_lazy."""
         mock_hashes.return_value = ["hash1", "hash2"]
@@ -286,7 +291,7 @@ class TestApplyCacheLazySpatialMode:
         handler.get_spatial_filter_lazy.assert_called_once()
         assert stats["enhanced"] == 1
 
-    @patch("partitioncache.apply_cache.generate_all_hashes")
+    @patch.object(_apply_cache_module, "generate_all_hashes")
     def test_spatial_mode_no_cache_hits_returns_original(self, mock_hashes):
         """When no cache hits in spatial mode, return original query."""
         mock_hashes.return_value = ["hash1"]
@@ -305,7 +310,7 @@ class TestApplyCacheLazySpatialMode:
         assert result == query
         assert stats["enhanced"] == 0
 
-    @patch("partitioncache.apply_cache.generate_all_hashes")
+    @patch.object(_apply_cache_module, "generate_all_hashes")
     def test_spatial_mode_requires_buffer_distance(self, mock_hashes):
         """When geometry_column is set but buffer_distance is None, should raise ValueError."""
         mock_hashes.return_value = ["hash1"]
@@ -321,7 +326,7 @@ class TestApplyCacheLazySpatialMode:
                 buffer_distance=None,
             )
 
-    @patch("partitioncache.apply_cache.generate_all_hashes")
+    @patch.object(_apply_cache_module, "generate_all_hashes")
     def test_spatial_mode_requires_spatial_handler(self, mock_hashes):
         """When handler lacks get_spatial_filter_lazy, should raise ValueError."""
         mock_hashes.return_value = ["hash1"]
@@ -696,7 +701,7 @@ class TestApplyCacheSpatialMode:
         handler.srid = srid
         return handler
 
-    @patch("partitioncache.apply_cache.generate_all_hashes")
+    @patch.object(_apply_cache_module, "generate_all_hashes")
     def test_spatial_mode_calls_get_spatial_filter(self, mock_hashes):
         """When geometry_column is set, should call get_spatial_filter."""
         mock_hashes.return_value = ["hash1", "hash2"]
@@ -719,7 +724,7 @@ class TestApplyCacheSpatialMode:
         assert stats["enhanced"] == 1
         assert "ST_DWITHIN" in result.upper()
 
-    @patch("partitioncache.apply_cache.generate_all_hashes")
+    @patch.object(_apply_cache_module, "generate_all_hashes")
     def test_spatial_mode_no_cache_hits_returns_original(self, mock_hashes):
         """When no spatial filter returned, return original query."""
         mock_hashes.return_value = ["hash1"]
@@ -738,7 +743,7 @@ class TestApplyCacheSpatialMode:
         assert result == query
         assert stats["enhanced"] == 0
 
-    @patch("partitioncache.apply_cache.generate_all_hashes")
+    @patch.object(_apply_cache_module, "generate_all_hashes")
     def test_spatial_mode_requires_buffer_distance(self, mock_hashes):
         """When geometry_column is set but buffer_distance is None, should raise ValueError."""
         mock_hashes.return_value = ["hash1"]
@@ -754,7 +759,7 @@ class TestApplyCacheSpatialMode:
                 buffer_distance=None,
             )
 
-    @patch("partitioncache.apply_cache.generate_all_hashes")
+    @patch.object(_apply_cache_module, "generate_all_hashes")
     def test_spatial_mode_requires_spatial_handler(self, mock_hashes):
         """When handler lacks get_spatial_filter, should raise ValueError."""
         mock_hashes.return_value = ["hash1"]
@@ -773,7 +778,7 @@ class TestApplyCacheSpatialMode:
                 buffer_distance=500.0,
             )
 
-    @patch("partitioncache.apply_cache.generate_all_hashes")
+    @patch.object(_apply_cache_module, "generate_all_hashes")
     def test_spatial_mode_uses_srid_from_spatial_filter(self, mock_hashes):
         """Should use the SRID returned by get_spatial_filter in the generated query."""
         mock_hashes.return_value = ["hash1"]
