@@ -43,14 +43,16 @@ def clean_query(query: str) -> str:
         str: Cleaned and normalized query suitable for cache variant generation
     """
 
+    # Remove single-line comments before whitespace normalization,
+    # otherwise collapsing newlines makes `--.*` wipe out everything
+    # from the first comment to the end of the (now single-line) string.
+    query = re.sub(r"--.*", "", query)
+
     query = re.sub(r"\s+", " ", query)
     query = re.sub(r"\s*=\s*", "=", query)
 
     # Remove trailing semicolons (they're not part of the SQL statement)
     query = query.rstrip().rstrip(";")
-
-    # Remove comment
-    query = re.sub(r"--.*", "", query)
 
     # Parse the query
     parsed = sqlglot.parse_one(query)

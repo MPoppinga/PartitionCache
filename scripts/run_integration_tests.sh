@@ -50,6 +50,7 @@ show_help() {
     echo "  redis               All Redis-based backends"
     echo "  rocksdb             All RocksDB-based backends"
     echo "  queue               Queue processing tests"
+    echo "  spatial             Spatial cache tests"
     echo "  performance         Performance tests"
     echo "  error_recovery      Error recovery tests"
     echo ""
@@ -171,6 +172,8 @@ run_tests() {
             PYTEST_CMD="$PYTEST_CMD -k 'redis_set'"
         elif [ "$TEST_PATTERN" = "redis_bit" ]; then
             PYTEST_CMD="$PYTEST_CMD -k 'redis_bit'"
+        elif [ "$TEST_PATTERN" = "spatial" ]; then
+            PYTEST_CMD="$PYTEST_CMD -k 'spatial'"
         else
             PYTEST_CMD="$PYTEST_CMD -k $TEST_PATTERN"
         fi

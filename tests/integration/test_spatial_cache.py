@@ -61,62 +61,58 @@ class TestSpatialCache:
         # Test with cache
         backend = self._get_cache_backend()
 
-        try:
-            with partitioncache.create_cache_helper(backend, partition_key, partition_datatype) as cache:
-                # Get partition keys (this may be empty for first run)
-                import time
+        with partitioncache.create_cache_helper(backend, partition_key, partition_datatype) as cache:
+            # Get partition keys (this may be empty for first run)
+            import time
 
-                start_time = time.perf_counter()
+            start_time = time.perf_counter()
 
-                partition_keys, num_subqueries, num_hits = partitioncache.get_partition_keys(
-                    query=query,
-                    cache_handler=cache.underlying_handler,
+            partition_keys, num_subqueries, num_hits = partitioncache.get_partition_keys(
+                query=query,
+                cache_handler=cache.underlying_handler,
+                partition_key=partition_key,
+                min_component_size=1,
+            )
+
+            cache_lookup_time = time.perf_counter() - start_time
+
+            if partition_keys:
+                # Apply cache optimization
+                optimized_query = partitioncache.extend_query_with_partition_keys(
+                    query,
+                    partition_keys,
                     partition_key=partition_key,
-                    min_component_size=1,
+                    method="IN",
+                    p0_alias="p1",
                 )
 
-                cache_lookup_time = time.perf_counter() - start_time
+                results_with_cache, time_with_cache = self._execute_query(optimized_query)
+                total_cache_time = cache_lookup_time + time_with_cache
 
-                if partition_keys:
-                    # Apply cache optimization
-                    optimized_query = partitioncache.extend_query_with_partition_keys(
-                        query,
-                        partition_keys,
-                        partition_key=partition_key,
-                        method="IN",
-                        p0_alias="p1",
-                    )
+                # Verify results are consistent
+                assert len(results_no_cache) >= len(results_with_cache), "Cache should not return more results than full query"
 
-                    results_with_cache, time_with_cache = self._execute_query(optimized_query)
-                    total_cache_time = cache_lookup_time + time_with_cache
-
-                    # Verify results are consistent
-                    assert len(results_no_cache) >= len(results_with_cache), "Cache should not return more results than full query"
-
-                    return {
-                        "results_count": len(results_no_cache),
-                        "cached_results_count": len(results_with_cache),
-                        "time_no_cache": time_no_cache,
-                        "time_with_cache": total_cache_time,
-                        "cache_hits": num_hits,
-                        "num_subqueries": num_subqueries,
-                        "speedup": time_no_cache / total_cache_time if total_cache_time > 0 else 0,
-                        "cache_effective": num_hits > 0,
-                    }
-                else:
-                    return {
-                        "results_count": len(results_no_cache),
-                        "cached_results_count": 0,
-                        "time_no_cache": time_no_cache,
-                        "time_with_cache": cache_lookup_time,
-                        "cache_hits": 0,
-                        "num_subqueries": num_subqueries,
-                        "speedup": 0,
-                        "cache_effective": False,
-                    }
-
-        except Exception as e:
-            pytest.skip(f"Cache test failed: {e}")
+                return {
+                    "results_count": len(results_no_cache),
+                    "cached_results_count": len(results_with_cache),
+                    "time_no_cache": time_no_cache,
+                    "time_with_cache": total_cache_time,
+                    "cache_hits": num_hits,
+                    "num_subqueries": num_subqueries,
+                    "speedup": time_no_cache / total_cache_time if total_cache_time > 0 else 0,
+                    "cache_effective": num_hits > 0,
+                }
+            else:
+                return {
+                    "results_count": len(results_no_cache),
+                    "cached_results_count": 0,
+                    "time_no_cache": time_no_cache,
+                    "time_with_cache": cache_lookup_time,
+                    "cache_hits": 0,
+                    "num_subqueries": num_subqueries,
+                    "speedup": 0,
+                    "cache_effective": False,
+                }
 
     def test_spatial_data_exists(self):
         """Test that spatial test data exists."""
