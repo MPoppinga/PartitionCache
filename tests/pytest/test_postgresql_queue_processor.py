@@ -1,7 +1,7 @@
 """Tests for PostgreSQL direct queue processor."""
 
 import os
-from unittest.mock import ANY, Mock, patch
+from unittest.mock import Mock, patch
 
 import pytest
 

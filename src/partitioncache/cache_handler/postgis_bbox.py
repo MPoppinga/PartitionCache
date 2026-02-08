@@ -283,6 +283,48 @@ class PostGISBBoxCacheHandler(PostGISSpatialAbstractCacheHandler):
             logger.error(f"Failed to get BBox lazy intersection: {e}")
             return None, 0
 
+    def get_spatial_filter(
+        self,
+        keys: set[str],
+        partition_key: str = "partition_key",
+        buffer_distance: float = 0.0,
+    ) -> bytes | None:
+        """
+        Get spatial filter geometry as WKB bytes for bounding boxes.
+
+        Executes the intersection SQL from _get_intersected_sql() and returns
+        the resulting geometry as WKB binary bytes.
+
+        Args:
+            keys: Set of cache keys to intersect.
+            partition_key: Partition key namespace.
+            buffer_distance: Buffer distance in meters (applied externally via ST_DWithin).
+
+        Returns:
+            WKB bytes representing the spatial filter geometry, or None if no cache hits.
+        """
+        try:
+            datatype = self._get_partition_datatype(partition_key)
+            if datatype is None:
+                return None
+
+            filtered_keys = self.filter_existing_keys(keys, partition_key)
+            if not filtered_keys:
+                return None
+
+            intersect_sql = self._get_intersected_sql(filtered_keys, partition_key)
+            query = sql.SQL("SELECT ST_AsBinary(({intersect_sql})::geometry)").format(
+                intersect_sql=intersect_sql,
+            )
+            self.cursor.execute(query)
+            result = self.cursor.fetchone()
+            if result is None or result[0] is None:
+                return None
+            return bytes(result[0])
+        except Exception as e:
+            logger.error(f"Failed to get BBox spatial filter as WKB: {e}")
+            return None
+
     def get_spatial_filter_lazy(
         self,
         keys: set[str],

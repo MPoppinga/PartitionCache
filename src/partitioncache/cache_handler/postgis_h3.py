@@ -275,6 +275,43 @@ class PostGISH3CacheHandler(PostGISSpatialAbstractCacheHandler):
             logger.error(f"Failed to get H3 lazy intersection: {e}")
             return None, 0
 
+    def get_spatial_filter(
+        self,
+        keys: set[str],
+        partition_key: str = "partition_key",
+        buffer_distance: float = 0.0,
+    ) -> bytes | None:
+        """
+        Get spatial filter geometry as WKB bytes for H3 cells with optional k-ring buffer.
+
+        Executes the spatial filter SQL from get_spatial_filter_lazy() and returns
+        the resulting geometry as WKB binary bytes.
+
+        Args:
+            keys: Set of cache keys to intersect.
+            partition_key: Partition key namespace.
+            buffer_distance: Buffer distance in meters. Converted to k-ring radius.
+
+        Returns:
+            WKB bytes representing the spatial filter geometry, or None if no cache hits.
+        """
+        try:
+            spatial_sql = self.get_spatial_filter_lazy(keys, partition_key, buffer_distance)
+            if spatial_sql is None:
+                return None
+
+            query = sql.SQL("SELECT ST_AsBinary(({spatial_sql})::geometry)").format(
+                spatial_sql=sql.SQL(spatial_sql),
+            )
+            self.cursor.execute(query)
+            result = self.cursor.fetchone()
+            if result is None or result[0] is None:
+                return None
+            return bytes(result[0])
+        except Exception as e:
+            logger.error(f"Failed to get H3 spatial filter as WKB: {e}")
+            return None
+
     def get_spatial_filter_lazy(
         self,
         keys: set[str],

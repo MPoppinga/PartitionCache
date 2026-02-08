@@ -127,6 +127,27 @@ class PostGISSpatialAbstractCacheHandler(PostgreSQLAbstractCacheHandler):
         ...
 
     @abstractmethod
+    def get_spatial_filter(
+        self,
+        keys: set[str],
+        partition_key: str = "partition_key",
+        buffer_distance: float = 0.0,
+    ) -> bytes | None:
+        """Get spatial filter geometry as WKB bytes for non-lazy cache application.
+
+        Executes the spatial filter SQL and returns the result as WKB binary.
+
+        Args:
+            keys: Set of cache keys to intersect.
+            partition_key: Partition key namespace.
+            buffer_distance: Buffer distance in meters.
+
+        Returns:
+            WKB bytes representing the spatial filter geometry, or None if no cache hits.
+        """
+        ...
+
+    @abstractmethod
     def get_spatial_filter_lazy(
         self,
         keys: set[str],

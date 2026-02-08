@@ -203,7 +203,38 @@ def test_spatial_partition_key(conn, partition_key: str, cache_backend: str, geo
             rows, elapsed = run_query(conn, sql_query)
             print(f"Without PartitionCache: {len(rows)} results in {elapsed:.3f} seconds")
 
-            # Test apply_cache_lazy with spatial filter
+            # Test non-lazy apply_cache with spatial filter
+            start_cache = time.perf_counter()
+            sql_cached, stats = partitioncache.apply_cache(
+                query=sql_query,
+                cache_handler=cache_handler,
+                partition_key=partition_key,
+                geometry_column=geometry_column,
+                buffer_distance=buffer_distance,
+                min_component_size=1,
+            )
+            elapsed_cache_get = time.perf_counter() - start_cache
+
+            if stats["enhanced"]:
+                rows_cached, elapsed_cached = run_query(conn, sql_cached)
+                print(
+                    f"With apply_cache (spatial): {len(rows_cached)} results in {elapsed_cache_get:.3f} + "
+                    f"{elapsed_cached:.3f} seconds (generated: {stats['generated_variants']}, "
+                    f"hits: {stats['cache_hits']}, enhanced: {stats['enhanced']})"
+                )
+            else:
+                if stats["cache_hits"] > 0:
+                    print(f"Cache entries found ({stats['cache_hits']} hash matches) but query was not enhanced.")
+                else:
+                    print("No cache entries found for this query.")
+                    print("Hint: Add queries to cache using:")
+                    print(
+                        f"  pcache-add --direct --query-file {query_dir}/{description} "
+                        f"--partition-key {partition_key} --partition-datatype geometry "
+                        f"--cache-backend {cache_backend} --geometry-column {geometry_column}"
+                    )
+
+            # Test lazy apply_cache_lazy with spatial filter
             start_cache = time.perf_counter()
             sql_cached, stats = partitioncache.apply_cache_lazy(
                 query=sql_query,
@@ -223,17 +254,6 @@ def test_spatial_partition_key(conn, partition_key: str, cache_backend: str, geo
                     f"{elapsed_cached:.3f} seconds (generated: {stats['generated_variants']}, "
                     f"hits: {stats['cache_hits']}, enhanced: {stats['enhanced']})"
                 )
-            else:
-                if stats["cache_hits"] > 0:
-                    print(f"Cache entries found ({stats['cache_hits']} hash matches) but query was not enhanced.")
-                else:
-                    print("No cache entries found for this query.")
-                    print("Hint: Add queries to cache using:")
-                    print(
-                        f"  pcache-add --direct --query-file {query_dir}/{description} "
-                        f"--partition-key {partition_key} --partition-datatype geometry "
-                        f"--cache-backend {cache_backend} --geometry-column {geometry_column}"
-                    )
 
     except ValueError as e:
         print(f"Cache configuration error: {e}")

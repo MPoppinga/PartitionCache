@@ -4,7 +4,9 @@ Unit tests for spatial cache handlers (PostGIS H3 and PostGIS BBox).
 Tests cover:
 - query_processor changes: geometry_column and skip_partition_key_joins
 - apply_cache changes: extend_query_with_spatial_filter_lazy, spatial mode in apply_cache_lazy
+- apply_cache changes: extend_query_with_spatial_filter, spatial mode in apply_cache (non-lazy)
 - Handler SQL generation: set_cache_lazy wrapping, get_intersected_sql, get_spatial_filter_lazy
+- Handler WKB generation: get_spatial_filter (non-lazy)
 """
 
 from unittest.mock import MagicMock, patch
@@ -12,7 +14,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from partitioncache.apply_cache import (
+    apply_cache,
     apply_cache_lazy,
+    extend_query_with_spatial_filter,
     extend_query_with_spatial_filter_lazy,
 )
 from partitioncache.query_processor import (
@@ -595,3 +599,269 @@ class TestUnifiedGeometryDatatype:
         from partitioncache.cache_handler.postgis_h3 import PostGISH3CacheHandler
 
         assert PostGISH3CacheHandler.get_supported_datatypes() == PostGISBBoxCacheHandler.get_supported_datatypes()
+
+
+# =============================================================================
+# Tests for non-lazy spatial functions
+# =============================================================================
+
+
+class TestExtendQueryWithSpatialFilter:
+    """Test the non-lazy extend_query_with_spatial_filter function."""
+
+    def test_adds_st_dwithin_with_wkb(self):
+        """Should add ST_DWithin with WKB geometry literal."""
+        query = "SELECT * FROM poi AS p1 WHERE p1.type = 'restaurant'"
+        # Fake WKB bytes (just needs to be non-empty for the test)
+        wkb = b"\x01\x02\x03\x04"
+        result = extend_query_with_spatial_filter(
+            query=query,
+            spatial_filter_wkb=wkb,
+            geometry_column="geom",
+            buffer_distance=500.0,
+            srid=4326,
+            p0_alias="p1",
+        )
+        result_upper = result.upper()
+        assert "ST_DWITHIN" in result_upper
+        assert "GEOGRAPHY" in result_upper
+        assert "500.0" in result
+        assert "ST_GEOMFROMWKB" in result_upper
+        assert "01020304" in result.lower()  # hex of WKB bytes
+
+    def test_empty_wkb_returns_original(self):
+        """Empty WKB should return original query."""
+        query = "SELECT * FROM poi AS p1"
+        result = extend_query_with_spatial_filter(
+            query=query,
+            spatial_filter_wkb=b"",
+            geometry_column="geom",
+            buffer_distance=500.0,
+        )
+        assert result == query
+
+    def test_auto_detects_table_alias(self):
+        """When p0_alias is None, should auto-detect first table."""
+        query = "SELECT * FROM poi AS p1 WHERE p1.type = 'cafe'"
+        wkb = b"\x01\x02"
+        result = extend_query_with_spatial_filter(
+            query=query,
+            spatial_filter_wkb=wkb,
+            geometry_column="geom",
+            buffer_distance=100.0,
+        )
+        result_upper = result.upper()
+        assert "ST_DWITHIN" in result_upper
+        assert "p1.geom" in result.lower()
+
+    def test_srid_in_geomfromwkb(self):
+        """SRID should be passed to ST_GeomFromWKB."""
+        query = "SELECT * FROM poi AS p1"
+        wkb = b"\xAA\xBB"
+        result = extend_query_with_spatial_filter(
+            query=query,
+            spatial_filter_wkb=wkb,
+            geometry_column="geom",
+            buffer_distance=100.0,
+            srid=25832,
+            p0_alias="p1",
+        )
+        assert "25832" in result
+
+    def test_no_table_raises_error(self):
+        """Query without tables should raise ValueError."""
+        with pytest.raises(ValueError, match="No table found"):
+            extend_query_with_spatial_filter(
+                query="SELECT 1",
+                spatial_filter_wkb=b"\x01",
+                geometry_column="geom",
+                buffer_distance=100.0,
+            )
+
+
+class TestApplyCacheSpatialMode:
+    """Test apply_cache (non-lazy) with spatial parameters."""
+
+    def _make_mock_handler(self, spatial_filter_wkb=None, existing_keys=None):
+        """Create a mock cache handler with spatial support."""
+        from partitioncache.cache_handler.abstract import AbstractCacheHandler
+
+        handler = MagicMock(spec=AbstractCacheHandler)
+        handler.get_spatial_filter = MagicMock(return_value=spatial_filter_wkb)
+        handler.filter_existing_keys = MagicMock(return_value=existing_keys or set())
+        handler.srid = 4326
+        return handler
+
+    @patch("partitioncache.apply_cache.generate_all_hashes")
+    def test_spatial_mode_calls_get_spatial_filter(self, mock_hashes):
+        """When geometry_column is set, should call get_spatial_filter."""
+        mock_hashes.return_value = ["hash1", "hash2"]
+
+        handler = self._make_mock_handler(
+            spatial_filter_wkb=b"\x01\x02\x03",
+            existing_keys={"hash1", "hash2"},
+        )
+
+        query = "SELECT * FROM poi AS p1 WHERE p1.type = 'cafe'"
+        result, stats = apply_cache(
+            query=query,
+            cache_handler=handler,
+            partition_key="spatial_h3",
+            geometry_column="geom",
+            buffer_distance=500.0,
+        )
+
+        handler.get_spatial_filter.assert_called_once()
+        assert stats["enhanced"] == 1
+        assert "ST_DWITHIN" in result.upper()
+
+    @patch("partitioncache.apply_cache.generate_all_hashes")
+    def test_spatial_mode_no_cache_hits_returns_original(self, mock_hashes):
+        """When no spatial filter returned, return original query."""
+        mock_hashes.return_value = ["hash1"]
+
+        handler = self._make_mock_handler(spatial_filter_wkb=None)
+
+        query = "SELECT * FROM poi AS p1 WHERE p1.type = 'cafe'"
+        result, stats = apply_cache(
+            query=query,
+            cache_handler=handler,
+            partition_key="spatial_h3",
+            geometry_column="geom",
+            buffer_distance=500.0,
+        )
+
+        assert result == query
+        assert stats["enhanced"] == 0
+
+    @patch("partitioncache.apply_cache.generate_all_hashes")
+    def test_spatial_mode_requires_buffer_distance(self, mock_hashes):
+        """When geometry_column is set but buffer_distance is None, should raise ValueError."""
+        mock_hashes.return_value = ["hash1"]
+
+        handler = self._make_mock_handler()
+
+        with pytest.raises(ValueError, match="buffer_distance is required"):
+            apply_cache(
+                query="SELECT * FROM poi AS p1",
+                cache_handler=handler,
+                partition_key="spatial_h3",
+                geometry_column="geom",
+                buffer_distance=None,
+            )
+
+    @patch("partitioncache.apply_cache.generate_all_hashes")
+    def test_spatial_mode_requires_spatial_handler(self, mock_hashes):
+        """When handler lacks get_spatial_filter, should raise ValueError."""
+        mock_hashes.return_value = ["hash1"]
+
+        from partitioncache.cache_handler.abstract import AbstractCacheHandler
+
+        handler = MagicMock(spec=AbstractCacheHandler)
+        del handler.get_spatial_filter
+
+        with pytest.raises(ValueError, match="does not support spatial filtering"):
+            apply_cache(
+                query="SELECT * FROM poi AS p1",
+                cache_handler=handler,
+                partition_key="spatial_h3",
+                geometry_column="geom",
+                buffer_distance=500.0,
+            )
+
+    @patch("partitioncache.apply_cache.generate_all_hashes")
+    def test_spatial_mode_uses_handler_srid(self, mock_hashes):
+        """Should use the handler's SRID in the generated query."""
+        mock_hashes.return_value = ["hash1"]
+
+        handler = self._make_mock_handler(
+            spatial_filter_wkb=b"\x01\x02",
+            existing_keys={"hash1"},
+        )
+        handler.srid = 25832
+
+        query = "SELECT * FROM poi AS p1 WHERE p1.type = 'cafe'"
+        result, stats = apply_cache(
+            query=query,
+            cache_handler=handler,
+            partition_key="spatial_h3",
+            geometry_column="geom",
+            buffer_distance=500.0,
+        )
+
+        assert "25832" in result
+        assert stats["enhanced"] == 1
+
+
+class TestGetSpatialFilterH3SqlGeneration:
+    """Test get_spatial_filter SQL generation for H3 handler (mock-based)."""
+
+    def test_get_spatial_filter_calls_lazy_and_executes(self):
+        """get_spatial_filter should call get_spatial_filter_lazy, then execute SQL."""
+        from partitioncache.cache_handler.postgis_h3 import PostGISH3CacheHandler
+
+        handler = MagicMock(spec=PostGISH3CacheHandler)
+        handler.get_spatial_filter_lazy = MagicMock(return_value="SELECT ST_Union(geom) FROM cells")
+
+        # Mock cursor to return WKB
+        mock_cursor = MagicMock()
+        mock_cursor.fetchone.return_value = (b"\x01\x02\x03",)
+        handler.cursor = mock_cursor
+
+        # Bind the real method
+        handler.get_spatial_filter = PostGISH3CacheHandler.get_spatial_filter.__get__(handler)
+
+        result = handler.get_spatial_filter({"hash1"}, "spatial_h3", 500.0)
+        assert result == b"\x01\x02\x03"
+        handler.get_spatial_filter_lazy.assert_called_once_with({"hash1"}, "spatial_h3", 500.0)
+
+    def test_get_spatial_filter_returns_none_when_lazy_is_none(self):
+        """get_spatial_filter should return None when lazy returns None."""
+        from partitioncache.cache_handler.postgis_h3 import PostGISH3CacheHandler
+
+        handler = MagicMock(spec=PostGISH3CacheHandler)
+        handler.get_spatial_filter_lazy = MagicMock(return_value=None)
+        handler.get_spatial_filter = PostGISH3CacheHandler.get_spatial_filter.__get__(handler)
+
+        result = handler.get_spatial_filter({"hash1"}, "spatial_h3", 500.0)
+        assert result is None
+
+
+class TestGetSpatialFilterBBoxSqlGeneration:
+    """Test get_spatial_filter SQL generation for BBox handler (mock-based)."""
+
+    def test_get_spatial_filter_executes_intersect_sql(self):
+        """get_spatial_filter should execute the intersection SQL and return WKB."""
+        from partitioncache.cache_handler.postgis_bbox import PostGISBBoxCacheHandler
+
+        handler = MagicMock(spec=PostGISBBoxCacheHandler)
+        handler.tableprefix = "test_prefix"
+        handler._get_partition_datatype = MagicMock(return_value="geometry")
+        handler.filter_existing_keys = MagicMock(return_value={"hash1"})
+
+        # Provide a real _get_intersected_sql to build real SQL
+        handler._get_intersected_sql = PostGISBBoxCacheHandler._get_intersected_sql.__get__(handler)
+
+        # Mock cursor
+        mock_cursor = MagicMock()
+        mock_cursor.fetchone.return_value = (b"\xAA\xBB\xCC",)
+        handler.cursor = mock_cursor
+
+        # Bind the real method
+        handler.get_spatial_filter = PostGISBBoxCacheHandler.get_spatial_filter.__get__(handler)
+
+        result = handler.get_spatial_filter({"hash1"}, "spatial_bbox", 0.0)
+        assert result == b"\xAA\xBB\xCC"
+        mock_cursor.execute.assert_called_once()
+
+    def test_get_spatial_filter_returns_none_when_no_keys(self):
+        """get_spatial_filter should return None when no filtered keys."""
+        from partitioncache.cache_handler.postgis_bbox import PostGISBBoxCacheHandler
+
+        handler = MagicMock(spec=PostGISBBoxCacheHandler)
+        handler._get_partition_datatype = MagicMock(return_value="geometry")
+        handler.filter_existing_keys = MagicMock(return_value=set())
+        handler.get_spatial_filter = PostGISBBoxCacheHandler.get_spatial_filter.__get__(handler)
+
+        result = handler.get_spatial_filter({"hash1"}, "spatial_bbox", 0.0)
+        assert result is None
