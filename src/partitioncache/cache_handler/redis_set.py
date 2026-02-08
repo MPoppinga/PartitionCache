@@ -103,8 +103,12 @@ class RedisCacheHandler(RedisAbstractCacheHandler):
         existing_datatype = self._get_partition_datatype(partition_key)
         if existing_datatype is not None:
             if existing_datatype == "integer":
+                if not all(isinstance(v, int) for v in partition_key_identifiers):
+                    raise ValueError("Unsupported partition key identifier type for integer partition")
                 str_values = [str(v) for v in partition_key_identifiers]
             elif existing_datatype == "text":
+                if not all(isinstance(v, str) for v in partition_key_identifiers):
+                    raise ValueError("Unsupported partition key identifier type for text partition")
                 str_values = [str(v) for v in partition_key_identifiers]
             else:
                 raise ValueError(f"Unsupported datatype in metadata: {existing_datatype}")

@@ -123,18 +123,25 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
 
     def close(self):
         cls = type(self)
-        cls._refcount -= 1
-        if cls._refcount <= 0:
-            # Actually close the connection
-            try:
-                if self.cursor:
-                    self.cursor.close()
-                if self.db:
-                    self.db.close()
-            except Exception as e:
-                logger.error(f"Error closing PostgreSQL connection: {e}")
-            cls._instance = None
-            cls._refcount = 0
+        is_singleton_instance = cls._instance is self and cls._refcount > 0
+
+        if is_singleton_instance:
+            cls._refcount -= 1
+            if cls._refcount > 0:
+                return
+
+        # Actually close the connection
+        try:
+            if self.cursor:
+                self.cursor.close()
+            if self.db:
+                self.db.close()
+        except Exception as e:
+            logger.error(f"Error closing PostgreSQL connection: {e}")
+        finally:
+            if is_singleton_instance:
+                cls._instance = None
+                cls._refcount = 0
 
     def set_query(self, key: str, querytext: str, partition_key: str = "partition_key") -> bool:
         """Store a query in the cache associated with the given key."""

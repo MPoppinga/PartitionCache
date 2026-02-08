@@ -182,12 +182,19 @@ class RocksDictAbstractCacheHandler(AbstractCacheHandler):
     def close(self) -> None:
         """Close the RocksDict database."""
         cls = type(self)
-        cls._refcount -= 1
-        if cls._refcount <= 0:
-            try:
-                self.db.close()
-            except Exception:
-                pass
+        is_singleton_instance = cls._instance is self and cls._refcount > 0
+
+        if is_singleton_instance:
+            cls._refcount -= 1
+            if cls._refcount > 0:
+                return
+
+        try:
+            self.db.close()
+        except Exception:
+            pass
+
+        if is_singleton_instance:
             cls._instance = None
             cls._refcount = 0
 
