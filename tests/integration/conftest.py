@@ -491,22 +491,16 @@ def cache_client(request, db_session):
         original_env_vars["ROCKSDB_BIT_BITSIZE"] = os.getenv("ROCKSDB_BIT_BITSIZE")
         os.environ["ROCKSDB_BIT_PATH"] = temp_dir
         os.environ["ROCKSDB_BIT_BITSIZE"] = "200000"
-    elif cache_backend == "rocksdict":
-        temp_dir = tempfile.mkdtemp(prefix="rocksdict_test_")
-        # rocksdict uses the db_path parameter directly, no env vars needed
-    elif cache_backend == "rocksdict_roaringbit":
-        temp_dir = tempfile.mkdtemp(prefix="rocksdict_roaringbit_test_")
-        # rocksdict_roaringbit uses the db_path parameter directly, no env vars needed
-
     try:
         # Create cache handler
         if cache_backend == "rocksdict":
-            # rocksdict needs the path passed directly
+            # rocksdict needs the path passed directly, no env vars needed
             temp_dir = tempfile.mkdtemp(prefix="rocksdict_test_")
             from partitioncache.cache_handler.rocks_dict import RocksDictCacheHandler
 
             cache_handler = RocksDictCacheHandler(temp_dir)
         elif cache_backend == "rocksdict_roaringbit":
+            # rocksdict_roaringbit needs the path passed directly, no env vars needed
             temp_dir = tempfile.mkdtemp(prefix="rocksdict_roaringbit_test_")
             from partitioncache.cache_handler.rocksdict_roaringbit import RocksDictRoaringBitCacheHandler
 

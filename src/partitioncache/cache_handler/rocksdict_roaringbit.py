@@ -95,7 +95,8 @@ class RocksDictRoaringBitCacheHandler(RocksDictAbstractCacheHandler):
             logger.debug(f"saving {len(bm)} partition key identifiers in cache {cache_key}")
             self.db[cache_key] = bm.serialize()
             return True
-        except Exception:
+        except Exception as e:
+            logger.error(f"Failed to set partition key identifiers for hash {key} in partition {partition_key}: {e}")
             return False
 
     def register_partition_key(self, partition_key: str, datatype: str, **kwargs) -> None:
