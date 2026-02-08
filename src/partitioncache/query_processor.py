@@ -525,6 +525,7 @@ def _build_select_clause(
     original_to_new_alias_mapping: dict[str, str],
     partition_key: str,
     star_join_alias: str | None = None,
+    geometry_column: str | None = None,
 ) -> str:
     """
     Build the SELECT clause for a partial query.
@@ -536,17 +537,21 @@ def _build_select_clause(
         original_to_new_alias_mapping: Mapping from original aliases to new aliases
         partition_key: The partition key column name
         star_join_alias: Alias of the star-join table if present (e.g., 'p1')
+        geometry_column: If set, use this column instead of partition_key in SELECT (for spatial queries)
 
     Returns:
         Complete SELECT clause string (with SELECT keyword)
     """
     if strip_select or original_select_clause is None:
+        # Determine which column to select
+        select_column = geometry_column if geometry_column else partition_key
+
         # For star-join queries, prefer selecting from the star-join table
         if star_join_alias:
-            return f"SELECT DISTINCT {star_join_alias}.{partition_key}"
+            return f"SELECT DISTINCT {star_join_alias}.{select_column}"
         else:
             # Default behavior: select only partition key from first table
-            return f"SELECT DISTINCT {table_aliases[0]}.{partition_key}"
+            return f"SELECT DISTINCT {table_aliases[0]}.{select_column}"
 
     # Preserve original SELECT clause with alias mapping
     try:
@@ -575,6 +580,8 @@ def generate_partial_queries(
     star_join_table: str | None = None,
     warn_no_partition_key: bool = True,
     strip_select: bool = True,
+    skip_partition_key_joins: bool = False,
+    geometry_column: str | None = None,
 ) -> list[str]:
     """
     This function takes a query and returns the list of all possible partial queries.
@@ -596,6 +603,10 @@ def generate_partial_queries(
         warn_no_partition_key: bool: If True, emit warnings for tables not using the partition key
         strip_select: bool: If True (default), strip SELECT clause to only select partition keys.
             If False, preserve original SELECT clause with proper alias mapping for partial queries.
+        skip_partition_key_joins: bool: If True, skip generating partition_key equijoin conditions between tables.
+            Used for spatial queries where tables are linked by distance conditions, not equijoins.
+        geometry_column: str | None: If set, use this geometry column instead of partition_key in SELECT clause.
+            Used for spatial cache handlers (H3, BBox) where the SELECT needs the geometry column.
 
     Returns:
         List[str]: List of all possible partial queries
@@ -769,10 +780,11 @@ def generate_partial_queries(
             for rdist in relvant_conditions_for_combination:
                 query_where.append(rdist)
 
-            # Add join conditions for given partition_key
-            for i in range(1, len(new_table_list)):
-                for j in range(i + 1, len(new_table_list) + 1):
-                    query_where.append(f"{new_table_list[i - 1]}.{partition_key} = {new_table_list[j - 1]}.{partition_key}")
+            # Add join conditions for given partition_key (skip for spatial queries)
+            if not skip_partition_key_joins:
+                for i in range(1, len(new_table_list)):
+                    for j in range(i + 1, len(new_table_list) + 1):
+                        query_where.append(f"{new_table_list[i - 1]}.{partition_key} = {new_table_list[j - 1]}.{partition_key}")
 
             # Build table list with correct table names from alias_to_table_map
             new_table_list_with_alias = []
@@ -841,7 +853,7 @@ def generate_partial_queries(
 
                 combined_where = query_where_without_pk_joins + star_join_joins + star_join_conditions
                 select_clause = _build_select_clause(
-                    strip_select, original_select_clause, new_table_list, original_to_new_alias_mapping, partition_key, star_join_new_alias
+                    strip_select, original_select_clause, new_table_list, original_to_new_alias_mapping, partition_key, star_join_new_alias, geometry_column
                 )
                 q_with_star_join = f"{select_clause} FROM {', '.join(combined_table_list)} WHERE {' AND '.join(combined_where)}"
                 ret.append(q_with_star_join)
@@ -865,7 +877,7 @@ def generate_partial_queries(
                                 query_where_comb.append(star_join_subquery)
                             # Build WHERE clause only if conditions exist
                             select_clause = _build_select_clause(
-                                strip_select, original_select_clause, new_table_list, original_to_new_alias_mapping, partition_key, star_join_new_alias
+                                strip_select, original_select_clause, new_table_list, original_to_new_alias_mapping, partition_key, star_join_new_alias, geometry_column
                             )
                             if query_where_comb:
                                 q = f"{select_clause} FROM {', '.join(combined_table_list)} WHERE {' AND '.join(query_where_comb)}"
@@ -875,7 +887,7 @@ def generate_partial_queries(
             else:
                 # Normal case without p0 exclusion
                 # Build WHERE clause only if conditions exist
-                select_clause = _build_select_clause(strip_select, original_select_clause, new_table_list, original_to_new_alias_mapping, partition_key, None)
+                select_clause = _build_select_clause(strip_select, original_select_clause, new_table_list, original_to_new_alias_mapping, partition_key, None, geometry_column)
                 if query_where:
                     q = f"{select_clause} FROM {', '.join(new_table_list_with_alias)} WHERE {' AND '.join(query_where)}"
                 else:
@@ -900,7 +912,7 @@ def generate_partial_queries(
                             query_where_comb.append(p_subquery)
                         # Build WHERE clause only if conditions exist
                         select_clause = _build_select_clause(
-                            strip_select, original_select_clause, new_table_list, original_to_new_alias_mapping, partition_key, None
+                            strip_select, original_select_clause, new_table_list, original_to_new_alias_mapping, partition_key, None, geometry_column
                         )
                         if query_where_comb:
                             q = f"{select_clause} FROM {', '.join(new_table_list_with_alias)} WHERE {' AND '.join(query_where_comb)}"
@@ -1361,6 +1373,8 @@ def generate_all_query_hash_pairs(
     add_constraints: dict[str, str] | None = None,
     remove_constraints_all: list[str] | None = None,
     remove_constraints_add: list[str] | None = None,
+    skip_partition_key_joins: bool = False,
+    geometry_column: str | None = None,
 ) -> list[tuple[str, str]]:
     """
     Generate all query hash pairs for a given query with configurable variant generation.
@@ -1404,6 +1418,8 @@ def generate_all_query_hash_pairs(
             star_join_table=star_join_table,
             warn_no_partition_key=warn_no_partition_key,
             strip_select=strip_select,
+            skip_partition_key_joins=skip_partition_key_joins,
+            geometry_column=geometry_column,
         )
     )
     query_set.update(query_set_diff_combinations)
@@ -1425,6 +1441,8 @@ def generate_all_query_hash_pairs(
                 star_join_table=star_join_table,
                 warn_no_partition_key=warn_no_partition_key,
                 strip_select=strip_select,
+                skip_partition_key_joins=skip_partition_key_joins,
+                geometry_column=geometry_column,
             )
         )
     )
@@ -1432,7 +1450,7 @@ def generate_all_query_hash_pairs(
     # Apply constraint modifications to all generated queries
     query_set = _apply_constraint_modifications(
         query_set, add_constraints=add_constraints, remove_constraints_all=remove_constraints_all, remove_constraints_add=remove_constraints_add
-    )
+    ) # TODO This would sometime create a difefrent ordering nessesary as the reassignment of aliase in the fragmentcreation could be different
 
     # If we have constraint modifications, also apply them to normalized distance variants
     if add_constraints or remove_constraints_add:
@@ -1479,6 +1497,8 @@ def generate_all_hashes(
     add_constraints: dict[str, str] | None = None,
     remove_constraints_all: list[str] | None = None,
     remove_constraints_add: list[str] | None = None,
+    skip_partition_key_joins: bool = False,
+    geometry_column: str | None = None,
 ) -> list[str]:
     """
     Generates all hashes for the given query.
@@ -1499,6 +1519,8 @@ def generate_all_hashes(
         add_constraints=add_constraints,
         remove_constraints_all=remove_constraints_all,
         remove_constraints_add=remove_constraints_add,
+        skip_partition_key_joins=skip_partition_key_joins,
+        geometry_column=geometry_column,
     )
     return [x[1] for x in qh_pairs]
 

@@ -450,11 +450,24 @@ def insert_cache_config(
                     target_database TEXT NOT NULL,
                     result_limit INTEGER DEFAULT NULL,
                     default_bitsize INTEGER DEFAULT NULL,
+                    geometry_column TEXT DEFAULT 'geom',
+                    h3_resolution INTEGER DEFAULT 9,
+                    bbox_cell_size FLOAT DEFAULT 0.01,
+                    bbox_srid INTEGER DEFAULT 4326,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
                 """
             ).format(sql.Identifier(config_table))
         )
+
+        # Ensure spatial columns exist (for upgrades from older schema)
+        for alter_stmt in [
+            sql.SQL("ALTER TABLE {} ADD COLUMN IF NOT EXISTS geometry_column TEXT DEFAULT 'geom'"),
+            sql.SQL("ALTER TABLE {} ADD COLUMN IF NOT EXISTS h3_resolution INTEGER DEFAULT 9"),
+            sql.SQL("ALTER TABLE {} ADD COLUMN IF NOT EXISTS bbox_cell_size FLOAT DEFAULT 0.01"),
+            sql.SQL("ALTER TABLE {} ADD COLUMN IF NOT EXISTS bbox_srid INTEGER DEFAULT 4326"),
+        ]:
+            cur.execute(alter_stmt.format(sql.Identifier(config_table)))
 
         # Insert configuration for worker functions to access
         cur.execute(

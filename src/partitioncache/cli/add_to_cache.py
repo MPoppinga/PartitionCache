@@ -12,6 +12,7 @@ from partitioncache.cli.common_args import (
     add_database_args,
     add_environment_args,
     add_queue_args,
+    add_spatial_args,
     add_variant_generation_args,
     add_verbosity_args,
     configure_logging,
@@ -50,6 +51,7 @@ def main():
     add_cache_args(parser, require_partition_key=True)
     add_database_args(parser)
     add_queue_args(parser)
+    add_spatial_args(parser)
     add_variant_generation_args(parser)
     add_environment_args(parser)
     add_verbosity_args(parser)
@@ -95,7 +97,20 @@ def main():
             exit(1)
 
     elif args.queue:  # Add to queue for async processing
+        is_spatial = args.partition_datatype == "geometry"
         if not args.no_recompose:  # Add to query fragment queue for async processing
+            # Resolve geometry column for spatial datatypes
+            geometry_column = None
+            if is_spatial:
+                geometry_column = args.geometry_column
+                if not geometry_column:
+                    # Try to get from cache handler config
+                    try:
+                        cache_handler = partitioncache.get_cache_handler(resolve_cache_backend(args), singleton=True)
+                        geometry_column = getattr(cache_handler, "geometry_column", "geom")
+                    except Exception:
+                        geometry_column = "geom"
+
             query_hash_pairs = generate_all_query_hash_pairs(
                 query,
                 args.partition_key,
@@ -110,6 +125,8 @@ def main():
                 add_constraints=add_constraints,
                 remove_constraints_all=remove_constraints_all,
                 remove_constraints_add=remove_constraints_add,
+                skip_partition_key_joins=is_spatial,
+                geometry_column=geometry_column,
             )
             success = partitioncache.push_to_query_fragment_queue(query_hash_pairs, args.partition_key, args.partition_datatype, queue_provider)
         else: # Compute fragments and add to fragment queue
@@ -123,6 +140,8 @@ def main():
             exit(1)
 
     elif args.direct:  # Execute directly
+        is_spatial = args.partition_datatype == "geometry"
+
         if not args.no_recompose:
             logger.warning("Direct mode with recomposing may take a long time on large queries, consider using the queue instead")
 
@@ -134,29 +153,22 @@ def main():
             cache_handler = partitioncache.get_cache_handler(cache_backend, singleton=True)
             kwargs = {}
             if hasattr(cache_handler, '_get_partition_bitsize'):
-                existing_bitsize = cache_handler._get_partition_bitsize(args.partition_key) # type: ignore[attr-defined]
+                existing_bitsize = cache_handler._get_partition_bitsize(args.partition_key)  # type: ignore[attr-defined]
                 if args.bitsize is not None:
                     kwargs['bitsize'] = args.bitsize
                     if existing_bitsize is not None and existing_bitsize != args.bitsize:
                         logger.info(f"Updating bitsize from {existing_bitsize} to {args.bitsize} for partition '{args.partition_key}'")
-                        cache_handler._set_partition_bitsize(args.partition_key, args.bitsize) # type: ignore[attr-defined]
+                        cache_handler._set_partition_bitsize(args.partition_key, args.bitsize)  # type: ignore[attr-defined]
                 elif existing_bitsize is not None:
                     kwargs['bitsize'] = existing_bitsize
             elif hasattr(args, 'bitsize') and args.bitsize is not None:
                 kwargs['bitsize'] = args.bitsize
             cache = partitioncache.create_partitioncache_helper(cache_handler, args.partition_key, args.partition_datatype, **kwargs)
 
-            # Get database handler using common connection parameters
-            db_connection_params = get_database_connection_params(args)
-
-            if args.db_backend == "postgresql":
-                db_handler = get_db_handler("postgres", **db_connection_params)
-            elif args.db_backend == "mysql":
-                db_handler = get_db_handler("mysql", **db_connection_params)
-            elif args.db_backend == "sqlite":
-                db_handler = get_db_handler("sqlite", **db_connection_params)
-            else:
-                raise ValueError(f"Unsupported database backend: {args.db_backend}")
+            # Resolve geometry column for spatial datatypes
+            geometry_column = None
+            if is_spatial:
+                geometry_column = args.geometry_column or getattr(cache_handler, "geometry_column", "geom")
 
             if not args.no_recompose:
                 logger.debug("Recomposing query")
@@ -176,6 +188,8 @@ def main():
                     add_constraints=add_constraints,
                     remove_constraints_all=remove_constraints_all,
                     remove_constraints_add=remove_constraints_add,
+                    skip_partition_key_joins=is_spatial,
+                    geometry_column=geometry_column,
                 )
 
             else:
@@ -184,24 +198,57 @@ def main():
 
             logger.debug(f"Found {len(query_hash_pairs)} subqueries to process")
 
-            # Process each query-hash pair
-            for query, hash_value in query_hash_pairs:
-                if cache.exists(hash_value):
-                    logger.debug(f"Query {hash_value} already in cache")
-                    cache.set_query(hash_value, query)
-                    continue
+            if is_spatial:
+                # Spatial mode: use lazy insertion (the handler wraps fragments with H3/BBox SQL)
+                if not hasattr(cache_handler, "set_cache_lazy"):
+                    logger.error(f"Spatial datatype '{args.partition_datatype}' requires a handler with set_cache_lazy support")
+                    exit(1)
 
-                # Execute query and store results
-                result = set(db_handler.execute(query))
-                if result:
-                    cache.set_cache(hash_value, result)
-                    cache.set_query(hash_value, query)
-                    logger.debug(f"Stored query {hash_value} with {len(result)} results")
+                for query, hash_value in query_hash_pairs:
+                    if cache.exists(hash_value):
+                        logger.debug(f"Query {hash_value} already in cache")
+                        cache.set_query(hash_value, query)
+                        continue
+
+                    success = cache_handler.set_cache_lazy(hash_value, query, args.partition_key)
+                    if success:
+                        cache.set_query(hash_value, query)
+                        logger.debug(f"Lazily stored spatial query {hash_value}")
+                    else:
+                        logger.warning(f"Failed to lazily store spatial query {hash_value}")
+
+                cache.close()
+            else:
+                # Standard mode: execute fragments via db_handler and store results
+                db_connection_params = get_database_connection_params(args)
+
+                if args.db_backend == "postgresql":
+                    db_handler = get_db_handler("postgres", **db_connection_params)
+                elif args.db_backend == "mysql":
+                    db_handler = get_db_handler("mysql", **db_connection_params)
+                elif args.db_backend == "sqlite":
+                    db_handler = get_db_handler("sqlite", **db_connection_params)
                 else:
-                    logger.warning(f"Query {hash_value} returned no results")
+                    raise ValueError(f"Unsupported database backend: {args.db_backend}")
 
-            db_handler.close()
-            cache.close()
+                # Process each query-hash pair
+                for query, hash_value in query_hash_pairs:
+                    if cache.exists(hash_value):
+                        logger.debug(f"Query {hash_value} already in cache")
+                        cache.set_query(hash_value, query)
+                        continue
+
+                    # Execute query and store results
+                    result = set(db_handler.execute(query))
+                    if result:
+                        cache.set_cache(hash_value, result)
+                        cache.set_query(hash_value, query)
+                        logger.debug(f"Stored query {hash_value} with {len(result)} results")
+                    else:
+                        logger.warning(f"Query {hash_value} returned no results")
+
+                db_handler.close()
+                cache.close()
 
         except Exception as e:
             logger.error(f"Error processing query: {str(e)}")

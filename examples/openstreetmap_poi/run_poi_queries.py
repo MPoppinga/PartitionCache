@@ -68,18 +68,21 @@ def test_partition_key(conn, partition_key: str, datatype: str = "integer"):
 
                 if partition_keys:
                     # Extend the query to restrict to cached partition keys
-                    sql_cached = partitioncache.extend_query_with_partition_keys(
-                        sql_query,
-                        partition_keys,
-                        partition_key=partition_key,
-                        method="IN",
-                        p0_alias="p1",  # assumes p1 is the main table alias for partition key
-                    )
-                    elapsed_cache_get = time.perf_counter() - start_cache
-                    rows_cached, elapsed_cached = run_query(conn, sql_cached)
-                    print(
-                        f"With PartitionCache: {len(rows_cached)} results in {elapsed_cache_get:.3f} + {elapsed_cached:.3f} seconds (cache hits: {num_hits}, partition keys: {len(partition_keys)})"
-                    )
+                    try:
+                        sql_cached = partitioncache.extend_query_with_partition_keys(
+                            sql_query,
+                            partition_keys,
+                            partition_key=partition_key,
+                            method="IN",
+                            p0_alias="p1",  # assumes p1 is the main table alias for partition key
+                        )
+                        elapsed_cache_get = time.perf_counter() - start_cache
+                        rows_cached, elapsed_cached = run_query(conn, sql_cached)
+                        print(
+                            f"With PartitionCache: {len(rows_cached)} results in {elapsed_cache_get:.3f} + {elapsed_cached:.3f} seconds (cache hits: {num_hits}, partition keys: {len(partition_keys)})"
+                        )
+                    except Exception as e:
+                        print(f"Skipping IN method (text values with special characters): {type(e).__name__}")
                 else:
                     if num_hits > 0:
                         print(f"Cache entries found ({num_hits} hash matches) but no common partition keys after intersection.")
@@ -172,6 +175,77 @@ def test_partition_key(conn, partition_key: str, datatype: str = "integer"):
         return
 
 
+def test_spatial_partition_key(conn, partition_key: str, cache_backend: str, geometry_column: str = "geom", buffer_distance: float = 500.0):
+    """Test queries with a spatial partition key (geometry datatype)."""
+    query_dir = os.path.join("testqueries_examples", "spatial")
+    if not os.path.exists(query_dir):
+        print(f"\nSkipping spatial partition key '{partition_key}' - no test queries found in {query_dir}")
+        return
+
+    print(f"\n{'=' * 60}")
+    print(f"Running with spatial partition key: {partition_key} (datatype: geometry)")
+    print(f"Cache backend: {cache_backend}, geometry_column: {geometry_column}, buffer_distance: {buffer_distance}m")
+    print(f"{'=' * 60}")
+
+    queries = []
+    for file in sorted(os.listdir(query_dir)):
+        if file.endswith(".sql"):
+            with open(os.path.join(query_dir, file)) as f:
+                queries.append((file, f.read()))
+
+    try:
+        cache_handler = partitioncache.get_cache_handler(cache_backend, singleton=True)
+
+        for description, sql_query in queries:
+            print(f"\n---\nQuery: {description}\n")
+
+            # Run without cache
+            rows, elapsed = run_query(conn, sql_query)
+            print(f"Without PartitionCache: {len(rows)} results in {elapsed:.3f} seconds")
+
+            # Test apply_cache_lazy with spatial filter
+            start_cache = time.perf_counter()
+            sql_cached, stats = partitioncache.apply_cache_lazy(
+                query=sql_query,
+                cache_handler=cache_handler,
+                partition_key=partition_key,
+                geometry_column=geometry_column,
+                buffer_distance=buffer_distance,
+                method="TMP_TABLE_IN",
+                min_component_size=1,
+            )
+            elapsed_cache_get = time.perf_counter() - start_cache
+
+            if stats["enhanced"]:
+                rows_cached, elapsed_cached = run_query(conn, sql_cached)
+                print(
+                    f"With apply_cache_lazy (spatial): {len(rows_cached)} results in {elapsed_cache_get:.3f} + "
+                    f"{elapsed_cached:.3f} seconds (generated: {stats['generated_variants']}, "
+                    f"hits: {stats['cache_hits']}, enhanced: {stats['enhanced']})"
+                )
+            else:
+                if stats["cache_hits"] > 0:
+                    print(f"Cache entries found ({stats['cache_hits']} hash matches) but query was not enhanced.")
+                else:
+                    print("No cache entries found for this query.")
+                    print("Hint: Add queries to cache using:")
+                    print(
+                        f"  pcache-add --direct --query-file {query_dir}/{description} "
+                        f"--partition-key {partition_key} --partition-datatype geometry "
+                        f"--cache-backend {cache_backend} --geometry-column {geometry_column}"
+                    )
+
+    except ValueError as e:
+        print(f"Cache configuration error: {e}")
+        return
+
+
+# Spatial cache backend (set via env or override)
+SPATIAL_CACHE_BACKEND = os.getenv("SPATIAL_CACHE_BACKEND", "postgis_h3")
+GEOMETRY_COLUMN = os.getenv("PARTITION_CACHE_GEOMETRY_COLUMN", "geom")
+BUFFER_DISTANCE = float(os.getenv("PARTITION_CACHE_BUFFER_DISTANCE", "500"))
+
+
 def main():
     print("Connecting to database...")
     conn = psycopg2.connect(dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD, host=DB_HOST, port=DB_PORT)
@@ -183,6 +257,12 @@ def main():
 
     # Test with landkreis partition key (text)
     test_partition_key(conn, "landkreis", "text")
+
+    # Test with spatial partition key
+    test_spatial_partition_key(
+        conn, "spatial", SPATIAL_CACHE_BACKEND,
+        geometry_column=GEOMETRY_COLUMN, buffer_distance=BUFFER_DISTANCE,
+    )
 
     conn.close()
     print("\nDone.")

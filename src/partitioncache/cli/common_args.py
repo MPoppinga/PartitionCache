@@ -59,7 +59,7 @@ def add_cache_args(parser: argparse.ArgumentParser, require_partition_key: bool 
     cache_group.add_argument(
         "--partition-datatype",
         type=str,
-        choices=["integer", "float", "text", "timestamp"],
+        choices=["integer", "float", "text", "timestamp", "geometry"],
         help="Datatype of the partition key (if not specified, will be inferred)",
     )
 
@@ -67,6 +67,31 @@ def add_cache_args(parser: argparse.ArgumentParser, require_partition_key: bool 
         "--bitsize",
         type=int,
         help="Bitsize for bit cache handlers (default: uses handler default or environment variable)",
+    )
+
+
+def add_spatial_args(parser: argparse.ArgumentParser) -> None:
+    """
+    Add spatial configuration arguments for H3/BBox cache handlers.
+
+    Args:
+        parser: The ArgumentParser to add arguments to
+    """
+    spatial_group = parser.add_argument_group("spatial configuration")
+
+    spatial_group.add_argument(
+        "--geometry-column",
+        type=str,
+        default=os.getenv("PARTITION_CACHE_GEOMETRY_COLUMN", None),
+        help="Geometry column name for spatial partition types (geometry). "
+        "If not specified, uses the cache handler's configured geometry column.",
+    )
+
+    spatial_group.add_argument(
+        "--buffer-distance",
+        type=float,
+        default=float(os.getenv("PARTITION_CACHE_BUFFER_DISTANCE", "0")),
+        help="Buffer distance in meters for spatial cache application (default: 0)",
     )
 
 
@@ -362,7 +387,7 @@ def resolve_cache_backend(args: argparse.Namespace) -> str:
 
     if not cache_backend:
         print("Error: No cache backend specified. Use --cache-backend or set CACHE_BACKEND environment variable")
-        print("Available backends: postgresql_array, postgresql_bit, postgresql_roaringbit, redis_set, redis_bit, rocksdb_set, rocksdb_bit, rocksdict")
+        print("Available backends: postgresql_array, postgresql_bit, postgresql_roaringbit, redis_set, redis_bit, rocksdb_set, rocksdb_bit, rocksdict, postgis_h3, postgis_bbox")
         sys.exit(1)
 
     return cache_backend

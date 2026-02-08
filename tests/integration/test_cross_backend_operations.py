@@ -15,6 +15,32 @@ from partitioncache.cache_handler import get_cache_handler
 from partitioncache.cli.manage_cache import copy_cache, export_cache, restore_cache
 
 
+@pytest.fixture(autouse=True)
+def cleanup_env_and_singleton():
+    """Save and restore environment variables and singleton state after each test."""
+    from partitioncache.cache_handler.rocks_dict import RocksDictCacheHandler
+
+    original_env = {
+        "CACHE_BACKEND": os.environ.get("CACHE_BACKEND"),
+        "ROCKSDB_DICT_PATH": os.environ.get("ROCKSDB_DICT_PATH"),
+    }
+    original_instance = RocksDictCacheHandler._instance
+    original_refcount = RocksDictCacheHandler._refcount
+
+    yield
+
+    # Restore environment variables
+    for key, value in original_env.items():
+        if value is not None:
+            os.environ[key] = value
+        elif key in os.environ:
+            del os.environ[key]
+
+    # Restore singleton state
+    RocksDictCacheHandler._instance = original_instance
+    RocksDictCacheHandler._refcount = original_refcount
+
+
 @pytest.fixture
 def temp_directories():
     """Create temporary directories for different cache backends."""

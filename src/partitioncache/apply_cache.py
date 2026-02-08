@@ -94,6 +94,8 @@ def get_partition_keys_lazy(
     add_constraints: dict[str, str] | None = None,
     remove_constraints_all: list[str] | None = None,
     remove_constraints_add: list[str] | None = None,
+    skip_partition_key_joins: bool = False,
+    geometry_column: str | None = None,
 ) -> tuple[str | None, int, int]:
     """
     Gets the lazy intersection representation of the partition keys for the given query.
@@ -134,6 +136,8 @@ def get_partition_keys_lazy(
         add_constraints=add_constraints,
         remove_constraints_all=remove_constraints_all,
         remove_constraints_add=remove_constraints_add,
+        skip_partition_key_joins=skip_partition_key_joins,
+        geometry_column=geometry_column,
     )
 
     if not isinstance(cache_handler, AbstractCacheHandler_Lazy):
@@ -524,6 +528,57 @@ def extend_query_with_partition_keys_lazy(
         return tmp_table_setup + parsed_query.sql()
 
 
+def extend_query_with_spatial_filter_lazy(
+    query: str,
+    spatial_filter_sql: str,
+    geometry_column: str,
+    buffer_distance: float,
+    p0_alias: str | None = None,
+    auto_detect_star_join: bool = True,
+    star_join_table: str | None = None,
+) -> str:
+    """
+    Extend a SQL query with a spatial filter using ST_DWithin on geography.
+
+    Adds a WHERE condition: ST_DWithin(ST_Transform({alias}.{geometry_column}, 4326)::geography, ST_Transform(({spatial_filter_sql})::geometry, 4326)::geography, {buffer_distance})
+
+    Args:
+        query: The original SQL query.
+        spatial_filter_sql: SQL subquery returning a geometry to filter against.
+        geometry_column: The geometry column name in the target table.
+        buffer_distance: Buffer distance in meters (uses geography cast).
+        p0_alias: Table alias to apply the filter to. If None, auto-detected.
+        auto_detect_star_join: Whether to auto-detect star-join tables for alias detection.
+        star_join_table: Explicitly specified star-join table alias or name.
+
+    Returns:
+        The extended SQL query with spatial filter.
+    """
+    if not spatial_filter_sql or not spatial_filter_sql.strip():
+        return query
+
+    if p0_alias is None:
+        # Find the first table in the query as fallback
+        parsed_query = sqlglot.parse_one(query)
+        first_table = parsed_query.find(exp.Table)
+        if first_table is None:
+            raise ValueError("No table found in query")
+        p0_alias = first_table.alias_or_name
+
+    # Build ST_DWithin condition with geography cast for meter-based distance
+    # Transform both sides to WGS84 (SRID 4326) before geography cast,
+    # since ::geography only supports lon/lat coordinate systems
+    spatial_condition = (
+        f"ST_DWithin(ST_Transform({p0_alias}.{geometry_column}, 4326)::geography, "
+        f"ST_Transform(({spatial_filter_sql})::geometry, 4326)::geography, {buffer_distance})"
+    )
+
+    parsed_query = sqlglot.parse_one(query)
+    spatial_expr = sqlglot.parse_one(spatial_condition)
+    _add_where_condition(parsed_query, spatial_expr)
+    return parsed_query.sql()
+
+
 def apply_cache_lazy(
     query: str,
     cache_handler: AbstractCacheHandler_Lazy,
@@ -542,6 +597,8 @@ def apply_cache_lazy(
     add_constraints: dict[str, str] | None = None,
     remove_constraints_all: list[str] | None = None,
     remove_constraints_add: list[str] | None = None,
+    geometry_column: str | None = None,
+    buffer_distance: float | None = None,
 ) -> tuple[str, dict[str, int]]:
     """
     Complete wrapper function that applies partition cache to a query using lazy intersection.
@@ -565,10 +622,18 @@ def apply_cache_lazy(
         add_constraints: Dict mapping table names to constraints to add (e.g., {"table": "col = val"})
         remove_constraints_all: List of attribute names to remove from all query variants
         remove_constraints_add: List of attribute names to remove, creating additional variants
+        geometry_column: If set, enables spatial cache mode. Uses this geometry column for fragment
+            SELECT clauses and spatial filter application. Requires a spatial cache handler with
+            get_spatial_filter_lazy() method.
+        buffer_distance: Buffer distance in meters for spatial filter (required when geometry_column is set).
+            Uses geography cast for meter-based distance.
 
     Returns:
         tuple[str, dict[str, int]]: Enhanced query and statistics.
     """
+    # Determine if we're in spatial mode
+    is_spatial = geometry_column is not None
+
     # Step 1: Generate query variants from original query
     lazy_cache_subquery, generated_variants, used_hashes = get_partition_keys_lazy(
         query=query,
@@ -577,18 +642,20 @@ def apply_cache_lazy(
         min_component_size=min_component_size,
         canonicalize_queries=canonicalize_queries,
         follow_graph=follow_graph,
-        auto_detect_star_join=auto_detect_star_join,
+        auto_detect_star_join=False if is_spatial else auto_detect_star_join,
         star_join_table=star_join_table,
         bucket_steps=bucket_steps,
         add_constraints=add_constraints,
         remove_constraints_all=remove_constraints_all,
         remove_constraints_add=remove_constraints_add,
+        skip_partition_key_joins=is_spatial,
+        geometry_column=geometry_column,
     )
 
-    # Step 2: Optionally rewrite with p0 table
+    # Step 2: Optionally rewrite with p0 table (not applicable for spatial queries)
     working_query = query
     p0_rewritten = 0
-    if use_p0_table:
+    if use_p0_table and not is_spatial:
         p0_table_alias = p0_alias if p0_alias else "p0"
         working_query = rewrite_query_with_p0_table(
             query=query,
@@ -606,24 +673,70 @@ def apply_cache_lazy(
         return working_query, stats
 
     # Step 3: Apply cache restrictions
-    cache_target_alias: str | None
-    if use_p0_table and p0_rewritten:
-        # Target p0 table for cache restrictions
-        cache_target_alias = p0_alias if p0_alias else "p0"
-    else:
-        # Regular query - use provided alias or auto-detect
-        cache_target_alias = p0_alias
+    if is_spatial:
+        # Spatial path: use get_spatial_filter_lazy and ST_DWithin
+        if buffer_distance is None:
+            raise ValueError("buffer_distance is required when geometry_column is set")
 
-    enhanced_query = extend_query_with_partition_keys_lazy(
-        query=working_query,
-        lazy_subquery=lazy_cache_subquery,
-        partition_key=partition_key,
-        method=method,
-        p0_alias=cache_target_alias,
-        analyze_tmp_table=analyze_tmp_table,
-        auto_detect_star_join=auto_detect_star_join,
-        star_join_table=star_join_table,
-    )
+        if not hasattr(cache_handler, "get_spatial_filter_lazy"):
+            raise ValueError("Cache handler does not support spatial filtering (missing get_spatial_filter_lazy method)")
+
+        # Get the hashes that were found in cache
+        hashes = generate_all_hashes(
+            query=query,
+            partition_key=partition_key,
+            min_component_size=min_component_size,
+            fix_attributes=False,
+            canonicalize_queries=canonicalize_queries,
+            follow_graph=follow_graph,
+            auto_detect_star_join=False,
+            star_join_table=star_join_table,
+            bucket_steps=bucket_steps,
+            add_constraints=add_constraints,
+            remove_constraints_all=remove_constraints_all,
+            remove_constraints_add=remove_constraints_add,
+            skip_partition_key_joins=True,
+            geometry_column=geometry_column,
+        )
+
+        spatial_filter_sql = cache_handler.get_spatial_filter_lazy(  # type: ignore[attr-defined]
+            keys=set(hashes),
+            partition_key=partition_key,
+            buffer_distance=buffer_distance,
+        )
+
+        if not spatial_filter_sql:
+            return working_query, stats
+
+        enhanced_query = extend_query_with_spatial_filter_lazy(
+            query=working_query,
+            spatial_filter_sql=spatial_filter_sql,
+            geometry_column=geometry_column,
+            buffer_distance=buffer_distance,
+            p0_alias=p0_alias,
+            auto_detect_star_join=auto_detect_star_join,
+            star_join_table=star_join_table,
+        )
+    else:
+        # Standard path: use partition key IN subquery
+        cache_target_alias: str | None
+        if use_p0_table and p0_rewritten:
+            # Target p0 table for cache restrictions
+            cache_target_alias = p0_alias if p0_alias else "p0"
+        else:
+            # Regular query - use provided alias or auto-detect
+            cache_target_alias = p0_alias
+
+        enhanced_query = extend_query_with_partition_keys_lazy(
+            query=working_query,
+            lazy_subquery=lazy_cache_subquery,
+            partition_key=partition_key,
+            method=method,
+            p0_alias=cache_target_alias,
+            analyze_tmp_table=analyze_tmp_table,
+            auto_detect_star_join=auto_detect_star_join,
+            star_join_table=star_join_table,
+        )
 
     stats["enhanced"] = 1
     return enhanced_query, stats
