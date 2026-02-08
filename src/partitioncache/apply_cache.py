@@ -15,7 +15,7 @@ import sqlglot
 import sqlglot.expressions as exp
 
 from partitioncache.cache_handler.abstract import AbstractCacheHandler, AbstractCacheHandler_Lazy
-from partitioncache.query_processor import detect_star_join_from_query, generate_all_hashes
+from partitioncache.query_processor import compute_buffer_distance, detect_star_join_from_query, generate_all_hashes
 
 logger = getLogger("PartitionCache")
 
@@ -686,8 +686,9 @@ def apply_cache_lazy(
         geometry_column: If set, enables spatial cache mode. Uses this geometry column for fragment
             SELECT clauses and spatial filter application. Requires a spatial cache handler with
             get_spatial_filter_lazy() method.
-        buffer_distance: Buffer distance in meters for spatial filter (required when geometry_column is set).
-            Uses geography cast for meter-based distance.
+        buffer_distance: Buffer distance in meters for spatial filter. If None and geometry_column
+            is set, auto-derived from distance constraints in the query (graph diameter).
+            Required when geometry_column is set and query has no distance constraints.
 
     Returns:
         tuple[str, dict[str, int]]: Enhanced query and statistics.
@@ -737,7 +738,9 @@ def apply_cache_lazy(
     if is_spatial:
         # Spatial path: use get_spatial_filter_lazy and ST_DWithin
         if buffer_distance is None:
-            raise ValueError("buffer_distance is required when geometry_column is set")
+            buffer_distance = compute_buffer_distance(query)
+            if buffer_distance == 0.0:
+                raise ValueError("buffer_distance is required when geometry_column is set and query has no distance constraints")
 
         if not hasattr(cache_handler, "get_spatial_filter_lazy"):
             raise ValueError("Cache handler does not support spatial filtering (missing get_spatial_filter_lazy method)")
@@ -857,8 +860,9 @@ def apply_cache(
         geometry_column: If set, enables spatial cache mode. Uses this geometry column for fragment
             SELECT clauses and spatial filter application. Requires a spatial cache handler with
             get_spatial_filter() method.
-        buffer_distance: Buffer distance in meters for spatial filter (required when geometry_column is set).
-            Uses geography cast for meter-based distance.
+        buffer_distance: Buffer distance in meters for spatial filter. If None and geometry_column
+            is set, auto-derived from distance constraints in the query (graph diameter).
+            Required when geometry_column is set and query has no distance constraints.
 
     Returns:
         tuple[str, dict[str, int]]: A tuple containing:
@@ -896,7 +900,9 @@ def apply_cache(
     if is_spatial:
         # Spatial path: generate hashes with spatial params, get WKB filter, apply via ST_DWithin
         if buffer_distance is None:
-            raise ValueError("buffer_distance is required when geometry_column is set")
+            buffer_distance = compute_buffer_distance(query)
+            if buffer_distance == 0.0:
+                raise ValueError("buffer_distance is required when geometry_column is set and query has no distance constraints")
 
         if not hasattr(cache_handler, "get_spatial_filter"):
             raise ValueError("Cache handler does not support spatial filtering (missing get_spatial_filter method)")

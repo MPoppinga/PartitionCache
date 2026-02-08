@@ -22,6 +22,8 @@ from partitioncache.apply_cache import (
 )
 from partitioncache.query_processor import (
     _build_select_clause,
+    compute_buffer_distance,
+    extract_distance_constraints,
     generate_all_hashes,
     generate_all_query_hash_pairs,
     generate_partial_queries,
@@ -317,7 +319,7 @@ class TestApplyCacheLazySpatialMode:
 
         handler = self._make_mock_handler(lazy_result="SELECT 1")
 
-        with pytest.raises(ValueError, match="buffer_distance is required"):
+        with pytest.raises(ValueError, match="buffer_distance is required.*no distance constraints"):
             apply_cache_lazy(
                 query="SELECT * FROM poi AS p1",
                 cache_handler=handler,
@@ -750,7 +752,7 @@ class TestApplyCacheSpatialMode:
 
         handler = self._make_mock_handler()
 
-        with pytest.raises(ValueError, match="buffer_distance is required"):
+        with pytest.raises(ValueError, match="buffer_distance is required.*no distance constraints"):
             apply_cache(
                 query="SELECT * FROM poi AS p1",
                 cache_handler=handler,
@@ -876,3 +878,327 @@ class TestGetSpatialFilterBBoxSqlGeneration:
 
         result = handler.get_spatial_filter({"hash1"}, "spatial_bbox", 0.0)
         assert result is None
+
+
+# ============================================================================
+# Tests for extract_distance_constraints and compute_buffer_distance
+# ============================================================================
+
+
+class TestExtractDistanceConstraints:
+    """Tests for extract_distance_constraints()."""
+
+    def test_star_pattern_query(self):
+        """Star pattern: all distances from p1."""
+        query = (
+            "SELECT * FROM pois AS p1, pois AS p2, pois AS p3 "
+            "WHERE p1.name LIKE '%Eis%' "
+            "AND ST_DWithin(p1.geom, p3.geom, 300) "
+            "AND ST_DWithin(p1.geom, p2.geom, 400)"
+        )
+        result = extract_distance_constraints(query)
+        assert len(result) == 2
+        # Sorted by alias pair: (p1, p2, 400) and (p1, p3, 300)
+        assert result[0] == ("p1", "p2", 400.0)
+        assert result[1] == ("p1", "p3", 300.0)
+
+    def test_chain_pattern_query(self):
+        """Chain pattern: p1->p2->p3."""
+        query = (
+            "SELECT * FROM t1 AS p1, t2 AS p2, t3 AS p3 "
+            "WHERE ST_DWithin(p1.geom, p2.geom, 400) "
+            "AND ST_DWithin(p2.geom, p3.geom, 300)"
+        )
+        result = extract_distance_constraints(query)
+        assert len(result) == 2
+        assert result[0] == ("p1", "p2", 400.0)
+        assert result[1] == ("p2", "p3", 300.0)
+
+    def test_no_st_dwithin(self):
+        """Query with no distance constraints returns empty list."""
+        query = "SELECT * FROM poi AS p1 WHERE p1.type = 'restaurant'"
+        result = extract_distance_constraints(query)
+        assert result == []
+
+    def test_single_st_dwithin(self):
+        """Single ST_DWithin call."""
+        query = "SELECT * FROM t1 AS p1, t2 AS p2 WHERE ST_DWithin(p1.geom, p2.geom, 500)"
+        result = extract_distance_constraints(query)
+        assert len(result) == 1
+        assert result[0] == ("p1", "p2", 500.0)
+
+    def test_alias_sorting(self):
+        """Aliases should be sorted within each tuple."""
+        query = "SELECT * FROM t1 AS b, t2 AS a WHERE ST_DWithin(b.geom, a.geom, 100)"
+        result = extract_distance_constraints(query)
+        assert result[0] == ("a", "b", 100.0)
+
+    def test_integer_distance(self):
+        """Integer distances should be parsed as floats."""
+        query = "SELECT * FROM t1 AS p1, t2 AS p2 WHERE ST_DWithin(p1.geom, p2.geom, 1000)"
+        result = extract_distance_constraints(query)
+        assert result[0][2] == 1000.0
+
+    def test_float_distance(self):
+        """Float distances should be parsed correctly."""
+        query = "SELECT * FROM t1 AS p1, t2 AS p2 WHERE ST_DWithin(p1.geom, p2.geom, 123.45)"
+        result = extract_distance_constraints(query)
+        assert result[0][2] == 123.45
+
+    # --- Comparison-based distance constraint tests ---
+
+    def test_sqrt_power_less_than(self):
+        """SQRT(POWER(...)) < value → extract upper bound."""
+        query = (
+            "SELECT * FROM t1 AS p1, t2 AS p2 "
+            "WHERE SQRT(POWER(p1.x - p2.x, 2) + POWER(p1.y - p2.y, 2)) < 0.008"
+        )
+        result = extract_distance_constraints(query)
+        assert len(result) == 1
+        assert result[0] == ("p1", "p2", 0.008)
+
+    def test_abs_sqrt_less_equal(self):
+        """ABS(SQRT(...)) <= value → extract upper bound."""
+        query = (
+            "SELECT * FROM t1 AS p1, t2 AS p2 "
+            "WHERE ABS(SQRT(POWER(p1.x - p2.x, 2))) <= 0.1"
+        )
+        result = extract_distance_constraints(query)
+        assert len(result) == 1
+        assert result[0] == ("p1", "p2", 0.1)
+
+    def test_dist_between(self):
+        """DIST(...) BETWEEN x AND y → extract y (upper bound)."""
+        query = (
+            "SELECT * FROM t1, t2 "
+            "WHERE DIST(t1.g, t2.g) BETWEEN 1.6 AND 3.6"
+        )
+        result = extract_distance_constraints(query)
+        assert len(result) == 1
+        assert result[0] == ("t1", "t2", 3.6)
+
+    def test_greater_than_skipped(self):
+        """DIST(...) > value → lower bound only, should be skipped."""
+        query = (
+            "SELECT * FROM t1 AS p1, t2 AS p2 "
+            "WHERE DIST(p1.g, p2.g) > 5"
+        )
+        result = extract_distance_constraints(query)
+        assert result == []
+
+    def test_mixed_st_dwithin_and_comparison(self):
+        """Both ST_DWithin and comparison patterns → all edges extracted."""
+        query = (
+            "SELECT * FROM t1 AS p1, t2 AS p2, t3 AS p3 "
+            "WHERE ST_DWithin(p1.geom, p2.geom, 400) "
+            "AND SQRT(POWER(p2.x - p3.x, 2) + POWER(p2.y - p3.y, 2)) <= 0.1"
+        )
+        result = extract_distance_constraints(query)
+        assert len(result) == 2
+        assert result[0] == ("p1", "p2", 400.0)
+        assert result[1] == ("p2", "p3", 0.1)
+
+    def test_multiple_comparison_distances(self):
+        """Multiple comparison-based distances → correct tuples for each pair."""
+        query = (
+            "SELECT * FROM t1 AS p1, t2 AS p2, t3 AS p3 "
+            "WHERE SQRT(POWER(p1.x - p2.x, 2)) <= 0.1 "
+            "AND SQRT(POWER(p2.x - p3.x, 2)) <= 0.2"
+        )
+        result = extract_distance_constraints(query)
+        assert len(result) == 2
+        assert result[0] == ("p1", "p2", 0.1)
+        assert result[1] == ("p2", "p3", 0.2)
+
+
+class TestComputeBufferDistance:
+    """Tests for compute_buffer_distance()."""
+
+    def test_star_pattern(self):
+        """Star: ST_DWithin(p1,p2,400) + ST_DWithin(p1,p3,300) → diameter=700."""
+        query = (
+            "SELECT * FROM pois AS p1, pois AS p2, pois AS p3 "
+            "WHERE ST_DWithin(p1.geom, p2.geom, 400) "
+            "AND ST_DWithin(p1.geom, p3.geom, 300)"
+        )
+        assert compute_buffer_distance(query) == 700.0
+
+    def test_chain_pattern(self):
+        """Chain: ST_DWithin(p1,p2,400) + ST_DWithin(p2,p3,300) → diameter=700."""
+        query = (
+            "SELECT * FROM t1 AS p1, t2 AS p2, t3 AS p3 "
+            "WHERE ST_DWithin(p1.geom, p2.geom, 400) "
+            "AND ST_DWithin(p2.geom, p3.geom, 300)"
+        )
+        assert compute_buffer_distance(query) == 700.0
+
+    def test_single_st_dwithin(self):
+        """Single edge → diameter equals that distance."""
+        query = "SELECT * FROM t1 AS p1, t2 AS p2 WHERE ST_DWithin(p1.geom, p2.geom, 500)"
+        assert compute_buffer_distance(query) == 500.0
+
+    def test_no_st_dwithin(self):
+        """No ST_DWithin → 0.0."""
+        query = "SELECT * FROM poi AS p1 WHERE p1.type = 'restaurant'"
+        assert compute_buffer_distance(query) == 0.0
+
+    def test_equal_distances_star(self):
+        """Star: ST_DWithin(p1,p2,400) + ST_DWithin(p1,p3,400) → diameter=800."""
+        query = (
+            "SELECT * FROM pois AS p1, pois AS p2, pois AS p3 "
+            "WHERE ST_DWithin(p1.geom, p2.geom, 400) "
+            "AND ST_DWithin(p1.geom, p3.geom, 400)"
+        )
+        assert compute_buffer_distance(query) == 800.0
+
+    def test_triangle_pattern(self):
+        """Triangle: p1-p2=400, p2-p3=300, p1-p3=500 → diameter=500 (direct p1-p3)."""
+        query = (
+            "SELECT * FROM t AS p1, t AS p2, t AS p3 "
+            "WHERE ST_DWithin(p1.geom, p2.geom, 400) "
+            "AND ST_DWithin(p2.geom, p3.geom, 300) "
+            "AND ST_DWithin(p1.geom, p3.geom, 500)"
+        )
+        assert compute_buffer_distance(query) == 500.0
+
+    def test_real_query_q1(self):
+        """Real q1 query: star pattern with 300 + 400 → diameter=700."""
+        query = (
+            "SELECT p1.name, p2.name, p3.name "
+            "FROM pois AS p1, pois AS p2, pois AS p3 "
+            "WHERE p1.name LIKE '%Eis %' AND p2.subtype = 'pharmacy' "
+            "AND p3.subtype = 'supermarket' AND p3.name LIKE '%ALDI%' "
+            "AND ST_DWithin(p1.geom, p3.geom, 300) "
+            "AND ST_DWithin(p1.geom, p2.geom, 400)"
+        )
+        assert compute_buffer_distance(query) == 700.0
+
+    def test_real_query_q2(self):
+        """Real q2 query: star pattern with 400 + 400 → diameter=800."""
+        query = (
+            "SELECT p1.name, p2.name, p3.name "
+            "FROM pois AS p1, pois AS p2, pois AS p3 "
+            "WHERE p1.name LIKE '%Eis %' AND p2.subtype = 'swimming_pool' "
+            "AND p3.subtype = 'supermarket' AND p3.name ILIKE '%Edeka%' "
+            "AND ST_DWithin(p1.geom, p3.geom, 400) "
+            "AND ST_DWithin(p1.geom, p2.geom, 400)"
+        )
+        assert compute_buffer_distance(query) == 800.0
+
+    def test_arithmetic_distance_chain(self):
+        """Chain with SQRT-based distances: 0.1 + 0.2 → diameter=0.3."""
+        query = (
+            "SELECT * FROM t1 AS p1, t2 AS p2, t3 AS p3 "
+            "WHERE SQRT(POWER(p1.x - p2.x, 2)) <= 0.1 "
+            "AND SQRT(POWER(p2.x - p3.x, 2)) <= 0.2"
+        )
+        assert compute_buffer_distance(query) == pytest.approx(0.3)
+
+    def test_mixed_st_dwithin_and_arithmetic(self):
+        """Mixed: ST_DWithin(p1,p2,400) + SQRT(p2,p3)<=0.1 → diameter=400.1."""
+        query = (
+            "SELECT * FROM t1 AS p1, t2 AS p2, t3 AS p3 "
+            "WHERE ST_DWithin(p1.geom, p2.geom, 400) "
+            "AND SQRT(POWER(p2.x - p3.x, 2) + POWER(p2.y - p3.y, 2)) <= 0.1"
+        )
+        assert compute_buffer_distance(query) == pytest.approx(400.1)
+
+
+class TestAutoDerivBufferDistanceLazy:
+    """Tests for auto-derivation of buffer_distance in apply_cache_lazy()."""
+
+    def _make_mock_handler(self, lazy_result=None, spatial_filter=None):
+        """Create a mock lazy cache handler with spatial support."""
+        from partitioncache.cache_handler.abstract import AbstractCacheHandler_Lazy
+
+        handler = MagicMock(spec=AbstractCacheHandler_Lazy)
+        handler.get_intersected_lazy.return_value = (lazy_result, 3 if lazy_result else 0)
+        handler.get_spatial_filter_lazy = MagicMock(return_value=spatial_filter)
+        return handler
+
+    @patch.object(_apply_cache_module, "generate_all_hashes")
+    def test_auto_derive_buffer_from_query(self, mock_hashes):
+        """When buffer_distance=None and query has ST_DWithin, auto-derive from graph diameter."""
+        mock_hashes.return_value = ["hash1"]
+
+        handler = self._make_mock_handler(
+            lazy_result="SELECT unnest(pk) FROM cache",
+            spatial_filter="SELECT ST_Union(geom) FROM cached",
+        )
+
+        query = (
+            "SELECT * FROM pois AS p1, pois AS p2, pois AS p3 "
+            "WHERE p1.name LIKE '%Eis%' "
+            "AND ST_DWithin(p1.geom, p2.geom, 400) "
+            "AND ST_DWithin(p1.geom, p3.geom, 300)"
+        )
+        result, stats = apply_cache_lazy(
+            query=query,
+            cache_handler=handler,
+            partition_key="spatial_h3",
+            geometry_column="geom",
+            buffer_distance=None,
+        )
+
+        # Should have called get_spatial_filter_lazy (no error raised)
+        handler.get_spatial_filter_lazy.assert_called_once()
+        # The result should be enhanced (not original query)
+        assert "ST_DWITHIN" in result.upper() or "st_dwithin" in result.lower()
+
+    @patch.object(_apply_cache_module, "generate_all_hashes")
+    def test_explicit_buffer_overrides_auto(self, mock_hashes):
+        """When buffer_distance is explicitly set, it should be used instead of auto-derive."""
+        mock_hashes.return_value = ["hash1"]
+
+        handler = self._make_mock_handler(
+            lazy_result="SELECT unnest(pk) FROM cache",
+            spatial_filter="SELECT ST_Union(geom) FROM cached",
+        )
+
+        query = (
+            "SELECT * FROM pois AS p1, pois AS p2 "
+            "WHERE ST_DWithin(p1.geom, p2.geom, 400)"
+        )
+        result, stats = apply_cache_lazy(
+            query=query,
+            cache_handler=handler,
+            partition_key="spatial_h3",
+            geometry_column="geom",
+            buffer_distance=999.0,
+        )
+
+        # Should succeed and use the explicit buffer distance
+        assert "999" in result
+
+
+class TestAutoDerivBufferDistanceNonLazy:
+    """Tests for auto-derivation of buffer_distance in apply_cache()."""
+
+    @patch.object(_apply_cache_module, "generate_all_hashes")
+    def test_auto_derive_buffer_from_query(self, mock_hashes):
+        """When buffer_distance=None and query has ST_DWithin, auto-derive from graph diameter."""
+        mock_hashes.return_value = ["hash1"]
+
+        handler = MagicMock(spec=["get", "get_intersected", "exists", "filter_existing_keys", "get_spatial_filter"])
+        handler.get_intersected.return_value = {1, 2, 3}
+        handler.filter_existing_keys.return_value = {"hash1"}
+        handler.get_spatial_filter.return_value = (b"\x00\x01\x02", 25832)
+
+        query = (
+            "SELECT * FROM pois AS p1, pois AS p2, pois AS p3 "
+            "WHERE p1.name LIKE '%Eis%' "
+            "AND ST_DWithin(p1.geom, p2.geom, 400) "
+            "AND ST_DWithin(p1.geom, p3.geom, 300)"
+        )
+        result, stats = apply_cache(
+            query=query,
+            cache_handler=handler,
+            partition_key="spatial_h3",
+            geometry_column="geom",
+            buffer_distance=None,
+        )
+
+        # Should have called get_spatial_filter (no error raised)
+        handler.get_spatial_filter.assert_called_once()
+        # The enhanced query should contain ST_DWithin with derived buffer 700
+        assert "700" in result

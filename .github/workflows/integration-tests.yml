@@ -136,6 +136,14 @@ jobs:
             parallel: false
             requires_redis: false
             job_index: 5
+          - name: "Spatial Cache"
+            pattern: "spatial"
+            suffix: "spatial"
+            backend_type: "postgresql_array"
+            database_suffix: "spatial"
+            parallel: false
+            requires_redis: false
+            job_index: 6
 
     services:
       postgres:

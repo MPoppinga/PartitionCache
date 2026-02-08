@@ -352,3 +352,49 @@ class TestPostGISSpatialE2E:
                     )
 
                 print(f"  [{backend_name}] {query_name}: valid WKB ({len(wkb)} bytes, SRID={srid})")
+
+    @pytest.mark.parametrize("backend_name", ["postgis_h3", "postgis_bbox"])
+    def test_apply_cache_auto_buffer_distance(self, backend_name):
+        """Test that buffer_distance=None auto-derives from ST_DWithin distances.
+
+        Compares results from auto-derived buffer against the explicit buffer baseline.
+        The auto-derived buffer should produce results that are a superset of baseline.
+        """
+        config = BACKEND_CONFIGS[backend_name]
+
+        if not _has_cache_entries(backend_name, config["partition_key"]):
+            pytest.skip(f"No cache entries for {backend_name} partition key '{config['partition_key']}'")
+
+        handler = partitioncache.get_cache_handler(backend_name, singleton=True)
+
+        for query_name, sql_query in self.queries:
+            # Baseline: run original query
+            rows_baseline = _run_query(self.conn, sql_query)
+
+            # Auto-derive buffer_distance by passing None
+            enhanced_query, stats = partitioncache.apply_cache(
+                query=sql_query,
+                cache_handler=handler,
+                partition_key=config["partition_key"],
+                geometry_column=config["geometry_column"],
+                buffer_distance=None,  # Auto-derive from ST_DWithin
+                min_component_size=1,
+            )
+
+            if stats["enhanced"]:
+                rows_enhanced = _run_query(self.conn, enhanced_query)
+                assert len(rows_enhanced) >= len(rows_baseline), (
+                    f"[{backend_name}] {query_name}: auto-buffer apply_cache returned fewer rows "
+                    f"({len(rows_enhanced)}) than baseline ({len(rows_baseline)}). "
+                    f"Stats: {stats}"
+                )
+                print(
+                    f"  [{backend_name}] {query_name} auto-buffer apply_cache: "
+                    f"{len(rows_enhanced)}/{len(rows_baseline)} rows "
+                    f"(hits={stats['cache_hits']}, variants={stats['generated_variants']})"
+                )
+            else:
+                print(
+                    f"  [{backend_name}] {query_name} auto-buffer apply_cache: not enhanced "
+                    f"(hits={stats['cache_hits']}, variants={stats['generated_variants']})"
+                )

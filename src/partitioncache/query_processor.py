@@ -1482,6 +1482,180 @@ def hash_query(query: str) -> str:
     return hashlib.sha1(query.encode()).hexdigest()
 
 
+
+def extract_distance_constraints(query: str) -> list[tuple[str, str, float]]:
+    """Extract (alias1, alias2, distance) from all distance constraints in the query.
+
+    Handles two kinds of distance constraints:
+      1. ST_DWithin(a.geom, b.geom, distance) function calls
+      2. Comparison-based distance expressions detected by is_distance_function(),
+         e.g. SQRT(POWER(p1.x - p2.x, 2)) < 0.008 or DIST(t1.g, t2.g) BETWEEN 1.6 AND 3.6
+
+    Args:
+        query: SQL query string to parse.
+
+    Returns:
+        List of (alias1, alias2, distance) tuples, sorted by alias pair.
+    """
+    try:
+        parsed = sqlglot.parse_one(query)
+    except sqlglot.ParseError:
+        return []
+
+    results: list[tuple[str, str, float]] = []
+    seen_pairs: set[tuple[str, str]] = set()
+
+    # --- Pass 1: ST_DWithin function calls ---
+    for func in parsed.find_all(exp.Anonymous):
+        if func.name.upper() != "ST_DWITHIN":
+            continue
+        args = func.args.get("expressions", [])
+        if len(args) < 3:
+            continue
+
+        alias1 = None
+        alias2 = None
+        for col in args[0].find_all(exp.Column):
+            if col.table:
+                alias1 = col.table
+                break
+        for col in args[1].find_all(exp.Column):
+            if col.table:
+                alias2 = col.table
+                break
+
+        distance_arg = args[2]
+        distance = None
+        literal = distance_arg.find(exp.Literal)
+        if literal is None and isinstance(distance_arg, exp.Literal):
+            literal = distance_arg
+        if literal is not None:
+            try:
+                distance = float(literal.this)
+            except (ValueError, TypeError):
+                pass
+
+        if alias1 is not None and alias2 is not None and distance is not None:
+            a1, a2 = sorted([alias1, alias2])
+            results.append((a1, a2, distance))
+            seen_pairs.add((a1, a2))
+
+    # --- Pass 2: Comparison-based distance functions ---
+    try:
+        conditions = extract_conjunctive_conditions(query)
+    except Exception:
+        conditions = []
+
+    for condition in conditions:
+        if not is_distance_function(condition):
+            continue
+
+        # Extract table aliases from column references in the condition
+        try:
+            cond_parsed = sqlglot.parse_one(f"SELECT 1 WHERE {condition}")
+        except sqlglot.ParseError:
+            continue
+
+        aliases: set[str] = set()
+        for col in cond_parsed.find_all(exp.Column):
+            if col.table:
+                aliases.add(col.table)
+
+        if len(aliases) != 2:
+            continue
+
+        a1, a2 = sorted(aliases)
+
+        # Skip if already captured by ST_DWithin pass
+        if (a1, a2) in seen_pairs:
+            continue
+
+        # Extract upper-bound distance from the condition
+        distance = None
+        condition_upper = condition.upper()
+
+        if " BETWEEN " in condition_upper:
+            # BETWEEN x AND y → extract y (upper bound)
+            try:
+                between_part = condition.split(" BETWEEN ")[1] if " BETWEEN " in condition else condition.split(" between ")[1]
+                upper_str = between_part.split(" AND ")[1] if " AND " in between_part else between_part.split(" and ")[1]
+                distance = float(upper_str.strip())
+            except (IndexError, ValueError):
+                pass
+        elif "<=" in condition:
+            match = re.search(r"<=\s*([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)", condition)
+            if match:
+                try:
+                    distance = float(match.group(1))
+                except ValueError:
+                    pass
+        elif "<" in condition:
+            match = re.search(r"<\s*([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)", condition)
+            if match:
+                try:
+                    distance = float(match.group(1))
+                except ValueError:
+                    pass
+        elif ">=" in condition or ">" in condition:
+            # Lower bound only — not relevant for buffer distance
+            continue
+
+        if distance is not None:
+            results.append((a1, a2, distance))
+            seen_pairs.add((a1, a2))
+
+    return sorted(results)
+
+
+def compute_buffer_distance(query: str) -> float:
+    """Compute buffer distance as the weighted graph diameter of distance constraints.
+
+    Builds a weighted graph where nodes are table aliases and edges are distance
+    constraints (ST_DWithin calls and comparison-based distance expressions).
+    Returns the diameter (longest shortest path weight) of the graph.
+
+    For star patterns (all distances from one hub), the diameter is the sum of the
+    two largest distances through the hub. For chain patterns, it's the sum along
+    the longest path.
+
+    Args:
+        query: SQL query string to parse.
+
+    Returns:
+        The weighted graph diameter in the same units as the distance constraints.
+        Returns 0.0 if no distance constraints are found or the graph has fewer than 2 nodes.
+    """
+    edges = extract_distance_constraints(query)
+    if not edges:
+        return 0.0
+
+    G = nx.Graph()
+    for alias1, alias2, distance in edges:
+        # If multiple ST_DWithin between same pair, use the max distance
+        if G.has_edge(alias1, alias2):
+            current_weight = G[alias1][alias2]["weight"]
+            G[alias1][alias2]["weight"] = max(current_weight, distance)
+        else:
+            G.add_edge(alias1, alias2, weight=distance)
+
+    if G.number_of_nodes() < 2:
+        return 0.0
+
+    # Compute weighted diameter: longest shortest path across all pairs
+    max_distance = 0.0
+    for component in nx.connected_components(G):
+        subgraph = G.subgraph(component)
+        if subgraph.number_of_nodes() < 2:
+            continue
+        # All-pairs shortest paths (weighted)
+        for source in subgraph.nodes():
+            lengths = nx.single_source_dijkstra_path_length(subgraph, source, weight="weight")
+            for _target, length in lengths.items():
+                if length > max_distance:
+                    max_distance = length
+
+    return max_distance
+
 def generate_all_hashes(
     query: str,
     partition_key: str,
