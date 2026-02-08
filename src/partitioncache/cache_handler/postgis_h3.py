@@ -280,12 +280,13 @@ class PostGISH3CacheHandler(PostGISSpatialAbstractCacheHandler):
         keys: set[str],
         partition_key: str = "partition_key",
         buffer_distance: float = 0.0,
-    ) -> bytes | None:
+    ) -> tuple[bytes, int] | None:
         """
         Get spatial filter geometry as WKB bytes for H3 cells with optional k-ring buffer.
 
         Executes the spatial filter SQL from get_spatial_filter_lazy() and returns
-        the resulting geometry as WKB binary bytes.
+        the resulting geometry as WKB binary bytes with SRID 4326 (H3 boundaries
+        are always in WGS84).
 
         Args:
             keys: Set of cache keys to intersect.
@@ -293,7 +294,8 @@ class PostGISH3CacheHandler(PostGISSpatialAbstractCacheHandler):
             buffer_distance: Buffer distance in meters. Converted to k-ring radius.
 
         Returns:
-            WKB bytes representing the spatial filter geometry, or None if no cache hits.
+            Tuple of (WKB bytes, SRID) for the spatial filter geometry,
+            or None if no cache hits. Geometry is in the handler's metric SRID.
         """
         try:
             spatial_sql = self.get_spatial_filter_lazy(keys, partition_key, buffer_distance)
@@ -307,7 +309,8 @@ class PostGISH3CacheHandler(PostGISSpatialAbstractCacheHandler):
             result = self.cursor.fetchone()
             if result is None or result[0] is None:
                 return None
-            return bytes(result[0])
+            # Geometry is in the handler's metric SRID (avoids geography edge distortion)
+            return bytes(result[0]), self.srid
         except Exception as e:
             logger.error(f"Failed to get H3 spatial filter as WKB: {e}")
             return None
@@ -319,20 +322,19 @@ class PostGISH3CacheHandler(PostGISSpatialAbstractCacheHandler):
         buffer_distance: float = 0.0,
     ) -> str | None:
         """
-        Get spatial filter geometry SQL for H3 cells with optional k-ring buffer.
+        Get spatial filter geometry SQL for H3 cells with optional buffer.
 
-        Returns SQL that produces a geometry by:
-        1. Intersecting all cached H3 cell arrays
-        2. Expanding cells by k-ring based on buffer_distance
-        3. Converting cells to boundaries and unioning into a single geometry
+        For a single key: converts cells to boundaries and unions into a geometry.
+        For multiple keys: uses geometric intersection of bounding envelopes (like BBox),
+        since discrete cell ID intersection is too restrictive for multi-table spatial queries.
 
         Args:
             keys: Set of cache keys to intersect.
             partition_key: Partition key namespace.
-            buffer_distance: Buffer distance in meters. Converted to k-ring radius.
+            buffer_distance: Buffer distance in meters. Applied as ST_Buffer on the result.
 
         Returns:
-            SQL string producing a geometry, or None if no cache hits.
+            SQL string producing a geometry in SRID 4326, or None if no cache hits.
         """
         try:
             datatype = self._get_partition_datatype(partition_key)
@@ -343,40 +345,49 @@ class PostGISH3CacheHandler(PostGISSpatialAbstractCacheHandler):
             if not filtered_keys:
                 return None
 
-            intersect_sql = self._get_intersected_sql(filtered_keys, partition_key)
+            keys_list = list(filtered_keys)
+            table_name = f"{self.tableprefix}_cache_{partition_key}"
 
-            # Calculate k-ring size from buffer distance
-            if buffer_distance > 0:
-                # k = ceil(buffer_distance / h3_edge_length_at_resolution)
-                # Use SQL function for accuracy
-                k_ring_sql = sql.SQL(
-                    """
-                    WITH intersected AS ({intersect_sql}),
-                    cells AS (SELECT unnest(partition_keys)::h3index AS cell FROM intersected),
-                    k_val AS (
-                        SELECT CEIL({buffer_m} / h3_get_hexagon_edge_length_avg({res}, 'm'))::INTEGER AS k
-                    ),
-                    buffered AS (
-                        SELECT DISTINCT h3_grid_disk(cells.cell, k_val.k) AS cell
-                        FROM cells, k_val
-                    )
-                    SELECT ST_Union(ST_SetSRID(h3_cell_to_boundary(cell)::geometry, 4326)) FROM buffered
-                    """
+            # Helper: scalar subquery returning the union of all cell boundaries for a key,
+            # transformed to the metric SRID. Using metric SRID avoids geography great circle edge
+            # distortion that occurs with large polygons in SRID 4326.
+            # unnest must be in a FROM subquery (set-returning functions can't be inside aggregates)
+            def _cell_union_subquery(key_val: str) -> sql.Composed:
+                return sql.SQL(
+                    "(SELECT ST_Union(ST_Transform(ST_SetSRID(h3_cell_to_boundary(cell::h3index)::geometry, 4326), {srid}))"
+                    " FROM (SELECT unnest(partition_keys) AS cell FROM {table} WHERE query_hash = {key}) _cells)"
                 ).format(
-                    intersect_sql=intersect_sql,
-                    buffer_m=sql.Literal(buffer_distance),
+                    table=sql.Identifier(table_name),
+                    key=sql.Literal(key_val),
+                    srid=sql.Literal(self.srid),
+                )
+
+            if len(keys_list) == 1:
+                # Single key: union all cell boundaries in metric SRID
+                result_sql = sql.SQL("SELECT {subq}").format(subq=_cell_union_subquery(keys_list[0]))
+            else:
+                # Multiple keys: use geometric intersection of buffered envelopes in metric SRID.
+                # Each envelope is buffered by one H3 edge length to account for cell boundary
+                # imprecision at fragment edges. Working in metric SRID gives accurate meter distances.
+                envelope_sql = sql.SQL(
+                    "ST_Buffer(ST_Envelope({subq}), h3_get_hexagon_edge_length_avg({res}, 'm'))"
+                )
+
+                result = envelope_sql.format(
+                    subq=_cell_union_subquery(keys_list[0]),
                     res=sql.Literal(self.resolution),
                 )
-            else:
-                k_ring_sql = sql.SQL(
-                    """
-                    WITH intersected AS ({intersect_sql}),
-                    cells AS (SELECT unnest(partition_keys)::h3index AS cell FROM intersected)
-                    SELECT ST_Union(ST_SetSRID(h3_cell_to_boundary(cell)::geometry, 4326)) FROM cells
-                    """
-                ).format(intersect_sql=intersect_sql)
 
-            return k_ring_sql.as_string(self.cursor)
+                for key in keys_list[1:]:
+                    inner = envelope_sql.format(
+                        subq=_cell_union_subquery(key),
+                        res=sql.Literal(self.resolution),
+                    )
+                    result = sql.SQL("ST_Intersection({a}, {b})").format(a=result, b=inner)
+
+                result_sql = sql.SQL("SELECT {result}").format(result=result)
+
+            return result_sql.as_string(self.cursor)
         except Exception as e:
             logger.error(f"Failed to get H3 spatial filter: {e}")
             return None

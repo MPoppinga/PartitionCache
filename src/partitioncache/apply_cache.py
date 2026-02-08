@@ -922,29 +922,30 @@ def apply_cache(
         generated_variants = len(cache_entry_hashes)
         stats: dict[str, int] = {"generated_variants": generated_variants, "cache_hits": 0, "enhanced": 0, "p0_rewritten": 0}
 
-        # Step 2: Get pre-computed spatial filter geometry as WKB bytes
-        spatial_filter_wkb = cache_handler.get_spatial_filter(  # type: ignore[attr-defined]
+        # Step 2: Get pre-computed spatial filter geometry as WKB bytes + SRID
+        spatial_result = cache_handler.get_spatial_filter(  # type: ignore[attr-defined]
             keys=set(cache_entry_hashes),
             partition_key=partition_key,
             buffer_distance=buffer_distance,
         )
 
-        if not spatial_filter_wkb:
+        if not spatial_result:
             logger.info(f"No spatial cache hits found for query. Generated {generated_variants} subqueries")
             return query, stats
+
+        spatial_filter_wkb, spatial_srid = spatial_result
 
         # Count cache hits (similar to lazy path logic)
         used_hashes = len(cache_handler.filter_existing_keys(set(cache_entry_hashes), partition_key))  # type: ignore[attr-defined]
         stats["cache_hits"] = used_hashes
 
         # Step 3: Apply spatial filter to query
-        srid = getattr(cache_handler, "srid", 4326)
         enhanced_query = extend_query_with_spatial_filter(
             query=query,
             spatial_filter_wkb=spatial_filter_wkb,
             geometry_column=geometry_column,
             buffer_distance=buffer_distance,
-            srid=srid,
+            srid=spatial_srid,
             p0_alias=p0_alias,
             auto_detect_star_join=auto_detect_star_join,
             star_join_table=star_join_table,

@@ -288,12 +288,12 @@ class PostGISBBoxCacheHandler(PostGISSpatialAbstractCacheHandler):
         keys: set[str],
         partition_key: str = "partition_key",
         buffer_distance: float = 0.0,
-    ) -> bytes | None:
+    ) -> tuple[bytes, int] | None:
         """
         Get spatial filter geometry as WKB bytes for bounding boxes.
 
         Executes the intersection SQL from _get_intersected_sql() and returns
-        the resulting geometry as WKB binary bytes.
+        the resulting geometry as WKB binary bytes with the handler's SRID.
 
         Args:
             keys: Set of cache keys to intersect.
@@ -301,7 +301,8 @@ class PostGISBBoxCacheHandler(PostGISSpatialAbstractCacheHandler):
             buffer_distance: Buffer distance in meters (applied externally via ST_DWithin).
 
         Returns:
-            WKB bytes representing the spatial filter geometry, or None if no cache hits.
+            Tuple of (WKB bytes, SRID) for the spatial filter geometry,
+            or None if no cache hits.
         """
         try:
             datatype = self._get_partition_datatype(partition_key)
@@ -320,7 +321,7 @@ class PostGISBBoxCacheHandler(PostGISSpatialAbstractCacheHandler):
             result = self.cursor.fetchone()
             if result is None or result[0] is None:
                 return None
-            return bytes(result[0])
+            return bytes(result[0]), self.srid
         except Exception as e:
             logger.error(f"Failed to get BBox spatial filter as WKB: {e}")
             return None

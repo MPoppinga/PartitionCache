@@ -682,14 +682,18 @@ class TestExtendQueryWithSpatialFilter:
 class TestApplyCacheSpatialMode:
     """Test apply_cache (non-lazy) with spatial parameters."""
 
-    def _make_mock_handler(self, spatial_filter_wkb=None, existing_keys=None):
+    def _make_mock_handler(self, spatial_filter_wkb=None, srid=4326, existing_keys=None):
         """Create a mock cache handler with spatial support."""
         from partitioncache.cache_handler.abstract import AbstractCacheHandler
 
         handler = MagicMock(spec=AbstractCacheHandler)
-        handler.get_spatial_filter = MagicMock(return_value=spatial_filter_wkb)
+        # get_spatial_filter now returns (bytes, srid) tuple or None
+        if spatial_filter_wkb is not None:
+            handler.get_spatial_filter = MagicMock(return_value=(spatial_filter_wkb, srid))
+        else:
+            handler.get_spatial_filter = MagicMock(return_value=None)
         handler.filter_existing_keys = MagicMock(return_value=existing_keys or set())
-        handler.srid = 4326
+        handler.srid = srid
         return handler
 
     @patch("partitioncache.apply_cache.generate_all_hashes")
@@ -770,15 +774,15 @@ class TestApplyCacheSpatialMode:
             )
 
     @patch("partitioncache.apply_cache.generate_all_hashes")
-    def test_spatial_mode_uses_handler_srid(self, mock_hashes):
-        """Should use the handler's SRID in the generated query."""
+    def test_spatial_mode_uses_srid_from_spatial_filter(self, mock_hashes):
+        """Should use the SRID returned by get_spatial_filter in the generated query."""
         mock_hashes.return_value = ["hash1"]
 
         handler = self._make_mock_handler(
             spatial_filter_wkb=b"\x01\x02",
+            srid=25832,
             existing_keys={"hash1"},
         )
-        handler.srid = 25832
 
         query = "SELECT * FROM poi AS p1 WHERE p1.type = 'cafe'"
         result, stats = apply_cache(
@@ -802,6 +806,7 @@ class TestGetSpatialFilterH3SqlGeneration:
 
         handler = MagicMock(spec=PostGISH3CacheHandler)
         handler.get_spatial_filter_lazy = MagicMock(return_value="SELECT ST_Union(geom) FROM cells")
+        handler.srid = 25832
 
         # Mock cursor to return WKB
         mock_cursor = MagicMock()
@@ -812,7 +817,7 @@ class TestGetSpatialFilterH3SqlGeneration:
         handler.get_spatial_filter = PostGISH3CacheHandler.get_spatial_filter.__get__(handler)
 
         result = handler.get_spatial_filter({"hash1"}, "spatial_h3", 500.0)
-        assert result == b"\x01\x02\x03"
+        assert result == (b"\x01\x02\x03", 25832)
         handler.get_spatial_filter_lazy.assert_called_once_with({"hash1"}, "spatial_h3", 500.0)
 
     def test_get_spatial_filter_returns_none_when_lazy_is_none(self):
@@ -836,6 +841,7 @@ class TestGetSpatialFilterBBoxSqlGeneration:
 
         handler = MagicMock(spec=PostGISBBoxCacheHandler)
         handler.tableprefix = "test_prefix"
+        handler.srid = 25832
         handler._get_partition_datatype = MagicMock(return_value="geometry")
         handler.filter_existing_keys = MagicMock(return_value={"hash1"})
 
@@ -851,7 +857,7 @@ class TestGetSpatialFilterBBoxSqlGeneration:
         handler.get_spatial_filter = PostGISBBoxCacheHandler.get_spatial_filter.__get__(handler)
 
         result = handler.get_spatial_filter({"hash1"}, "spatial_bbox", 0.0)
-        assert result == b"\xAA\xBB\xCC"
+        assert result == (b"\xAA\xBB\xCC", 25832)
         mock_cursor.execute.assert_called_once()
 
     def test_get_spatial_filter_returns_none_when_no_keys(self):

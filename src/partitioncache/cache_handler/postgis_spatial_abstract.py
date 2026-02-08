@@ -132,10 +132,11 @@ class PostGISSpatialAbstractCacheHandler(PostgreSQLAbstractCacheHandler):
         keys: set[str],
         partition_key: str = "partition_key",
         buffer_distance: float = 0.0,
-    ) -> bytes | None:
+    ) -> tuple[bytes, int] | None:
         """Get spatial filter geometry as WKB bytes for non-lazy cache application.
 
-        Executes the spatial filter SQL and returns the result as WKB binary.
+        Executes the spatial filter SQL and returns the result as WKB binary
+        along with the SRID of the geometry.
 
         Args:
             keys: Set of cache keys to intersect.
@@ -143,7 +144,8 @@ class PostGISSpatialAbstractCacheHandler(PostgreSQLAbstractCacheHandler):
             buffer_distance: Buffer distance in meters.
 
         Returns:
-            WKB bytes representing the spatial filter geometry, or None if no cache hits.
+            Tuple of (WKB bytes, SRID) representing the spatial filter geometry,
+            or None if no cache hits.
         """
         ...
 
