@@ -696,56 +696,11 @@ def apply_cache_lazy(
     # Determine if we're in spatial mode
     is_spatial = geometry_column is not None
 
-    # Step 1: Generate query variants from original query
-    lazy_cache_subquery, generated_variants, used_hashes = get_partition_keys_lazy(
-        query=query,
-        cache_handler=cache_handler,
-        partition_key=partition_key,
-        min_component_size=min_component_size,
-        canonicalize_queries=canonicalize_queries,
-        follow_graph=follow_graph,
-        auto_detect_star_join=False if is_spatial else auto_detect_star_join,
-        star_join_table=star_join_table,
-        bucket_steps=bucket_steps,
-        add_constraints=add_constraints,
-        remove_constraints_all=remove_constraints_all,
-        remove_constraints_add=remove_constraints_add,
-        skip_partition_key_joins=is_spatial,
-        geometry_column=geometry_column,
-    )
-
-    # Step 2: Optionally rewrite with p0 table (not applicable for spatial queries)
-    working_query = query
-    p0_rewritten = 0
-    if use_p0_table and not is_spatial:
-        p0_table_alias = p0_alias if p0_alias else "p0"
-        working_query = rewrite_query_with_p0_table(
-            query=query,
-            partition_key=partition_key,
-            mv_table_name=p0_table_name,
-            p0_alias=p0_table_alias,
-        )
-        p0_rewritten = 1 if working_query != query else 0
-
-    # Create statistics
-    stats = {"generated_variants": generated_variants, "cache_hits": used_hashes, "enhanced": 0, "p0_rewritten": p0_rewritten}
-
-    # If no cache hits, return working query
-    if not lazy_cache_subquery or not lazy_cache_subquery.strip():
-        return working_query, stats
-
-    # Step 3: Apply cache restrictions
     if is_spatial:
-        # Spatial path: use get_spatial_filter_lazy and ST_DWithin
-        if buffer_distance is None:
-            buffer_distance = compute_buffer_distance(query)
-            if buffer_distance == 0.0:
-                raise ValueError("buffer_distance is required when geometry_column is set and query has no distance constraints")
-
-        if not hasattr(cache_handler, "get_spatial_filter_lazy"):
-            raise ValueError("Cache handler does not support spatial filtering (missing get_spatial_filter_lazy method)")
-
-        # Get the hashes that were found in cache
+        # Spatial path: generate hashes once, use get_spatial_filter_lazy() directly.
+        # Unlike the non-spatial path, we skip get_partition_keys_lazy() / get_intersected_lazy()
+        # because spatial handlers need get_spatial_filter_lazy() (buffered geometric intersection),
+        # not partition key intersection (cell ID / bbox intersection).
         hashes = generate_all_hashes(
             query=query,
             partition_key=partition_key,
@@ -763,17 +718,35 @@ def apply_cache_lazy(
             geometry_column=geometry_column,
         )
 
+        generated_variants = len(hashes)
+        stats: dict[str, int] = {"generated_variants": generated_variants, "cache_hits": 0, "enhanced": 0, "p0_rewritten": 0}
+        if not hashes:
+            return query, stats
+
+        existing_hashes = set(cache_handler.filter_existing_keys(set(hashes), partition_key))
+        stats["cache_hits"] = len(existing_hashes)
+        if not existing_hashes:
+            return query, stats
+
+        if buffer_distance is None:
+            buffer_distance = compute_buffer_distance(query)
+            if buffer_distance == 0.0:
+                raise ValueError("buffer_distance is required when geometry_column is set and query has no distance constraints")
+
+        if not hasattr(cache_handler, "get_spatial_filter_lazy"):
+            raise ValueError("Cache handler does not support spatial filtering (missing get_spatial_filter_lazy method)")
+
         spatial_filter_sql = cache_handler.get_spatial_filter_lazy(  # type: ignore[attr-defined]
-            keys=set(hashes),
+            keys=existing_hashes,
             partition_key=partition_key,
             buffer_distance=buffer_distance,
         )
 
         if not spatial_filter_sql:
-            return working_query, stats
+            return query, stats
 
         enhanced_query = extend_query_with_spatial_filter_lazy(
-            query=working_query,
+            query=query,
             spatial_filter_sql=spatial_filter_sql,
             geometry_column=geometry_column,
             buffer_distance=buffer_distance,
@@ -781,26 +754,64 @@ def apply_cache_lazy(
             auto_detect_star_join=auto_detect_star_join,
             star_join_table=star_join_table,
         )
-    else:
-        # Standard path: use partition key IN subquery
-        cache_target_alias: str | None
-        if use_p0_table and p0_rewritten:
-            # Target p0 table for cache restrictions
-            cache_target_alias = p0_alias if p0_alias else "p0"
-        else:
-            # Regular query - use provided alias or auto-detect
-            cache_target_alias = p0_alias
 
-        enhanced_query = extend_query_with_partition_keys_lazy(
-            query=working_query,
-            lazy_subquery=lazy_cache_subquery,
+        stats["enhanced"] = 1
+        return enhanced_query, stats
+
+    # Non-spatial path: use partition key lazy intersection
+    # Step 1: Generate query variants from original query
+    lazy_cache_subquery, generated_variants, used_hashes = get_partition_keys_lazy(
+        query=query,
+        cache_handler=cache_handler,
+        partition_key=partition_key,
+        min_component_size=min_component_size,
+        canonicalize_queries=canonicalize_queries,
+        follow_graph=follow_graph,
+        auto_detect_star_join=auto_detect_star_join,
+        star_join_table=star_join_table,
+        bucket_steps=bucket_steps,
+        add_constraints=add_constraints,
+        remove_constraints_all=remove_constraints_all,
+        remove_constraints_add=remove_constraints_add,
+    )
+
+    # Step 2: Optionally rewrite with p0 table
+    working_query = query
+    p0_rewritten = 0
+    if use_p0_table:
+        p0_table_alias = p0_alias if p0_alias else "p0"
+        working_query = rewrite_query_with_p0_table(
+            query=query,
             partition_key=partition_key,
-            method=method,
-            p0_alias=cache_target_alias,
-            analyze_tmp_table=analyze_tmp_table,
-            auto_detect_star_join=auto_detect_star_join,
-            star_join_table=star_join_table,
+            mv_table_name=p0_table_name,
+            p0_alias=p0_table_alias,
         )
+        p0_rewritten = 1 if working_query != query else 0
+
+    # Create statistics
+    stats = {"generated_variants": generated_variants, "cache_hits": used_hashes, "enhanced": 0, "p0_rewritten": p0_rewritten}
+
+    # If no cache hits, return working query
+    if not lazy_cache_subquery or not lazy_cache_subquery.strip():
+        return working_query, stats
+
+    # Step 3: Apply partition key restrictions
+    cache_target_alias: str | None
+    if use_p0_table and p0_rewritten:
+        cache_target_alias = p0_alias if p0_alias else "p0"
+    else:
+        cache_target_alias = p0_alias
+
+    enhanced_query = extend_query_with_partition_keys_lazy(
+        query=working_query,
+        lazy_subquery=lazy_cache_subquery,
+        partition_key=partition_key,
+        method=method,
+        p0_alias=cache_target_alias,
+        analyze_tmp_table=analyze_tmp_table,
+        auto_detect_star_join=auto_detect_star_join,
+        star_join_table=star_join_table,
+    )
 
     stats["enhanced"] = 1
     return enhanced_query, stats

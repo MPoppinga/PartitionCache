@@ -261,13 +261,16 @@ class TestExtendQueryWithSpatialFilterLazy:
 class TestApplyCacheLazySpatialMode:
     """Test apply_cache_lazy with spatial parameters."""
 
-    def _make_mock_handler(self, lazy_result=None, spatial_filter=None):
+    def _make_mock_handler(self, lazy_result=None, spatial_filter=None, existing_keys=None):
         """Create a mock cache handler with spatial support."""
         from partitioncache.cache_handler.abstract import AbstractCacheHandler_Lazy
 
         handler = MagicMock(spec=AbstractCacheHandler_Lazy)
         handler.get_intersected_lazy.return_value = (lazy_result, 3 if lazy_result else 0)
         handler.get_spatial_filter_lazy = MagicMock(return_value=spatial_filter)
+        if existing_keys is None:
+            existing_keys = {"hash1"} if spatial_filter else set()
+        handler.filter_existing_keys.return_value = existing_keys
         return handler
 
     @patch.object(_apply_cache_module, "generate_all_hashes")
@@ -311,13 +314,39 @@ class TestApplyCacheLazySpatialMode:
 
         assert result == query
         assert stats["enhanced"] == 0
+        handler.get_spatial_filter_lazy.assert_not_called()
+
+    @patch.object(_apply_cache_module, "generate_all_hashes")
+    def test_spatial_mode_no_hits_skips_buffer_validation(self, mock_hashes):
+        """When there are no cache hits, return original query even if buffer_distance is None."""
+        mock_hashes.return_value = ["hash1"]
+
+        handler = self._make_mock_handler(existing_keys=set())
+
+        query = "SELECT * FROM poi AS p1 WHERE p1.type = 'cafe'"
+        result, stats = apply_cache_lazy(
+            query=query,
+            cache_handler=handler,
+            partition_key="spatial_h3",
+            geometry_column="geom",
+            buffer_distance=None,
+        )
+
+        assert result == query
+        assert stats["cache_hits"] == 0
+        assert stats["enhanced"] == 0
+        handler.get_spatial_filter_lazy.assert_not_called()
 
     @patch.object(_apply_cache_module, "generate_all_hashes")
     def test_spatial_mode_requires_buffer_distance(self, mock_hashes):
         """When geometry_column is set but buffer_distance is None, should raise ValueError."""
         mock_hashes.return_value = ["hash1"]
 
-        handler = self._make_mock_handler(lazy_result="SELECT 1")
+        handler = self._make_mock_handler(
+            lazy_result="SELECT 1",
+            spatial_filter="SELECT ST_Union(geom) FROM buffered",
+            existing_keys={"hash1"},
+        )
 
         with pytest.raises(ValueError, match="buffer_distance is required.*no distance constraints"):
             apply_cache_lazy(
@@ -337,6 +366,7 @@ class TestApplyCacheLazySpatialMode:
 
         handler = MagicMock(spec=AbstractCacheHandler_Lazy)
         handler.get_intersected_lazy.return_value = ("SELECT 1", 1)
+        handler.filter_existing_keys.return_value = {"hash1"}
         # Remove get_spatial_filter_lazy
         del handler.get_spatial_filter_lazy
 
@@ -1117,13 +1147,13 @@ class TestComputeBufferDistance:
 class TestAutoDerivBufferDistanceLazy:
     """Tests for auto-derivation of buffer_distance in apply_cache_lazy()."""
 
-    def _make_mock_handler(self, lazy_result=None, spatial_filter=None):
+    def _make_mock_handler(self, spatial_filter=None):
         """Create a mock lazy cache handler with spatial support."""
         from partitioncache.cache_handler.abstract import AbstractCacheHandler_Lazy
 
         handler = MagicMock(spec=AbstractCacheHandler_Lazy)
-        handler.get_intersected_lazy.return_value = (lazy_result, 3 if lazy_result else 0)
         handler.get_spatial_filter_lazy = MagicMock(return_value=spatial_filter)
+        handler.filter_existing_keys.return_value = {"hash1"} if spatial_filter else set()
         return handler
 
     @patch.object(_apply_cache_module, "generate_all_hashes")
@@ -1132,7 +1162,6 @@ class TestAutoDerivBufferDistanceLazy:
         mock_hashes.return_value = ["hash1"]
 
         handler = self._make_mock_handler(
-            lazy_result="SELECT unnest(pk) FROM cache",
             spatial_filter="SELECT ST_Union(geom) FROM cached",
         )
 
@@ -1150,8 +1179,9 @@ class TestAutoDerivBufferDistanceLazy:
             buffer_distance=None,
         )
 
-        # Should have called get_spatial_filter_lazy (no error raised)
+        # Should have called get_spatial_filter_lazy directly (no get_intersected_lazy)
         handler.get_spatial_filter_lazy.assert_called_once()
+        handler.get_intersected_lazy.assert_not_called()
         # The result should be enhanced (not original query)
         assert "ST_DWITHIN" in result.upper() or "st_dwithin" in result.lower()
 
@@ -1161,7 +1191,6 @@ class TestAutoDerivBufferDistanceLazy:
         mock_hashes.return_value = ["hash1"]
 
         handler = self._make_mock_handler(
-            lazy_result="SELECT unnest(pk) FROM cache",
             spatial_filter="SELECT ST_Union(geom) FROM cached",
         )
 
