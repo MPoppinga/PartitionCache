@@ -157,13 +157,13 @@ print(optimized)
 # SELECT * FROM users WHERE age > 25 AND user_id IN (1, 5, 10, 15, 20)
 ```
 
-#### `apply_cache_lazy(query: str, cache_handler: AbstractCacheHandler_Lazy, partition_key: str, method: Literal["IN_SUBQUERY", "TMP_TABLE_IN", "TMP_TABLE_JOIN"] = "IN_SUBQUERY", p0_alias: str | None = None, min_component_size: int = 2, canonicalize_queries: bool = False, follow_graph: bool = True, analyze_tmp_table: bool = True, use_p0_table: bool = False, p0_table_name: str | None = None, auto_detect_star_join: bool = True, star_join_table: str | None = None, bucket_steps: float = 1.0, add_constraints: dict[str, str] | None = None, remove_constraints_all: list[str] | None = None, remove_constraints_add: list[str] | None = None)`
+#### `apply_cache_lazy(query, cache_handler, partition_key, ..., geometry_column=None, buffer_distance=None)`
 
-**Recommended** - High-performance cache application with lazy evaluation.
+**Recommended** - High-performance cache application with lazy evaluation. Supports spatial mode.
 
 **Parameters:**
 - `query` (str): SQL query to optimize
-- `cache_handler` (AbstractCacheHandler_Lazy): Cache backend instance  
+- `cache_handler` (AbstractCacheHandler_Lazy): Cache backend instance
 - `partition_key` (str): Partition column name
 - `method` (Literal["IN_SUBQUERY", "TMP_TABLE_IN", "TMP_TABLE_JOIN"]): Integration method
 - `p0_alias` (str | None, optional): Table alias for cache restrictions
@@ -179,6 +179,8 @@ print(optimized)
 - `add_constraints` (dict[str, str] | None, optional): Dict mapping table names to constraints to add
 - `remove_constraints_all` (list[str] | None, optional): List of attribute names to remove from all query variants
 - `remove_constraints_add` (list[str] | None, optional): List of attribute names to remove, creating additional variants
+- `geometry_column` (str | None, optional): Enables spatial mode. Uses this geometry column for fragment SELECT clauses and spatial filter. Requires a spatial cache handler with `get_spatial_filter_lazy()` method.
+- `buffer_distance` (float | None, optional): Buffer distance in meters for spatial filter (required when `geometry_column` is set).
 
 **Returns:**
 - `Tuple[str, Dict]`: (enhanced_query, statistics)
@@ -199,6 +201,22 @@ print(f"Query enhanced: {stats['enhanced']}")
 
 # Execute enhanced query directly
 # enhanced_query contains complete optimized SQL
+```
+
+**Spatial Mode Example:**
+```python
+# Spatial cache application with PostGIS H3 handler
+enhanced_query, stats = partitioncache.apply_cache_lazy(
+    query="SELECT * FROM poi AS p1 WHERE p1.type = 'restaurant'",
+    cache_handler=spatial_cache_handler,
+    partition_key="spatial_h3",
+    geometry_column="geom",
+    buffer_distance=500.0,  # meters
+    min_component_size=1,
+)
+
+if stats['enhanced']:
+    print(f"Query enhanced with spatial filter ({stats['cache_hits']} cache hits)")
 ```
 
 **Performance Benefits:**
@@ -233,6 +251,56 @@ enhanced_query, stats = partitioncache.apply_cache_lazy(
     method="TMP_TABLE_JOIN"
 )
 ```
+
+#### `apply_cache(query, cache_handler, partition_key, ..., geometry_column=None, buffer_distance=None)`
+
+Applies partition cache to a query using regular (non-lazy) cache handlers. Supports spatial mode.
+
+**Spatial Parameters** (in addition to standard parameters):
+- `geometry_column` (str | None, optional): Enables spatial mode. Requires a spatial cache handler with `get_spatial_filter()` method.
+- `buffer_distance` (float | None, optional): Buffer distance in meters for spatial filter (required when `geometry_column` is set).
+
+**Example:**
+```python
+# Non-lazy spatial cache application
+enhanced_query, stats = partitioncache.apply_cache(
+    query="SELECT * FROM poi AS p1 WHERE p1.type = 'restaurant'",
+    cache_handler=spatial_cache_handler,
+    partition_key="spatial_h3",
+    geometry_column="geom",
+    buffer_distance=500.0,
+    min_component_size=1,
+)
+```
+
+#### `extend_query_with_spatial_filter(query, spatial_filter_wkb, geometry_column, buffer_distance, srid=4326, p0_alias=None)`
+
+Extends a SQL query with a pre-computed spatial filter geometry (WKB bytes). Non-lazy counterpart to `extend_query_with_spatial_filter_lazy()`.
+
+**Parameters:**
+- `query` (str): The original SQL query.
+- `spatial_filter_wkb` (bytes): Pre-computed spatial filter geometry as WKB bytes.
+- `geometry_column` (str): The geometry column name in the target table.
+- `buffer_distance` (float): Buffer distance in meters.
+- `srid` (int, optional): SRID of the spatial filter geometry (default: 4326).
+- `p0_alias` (str | None, optional): Table alias to apply the filter to.
+
+**Returns:**
+- `str`: The extended SQL query with spatial filter.
+
+#### `extend_query_with_spatial_filter_lazy(query, spatial_filter_sql, geometry_column, buffer_distance, p0_alias=None)`
+
+Extends a SQL query with a spatial filter using a lazy SQL subquery that produces geometry.
+
+**Parameters:**
+- `query` (str): The original SQL query.
+- `spatial_filter_sql` (str): SQL subquery returning a geometry to filter against.
+- `geometry_column` (str): The geometry column name in the target table.
+- `buffer_distance` (float): Buffer distance in meters (uses geography cast).
+- `p0_alias` (str | None, optional): Table alias to apply the filter to.
+
+**Returns:**
+- `str`: The extended SQL query with spatial filter.
 
 ### Queue Operations
 

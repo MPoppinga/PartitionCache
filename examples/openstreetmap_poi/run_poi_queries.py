@@ -175,7 +175,7 @@ def test_partition_key(conn, partition_key: str, datatype: str = "integer"):
         return
 
 
-def test_spatial_partition_key(conn, partition_key: str, cache_backend: str, geometry_column: str = "geom", buffer_distance: float = 500.0):
+def test_spatial_partition_key(conn, partition_key: str, cache_backend: str, geometry_column: str = "geom", buffer_distance: float | None = None):
     """Test queries with a spatial partition key (geometry datatype)."""
     query_dir = os.path.join("testqueries_examples", "spatial")
     if not os.path.exists(query_dir):
@@ -263,7 +263,8 @@ def test_spatial_partition_key(conn, partition_key: str, cache_backend: str, geo
 # Spatial cache backend (set via env or override)
 SPATIAL_CACHE_BACKEND = os.getenv("SPATIAL_CACHE_BACKEND", "postgis_h3")
 GEOMETRY_COLUMN = os.getenv("PARTITION_CACHE_GEOMETRY_COLUMN", "geom")
-BUFFER_DISTANCE = float(os.getenv("PARTITION_CACHE_BUFFER_DISTANCE", "500"))
+_buffer_env = float(os.getenv("PARTITION_CACHE_BUFFER_DISTANCE", "0"))
+BUFFER_DISTANCE: float | None = _buffer_env if _buffer_env > 0 else None  # None = auto-derive from ST_DWithin
 
 
 def main():

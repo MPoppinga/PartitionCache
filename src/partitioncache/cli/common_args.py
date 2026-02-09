@@ -70,12 +70,15 @@ def add_cache_args(parser: argparse.ArgumentParser, require_partition_key: bool 
     )
 
 
-def add_spatial_args(parser: argparse.ArgumentParser) -> None:
+def add_spatial_args(parser: argparse.ArgumentParser, include_buffer_distance: bool = True) -> None:
     """
     Add spatial configuration arguments for H3/BBox cache handlers.
 
     Args:
         parser: The ArgumentParser to add arguments to
+        include_buffer_distance: Whether to include --buffer-distance argument.
+            Set to False for commands that only populate cache (e.g. pcache-add),
+            since buffer distance is a read-time concern for apply_cache only.
     """
     spatial_group = parser.add_argument_group("spatial configuration")
 
@@ -87,13 +90,14 @@ def add_spatial_args(parser: argparse.ArgumentParser) -> None:
         "If not specified, uses the cache handler's configured geometry column.",
     )
 
-    spatial_group.add_argument(
-        "--buffer-distance",
-        type=float,
-        default=float(os.getenv("PARTITION_CACHE_BUFFER_DISTANCE", "0")) or None,
-        help="Buffer distance in meters for spatial cache application. "
-        "If not set, auto-derived from ST_DWithin distances in the query.",
-    )
+    if include_buffer_distance:
+        spatial_group.add_argument(
+            "--buffer-distance",
+            type=float,
+            default=float(os.getenv("PARTITION_CACHE_BUFFER_DISTANCE", "0")) or None,
+            help="Buffer distance in meters for spatial cache application. "
+            "If not set, auto-derived from ST_DWithin distances in the query.",
+        )
 
 
 def add_environment_args(parser: argparse.ArgumentParser) -> None:

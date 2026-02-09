@@ -51,7 +51,7 @@ def main():
     add_cache_args(parser, require_partition_key=True)
     add_database_args(parser)
     add_queue_args(parser)
-    add_spatial_args(parser)
+    add_spatial_args(parser, include_buffer_distance=False)
     add_variant_generation_args(parser)
     add_environment_args(parser)
     add_verbosity_args(parser)

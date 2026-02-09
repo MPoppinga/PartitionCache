@@ -283,6 +283,55 @@ class PostGISBBoxCacheHandler(PostGISSpatialAbstractCacheHandler):
             logger.error(f"Failed to get BBox lazy intersection: {e}")
             return None, 0
 
+    def _get_buffered_intersected_sql(
+        self, keys: set[str], partition_key: str, buffer_distance: float
+    ) -> sql.Composed:
+        """Build SQL for chained ST_Intersection of buffered geometry envelopes.
+
+        Each envelope is buffered by ``buffer_distance + cell_size`` before
+        intersection.  This mirrors the H3 handler which buffers by the H3 edge
+        length and prevents the intersection from collapsing to empty when
+        different query fragments cover nearby but non-overlapping areas that
+        are within ``buffer_distance`` of each other.
+
+        Without buffering, fragment A (e.g. ice cream shops) and fragment B
+        (e.g. pharmacies) 100 m apart would produce an empty intersection even
+        though ``ST_DWithin(..., 400)`` in the original query matches them.
+        """
+        table_name = f"{self.tableprefix}_cache_{partition_key}"
+        keys_list = list(keys)
+        buf = buffer_distance + self.cell_size
+
+        if len(keys_list) == 1:
+            # Single key: buffer the envelope
+            return sql.SQL(
+                "ST_Buffer(ST_Envelope((SELECT partition_keys FROM {table} WHERE query_hash = {key})), {buf})"
+            ).format(
+                table=sql.Identifier(table_name),
+                key=sql.Literal(keys_list[0]),
+                buf=sql.Literal(buf),
+            )
+
+        result = sql.SQL(
+            "ST_Buffer(ST_Envelope((SELECT partition_keys FROM {table} WHERE query_hash = {key})), {buf})"
+        ).format(
+            table=sql.Identifier(table_name),
+            key=sql.Literal(keys_list[0]),
+            buf=sql.Literal(buf),
+        )
+
+        for i in range(1, len(keys_list)):
+            inner = sql.SQL(
+                "ST_Buffer(ST_Envelope((SELECT partition_keys FROM {table} WHERE query_hash = {key})), {buf})"
+            ).format(
+                table=sql.Identifier(table_name),
+                key=sql.Literal(keys_list[i]),
+                buf=sql.Literal(buf),
+            )
+            result = sql.SQL("ST_Intersection({a}, {b})").format(a=result, b=inner)
+
+        return result
+
     def get_spatial_filter(
         self,
         keys: set[str],
@@ -292,13 +341,16 @@ class PostGISBBoxCacheHandler(PostGISSpatialAbstractCacheHandler):
         """
         Get spatial filter geometry as WKB bytes for bounding boxes.
 
-        Executes the intersection SQL from _get_intersected_sql() and returns
-        the resulting geometry as WKB binary bytes with the handler's SRID.
+        Each cached envelope is buffered by ``buffer_distance + cell_size``
+        before intersection, so that fragments covering nearby but
+        non-overlapping areas still produce a valid spatial filter.
+        This is analogous to the H3 handler buffering by edge length.
 
         Args:
             keys: Set of cache keys to intersect.
             partition_key: Partition key namespace.
-            buffer_distance: Buffer distance in meters (applied externally via ST_DWithin).
+            buffer_distance: Buffer distance in the SRID's native unit (meters
+                for metric SRIDs). Applied to each envelope before intersection.
 
         Returns:
             Tuple of (WKB bytes, SRID) for the spatial filter geometry,
@@ -313,7 +365,7 @@ class PostGISBBoxCacheHandler(PostGISSpatialAbstractCacheHandler):
             if not filtered_keys:
                 return None
 
-            intersect_sql = self._get_intersected_sql(filtered_keys, partition_key)
+            intersect_sql = self._get_buffered_intersected_sql(filtered_keys, partition_key, buffer_distance)
             query = sql.SQL("SELECT ST_AsBinary(({intersect_sql})::geometry)").format(
                 intersect_sql=intersect_sql,
             )
@@ -335,14 +387,16 @@ class PostGISBBoxCacheHandler(PostGISSpatialAbstractCacheHandler):
         """
         Get spatial filter geometry SQL for bounding boxes.
 
-        Returns the ST_Intersection of all cached bounding box geometries.
-        The buffer is applied via ST_DWithin in the query extension step (not here),
-        since the ST_DWithin uses geography cast for meter-based distance.
+        Each cached envelope is buffered by ``buffer_distance + cell_size``
+        before intersection, so that fragments covering nearby but
+        non-overlapping areas still produce a valid spatial filter.
+        This is analogous to the H3 handler buffering by edge length.
 
         Args:
             keys: Set of cache keys to intersect.
             partition_key: Partition key namespace.
-            buffer_distance: Buffer distance in meters (applied externally via ST_DWithin).
+            buffer_distance: Buffer distance in the SRID's native unit (meters
+                for metric SRIDs). Applied to each envelope before intersection.
 
         Returns:
             SQL string producing a geometry, or None if no cache hits.
@@ -356,7 +410,7 @@ class PostGISBBoxCacheHandler(PostGISSpatialAbstractCacheHandler):
             if not filtered_keys:
                 return None
 
-            intersect_sql = self._get_intersected_sql(filtered_keys, partition_key)
+            intersect_sql = self._get_buffered_intersected_sql(filtered_keys, partition_key, buffer_distance)
             return intersect_sql.as_string(self.cursor)
         except Exception as e:
             logger.error(f"Failed to get BBox spatial filter: {e}")

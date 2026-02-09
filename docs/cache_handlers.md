@@ -77,6 +77,26 @@ PartitionCache supports multiple cache backends with different performance chara
 - **Memory**: Disk-based with cache
 - **Scalability**: Good (single-instance)
 
+### PostGIS Spatial Backends
+
+#### PostGIS H3 Handler
+- **Type**: `postgis_h3`
+- **Storage**: BIGINT[] arrays of H3 hexagonal cell indices
+- **Datatypes**: `geometry`
+- **Requirements**: PostgreSQL + PostGIS + h3-pg extension
+- **Best for**: Hexagonal spatial partitioning, uniform spatial distribution
+- **Spatial filtering**: K-ring buffer expansion via `h3_grid_disk()`
+- **Scalability**: Excellent (database-native)
+
+#### PostGIS BBox Handler
+- **Type**: `postgis_bbox`
+- **Storage**: PostGIS geometry (MultiPolygon of grid cell envelopes)
+- **Datatypes**: `geometry`
+- **Requirements**: PostgreSQL + PostGIS extension
+- **Best for**: Grid-based spatial partitioning, bounding box intersection
+- **Spatial filtering**: Geometric `ST_Intersection` of cached bounding boxes
+- **Scalability**: Excellent (database-native)
+
 ## Multi-Partition Support
 
 ### Architecture
@@ -146,7 +166,8 @@ cache.set_cache("key2", {"a", "b"}, partition_key="test")
 | Distributed system | Any | integer, text | redis_set, redis_bit | Network-accessible |
 | Development/testing | Any | any | rocksdict | No server setup required |
 | Time-series data | Large | timestamp | postgresql_array | Native timestamp support |
-| Geographic data | Large | float | postgresql_array | PostGIS support |
+| Spatial data (hexagonal) | Large | geometry | postgis_h3 | H3 hexagonal cells, requires h3-pg |
+| Spatial data (grid) | Large | geometry | postgis_bbox | Bounding box grid cells |
 
 ### Memory Efficiency Comparison
 

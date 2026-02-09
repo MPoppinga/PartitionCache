@@ -977,6 +977,16 @@ class TestExtractDistanceConstraints:
         assert len(result) == 1
         assert result[0] == ("t1", "t2", 3.6)
 
+    def test_dist_between_mixed_case(self):
+        """Mixed-case BETWEEN/AND keywords are handled correctly."""
+        query = (
+            "SELECT * FROM t1, t2 "
+            "WHERE DIST(t1.g, t2.g) Between 1.6 And 3.6"
+        )
+        result = extract_distance_constraints(query)
+        assert len(result) == 1
+        assert result[0] == ("t1", "t2", 3.6)
+
     def test_greater_than_skipped(self):
         """DIST(...) > value → lower bound only, should be skipped."""
         query = (
