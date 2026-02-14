@@ -714,3 +714,26 @@ BEGIN
     RETURN v_cleaned_count;
 END;
 $$ LANGUAGE plpgsql;
+
+-- Function to clean up old processor log entries.
+CREATE OR REPLACE FUNCTION partitioncache_cleanup_processor_logs(
+    p_queue_prefix TEXT DEFAULT 'partitioncache_queue',
+    p_retention_days INTEGER DEFAULT 30
+)
+RETURNS INTEGER AS $$
+DECLARE
+    v_log_table TEXT;
+    v_deleted_count INTEGER;
+BEGIN
+    v_log_table := p_queue_prefix || '_processor_log';
+
+    EXECUTE format(
+        'DELETE FROM %I WHERE created_at < NOW() - INTERVAL ''%s days''',
+        v_log_table,
+        p_retention_days
+    );
+
+    GET DIAGNOSTICS v_deleted_count = ROW_COUNT;
+    RETURN v_deleted_count;
+END;
+$$ LANGUAGE plpgsql;

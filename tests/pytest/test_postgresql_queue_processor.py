@@ -353,6 +353,30 @@ class TestDatabaseOperations:
         # Verify that commit was called (may be called multiple times)
         assert mock_conn.commit.call_count >= 1
 
+    def test_insert_initial_config_uses_upsert(self):
+        """Test that re-running setup updates config instead of silently doing nothing."""
+        from partitioncache.cli.postgresql_queue_processor import insert_initial_config
+
+        mock_conn = Mock()
+        mock_cursor = Mock()
+        mock_conn.cursor.return_value.__enter__ = Mock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = Mock(return_value=None)
+
+        # Insert without job_owner
+        insert_initial_config(mock_conn, "test_job", "prefix", "queue", "array", 5, False, 1800, "testdb", None)
+        sql_text = str(mock_cursor.execute.call_args_list[0][0][0])
+        assert "ON CONFLICT" in sql_text
+        assert "DO UPDATE SET" in sql_text
+        assert "DO NOTHING" not in sql_text
+
+        # Insert with job_owner
+        mock_cursor.reset_mock()
+        insert_initial_config(mock_conn, "test_job", "prefix", "queue", "array", 5, False, 1800, "testdb", None, job_owner="testworker")
+        sql_text = str(mock_cursor.execute.call_args_list[0][0][0])
+        assert "ON CONFLICT" in sql_text
+        assert "DO UPDATE SET" in sql_text
+        assert "job_owner = EXCLUDED.job_owner" in sql_text
+
 
 class TestCLIIntegration:
     """Test CLI integration points."""
@@ -511,3 +535,167 @@ class TestProcessorEnableDisable:
         with patch("partitioncache.cli.postgresql_queue_processor.get_pg_cron_connection", return_value=mock_conn):
             with pytest.raises(Exception, match="Function does not exist"):
                 disable_processor("test_queue_prefix")
+
+
+class TestDurationParsingAndVerifyCommand:
+    """Test duration parsing and verify command wiring."""
+
+    @patch("partitioncache.cli.postgresql_queue_processor.get_cache_backend_from_env")
+    @patch("partitioncache.cli.postgresql_queue_processor.get_queue_table_prefix_from_env")
+    @patch("partitioncache.cli.postgresql_queue_processor.get_table_prefix_from_env")
+    @patch("partitioncache.cli.postgresql_queue_processor.handle_setup")
+    @patch("partitioncache.cli.postgresql_queue_processor.validate_environment")
+    @patch("partitioncache.cli.postgresql_queue_processor.load_environment_with_validation")
+    def test_main_setup_parses_duration_units(
+        self,
+        mock_load_env,
+        mock_validate,
+        mock_handle_setup,
+        mock_get_table_prefix,
+        mock_get_queue_prefix,
+        mock_get_cache_backend,
+    ):
+        from partitioncache.cli.postgresql_queue_processor import main
+
+        mock_validate.return_value = (True, "OK")
+        mock_get_table_prefix.return_value = "partitioncache"
+        mock_get_queue_prefix.return_value = "partitioncache_queue"
+        mock_get_cache_backend.return_value = "array"
+
+        with patch("sys.argv", ["postgresql_queue_processor.py", "setup", "--frequency", "5m", "--timeout", "2h"]):
+            main()
+
+        mock_handle_setup.assert_called_once_with("partitioncache", "partitioncache_queue", "array", 300, False, 7200, None, job_owner=None, create_role=False)
+
+    @patch("partitioncache.cli.postgresql_queue_processor.get_queue_table_prefix_from_env")
+    @patch("partitioncache.cli.postgresql_queue_processor.get_table_prefix_from_env")
+    @patch("partitioncache.cli.postgresql_queue_processor.verify_processor_setup")
+    @patch("partitioncache.cli.postgresql_queue_processor.validate_environment")
+    @patch("partitioncache.cli.postgresql_queue_processor.load_environment_with_validation")
+    def test_main_verify_uses_return_code(
+        self,
+        mock_load_env,
+        mock_validate,
+        mock_verify,
+        mock_get_table_prefix,
+        mock_get_queue_prefix,
+    ):
+        from partitioncache.cli.postgresql_queue_processor import main
+
+        mock_validate.return_value = (True, "OK")
+        mock_verify.return_value = 0
+        mock_get_table_prefix.return_value = "partitioncache"
+        mock_get_queue_prefix.return_value = "partitioncache_queue"
+
+        with patch("sys.argv", ["postgresql_queue_processor.py", "verify"]):
+            with pytest.raises(SystemExit) as exc_info:
+                main()
+
+        assert exc_info.value.code == 0
+        mock_verify.assert_called_once_with("partitioncache", "partitioncache_queue")
+
+
+class TestScopedRemove:
+    """Verify remove_all_processor_objects uses scoped function lists, not blanket LIKE."""
+
+    @patch("partitioncache.cli.postgresql_queue_processor.get_cache_database_name", return_value="testdb")
+    @patch("partitioncache.cli.postgresql_queue_processor.get_cron_database_name", return_value="testdb")
+    def test_scoped_function_drop_uses_any_not_like(self, mock_cron_db, mock_cache_db):
+        from partitioncache.cli.postgresql_queue_processor import remove_all_processor_objects
+
+        mock_conn = Mock()
+        mock_cursor = Mock()
+        mock_conn.cursor.return_value.__enter__ = Mock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = Mock(return_value=None)
+
+        remove_all_processor_objects(mock_conn, "partitioncache_queue")
+
+        # Collect all SQL executed
+        all_sql = ""
+        for c in mock_cursor.execute.call_args_list:
+            all_sql += str(c[0][0]) + "\n"
+
+        # Must use ANY(...) for scoped drops
+        assert "ANY(processor_funcs)" in all_sql
+        # Must NOT use LIKE pattern for function discovery
+        assert "LIKE 'partitioncache_%'" not in all_sql or "jobname LIKE" in all_sql  # jobname LIKE is OK for cron.job cleanup
+
+    @patch("partitioncache.cli.postgresql_queue_processor.get_cache_database_name", return_value="testdb")
+    @patch("partitioncache.cli.postgresql_queue_processor.get_cron_database_name", return_value="testdb")
+    def test_does_not_drop_eviction_functions(self, mock_cron_db, mock_cache_db):
+        """Processor remove must not include eviction-specific function names."""
+        from partitioncache.cli.postgresql_queue_processor import remove_all_processor_objects
+
+        mock_conn = Mock()
+        mock_cursor = Mock()
+        mock_conn.cursor.return_value.__enter__ = Mock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = Mock(return_value=None)
+
+        remove_all_processor_objects(mock_conn, "partitioncache_queue")
+
+        all_sql = ""
+        for c in mock_cursor.execute.call_args_list:
+            all_sql += str(c[0][0]) + "\n"
+
+        # These are eviction-specific functions that must NOT appear
+        eviction_only = [
+            "partitioncache_construct_eviction_job_name",
+            "partitioncache_sync_eviction_cron_job",
+            "partitioncache_run_eviction_job_with_params",
+            "_partitioncache_evict_oldest_from_partition",
+            "_partitioncache_evict_largest_from_partition",
+        ]
+        for fn in eviction_only:
+            assert fn not in all_sql, f"Processor remove must not drop eviction function {fn}"
+
+
+class TestLiveMetrics:
+    """Test _fetch_processor_live_metrics with mocked connection."""
+
+    @patch("partitioncache.cli.postgresql_queue_processor.get_db_connection")
+    def test_returns_defaults_when_tables_missing(self, mock_get_conn):
+        from partitioncache.cli.postgresql_queue_processor import _fetch_processor_live_metrics
+
+        mock_conn = Mock()
+        mock_cursor = Mock()
+        mock_conn.cursor.return_value.__enter__ = Mock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = Mock(return_value=None)
+        mock_get_conn.return_value = mock_conn
+
+        # All queries raise UndefinedTable
+        import psycopg.errors
+        mock_cursor.execute.side_effect = psycopg.errors.UndefinedTable("relation does not exist")
+
+        metrics = _fetch_processor_live_metrics("partitioncache_queue")
+
+        assert metrics["queue_length"] == 0
+        assert metrics["active_jobs_count"] == 0
+        assert metrics["recent_successes_5m"] == 0
+        assert metrics["recent_failures_5m"] == 0
+
+    @patch("partitioncache.cli.postgresql_queue_processor.get_db_connection")
+    def test_returns_queue_length(self, mock_get_conn):
+        from partitioncache.cli.postgresql_queue_processor import _fetch_processor_live_metrics
+
+        mock_conn = Mock()
+        mock_cursor = Mock()
+        mock_conn.cursor.return_value.__enter__ = Mock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = Mock(return_value=None)
+        mock_get_conn.return_value = mock_conn
+
+        # Queue count returns 42, then log queries raise UndefinedTable
+        import psycopg.errors
+        call_count = [0]
+
+        def side_effect(*args, **kwargs):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return None  # queue count query
+            raise psycopg.errors.UndefinedTable("relation does not exist")
+
+        mock_cursor.execute.side_effect = side_effect
+        mock_cursor.fetchone.return_value = (42,)
+
+        metrics = _fetch_processor_live_metrics("partitioncache_queue")
+
+        assert metrics["queue_length"] == 42

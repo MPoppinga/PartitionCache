@@ -364,3 +364,41 @@ BEGIN
     END IF;
 END;
 $$ LANGUAGE plpgsql;
+
+-- Function to read active jobs table for diagnostics.
+CREATE OR REPLACE FUNCTION partitioncache_get_active_jobs_info(p_queue_prefix TEXT)
+RETURNS TABLE(job_id TEXT, query_hash TEXT, partition_key TEXT, started_at TIMESTAMP) AS $$
+DECLARE
+    v_active_jobs_table TEXT;
+BEGIN
+    v_active_jobs_table := p_queue_prefix || '_active_jobs';
+    RETURN QUERY EXECUTE format(
+        'SELECT job_id, query_hash, partition_key, started_at FROM %I ORDER BY started_at DESC',
+        v_active_jobs_table
+    );
+END;
+$$ LANGUAGE plpgsql;
+
+-- Function to read processor logs for diagnostics.
+CREATE OR REPLACE FUNCTION partitioncache_get_log_info(p_queue_prefix TEXT)
+RETURNS TABLE(
+    job_id TEXT,
+    query_hash TEXT,
+    partition_key TEXT,
+    status TEXT,
+    error_message TEXT,
+    rows_affected INTEGER,
+    execution_time_ms NUMERIC,
+    execution_source TEXT,
+    created_at TIMESTAMP
+) AS $$
+DECLARE
+    v_log_table TEXT;
+BEGIN
+    v_log_table := p_queue_prefix || '_processor_log';
+    RETURN QUERY EXECUTE format(
+        'SELECT job_id, query_hash, partition_key, status, error_message, rows_affected, execution_time_ms, execution_source, created_at FROM %I ORDER BY created_at DESC',
+        v_log_table
+    );
+END;
+$$ LANGUAGE plpgsql;

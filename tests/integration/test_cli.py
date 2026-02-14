@@ -923,6 +923,12 @@ class TestPostgreSQLQueueProcessorCLI:
         output_text = (result.stdout + result.stderr).lower()
         assert "enabled" in output_text
 
+        # 2b. Test verify command after setup
+        result = subprocess.run(
+            ["python", "-m", "partitioncache.cli.postgresql_queue_processor", "verify"], capture_output=True, text=True, env=env, timeout=30
+        )
+        assert result.returncode == 0, f"Verify failed: {result.stderr}"
+
         # 3. Test enable command
         result = subprocess.run(
             ["python", "-m", "partitioncache.cli.postgresql_queue_processor", "enable"], capture_output=True, text=True, env=env, timeout=30
@@ -963,6 +969,55 @@ class TestPostgreSQLQueueProcessorCLI:
         )
         # Remove command may fail if objects don't exist, that's OK
 
+    @pytest.mark.slow
+    def test_postgresql_cache_eviction_verify_workflow(self, db_session):
+        """Test setup/verify workflow for PostgreSQL cache eviction CLI."""
+        import os
+        import subprocess
+        import time
+
+        cache_backend = os.getenv("CACHE_BACKEND", "postgresql_array")
+        if not cache_backend.startswith("postgresql"):
+            pytest.skip("This test requires PostgreSQL cache backend")
+
+        queue_provider = os.getenv("QUERY_QUEUE_PROVIDER", "postgresql")
+        if queue_provider != "postgresql":
+            pytest.skip("This test requires PostgreSQL queue provider")
+
+        with db_session.cursor() as cur:
+            cur.execute("SELECT 1 FROM pg_extension WHERE extname = 'pg_cron'")
+            if not cur.fetchone():
+                pytest.skip("pg_cron extension not installed - this test should only run in cli-tools-tests job")
+
+        env = os.environ.copy()
+        test_table_prefix = f"test_pcache_eviction_{int(time.time())}"
+        env.update(
+            {
+                "CACHE_BACKEND": env.get("CACHE_BACKEND", "postgresql_array"),
+                "PG_ARRAY_CACHE_TABLE_PREFIX": test_table_prefix,
+                "PG_BIT_CACHE_TABLE_PREFIX": test_table_prefix,
+                "PG_ROARINGBIT_CACHE_TABLE_PREFIX": test_table_prefix,
+            }
+        )
+
+        result = subprocess.run(
+            ["python", "-m", "partitioncache.cli.postgresql_cache_eviction", "setup", "--frequency", "2m"],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=60,
+        )
+        assert result.returncode == 0, f"Eviction setup failed: {result.stderr}"
+
+        result = subprocess.run(
+            ["python", "-m", "partitioncache.cli.postgresql_cache_eviction", "verify"], capture_output=True, text=True, env=env, timeout=30
+        )
+        assert result.returncode == 0, f"Eviction verify failed: {result.stderr}"
+
+        subprocess.run(
+            ["python", "-m", "partitioncache.cli.postgresql_cache_eviction", "remove"], capture_output=True, text=True, env=env, timeout=30
+        )
+
     def test_postgresql_queue_processor_help_commands(self):
         """Test that all PostgreSQL queue processor help commands work."""
         commands = [
@@ -971,6 +1026,8 @@ class TestPostgreSQLQueueProcessorCLI:
             ["python", "-m", "partitioncache.cli.postgresql_queue_processor", "status", "--help"],
             ["python", "-m", "partitioncache.cli.postgresql_queue_processor", "enable", "--help"],
             ["python", "-m", "partitioncache.cli.postgresql_queue_processor", "disable", "--help"],
+            ["python", "-m", "partitioncache.cli.postgresql_queue_processor", "verify", "--help"],
+            ["python", "-m", "partitioncache.cli.postgresql_cache_eviction", "verify", "--help"],
         ]
 
         for cmd in commands:

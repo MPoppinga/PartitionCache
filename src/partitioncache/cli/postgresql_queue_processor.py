@@ -32,7 +32,20 @@ from pathlib import Path
 import psycopg
 from psycopg import sql
 
-from partitioncache.cli.common_args import add_environment_args, add_verbosity_args, configure_logging, load_environment_with_validation
+from partitioncache.cli.common_args import (
+    add_environment_args,
+    add_verbosity_args,
+    configure_logging,
+    ensure_role_exists,
+    function_exists,
+    get_cache_database_name,
+    get_cron_database_name,
+    get_db_connection,
+    get_pg_cron_connection,
+    load_environment_with_validation,
+    parse_duration_to_seconds,
+    table_exists,
+)
 
 logger = getLogger("PartitionCache.PostgreSQLQueueProcessor")
 
@@ -42,6 +55,23 @@ SQL_CRON_FILE = Path(__file__).parent.parent / "queue_handler" / "postgresql_que
 SQL_CACHE_FILE = Path(__file__).parent.parent / "queue_handler" / "postgresql_queue_processor_cache.sql"
 SQL_CRON_STATUS_FILE = Path(__file__).parent.parent / "queue_handler" / "postgresql_queue_processor_cron_status.sql"
 SQL_CACHE_INFO_FILE = Path(__file__).parent.parent / "queue_handler" / "postgresql_queue_processor_cache_info.sql"
+SQL_CRON_MAINTENANCE_FILE = Path(__file__).parent.parent / "queue_handler" / "postgresql_cron_maintenance.sql"
+
+
+def _parse_duration_arg(value: str, arg_name: str) -> int:
+    """Parse CLI duration argument to seconds and re-raise as argparse errors."""
+    try:
+        return parse_duration_to_seconds(value, arg_name=arg_name)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def _parse_frequency_seconds_arg(value: str) -> int:
+    return _parse_duration_arg(value, "--frequency")
+
+
+def _parse_timeout_seconds_arg(value: str) -> int:
+    return _parse_duration_arg(value, "--timeout")
 
 
 def get_cache_backend_from_env() -> str:
@@ -89,16 +119,6 @@ def get_queue_table_prefix_from_env() -> str:
     Returns the queue table prefix, defaulting to partitioncache_queue.
     """
     return os.getenv("PG_QUEUE_TABLE_PREFIX", "partitioncache_queue")
-
-
-def get_cache_database_name() -> str:
-    """Get the cache database name from environment."""
-    return os.getenv("DB_NAME", "postgres")
-
-
-def get_cron_database_name() -> str:
-    """Get the cron database name from environment."""
-    return os.getenv("PG_CRON_DATABASE", "postgres")
 
 
 def construct_processor_job_name(target_database: str, table_prefix: str | None) -> str:
@@ -182,28 +202,6 @@ def validate_environment() -> tuple[bool, str]:
         return False, str(e)
 
     return True, "Environment validated successfully"
-
-
-def get_db_connection():
-    """Get database connection using environment variables."""
-    return psycopg.connect(
-        host=os.getenv("DB_HOST"),
-        port=int(os.getenv("DB_PORT", "5432")),
-        user=os.getenv("DB_USER"),
-        password=os.getenv("DB_PASSWORD"),
-        dbname=os.getenv("DB_NAME"),
-    )
-
-
-def get_pg_cron_connection():
-    """Get pg_cron database connection using environment variables."""
-    return psycopg.connect(
-        host=os.getenv("PG_CRON_HOST", os.getenv("DB_HOST")),
-        port=int(os.getenv("PG_CRON_PORT", os.getenv("DB_PORT", "5432"))),
-        user=os.getenv("PG_CRON_USER", os.getenv("DB_USER")),
-        password=os.getenv("PG_CRON_PASSWORD", os.getenv("DB_PASSWORD")),
-        dbname=os.getenv("PG_CRON_DATABASE", "postgres"),
-    )
 
 
 def check_pg_cron_installed() -> bool:
@@ -306,6 +304,22 @@ def setup_cron_database_objects(cron_conn):
     cron_conn.commit()
     logger.info("Cron database objects created successfully")
 
+    # Optional: install cron maintenance helpers to keep cron.job_run_details bounded.
+    if SQL_CRON_MAINTENANCE_FILE.exists():
+        try:
+            sql_maintenance_content = SQL_CRON_MAINTENANCE_FILE.read_text()
+            with cron_conn.cursor() as cur:
+                cur.execute(sql_maintenance_content)
+                cur.execute(
+                    "SELECT partitioncache_schedule_cron_run_details_cleanup(%s, %s, %s)",
+                    [get_cron_database_name(), 30, "0 3 * * *"],
+                )
+            cron_conn.commit()
+            logger.info("Scheduled pg_cron run-details cleanup (daily, 30d retention)")
+        except Exception as e:
+            cron_conn.rollback()
+            logger.warning(f"Could not configure pg_cron run-details cleanup: {e}")
+
 
 def setup_cache_database_objects(cache_conn):
     """Set up cache database components (worker functions and processing logic)."""
@@ -395,24 +409,55 @@ def insert_initial_config(
     timeout: int,
     target_database: str,
     default_bitsize: int | None,
+    job_owner: str | None = None,
 ):
     """Insert the initial configuration row in cron database which will trigger the cron job creation."""
     logger.info(f"Inserting initial config for job '{job_name}' in cron database")
     config_table = f"{queue_prefix}_processor_config"
 
     with cron_conn.cursor() as cur:
-        # This will either insert a new config or do nothing if it already exists.
-        # The trigger will handle creating/updating the cron.job.
-        cur.execute(
-            sql.SQL(
-                """
-                INSERT INTO {} (job_name, table_prefix, queue_prefix, cache_backend, frequency_seconds, enabled, timeout_seconds, target_database, default_bitsize)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (job_name) DO NOTHING
-                """
-            ).format(sql.Identifier(config_table)),
-            (job_name, table_prefix, queue_prefix, cache_backend, frequency, enabled, timeout, target_database, default_bitsize),
-        )
+        # Insert or update config — the trigger will handle creating/updating the cron.job.
+        if job_owner:
+            cur.execute(
+                sql.SQL(
+                    """
+                    INSERT INTO {} (job_name, table_prefix, queue_prefix, cache_backend, frequency_seconds, enabled, timeout_seconds, target_database, default_bitsize, job_owner)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (job_name) DO UPDATE SET
+                        table_prefix = EXCLUDED.table_prefix,
+                        queue_prefix = EXCLUDED.queue_prefix,
+                        cache_backend = EXCLUDED.cache_backend,
+                        frequency_seconds = EXCLUDED.frequency_seconds,
+                        enabled = EXCLUDED.enabled,
+                        timeout_seconds = EXCLUDED.timeout_seconds,
+                        target_database = EXCLUDED.target_database,
+                        default_bitsize = EXCLUDED.default_bitsize,
+                        job_owner = EXCLUDED.job_owner,
+                        updated_at = CURRENT_TIMESTAMP
+                    """
+                ).format(sql.Identifier(config_table)),
+                (job_name, table_prefix, queue_prefix, cache_backend, frequency, enabled, timeout, target_database, default_bitsize, job_owner),
+            )
+        else:
+            cur.execute(
+                sql.SQL(
+                    """
+                    INSERT INTO {} (job_name, table_prefix, queue_prefix, cache_backend, frequency_seconds, enabled, timeout_seconds, target_database, default_bitsize)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (job_name) DO UPDATE SET
+                        table_prefix = EXCLUDED.table_prefix,
+                        queue_prefix = EXCLUDED.queue_prefix,
+                        cache_backend = EXCLUDED.cache_backend,
+                        frequency_seconds = EXCLUDED.frequency_seconds,
+                        enabled = EXCLUDED.enabled,
+                        timeout_seconds = EXCLUDED.timeout_seconds,
+                        target_database = EXCLUDED.target_database,
+                        default_bitsize = EXCLUDED.default_bitsize,
+                        updated_at = CURRENT_TIMESTAMP
+                    """
+                ).format(sql.Identifier(config_table)),
+                (job_name, table_prefix, queue_prefix, cache_backend, frequency, enabled, timeout, target_database, default_bitsize),
+            )
     cron_conn.commit()
     logger.info("Initial configuration inserted successfully in cron database. Cron job should be synced.")
 
@@ -530,26 +575,51 @@ def remove_all_processor_objects(conn, queue_prefix: str):
             cron_conn.close()
 
     with conn.cursor() as cur:
-        # Dynamically drop all functions beginning with 'partitioncache_'
-        logger.info("Dropping all functions with prefix 'partitioncache_' …")
+        # Drop only processor-specific functions (not eviction or other modules)
+        logger.info("Dropping processor-specific functions …")
         cur.execute(
             """
             DO $$
             DECLARE
                 rec RECORD;
+                processor_funcs TEXT[] := ARRAY[
+                    'partitioncache_initialize_cron_config_table',
+                    'partitioncache_schedule_processor_log_cleanup',
+                    'partitioncache_unschedule_processor_log_cleanup',
+                    'partitioncache_sync_cron_job',
+                    'partitioncache_create_cron_config_trigger',
+                    'partitioncache_construct_job_name',
+                    'partitioncache_set_processor_enabled_cron',
+                    'partitioncache_update_processor_config_cron',
+                    'partitioncache_get_processor_status_cron',
+                    'partitioncache_resolve_job_name',
+                    'partitioncache_initialize_cache_processor_tables',
+                    'partitioncache_run_single_job_with_params',
+                    '_partitioncache_execute_job',
+                    'partitioncache_manual_process_queue',
+                    'partitioncache_cleanup_cached_queue_items',
+                    'partitioncache_cleanup_processor_logs',
+                    'partitioncache_get_queue_and_cache_info',
+                    'partitioncache_get_active_jobs_info',
+                    'partitioncache_get_log_info',
+                    'partitioncache_cleanup_cron_run_details',
+                    'partitioncache_schedule_cron_run_details_cleanup',
+                    'partitioncache_get_processor_status',
+                    'partitioncache_get_processor_status_detailed'
+                ];
             BEGIN
                 FOR rec IN
                     SELECT p.oid::regprocedure AS func_ident
                     FROM pg_proc p
                     JOIN pg_namespace n ON n.oid = p.pronamespace
-                    WHERE n.nspname = 'public' AND p.proname LIKE 'partitioncache_%'
+                    WHERE n.nspname = 'public' AND p.proname = ANY(processor_funcs)
                 LOOP
                     EXECUTE format('DROP FUNCTION IF EXISTS %s CASCADE', rec.func_ident);
                 END LOOP;
             END;$$;
             """
         )
-        logger.info("All PartitionCache functions dropped.")
+        logger.info("Processor-specific functions dropped.")
 
     conn.commit()
     logger.info("All processor objects and functions removed.")
@@ -611,7 +681,7 @@ def update_processor_config(
     logger.info("Processor configuration updated successfully.")
 
 
-def handle_setup(table_prefix: str, queue_prefix: str, cache_backend: str, frequency: int, enabled: bool, timeout: int, default_bitsize: int | None):
+def handle_setup(table_prefix: str, queue_prefix: str, cache_backend: str, frequency: int, enabled: bool, timeout: int, default_bitsize: int | None, job_owner: str | None = None, create_role: bool = False):
     """Handle the main setup logic."""
     logger.info("Starting PostgreSQL queue processor cross-database setup...")
 
@@ -619,6 +689,16 @@ def handle_setup(table_prefix: str, queue_prefix: str, cache_backend: str, frequ
     cache_conn = get_db_connection()
     cron_conn = get_pg_cron_connection()
     target_database = get_cache_database_name()
+
+    # Handle job_owner role creation if requested
+    if job_owner:
+        actual_cron_conn_for_role = cache_conn if get_cron_database_name() == get_cache_database_name() else cron_conn
+        ok, msg = ensure_role_exists(actual_cron_conn_for_role, job_owner, create_if_missing=create_role)
+        if ok:
+            logger.info(msg)
+        else:
+            logger.warning(f"{msg} — falling back to current_user")
+            job_owner = None
 
     # Check if pg_cron is available (but don't require it)
     pg_cron_available = check_pg_cron_installed()
@@ -656,7 +736,21 @@ def handle_setup(table_prefix: str, queue_prefix: str, cache_backend: str, frequ
 
     # Insert configuration in cron database for pg_cron job management
     actual_cron_conn = cache_conn if get_cron_database_name() == get_cache_database_name() else cron_conn
-    insert_initial_config(actual_cron_conn, job_name, table_prefix, queue_prefix, cache_backend, frequency, enabled, timeout, target_database, default_bitsize)
+    insert_initial_config(actual_cron_conn, job_name, table_prefix, queue_prefix, cache_backend, frequency, enabled, timeout, target_database, default_bitsize, job_owner=job_owner)
+
+    # Optional: schedule processor log cleanup if helper functions are available.
+    if pg_cron_available:
+        try:
+            with actual_cron_conn.cursor() as cur:
+                cur.execute(
+                    "SELECT partitioncache_schedule_processor_log_cleanup(%s, %s, %s, %s)",
+                    [queue_prefix, target_database, 30, "0 3 * * *"],
+                )
+            actual_cron_conn.commit()
+            logger.info("Scheduled processor log cleanup (daily, 30d retention)")
+        except Exception as e:
+            actual_cron_conn.rollback()
+            logger.warning(f"Could not schedule processor log cleanup: {e}")
 
     # Also create minimal config in cache database for manual commands (without triggers)
     if get_cron_database_name() != get_cache_database_name():
@@ -693,8 +787,9 @@ def get_processor_status(queue_prefix: str):
 
 
 def get_processor_status_detailed(table_prefix: str, queue_prefix: str):
-    """Get detailed processor status from cron database."""
+    """Get detailed processor status by combining cron and cache database views."""
     logger.info("Fetching detailed processor status...")
+    status_dict: dict | None = None
     conn = get_pg_cron_connection()
     target_database = get_cache_database_name()
     try:
@@ -703,10 +798,104 @@ def get_processor_status_detailed(table_prefix: str, queue_prefix: str):
             status = cur.fetchone()
             if status:
                 columns = [desc[0] for desc in cur.description]  # type: ignore[attr-defined]
-                return dict(zip(columns, status, strict=False))
+                status_dict = dict(zip(columns, status, strict=False))
     finally:
         conn.close()
-    return None
+
+    # Fallback to basic status if detailed SQL status is unavailable.
+    if not status_dict:
+        status_dict = get_processor_status(queue_prefix)
+        if not status_dict:
+            return None
+
+    live_metrics = _fetch_processor_live_metrics(queue_prefix)
+    status_dict.update(live_metrics)
+    return status_dict
+
+
+def _fetch_processor_live_metrics(queue_prefix: str) -> dict:
+    """Fetch queue length, recent logs, and active jobs from the cache database."""
+    metrics = {
+        "active_jobs_count": 0,
+        "queue_length": 0,
+        "recent_successes_5m": 0,
+        "recent_failures_5m": 0,
+        "recent_logs": [],
+        "active_job_details": [],
+    }
+    queue_table = f"{queue_prefix}_query_fragment_queue"
+    log_table = f"{queue_prefix}_processor_log"
+    active_jobs_table = f"{queue_prefix}_active_jobs"
+
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            try:
+                cur.execute(sql.SQL("SELECT COUNT(*) FROM {}").format(sql.Identifier(queue_table)))
+                queue_count = cur.fetchone()
+                metrics["queue_length"] = int(queue_count[0]) if queue_count else 0
+            except psycopg.errors.UndefinedTable:
+                conn.rollback()
+
+            try:
+                cur.execute(
+                    sql.SQL("SELECT COUNT(*) FROM {} WHERE status = %s AND created_at > NOW() - INTERVAL '5 minutes'").format(
+                        sql.Identifier(log_table)
+                    ),
+                    ["success"],
+                )
+                success_count = cur.fetchone()
+                metrics["recent_successes_5m"] = int(success_count[0]) if success_count else 0
+
+                cur.execute(
+                    sql.SQL("SELECT COUNT(*) FROM {} WHERE status = %s AND created_at > NOW() - INTERVAL '5 minutes'").format(
+                        sql.Identifier(log_table)
+                    ),
+                    ["failed"],
+                )
+                failure_count = cur.fetchone()
+                metrics["recent_failures_5m"] = int(failure_count[0]) if failure_count else 0
+
+                cur.execute(
+                    sql.SQL(
+                        "SELECT job_id, query_hash, partition_key, status, error_message, execution_time_ms, execution_source, created_at "
+                        "FROM {} ORDER BY created_at DESC LIMIT 10"
+                    ).format(sql.Identifier(log_table))
+                )
+                rows = cur.fetchall()
+                metrics["recent_logs"] = [
+                    {
+                        "job_id": row[0],
+                        "query_hash": row[1],
+                        "partition_key": row[2],
+                        "status": row[3],
+                        "error_message": row[4],
+                        "execution_time_ms": row[5],
+                        "execution_source": row[6],
+                        "created_at": row[7],
+                    }
+                    for row in rows
+                ]
+            except psycopg.errors.UndefinedTable:
+                conn.rollback()
+
+            try:
+                cur.execute(
+                    sql.SQL("SELECT job_id, query_hash, partition_key, started_at FROM {} ORDER BY started_at DESC").format(
+                        sql.Identifier(active_jobs_table)
+                    )
+                )
+                rows = cur.fetchall()
+                metrics["active_job_details"] = [
+                    {"job_id": row[0], "query_hash": row[1], "partition_key": row[2], "started_at": row[3]} for row in rows
+                ]
+                metrics["active_jobs_count"] = len(rows)
+            except psycopg.errors.UndefinedTable:
+                conn.rollback()
+    finally:
+        conn.close()
+
+    return metrics
 
 
 def get_queue_and_cache_info(table_prefix: str, queue_prefix: str):
@@ -875,6 +1064,125 @@ def manual_process_queue(conn, count: int):
     conn.commit()
 
 
+def verify_processor_setup(table_prefix: str, queue_prefix: str) -> int:
+    """Verify processor installation across cache and cron databases."""
+    target_database = get_cache_database_name()
+    job_name = construct_processor_job_name(target_database, table_prefix)
+    required_ok = True
+    warnings = 0
+
+    print("Verifying PostgreSQL queue processor setup...")
+    print(f"  Target DB: {target_database}")
+    print(f"  Job Name:  {job_name}")
+
+    cache_conn = get_db_connection()
+    try:
+        print("\n[Cache Database Checks]")
+        required_tables = [
+            f"{queue_prefix}_query_fragment_queue",
+            f"{queue_prefix}_processor_log",
+            f"{queue_prefix}_active_jobs",
+        ]
+        for table_name in required_tables:
+            exists = table_exists(cache_conn, table_name)
+            print(f"  {'[OK]' if exists else '[ERR]'} table {table_name}")
+            required_ok = required_ok and exists
+
+        required_functions = [
+            "partitioncache_initialize_cache_processor_tables",
+            "partitioncache_run_single_job_with_params",
+            "partitioncache_manual_process_queue",
+        ]
+        optional_functions = [
+            "partitioncache_cleanup_processor_logs",
+            "partitioncache_get_log_info",
+            "partitioncache_get_active_jobs_info",
+        ]
+        for function_name in required_functions:
+            exists = function_exists(cache_conn, function_name)
+            print(f"  {'[OK]' if exists else '[ERR]'} function {function_name}")
+            required_ok = required_ok and exists
+
+        for function_name in optional_functions:
+            exists = function_exists(cache_conn, function_name)
+            if exists:
+                print(f"  [OK] function {function_name}")
+            else:
+                print(f"  [WARN] function {function_name} not installed")
+                warnings += 1
+    finally:
+        cache_conn.close()
+
+    cron_conn = get_pg_cron_connection()
+    try:
+        print("\n[Cron Database Checks]")
+        config_table = f"{queue_prefix}_processor_config"
+        config_exists = table_exists(cron_conn, config_table)
+        print(f"  {'[OK]' if config_exists else '[ERR]'} table {config_table}")
+        required_ok = required_ok and config_exists
+
+        if config_exists:
+            with cron_conn.cursor() as cur:
+                cur.execute(sql.SQL("SELECT enabled FROM {} WHERE job_name = %s").format(sql.Identifier(config_table)), [job_name])
+                row = cur.fetchone()
+                if row is None:
+                    print(f"  [ERR] config row for job '{job_name}' not found")
+                    required_ok = False
+                else:
+                    print(f"  [OK] config row exists (enabled={row[0]})")
+
+        pg_cron_installed = False
+        try:
+            with cron_conn.cursor() as cur:
+                cur.execute("SELECT 1 FROM pg_extension WHERE extname = 'pg_cron'")
+                pg_cron_installed = cur.fetchone() is not None
+        except Exception:
+            pg_cron_installed = False
+
+        if pg_cron_installed:
+            print("  [OK] pg_cron extension installed")
+            try:
+                with cron_conn.cursor() as cur:
+                    cur.execute("SELECT COUNT(*) FROM cron.job WHERE jobname LIKE %s", [f"{job_name}_%"])
+                    count_row = cur.fetchone()
+                    count = int(count_row[0]) if count_row else 0
+                    if count > 0:
+                        print(f"  [OK] scheduled cron jobs found: {count}")
+                    else:
+                        print("  [WARN] no scheduled cron jobs found (may be disabled or not yet enabled)")
+                        warnings += 1
+            except Exception as e:
+                print(f"  [WARN] unable to inspect cron.job entries: {e}")
+                warnings += 1
+        else:
+            print("  [WARN] pg_cron extension not installed (manual processing mode)")
+            warnings += 1
+
+        for function_name in [
+            "partitioncache_cleanup_cron_run_details",
+            "partitioncache_schedule_cron_run_details_cleanup",
+            "partitioncache_schedule_processor_log_cleanup",
+        ]:
+            exists = function_exists(cron_conn, function_name)
+            if exists:
+                print(f"  [OK] function {function_name}")
+            else:
+                print(f"  [WARN] function {function_name} not installed")
+                warnings += 1
+    finally:
+        cron_conn.close()
+
+    print("\n[Summary]")
+    if required_ok:
+        print("  [OK] required checks passed")
+        if warnings:
+            print(f"  [WARN] optional warnings: {warnings}")
+        return 0
+
+    print("  [ERR] required checks failed")
+    return 1
+
+
 def main():
     """Main function to handle CLI commands."""
     # Create main parser
@@ -894,8 +1202,18 @@ def main():
 
     # setup command
     setup_parser = subparsers.add_parser("setup", help="Setup database objects and pg_cron job")
-    setup_parser.add_argument("--frequency", type=int, default=1, help="Frequency in seconds to run the processor job (default: 1)")
-    setup_parser.add_argument("--timeout", type=int, default=1800, help="Timeout in seconds for processing jobs (default: 1800 = 30 minutes)")
+    setup_parser.add_argument(
+        "--frequency",
+        type=_parse_frequency_seconds_arg,
+        default=1,
+        help="Frequency to run the processor job (seconds or 30s/5m/2h/1d, default: 1)",
+    )
+    setup_parser.add_argument(
+        "--timeout",
+        type=_parse_timeout_seconds_arg,
+        default=1800,
+        help="Processing timeout (seconds or 30s/5m/2h/1d, default: 1800)",
+    )
     setup_parser.add_argument(
         "--enable-after-setup",
         action="store_true",
@@ -903,6 +1221,8 @@ def main():
     )
     setup_parser.add_argument("--table-prefix", default=None, help="Table prefix for cache tables (default: based on env vars)")
     setup_parser.add_argument("--bitsize", type=int, help="Global default bitsize for postgresql_bit backend (optional)")
+    setup_parser.add_argument("--job-owner", type=str, default=os.getenv("PARTITIONCACHE_JOB_OWNER"), help="PostgreSQL role to own the pg_cron job (default: current_user)")
+    setup_parser.add_argument("--create-role", action="store_true", help="Create the --job-owner role if it does not exist")
     setup_parser.set_defaults(
         func=lambda args: handle_setup(
             args.table_prefix or get_table_prefix_from_env(),
@@ -912,6 +1232,8 @@ def main():
             args.enable_after_setup,
             args.timeout,
             args.bitsize,
+            job_owner=args.job_owner,
+            create_role=args.create_role,
         )
     )
 
@@ -931,8 +1253,8 @@ def main():
     parser_update = subparsers.add_parser("update-config", help="Update processor configuration")
     parser_update.add_argument("--enable", action=argparse.BooleanOptionalAction, help="Enable or disable the processor")
     parser_update.add_argument("--max-parallel-jobs", type=int, help="New max parallel jobs limit")
-    parser_update.add_argument("--frequency", type=int, help="New frequency in seconds for the processor job")
-    parser_update.add_argument("--timeout", type=int, help="New timeout in seconds for processing jobs")
+    parser_update.add_argument("--frequency", type=_parse_frequency_seconds_arg, help="New frequency (seconds or 30s/5m/2h/1d)")
+    parser_update.add_argument("--timeout", type=_parse_timeout_seconds_arg, help="New timeout (seconds or 30s/5m/2h/1d)")
     parser_update.add_argument("--table-prefix", type=str, help="New table prefix for the cache tables")
     parser_update.add_argument("--result-limit", type=int, help="New result limit for queries (NULL to disable)")
     parser_update.set_defaults(
@@ -1015,6 +1337,16 @@ def main():
         )
     )
 
+    # verify command
+    parser_verify = subparsers.add_parser("verify", help="Verify processor setup, tables, functions, and cron wiring")
+    parser_verify.add_argument("--table-prefix", default=None, help="Table prefix for cache tables (default: based on env vars)")
+    parser_verify.set_defaults(
+        func=lambda args: verify_processor_setup(
+            args.table_prefix or get_table_prefix_from_env(),
+            get_queue_table_prefix_from_env(),
+        )
+    )
+
     try:
         # Parse all arguments and execute the corresponding function
         args = parser.parse_args()
@@ -1032,7 +1364,9 @@ def main():
             if not is_valid:
                 logger.error(f"Environment validation failed: {message}")
                 sys.exit(1)
-            args.func(args)
+            result = args.func(args)
+            if isinstance(result, int):
+                sys.exit(result)
         else:
             parser.print_help()
     except Exception as e:
