@@ -236,7 +236,7 @@ class EnvironmentConfigManager:
         Get RocksDB configuration from environment variables.
 
         Args:
-            cache_type: Type of RocksDB cache ("set", "bit", or "dict")
+            cache_type: Type of RocksDB cache ("set", "bit", "dict", or "roaringbit")
 
         Returns:
             Dictionary with RocksDB configuration parameters
@@ -273,9 +273,10 @@ class EnvironmentConfigManager:
             config["db_path"] = db_path
 
         elif cache_type == "roaringbit":
-            db_path = os.getenv("ROCKSDICT_ROARINGBIT_PATH")
+            # Keep compatibility with existing ROCKSDB_* naming while allowing a dedicated roaringbit path.
+            db_path = os.getenv("ROCKSDICT_ROARINGBIT_PATH") or os.getenv("ROCKSDB_DICT_PATH")
             if not db_path:
-                raise ValueError("ROCKSDICT_ROARINGBIT_PATH environment variable not set")
+                raise ValueError("ROCKSDICT_ROARINGBIT_PATH or ROCKSDB_DICT_PATH environment variable not set")
             config["db_path"] = db_path
 
         else:

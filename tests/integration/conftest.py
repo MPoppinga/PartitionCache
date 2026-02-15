@@ -638,8 +638,8 @@ def cache_client(request, db_session):
                     shutil.rmtree(os.environ["ROCKSDB_PATH"], ignore_errors=True)
                 elif cache_backend == "rocksdb_bit" and "ROCKSDB_BIT_PATH" in os.environ:
                     shutil.rmtree(os.environ["ROCKSDB_BIT_PATH"], ignore_errors=True)
-                elif cache_backend == "rocksdict" and hasattr(cache_handler, "db") and hasattr(cache_handler.db, "name"):
-                    # For rocksdict, clean up the temp directory created for testing
+                elif cache_backend in ["rocksdict", "rocksdict_roaringbit"] and hasattr(cache_handler, "db") and hasattr(cache_handler.db, "name"):
+                    # For RocksDict backends, clean up the temp directory created for testing.
                     db_path = getattr(cache_handler.db, "name", None)
                     if db_path and os.path.exists(os.path.dirname(db_path)):
                         shutil.rmtree(os.path.dirname(db_path), ignore_errors=True)
