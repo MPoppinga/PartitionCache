@@ -976,7 +976,7 @@ def clear_query_fragment_queue():
         logger.error(f"Error clearing {provider} query fragment queue: {e}")
 
 
-def delete_partition(cache_type: str, partition_key: str):
+def delete_partition(cache_type: str, partition_key: str) -> bool:
     """Delete a specific partition and all its data."""
     try:
         cache = get_cache_handler(cache_type)
@@ -987,14 +987,19 @@ def delete_partition(cache_type: str, partition_key: str):
                 logger.info(f"Successfully deleted partition '{partition_key}' from {cache_type} cache")
             else:
                 logger.error(f"Failed to delete partition '{partition_key}' from {cache_type} cache")
+            cache.close()
+            return bool(success)
         else:
             logger.error(f"Cache handler {cache_type} does not support partition deletion")
+            cache.close()
+            return False
 
-        cache.close()
     except ValueError as e:
         logger.error(f"Cache configuration error for {cache_type}: {e}")
+        return False
     except Exception as e:
         logger.error(f"Error deleting partition {partition_key} from {cache_type}: {e}")
+        return False
 
 
 def prune_old_queries(cache_type: str, days_old: int):
@@ -1739,7 +1744,9 @@ valid environment variables. Use --env to load configuration from a custom file.
             elif args.maintenance_command == "partition":
                 cache_type = args.cache_type or get_cache_type_from_env()
                 if args.partition_key:
-                    delete_partition(cache_type, args.partition_key)
+                    success = delete_partition(cache_type, args.partition_key)
+                    if not success:
+                        sys.exit(1)
                 else:
                     partition_parser.print_help()
 

@@ -309,9 +309,10 @@ class TestManualProcessingCacheBackend:
         assert success, "Failed to push fragment with cache_backend"
 
         # Verify the cache_backend column is in the queue table
+        fragment_queue_table = f"{manual_queue_processor['queue_prefix']}_fragmentqueue"
         with db_session.cursor() as cur:
-            cur.execute("""
-                SELECT cache_backend FROM query_fragment_queue
+            cur.execute(f"""
+                SELECT cache_backend FROM {fragment_queue_table}
                 WHERE hash = 'coalesce_test_hash' AND partition_key = 'zipcode'
             """)
             row = cur.fetchone()

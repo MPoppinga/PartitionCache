@@ -402,6 +402,8 @@ class TestPartitionDeletion:
 
         assert result.returncode == 0, f"CLI partition delete failed: {result.stderr}"
         # Verify partition was actually deleted
+        # CLI runs in a subprocess, so invalidate local in-memory datatype cache first.
+        maintenance_cache._cached_datatype.pop("zipcode", None)
         assert maintenance_cache._get_partition_datatype("zipcode") is None, "Partition should be deleted after CLI operation"
 
 

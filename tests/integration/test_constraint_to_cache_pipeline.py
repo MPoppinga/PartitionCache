@@ -239,7 +239,9 @@ class TestPipelineWithAddConstraints:
         # the constraint-modified hashes in cache, so cache_hits may be 0 here.
         # We verify the function completes correctly and returns expected stats keys.
         assert "cache_hits" in stats, "Stats should contain cache_hits key"
-        assert "cache_misses" in stats, "Stats should contain cache_misses key"
+        assert "generated_variants" in stats, "Stats should contain generated_variants key"
+        assert "enhanced" in stats, "Stats should contain enhanced key"
+        assert "p0_rewritten" in stats, "Stats should contain p0_rewritten key"
 
 
 class TestPipelineWithRemoveConstraints:
@@ -366,9 +368,9 @@ class TestPipelineWithCombinedModifications:
         )
 
         if stats["cache_hits"] > 1:
-            # If multiple hits, intersection should narrow the results
-            assert "result_count" in stats, "Stats should include result_count when cache hits exist"
-            assert stats["result_count"] <= 3, "Intersection should narrow result set"
+            # If multiple hits, query should be enhanced with cache filtering.
+            assert stats["enhanced"] == 1, "Expected query enhancement when multiple cache hits exist"
+            assert modified_query != query, "Expected modified query when cache enhancement is applied"
 
 
 class TestPipelineApplyCacheMethods:
