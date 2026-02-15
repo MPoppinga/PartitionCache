@@ -309,7 +309,7 @@ class TestManualProcessingCacheBackend:
         assert success, "Failed to push fragment with cache_backend"
 
         # Verify the cache_backend column is in the queue table
-        fragment_queue_table = f"{manual_queue_processor['queue_prefix']}_fragmentqueue"
+        fragment_queue_table = f"{manual_queue_processor['queue_prefix']}_query_fragment_queue"
         with db_session.cursor() as cur:
             cur.execute(f"""
                 SELECT cache_backend FROM {fragment_queue_table}
