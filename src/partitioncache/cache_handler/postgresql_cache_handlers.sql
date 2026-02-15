@@ -168,13 +168,46 @@ BEGIN
                 partition_keys roaringbitmap,
                 partition_keys_count INTEGER GENERATED ALWAYS AS (rb_cardinality(partition_keys)) STORED
             )', v_cache_table);
+    ELSIF p_cache_backend = 'h3' THEN
+        -- For H3 spatial cache (stores BIGINT[] arrays of H3 cell indices)
+        EXECUTE format(
+            'INSERT INTO %I (partition_key, datatype) VALUES (%L, %L) ON CONFLICT(partition_key) DO NOTHING',
+            v_metadata_table, p_partition_key, p_datatype
+        );
+
+        EXECUTE format('
+            CREATE TABLE IF NOT EXISTS %I (
+                query_hash TEXT PRIMARY KEY,
+                partition_keys BIGINT[],
+                partition_keys_count INTEGER
+            )', v_cache_table);
+
+    ELSIF p_cache_backend = 'bbox' THEN
+        -- For BBox spatial cache (stores PostGIS geometry - MultiPolygon of grid cells)
+        EXECUTE format(
+            'INSERT INTO %I (partition_key, datatype) VALUES (%L, %L) ON CONFLICT(partition_key) DO NOTHING',
+            v_metadata_table, p_partition_key, p_datatype
+        );
+
+        EXECUTE format('
+            CREATE TABLE IF NOT EXISTS %I (
+                query_hash TEXT PRIMARY KEY,
+                partition_keys geometry,
+                partition_keys_count INTEGER
+            )', v_cache_table);
+
+        -- Create GiST spatial index for bounding box intersection queries
+        v_index_name := 'idx_' || replace(v_cache_table, '.', '_') || '_gist';
+        EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I USING GIST (partition_keys)',
+                      v_index_name, v_cache_table);
+
     ELSE -- 'array'
         -- For array cache
         EXECUTE format(
             'INSERT INTO %I (partition_key, datatype) VALUES (%L, %L) ON CONFLICT(partition_key) DO NOTHING',
             v_metadata_table, p_partition_key, p_datatype
         );
-        
+
         -- Create array cache table with proper datatype
         EXECUTE format('
             CREATE TABLE IF NOT EXISTS %I (
@@ -186,30 +219,30 @@ BEGIN
                         ELSE cardinality(partition_keys)
                     END
                 ) STORED
-            )', v_cache_table, 
-            CASE p_datatype 
+            )', v_cache_table,
+            CASE p_datatype
                 WHEN 'integer' THEN 'INTEGER'
                 WHEN 'float' THEN 'NUMERIC'
                 WHEN 'text' THEN 'TEXT'
                 WHEN 'timestamp' THEN 'TIMESTAMP'
                 ELSE 'TEXT'
             END);
-        
+
         -- Create optimized indexes for array cache
         v_index_name := 'idx_' || replace(v_cache_table, '.', '_') || '_partition_keys';
         IF p_datatype = 'integer' THEN
             -- Try intarray-specific GIN index for integers first
             BEGIN
-                EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I USING GIN (partition_keys gin__int_ops)', 
+                EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I USING GIN (partition_keys gin__int_ops)',
                               v_index_name, v_cache_table);
             EXCEPTION WHEN OTHERS THEN
                 -- Fallback to standard GIN index if intarray extension not available
-                EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I USING GIN (partition_keys)', 
+                EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I USING GIN (partition_keys)',
                               v_index_name, v_cache_table);
             END;
         ELSE
             -- Use standard GIN index for other types
-            EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I USING GIN (partition_keys)', 
+            EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I USING GIN (partition_keys)',
                           v_index_name, v_cache_table);
         END IF;
     END IF;

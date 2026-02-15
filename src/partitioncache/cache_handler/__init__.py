@@ -99,5 +99,21 @@ def get_cache_handler(cache_type: str, singleton: bool = False) -> AbstractCache
             return DuckDBBitCacheHandler.get_instance(**config)  # type: ignore[no-any-return]
         else:
             return DuckDBBitCacheHandler(**config)  # type: ignore[no-any-return]
+    elif cache_type == "postgis_h3":
+        from partitioncache.cache_handler.postgis_h3 import PostGISH3CacheHandler
+
+        config = EnvironmentConfigManager.get_postgis_h3_config()
+        if singleton:
+            return PostGISH3CacheHandler.get_instance(**config)  # type: ignore[no-any-return]
+        else:
+            return PostGISH3CacheHandler(**config)  # type: ignore[no-any-return]
+    elif cache_type == "postgis_bbox":
+        from partitioncache.cache_handler.postgis_bbox import PostGISBBoxCacheHandler
+
+        config = EnvironmentConfigManager.get_postgis_bbox_config()
+        if singleton:
+            return PostGISBBoxCacheHandler.get_instance(**config)  # type: ignore[no-any-return]
+        else:
+            return PostGISBBoxCacheHandler(**config)  # type: ignore[no-any-return]
     else:
         raise ValueError(f"Unsupported cache type: {cache_type}")

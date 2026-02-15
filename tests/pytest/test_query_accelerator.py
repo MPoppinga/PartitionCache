@@ -141,7 +141,7 @@ class TestDuckDBQueryAccelerator:
                 result.fetchone.return_value = None
             execute_results.append(query)
             return result
-        
+
         mock_duckdb_conn.execute.side_effect = mock_execute
 
         # Test table preloading

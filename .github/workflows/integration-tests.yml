@@ -136,6 +136,14 @@ jobs:
             parallel: false
             requires_redis: false
             job_index: 5
+          - name: "Spatial Cache"
+            pattern: "spatial"
+            suffix: "spatial"
+            backend_type: "postgresql_array"
+            database_suffix: "spatial"
+            parallel: false
+            requires_redis: false
+            job_index: 6
 
     services:
       postgres:
@@ -204,6 +212,12 @@ jobs:
       PG_BIT_CACHE_TABLE_PREFIX: ci_bit_${{ matrix.database_suffix }}
       PG_BIT_CACHE_BITSIZE: 300000
       PG_ROARINGBIT_CACHE_TABLE_PREFIX: ci_roaring_${{ matrix.database_suffix }}
+
+      # PostGIS spatial cache configuration (used by spatial test job)
+      PG_H3_SRID: 25832
+      PG_BBOX_SRID: 25832
+      PG_H3_CACHE_TABLE_PREFIX: ci_h3_${{ matrix.database_suffix }}
+      PG_BBOX_CACHE_TABLE_PREFIX: ci_bbox_${{ matrix.database_suffix }}
       
       # Queue configuration with backend-specific prefixes
       PG_QUEUE_TABLE_PREFIX: ci_queue_${{ matrix.database_suffix }}
@@ -289,7 +303,33 @@ jobs:
                     print('pg_cron extension verified (cron-enabled database)')
                 else:
                     print('pg_cron extension not found (expected for regular test databases)')
-                
+
+                # Check for PostGIS extension
+                cur.execute('SELECT extname, extversion FROM pg_extension WHERE extname = %s', ('postgis',))
+                row = cur.fetchone()
+                if row:
+                    print(f'PostGIS extension verified (version {row[1]})')
+                else:
+                    print('PostGIS extension not found (spatial tests will skip)')
+
+                # Check for h3 extension
+                cur.execute('SELECT extname, extversion FROM pg_extension WHERE extname = %s', ('h3',))
+                row = cur.fetchone()
+                if row:
+                    print(f'h3 extension verified (version {row[1]})')
+                else:
+                    print('h3 extension not found (H3 spatial tests will skip)')
+
+                # Check for pois table
+                cur.execute(\"\"\"SELECT count(*) FROM information_schema.tables WHERE table_name = 'pois'\"\"\")
+                row = cur.fetchone()
+                if row and row[0] > 0:
+                    cur.execute('SELECT count(*) FROM pois')
+                    count = cur.fetchone()
+                    print(f'pois table verified ({count[0]} rows)')
+                else:
+                    print('pois table not found (spatial tests will skip)')
+
                 print(f'Database {db_name} extension verification completed')
         "
 

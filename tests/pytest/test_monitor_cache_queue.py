@@ -129,6 +129,8 @@ class TestQueryFragmentProcessor:
             add_constraints=None,
             remove_constraints_all=None,
             remove_constraints_add=None,
+            skip_partition_key_joins=False,
+            geometry_column=None,
         )
         mock_push_fragments.assert_called_once_with([("SELECT DISTINCT t1.partition_key FROM test_table t1", "hash1")], "test_partition_key", "integer")
 
@@ -621,6 +623,8 @@ class TestIntegration:
             add_constraints=None,
             remove_constraints_all=None,
             remove_constraints_add=None,
+            skip_partition_key_joins=False,
+            geometry_column=None,
         )
         mock_push_to_outgoing.assert_called_once_with(
             [("SELECT DISTINCT t1.partition_key FROM test_table t1 WHERE t1.id = 1", "hash1")], "test_partition_key", "integer"

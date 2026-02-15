@@ -5,26 +5,31 @@ PartitionCache now supports multiple datatypes for partition keys, allowing you 
 ## Supported Datatypes
 
 - **integer**: Standard integer values (Python `int`)
-- **float**: Floating-point numbers (Python `float`) 
+- **float**: Floating-point numbers (Python `float`)
 - **text**: String values (Python `str`)
 - **timestamp**: Date and time values (Python `datetime`)
+- **geometry**: Spatial geometry values (PostGIS geometry/WKB bytes) — used by spatial cache handlers
 
 ## Cache Handler Compatibility
 
 Different cache handlers support different datatypes:
 
-| Cache Handler | integer | float | text | timestamp |
-|---------------|---------|-------|------|-----------|
-| postgresql_array | ✓ | ✓ | ✓ | ✓ |
-| postgresql_bit | ✓ | ✗ | ✗ | ✗ |
-| postgresql_roaringbit | ✓ | ✗ | ✗ | ✗ |
-| redis_set | ✓ | ✗ | ✓ | ✗ |
-| redis_bit | ✓ | ✗ | ✗ | ✗ |
-| rocksdb_set | ✓ | ✗ | ✓ | ✗ |
-| rocksdb_bit | ✓ | ✗ | ✗ | ✗ |
-| rocksdict | ✓ | ✓ | ✓ | ✓ |
+| Cache Handler | integer | float | text | timestamp | geometry |
+|---------------|---------|-------|------|-----------|----------|
+| postgresql_array | ✓ | ✓ | ✓ | ✓ | ✗ |
+| postgresql_bit | ✓ | ✗ | ✗ | ✗ | ✗ |
+| postgresql_roaringbit | ✓ | ✗ | ✗ | ✗ | ✗ |
+| redis_set | ✓ | ✗ | ✓ | ✗ | ✗ |
+| redis_bit | ✓ | ✗ | ✗ | ✗ | ✗ |
+| rocksdb_set | ✓ | ✗ | ✓ | ✗ | ✗ |
+| rocksdb_bit | ✓ | ✗ | ✗ | ✗ | ✗ |
+| rocksdict | ✓ | ✓ | ✓ | ✓ | ✗ |
+| postgis_h3 | ✗ | ✗ | ✗ | ✗ | ✓ |
+| postgis_bbox | ✗ | ✗ | ✗ | ✗ | ✓ |
 
 **Note**: Bit-based handlers (postgresql_bit, postgresql_roaringbit, redis_bit, rocksdb_bit) only support integers due to their underlying storage mechanism.
+
+**Note**: Spatial handlers (postgis_h3, postgis_bbox) exclusively use the `geometry` datatype and require PostGIS. The H3 handler additionally requires the h3-pg extension.
 
 ## CLI Tool Usage
 
@@ -63,6 +68,17 @@ pcache-add \
     --partition-key "created_at" \
     --partition-datatype "timestamp" \
     --cache-backend "postgresql_array" \
+    --direct
+```
+
+```bash
+# Geometry partition keys (spatial handlers)
+pcache-add \
+    --query "SELECT DISTINCT t1.geom FROM poi AS t1 WHERE t1.type = 'restaurant'" \
+    --partition-key "spatial" \
+    --partition-datatype "geometry" \
+    --cache-backend "postgis_h3" \
+    --geometry-column "geom" \
     --direct
 ```
 

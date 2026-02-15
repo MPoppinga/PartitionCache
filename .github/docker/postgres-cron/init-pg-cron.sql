@@ -13,11 +13,15 @@ GRANT CREATE ON DATABASE postgres TO integration_user;
 -- Create the pg_cron extension in the partitioncache_integration database
 CREATE EXTENSION IF NOT EXISTS pg_cron;
 
--- Create the roaringbitmap extension in the partitioncache_integration database  
+-- Create the roaringbitmap extension in the partitioncache_integration database
 CREATE EXTENSION IF NOT EXISTS roaringbitmap;
 
+-- Create PostGIS and h3 extensions for spatial cache testing
+CREATE EXTENSION IF NOT EXISTS postgis;
+CREATE EXTENSION IF NOT EXISTS h3;
+
 -- Verify the extensions are properly installed
-SELECT extname, extversion FROM pg_extension WHERE extname IN ('pg_cron', 'roaringbitmap');
+SELECT extname, extversion FROM pg_extension WHERE extname IN ('pg_cron', 'roaringbitmap', 'postgis', 'h3');
 
 -- Grant necessary permissions for the integration user
 GRANT USAGE ON SCHEMA cron TO integration_user;
@@ -74,6 +78,22 @@ GRANT ALL PRIVILEGES ON test_businesses TO integration_user;
 GRANT USAGE, SELECT ON SEQUENCE test_businesses_id_seq TO integration_user;
 GRANT ALL PRIVILEGES ON test_spatial_points TO integration_user;
 GRANT USAGE, SELECT ON SEQUENCE test_spatial_points_id_seq TO integration_user;
+
+-- Create pois table with PostGIS geometry for spatial cache integration tests
+-- Schema only — test data is seeded by the test fixtures (test_spatial_postgis_ci.py)
+CREATE TABLE pois (
+    id SERIAL PRIMARY KEY,
+    name TEXT NOT NULL,
+    subtype TEXT NOT NULL,
+    geom geometry(Point, 25832) NOT NULL
+);
+
+-- Create spatial index on pois geometry
+CREATE INDEX idx_pois_geom ON pois USING GIST (geom);
+
+-- Grant permissions on pois table
+GRANT ALL PRIVILEGES ON pois TO integration_user;
+GRANT USAGE, SELECT ON SEQUENCE pois_id_seq TO integration_user;
 
 -- Note: PartitionCache queue processor functions are loaded at test runtime
 -- via the postgresql_queue_processor.py CLI tool

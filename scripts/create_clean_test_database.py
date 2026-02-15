@@ -144,6 +144,33 @@ def setup_database_extensions_and_tables(unique_db: str, require_pg_cron: bool =
             cur.execute("GRANT ALL PRIVILEGES ON test_spatial_points TO integration_user;")
             cur.execute("GRANT USAGE, SELECT ON SEQUENCE test_spatial_points_id_seq TO integration_user;")
 
+            # Create PostGIS and h3 extensions for spatial cache testing (non-fatal)
+            try:
+                cur.execute("CREATE EXTENSION IF NOT EXISTS postgis;")
+                print("PostGIS extension created successfully")
+                try:
+                    cur.execute("CREATE EXTENSION IF NOT EXISTS h3;")
+                    print("h3 extension created successfully")
+                except Exception as e:
+                    print(f"h3 extension not created (this may be expected): {e}")
+
+                # Create pois table for spatial integration tests
+                # Schema only — test data is seeded by the test fixtures (test_spatial_postgis_ci.py)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS pois (
+                        id SERIAL PRIMARY KEY,
+                        name TEXT NOT NULL,
+                        subtype TEXT NOT NULL,
+                        geom geometry(Point, 25832) NOT NULL
+                    );
+                """)
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_pois_geom ON pois USING GIST (geom);")
+                cur.execute("GRANT ALL PRIVILEGES ON pois TO integration_user;")
+                cur.execute("GRANT USAGE, SELECT ON SEQUENCE pois_id_seq TO integration_user;")
+                print("pois table created successfully (data seeded by test fixtures)")
+            except Exception as e:
+                print(f"PostGIS/h3 extensions or pois table not created (this may be expected): {e}")
+
             # Install PartitionCache queue processor functions for manual testing
             print("Installing PartitionCache queue processor functions...")
             try:

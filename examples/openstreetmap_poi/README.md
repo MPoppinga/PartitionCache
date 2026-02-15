@@ -125,7 +125,7 @@ python run_poi_queries.py
 ```
 
 This will:
-- Run the same queries against both zipcode and administrative boundaries partition keys # TODO administaive boundaries still pending
+- Run the same queries against zipcode, landkreis, and spatial partition keys
 - Show performance comparisons between strategies
 - Demonstrate cache hit/miss scenarios
 - Provide helpful hints for adding queries to cache
@@ -194,6 +194,55 @@ for query in testqueries_examples/landkreis/*.sql; do
 done
 ```
 
+#### For Spatial Partition (Geometry)
+
+Spatial cache uses PostGIS geometry instead of discrete partition keys. Queries with `ST_DWithin` spatial joins benefit from geometric intersection filtering. The `--geometry-column` flag tells `pcache-add` which column to use for spatial cell derivation (H3 hexagons or BBox grid cells).
+
+```bash
+# H3 backend
+pcache-add --direct \
+  --query-file testqueries_examples/spatial/q1.sql \
+  --partition-key spatial \
+  --partition-datatype h3 \
+  --cache-backend postgis_h3 \
+  --geometry-column geom \
+  --env .env
+
+# BBox backend
+pcache-add --direct \
+  --query-file testqueries_examples/spatial/q1.sql \
+  --partition-key spatial \
+  --partition-datatype bbox \
+  --cache-backend postgis_bbox \
+  --geometry-column geom \
+  --env .env
+
+# Add all spatial test queries
+for query in testqueries_examples/spatial/*.sql; do
+  pcache-add --direct \
+    --query-file "$query" \
+    --partition-key spatial \
+    --partition-datatype h3 \
+    --cache-backend postgis_h3 \
+    --geometry-column geom \
+    --env .env
+done
+```
+
+**Note on buffer distance**: The `--buffer-distance` parameter is a read-time concern — it controls how much cached envelopes are expanded when `apply_cache` / `apply_cache_lazy` intersects them to build the spatial filter. It is **not** used during cache population (`pcache-add`). When omitted at query time, PartitionCache auto-derives it from `ST_DWithin` distances in the query using the weighted graph diameter. For example, a query with `ST_DWithin(p1.geom, p3.geom, 300) AND ST_DWithin(p1.geom, p2.geom, 400)` auto-computes a buffer of 700m (path p2→p1→p3 = 400+300).
+
+```python
+# Python API: buffer_distance is used at apply_cache time, not at population time
+enhanced_query, stats = partitioncache.apply_cache(
+    query=sql_query,
+    cache_handler=handler,
+    partition_key="spatial",
+    geometry_column="geom",
+    buffer_distance=500,       # explicit override
+    # buffer_distance=None,    # or omit to auto-derive from ST_DWithin
+)
+```
+
 ### Reading from Cache
 
 ```bash
@@ -241,13 +290,13 @@ pcache-manage maintenance partition --delete zipcode \
 
 ## Example Queries
 
-The example includes three test queries:
+Each partition strategy (`zipcode`, `landkreis`, `spatial`) has three test queries in `testqueries_examples/`:
 
 1. **q1.sql**: Find ice cream shops near pharmacies and ALDI supermarkets
-2. **q2.sql**: Find pizza restaurants near hotels
-3. **q3.sql**: Find banks near ATMs
+2. **q2.sql**: Find ice cream shops near swimming pools and Edeka supermarkets
+3. **q3.sql**: Find ice cream shops near swimming pools and ALDI supermarkets
 
-Each query works with both partition strategies and demonstrates spatial proximity searches.
+The `zipcode` and `landkreis` variants include partition key join conditions (e.g. `p2.zipcode = p1.zipcode`), while the `spatial` variants use only `ST_DWithin` spatial joins without partition key joins.
 
 ## Performance Comparison
 
@@ -255,11 +304,23 @@ The example demonstrates how different partition strategies affect query perform
 
 - **Zipcode partitioning**: Fine-grained, good for local searches
 - **Landkreis partitioning**: Broader regions, good for administrative queries
+- **Spatial partitioning** (H3/BBox): Geometry-based, good for spatial proximity queries without explicit partition key columns
 
 Run `python run_poi_queries.py` to see performance comparisons between:
 - Queries without cache
 - Queries with zipcode partitioning
 - Queries with landkreis partitioning
+- Queries with spatial partitioning (H3 or BBox)
+
+## Automated Workflow Test
+
+The `test_workflow.py` script demonstrates a complete end-to-end PartitionCache workflow:
+
+```bash
+python test_workflow.py
+```
+
+This sets up the PostgreSQL queue processor via pg_cron, adds queries to the processing queue, waits for automatic processing, and verifies cache effectiveness. It requires the database to be running and OSM data imported.
 
 ## Cache Backend Options
 
@@ -277,7 +338,15 @@ CACHE_BACKEND=rocksdb_set
 
 # Redis (in-memory, good for distributed setups)
 CACHE_BACKEND=redis_set
+
+# PostGIS H3 (spatial partitioning with hexagonal cells)
+SPATIAL_CACHE_BACKEND=postgis_h3
+
+# PostGIS BBox (spatial partitioning with grid-based bounding boxes)
+SPATIAL_CACHE_BACKEND=postgis_bbox
 ```
+
+Spatial backends require PostGIS and h3-pg extensions. Configure via `PG_H3_*` / `PG_BBOX_*` env vars in `.env` (see `.env.example`).
 
 ## Troubleshooting
 

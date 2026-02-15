@@ -43,14 +43,16 @@ def clean_query(query: str) -> str:
         str: Cleaned and normalized query suitable for cache variant generation
     """
 
+    # Remove single-line comments before whitespace normalization,
+    # otherwise collapsing newlines makes `--.*` wipe out everything
+    # from the first comment to the end of the (now single-line) string.
+    query = re.sub(r"--.*", "", query)
+
     query = re.sub(r"\s+", " ", query)
     query = re.sub(r"\s*=\s*", "=", query)
 
     # Remove trailing semicolons (they're not part of the SQL statement)
     query = query.rstrip().rstrip(";")
-
-    # Remove comment
-    query = re.sub(r"--.*", "", query)
 
     # Parse the query
     parsed = sqlglot.parse_one(query)
@@ -525,6 +527,7 @@ def _build_select_clause(
     original_to_new_alias_mapping: dict[str, str],
     partition_key: str,
     star_join_alias: str | None = None,
+    geometry_column: str | None = None,
 ) -> str:
     """
     Build the SELECT clause for a partial query.
@@ -536,17 +539,21 @@ def _build_select_clause(
         original_to_new_alias_mapping: Mapping from original aliases to new aliases
         partition_key: The partition key column name
         star_join_alias: Alias of the star-join table if present (e.g., 'p1')
+        geometry_column: If set, use this column instead of partition_key in SELECT (for spatial queries)
 
     Returns:
         Complete SELECT clause string (with SELECT keyword)
     """
     if strip_select or original_select_clause is None:
+        # Determine which column to select
+        select_column = geometry_column if geometry_column else partition_key
+
         # For star-join queries, prefer selecting from the star-join table
         if star_join_alias:
-            return f"SELECT DISTINCT {star_join_alias}.{partition_key}"
+            return f"SELECT DISTINCT {star_join_alias}.{select_column}"
         else:
             # Default behavior: select only partition key from first table
-            return f"SELECT DISTINCT {table_aliases[0]}.{partition_key}"
+            return f"SELECT DISTINCT {table_aliases[0]}.{select_column}"
 
     # Preserve original SELECT clause with alias mapping
     try:
@@ -575,6 +582,8 @@ def generate_partial_queries(
     star_join_table: str | None = None,
     warn_no_partition_key: bool = True,
     strip_select: bool = True,
+    skip_partition_key_joins: bool = False,
+    geometry_column: str | None = None,
 ) -> list[str]:
     """
     This function takes a query and returns the list of all possible partial queries.
@@ -596,6 +605,10 @@ def generate_partial_queries(
         warn_no_partition_key: bool: If True, emit warnings for tables not using the partition key
         strip_select: bool: If True (default), strip SELECT clause to only select partition keys.
             If False, preserve original SELECT clause with proper alias mapping for partial queries.
+        skip_partition_key_joins: bool: If True, skip generating partition_key equijoin conditions between tables.
+            Used for spatial queries where tables are linked by distance conditions, not equijoins.
+        geometry_column: str | None: If set, use this geometry column instead of partition_key in SELECT clause.
+            Used for spatial cache handlers (H3, BBox) where the SELECT needs the geometry column.
 
     Returns:
         List[str]: List of all possible partial queries
@@ -644,7 +657,8 @@ def generate_partial_queries(
     )
 
     # Emit warnings for tables not using partition key if requested
-    if warn_no_partition_key:
+    # Skip warning in spatial mode — partition_key is a namespace, not a column
+    if warn_no_partition_key and not geometry_column:
         for alias in table_aliases:
             if alias == detected_star_join_alias:
                 continue  # Star-join tables are expected to use partition key
@@ -769,10 +783,11 @@ def generate_partial_queries(
             for rdist in relvant_conditions_for_combination:
                 query_where.append(rdist)
 
-            # Add join conditions for given partition_key
-            for i in range(1, len(new_table_list)):
-                for j in range(i + 1, len(new_table_list) + 1):
-                    query_where.append(f"{new_table_list[i - 1]}.{partition_key} = {new_table_list[j - 1]}.{partition_key}")
+            # Add join conditions for given partition_key (skip for spatial queries)
+            if not skip_partition_key_joins:
+                for i in range(1, len(new_table_list)):
+                    for j in range(i + 1, len(new_table_list) + 1):
+                        query_where.append(f"{new_table_list[i - 1]}.{partition_key} = {new_table_list[j - 1]}.{partition_key}")
 
             # Build table list with correct table names from alias_to_table_map
             new_table_list_with_alias = []
@@ -841,7 +856,7 @@ def generate_partial_queries(
 
                 combined_where = query_where_without_pk_joins + star_join_joins + star_join_conditions
                 select_clause = _build_select_clause(
-                    strip_select, original_select_clause, new_table_list, original_to_new_alias_mapping, partition_key, star_join_new_alias
+                    strip_select, original_select_clause, new_table_list, original_to_new_alias_mapping, partition_key, star_join_new_alias, geometry_column
                 )
                 q_with_star_join = f"{select_clause} FROM {', '.join(combined_table_list)} WHERE {' AND '.join(combined_where)}"
                 ret.append(q_with_star_join)
@@ -865,7 +880,7 @@ def generate_partial_queries(
                                 query_where_comb.append(star_join_subquery)
                             # Build WHERE clause only if conditions exist
                             select_clause = _build_select_clause(
-                                strip_select, original_select_clause, new_table_list, original_to_new_alias_mapping, partition_key, star_join_new_alias
+                                strip_select, original_select_clause, new_table_list, original_to_new_alias_mapping, partition_key, star_join_new_alias, geometry_column
                             )
                             if query_where_comb:
                                 q = f"{select_clause} FROM {', '.join(combined_table_list)} WHERE {' AND '.join(query_where_comb)}"
@@ -875,7 +890,7 @@ def generate_partial_queries(
             else:
                 # Normal case without p0 exclusion
                 # Build WHERE clause only if conditions exist
-                select_clause = _build_select_clause(strip_select, original_select_clause, new_table_list, original_to_new_alias_mapping, partition_key, None)
+                select_clause = _build_select_clause(strip_select, original_select_clause, new_table_list, original_to_new_alias_mapping, partition_key, None, geometry_column)
                 if query_where:
                     q = f"{select_clause} FROM {', '.join(new_table_list_with_alias)} WHERE {' AND '.join(query_where)}"
                 else:
@@ -900,7 +915,7 @@ def generate_partial_queries(
                             query_where_comb.append(p_subquery)
                         # Build WHERE clause only if conditions exist
                         select_clause = _build_select_clause(
-                            strip_select, original_select_clause, new_table_list, original_to_new_alias_mapping, partition_key, None
+                            strip_select, original_select_clause, new_table_list, original_to_new_alias_mapping, partition_key, None, geometry_column
                         )
                         if query_where_comb:
                             q = f"{select_clause} FROM {', '.join(new_table_list_with_alias)} WHERE {' AND '.join(query_where_comb)}"
@@ -1361,6 +1376,8 @@ def generate_all_query_hash_pairs(
     add_constraints: dict[str, str] | None = None,
     remove_constraints_all: list[str] | None = None,
     remove_constraints_add: list[str] | None = None,
+    skip_partition_key_joins: bool = False,
+    geometry_column: str | None = None,
 ) -> list[tuple[str, str]]:
     """
     Generate all query hash pairs for a given query with configurable variant generation.
@@ -1404,6 +1421,8 @@ def generate_all_query_hash_pairs(
             star_join_table=star_join_table,
             warn_no_partition_key=warn_no_partition_key,
             strip_select=strip_select,
+            skip_partition_key_joins=skip_partition_key_joins,
+            geometry_column=geometry_column,
         )
     )
     query_set.update(query_set_diff_combinations)
@@ -1425,6 +1444,8 @@ def generate_all_query_hash_pairs(
                 star_join_table=star_join_table,
                 warn_no_partition_key=warn_no_partition_key,
                 strip_select=strip_select,
+                skip_partition_key_joins=skip_partition_key_joins,
+                geometry_column=geometry_column,
             )
         )
     )
@@ -1432,7 +1453,7 @@ def generate_all_query_hash_pairs(
     # Apply constraint modifications to all generated queries
     query_set = _apply_constraint_modifications(
         query_set, add_constraints=add_constraints, remove_constraints_all=remove_constraints_all, remove_constraints_add=remove_constraints_add
-    )
+    ) # TODO This would sometime create a difefrent ordering nessesary as the reassignment of aliase in the fragmentcreation could be different
 
     # If we have constraint modifications, also apply them to normalized distance variants
     if add_constraints or remove_constraints_add:
@@ -1463,6 +1484,180 @@ def hash_query(query: str) -> str:
     return hashlib.sha1(query.encode()).hexdigest()
 
 
+
+def extract_distance_constraints(query: str) -> list[tuple[str, str, float]]:
+    """Extract (alias1, alias2, distance) from all distance constraints in the query.
+
+    Handles two kinds of distance constraints:
+      1. ST_DWithin(a.geom, b.geom, distance) function calls
+      2. Comparison-based distance expressions detected by is_distance_function(),
+         e.g. SQRT(POWER(p1.x - p2.x, 2)) < 0.008 or DIST(t1.g, t2.g) BETWEEN 1.6 AND 3.6
+
+    Args:
+        query: SQL query string to parse.
+
+    Returns:
+        List of (alias1, alias2, distance) tuples, sorted by alias pair.
+    """
+    try:
+        parsed = sqlglot.parse_one(query)
+    except sqlglot.ParseError:
+        return []
+
+    results: list[tuple[str, str, float]] = []
+    seen_pairs: set[tuple[str, str]] = set()
+
+    # --- Pass 1: ST_DWithin function calls ---
+    for func in parsed.find_all(exp.Anonymous):
+        if func.name.upper() != "ST_DWITHIN":
+            continue
+        args = func.args.get("expressions", [])
+        if len(args) < 3:
+            continue
+
+        alias1 = None
+        alias2 = None
+        for col in args[0].find_all(exp.Column):
+            if col.table:
+                alias1 = col.table
+                break
+        for col in args[1].find_all(exp.Column):
+            if col.table:
+                alias2 = col.table
+                break
+
+        distance_arg = args[2]
+        distance = None
+        literal = distance_arg.find(exp.Literal)
+        if literal is None and isinstance(distance_arg, exp.Literal):
+            literal = distance_arg
+        if literal is not None:
+            try:
+                distance = float(literal.this)
+            except (ValueError, TypeError):
+                pass
+
+        if alias1 is not None and alias2 is not None and distance is not None:
+            a1, a2 = sorted([alias1, alias2])
+            results.append((a1, a2, distance))
+            seen_pairs.add((a1, a2))
+
+    # --- Pass 2: Comparison-based distance functions ---
+    try:
+        conditions = extract_conjunctive_conditions(query)
+    except Exception:
+        conditions = []
+
+    for condition in conditions:
+        if not is_distance_function(condition):
+            continue
+
+        # Extract table aliases from column references in the condition
+        try:
+            cond_parsed = sqlglot.parse_one(f"SELECT 1 WHERE {condition}")
+        except sqlglot.ParseError:
+            continue
+
+        aliases: set[str] = set()
+        for col in cond_parsed.find_all(exp.Column):
+            if col.table:
+                aliases.add(col.table)
+
+        if len(aliases) != 2:
+            continue
+
+        a1, a2 = sorted(aliases)
+
+        # Skip if already captured by ST_DWithin pass
+        if (a1, a2) in seen_pairs:
+            continue
+
+        # Extract upper-bound distance from the condition
+        distance = None
+        condition_upper = condition.upper()
+
+        if " BETWEEN " in condition_upper:
+            # BETWEEN x AND y → extract y (upper bound)
+            try:
+                between_part = condition.split(" BETWEEN ")[1] if " BETWEEN " in condition else condition.split(" between ")[1]
+                upper_str = between_part.split(" AND ")[1] if " AND " in between_part else between_part.split(" and ")[1]
+                distance = float(upper_str.strip())
+            except (IndexError, ValueError):
+                pass
+        elif "<=" in condition:
+            match = re.search(r"<=\s*([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)", condition)
+            if match:
+                try:
+                    distance = float(match.group(1))
+                except ValueError:
+                    pass
+        elif "<" in condition:
+            match = re.search(r"<\s*([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)", condition)
+            if match:
+                try:
+                    distance = float(match.group(1))
+                except ValueError:
+                    pass
+        elif ">=" in condition or ">" in condition:
+            # Lower bound only — not relevant for buffer distance
+            continue
+
+        if distance is not None:
+            results.append((a1, a2, distance))
+            seen_pairs.add((a1, a2))
+
+    return sorted(results)
+
+
+def compute_buffer_distance(query: str) -> float:
+    """Compute buffer distance as the weighted graph diameter of distance constraints.
+
+    Builds a weighted graph where nodes are table aliases and edges are distance
+    constraints (ST_DWithin calls and comparison-based distance expressions).
+    Returns the diameter (longest shortest path weight) of the graph.
+
+    For star patterns (all distances from one hub), the diameter is the sum of the
+    two largest distances through the hub. For chain patterns, it's the sum along
+    the longest path.
+
+    Args:
+        query: SQL query string to parse.
+
+    Returns:
+        The weighted graph diameter in the same units as the distance constraints.
+        Returns 0.0 if no distance constraints are found or the graph has fewer than 2 nodes.
+    """
+    edges = extract_distance_constraints(query)
+    if not edges:
+        return 0.0
+
+    G = nx.Graph()
+    for alias1, alias2, distance in edges:
+        # If multiple ST_DWithin between same pair, use the max distance
+        if G.has_edge(alias1, alias2):
+            current_weight = G[alias1][alias2]["weight"]
+            G[alias1][alias2]["weight"] = max(current_weight, distance)
+        else:
+            G.add_edge(alias1, alias2, weight=distance)
+
+    if G.number_of_nodes() < 2:
+        return 0.0
+
+    # Compute weighted diameter: longest shortest path across all pairs
+    max_distance = 0.0
+    for component in nx.connected_components(G):
+        subgraph = G.subgraph(component)
+        if subgraph.number_of_nodes() < 2:
+            continue
+        # All-pairs shortest paths (weighted)
+        for source in subgraph.nodes():
+            lengths = nx.single_source_dijkstra_path_length(subgraph, source, weight="weight")
+            for _target, length in lengths.items():
+                if length > max_distance:
+                    max_distance = length
+
+    return max_distance
+
 def generate_all_hashes(
     query: str,
     partition_key: str,
@@ -1479,6 +1674,8 @@ def generate_all_hashes(
     add_constraints: dict[str, str] | None = None,
     remove_constraints_all: list[str] | None = None,
     remove_constraints_add: list[str] | None = None,
+    skip_partition_key_joins: bool = False,
+    geometry_column: str | None = None,
 ) -> list[str]:
     """
     Generates all hashes for the given query.
@@ -1499,6 +1696,8 @@ def generate_all_hashes(
         add_constraints=add_constraints,
         remove_constraints_all=remove_constraints_all,
         remove_constraints_add=remove_constraints_add,
+        skip_partition_key_joins=skip_partition_key_joins,
+        geometry_column=geometry_column,
     )
     return [x[1] for x in qh_pairs]
 

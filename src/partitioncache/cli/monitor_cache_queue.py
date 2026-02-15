@@ -152,6 +152,16 @@ def query_fragment_processor(args, constraint_args):
             query, partition_key, partition_datatype = query_result
             logger.debug(f"Processing original query into fragments for partition_key: {partition_key} (datatype: {partition_datatype})")
 
+            # Detect spatial mode and resolve geometry column from handler
+            is_spatial = partition_datatype == "geometry"
+            geometry_column = None
+            if is_spatial:
+                try:
+                    spatial_cache_handler = get_cache_handler(resolve_cache_backend(args), singleton=True)
+                    geometry_column = getattr(spatial_cache_handler, "geometry_column", "geom")
+                except Exception:
+                    geometry_column = "geom"
+
             # Process the query into fragments using the partition_key from queue
             query_hash_pairs = generate_all_query_hash_pairs(
                 query,
@@ -167,6 +177,8 @@ def query_fragment_processor(args, constraint_args):
                 add_constraints=add_constraints,
                 remove_constraints_all=remove_constraints_all,
                 remove_constraints_add=remove_constraints_add,
+                skip_partition_key_joins=is_spatial,
+                geometry_column=geometry_column,
             )
             logger.debug(f"Generated {len(query_hash_pairs)} fragments from original query")
 
@@ -364,6 +376,12 @@ def run_and_store_query(query: str, query_hash: str, partition_key: str, partiti
                 log_query_time(f"{query_hash}_lazy_exception", execution_time)
 
         if not use_lazy_insertion or not success:
+            # Spatial datatypes require lazy insertion - cannot fall back to execute + set_cache
+            if not success and partition_datatype == "geometry":
+                logger.error(f"Spatial datatype '{partition_datatype}' requires lazy insertion for query {query_hash}. "
+                             "Ensure lazy insertion is enabled and the cache handler supports it.")
+                return False
+
             logger.info(f"Beginning calculation for cache population for query {query_hash}")
             db_connection_params = get_database_connection_params(args)
             if args.db_backend == "postgresql":
