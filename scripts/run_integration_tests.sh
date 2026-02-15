@@ -53,6 +53,8 @@ show_help() {
     echo "  spatial             Spatial cache tests"
     echo "  performance         Performance tests"
     echo "  error_recovery      Error recovery tests"
+    echo "  maintenance         Maintenance operations tests"
+    echo "  constraint_to_cache_pipeline  Pipeline integration tests"
     echo ""
     echo "Examples:"
     echo "  $0                              # Run all tests with default services"

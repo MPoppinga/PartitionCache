@@ -278,9 +278,16 @@ Advanced options for controlling how query variants are generated for better cac
 
 ### Partition Configuration (Required)
 - `--partition-key PARTITION_KEY` - Name of the partition key column (**Required**)
-- `--partition-datatype {integer,float,text,timestamp}` - Partition key datatype
+- `--partition-datatype {integer,float,text,timestamp,geometry}` - Partition key datatype
   - **Default**: Inferred from query analysis
   - **When to specify**: For explicit type validation or when inference fails
+  - **Spatial**: Use `geometry` for spatial queries (requires `--cache-backend postgis_h3` or `postgis_bbox`)
+
+### Spatial Configuration
+- `--geometry-column GEOMETRY_COLUMN` - Name of the geometry column for spatial queries
+  - **Default**: From `PARTITION_CACHE_GEOMETRY_COLUMN` environment variable, or `geom`
+  - **Required when**: `--partition-datatype geometry` is used
+  - **Note**: Buffer distance is not needed for cache population (only for cache application)
 
 ### Execution Mode (Mutually Exclusive - Required)
 
@@ -375,6 +382,26 @@ This generates multiple variants:
 - Variants with and without `size = 4` constraint
 - Variants with added `active = true` constraint
 
+**Spatial query (PostGIS H3 backend):**
+```bash
+pcache-add --queue \
+  --query-file "spatial_query.sql" \
+  --partition-key "spatial" \
+  --partition-datatype geometry \
+  --geometry-column geom \
+  --cache-backend postgis_h3
+```
+
+**Spatial query (direct execution):**
+```bash
+pcache-add --direct \
+  --query "SELECT p.geom FROM points p JOIN regions r ON ST_DWithin(p.geom::geography, r.geom::geography, 1000)" \
+  --partition-key "spatial" \
+  --partition-datatype geometry \
+  --geometry-column geom \
+  --cache-backend postgis_bbox
+```
+
 ---
 
 ## pcache-read
@@ -394,8 +421,9 @@ pcache-read --query QUERY [options]
   - **Default**: From `CACHE_BACKEND` environment variable
 - `--partition-key PARTITION_KEY` - Partition key column name
   - **Default**: From cache metadata or `partition_key`
-- `--partition-datatype {integer,float,text,timestamp}` - Partition key datatype
+- `--partition-datatype {integer,float,text,timestamp,geometry}` - Partition key datatype
   - **Default**: `integer`
+  - **Spatial**: Use `geometry` for spatial queries with PostGIS backends
 
 ### Output Options
 - `--output-format {list,json,lines}` - Output format for partition keys
@@ -536,6 +564,15 @@ Controls how query variants are generated when processing original queries from 
 - `--remove-constraints-add JSON` - Remove attributes creating additional variants
   - **Format**: JSON array of attribute names to remove
   - **Environment**: `PARTITION_CACHE_REMOVE_CONSTRAINTS_ADD`
+
+### Lazy Insertion & Query Logging
+- `--disable-lazy-insertion` - Force traditional query execution instead of lazy insertion
+  - **Default**: Lazy insertion enabled (when handler supports `set_cache_lazy`)
+  - **Purpose**: Debug or compare execution strategies
+  - **Note**: Lazy insertion wraps fragment SQL for server-side execution without materializing results
+- `--log-query-times LOG_FILE` - Log query execution times to CSV file
+  - **Format**: CSV with columns for query hash, execution time, result count
+  - **Purpose**: Performance analysis and profiling
 
 ### Configuration
 - `--env ENV` - Environment file path
@@ -678,9 +715,10 @@ pcache-postgresql-queue-processor disable
 
 #### update-config - Update Configuration
 ```bash
-pcache-postgresql-queue-processor update-config [--frequency SECONDS] [--max-jobs COUNT]
+pcache-postgresql-queue-processor update-config [--frequency DURATION] [--timeout DURATION] [--max-jobs COUNT]
 ```
-- `--frequency SECONDS` - Processing frequency (1-59 seconds)
+- `--frequency DURATION` - Processing frequency (accepts seconds or duration format: `30`, `30s`, `5m`, `2h`, `1d`)
+- `--timeout DURATION` - Job timeout (accepts seconds or duration format: `30`, `30s`, `5m`, `2h`, `1d`)
 - `--max-jobs COUNT` - Maximum concurrent jobs
 - **Purpose**: Tune performance for your workload
 
@@ -717,10 +755,28 @@ pcache-postgresql-queue-processor logs [--limit LIMIT] [--status STATUS]
 
 #### manual-process - Manual Processing
 ```bash
-pcache-postgresql-queue-processor manual-process
+pcache-postgresql-queue-processor manual-process [LIMIT]
 ```
+- `LIMIT` - Maximum number of queue items to process (default: 100)
 - Manually trigger one processing cycle
 - **Use case**: Testing, development, troubleshooting
+
+#### check-permissions - Verify pg_cron Permissions
+```bash
+pcache-postgresql-queue-processor check-permissions [--grant]
+```
+- Checks that required pg_cron permissions are granted
+- `--grant` - Automatically grant missing permissions
+- **Use case**: Diagnosing setup issues
+
+#### verify - Verify Setup Integrity
+```bash
+pcache-postgresql-queue-processor verify
+```
+- Verifies all processor components are correctly installed
+- Checks tables, functions, config rows, and cron job wiring
+- Reports OK/FAIL for each component
+- **Use case**: Post-setup validation, troubleshooting
 
 ### Examples
 
@@ -802,10 +858,11 @@ pcache-postgresql-eviction-manager disable
 
 #### update-config - Update Eviction Configuration
 ```bash
-pcache-postgresql-eviction-manager update-config [options]
+pcache-postgresql-eviction-manager update-config [--frequency DURATION] [--threshold COUNT] [--strategy {oldest,largest}]
 ```
-- Configure eviction policies and schedules
-- **Options**: TTL, size limits, frequency
+- `--frequency DURATION` - Eviction frequency (accepts minutes or duration format: `60`, `30s`, `5m`, `2h`, `1d`; stored as minutes)
+- `--threshold COUNT` - Cache size threshold to trigger eviction
+- `--strategy {oldest,largest}` - Eviction strategy
 
 #### status - Eviction Status
 ```bash
@@ -826,6 +883,15 @@ pcache-postgresql-eviction-manager manual-run
 ```
 - Manually trigger eviction process
 - **Use case**: Testing eviction policies
+
+#### verify - Verify Setup Integrity
+```bash
+pcache-postgresql-eviction-manager verify
+```
+- Verifies all eviction components are correctly installed
+- Checks tables, functions, config rows, and cron job wiring
+- Reports OK/FAIL for each component
+- **Use case**: Post-setup validation, troubleshooting
 
 ### Examples
 

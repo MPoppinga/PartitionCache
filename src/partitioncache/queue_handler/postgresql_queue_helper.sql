@@ -1,11 +1,12 @@
 -- Function for fragment queue (hash, partition_key constraint)
 CREATE OR REPLACE FUNCTION non_blocking_fragment_queue_upsert(
     p_hash TEXT,
-    p_partition_key TEXT, 
+    p_partition_key TEXT,
     p_partition_datatype TEXT,
     p_query TEXT,
     p_priority INT DEFAULT 1,
-    p_queue_table TEXT DEFAULT 'partitioncache_fragmentqueue'
+    p_queue_table TEXT DEFAULT 'partitioncache_fragmentqueue',
+    p_cache_backend TEXT DEFAULT NULL
 ) RETURNS TEXT AS $$
 DECLARE
     v_id INT;
@@ -27,7 +28,7 @@ BEGIN
         p_queue_table
     );
     EXECUTE v_sql USING p_priority, p_hash, p_partition_key;
-    
+
     RETURN 'updated';
 
 EXCEPTION
@@ -35,28 +36,28 @@ EXCEPTION
     WHEN no_data_found THEN
         BEGIN
             v_sql := format(
-                'INSERT INTO %I (hash, partition_key, partition_datatype, query, priority, updated_at, created_at) ' ||
-                'VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) ' ||
+                'INSERT INTO %I (hash, partition_key, partition_datatype, query, priority, cache_backend, updated_at, created_at) ' ||
+                'VALUES ($1, $2, $3, $4, $5, $6, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) ' ||
                 'ON CONFLICT (hash, partition_key) DO UPDATE SET ' ||
                 'priority = %I.priority + $5, updated_at = CURRENT_TIMESTAMP',
                 p_queue_table, p_queue_table
             );
-            EXECUTE v_sql USING p_hash, p_partition_key, p_partition_datatype, p_query, p_priority;
+            EXECUTE v_sql USING p_hash, p_partition_key, p_partition_datatype, p_query, p_priority, p_cache_backend;
             RETURN 'inserted';
         EXCEPTION
             -- Handle concurrent INSERT race conditions
             WHEN serialization_failure OR deadlock_detected OR unique_violation THEN
                 RETURN 'skipped_concurrent';
         END;
-        
+
     -- Row is locked (being processed) - skip operation to avoid blocking
     WHEN lock_not_available THEN
         RETURN 'skipped_locked';
-        
+
     -- Handle concurrent update/insert errors that can occur during heavy load
     WHEN serialization_failure OR deadlock_detected THEN
         RETURN 'skipped_concurrent';
-        
+
     -- Handle any other errors gracefully
     WHEN OTHERS THEN
         RAISE NOTICE 'Unexpected error in non_blocking_fragment_queue_upsert: %', SQLERRM;
@@ -133,11 +134,12 @@ $$ LANGUAGE plpgsql;
 -- Batch function for fragment queue (wrapper for non_blocking_fragment_queue_upsert)
 CREATE OR REPLACE FUNCTION non_blocking_fragment_queue_batch_upsert(
     p_hashes TEXT[],
-    p_partition_keys TEXT[], 
+    p_partition_keys TEXT[],
     p_partition_datatypes TEXT[],
     p_queries TEXT[],
     p_priorities INT[] DEFAULT NULL,
-    p_queue_table TEXT DEFAULT 'partitioncache_fragmentqueue'
+    p_queue_table TEXT DEFAULT 'partitioncache_fragmentqueue',
+    p_cache_backends TEXT[] DEFAULT NULL
 ) RETURNS TABLE(idx INT, hash TEXT, partition_key TEXT, status TEXT) AS $$
 DECLARE
     v_array_length INT;
@@ -146,18 +148,19 @@ DECLARE
 BEGIN
     -- Validate array lengths
     v_array_length := array_length(p_hashes, 1);
-    
+
     IF v_array_length IS NULL OR v_array_length = 0 THEN
         RETURN;
     END IF;
-    
+
     IF array_length(p_partition_keys, 1) != v_array_length OR
        array_length(p_partition_datatypes, 1) != v_array_length OR
        array_length(p_queries, 1) != v_array_length OR
-       (p_priorities IS NOT NULL AND array_length(p_priorities, 1) != v_array_length) THEN
+       (p_priorities IS NOT NULL AND array_length(p_priorities, 1) != v_array_length) OR
+       (p_cache_backends IS NOT NULL AND array_length(p_cache_backends, 1) != v_array_length) THEN
         RAISE EXCEPTION 'All input arrays must have the same length';
     END IF;
-    
+
     -- Process each item using the existing function
     FOR v_idx IN 1..v_array_length LOOP
         v_status := non_blocking_fragment_queue_upsert(
@@ -166,9 +169,10 @@ BEGIN
             p_partition_datatypes[v_idx],
             p_queries[v_idx],
             COALESCE(p_priorities[v_idx], 1),
-            p_queue_table
+            p_queue_table,
+            CASE WHEN p_cache_backends IS NOT NULL THEN p_cache_backends[v_idx] ELSE NULL END
         );
-        
+
         -- Return result for this item
         RETURN QUERY SELECT v_idx, p_hashes[v_idx], p_partition_keys[v_idx], v_status;
     END LOOP;
@@ -178,7 +182,7 @@ $$ LANGUAGE plpgsql;
 -- Overloaded version with default queue table and priorities
 CREATE OR REPLACE FUNCTION non_blocking_fragment_queue_batch_upsert(
     p_hashes TEXT[],
-    p_partition_keys TEXT[], 
+    p_partition_keys TEXT[],
     p_partition_datatypes TEXT[],
     p_queries TEXT[]
 ) RETURNS TABLE(idx INT, hash TEXT, partition_key TEXT, status TEXT) AS $$
@@ -190,7 +194,8 @@ BEGIN
         p_partition_datatypes,
         p_queries,
         NULL::INT[],
-        'partitioncache_fragmentqueue'
+        'partitioncache_fragmentqueue',
+        NULL::TEXT[]
     );
 END;
 $$ LANGUAGE plpgsql;

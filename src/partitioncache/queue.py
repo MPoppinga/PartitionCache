@@ -63,7 +63,7 @@ def push_to_original_query_queue(
 
 
 def push_to_query_fragment_queue(
-    query_hash_pairs: list[tuple[str, str]], partition_key: str = "partition_key", partition_datatype: str = "integer", queue_provider: str | None = None
+    query_hash_pairs: list[tuple[str, str]], partition_key: str = "partition_key", partition_datatype: str = "integer", queue_provider: str | None = None, cache_backend: str | None = None
 ) -> bool:
     """
     Push query fragments (as query-hash pairs) directly to the query fragment queue.
@@ -73,12 +73,13 @@ def push_to_query_fragment_queue(
         partition_key (str): The partition key for these query fragments (default: "partition_key").
         partition_datatype (str): The datatype of the partition key (default: "integer").
         queue_provider (str): The queue provider to use (default: None, which uses the environment variable QUERY_QUEUE_PROVIDER).
+        cache_backend (str): The cache backend to use for processing (default: None, uses processor config).
     Returns:
         bool: True if all fragments were pushed successfully, False otherwise.
     """
     try:
         handler = _get_queue_handler(queue_provider)
-        return handler.push_to_query_fragment_queue(query_hash_pairs, partition_key, partition_datatype)  # type: ignore[no-any-return]
+        return handler.push_to_query_fragment_queue(query_hash_pairs, partition_key, partition_datatype, cache_backend)  # type: ignore[no-any-return]
     except Exception as e:
         logger.error(f"Failed to push fragments to query fragment queue: {e}")
         return False
@@ -124,12 +125,12 @@ def pop_from_original_query_queue_blocking(timeout: int = 60, queue_provider: st
         return None
 
 
-def pop_from_query_fragment_queue(queue_provider: str | None = None) -> tuple[str, str, str, str] | None:
+def pop_from_query_fragment_queue(queue_provider: str | None = None) -> tuple[str, str, str, str, str | None] | None:
     """
     Pop a query fragment from the query fragment queue.
 
     Returns:
-        Tuple[str, str, str, str] or None: (query, hash, partition_key, partition_datatype) tuple if available, None if queue is empty or error occurred.
+        Tuple[str, str, str, str, str | None] or None: (query, hash, partition_key, partition_datatype, cache_backend) tuple if available, None if queue is empty or error occurred.
     """
     try:
         handler = _get_queue_handler(queue_provider)
@@ -139,7 +140,7 @@ def pop_from_query_fragment_queue(queue_provider: str | None = None) -> tuple[st
         return None
 
 
-def pop_from_query_fragment_queue_blocking(timeout: int = 60, queue_provider: str | None = None) -> tuple[str, str, str, str] | None:
+def pop_from_query_fragment_queue_blocking(timeout: int = 60, queue_provider: str | None = None) -> tuple[str, str, str, str, str | None] | None:
     """
     Pop a query fragment from the query fragment queue with blocking wait.
     Uses provider-specific blocking mechanisms when available.
@@ -148,7 +149,7 @@ def pop_from_query_fragment_queue_blocking(timeout: int = 60, queue_provider: st
         timeout (int): Maximum time to wait in seconds (default: 60)
 
     Returns:
-        Tuple[str, str, str, str] or None: (query, hash, partition_key, partition_datatype) tuple if available, None if timeout or error occurred.
+        Tuple[str, str, str, str, str | None] or None: (query, hash, partition_key, partition_datatype, cache_backend) tuple if available, None if timeout or error occurred.
     """
     try:
         handler = _get_queue_handler(queue_provider)

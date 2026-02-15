@@ -144,6 +144,22 @@ jobs:
             parallel: false
             requires_redis: false
             job_index: 6
+          - name: "Maintenance Operations"
+            pattern: "maintenance"
+            suffix: "maintenance"
+            backend_type: "postgresql_array"
+            database_suffix: "maintenance"
+            parallel: false
+            requires_redis: false
+            job_index: 7
+          - name: "Pipeline Integration"
+            pattern: "constraint_to_cache_pipeline"
+            suffix: "pipeline"
+            backend_type: "postgresql_array"
+            database_suffix: "pipeline"
+            parallel: false
+            requires_redis: false
+            job_index: 8
 
     services:
       postgres:

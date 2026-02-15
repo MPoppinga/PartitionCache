@@ -93,7 +93,12 @@ class TestDuckDBQueryAccelerator:
         # Verify DuckDB configuration was applied
         execute_calls = mock_duckdb_conn.execute.call_args_list
         config_calls = [call for call in execute_calls if "SET" in str(call)]
-        assert len(config_calls) >= 2  # Should set memory limit and threads
+        assert len(config_calls) == 2  # Exactly: memory_limit and threads
+
+        # Verify the specific SET calls
+        config_sql = [str(call) for call in config_calls]
+        assert any("SET memory_limit = '2GB'" in sql for sql in config_sql), f"Expected memory_limit SET call, got: {config_sql}"
+        assert any("SET threads = 8" in sql for sql in config_sql), f"Expected threads SET call, got: {config_sql}"
 
     @patch("partitioncache.query_accelerator.duckdb")
     @patch("partitioncache.query_accelerator.psycopg")
@@ -151,10 +156,12 @@ class TestDuckDBQueryAccelerator:
 
         # Verify PostgreSQL extension was installed and table was created
         install_calls = [query for query in execute_results if "INSTALL" in query]
-        assert len(install_calls) >= 1  # Should install postgres extension
+        assert len(install_calls) == 1  # Exactly one INSTALL call for postgres extension
+        assert "INSTALL postgres" in install_calls[0], f"Expected 'INSTALL postgres', got: {install_calls[0]}"
 
         create_calls = [query for query in execute_results if "CREATE" in query and "TABLE" in query]
-        assert len(create_calls) >= 1  # Should create table from PostgreSQL
+        assert len(create_calls) == 1  # Exactly one CREATE TABLE for 'test_table'
+        assert "test_table" in create_calls[0], f"Expected CREATE TABLE for 'test_table', got: {create_calls[0]}"
 
     @patch("partitioncache.query_accelerator.duckdb")
     @patch("partitioncache.query_accelerator.psycopg")
@@ -293,7 +300,8 @@ class TestDuckDBQueryAccelerator:
 
         assert stats["initialized"] is True
         assert stats["tables_preloaded"] == 2
-        assert stats["preload_time"] >= 0
+        assert isinstance(stats["preload_time"], float)
+        assert stats["preload_time"] == 0.0  # Mocked preload sets stats directly, no actual timing
 
     @patch("partitioncache.query_accelerator.duckdb")
     @patch("partitioncache.query_accelerator.psycopg")

@@ -85,18 +85,18 @@ BEGIN
         EXECUTE format(
             'DELETE FROM %I
                 WHERE id = (
-                    SELECT q.id 
+                    SELECT q.id
                     FROM %I q
                     WHERE NOT EXISTS (
-                        SELECT 1 FROM %I qr 
-                        WHERE qr.query_hash = q.hash 
+                        SELECT 1 FROM %I qr
+                        WHERE qr.query_hash = q.hash
                         AND qr.partition_key = q.partition_key
                     )  -- Only uncached items
                     ORDER BY q.priority DESC, q.id
                     FOR UPDATE SKIP LOCKED
                     LIMIT 1
                 )
-                RETURNING id, query, hash, partition_key, partition_datatype',
+                RETURNING id, query, hash, partition_key, partition_datatype, cache_backend',
             v_queue_table, v_queue_table, v_queries_table
         ) INTO v_queue_item;
     END;
@@ -166,7 +166,7 @@ BEGIN
             v_queue_item.partition_datatype,
             p_queue_prefix,
             p_table_prefix,
-            p_cache_backend,
+            COALESCE(v_queue_item.cache_backend, p_cache_backend),
             'cron',
             p_timeout_seconds,
             p_default_bitsize

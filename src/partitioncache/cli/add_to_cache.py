@@ -98,6 +98,10 @@ def main():
 
     elif args.queue:  # Add to queue for async processing
         is_spatial = args.partition_datatype == "geometry"
+
+        # Resolve cache backend to store with queue item (important for spatial routing)
+        queue_cache_backend = resolve_cache_backend(args) if is_spatial else None
+
         if not args.no_recompose:  # Add to query fragment queue for async processing
             # Resolve geometry column for spatial datatypes
             geometry_column = None
@@ -128,11 +132,11 @@ def main():
                 skip_partition_key_joins=is_spatial,
                 geometry_column=geometry_column,
             )
-            success = partitioncache.push_to_query_fragment_queue(query_hash_pairs, args.partition_key, args.partition_datatype, queue_provider)
+            success = partitioncache.push_to_query_fragment_queue(query_hash_pairs, args.partition_key, args.partition_datatype, queue_provider, cache_backend=queue_cache_backend)
         else: # Compute fragments and add to fragment queue
             query = clean_query(query)
             query_hash_pairs = [(query, hash_query(query))]
-            success = partitioncache.push_to_query_fragment_queue(query_hash_pairs, args.partition_key, args.partition_datatype, queue_provider)
+            success = partitioncache.push_to_query_fragment_queue(query_hash_pairs, args.partition_key, args.partition_datatype, queue_provider, cache_backend=queue_cache_backend)
         if success:
             logger.info("Query successfully added to query fragment queue")
         else:

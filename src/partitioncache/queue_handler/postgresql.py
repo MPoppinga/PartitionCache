@@ -64,6 +64,11 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
             # Check if the original query queue table already exists
             cursor.execute(sql.SQL("SELECT to_regclass('{0}')").format(sql.Identifier(self.original_queue_table)))
             if cursor.fetchone()[0]:
+                # Migration: add cache_backend column to existing fragment queue tables
+                cursor.execute(
+                    sql.SQL("ALTER TABLE {} ADD COLUMN IF NOT EXISTS cache_backend TEXT").format(sql.Identifier(self.fragment_queue_table))
+                )
+                conn.commit()
                 return
 
             # Create original query queue table with partition_key and priority
@@ -91,6 +96,7 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
                     hash TEXT NOT NULL,
                     partition_key TEXT NOT NULL,
                     partition_datatype TEXT,
+                    cache_backend TEXT,
                     priority INTEGER NOT NULL DEFAULT 1,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -289,7 +295,7 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
                 except Exception:
                     pass
 
-    def push_to_query_fragment_queue(self, query_hash_pairs: list[tuple[str, str]], partition_key: str, partition_datatype: str | None = None) -> bool:
+    def push_to_query_fragment_queue(self, query_hash_pairs: list[tuple[str, str]], partition_key: str, partition_datatype: str | None = None, cache_backend: str | None = None) -> bool:
         """
         Push query fragments to the fragment queue (implements AbstractQueueHandler interface).
         Uses batch non-blocking upsert for optimal performance and proper concurrency handling.
@@ -298,6 +304,7 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
             query_hash_pairs (List[Tuple[str, str]]): List of (query, hash) tuples to push.
             partition_key (str): The partition key for these query fragments.
             partition_datatype (str): The datatype of the partition key (default: None).
+            cache_backend (str): The cache backend to use for processing (default: None, uses processor config).
 
         Returns:
             bool: True if all fragments were pushed successfully, False otherwise.
@@ -318,11 +325,12 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
                 partition_keys = [partition_key] * len(query_hash_pairs)
                 partition_datatypes = [partition_datatype] * len(query_hash_pairs)
                 priorities = [1] * len(query_hash_pairs)  # Default priority
+                cache_backends = [cache_backend] * len(query_hash_pairs)
 
                 # Use base batch function directly with table parameter
                 cursor.execute(
-                    "SELECT * FROM non_blocking_fragment_queue_batch_upsert(%s, %s, %s, %s, %s, %s)",
-                    (hashes, partition_keys, partition_datatypes, queries, priorities, self.fragment_queue_table),
+                    "SELECT * FROM non_blocking_fragment_queue_batch_upsert(%s, %s, %s, %s, %s, %s, %s)",
+                    (hashes, partition_keys, partition_datatypes, queries, priorities, self.fragment_queue_table, cache_backends),
                 )
                 results = cursor.fetchall()
                 conn.commit()
@@ -337,13 +345,13 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
                 for query, hash_value in query_hash_pairs:
                     cursor.execute(
                         sql.SQL("""
-                        INSERT INTO {} (query, hash, partition_key, partition_datatype, priority, updated_at, created_at)
-                        VALUES (%s, %s, %s, %s, %s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                        INSERT INTO {} (query, hash, partition_key, partition_datatype, cache_backend, priority, updated_at, created_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                         ON CONFLICT (hash, partition_key) DO UPDATE SET
                             priority = {}.priority + 1,
                             updated_at = CURRENT_TIMESTAMP
                     """).format(sql.Identifier(self.fragment_queue_table), sql.Identifier(self.fragment_queue_table)),
-                        (query, hash_value, partition_key, partition_datatype, 1),
+                        (query, hash_value, partition_key, partition_datatype, cache_backend, 1),
                     )
 
                 conn.commit()
@@ -420,7 +428,7 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
                     pass
 
     def push_to_query_fragment_queue_with_priority(
-        self, query_hash_pairs: list[tuple[str, str]], partition_key: str, priority: int = 1, partition_datatype: str | None = None
+        self, query_hash_pairs: list[tuple[str, str]], partition_key: str, priority: int = 1, partition_datatype: str | None = None, cache_backend: str | None = None
     ) -> bool:
         """
         Push query fragments with specified priority.
@@ -447,16 +455,17 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
             # Try batch non-blocking upsert first
             try:
                 # Prepare arrays for batch upsert
-                hashes = [hash_value for query, hash_value in query_hash_pairs]
-                queries = [query for query, hash_value in query_hash_pairs]
+                hashes = [hash_value for _, hash_value in query_hash_pairs]
+                queries = [query for query, _ in query_hash_pairs]
                 partition_keys = [partition_key] * len(query_hash_pairs)
                 partition_datatypes = [partition_datatype] * len(query_hash_pairs)
                 priorities = [priority] * len(query_hash_pairs)
+                cache_backends = [cache_backend] * len(query_hash_pairs)
 
                 # Use base batch function directly with table parameter
                 cursor.execute(
-                    "SELECT * FROM non_blocking_fragment_queue_batch_upsert(%s, %s, %s, %s, %s, %s)",
-                    (hashes, partition_keys, partition_datatypes, queries, priorities, self.fragment_queue_table),
+                    "SELECT * FROM non_blocking_fragment_queue_batch_upsert(%s, %s, %s, %s, %s, %s, %s)",
+                    (hashes, partition_keys, partition_datatypes, queries, priorities, self.fragment_queue_table, cache_backends),
                 )
                 results = cursor.fetchall()
                 conn.commit()
@@ -470,14 +479,14 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
                 for query, hash_value in query_hash_pairs:
                     cursor.execute(
                         sql.SQL("""
-                        INSERT INTO {} (query, hash, partition_key, partition_datatype, priority, updated_at, created_at)
-                        VALUES (%s, %s, %s, %s, %s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                        INSERT INTO {} (query, hash, partition_key, partition_datatype, cache_backend, priority, updated_at, created_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                         ON CONFLICT (hash, partition_key)
                         DO UPDATE SET
                             priority = {}.priority + %s,
                             updated_at = CURRENT_TIMESTAMP
                     """).format(sql.Identifier(self.fragment_queue_table), sql.Identifier(self.fragment_queue_table)),
-                        (query, hash_value, partition_key, partition_datatype, priority, priority),
+                        (query, hash_value, partition_key, partition_datatype, cache_backend, priority, priority),
                     )
 
                 conn.commit()
@@ -631,13 +640,13 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
                 except Exception:
                     pass
 
-    def pop_from_query_fragment_queue(self) -> tuple[str, str, str, str] | None:
+    def pop_from_query_fragment_queue(self) -> tuple[str, str, str, str, str | None] | None:
         """
         Pop a query fragment from the query fragment queue.
         Uses PostgreSQL's SELECT FOR UPDATE SKIP LOCKED for atomic operations.
 
         Returns:
-            Tuple[str, str, str, str] or None: (query, hash, partition_key, partition_datatype) tuple if available, None if queue is empty.
+            Tuple[str, str, str, str, str | None] or None: (query, hash, partition_key, partition_datatype, cache_backend) tuple if available, None if queue is empty.
         """
         cursor = None
         try:
@@ -650,7 +659,7 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
             # Get the highest priority entry (highest priority first, then oldest)
             cursor.execute(
                 sql.SQL("""
-                SELECT id, query, hash, partition_key, partition_datatype FROM {}
+                SELECT id, query, hash, partition_key, partition_datatype, cache_backend FROM {}
                 ORDER BY priority DESC, created_at ASC
                 LIMIT 1 FOR UPDATE SKIP LOCKED
             """).format(sql.Identifier(self.fragment_queue_table))
@@ -661,14 +670,14 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
                 cursor.execute("ROLLBACK")
                 return None
 
-            entry_id, query, hash_value, partition_key, partition_datatype = entry
+            entry_id, query, hash_value, partition_key, partition_datatype, item_cache_backend = entry
 
             # Delete the entry
             cursor.execute(sql.SQL("DELETE FROM {} WHERE id = %s").format(sql.Identifier(self.fragment_queue_table)), (entry_id,))
             cursor.execute("COMMIT")
 
             logger.debug("Popped query fragment from PostgreSQL query fragment queue")
-            return (query, hash_value, partition_key, partition_datatype or "")
+            return (query, hash_value, partition_key, partition_datatype or "", item_cache_backend)
 
         except Exception as e:
             logger.error(f"Failed to pop from PostgreSQL query fragment queue: {e}")
@@ -679,7 +688,7 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
                 pass
             return None
 
-    def pop_from_query_fragment_queue_blocking(self, timeout: int = 60) -> tuple[str, str, str, str] | None:
+    def pop_from_query_fragment_queue_blocking(self, timeout: int = 60) -> tuple[str, str, str, str, str | None] | None:
         """
         Pop a query fragment from the query fragment queue with blocking wait.
         Uses PostgreSQL LISTEN/NOTIFY for efficient blocking with timeout fallback.
@@ -688,7 +697,7 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
             timeout (int): Maximum time to wait in seconds (default: 60)
 
         Returns:
-            Tuple[str, str, str, str] or None: (query, hash, partition_key, partition_datatype) tuple if available, None if timeout or error occurred.
+            Tuple[str, str, str, str, str | None] or None: (query, hash, partition_key, partition_datatype, cache_backend) tuple if available, None if timeout or error occurred.
         """
 
         # First try to get an item immediately
