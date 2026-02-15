@@ -62,13 +62,17 @@ def list_cache_types() -> dict[str, list[str]]:
     from partitioncache.cache_handler.postgresql_bit import PostgreSQLBitCacheHandler
     from partitioncache.cache_handler.postgresql_roaringbit import PostgreSQLRoaringBitCacheHandler
     from partitioncache.cache_handler.redis_bit import RedisBitCacheHandler
+    from partitioncache.cache_handler.redis_roaringbit import RedisRoaringBitCacheHandler
     from partitioncache.cache_handler.redis_set import RedisCacheHandler
     from partitioncache.cache_handler.rocks_dict import RocksDictCacheHandler
+    from partitioncache.cache_handler.rocksdict_roaringbit import RocksDictRoaringBitCacheHandler
 
     handler_classes = {
         "redis_set": RedisCacheHandler,
         "redis_bit": RedisBitCacheHandler,
+        "redis_roaringbit": RedisRoaringBitCacheHandler,
         "rocksdict": RocksDictCacheHandler,
+        "rocksdict_roaringbit": RocksDictRoaringBitCacheHandler,
         "postgresql_array": PostgreSQLArrayCacheHandler,
         "postgresql_bit": PostgreSQLBitCacheHandler,
         "postgresql_roaringbit": PostgreSQLRoaringBitCacheHandler,

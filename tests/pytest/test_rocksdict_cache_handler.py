@@ -34,7 +34,7 @@ def mock_rocksdict():
 @pytest.fixture
 def cache_handler(temp_db_path, mock_rocksdict):
     """Create RocksDictCacheHandler with mocked RocksDict."""
-    with patch("partitioncache.cache_handler.rocks_dict.Rdict", return_value=mock_rocksdict):
+    with patch("partitioncache.cache_handler.rocksdict_abstract.Rdict", return_value=mock_rocksdict):
         handler = RocksDictCacheHandler(temp_db_path)
         return handler
 
@@ -44,7 +44,7 @@ class TestRocksDictCacheHandler:
 
     def test_init_creates_db_with_options(self, temp_db_path):
         """Test that initialization creates RocksDB with proper options."""
-        with patch("partitioncache.cache_handler.rocks_dict.Rdict") as mock_rdict_class:
+        with patch("partitioncache.cache_handler.rocksdict_abstract.Rdict") as mock_rdict_class:
             mock_rdict = MagicMock()
             mock_rdict_class.return_value = mock_rdict
 
@@ -389,12 +389,19 @@ class TestRocksDictCacheHandler:
         assert RocksDictCacheHandler._instance is None
         assert RocksDictCacheHandler._refcount == 0
 
-    def test_close_multiple_references(self, cache_handler, mock_rocksdict):
-        """Test closing with multiple references."""
-        cache_handler._refcount = 2
-        cache_handler.close()
-        mock_rocksdict.close.assert_not_called()
-        assert cache_handler._refcount == 1
+    def test_close_multiple_references(self, temp_db_path, mock_rocksdict):
+        """Test singleton close behavior with multiple references."""
+        with patch("partitioncache.cache_handler.rocksdict_abstract.Rdict", return_value=mock_rocksdict):
+            RocksDictCacheHandler._instance = None
+            RocksDictCacheHandler._refcount = 0
+
+            instance1 = RocksDictCacheHandler.get_instance(temp_db_path)
+            instance2 = RocksDictCacheHandler.get_instance(temp_db_path)
+            assert instance1 is instance2
+
+            instance1.close()
+            mock_rocksdict.close.assert_not_called()
+            assert RocksDictCacheHandler._refcount == 1
 
     def test_compact(self, cache_handler, mock_rocksdict):
         """Test database compaction."""
@@ -438,7 +445,7 @@ class TestRocksDictCacheHandler:
 
     def test_get_instance_singleton(self, temp_db_path):
         """Test get_instance singleton behavior."""
-        with patch("partitioncache.cache_handler.rocks_dict.Rdict"):
+        with patch("partitioncache.cache_handler.rocksdict_abstract.Rdict"):
             # Reset class variables
             RocksDictCacheHandler._instance = None
             RocksDictCacheHandler._refcount = 0
@@ -448,6 +455,18 @@ class TestRocksDictCacheHandler:
 
             assert instance1 is instance2
             assert RocksDictCacheHandler._refcount == 2
+
+    def test_close_clears_singleton(self, temp_db_path):
+        """After close(), get_instance() should return a new instance."""
+        with patch("partitioncache.cache_handler.rocksdict_abstract.Rdict"):
+            RocksDictCacheHandler._instance = None
+            RocksDictCacheHandler._refcount = 0
+
+            inst1 = RocksDictCacheHandler.get_instance(temp_db_path)
+            inst1.close()
+
+            inst2 = RocksDictCacheHandler.get_instance(temp_db_path)
+            assert inst1 is not inst2  # Must be a fresh instance
 
     def test_get_datatype(self, cache_handler, mock_rocksdict):
         """Test getting datatype for partition."""

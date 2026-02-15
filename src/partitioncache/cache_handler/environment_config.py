@@ -143,6 +143,28 @@ class EnvironmentConfigManager:
                 "db_port": port,
             }
 
+        elif cache_type == "roaringbit":
+            db_name = os.getenv("REDIS_ROARINGBIT_DB")
+            if not db_name:
+                raise ValueError("REDIS_ROARINGBIT_DB environment variable not set")
+
+            host = os.getenv("REDIS_ROARINGBIT_HOST") or os.getenv("REDIS_HOST")
+            if not host:
+                raise ValueError("REDIS_ROARINGBIT_HOST or REDIS_HOST environment variable not set")
+
+            password = os.getenv("REDIS_ROARINGBIT_PASSWORD") or os.getenv("REDIS_PASSWORD", "")
+
+            port = os.getenv("REDIS_ROARINGBIT_PORT") or os.getenv("REDIS_PORT")
+            if not port:
+                raise ValueError("REDIS_ROARINGBIT_PORT or REDIS_PORT environment variable not set")
+
+            config = {
+                "db_name": db_name,
+                "db_host": host,
+                "db_password": password,
+                "db_port": port,
+            }
+
         elif cache_type == "bit":
             db_name = os.getenv("REDIS_BIT_DB")
             if not db_name:
@@ -214,7 +236,7 @@ class EnvironmentConfigManager:
         Get RocksDB configuration from environment variables.
 
         Args:
-            cache_type: Type of RocksDB cache ("set", "bit", or "dict")
+            cache_type: Type of RocksDB cache ("set", "bit", "dict", or "roaringbit")
 
         Returns:
             Dictionary with RocksDB configuration parameters
@@ -250,6 +272,13 @@ class EnvironmentConfigManager:
                 raise ValueError("ROCKSDB_DICT_PATH environment variable not set")
             config["db_path"] = db_path
 
+        elif cache_type == "roaringbit":
+            # Keep compatibility with existing ROCKSDB_* naming while allowing a dedicated roaringbit path.
+            db_path = os.getenv("ROCKSDICT_ROARINGBIT_PATH") or os.getenv("ROCKSDB_DICT_PATH")
+            if not db_path:
+                raise ValueError("ROCKSDICT_ROARINGBIT_PATH or ROCKSDB_DICT_PATH environment variable not set")
+            config["db_path"] = db_path
+
         else:
             raise ValueError(f"Unsupported RocksDB cache type: {cache_type}")
 
@@ -280,12 +309,16 @@ class EnvironmentConfigManager:
                 EnvironmentConfigManager.get_redis_config("set")
             elif cache_type == "redis_bit":
                 EnvironmentConfigManager.get_redis_config("bit")
+            elif cache_type == "redis_roaringbit":
+                EnvironmentConfigManager.get_redis_config("roaringbit")
             elif cache_type == "rocksdb_set":
                 EnvironmentConfigManager.get_rocksdb_config("set")
             elif cache_type == "rocksdb_bit":
                 EnvironmentConfigManager.get_rocksdb_config("bit")
             elif cache_type == "rocksdict":
                 EnvironmentConfigManager.get_rocksdb_config("dict")
+            elif cache_type == "rocksdict_roaringbit":
+                EnvironmentConfigManager.get_rocksdb_config("roaringbit")
             elif cache_type == "duckdb_bit":
                 EnvironmentConfigManager.get_duckdb_bit_config()
             else:

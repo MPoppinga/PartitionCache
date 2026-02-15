@@ -1089,11 +1089,19 @@ class DuckDBBitCacheHandler(AbstractCacheHandler_Lazy):
         """Close database connection."""
         try:
             with self._lock:
-                self._refcount -= 1
-                if self._refcount <= 0:
-                    if self.conn:
-                        self.conn.close()
-                    self._instance = None
-                    self._refcount = 0
+                cls = type(self)
+                is_singleton_instance = cls._instance is self and cls._refcount > 0
+
+                if is_singleton_instance:
+                    cls._refcount -= 1
+                    if cls._refcount > 0:
+                        return
+
+                if self.conn:
+                    self.conn.close()
+
+                if is_singleton_instance:
+                    cls._instance = None
+                    cls._refcount = 0
         except Exception as e:
             logger.error(f"Error closing DuckDB connection: {e}")

@@ -202,7 +202,7 @@ class TestCLIIntegration:
         backend_type = request.node.callspec.params["cache_client"]
 
         # Skip RocksDB backends for CLI tests due to file locking conflicts with subprocess calls
-        if backend_type.startswith("rocksdb") or backend_type == "rocksdict":
+        if backend_type.startswith("rocksdb") or backend_type.startswith("rocksdict"):
             pytest.skip(f"CLI tests not compatible with {backend_type} due to file locking conflicts between test fixtures and subprocess calls")
 
         backend_suffix = backend_type.replace("_", "").replace("-", "")
@@ -286,7 +286,7 @@ class TestCLIIntegration:
         backend_type = request.node.callspec.params["cache_client"]
 
         # Skip RocksDB backends for CLI tests due to file locking conflicts with subprocess calls
-        if backend_type.startswith("rocksdb") or backend_type == "rocksdict":
+        if backend_type.startswith("rocksdb") or backend_type.startswith("rocksdict"):
             pytest.skip(f"CLI tests not compatible with {backend_type} due to file locking conflicts between test fixtures and subprocess calls")
 
         backend_suffix = backend_type.replace("_", "").replace("-", "")
@@ -419,7 +419,7 @@ class TestCLIIntegration:
         backend_type = request.node.callspec.params["cache_client"]
 
         # Skip RocksDB backends for CLI tests due to file locking conflicts with subprocess calls
-        if backend_type.startswith("rocksdb") or backend_type == "rocksdict":
+        if backend_type.startswith("rocksdb") or backend_type.startswith("rocksdict"):
             pytest.skip(f"CLI tests not compatible with {backend_type} due to file locking conflicts between test fixtures and subprocess calls")
 
         backend_suffix = backend_type.replace("_", "").replace("-", "")

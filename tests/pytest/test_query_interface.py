@@ -38,7 +38,7 @@ def mock_rocksdict():
 @pytest.fixture
 def rocksdict_handler(temp_db_path, mock_rocksdict):
     """Create RocksDictCacheHandler with mocked RocksDict."""
-    with patch("partitioncache.cache_handler.rocks_dict.Rdict", return_value=mock_rocksdict):
+    with patch("partitioncache.cache_handler.rocksdict_abstract.Rdict", return_value=mock_rocksdict):
         handler = RocksDictCacheHandler(temp_db_path)
         return handler
 

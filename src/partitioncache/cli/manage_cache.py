@@ -43,9 +43,11 @@ def detect_configured_cache_backends() -> list[str]:
         "postgresql_roaringbit": lambda: EnvironmentConfigManager.get_postgresql_roaringbit_config(),
         "redis_set": lambda: EnvironmentConfigManager.get_redis_config("set"),
         "redis_bit": lambda: EnvironmentConfigManager.get_redis_config("bit"),
+        "redis_roaringbit": lambda: EnvironmentConfigManager.get_redis_config("roaringbit"),
         "rocksdb_set": lambda: EnvironmentConfigManager.get_rocksdb_config("set"),
         "rocksdb_bit": lambda: EnvironmentConfigManager.get_rocksdb_config("bit"),
         "rocksdict": lambda: EnvironmentConfigManager.get_rocksdb_config("dict"),
+        "rocksdict_roaringbit": lambda: EnvironmentConfigManager.get_rocksdb_config("roaringbit"),
     }
 
     for backend_name, config_func in backend_configs.items():

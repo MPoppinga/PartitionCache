@@ -51,9 +51,11 @@ def test_get_bitarray(cache_handler, mock_redis):
 def test_get_intersected_single_key(cache_handler, mock_redis):
     cache_key = "cache:partition_key:key1"
     cache_handler._get_partition_datatype = lambda pk: "integer"
-    mock_redis.pipeline.return_value = pipe = Mock()
-    pipe.type.side_effect = [b"string"]
-    pipe.execute.return_value = [b"string"]
+    type_pipe = Mock()
+    type_pipe.execute.return_value = [b"string"]
+    marker_pipe = Mock()
+    marker_pipe.execute.return_value = [b"0"]
+    mock_redis.pipeline.side_effect = [type_pipe, marker_pipe]
     mock_redis.get.return_value = b'0101' + b'0' * 97
     result, count = cache_handler.get_intersected({"key1"})
     assert result == {1, 3}
@@ -63,9 +65,11 @@ def test_get_intersected_single_key(cache_handler, mock_redis):
 
 def test_get_intersected_multiple_keys(cache_handler, mock_redis):
     cache_handler._get_partition_datatype = lambda pk: "integer"
-    mock_redis.pipeline.return_value = pipe = Mock()
-    pipe.type.side_effect = [b"string", b"string", b"hash"]
-    pipe.execute.return_value = [b"string", b"string", b"hash"]
+    type_pipe = Mock()
+    type_pipe.execute.return_value = [b"string", b"string", b"hash"]
+    marker_pipe = Mock()
+    marker_pipe.execute.return_value = [b"0", b"0"]
+    mock_redis.pipeline.side_effect = [type_pipe, marker_pipe]
     mock_redis.bitop.return_value = b'0101' + b'0' * 97
     mock_redis.get.return_value = b'0101' + b'0' * 97
 
@@ -73,6 +77,20 @@ def test_get_intersected_multiple_keys(cache_handler, mock_redis):
     assert result == {1,3}
     assert count == 2
     mock_redis.bitop.assert_called()
+
+def test_get_intersected_excludes_null_marker_from_count(cache_handler, mock_redis):
+    cache_handler._get_partition_datatype = lambda pk: "integer"
+    type_pipe = Mock()
+    type_pipe.execute.return_value = [b"string", b"string", b"none"]
+    marker_pipe = Mock()
+    marker_pipe.execute.return_value = [b"\x00", b"0"]
+    mock_redis.pipeline.side_effect = [type_pipe, marker_pipe]
+    mock_redis.get.return_value = b'0101' + b'0' * 97
+
+    result, count = cache_handler.get_intersected({"key1", "key2", "key3"})
+    assert result == {1, 3}
+    assert count == 1
+    mock_redis.bitop.assert_not_called()
 
 def test_set_cache_int(cache_handler, mock_redis):
     cache_key = "cache:partition_key:int_bit_key"
