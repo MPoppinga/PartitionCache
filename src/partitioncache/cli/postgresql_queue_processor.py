@@ -74,17 +74,26 @@ def _parse_timeout_seconds_arg(value: str) -> int:
     return _parse_duration_arg(value, "--timeout")
 
 
+DIRECT_PROCESSOR_BACKENDS = {
+    "postgresql_array": ("array", "PG_ARRAY_CACHE_TABLE_PREFIX"),
+    "postgresql_bit": ("bit", "PG_BIT_CACHE_TABLE_PREFIX"),
+    "postgresql_roaringbit": ("roaringbit", "PG_ROARINGBIT_CACHE_TABLE_PREFIX"),
+    "postgis_h3": ("h3", "PG_H3_CACHE_TABLE_PREFIX"),
+    "postgis_bbox": ("bbox", "PG_BBOX_CACHE_TABLE_PREFIX"),
+}
+
+
 def get_cache_backend_from_env() -> str:
     """
     Get the cache backend type from environment variables.
     """
     cache_backend = os.getenv("CACHE_BACKEND", "postgresql_array")
-    supported_backends = {"postgresql_array", "postgresql_bit", "postgresql_roaringbit"}
-    if cache_backend not in supported_backends:
+    backend_config = DIRECT_PROCESSOR_BACKENDS.get(cache_backend)
+    if backend_config is None:
         raise ValueError(f"Unsupported CACHE_BACKEND for direct processor: {cache_backend}")
 
-    # Return the simple name for the backend (e.g., 'array', 'bit')
-    return cache_backend.replace("postgresql_", "")
+    # Return the SQL backend key used by processor SQL functions (e.g., 'array', 'h3').
+    return backend_config[0]
 
 
 def get_table_prefix_from_env() -> str:
@@ -93,17 +102,11 @@ def get_table_prefix_from_env() -> str:
     This is used to determine which cache tables the direct processor should interact with.
     """
     cache_backend = os.getenv("CACHE_BACKEND", "postgresql_array")
-
-    supported_backends = {
-        "postgresql_array": "PG_ARRAY_CACHE_TABLE_PREFIX",
-        "postgresql_bit": "PG_BIT_CACHE_TABLE_PREFIX",
-        "postgresql_roaringbit": "PG_ROARINGBIT_CACHE_TABLE_PREFIX",
-    }
-
-    if cache_backend not in supported_backends:
+    backend_config = DIRECT_PROCESSOR_BACKENDS.get(cache_backend)
+    if backend_config is None:
         raise ValueError(f"Unsupported CACHE_BACKEND for direct processor: {cache_backend}")
 
-    table_prefix_env = supported_backends[cache_backend]
+    table_prefix_env = backend_config[1]
     table_prefix = os.getenv(table_prefix_env)
 
     if not table_prefix:

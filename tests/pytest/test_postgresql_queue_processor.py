@@ -9,10 +9,44 @@ from partitioncache.cli.postgresql_queue_processor import (
     SQL_CRON_FILE,
     check_and_grant_pg_cron_permissions,
     check_pg_cron_installed,
+    get_cache_backend_from_env,
     get_pg_cron_connection,
     get_processor_status,
+    get_table_prefix_from_env,
     validate_environment,
 )
+
+
+class TestBackendEnvMapping:
+    """Test backend/env mapping for direct processor."""
+
+    @pytest.mark.parametrize(
+        ("cache_backend", "expected_backend"),
+        [
+            ("postgresql_array", "array"),
+            ("postgresql_bit", "bit"),
+            ("postgresql_roaringbit", "roaringbit"),
+            ("postgis_h3", "h3"),
+            ("postgis_bbox", "bbox"),
+        ],
+    )
+    def test_get_cache_backend_from_env_supported(self, cache_backend, expected_backend):
+        with patch.dict(os.environ, {"CACHE_BACKEND": cache_backend}, clear=True):
+            assert get_cache_backend_from_env() == expected_backend
+
+    @pytest.mark.parametrize(
+        ("cache_backend", "prefix_env", "prefix_value"),
+        [
+            ("postgresql_array", "PG_ARRAY_CACHE_TABLE_PREFIX", "array_cache"),
+            ("postgresql_bit", "PG_BIT_CACHE_TABLE_PREFIX", "bit_cache"),
+            ("postgresql_roaringbit", "PG_ROARINGBIT_CACHE_TABLE_PREFIX", "roaring_cache"),
+            ("postgis_h3", "PG_H3_CACHE_TABLE_PREFIX", "h3_cache"),
+            ("postgis_bbox", "PG_BBOX_CACHE_TABLE_PREFIX", "bbox_cache"),
+        ],
+    )
+    def test_get_table_prefix_from_env_supported(self, cache_backend, prefix_env, prefix_value):
+        with patch.dict(os.environ, {"CACHE_BACKEND": cache_backend, prefix_env: prefix_value}, clear=True):
+            assert get_table_prefix_from_env() == prefix_value
 
 
 class TestEnvironmentValidation:
@@ -65,7 +99,15 @@ class TestEnvironmentValidation:
             assert not valid
             assert "Unsupported CACHE_BACKEND for direct processor" in message
 
-    def test_validate_environment_success(self):
+    @pytest.mark.parametrize(
+        ("cache_backend", "prefix_env", "prefix_value"),
+        [
+            ("postgresql_array", "PG_ARRAY_CACHE_TABLE_PREFIX", "partitioncache"),
+            ("postgis_h3", "PG_H3_CACHE_TABLE_PREFIX", "partitioncache_h3"),
+            ("postgis_bbox", "PG_BBOX_CACHE_TABLE_PREFIX", "partitioncache_bbox"),
+        ],
+    )
+    def test_validate_environment_success(self, cache_backend, prefix_env, prefix_value):
         """Test validation succeeds with correct configuration."""
         env = {
             "PG_QUEUE_HOST": "localhost",
@@ -78,8 +120,8 @@ class TestEnvironmentValidation:
             "DB_USER": "user",
             "DB_PASSWORD": "pass",
             "DB_NAME": "testdb",
-            "CACHE_BACKEND": "postgresql_array",
-            "PG_ARRAY_CACHE_TABLE_PREFIX": "partitioncache",
+            "CACHE_BACKEND": cache_backend,
+            prefix_env: prefix_value,
         }
         with patch.dict(os.environ, env, clear=True):
             valid, message = validate_environment()
