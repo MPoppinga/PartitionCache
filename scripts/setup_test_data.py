@@ -495,6 +495,136 @@ class TestDataSetup:
 
             print(f"  ✓ Created TPC-H dataset with scale factor {scale_factor}")
 
+    def create_ssb_dataset(self, size: str = "small", reset: bool = False):
+        """Create SSB (Star Schema Benchmark) dataset.
+
+        Creates all 5 SSB tables: lineorder (fact), customer, supplier, part, date_dim.
+        Uses the generate_ssb_data module for data generation.
+        """
+        from examples.ssb_benchmark.generate_ssb_data import (
+            generate_customers,
+            generate_date_dim,
+            generate_lineorder,
+            generate_parts,
+            generate_suppliers,
+        )
+
+        sizes = {"small": 0.01, "medium": 0.1, "large": 1.0}
+        scale_factor = sizes.get(size, 0.01)
+
+        print(f"Creating SSB dataset (size: {size}, SF={scale_factor})...")
+
+        random.seed(42)
+
+        with self.conn.cursor() as cur:
+            # Create tables
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS date_dim (
+                    d_datekey INTEGER PRIMARY KEY, d_date VARCHAR(18),
+                    d_dayofweek VARCHAR(9), d_month VARCHAR(9), d_year INTEGER,
+                    d_yearmonthnum INTEGER, d_yearmonth VARCHAR(7),
+                    d_daynuminweek INTEGER, d_daynuminmonth INTEGER, d_daynuminyear INTEGER,
+                    d_monthnuminyear INTEGER, d_weeknuminyear INTEGER,
+                    d_sellingseason VARCHAR(12), d_lastdayinweekfl INTEGER,
+                    d_lastdayinmonthfl INTEGER, d_holidayfl INTEGER, d_weekdayfl INTEGER
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS customer (
+                    c_custkey INTEGER PRIMARY KEY, c_name VARCHAR(25), c_address VARCHAR(25),
+                    c_city VARCHAR(10), c_nation VARCHAR(15), c_region VARCHAR(12),
+                    c_phone VARCHAR(15), c_mktsegment VARCHAR(10)
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS supplier (
+                    s_suppkey INTEGER PRIMARY KEY, s_name VARCHAR(25), s_address VARCHAR(25),
+                    s_city VARCHAR(10), s_nation VARCHAR(15), s_region VARCHAR(12), s_phone VARCHAR(15)
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS part (
+                    p_partkey INTEGER PRIMARY KEY, p_name VARCHAR(22), p_mfgr VARCHAR(6),
+                    p_category VARCHAR(7), p_brand VARCHAR(9), p_color VARCHAR(11),
+                    p_type VARCHAR(25), p_size INTEGER, p_container VARCHAR(10)
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS lineorder (
+                    lo_orderkey INTEGER, lo_linenumber INTEGER, lo_custkey INTEGER,
+                    lo_partkey INTEGER, lo_suppkey INTEGER, lo_orderdate INTEGER,
+                    lo_orderpriority VARCHAR(15), lo_shippriority INTEGER,
+                    lo_quantity INTEGER, lo_extendedprice INTEGER, lo_ordtotalprice INTEGER,
+                    lo_discount INTEGER, lo_revenue INTEGER, lo_supplycost INTEGER,
+                    lo_tax INTEGER, lo_commitdate INTEGER, lo_shipmode VARCHAR(10)
+                )
+            """)
+
+            if reset:
+                cur.execute("TRUNCATE TABLE lineorder, customer, supplier, part, date_dim RESTART IDENTITY CASCADE")
+                print("  ✓ Reset existing SSB data")
+
+            # Generate and insert data
+            print("  Generating date_dim...")
+            date_rows = generate_date_dim()
+            cur.executemany(
+                "INSERT INTO date_dim VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",
+                date_rows,
+            )
+            print(f"    Inserted {len(date_rows)} date rows")
+
+            print("  Generating customers...")
+            customer_rows = generate_customers(scale_factor)
+            cur.executemany(
+                "INSERT INTO customer VALUES (%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",
+                customer_rows,
+            )
+            print(f"    Inserted {len(customer_rows)} customers")
+
+            print("  Generating suppliers...")
+            supplier_rows = generate_suppliers(scale_factor)
+            cur.executemany(
+                "INSERT INTO supplier VALUES (%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",
+                supplier_rows,
+            )
+            print(f"    Inserted {len(supplier_rows)} suppliers")
+
+            print("  Generating parts...")
+            part_rows = generate_parts(scale_factor)
+            cur.executemany(
+                "INSERT INTO part VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",
+                part_rows,
+            )
+            print(f"    Inserted {len(part_rows)} parts")
+
+            print("  Generating lineorder...")
+            date_keys = [row[0] for row in date_rows]
+            lineorder_rows = generate_lineorder(
+                scale_factor, len(customer_rows), len(supplier_rows), len(part_rows), date_keys,
+            )
+
+            batch_size = 5000
+            for i in range(0, len(lineorder_rows), batch_size):
+                batch = lineorder_rows[i:i + batch_size]
+                cur.executemany(
+                    "INSERT INTO lineorder VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    batch,
+                )
+                if (i + batch_size) % 50000 == 0 or i + batch_size >= len(lineorder_rows):
+                    print(f"    Inserted {min(i + batch_size, len(lineorder_rows))} lineorder rows...")
+
+            # Create indexes
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_lo_custkey ON lineorder(lo_custkey)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_lo_suppkey ON lineorder(lo_suppkey)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_lo_partkey ON lineorder(lo_partkey)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_lo_orderdate ON lineorder(lo_orderdate)")
+
+            cur.execute("ANALYZE date_dim, customer, supplier, part, lineorder")
+
+            print(f"  ✓ Created SSB dataset with scale factor {scale_factor}")
+            print(f"    lineorder: {len(lineorder_rows)}, customer: {len(customer_rows)}, "
+                  f"supplier: {len(supplier_rows)}, part: {len(part_rows)}, date_dim: {len(date_rows)}")
+
     def get_dataset_stats(self) -> dict[str, Any]:
         """Get statistics about existing test datasets."""
         stats = {}
@@ -527,6 +657,25 @@ class TestDataSetup:
                 stats["tpch_orders_count"] = 0
                 stats["tpch_customers_count"] = 0
 
+            # Check SSB dataset
+            try:
+                cur.execute("SELECT COUNT(*) FROM lineorder")
+                stats["ssb_lineorder_count"] = cur.fetchone()[0]
+                cur.execute("SELECT COUNT(*) FROM customer")
+                stats["ssb_customer_count"] = cur.fetchone()[0]
+                cur.execute("SELECT COUNT(*) FROM supplier")
+                stats["ssb_supplier_count"] = cur.fetchone()[0]
+                cur.execute("SELECT COUNT(*) FROM part")
+                stats["ssb_part_count"] = cur.fetchone()[0]
+                cur.execute("SELECT COUNT(*) FROM date_dim")
+                stats["ssb_date_count"] = cur.fetchone()[0]
+            except:
+                stats["ssb_lineorder_count"] = 0
+                stats["ssb_customer_count"] = 0
+                stats["ssb_supplier_count"] = 0
+                stats["ssb_part_count"] = 0
+                stats["ssb_date_count"] = 0
+
         return stats
 
     def cleanup_test_data(self):
@@ -534,7 +683,8 @@ class TestDataSetup:
         print("Cleaning up test data...")
 
         with self.conn.cursor() as cur:
-            tables = ["test_spatial_points", "test_businesses", "test_orders", "test_tpch_orders", "test_customers", "test_nation"]
+            tables = ["test_spatial_points", "test_businesses", "test_orders", "test_tpch_orders", "test_customers", "test_nation",
+                      "lineorder", "customer", "supplier", "part", "date_dim"]
 
             for table in tables:
                 try:
@@ -549,7 +699,7 @@ def main():
     parser = argparse.ArgumentParser(description="Setup test data for PartitionCache")
     parser.add_argument("--reset", action="store_true", help="Reset existing test data")
     parser.add_argument("--size", choices=["small", "medium", "large"], default="small", help="Size of dataset to create")
-    parser.add_argument("--dataset", choices=["spatial", "orders", "tpch", "all"], default="spatial", help="Which dataset to create")
+    parser.add_argument("--dataset", choices=["spatial", "orders", "tpch", "ssb", "all"], default="spatial", help="Which dataset to create")
     parser.add_argument("--cleanup", action="store_true", help="Remove all test data")
     parser.add_argument("--stats", action="store_true", help="Show dataset statistics")
     parser.add_argument("--connection-string", help="Database connection string")
@@ -574,6 +724,11 @@ def main():
             print(f"  Orders: {stats['orders_count']} records")
             print(f"  TPC-H Orders: {stats['tpch_orders_count']} records")
             print(f"  TPC-H Customers: {stats['tpch_customers_count']} records")
+            print(f"  SSB Lineorder: {stats['ssb_lineorder_count']} records")
+            print(f"  SSB Customer: {stats['ssb_customer_count']} records")
+            print(f"  SSB Supplier: {stats['ssb_supplier_count']} records")
+            print(f"  SSB Part: {stats['ssb_part_count']} records")
+            print(f"  SSB Date: {stats['ssb_date_count']} records")
             return
 
         # Create datasets
@@ -586,6 +741,9 @@ def main():
         if args.dataset in ["tpch", "all"]:
             setup.create_tpch_dataset(args.size, args.reset)
 
+        if args.dataset in ["ssb", "all"]:
+            setup.create_ssb_dataset(args.size, args.reset)
+
         # Show final stats
         stats = setup.get_dataset_stats()
         print("\n✓ Test data setup complete!")
@@ -594,6 +752,8 @@ def main():
         print(f"  Orders: {stats['orders_count']} records")
         print(f"  TPC-H Orders: {stats['tpch_orders_count']} records")
         print(f"  TPC-H Customers: {stats['tpch_customers_count']} records")
+        print(f"  SSB Lineorder: {stats['ssb_lineorder_count']} records")
+        print(f"  SSB Customer: {stats['ssb_customer_count']} records")
 
     except Exception as e:
         print(f"✗ Error: {e}")
