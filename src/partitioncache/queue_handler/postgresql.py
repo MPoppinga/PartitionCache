@@ -64,12 +64,27 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
             # Check if the original query queue table already exists
             cursor.execute(sql.SQL("SELECT to_regclass('{0}')").format(sql.Identifier(self.original_queue_table)))
             if cursor.fetchone()[0]:
-                # Migration: add cache_backend column to existing fragment queue tables
-                cursor.execute(
-                    sql.SQL("ALTER TABLE {} ADD COLUMN IF NOT EXISTS cache_backend TEXT").format(sql.Identifier(self.fragment_queue_table))
-                )
-                conn.commit()
-                return
+                # Existing installation path: avoid ALTER TABLE unless migration is needed.
+                # Running ALTER TABLE on every handler init can block behind row locks.
+                cursor.execute(sql.SQL("SELECT to_regclass('{0}')").format(sql.Identifier(self.fragment_queue_table)))
+                fragment_table_exists = cursor.fetchone()[0] is not None
+                if fragment_table_exists:
+                    cursor.execute(
+                        """
+                        SELECT 1
+                        FROM information_schema.columns
+                        WHERE table_name = %s
+                          AND column_name = 'cache_backend'
+                        """,
+                        (self.fragment_queue_table,),
+                    )
+                    has_cache_backend = cursor.fetchone() is not None
+                    if not has_cache_backend:
+                        cursor.execute(
+                            sql.SQL("ALTER TABLE {} ADD COLUMN cache_backend TEXT").format(sql.Identifier(self.fragment_queue_table))
+                        )
+                    conn.commit()
+                    return
 
             # Create original query queue table with partition_key and priority
             cursor.execute(
