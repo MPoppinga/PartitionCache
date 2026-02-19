@@ -1,10 +1,8 @@
 -- TPC-H Q2.1: Revenue by part mfgr for BRASS parts from EUROPE suppliers
 SELECT p.p_mfgr, SUM(l.l_extendedprice * (1 - l.l_discount)) AS revenue
-FROM lineitem l, part p, supplier s, partsupp ps, nation n, region r
+FROM lineitem l, part p, supplier s, nation n, region r
 WHERE l.l_partkey = p.p_partkey
   AND l.l_suppkey = s.s_suppkey
-  AND p.p_partkey = ps.ps_partkey
-  AND s.s_suppkey = ps.ps_suppkey
   AND s.s_nationkey = n.n_nationkey
   AND n.n_regionkey = r.r_regionkey
   AND r.r_name = 'EUROPE'

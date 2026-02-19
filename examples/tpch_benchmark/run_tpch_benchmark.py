@@ -109,6 +109,23 @@ def load_query(query_dir, query_name):
         return f.read().strip()
 
 
+def compute_fact_table_stats(executor):
+    """
+    Query COUNT(DISTINCT pk) for each partition key column on lineitem.
+
+    Returns dict mapping partition key name to total distinct count, e.g.:
+        {"l_orderkey": 15000, "l_partkey": 2000, "l_suppkey": 100}
+    """
+    stats = {}
+    for pk in ["l_orderkey", "l_partkey", "l_suppkey"]:
+        rows, _ = executor.execute(f"SELECT COUNT(DISTINCT {pk}) FROM lineitem")
+        stats[pk] = rows[0][0]
+    print(f"\nFact table (lineitem) partition key cardinalities:")
+    for pk, count in stats.items():
+        print(f"  {pk}: {count:,} distinct values")
+    return stats
+
+
 # --- DuckDB Execution ---
 
 class DuckDBExecutor:
@@ -284,11 +301,12 @@ def populate_cache_for_query(executor, cache_manager, adapted_query, partition_k
     return stats
 
 
-def apply_cache_to_query(cache_manager, adapted_query, original_query, partition_keys):
+def apply_cache_to_query(cache_manager, adapted_query, original_query, partition_keys, fact_stats=None):
     """
     Apply cached restrictions for all partition keys to the original query.
 
     Returns (enhanced_query, per_pk_stats, cache_apply_time).
+    If fact_stats is provided, each pk_stats entry includes search_space_reduction.
     """
     apply_start = time.perf_counter()
     enhanced = original_query
@@ -305,11 +323,23 @@ def apply_cache_to_query(cache_manager, adapted_query, original_query, partition
             auto_detect_star_join=False,
         )
 
-        pk_stats[pk] = {
+        cached_set_size = len(cached_keys) if cached_keys else 0
+        entry = {
             "variants_checked": num_generated,
             "cache_hits": num_hits,
-            "partition_keys_found": len(cached_keys) if cached_keys else 0,
+            "partition_keys_found": cached_set_size,
         }
+
+        if fact_stats and pk in fact_stats and cached_set_size > 0:
+            total = fact_stats[pk]
+            reduction_pct = (1 - cached_set_size / total) * 100 if total > 0 else 0
+            entry["search_space_reduction"] = {
+                "total_distinct": total,
+                "cached_set_size": cached_set_size,
+                "reduction_pct": round(reduction_pct, 1),
+            }
+
+        pk_stats[pk] = entry
 
         if cached_keys:
             try:
@@ -327,7 +357,7 @@ def apply_cache_to_query(cache_manager, adapted_query, original_query, partition
     return enhanced, pk_stats, cache_apply_time
 
 
-def run_single_query(executor, cache_manager, query_name, query_dir, repeat=1):
+def run_single_query(executor, cache_manager, query_name, query_dir, repeat=1, fact_stats=None):
     """Run a single query through the full benchmark pipeline."""
     adapted_query = load_query(os.path.join(query_dir, "adapted"), query_name)
     original_query = load_query(os.path.join(query_dir, "original"), query_name)
@@ -360,7 +390,7 @@ def run_single_query(executor, cache_manager, query_name, query_dir, repeat=1):
 
     # 3. Apply cache and run enhanced query (with repeat)
     enhanced_query, pk_stats, cache_apply_time = apply_cache_to_query(
-        cache_manager, adapted_query, original_query, pks,
+        cache_manager, adapted_query, original_query, pks, fact_stats=fact_stats,
     )
     result["apply_stats"] = pk_stats
     result["cache_apply_time"] = cache_apply_time
@@ -386,7 +416,7 @@ def run_single_query(executor, cache_manager, query_name, query_dir, repeat=1):
 
 # --- Benchmark Modes ---
 
-def run_all_queries(executor, cache_manager, query_dir, repeat=1):
+def run_all_queries(executor, cache_manager, query_dir, repeat=1, fact_stats=None):
     """Run all TPC-H queries."""
     print("\n" + "=" * 80)
     print(f"TPC-H Benchmark: All Queries ({len(ALL_QUERIES)} queries)")
@@ -395,7 +425,7 @@ def run_all_queries(executor, cache_manager, query_dir, repeat=1):
     results = []
     for query_name in ALL_QUERIES:
         print(f"\n--- {query_name} ---")
-        result = run_single_query(executor, cache_manager, query_name, query_dir, repeat=repeat)
+        result = run_single_query(executor, cache_manager, query_name, query_dir, repeat=repeat, fact_stats=fact_stats)
         results.append(result)
         print_query_result(result)
 
@@ -403,7 +433,7 @@ def run_all_queries(executor, cache_manager, query_dir, repeat=1):
     return results
 
 
-def run_flight(executor, cache_manager, query_dir, flight_num, repeat=1):
+def run_flight(executor, cache_manager, query_dir, flight_num, repeat=1, fact_stats=None):
     """Run a single query flight."""
     queries = QUERY_FLIGHTS.get(flight_num)
     if not queries:
@@ -418,7 +448,7 @@ def run_flight(executor, cache_manager, query_dir, flight_num, repeat=1):
     results = []
     for query_name in queries:
         print(f"\n--- {query_name} ---")
-        result = run_single_query(executor, cache_manager, query_name, query_dir, repeat=repeat)
+        result = run_single_query(executor, cache_manager, query_name, query_dir, repeat=repeat, fact_stats=fact_stats)
         results.append(result)
         print_query_result(result)
 
@@ -426,7 +456,7 @@ def run_flight(executor, cache_manager, query_dir, flight_num, repeat=1):
     return results
 
 
-def run_cross_dimension(executor, cache_manager, query_dir, repeat=1):
+def run_cross_dimension(executor, cache_manager, query_dir, repeat=1, fact_stats=None):
     """
     Cross-dimension cache reuse evaluation.
 
@@ -483,7 +513,7 @@ def run_cross_dimension(executor, cache_manager, query_dir, repeat=1):
 
         # Apply and run (with repeat)
         enhanced_query, pk_stats, cache_apply_time = apply_cache_to_query(
-            cache_manager, adapted_query, original_query, pks,
+            cache_manager, adapted_query, original_query, pks, fact_stats=fact_stats,
         )
         cached_times = []
         cached_rows = None
@@ -573,7 +603,7 @@ def run_cross_dimension(executor, cache_manager, query_dir, repeat=1):
 
         # Apply and run (with repeat)
         enhanced_query, pk_stats, cache_apply_time = apply_cache_to_query(
-            cache_manager, adapted_query, original_query, pks,
+            cache_manager, adapted_query, original_query, pks, fact_stats=fact_stats,
         )
         cached_times = []
         cached_rows = None
@@ -637,7 +667,7 @@ def run_cross_dimension(executor, cache_manager, query_dir, repeat=1):
     return results
 
 
-def run_cold_vs_warm(executor, cache_manager, query_dir, repeat=1):
+def run_cold_vs_warm(executor, cache_manager, query_dir, repeat=1, fact_stats=None):
     """Compare cold cache (no pre-existing entries) vs warm cache (reuse from prior queries)."""
     print("\n" + "=" * 80)
     print("TPC-H Benchmark: Cold vs Warm Cache")
@@ -650,7 +680,7 @@ def run_cold_vs_warm(executor, cache_manager, query_dir, repeat=1):
     cold_results = []
     for query_name in QUERY_FLIGHTS[3]:
         print(f"\n--- {query_name} (cold) ---")
-        result = run_single_query(executor, cache_manager, query_name, query_dir, repeat=repeat)
+        result = run_single_query(executor, cache_manager, query_name, query_dir, repeat=repeat, fact_stats=fact_stats)
         result["mode"] = "cold"
         cold_results.append(result)
         print_query_result(result)
@@ -660,7 +690,7 @@ def run_cold_vs_warm(executor, cache_manager, query_dir, repeat=1):
     warm_results = []
     for query_name in QUERY_FLIGHTS[3]:
         print(f"\n--- {query_name} (warm) ---")
-        result = run_single_query(executor, cache_manager, query_name, query_dir, repeat=repeat)
+        result = run_single_query(executor, cache_manager, query_name, query_dir, repeat=repeat, fact_stats=fact_stats)
         result["mode"] = "warm"
         warm_results.append(result)
         print_query_result(result)
@@ -678,7 +708,7 @@ def run_cold_vs_warm(executor, cache_manager, query_dir, repeat=1):
     return cold_results + warm_results
 
 
-def run_hierarchy(executor, cache_manager, query_dir, repeat=1):
+def run_hierarchy(executor, cache_manager, query_dir, repeat=1, fact_stats=None):
     """
     Hierarchical drill-down evaluation.
 
@@ -814,7 +844,7 @@ def run_hierarchy(executor, cache_manager, query_dir, repeat=1):
     return all_results
 
 
-def run_backend_comparison(executor, cache_manager, query_dir, db_backend, db_path=None, scale_factor=0.01, repeat=1):
+def run_backend_comparison(executor, cache_manager, query_dir, db_backend, db_path=None, scale_factor=0.01, repeat=1, fact_stats=None):
     """
     Compare different cache backends on a fixed set of representative queries.
 
@@ -855,7 +885,7 @@ def run_backend_comparison(executor, cache_manager, query_dir, db_backend, db_pa
         for query_name in representative_queries:
             print(f"\n--- {query_name} ---")
             try:
-                result = run_single_query(executor, cm, query_name, query_dir, repeat=repeat)
+                result = run_single_query(executor, cm, query_name, query_dir, repeat=repeat, fact_stats=fact_stats)
                 backend_results.append(result)
                 print_query_result(result)
             except Exception as e:
@@ -918,6 +948,21 @@ def print_query_result(result):
         print(f"    {pk}: {cs.get('fragments_generated', 0)} fragments, "
               f"{ap.get('cache_hits', 0)} hits, "
               f"{ap.get('partition_keys_found', 0)} keys{pop_str}")
+
+    # Search space reduction
+    has_reduction = any(
+        "search_space_reduction" in result["apply_stats"].get(pk, {})
+        for pk in result["partition_keys"]
+    )
+    if has_reduction:
+        print("  Search Space Reduction:")
+        for pk in result["partition_keys"]:
+            ssr = result["apply_stats"].get(pk, {}).get("search_space_reduction")
+            if ssr:
+                print(f"    {pk}: {ssr['total_distinct']:,} total -> "
+                      f"{ssr['cached_set_size']:,} cached "
+                      f"({ssr['reduction_pct']:.1f}% reduction)")
+
     cached_str = f"{result['cached_time']:.4f}s"
     if "cached_stddev" in result:
         cached_str += f" (stddev: {result['cached_stddev']:.4f}s)"
@@ -925,27 +970,52 @@ def print_query_result(result):
           f"(speedup: {result['speedup']:.2f}x, match: {result['result_match']})")
 
 
+def _avg_reduction(result):
+    """Compute average search space reduction % across all PKs for a result."""
+    reductions = []
+    for pk in result.get("partition_keys", []):
+        ssr = result.get("apply_stats", {}).get(pk, {}).get("search_space_reduction")
+        if ssr:
+            reductions.append(ssr["reduction_pct"])
+    return sum(reductions) / len(reductions) if reductions else None
+
+
 def print_summary(results):
     """Print overall summary."""
     has_stddev = any("baseline_stddev" in r for r in results)
+    has_reduction = any(_avg_reduction(r) is not None for r in results)
 
     if has_stddev:
+        header = f"{'Query':<8} {'Baseline':>10} {'B.Std':>8} {'Cached':>10} {'C.Std':>8} {'Speedup':>9} {'Match':>7}"
+        if has_reduction:
+            header += f" {'Reduction':>10}"
         print(f"\n{'=' * 80}")
-        print(f"{'Query':<8} {'Baseline':>10} {'B.Std':>8} {'Cached':>10} {'C.Std':>8} {'Speedup':>9} {'Match':>7}")
-        print("-" * 64)
+        print(header)
+        print("-" * len(header))
         for r in results:
             b_std = f"{r.get('baseline_stddev', 0):.4f}" if "baseline_stddev" in r else "n/a"
             c_std = f"{r.get('cached_stddev', 0):.4f}" if "cached_stddev" in r else "n/a"
-            print(f"{r['query']:<8} {r['baseline_time']:>9.4f}s {b_std:>8} "
-                  f"{r['cached_time']:>9.4f}s {c_std:>8} "
-                  f"{r['speedup']:>8.2f}x {'Y' if r['result_match'] else 'N':>6}")
+            line = (f"{r['query']:<8} {r['baseline_time']:>9.4f}s {b_std:>8} "
+                    f"{r['cached_time']:>9.4f}s {c_std:>8} "
+                    f"{r['speedup']:>8.2f}x {'Y' if r['result_match'] else 'N':>6}")
+            if has_reduction:
+                avg_red = _avg_reduction(r)
+                line += f" {avg_red:>9.1f}%" if avg_red is not None else f" {'n/a':>10}"
+            print(line)
     else:
+        header = f"{'Query':<8} {'Baseline':>10} {'Cached':>10} {'Speedup':>9} {'Match':>7}"
+        if has_reduction:
+            header += f" {'Reduction':>10}"
         print(f"\n{'=' * 80}")
-        print(f"{'Query':<8} {'Baseline':>10} {'Cached':>10} {'Speedup':>9} {'Match':>7}")
-        print("-" * 48)
+        print(header)
+        print("-" * len(header))
         for r in results:
-            print(f"{r['query']:<8} {r['baseline_time']:>9.4f}s {r['cached_time']:>9.4f}s "
-                  f"{r['speedup']:>8.2f}x {'Y' if r['result_match'] else 'N':>6}")
+            line = (f"{r['query']:<8} {r['baseline_time']:>9.4f}s {r['cached_time']:>9.4f}s "
+                    f"{r['speedup']:>8.2f}x {'Y' if r['result_match'] else 'N':>6}")
+            if has_reduction:
+                avg_red = _avg_reduction(r)
+                line += f" {avg_red:>9.1f}%" if avg_red is not None else f" {'n/a':>10}"
+            print(line)
 
     avg_speedup = sum(r["speedup"] for r in results) / len(results) if results else 0
     all_match = all(r["result_match"] for r in results)
@@ -1006,24 +1076,27 @@ def main():
     cache_manager = CacheManager(cache_type, scale_factor=args.scale_factor, db_path=db_path)
 
     try:
+        # Compute fact table stats for search space reduction metrics
+        fact_stats = compute_fact_table_stats(executor)
+
         mode = args.mode[0]
 
         if mode == "all":
-            results = run_all_queries(executor, cache_manager, query_dir, repeat=args.repeat)
+            results = run_all_queries(executor, cache_manager, query_dir, repeat=args.repeat, fact_stats=fact_stats)
         elif mode == "flight":
             flight_num = int(args.mode[1]) if len(args.mode) > 1 else 3
-            results = run_flight(executor, cache_manager, query_dir, flight_num, repeat=args.repeat)
+            results = run_flight(executor, cache_manager, query_dir, flight_num, repeat=args.repeat, fact_stats=fact_stats)
         elif mode == "cross-dimension":
-            results = run_cross_dimension(executor, cache_manager, query_dir, repeat=args.repeat)
+            results = run_cross_dimension(executor, cache_manager, query_dir, repeat=args.repeat, fact_stats=fact_stats)
         elif mode == "cold-vs-warm":
-            results = run_cold_vs_warm(executor, cache_manager, query_dir, repeat=args.repeat)
+            results = run_cold_vs_warm(executor, cache_manager, query_dir, repeat=args.repeat, fact_stats=fact_stats)
         elif mode == "hierarchy":
-            results = run_hierarchy(executor, cache_manager, query_dir, repeat=args.repeat)
+            results = run_hierarchy(executor, cache_manager, query_dir, repeat=args.repeat, fact_stats=fact_stats)
         elif mode == "backend-comparison":
             results = run_backend_comparison(
                 executor, cache_manager, query_dir,
                 db_backend=args.db_backend, db_path=db_path,
-                scale_factor=args.scale_factor, repeat=args.repeat,
+                scale_factor=args.scale_factor, repeat=args.repeat, fact_stats=fact_stats,
             )
         else:
             print(f"Unknown mode: {mode}")
@@ -1039,6 +1112,7 @@ def main():
                     "scale_factor": args.scale_factor,
                     "repeat": args.repeat,
                     "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "fact_table_stats": fact_stats,
                 },
                 "results": [],
             }

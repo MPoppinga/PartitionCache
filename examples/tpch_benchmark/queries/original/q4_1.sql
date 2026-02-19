@@ -1,13 +1,12 @@
--- TPC-H Q4.1: Profit by year, AMERICA cust+supp, Manufacturer#1/#2 parts
+-- TPC-H Q4.1: Revenue by year, AMERICA cust+supp, Manufacturer#1/#2 parts
 SELECT EXTRACT(YEAR FROM o.o_orderdate) AS o_year,
-       SUM(l.l_extendedprice * (1 - l.l_discount) - ps.ps_supplycost * l.l_quantity) AS profit
-FROM lineitem l, orders o, customer c, supplier s, part p, partsupp ps,
+       SUM(l.l_extendedprice * (1 - l.l_discount)) AS revenue
+FROM lineitem l, orders o, customer c, supplier s, part p,
      nation cn, nation sn, region cr, region sr
 WHERE l.l_orderkey = o.o_orderkey
   AND o.o_custkey = c.c_custkey
   AND l.l_suppkey = s.s_suppkey
   AND l.l_partkey = p.p_partkey
-  AND l.l_partkey = ps.ps_partkey AND l.l_suppkey = ps.ps_suppkey
   AND c.c_nationkey = cn.n_nationkey
   AND s.s_nationkey = sn.n_nationkey
   AND cn.n_regionkey = cr.r_regionkey

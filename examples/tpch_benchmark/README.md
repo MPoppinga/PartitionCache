@@ -40,6 +40,25 @@ python run_tpch_benchmark.py --scale-factor 0.01 --db-backend postgresql --mode 
 python run_tpch_benchmark.py --scale-factor 0.01 --db-backend postgresql --mode backend-comparison
 ```
 
+## Data Generation
+
+The data generator uses **DuckDB's built-in TPC-H extension** (`CALL dbgen(sf=X)`) to produce spec-compliant data:
+
+- Grammar-based part names (e.g., "almond aquamarine mint royal cream") instead of placeholders
+- TPC-H-prescribed distributions (Zipf, seasonal patterns) instead of uniform random
+- Deterministic output matching the official `dbgen` tool
+- Arbitrary scale factors supported (not limited to 0.01, 0.1, 1.0)
+
+For PostgreSQL, data is generated in a temporary DuckDB instance and bulk-loaded via `COPY FROM`.
+
+```bash
+# DuckDB (direct generation)
+python generate_tpch_data.py --scale-factor 0.01 --db-backend duckdb
+
+# PostgreSQL (DuckDB -> CSV -> COPY FROM)
+python generate_tpch_data.py --scale-factor 0.1 --db-backend postgresql
+```
+
 ## TPC-H Schema (8 Tables)
 
 ```
@@ -82,6 +101,8 @@ AND l.l_orderkey IN (SELECT o_orderkey FROM orders
 
 This separation enables PartitionCache to cache each condition independently - a date-only variant gets its own hash, reusable by any query with the same date range regardless of customer filters.
 
+Why not a single combined subquery? If customer and date were a single `l_orderkey IN (SELECT o_orderkey FROM orders WHERE o_custkey IN (...) AND o_orderdate ...)`, the cache entry would be specific to that exact (customer, date) combination. By splitting them, the date cache entry is reusable by any query with the same date range, regardless of customer filter, and vice versa.
+
 ## Deeper Hierarchy Nesting
 
 TPC-H's nation/region hierarchy creates deeper IN-subquery nesting than SSB:
@@ -113,7 +134,7 @@ Three partition key columns on the `lineitem` fact table:
 | Q1 (1.1-1.3) | 3 | YES (date) | - | - | Date via orders + lineitem attrs |
 | Q2 (2.1-2.3) | 3 | - | YES | YES | Part type/brand + supplier region |
 | Q3 (3.1-3.4) | 4 | YES (date+cust) | - | YES | Customer + date + supplier |
-| Q4 (4.1-4.3) | 3 | YES (date+cust) | YES | YES | All 3 PKs, all dimensions |
+| Q4 (4.1-4.3) | 3 | YES (date+cust) | YES | YES | All 3 PKs, revenue (no partsupp) |
 | Q5 (5.1-5.3) | 3 | YES (date+cust) | - | YES | Supplier hierarchy drill-down |
 | Q6 (6.1-6.3) | 3 | YES (date) | YES | YES | Part hierarchy drill-down |
 | Q7 (7.1-7.3) | 3 | * | * | * | Single PK per query |
@@ -156,7 +177,7 @@ Constant: ASIA customers + 1994-1996 date
 |-------|------------|----------------|
 | q6_1 | mfgr = Manufacturer#1 | Manufacturer (broadest) |
 | q6_2 | brand = Brand#13 | Brand |
-| q6_3 | brand = Brand#13 + type = ECONOMY BURNISHED BRASS | Brand + type (narrowest) |
+| q6_3 | brand = Brand#13 + type LIKE '%BRASS' | Brand + type (narrowest) |
 
 Constant: 1994-1996 date + AMERICA suppliers
 
@@ -218,6 +239,33 @@ WHERE l.l_orderkey IN (SELECT o_orderkey FROM orders
 ```
 
 The SELECT column is irrelevant when `strip_select=True` - it gets replaced with `SELECT DISTINCT {partition_key}` during variant generation.
+
+## Search Space Reduction Metrics
+
+The benchmark reports **search space reduction** per partition key for each query. This metric shows how much the cache narrows the fact table scan:
+
+```
+Search Space Reduction:
+  l_orderkey: 15,000 total -> 2,340 cached (84.4% reduction)
+  l_suppkey:  100 total -> 20 cached (80.0% reduction)
+```
+
+- **total**: `COUNT(DISTINCT pk)` across the entire `lineitem` table (computed once at startup)
+- **cached**: number of distinct PK values in the intersected cache entry
+- **reduction**: `(1 - cached / total) * 100` - percentage of the search space eliminated
+
+Higher reduction means the cache provides a tighter constraint. The summary table includes an average reduction column per query when these metrics are available.
+
+In JSON output (`--output`), each partition key's `apply_stats` entry includes:
+```json
+"search_space_reduction": {
+  "total_distinct": 15000,
+  "cached_set_size": 2340,
+  "reduction_pct": 84.4
+}
+```
+
+The `fact_table_stats` are also included in the `metadata` section.
 
 ## File Structure
 
