@@ -152,69 +152,84 @@ load_env() {
 # Function to run the tests
 run_tests() {
     echo -e "${YELLOW}🧪 Running integration tests...${NC}"
-    
-    # Construct pytest command
-    PYTEST_CMD="python -m pytest tests/integration/"
-    
+
+    # Build pytest command as an array for safe argument handling.
+    # This avoids eval/quoting issues for complex -k expressions.
+    local -a PYTEST_CMD=("python" "-m" "pytest" "tests/integration/")
+    local K_EXPR=""
+
     # Add pattern filter
     if [ -n "$TEST_PATTERN" ]; then
         if [ "$TEST_PATTERN" = "postgresql" ]; then
-            PYTEST_CMD="$PYTEST_CMD -k 'postgresql_array or postgresql_bit or postgresql_roaringbit'"
+            K_EXPR="postgresql_array or postgresql_bit or postgresql_roaringbit"
         elif [ "$TEST_PATTERN" = "redis" ]; then
-            PYTEST_CMD="$PYTEST_CMD -k 'redis_set or redis_bit'"
+            K_EXPR="redis_set or redis_bit"
         elif [ "$TEST_PATTERN" = "rocksdb" ]; then
-            PYTEST_CMD="$PYTEST_CMD -k 'rocksdb_set or rocksdb_bit or rocksdict'"
+            K_EXPR="rocksdb_set or rocksdb_bit or rocksdict"
         elif [ "$TEST_PATTERN" = "postgresql_array" ]; then
-            PYTEST_CMD="$PYTEST_CMD -k 'postgresql_array'"
+            K_EXPR="postgresql_array"
         elif [ "$TEST_PATTERN" = "postgresql_bit" ]; then
-            PYTEST_CMD="$PYTEST_CMD -k 'postgresql_bit'"
+            K_EXPR="postgresql_bit"
         elif [ "$TEST_PATTERN" = "postgresql_roaringbit" ]; then
-            PYTEST_CMD="$PYTEST_CMD -k 'postgresql_roaringbit'"
+            K_EXPR="postgresql_roaringbit"
         elif [ "$TEST_PATTERN" = "redis_set" ]; then
-            PYTEST_CMD="$PYTEST_CMD -k 'redis_set'"
+            K_EXPR="redis_set"
         elif [ "$TEST_PATTERN" = "redis_bit" ]; then
-            PYTEST_CMD="$PYTEST_CMD -k 'redis_bit'"
+            K_EXPR="redis_bit"
         elif [ "$TEST_PATTERN" = "spatial" ]; then
-            PYTEST_CMD="$PYTEST_CMD -k 'spatial'"
+            K_EXPR="spatial"
         else
-            PYTEST_CMD="$PYTEST_CMD -k $TEST_PATTERN"
+            K_EXPR="$TEST_PATTERN"
         fi
     fi
-    
+
     # Add specific backend filter
     if [ -n "$BACKEND_FILTER" ]; then
-        if [ -n "$TEST_PATTERN" ]; then
-            PYTEST_CMD="$PYTEST_CMD and $BACKEND_FILTER"
+        if [ -n "$K_EXPR" ]; then
+            K_EXPR="($K_EXPR) and ($BACKEND_FILTER)"
         else
-            PYTEST_CMD="$PYTEST_CMD -k $BACKEND_FILTER"
+            K_EXPR="$BACKEND_FILTER"
         fi
     fi
-    
+
+    if [ -n "$K_EXPR" ]; then
+        PYTEST_CMD+=("-k" "$K_EXPR")
+    fi
+
     # Add verbose flag
     if [ "$VERBOSE" = true ]; then
-        PYTEST_CMD="$PYTEST_CMD -v"
+        PYTEST_CMD+=("-v")
     fi
-    
+
     # Add parallel execution
     if [ "$PARALLEL" = true ]; then
-        PYTEST_CMD="$PYTEST_CMD -n auto"
+        PYTEST_CMD+=("-n" "auto")
     fi
-    
+
     # Add coverage
     if [ "$COVERAGE" = true ]; then
-        PYTEST_CMD="$PYTEST_CMD --cov=partitioncache --cov-report=html --cov-report=term-missing"
+        PYTEST_CMD+=("--cov=partitioncache" "--cov-report=html" "--cov-report=term-missing")
     fi
-    
+
+    # In CI, always print skip reasons in the summary.
+    if [ "$CI_MODE" = true ]; then
+        PYTEST_CMD+=("-rs")
+    fi
+
     # Add ignore paths
     if [ -n "$IGNORE_PATHS" ]; then
-        PYTEST_CMD="$PYTEST_CMD $IGNORE_PATHS"
+        # shellcheck disable=SC2206
+        local ignore_args=( $IGNORE_PATHS )
+        PYTEST_CMD+=("${ignore_args[@]}")
     fi
-    
+
     # Add extra pytest args
     if [ -n "$PYTEST_ARGS" ]; then
-        PYTEST_CMD="$PYTEST_CMD $PYTEST_ARGS"
+        # shellcheck disable=SC2206
+        local extra_args=( $PYTEST_ARGS )
+        PYTEST_CMD+=("${extra_args[@]}")
     fi
-    
+
     # Show environment info
     echo -e "${BLUE}📋 Test Environment:${NC}"
     echo "  PostgreSQL: ${PG_HOST:-localhost}:${PG_PORT:-5432}"
@@ -223,16 +238,17 @@ run_tests() {
     echo "  Pattern: ${TEST_PATTERN:-all}"
     echo "  Backend: ${BACKEND_FILTER:-all}"
     echo ""
-    echo -e "${BLUE}🏃 Running command: $PYTEST_CMD${NC}"
+    printf -v PYTEST_CMD_STRING '%q ' "${PYTEST_CMD[@]}"
+    echo -e "${BLUE}🏃 Running command: ${PYTEST_CMD_STRING}${NC}"
     echo ""
-    
+
     # Show available backends
     show_available_backends
-    
+
     # Run the tests
     local start_time=$(date +%s)
-    
-    if eval $PYTEST_CMD; then
+
+    if "${PYTEST_CMD[@]}"; then
         local end_time=$(date +%s)
         local duration=$((end_time - start_time))
         echo -e "\n${GREEN}✅ All integration tests passed! (${duration}s)${NC}"

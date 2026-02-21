@@ -35,6 +35,7 @@ except ImportError:
     PSYCOPG2_AVAILABLE = False
 
 import partitioncache
+from partitioncache.query_processor import generate_all_query_hash_pairs
 
 # Path to spatial test queries
 SPATIAL_QUERIES_DIR = Path(__file__).parent.parent.parent / "examples" / "openstreetmap_poi" / "testqueries_examples" / "spatial"
@@ -107,6 +108,31 @@ BACKEND_CONFIGS = {
     },
 }
 
+SAMPLE_POIS_SQL = """
+    INSERT INTO pois (name, subtype, geom) VALUES
+        ('Eis Cafe Milano', 'ice_cream', ST_SetSRID(ST_MakePoint(549000, 5802000), 25832)),
+        ('Eis Dolomiti', 'ice_cream', ST_SetSRID(ST_MakePoint(549050, 5802020), 25832)),
+        ('Eis am Markt', 'ice_cream', ST_SetSRID(ST_MakePoint(549080, 5802050), 25832)),
+        ('Markt Apotheke', 'pharmacy', ST_SetSRID(ST_MakePoint(549100, 5802010), 25832)),
+        ('Rats Apotheke', 'pharmacy', ST_SetSRID(ST_MakePoint(549120, 5802080), 25832)),
+        ('Stadt Apotheke', 'pharmacy', ST_SetSRID(ST_MakePoint(549060, 5802100), 25832)),
+        ('ALDI Nord', 'supermarket', ST_SetSRID(ST_MakePoint(549030, 5802070), 25832)),
+        ('Edeka Markt', 'supermarket', ST_SetSRID(ST_MakePoint(549150, 5802030), 25832)),
+        ('ALDI Sued', 'supermarket', ST_SetSRID(ST_MakePoint(549070, 5802130), 25832)),
+        ('Stadtbad', 'swimming_pool', ST_SetSRID(ST_MakePoint(549110, 5802060), 25832)),
+        ('Schwimmbad Am See', 'swimming_pool', ST_SetSRID(ST_MakePoint(549040, 5802110), 25832))
+"""
+
+
+def _seed_pois_if_empty(conn) -> None:
+    """Seed sample POI rows when CI starts from an empty pois table."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM pois")
+        row = cur.fetchone()
+        if row and row[0] == 0:
+            cur.execute(SAMPLE_POIS_SQL)
+            conn.commit()
+
 
 @pytest.fixture(scope="module")
 def poi_connection():
@@ -114,6 +140,7 @@ def poi_connection():
     _skip_if_no_database()
     _skip_if_no_queries()
     conn = _get_db_connection()
+    _seed_pois_if_empty(conn)
     yield conn
     conn.close()
 
@@ -142,6 +169,40 @@ def _has_cache_entries(backend_name: str, partition_key: str) -> bool:
         return False
 
 
+def _ensure_cache_entries(backend_name: str, partition_key: str, queries: list[tuple[str, str]]) -> bool:
+    """Populate cache entries on-demand so spatial E2E can run in CI."""
+    if _has_cache_entries(backend_name, partition_key):
+        return True
+
+    try:
+        handler = partitioncache.get_cache_handler(backend_name, singleton=True)
+    except Exception:
+        return False
+
+    try:
+        handler.register_partition_key(partition_key, "geometry")
+    except Exception:
+        pass
+
+    for _query_name, sql_query in queries:
+        try:
+            hash_pairs = generate_all_query_hash_pairs(
+                sql_query.strip(),
+                partition_key=partition_key,
+                min_component_size=1,
+                skip_partition_key_joins=True,
+                geometry_column="geom",
+            )
+            for fragment_query, query_hash in hash_pairs:
+                handler.set_cache_lazy(query_hash, fragment_query, partition_key)
+                handler.set_query(query_hash, fragment_query, partition_key)
+        except Exception:
+            # If one query fails to prewarm we still try others.
+            continue
+
+    return _has_cache_entries(backend_name, partition_key)
+
+
 @pytest.mark.skipif(not PSYCOPG2_AVAILABLE, reason="psycopg2 not installed")
 class TestPostGISSpatialE2E:
     """
@@ -167,6 +228,7 @@ class TestPostGISSpatialE2E:
         """Test non-lazy apply_cache() with spatial filter for all queries."""
         config = BACKEND_CONFIGS[backend_name]
 
+        _ensure_cache_entries(backend_name, config["partition_key"], self.queries)
         if not _has_cache_entries(backend_name, config["partition_key"]):
             pytest.skip(f"No cache entries for {backend_name} partition key '{config['partition_key']}'")
 
@@ -209,6 +271,7 @@ class TestPostGISSpatialE2E:
         """Test lazy apply_cache_lazy() with spatial filter for all queries."""
         config = BACKEND_CONFIGS[backend_name]
 
+        _ensure_cache_entries(backend_name, config["partition_key"], self.queries)
         if not _has_cache_entries(backend_name, config["partition_key"]):
             pytest.skip(f"No cache entries for {backend_name} partition key '{config['partition_key']}'")
 
@@ -252,6 +315,7 @@ class TestPostGISSpatialE2E:
         """Verify that lazy and non-lazy paths return the same result count."""
         config = BACKEND_CONFIGS[backend_name]
 
+        _ensure_cache_entries(backend_name, config["partition_key"], self.queries)
         if not _has_cache_entries(backend_name, config["partition_key"]):
             pytest.skip(f"No cache entries for {backend_name} partition key '{config['partition_key']}'")
 
@@ -302,6 +366,7 @@ class TestPostGISSpatialE2E:
         """Test that get_spatial_filter() returns valid WKB with correct SRID."""
         config = BACKEND_CONFIGS[backend_name]
 
+        _ensure_cache_entries(backend_name, config["partition_key"], self.queries)
         if not _has_cache_entries(backend_name, config["partition_key"]):
             pytest.skip(f"No cache entries for {backend_name} partition key '{config['partition_key']}'")
 
@@ -362,6 +427,7 @@ class TestPostGISSpatialE2E:
         """
         config = BACKEND_CONFIGS[backend_name]
 
+        _ensure_cache_entries(backend_name, config["partition_key"], self.queries)
         if not _has_cache_entries(backend_name, config["partition_key"]):
             pytest.skip(f"No cache entries for {backend_name} partition key '{config['partition_key']}'")
 

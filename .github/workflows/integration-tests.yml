@@ -72,6 +72,8 @@ jobs:
         include:
           - name: "PostgreSQL Array Backend"
             pattern: "postgresql_array"
+            backend_filter: "postgresql_array"
+            integration_backends: "postgresql_array"
             suffix: "pg_array"
             backend_type: "postgresql_array"
             database_suffix: "array"
@@ -80,6 +82,8 @@ jobs:
             job_index: 0
           - name: "PostgreSQL Bit Backend"
             pattern: "postgresql_bit"
+            backend_filter: "postgresql_bit"
+            integration_backends: "postgresql_bit"
             suffix: "pg_bit"
             backend_type: "postgresql_bit"
             database_suffix: "bit"
@@ -88,6 +92,8 @@ jobs:
             job_index: 1
           - name: "PostgreSQL RoaringBit Backend"
             pattern: "postgresql_roaringbit"
+            backend_filter: "postgresql_roaringbit"
+            integration_backends: "postgresql_roaringbit"
             suffix: "pg_roaring"
             backend_type: "postgresql_roaringbit"
             database_suffix: "roaring"
@@ -96,6 +102,8 @@ jobs:
             job_index: 2
           - name: "Redis Set Backend"
             pattern: "redis_set"
+            backend_filter: "redis_set"
+            integration_backends: "redis_set"
             suffix: "redis_set"
             backend_type: "redis_set"
             database_suffix: "redis_set"
@@ -105,6 +113,8 @@ jobs:
             redis_set_db: 0
           - name: "Redis Bit Backend"
             pattern: "redis_bit"
+            backend_filter: "redis_bit"
+            integration_backends: "redis_bit"
             suffix: "redis_bit"
             backend_type: "redis_bit"
             database_suffix: "redis_bit"
@@ -114,6 +124,8 @@ jobs:
             redis_bit_db: 1
           - name: "RocksDB Backends"
             pattern: "rocksdb"
+            backend_filter: "rocksdb_set or rocksdb_bit or rocksdict or rocksdict_roaringbit"
+            integration_backends: "rocksdb_set,rocksdb_bit,rocksdict,rocksdict_roaringbit"
             suffix: "rocksdb"
             backend_type: "rocksdb"
             database_suffix: "rocksdb"
@@ -122,6 +134,8 @@ jobs:
             job_index: 3
           - name: "DuckDB Acceleration"
             pattern: "duckdb_acceleration"
+            backend_filter: "postgresql_array"
+            integration_backends: "postgresql_array"
             suffix: "duckdb_accel"
             backend_type: "postgresql_array"
             database_suffix: "duckdb_accel"
@@ -130,6 +144,8 @@ jobs:
             job_index: 4
           - name: "Queue Processing"
             pattern: "queue"
+            backend_filter: "postgresql_array"
+            integration_backends: "postgresql_array"
             suffix: "queue"
             backend_type: "postgresql_array"
             database_suffix: "queue"
@@ -138,14 +154,28 @@ jobs:
             job_index: 5
           - name: "Spatial Cache"
             pattern: "spatial"
+            backend_filter: "postgresql_array"
+            integration_backends: "postgresql_array"
             suffix: "spatial"
             backend_type: "postgresql_array"
             database_suffix: "spatial"
             parallel: false
             requires_redis: false
             job_index: 6
+          - name: "Spatial Cache (RoaringBit)"
+            pattern: "spatial"
+            backend_filter: "postgresql_roaringbit"
+            integration_backends: "postgresql_roaringbit"
+            suffix: "spatial_roaring"
+            backend_type: "postgresql_roaringbit"
+            database_suffix: "spatial_roaring"
+            parallel: false
+            requires_redis: false
+            job_index: 9
           - name: "Maintenance Operations"
             pattern: "maintenance"
+            backend_filter: "postgresql_array"
+            integration_backends: "postgresql_array"
             suffix: "maintenance"
             backend_type: "postgresql_array"
             database_suffix: "maintenance"
@@ -154,6 +184,8 @@ jobs:
             job_index: 7
           - name: "Pipeline Integration"
             pattern: "constraint_to_cache_pipeline"
+            backend_filter: "postgresql_array"
+            integration_backends: "postgresql_array"
             suffix: "pipeline"
             backend_type: "postgresql_array"
             database_suffix: "pipeline"
@@ -191,6 +223,8 @@ jobs:
       
       # Set the specific backend type for this job
       CACHE_BACKEND: ${{ matrix.backend_type }}
+      INTEGRATION_CACHE_BACKENDS: ${{ matrix.integration_backends }}
+      INTEGRATION_TEST_ENABLED: 1
       
       # PostgreSQL configuration
       PG_HOST: localhost
@@ -352,19 +386,13 @@ jobs:
     - name: Run tests
       shell: micromamba-shell {0}
       run: |
-        PYTEST_FLAGS="--ci --pattern ${{ matrix.pattern }} --verbose"
-        
-        # Exclude pg_cron tests from regular runs (they run in dedicated job)
-        PYTEST_FLAGS="$PYTEST_FLAGS --ignore=tests/integration/test_pg_cron_integration.py"
-        
-        # Note: CLI tests that require pg_cron will automatically skip via pytest.skip() 
-        # when pg_cron extension is not available, so no exclusion needed
-        
-        if [[ "${{ matrix.parallel }}" == "true" ]]; then
-          PYTEST_FLAGS="$PYTEST_FLAGS --parallel"
-        fi
-        
-        ./scripts/run_integration_tests.sh $PYTEST_FLAGS --no-setup
+        ./scripts/run_integration_tests.sh \
+          --ci \
+          --pattern "${{ matrix.pattern }}" \
+          --backend "${{ matrix.backend_filter }}" \
+          --verbose \
+          --ignore tests/integration/test_pg_cron_integration.py \
+          --no-setup
 
     - name: Upload artifacts
       uses: actions/upload-artifact@v4
@@ -414,8 +442,14 @@ jobs:
       PG_QUEUE_USER: integration_user
       PG_QUEUE_PASSWORD: integration_password
       QUERY_QUEUE_PROVIDER: postgresql
+      PG_QUEUE_HOST: localhost
+      PG_QUEUE_PORT: 5432
+      PG_QUEUE_USER: integration_user
+      PG_QUEUE_PASSWORD: integration_password
+      QUERY_QUEUE_PROVIDER: postgresql
       PG_ARRAY_CACHE_TABLE_PREFIX: ci_array_cache_cli
       PG_QUEUE_TABLE_PREFIX: ci_queue_cli
+      INTEGRATION_CACHE_BACKENDS: postgresql_array
 
     steps:
     - name: Checkout repository
@@ -461,8 +495,12 @@ jobs:
     - name: Run CLI tests
       shell: micromamba-shell {0}
       run: |
-        PYTEST_FLAGS="--ci --pattern test_cli --verbose"
-        ./scripts/run_integration_tests.sh $PYTEST_FLAGS --no-setup
+        ./scripts/run_integration_tests.sh \
+          --ci \
+          --pattern test_cli \
+          --backend postgresql_array \
+          --verbose \
+          --no-setup
 
     - name: Upload CLI test artifacts
       uses: actions/upload-artifact@v4
@@ -530,6 +568,7 @@ jobs:
       
       # Queue configuration with E2E-specific prefixes
       PG_QUEUE_TABLE_PREFIX: e2e_queue_${{ github.run_id }}
+      INTEGRATION_CACHE_BACKENDS: postgresql_array
 
     steps:
     - name: Checkout repository
@@ -575,8 +614,11 @@ jobs:
     - name: Run E2E tests
       shell: micromamba-shell {0}
       run: |
-        PYTEST_FLAGS="--ci --pattern test_end_to_end_workflows --verbose"
-        ./scripts/run_integration_tests.sh $PYTEST_FLAGS
+        ./scripts/run_integration_tests.sh \
+          --ci \
+          --pattern test_end_to_end_workflows \
+          --backend postgresql_array \
+          --verbose
 
     - name: Upload E2E artifacts
       uses: actions/upload-artifact@v4
@@ -619,6 +661,11 @@ jobs:
       DB_PORT: 5432
       DB_USER: integration_user
       DB_PASSWORD: integration_password
+      PG_QUEUE_HOST: localhost
+      PG_QUEUE_PORT: 5432
+      PG_QUEUE_USER: integration_user
+      PG_QUEUE_PASSWORD: integration_password
+      QUERY_QUEUE_PROVIDER: postgresql
       
       # Cache backend configuration with Performance-specific prefixes for isolation
       PG_ARRAY_CACHE_TABLE_PREFIX: perf_array_cache_${{ github.run_id }}
@@ -661,35 +708,13 @@ jobs:
           sleep 2
         done
 
-        echo "Creating isolated test database: $UNIQUE_DB_NAME from base template: $BASE_TEMPLATE_DB"
-        python -c "
-        import os
-        import psycopg
-        from psycopg import sql
-        
-        unique_db = os.environ['UNIQUE_DB_NAME']
-        base_template = os.environ['BASE_TEMPLATE_DB']
-        conn_str = f'postgresql://integration_user:integration_password@localhost:5432/postgres'
-        
-        with psycopg.connect(conn_str, autocommit=True) as conn:
-            with conn.cursor() as cur:
-                # Check if database already exists and drop it to ensure clean state
-                cur.execute(sql.SQL('SELECT 1 FROM pg_database WHERE datname = %s'), (unique_db,))
-                if cur.fetchone():
-                    print(f'Dropping existing database: {unique_db}')
-                    cur.execute(sql.SQL('DROP DATABASE {}').format(sql.Identifier(unique_db)))
-                
-                # Create new isolated database from base template
-                print(f'Creating database: {unique_db} from template: {base_template}')
-                cur.execute(sql.SQL('CREATE DATABASE {} TEMPLATE {}').format(
-                    sql.Identifier(unique_db),
-                    sql.Identifier(base_template)
-                ))
-        "
+        echo "Creating clean isolated test database: $UNIQUE_DB_NAME"
+        python scripts/create_clean_test_database.py
 
         # Set the database name for subsequent steps
         echo "PG_DBNAME=$UNIQUE_DB_NAME" >> $GITHUB_ENV
         echo "DB_NAME=$UNIQUE_DB_NAME" >> $GITHUB_ENV
+        echo "PG_QUEUE_DB=$UNIQUE_DB_NAME" >> $GITHUB_ENV
         echo "PG_CRON_DATABASE=$UNIQUE_DB_NAME" >> $GITHUB_ENV
 
     - name: Run performance tests
@@ -748,6 +773,136 @@ jobs:
       QUERY_QUEUE_PROVIDER: postgresql
       PG_ARRAY_CACHE_TABLE_PREFIX: ci_array_cache_pgcron
       PG_QUEUE_TABLE_PREFIX: ci_queue_pgcron
+      INTEGRATION_CACHE_BACKENDS: postgresql_array
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Setup micromamba
+      uses: mamba-org/setup-micromamba@v1
+      with:
+        micromamba-version: 'latest'
+        environment-file: .github/micromamba-env.yml
+        init-shell: >-
+          bash
+        cache-environment: false
+        post-cleanup: 'all'
+
+    - name: Install PartitionCache
+      shell: micromamba-shell {0}
+      run: |
+        pip install -e ".[testing,db]"
+
+    - name: Create and configure test database
+      shell: micromamba-shell {0}
+      run: |
+        echo "Waiting for PostgreSQL..."
+        for i in {1..30}; do
+          if python -c "import psycopg; psycopg.connect('postgresql://integration_user:integration_password@localhost:5432/postgres')" 2>/dev/null; then
+            echo "PostgreSQL ready"
+            break
+          fi
+          sleep 2
+        done
+
+        echo "Creating clean isolated test database: $UNIQUE_DB_NAME"
+        python scripts/create_clean_test_database.py --require-pg-cron
+
+        # Set the database name for subsequent steps
+        echo "PG_DBNAME=$UNIQUE_DB_NAME" >> $GITHUB_ENV
+        echo "DB_NAME=$UNIQUE_DB_NAME" >> $GITHUB_ENV
+        echo "PG_QUEUE_DB=$UNIQUE_DB_NAME" >> $GITHUB_ENV
+        echo "PG_CRON_DATABASE=$UNIQUE_DB_NAME" >> $GITHUB_ENV
+
+    - name: Verify pg_cron extension
+      shell: micromamba-shell {0}
+      run: |
+        python -c "
+        import os
+        import psycopg
+        db_name = os.environ['PG_DBNAME']
+        conn_str = f'postgresql://integration_user:integration_password@localhost:5432/{db_name}'
+        with psycopg.connect(conn_str, autocommit=True) as conn:
+            with conn.cursor() as cur:
+                cur.execute('SELECT extname FROM pg_extension WHERE extname = %s', ('pg_cron',))
+                if not cur.fetchone():
+                    raise Exception('pg_cron extension not found')
+                print('pg_cron extension verified')
+        "
+
+    - name: Run pg_cron integration tests
+      shell: micromamba-shell {0}
+      run: |
+        python -m pytest \
+          tests/integration/test_pg_cron_integration.py \
+          tests/integration/test_cross_database_pg_cron.py \
+          tests/integration/test_queue_processor.py::TestQueueProcessor::test_schedule_and_execute_task \
+          tests/integration/test_queue_processor.py::TestQueueProcessor::test_schedule_job_fast \
+          tests/integration/test_error_recovery.py::TestQueueErrorRecovery::test_invalid_cron_job_handling \
+          -v -rs
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: pg-cron-test-results
+        path: |
+          test-logs/
+        retention-days: 7
+        if-no-files-found: ignore
+
+  redis-queue-provider-tests:
+    name: Redis Queue Provider Tests
+    runs-on: ubuntu-latest
+    needs: [build-postgres-image]
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
+
+    services:
+      postgres:
+        image: ghcr.io/mpoppinga/postgres-test-extensions:${{ needs.build-postgres-image.outputs.image-tag }}
+        env:
+          POSTGRES_USER: integration_user
+          POSTGRES_PASSWORD: integration_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U integration_user -d postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      UNIQUE_DB_NAME: partitioncache_queue_redis_${{ github.run_id }}
+      CACHE_BACKEND: redis_set
+      INTEGRATION_CACHE_BACKENDS: redis_set
+      PG_HOST: localhost
+      PG_PORT: 5432
+      PG_USER: integration_user
+      PG_PASSWORD: integration_password
+      DB_HOST: localhost
+      DB_PORT: 5432
+      DB_USER: integration_user
+      DB_PASSWORD: integration_password
+      QUERY_QUEUE_PROVIDER: redis
+      QUERY_QUEUE_REDIS_DB: 14
+      QUERY_QUEUE_REDIS_QUEUE_KEY: ci_queue_redis_${{ github.run_id }}
+      REDIS_HOST: localhost
+      REDIS_PORT: 6379
+      REDIS_CACHE_DB: 0
+      REDIS_SET_DB: 0
+      REDIS_BIT_DB: 1
+      REDIS_BIT_BITSIZE: 300000
 
     steps:
     - name: Checkout repository
@@ -789,33 +944,18 @@ jobs:
         echo "PG_QUEUE_DB=$UNIQUE_DB_NAME" >> $GITHUB_ENV
         echo "PG_CRON_DATABASE=$UNIQUE_DB_NAME" >> $GITHUB_ENV
 
-    - name: Verify pg_cron extension
+    - name: Run Redis queue provider integration test
       shell: micromamba-shell {0}
       run: |
-        python -c "
-        import os
-        import psycopg
-        db_name = os.environ['PG_DBNAME']
-        conn_str = f'postgresql://integration_user:integration_password@localhost:5432/{db_name}'
-        with psycopg.connect(conn_str, autocommit=True) as conn:
-            with conn.cursor() as cur:
-                cur.execute('SELECT extname FROM pg_extension WHERE extname = %s', ('pg_cron',))
-                if not cur.fetchone():
-                    raise Exception('pg_cron extension not found')
-                print('pg_cron extension verified')
-        "
-
-    - name: Run pg_cron integration tests
-      shell: micromamba-shell {0}
-      run: |
-        # Run only the pg_cron integration tests
-        python -m pytest tests/integration/test_pg_cron_integration.py -v
+        python -m pytest \
+          tests/integration/test_queue_processor.py::TestQueueProcessor::test_concurrent_queue_processing_simulation \
+          -v -rs
 
     - name: Upload artifacts
       uses: actions/upload-artifact@v4
       if: always()
       with:
-        name: pg-cron-test-results
+        name: redis-queue-provider-test-results
         path: |
           test-logs/
         retention-days: 7
@@ -824,7 +964,7 @@ jobs:
   test-summary:
     name: Test Summary
     runs-on: ubuntu-latest
-    needs: [integration-tests, cli-tools-tests, e2e-tests, performance-tests, pg-cron-tests]
+    needs: [integration-tests, cli-tools-tests, e2e-tests, performance-tests, pg-cron-tests, redis-queue-provider-tests]
     if: always()
     
     steps:
@@ -844,6 +984,20 @@ jobs:
           echo "CLI Tools tests: PASSED"
         else
           echo "CLI Tools tests: FAILED"
+          exit 1
+        fi
+
+        if [[ "${{ needs.pg-cron-tests.result }}" == "success" ]]; then
+          echo "pg_cron tests: PASSED"
+        else
+          echo "pg_cron tests: FAILED"
+          exit 1
+        fi
+
+        if [[ "${{ needs.redis-queue-provider-tests.result }}" == "success" ]]; then
+          echo "Redis queue provider tests: PASSED"
+        else
+          echo "Redis queue provider tests: FAILED"
           exit 1
         fi
         

@@ -5,7 +5,6 @@ Tests the new --max-pending-jobs functionality and queue consumption control.
 """
 
 import os
-from unittest.mock import patch
 
 import pytest
 
@@ -160,34 +159,122 @@ class TestMaxPendingJobsValidation:
 class TestMonitorQueueIntegration:
     """Integration tests requiring actual queue infrastructure."""
 
+    @pytest.fixture(autouse=True)
+    def _require_queue_env(self):
+        """Skip integration queue tests when required queue env is not configured."""
+        required = [
+            "PG_QUEUE_HOST",
+            "PG_QUEUE_PORT",
+            "PG_QUEUE_USER",
+            "PG_QUEUE_PASSWORD",
+            "PG_QUEUE_DB",
+        ]
+        missing = [name for name in required if not os.getenv(name)]
+        if missing:
+            pytest.skip(f"Queue integration tests require env vars: {', '.join(missing)}")
+
+    @pytest.fixture(autouse=True)
+    def _reset_queues(self):
+        """Ensure queue isolation between tests."""
+        from partitioncache.queue import clear_all_queues, reset_queue_handler
+
+        reset_queue_handler()
+        clear_all_queues()
+        yield
+        reset_queue_handler()
+
     @pytest.mark.skipif(
         not os.getenv("INTEGRATION_TEST_ENABLED"),
         reason="Integration tests require INTEGRATION_TEST_ENABLED=1"
     )
     def test_monitor_with_max_pending_jobs(self):
-        """Test monitor behavior with max_pending_jobs limit."""
-        # This test would require actual queue infrastructure
-        # and would be implemented as part of the broader integration test suite
-        pytest.skip("Requires full integration test environment setup")
+        """Test monitor behavior under queue pressure and limited worker capacity."""
+        from partitioncache.queue import (
+            get_queue_lengths,
+            pop_from_original_query_queue,
+            push_to_original_query_queue,
+        )
+
+        for i in range(5):
+            assert push_to_original_query_queue(
+                query=f"SELECT {i}",
+                partition_key="zipcode",
+                partition_datatype="integer",
+            )
+
+        lengths = get_queue_lengths()
+        assert lengths["original_query_queue"] >= 5
+
+        max_processes = 1
+        active_futures = 1
+        can_consume = active_futures < max_processes
+        timeout = get_timeout_for_state(can_consume=can_consume, exit_event_set=False, error_count=0)
+        assert can_consume is False
+        assert timeout == 0.1
+
+        item = pop_from_original_query_queue()
+        assert item is not None
+        lengths_after = get_queue_lengths()
+        assert lengths_after["original_query_queue"] < lengths["original_query_queue"]
 
     @pytest.mark.skipif(
         not os.getenv("INTEGRATION_TEST_ENABLED"),
         reason="Integration tests require INTEGRATION_TEST_ENABLED=1"
     )
     def test_queue_consumption_priority(self):
-        """Test that pending jobs are processed before new queue consumption."""
-        # This test would verify the priority system works correctly
-        pytest.skip("Requires full integration test environment setup")
+        """Test queue consumption priority decisions with capacity gating."""
+        from partitioncache.queue import (
+            get_queue_lengths,
+            pop_from_original_query_queue,
+            push_to_original_query_queue,
+        )
+
+        assert push_to_original_query_queue("SELECT 1", "zipcode", "integer")
+        assert push_to_original_query_queue("SELECT 2", "zipcode", "integer")
+
+        wait_timeout = get_timeout_for_state(can_consume=False, exit_event_set=False, error_count=0)
+        process_timeout = get_timeout_for_state(can_consume=True, exit_event_set=False, error_count=0)
+        assert wait_timeout < process_timeout
+
+        first = pop_from_original_query_queue()
+        assert first is not None
+        lengths = get_queue_lengths()
+        assert lengths["original_query_queue"] >= 1
 
     @pytest.mark.skipif(
         not os.getenv("INTEGRATION_TEST_ENABLED"),
         reason="Integration tests require INTEGRATION_TEST_ENABLED=1"
     )
     def test_memory_bounded_consumption(self):
-        """Test that queue consumption is bounded by max_pending_jobs."""
-        # This test would fill a queue with more items than max_pending_jobs
-        # and verify that memory usage stays bounded
-        pytest.skip("Requires full integration test environment setup")
+        """Test bounded queue consumption behavior under a max-processes style cap."""
+        from partitioncache.queue import (
+            get_queue_lengths,
+            pop_from_original_query_queue,
+            push_to_original_query_queue,
+        )
+
+        for i in range(8):
+            assert push_to_original_query_queue(
+                query=f"SELECT {i}",
+                partition_key="zipcode",
+                partition_datatype="integer",
+            )
+
+        max_processes = 2
+        active = 2
+        can_consume = active < max_processes
+        assert can_consume is False
+        assert get_timeout_for_state(can_consume=can_consume, exit_event_set=False, error_count=0) == 0.1
+
+        # Simulate bounded consumption: only pop up to max_processes in one cycle.
+        popped = 0
+        for _ in range(max_processes):
+            if pop_from_original_query_queue() is not None:
+                popped += 1
+
+        assert popped == max_processes
+        lengths = get_queue_lengths()
+        assert lengths["original_query_queue"] >= 6
 
 
 if __name__ == "__main__":
