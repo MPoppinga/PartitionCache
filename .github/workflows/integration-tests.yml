@@ -301,6 +301,7 @@ jobs:
     - name: Create and configure test database
       shell: micromamba-shell {0}
       run: |
+        set -euo pipefail
         echo "Waiting for PostgreSQL..."
         for i in {1..30}; do
           if python -c "import psycopg; psycopg.connect('postgresql://integration_user:integration_password@localhost:5432/postgres')" 2>/dev/null; then
@@ -468,6 +469,7 @@ jobs:
     - name: Verify and configure pg_cron database
       shell: micromamba-shell {0}
       run: |
+        set -euo pipefail
         echo "Waiting for PostgreSQL..."
         for i in {1..30}; do
           if python -c "import psycopg; psycopg.connect('postgresql://integration_user:integration_password@localhost:5432/postgres')" 2>/dev/null; then
@@ -479,13 +481,29 @@ jobs:
 
         echo "Using partitioncache_integration database for pg_cron compatibility"
         echo "Verifying pg_cron database exists and is configured..."
-        python scripts/create_clean_test_database.py --require-pg-cron
+        python scripts/create_clean_test_database.py
+
+        python - <<'PY'
+        import os
+        import psycopg
+
+        db_name = os.environ.get("UNIQUE_DB_NAME", "partitioncache_integration")
+        conn_str = f"postgresql://integration_user:integration_password@localhost:5432/{db_name}"
+
+        with psycopg.connect(conn_str, autocommit=True) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 FROM pg_extension WHERE extname = 'pg_cron'")
+                if not cur.fetchone():
+                    raise Exception(f"pg_cron extension not found in {db_name}")
+
+        print(f"pg_cron extension verified in {db_name}")
+        PY
 
         # Set the database name for subsequent steps
-        echo "PG_DBNAME=partitioncache_integration" >> $GITHUB_ENV
-        echo "DB_NAME=partitioncache_integration" >> $GITHUB_ENV
-        echo "PG_QUEUE_DB=partitioncache_integration" >> $GITHUB_ENV
-        echo "PG_CRON_DATABASE=partitioncache_integration" >> $GITHUB_ENV
+        echo "PG_DBNAME=$UNIQUE_DB_NAME" >> $GITHUB_ENV
+        echo "DB_NAME=$UNIQUE_DB_NAME" >> $GITHUB_ENV
+        echo "PG_QUEUE_DB=$UNIQUE_DB_NAME" >> $GITHUB_ENV
+        echo "PG_CRON_DATABASE=$UNIQUE_DB_NAME" >> $GITHUB_ENV
 
     - name: Run CLI tests
       shell: micromamba-shell {0}
@@ -588,6 +606,7 @@ jobs:
     - name: Create and configure test database
       shell: micromamba-shell {0}
       run: |
+        set -euo pipefail
         echo "Waiting for PostgreSQL..."
         for i in {1..30}; do
           if python -c "import psycopg; psycopg.connect('postgresql://integration_user:integration_password@localhost:5432/postgres')" 2>/dev/null; then
@@ -612,7 +631,6 @@ jobs:
         ./scripts/run_integration_tests.sh \
           --ci \
           --pattern test_end_to_end_workflows \
-          --backend postgresql_array \
           --verbose
 
     - name: Upload E2E artifacts
@@ -670,6 +688,7 @@ jobs:
       
       # Queue configuration with Performance-specific prefixes  
       PG_QUEUE_TABLE_PREFIX: perf_queue_${{ github.run_id }}
+      INTEGRATION_CACHE_BACKENDS: postgresql_array
 
     steps:
     - name: Checkout repository
@@ -694,6 +713,7 @@ jobs:
     - name: Create and configure test database
       shell: micromamba-shell {0}
       run: |
+        set -euo pipefail
         echo "Waiting for PostgreSQL..."
         for i in {1..30}; do
           if python -c "import psycopg; psycopg.connect('postgresql://integration_user:integration_password@localhost:5432/postgres')" 2>/dev/null; then
@@ -792,6 +812,7 @@ jobs:
     - name: Create and configure test database
       shell: micromamba-shell {0}
       run: |
+        set -euo pipefail
         echo "Waiting for PostgreSQL..."
         for i in {1..30}; do
           if python -c "import psycopg; psycopg.connect('postgresql://integration_user:integration_password@localhost:5432/postgres')" 2>/dev/null; then
@@ -802,7 +823,7 @@ jobs:
         done
 
         echo "Creating clean isolated test database: $UNIQUE_DB_NAME"
-        python scripts/create_clean_test_database.py --require-pg-cron
+        python scripts/create_clean_test_database.py
 
         # Set the database name for subsequent steps
         echo "PG_DBNAME=$UNIQUE_DB_NAME" >> $GITHUB_ENV
