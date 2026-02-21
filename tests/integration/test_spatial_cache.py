@@ -43,6 +43,17 @@ class TestSpatialCache:
 
         return results, elapsed
 
+    def _backend_supports_datatype(self, backend: str, datatype: str) -> bool:
+        """Check whether the selected backend supports a partition datatype."""
+        try:
+            handler = partitioncache.get_cache_handler(backend, singleton=True)
+            supports = getattr(handler.__class__, "supports_datatype", None)
+            if callable(supports):
+                return bool(supports(datatype))
+        except Exception:
+            return False
+        return True
+
     def _load_query_from_file(self, query_file: str) -> str:
         """Load query from file."""
         query_path = Path(__file__).parent / "spatial_queries" / query_file
@@ -60,6 +71,8 @@ class TestSpatialCache:
 
         # Test with cache
         backend = self._get_cache_backend()
+        if not self._backend_supports_datatype(backend, partition_datatype):
+            pytest.skip(f"{backend} does not support datatype '{partition_datatype}'")
 
         with partitioncache.create_cache_helper(backend, partition_key, partition_datatype) as cache:
             # Get partition keys (this may be empty for first run)
@@ -229,8 +242,11 @@ class TestSpatialCache:
         ]
 
         performance_results = []
+        backend = self._get_cache_backend()
 
         for query_file, partition_key, datatype in test_queries:
+            if not self._backend_supports_datatype(backend, datatype):
+                continue
             query = self._load_query_from_file(query_file)
             result = self._test_cache_effectiveness(query, partition_key, datatype)
 
@@ -243,6 +259,9 @@ class TestSpatialCache:
                     "results_count": result["results_count"],
                 }
             )
+
+        if not performance_results:
+            pytest.skip(f"No compatible partition datatype tests for backend {backend}")
 
         print("\nPerformance Comparison:")
         print("-" * 60)
@@ -269,14 +288,10 @@ class TestSpatialCache:
         if backend == "postgresql_roaringbit":
             # Check if roaringbitmap extension is available
             try:
-                import psycopg
-
-                conn = psycopg.connect(self.conn_str)
-                cur = conn.cursor()
-                cur.execute("SELECT 1 FROM pg_extension WHERE extname = 'roaringbitmap'")
-                if not cur.fetchone():
-                    pytest.skip("roaringbitmap extension not available")
-                conn.close()
+                with self.conn.cursor() as cur:
+                    cur.execute("SELECT 1 FROM pg_extension WHERE extname = 'roaringbitmap'")
+                    if not cur.fetchone():
+                        pytest.skip("roaringbitmap extension not available")
                 print("✅ roaringbitmap extension is available")
             except Exception as e:
                 pytest.skip(f"Cannot check roaringbitmap extension: {e}")
