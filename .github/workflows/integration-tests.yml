@@ -442,11 +442,6 @@ jobs:
       PG_QUEUE_USER: integration_user
       PG_QUEUE_PASSWORD: integration_password
       QUERY_QUEUE_PROVIDER: postgresql
-      PG_QUEUE_HOST: localhost
-      PG_QUEUE_PORT: 5432
-      PG_QUEUE_USER: integration_user
-      PG_QUEUE_PASSWORD: integration_password
-      QUERY_QUEUE_PROVIDER: postgresql
       PG_ARRAY_CACHE_TABLE_PREFIX: ci_array_cache_cli
       PG_QUEUE_TABLE_PREFIX: ci_queue_cli
       INTEGRATION_CACHE_BACKENDS: postgresql_array
