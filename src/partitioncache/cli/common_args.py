@@ -15,8 +15,6 @@ from pathlib import Path
 from typing import Any
 
 import dotenv
-import psycopg
-from psycopg import sql as psycopg_sql
 
 logger = getLogger("PartitionCache")
 
@@ -126,7 +124,7 @@ def add_spatial_args(parser: argparse.ArgumentParser, include_buffer_distance: b
         spatial_group.add_argument(
             "--buffer-distance",
             type=float,
-            default=float(os.getenv("PARTITION_CACHE_BUFFER_DISTANCE", "0")) or None,
+            default=float(os.getenv("PARTITION_CACHE_BUFFER_DISTANCE")) if os.getenv("PARTITION_CACHE_BUFFER_DISTANCE") else None,
             help="Buffer distance in meters for spatial cache application. "
             "If not set, auto-derived from ST_DWithin distances in the query.",
         )
@@ -358,16 +356,16 @@ def add_variant_generation_args(parser: argparse.ArgumentParser) -> None:
         help="Only generate variants from tables forming connected subgraphs via multi-table predicates like distance conditions or non-equijoin conditions (default: True or PARTITION_CACHE_FOLLOW_GRAPH)",
     )
     variant_group.add_argument(
-        "--no-auto-detect-star-join",
+        "--no-auto-detect-partition-join",
         action="store_true",
-        default=os.getenv("PARTITION_CACHE_NO_AUTO_DETECT_STAR_JOIN", "false").lower() in ("true", "1", "yes"),
-        help="Disable automatic star-join table detection based on query pattern (default: False or PARTITION_CACHE_NO_AUTO_DETECT_STAR_JOIN)",
+        default=os.getenv("PARTITION_CACHE_NO_AUTO_DETECT_PARTITION_JOIN", os.getenv("PARTITION_CACHE_NO_AUTO_DETECT_STAR_JOIN", "false")).lower() in ("true", "1", "yes"),
+        help="Disable automatic partition-join table detection based on query pattern (default: False or PARTITION_CACHE_NO_AUTO_DETECT_PARTITION_JOIN)",
     )
     variant_group.add_argument(
-        "--star-join-table",
+        "--partition-join-table",
         type=str,
-        default=os.getenv("PARTITION_CACHE_STAR_JOIN_TABLE", None),
-        help="Explicitly specify star-join table alias or name (only one star-join table per query, or set PARTITION_CACHE_STAR_JOIN_TABLE)",
+        default=os.getenv("PARTITION_CACHE_PARTITION_JOIN_TABLE", os.getenv("PARTITION_CACHE_STAR_JOIN_TABLE", None)),
+        help="Explicitly specify partition-join table alias or name (only one partition-join table per query, or set PARTITION_CACHE_PARTITION_JOIN_TABLE)",
     )
     variant_group.add_argument(
         "--max-component-size",
@@ -531,6 +529,8 @@ def setup_logging(verbose: bool = False) -> None:
 
 def get_db_connection():
     """Get database connection using environment variables."""
+    import psycopg
+
     return psycopg.connect(
         host=os.getenv("DB_HOST"),
         port=int(os.getenv("DB_PORT", "5432")),
@@ -542,6 +542,8 @@ def get_db_connection():
 
 def get_pg_cron_connection():
     """Get pg_cron database connection using environment variables."""
+    import psycopg
+
     return psycopg.connect(
         host=os.getenv("PG_CRON_HOST", os.getenv("DB_HOST")),
         port=int(os.getenv("PG_CRON_PORT", os.getenv("DB_PORT", "5432"))),
@@ -592,6 +594,8 @@ def ensure_role_exists(conn, role_name: str, create_if_missing: bool = False) ->
         Tuple of (success, message).  *success* is True when the role exists
         (either pre-existing or newly created).
     """
+    from psycopg import sql as psycopg_sql
+
     with conn.cursor() as cur:
         cur.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", [role_name])
         if cur.fetchone() is not None:

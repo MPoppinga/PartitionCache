@@ -1,0 +1,20 @@
+-- q1_1: Tourism - Museum to Hotel, long trips
+-- Average fare and duration for trips that start near museums (200m),
+-- last >45 min, and end near hotels (200m). Grouped by museum name.
+SELECT p_start.name AS museum_name,
+       COUNT(*) AS trip_count,
+       AVG(t.fare_amount) AS avg_fare,
+       AVG(t.duration_seconds) AS avg_duration,
+       AVG(t.trip_distance) AS avg_distance
+FROM taxi_trips t, osm_pois p_start
+WHERE ST_DWithin(t.pickup_geom, p_start.geom, 200)
+  AND p_start.poi_type = 'museum'
+  AND t.duration_seconds > 2700
+  AND EXISTS (
+    SELECT 1 FROM osm_pois p_end
+    WHERE p_end.poi_type = 'hotel'
+      AND ST_DWithin(t.dropoff_geom, p_end.geom, 200)
+  )
+GROUP BY p_start.name
+ORDER BY trip_count DESC
+LIMIT 20

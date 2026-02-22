@@ -4,6 +4,8 @@ data
 sm_filter*
 
 *.sqlite
+*.duckdb
+*.duckdb.wal
 *.png
 .env
 *.txt

@@ -154,12 +154,14 @@ def query_fragment_processor(args, constraint_args):
 
             # Detect spatial mode and resolve geometry column from handler
             is_spatial = partition_datatype == "geometry"
+            resolved_backend = resolve_cache_backend(args) if is_spatial else None
             geometry_column = None
             if is_spatial:
                 try:
-                    spatial_cache_handler = get_cache_handler(resolve_cache_backend(args), singleton=True)
+                    spatial_cache_handler = get_cache_handler(resolved_backend, singleton=True)
                     geometry_column = getattr(spatial_cache_handler, "geometry_column", "geom")
-                except Exception:
+                except Exception as e:
+                    logger.debug("Could not resolve geometry column from cache handler, using default 'geom': %s", e)
                     geometry_column = "geom"
 
             # Process the query into fragments using the partition_key from queue
@@ -169,9 +171,9 @@ def query_fragment_processor(args, constraint_args):
                 min_component_size=args.min_component_size,
                 follow_graph=args.follow_graph,
                 keep_all_attributes=True,
-                auto_detect_star_join=not args.no_auto_detect_star_join,
+                auto_detect_partition_join=not args.no_auto_detect_partition_join,
                 max_component_size=args.max_component_size,
-                star_join_table=args.star_join_table,
+                partition_join_table=args.partition_join_table,
                 warn_no_partition_key=not args.no_warn_partition_key,
                 bucket_steps=args.bucket_steps,
                 add_constraints=add_constraints,
@@ -184,7 +186,7 @@ def query_fragment_processor(args, constraint_args):
 
             # Push fragments to query fragment queue using the partition_key and datatype from queue
             # For spatial queries, resolve and pass cache_backend so the processor knows which handler to use
-            queue_cache_backend = resolve_cache_backend(args) if is_spatial else None
+            queue_cache_backend = resolved_backend
             success = push_to_query_fragment_queue(query_hash_pairs, partition_key, partition_datatype, cache_backend=queue_cache_backend)
             if success:
                 logger.debug(f"Pushed {len(query_hash_pairs)} fragments to query fragment queue")

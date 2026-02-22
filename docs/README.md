@@ -98,7 +98,7 @@ PartitionCache follows a modular architecture with distinct layers:
 ### Examples & Tutorials
 - **[Complete Workflow](complete_workflow_example.md)** - End-to-end tutorial
 - **[Cache Management CLI](manage_cache_cli.md)** - pcache-manage usage guide
-- **[P0 Table Handling](p0_table_handling.md)** - Star-join query optimization
+- **[P0 Table Handling](p0_table_handling.md)** - Partition-join query optimization
 - **[pg_cron Cross-Database Setup](pg_cron_cross_database_setup.md)** - Advanced PostgreSQL configuration
 
 ## Key Concepts
