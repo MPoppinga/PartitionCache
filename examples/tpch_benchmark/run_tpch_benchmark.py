@@ -268,7 +268,7 @@ def populate_cache_for_query(executor, cache_manager, adapted_query, partition_k
             partition_key=pk,
             min_component_size=1,
             strip_select=True,
-            auto_detect_star_join=False,
+            auto_detect_partition_join=False,
             skip_partition_key_joins=True,
         )
 
@@ -320,7 +320,7 @@ def apply_cache_to_query(cache_manager, adapted_query, original_query, partition
             cache_handler=handler.underlying_handler,
             partition_key=pk,
             min_component_size=1,
-            auto_detect_star_join=False,
+            auto_detect_partition_join=False,
         )
 
         cached_set_size = len(cached_keys) if cached_keys else 0
@@ -492,7 +492,7 @@ def run_cross_dimension(executor, cache_manager, query_dir, repeat=1, fact_stats
                 cache_handler=handler.underlying_handler,
                 partition_key=pk,
                 min_component_size=1,
-                auto_detect_star_join=False,
+                auto_detect_partition_join=False,
             )
             pre_hits[pk] = {"variants": num_gen, "hits_before": num_hits}
 
@@ -582,7 +582,7 @@ def run_cross_dimension(executor, cache_manager, query_dir, repeat=1, fact_stats
                 cache_handler=handler.underlying_handler,
                 partition_key=pk,
                 min_component_size=1,
-                auto_detect_star_join=False,
+                auto_detect_partition_join=False,
             )
             pre_hits[pk] = {"variants": num_gen, "hits_before": num_hits}
 
@@ -748,7 +748,7 @@ def run_hierarchy(executor, cache_manager, query_dir, repeat=1, fact_stats=None)
                     cache_handler=handler.underlying_handler,
                     partition_key=pk,
                     min_component_size=1,
-                    auto_detect_star_join=False,
+                    auto_detect_partition_join=False,
                 )
                 pre_hits[pk] = {"variants": num_gen, "hits_before": num_hits}
 
