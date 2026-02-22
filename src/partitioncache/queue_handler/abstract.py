@@ -38,7 +38,7 @@ class AbstractQueueHandler(ABC):
         pass
 
     @abstractmethod
-    def push_to_query_fragment_queue(self, query_hash_pairs: list[tuple[str, str]], partition_key: str, partition_datatype: str | None = None) -> bool:
+    def push_to_query_fragment_queue(self, query_hash_pairs: list[tuple[str, str]], partition_key: str, partition_datatype: str | None = None, cache_backend: str | None = None) -> bool:
         """
         Push query fragments (as query-hash pairs) directly to the query fragment queue.
 
@@ -46,6 +46,7 @@ class AbstractQueueHandler(ABC):
             query_hash_pairs (List[Tuple[str, str]]): List of (query, hash) tuples to push to fragment queue.
             partition_key (str): The partition key for these query fragments.
             partition_datatype (str): The datatype of the partition key (default: None).
+            cache_backend (str): The cache backend to use for processing (default: None, uses processor config).
 
         Returns:
             bool: True if all fragments were pushed successfully, False otherwise.
@@ -63,12 +64,12 @@ class AbstractQueueHandler(ABC):
         pass
 
     @abstractmethod
-    def pop_from_query_fragment_queue(self) -> tuple[str, str, str, str] | None:
+    def pop_from_query_fragment_queue(self) -> tuple[str, str, str, str, str | None] | None:
         """
         Pop a query fragment from the query fragment queue.
 
         Returns:
-            Tuple[str, str, str, str] or None: (query, hash, partition_key, partition_datatype) tuple if available, None if queue is empty or error occurred.
+            Tuple[str, str, str, str, str | None] or None: (query, hash, partition_key, partition_datatype, cache_backend) tuple if available, None if queue is empty or error occurred.
         """
         pass
 
@@ -145,7 +146,7 @@ class AbstractPriorityQueueHandler(AbstractQueueHandler):
 
     @abstractmethod
     def push_to_query_fragment_queue_with_priority(
-        self, query_hash_pairs: list[tuple[str, str]], partition_key: str, priority: int = 1, partition_datatype: str | None = None
+        self, query_hash_pairs: list[tuple[str, str]], partition_key: str, priority: int = 1, partition_datatype: str | None = None, cache_backend: str | None = None
     ) -> bool:
         """
         Push query fragments with specified priority.
@@ -156,6 +157,7 @@ class AbstractPriorityQueueHandler(AbstractQueueHandler):
             partition_key (str): The partition key for these query fragments.
             priority (int): Initial priority for the fragments (default: 1).
             partition_datatype (str): The datatype of the partition key (default: None).
+            cache_backend (str): The cache backend to use for processing (default: None, uses processor config).
 
         Returns:
             bool: True if all fragments were pushed/updated successfully, False otherwise.
@@ -168,8 +170,8 @@ class AbstractPriorityQueueHandler(AbstractQueueHandler):
         """
         return self.push_to_original_query_queue_with_priority(query, partition_key, 1, partition_datatype)
 
-    def push_to_query_fragment_queue(self, query_hash_pairs: list[tuple[str, str]], partition_key: str, partition_datatype: str | None = None) -> bool:
+    def push_to_query_fragment_queue(self, query_hash_pairs: list[tuple[str, str]], partition_key: str, partition_datatype: str | None = None, cache_backend: str | None = None) -> bool:
         """
         Default implementation using priority system with priority=1.
         """
-        return self.push_to_query_fragment_queue_with_priority(query_hash_pairs, partition_key, 1, partition_datatype)
+        return self.push_to_query_fragment_queue_with_priority(query_hash_pairs, partition_key, 1, partition_datatype, cache_backend)

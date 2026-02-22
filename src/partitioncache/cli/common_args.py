@@ -8,14 +8,46 @@ consistency across all CLI tools and reduce code duplication.
 import argparse
 import json
 import os
+import re
 import sys
 from logging import getLogger
 from pathlib import Path
 from typing import Any
 
 import dotenv
+import psycopg
+from psycopg import sql as psycopg_sql
 
 logger = getLogger("PartitionCache")
+
+_DURATION_PATTERN = re.compile(r"^(\d+)\s*([smhdSMHD]?)$")
+
+
+def parse_duration_to_seconds(value: str | int, arg_name: str = "duration") -> int:
+    """
+    Parse a duration value into seconds.
+
+    Accepted formats:
+    - Integer seconds: 30
+    - String seconds: "30" / "30s"
+    - Minutes: "5m"
+    - Hours: "2h"
+    - Days: "1d"
+    """
+    if isinstance(value, int):
+        if value < 0:
+            raise ValueError(f"{arg_name} must be >= 0")
+        return value
+
+    value_str = str(value).strip()
+    match = _DURATION_PATTERN.match(value_str)
+    if not match:
+        raise ValueError(f"Invalid {arg_name} '{value}'. Use formats like 30, 30s, 5m, 2h, 1d.")
+
+    amount = int(match.group(1))
+    unit = (match.group(2) or "s").lower()
+    factor = {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
+    return amount * factor
 
 
 def add_database_args(parser: argparse.ArgumentParser, include_sqlite: bool = True) -> None:
@@ -490,3 +522,89 @@ def setup_logging(verbose: bool = False) -> None:
     format_string = "%(asctime)s - %(name)s - %(levelname)s - %(message)s" if verbose else "%(levelname)s: %(message)s"
 
     logging.basicConfig(level=level, format=format_string, datefmt="%Y-%m-%d %H:%M:%S")
+
+
+# ---------------------------------------------------------------------------
+# Shared database connection and introspection helpers
+# ---------------------------------------------------------------------------
+
+
+def get_db_connection():
+    """Get database connection using environment variables."""
+    return psycopg.connect(
+        host=os.getenv("DB_HOST"),
+        port=int(os.getenv("DB_PORT", "5432")),
+        user=os.getenv("DB_USER"),
+        password=os.getenv("DB_PASSWORD"),
+        dbname=os.getenv("DB_NAME"),
+    )
+
+
+def get_pg_cron_connection():
+    """Get pg_cron database connection using environment variables."""
+    return psycopg.connect(
+        host=os.getenv("PG_CRON_HOST", os.getenv("DB_HOST")),
+        port=int(os.getenv("PG_CRON_PORT", os.getenv("DB_PORT", "5432"))),
+        user=os.getenv("PG_CRON_USER", os.getenv("DB_USER")),
+        password=os.getenv("PG_CRON_PASSWORD", os.getenv("DB_PASSWORD")),
+        dbname=os.getenv("PG_CRON_DATABASE", "postgres"),
+    )
+
+
+def get_cache_database_name() -> str:
+    """Get the cache database name from environment."""
+    return os.getenv("DB_NAME", "postgres")
+
+
+def get_cron_database_name() -> str:
+    """Get the cron database name from environment."""
+    return os.getenv("PG_CRON_DATABASE", "postgres")
+
+
+def table_exists(conn, table_name: str) -> bool:
+    """Check if a table exists in the database."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = %s)",
+            [table_name],
+        )
+        result = cur.fetchone()
+        return bool(result and result[0])
+
+
+def function_exists(conn, function_name: str) -> bool:
+    """Check if a function exists in the database."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT EXISTS (SELECT 1 FROM pg_proc WHERE proname = %s)", [function_name])
+        result = cur.fetchone()
+        return bool(result and result[0])
+
+
+def ensure_role_exists(conn, role_name: str, create_if_missing: bool = False) -> tuple[bool, str]:
+    """Check if a PostgreSQL role exists and optionally create it.
+
+    Args:
+        conn: Active psycopg connection (must have sufficient privileges for CREATE ROLE if *create_if_missing* is True).
+        role_name: Name of the role to check/create.
+        create_if_missing: When True, attempt ``CREATE ROLE <role_name> LOGIN`` if the role does not exist.
+
+    Returns:
+        Tuple of (success, message).  *success* is True when the role exists
+        (either pre-existing or newly created).
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", [role_name])
+        if cur.fetchone() is not None:
+            return True, f"Role '{role_name}' already exists"
+
+    if not create_if_missing:
+        return False, f"Role '{role_name}' does not exist (use --create-role to create it)"
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(psycopg_sql.SQL("CREATE ROLE {} LOGIN").format(psycopg_sql.Identifier(role_name)))
+        conn.commit()
+        return True, f"Role '{role_name}' created successfully"
+    except Exception as e:
+        conn.rollback()
+        return False, f"Failed to create role '{role_name}': {e}"

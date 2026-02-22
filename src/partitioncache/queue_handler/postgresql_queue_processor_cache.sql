@@ -85,18 +85,18 @@ BEGIN
         EXECUTE format(
             'DELETE FROM %I
                 WHERE id = (
-                    SELECT q.id 
+                    SELECT q.id
                     FROM %I q
                     WHERE NOT EXISTS (
-                        SELECT 1 FROM %I qr 
-                        WHERE qr.query_hash = q.hash 
+                        SELECT 1 FROM %I qr
+                        WHERE qr.query_hash = q.hash
                         AND qr.partition_key = q.partition_key
                     )  -- Only uncached items
                     ORDER BY q.priority DESC, q.id
                     FOR UPDATE SKIP LOCKED
                     LIMIT 1
                 )
-                RETURNING id, query, hash, partition_key, partition_datatype',
+                RETURNING id, query, hash, partition_key, partition_datatype, cache_backend',
             v_queue_table, v_queue_table, v_queries_table
         ) INTO v_queue_item;
     END;
@@ -166,7 +166,7 @@ BEGIN
             v_queue_item.partition_datatype,
             p_queue_prefix,
             p_table_prefix,
-            p_cache_backend,
+            COALESCE(v_queue_item.cache_backend, p_cache_backend),
             'cron',
             p_timeout_seconds,
             p_default_bitsize
@@ -712,5 +712,28 @@ BEGIN
     
     GET DIAGNOSTICS v_cleaned_count = ROW_COUNT;
     RETURN v_cleaned_count;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Function to clean up old processor log entries.
+CREATE OR REPLACE FUNCTION partitioncache_cleanup_processor_logs(
+    p_queue_prefix TEXT DEFAULT 'partitioncache_queue',
+    p_retention_days INTEGER DEFAULT 30
+)
+RETURNS INTEGER AS $$
+DECLARE
+    v_log_table TEXT;
+    v_deleted_count INTEGER;
+BEGIN
+    v_log_table := p_queue_prefix || '_processor_log';
+
+    EXECUTE format(
+        'DELETE FROM %I WHERE created_at < NOW() - INTERVAL ''%s days''',
+        v_log_table,
+        p_retention_days
+    );
+
+    GET DIAGNOSTICS v_deleted_count = ROW_COUNT;
+    RETURN v_deleted_count;
 END;
 $$ LANGUAGE plpgsql;

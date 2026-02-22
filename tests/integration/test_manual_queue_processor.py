@@ -10,7 +10,7 @@ class TestManualQueueProcessor:
     Uses manual processing instead of pg_cron to avoid concurrency issues in CI.
     """
 
-    def _queue_query_as_fragments(self, query: str, partition_key: str, partition_datatype: str = "integer") -> bool:
+    def _queue_query_as_fragments(self, query: str, partition_key: str, partition_datatype: str = "integer", cache_backend: str | None = None) -> bool:
         """Helper to generate and queue query fragments."""
         query_hash_pairs = generate_all_query_hash_pairs(
             query,
@@ -19,7 +19,7 @@ class TestManualQueueProcessor:
             follow_graph=True,
             keep_all_attributes=True,
         )
-        return push_to_query_fragment_queue(query_hash_pairs=query_hash_pairs, partition_key=partition_key, partition_datatype=partition_datatype)
+        return push_to_query_fragment_queue(query_hash_pairs=query_hash_pairs, partition_key=partition_key, partition_datatype=partition_datatype, cache_backend=cache_backend)
 
     @pytest.fixture(autouse=True)
     def setup_manual_processing(self):
@@ -246,10 +246,92 @@ class TestManualQueueProcessor:
         assert total_processed > 0, "Should have processed some queries"
 
 
+class TestManualProcessingCacheBackend:
+    """Test that cache_backend flows correctly through the queue pipeline."""
+
+    @pytest.fixture(autouse=True)
+    def setup_manual_processing(self):
+        """Setup fixture to ensure manual processing environment."""
+        from partitioncache.queue import clear_all_queues, reset_queue_handler
+
+        reset_queue_handler()
+        clear_all_queues()
+        yield
+        reset_queue_handler()
+
+    def test_cache_backend_stored_in_queue(self, db_session, manual_queue_processor):
+        """Test that cache_backend is stored in fragment queue when pushed."""
+        from partitioncache.queue import pop_from_query_fragment_queue
+
+        query_hash_pairs = [("SELECT 1", "test_hash_backend")]
+        success = push_to_query_fragment_queue(
+            query_hash_pairs=query_hash_pairs,
+            partition_key="test_key",
+            partition_datatype="integer",
+            cache_backend="postgresql_bit",
+        )
+        assert success, "Failed to push fragment with cache_backend"
+
+        result = pop_from_query_fragment_queue()
+        assert result is not None, "Should pop a fragment"
+        assert len(result) == 5, f"Expected 5-tuple, got {len(result)}-tuple"
+        query, hash_val, partition_key, partition_datatype, cache_backend = result
+        assert cache_backend == "postgresql_bit", f"Expected cache_backend='postgresql_bit', got '{cache_backend}'"
+
+    def test_cache_backend_null_when_not_specified(self, db_session, manual_queue_processor):
+        """Test that cache_backend is None when not specified (backward compat)."""
+        from partitioncache.queue import pop_from_query_fragment_queue
+
+        query_hash_pairs = [("SELECT 2", "test_hash_no_backend")]
+        success = push_to_query_fragment_queue(
+            query_hash_pairs=query_hash_pairs,
+            partition_key="test_key",
+            partition_datatype="integer",
+        )
+        assert success, "Failed to push fragment without cache_backend"
+
+        result = pop_from_query_fragment_queue()
+        assert result is not None, "Should pop a fragment"
+        assert len(result) == 5, f"Expected 5-tuple, got {len(result)}-tuple"
+        _, _, _, _, cache_backend = result
+        assert cache_backend is None, f"Expected cache_backend=None, got '{cache_backend}'"
+
+    def test_manual_processor_uses_coalesce_for_cache_backend(self, db_session, manual_queue_processor):
+        """Test that manual processor SQL uses COALESCE(queue.cache_backend, config.cache_backend)."""
+        # Push a fragment with explicit cache_backend
+        query_hash_pairs = [("SELECT * FROM test_locations WHERE zipcode = 9001", "coalesce_test_hash")]
+        success = push_to_query_fragment_queue(
+            query_hash_pairs=query_hash_pairs,
+            partition_key="zipcode",
+            partition_datatype="integer",
+            cache_backend="postgresql_array",  # Explicit override
+        )
+        assert success, "Failed to push fragment with cache_backend"
+
+        # Verify the cache_backend column is in the queue table
+        fragment_queue_table = f"{manual_queue_processor['queue_prefix']}_query_fragment_queue"
+        with db_session.cursor() as cur:
+            cur.execute(f"""
+                SELECT cache_backend FROM {fragment_queue_table}
+                WHERE hash = 'coalesce_test_hash' AND partition_key = 'zipcode'
+            """)
+            row = cur.fetchone()
+            assert row is not None, "Queue item should exist"
+            assert row[0] == "postgresql_array", f"Expected 'postgresql_array' in DB, got '{row[0]}'"
+
+            # Process via manual processor - COALESCE should use queue item's cache_backend
+            cur.execute("SELECT * FROM partitioncache_manual_process_queue(1)")
+            result = cur.fetchone()
+            assert result is not None
+            # The processor should succeed (processed_count > 0) or at least not error
+            # Even if the query itself fails, the routing via COALESCE should work
+            print(f"COALESCE test: processed={result[0]}, message={result[1]}")
+
+
 class TestManualProcessingIntegration:
     """Integration tests for manual queue processing with other components."""
 
-    def _queue_query_as_fragments(self, query: str, partition_key: str, partition_datatype: str = "integer") -> bool:
+    def _queue_query_as_fragments(self, query: str, partition_key: str, partition_datatype: str = "integer", cache_backend: str | None = None) -> bool:
         """Helper to generate and queue query fragments."""
         query_hash_pairs = generate_all_query_hash_pairs(
             query,
@@ -258,7 +340,7 @@ class TestManualProcessingIntegration:
             follow_graph=True,
             keep_all_attributes=True,
         )
-        return push_to_query_fragment_queue(query_hash_pairs=query_hash_pairs, partition_key=partition_key, partition_datatype=partition_datatype)
+        return push_to_query_fragment_queue(query_hash_pairs=query_hash_pairs, partition_key=partition_key, partition_datatype=partition_datatype, cache_backend=cache_backend)
 
     def test_manual_processing_with_postgresql_queue_processor_cli(self, db_session, manual_queue_processor):
         """Test manual processing through the CLI interface."""

@@ -137,9 +137,8 @@ class TestParenthesesHandling:
         cleaned = clean_query(query)
         conditions = extract_conjunctive_conditions(cleaned)
 
-        # Should extract conditions, SQLGlot may flatten/reorganize the logical structure
-        # Updated expectation: SQLGlot might extract more granular conditions
-        assert len(conditions) >= 2
+        # SQLGlot flattens the outer AND, yielding 3 top-level conjuncts
+        assert len(conditions) == 3
         assert any("(p.y = 1 OR p.z = 2)" in cond for cond in conditions)
         # Note: sqlglot normalizes 'true' to 'TRUE'
         assert any("p.active = TRUE" in cond for cond in conditions)
@@ -310,11 +309,13 @@ class TestIntegrationScenarios:
         try:
             # Test query cleaning
             cleaned = clean_query(user_query)
-            assert len(cleaned) > 0
+            assert "SELECT" in cleaned
+            assert "complex_data" in cleaned
+            assert "data_points" in cleaned
 
             # Test condition extraction
             conditions = extract_conjunctive_conditions(cleaned)
-            assert len(conditions) >= 6  # Should extract individual conditions
+            assert len(conditions) == 7  # 2 join conditions + 4 attribute filters + 1 distance condition
 
             # Test distance normalization
             normalized = normalize_distance_conditions(cleaned, bucket_steps=1.0)
@@ -328,7 +329,7 @@ class TestIntegrationScenarios:
                 follow_graph=True,
                 keep_all_attributes=True,
             )
-            assert len(hash_pairs) > 0  # Should generate query variants
+            assert len(hash_pairs) == 4  # Partial query variants from fragment generation
 
         except Exception as e:
             pytest.fail(f"User's original query should process without errors: {e}")

@@ -31,13 +31,57 @@ from pathlib import Path
 import psycopg
 from psycopg import sql
 
-from partitioncache.cli.common_args import add_environment_args, add_verbosity_args, configure_logging, load_environment_with_validation
+from partitioncache.cli.common_args import (
+    add_environment_args,
+    add_verbosity_args,
+    configure_logging,
+    ensure_role_exists,
+    function_exists,
+    get_cache_database_name,
+    get_cron_database_name,
+    get_db_connection,
+    get_pg_cron_connection,
+    load_environment_with_validation,
+    parse_duration_to_seconds,
+    table_exists,
+)
 
 logger = getLogger("PartitionCache.PostgreSQLCacheEviction")
 
 # SQL file locations
 SQL_CRON_FILE = Path(__file__).parent.parent / "cache_handler" / "postgresql_cache_eviction_cron.sql"
 SQL_CACHE_FILE = Path(__file__).parent.parent / "cache_handler" / "postgresql_cache_eviction_cache.sql"
+
+
+def _parse_duration_arg(value: str, arg_name: str) -> int:
+    try:
+        return parse_duration_to_seconds(value, arg_name=arg_name)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def _parse_eviction_frequency_minutes_arg(value: str) -> int:
+    """
+    Parse duration input for eviction frequency.
+
+    The eviction scheduler uses minute granularity, so second-based inputs are
+    rounded down to minutes with a minimum of 1.
+    """
+    raw_value = str(value).strip()
+    # Backward compatibility: bare integers are interpreted as minutes.
+    if raw_value.isdigit():
+        minutes = int(raw_value)
+        if minutes <= 0:
+            raise argparse.ArgumentTypeError("--frequency must be > 0")
+        return minutes
+
+    seconds = _parse_duration_arg(raw_value, "--frequency")
+    if seconds <= 0:
+        raise argparse.ArgumentTypeError("--frequency must be > 0")
+    minutes = seconds // 60
+    if minutes <= 0:
+        minutes = 1
+    return minutes
 
 
 def construct_eviction_job_name(target_database: str, table_prefix: str | None) -> str:
@@ -127,38 +171,6 @@ def validate_environment() -> tuple[bool, str]:
     return True, "Environment validated successfully"
 
 
-def get_db_connection():
-    """Get database connection using environment variables."""
-    return psycopg.connect(
-        host=os.getenv("DB_HOST"),
-        port=int(os.getenv("DB_PORT", "5432")),
-        user=os.getenv("DB_USER"),
-        password=os.getenv("DB_PASSWORD"),
-        dbname=os.getenv("DB_NAME"),
-    )
-
-
-def get_pg_cron_connection():
-    """Get pg_cron database connection using environment variables."""
-    return psycopg.connect(
-        host=os.getenv("PG_CRON_HOST", os.getenv("DB_HOST")),
-        port=int(os.getenv("PG_CRON_PORT", os.getenv("DB_PORT", "5432"))),
-        user=os.getenv("PG_CRON_USER", os.getenv("DB_USER")),
-        password=os.getenv("PG_CRON_PASSWORD", os.getenv("DB_PASSWORD")),
-        dbname=os.getenv("PG_CRON_DATABASE", "postgres"),
-    )
-
-
-def get_cache_database_name() -> str:
-    """Get the cache database name from environment."""
-    return os.getenv("DB_NAME", "geominedb2_pdb")
-
-
-def get_cron_database_name() -> str:
-    """Get the cron database name from environment."""
-    return os.getenv("PG_CRON_DATABASE", "postgres")
-
-
 def check_pg_cron_installed() -> bool:
     """Check if pg_cron extension is installed in the pg_cron database."""
     try:
@@ -232,22 +244,50 @@ def setup_database_objects(cache_conn, cron_conn, table_prefix: str):
     logger.info("Cross-database eviction setup completed successfully")
 
 
-def insert_initial_config(cron_conn, job_name: str, table_prefix: str, frequency: int, enabled: bool, strategy: str, threshold: int, target_database: str):
+def insert_initial_config(cron_conn, job_name: str, table_prefix: str, frequency: int, enabled: bool, strategy: str, threshold: int, target_database: str, job_owner: str | None = None):
     """Insert the initial configuration row in cron database which will trigger the cron job creation."""
     logger.info(f"Inserting initial config for job '{job_name}' in cron database")
     config_table = f"{table_prefix}_eviction_config"
 
     with cron_conn.cursor() as cur:
-        cur.execute(
-            sql.SQL(
-                """
-                INSERT INTO {} (job_name, table_prefix, frequency_minutes, enabled, strategy, threshold, target_database)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (job_name) DO NOTHING
-                """
-            ).format(sql.Identifier(config_table)),
-            (job_name, table_prefix, frequency, enabled, strategy, threshold, target_database),
-        )
+        # Insert or update config — the trigger will handle creating/updating the cron.job.
+        if job_owner:
+            cur.execute(
+                sql.SQL(
+                    """
+                    INSERT INTO {} (job_name, table_prefix, frequency_minutes, enabled, strategy, threshold, target_database, job_owner)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (job_name) DO UPDATE SET
+                        table_prefix = EXCLUDED.table_prefix,
+                        frequency_minutes = EXCLUDED.frequency_minutes,
+                        enabled = EXCLUDED.enabled,
+                        strategy = EXCLUDED.strategy,
+                        threshold = EXCLUDED.threshold,
+                        target_database = EXCLUDED.target_database,
+                        job_owner = EXCLUDED.job_owner,
+                        updated_at = CURRENT_TIMESTAMP
+                    """
+                ).format(sql.Identifier(config_table)),
+                (job_name, table_prefix, frequency, enabled, strategy, threshold, target_database, job_owner),
+            )
+        else:
+            cur.execute(
+                sql.SQL(
+                    """
+                    INSERT INTO {} (job_name, table_prefix, frequency_minutes, enabled, strategy, threshold, target_database)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (job_name) DO UPDATE SET
+                        table_prefix = EXCLUDED.table_prefix,
+                        frequency_minutes = EXCLUDED.frequency_minutes,
+                        enabled = EXCLUDED.enabled,
+                        strategy = EXCLUDED.strategy,
+                        threshold = EXCLUDED.threshold,
+                        target_database = EXCLUDED.target_database,
+                        updated_at = CURRENT_TIMESTAMP
+                    """
+                ).format(sql.Identifier(config_table)),
+                (job_name, table_prefix, frequency, enabled, strategy, threshold, target_database),
+            )
     cron_conn.commit()
     logger.info("Initial configuration inserted in cron database. Cron job should be synced.")
 
@@ -298,66 +338,106 @@ def insert_cache_eviction_config(cache_conn, job_name: str, table_prefix: str, f
     logger.info("Eviction configuration inserted successfully in cache database for worker function access.")
 
 
-def check_eviction_job_exists() -> bool:
-    """Check if any eviction job exists in the database."""
+def remove_all_eviction_objects(table_prefix: str):
+    """Remove all eviction-related tables, cron jobs and functions from both cron and cache databases."""
+    logger.info("Removing all PostgreSQL cache eviction objects and functions...")
+
+    target_database = get_cache_database_name()
+    job_name = construct_eviction_job_name(target_database, table_prefix)
+    config_table = f"{table_prefix}_eviction_config"
+    log_table = f"{table_prefix}_eviction_log"
+
+    # --- Cron database: unschedule jobs, drop config table and cron functions ---
+    cron_conn = get_pg_cron_connection()
     try:
-        conn = psycopg.connect(
-            host=os.getenv("DB_HOST"),
-            port=int(os.getenv("DB_PORT", "5432")),
-            user=os.getenv("DB_USER"),
-            password=os.getenv("DB_PASSWORD"),
-            dbname=os.getenv("DB_NAME"),
-        )
+        with cron_conn.cursor() as cur:
+            # Unschedule eviction job and log cleanup job
+            for jname in [job_name, f"partitioncache_eviction_log_cleanup_{table_prefix}"]:
+                try:
+                    cur.execute("SELECT cron.unschedule(%s)", [jname])
+                except Exception:
+                    cron_conn.rollback()
 
-        # Get the table prefix from environment
-        cache_backend = os.getenv("CACHE_BACKEND", "postgresql_array")
-        if cache_backend == "postgresql_array":
-            table_prefix = os.getenv("PG_ARRAY_CACHE_TABLE_PREFIX", "partitioncache")
-        elif cache_backend == "postgresql_bit":
-            table_prefix = os.getenv("PG_BIT_CACHE_TABLE_PREFIX", "partitioncache")
-        else:
-            table_prefix = os.getenv("PG_ROARINGBIT_CACHE_TABLE_PREFIX", "partitioncache")
+            # Drop config table (trigger will also attempt to unschedule)
+            cur.execute(sql.SQL("DROP TABLE IF EXISTS {} CASCADE").format(sql.Identifier(config_table)))
+            logger.info(f"Dropped cron config table '{config_table}'")
 
-        target_database = os.getenv("DB_NAME")
-        job_name = construct_eviction_job_name(target_database, table_prefix)
-        config_table = f"{table_prefix}_eviction_config"
-
-        with conn.cursor() as cur:
-            # Check if config table exists and has an enabled job
+            # Drop eviction-specific cron functions
             cur.execute(
                 """
-                SELECT EXISTS (
-                    SELECT 1 FROM information_schema.tables
-                    WHERE table_name = %s
-                )
-                """,
-                [config_table],
+                DO $$
+                DECLARE
+                    rec RECORD;
+                    eviction_cron_funcs TEXT[] := ARRAY[
+                        'partitioncache_construct_eviction_job_name',
+                        'partitioncache_initialize_eviction_cron_config_table',
+                        'partitioncache_schedule_eviction_log_cleanup',
+                        'partitioncache_unschedule_eviction_log_cleanup',
+                        'partitioncache_sync_eviction_cron_job',
+                        'partitioncache_create_eviction_cron_config_trigger',
+                        'partitioncache_get_eviction_status_cron',
+                        'partitioncache_update_eviction_config_cron'
+                    ];
+                BEGIN
+                    FOR rec IN
+                        SELECT p.oid::regprocedure AS func_ident
+                        FROM pg_proc p
+                        JOIN pg_namespace n ON n.oid = p.pronamespace
+                        WHERE n.nspname = 'public' AND p.proname = ANY(eviction_cron_funcs)
+                    LOOP
+                        EXECUTE format('DROP FUNCTION IF EXISTS %s CASCADE', rec.func_ident);
+                    END LOOP;
+                END;$$;
+                """
             )
-            table_exists = cur.fetchone()
-            if table_exists:
-                table_exists = table_exists[0]
+            logger.info("Eviction cron functions dropped.")
+        cron_conn.commit()
+    finally:
+        cron_conn.close()
 
-            if not table_exists:
-                conn.close()
-                return False
+    # --- Cache database: drop log table and cache-side eviction functions ---
+    cache_conn = get_db_connection()
+    try:
+        with cache_conn.cursor() as cur:
+            # Drop eviction log table
+            cur.execute(sql.SQL("DROP TABLE IF EXISTS {} CASCADE").format(sql.Identifier(log_table)))
+            logger.info(f"Dropped eviction log table '{log_table}'")
 
-            # Check if job is enabled
-            cur.execute(sql.SQL("SELECT enabled FROM {} WHERE job_name = %s").format(sql.Identifier(config_table)), [job_name])
-            result = cur.fetchone()
+            # Also drop the config table copy in cache database (if separate databases)
+            if get_cron_database_name() != get_cache_database_name():
+                cur.execute(sql.SQL("DROP TABLE IF EXISTS {} CASCADE").format(sql.Identifier(config_table)))
 
-        conn.close()
-        return bool(result and result[0])
+            # Drop eviction-specific cache functions
+            cur.execute(
+                """
+                DO $$
+                DECLARE
+                    rec RECORD;
+                    eviction_cache_funcs TEXT[] := ARRAY[
+                        'partitioncache_run_eviction_job_with_params',
+                        '_partitioncache_evict_oldest_from_partition',
+                        '_partitioncache_evict_largest_from_partition',
+                        'partitioncache_initialize_eviction_cache_log_table',
+                        'partitioncache_cleanup_eviction_logs',
+                        'partitioncache_remove_eviction_cache_objects'
+                    ];
+                BEGIN
+                    FOR rec IN
+                        SELECT p.oid::regprocedure AS func_ident
+                        FROM pg_proc p
+                        JOIN pg_namespace n ON n.oid = p.pronamespace
+                        WHERE n.nspname = 'public' AND p.proname = ANY(eviction_cache_funcs)
+                    LOOP
+                        EXECUTE format('DROP FUNCTION IF EXISTS %s CASCADE', rec.func_ident);
+                    END LOOP;
+                END;$$;
+                """
+            )
+            logger.info("Eviction cache functions dropped.")
+        cache_conn.commit()
+    finally:
+        cache_conn.close()
 
-    except Exception:
-        return False
-
-
-def remove_all_eviction_objects(conn, table_prefix: str):
-    """Remove all eviction-related tables, cron job and functions."""
-    logger.info("Removing all PostgreSQL cache eviction objects and functions...")
-    with conn.cursor() as cur:
-        cur.execute("SELECT partitioncache_remove_eviction_objects(%s)", [table_prefix])
-    conn.commit()
     logger.info("All cache eviction objects and functions removed.")
 
 
@@ -377,7 +457,8 @@ def set_processor_enabled(conn, table_prefix: str, job_name: str, enabled: bool)
         )
     cron_conn.commit()
     cron_conn.close()
-    logger.info(f"Cache eviction job {status.lower()}d successfully.")
+    result = "enabled" if enabled else "disabled"
+    logger.info(f"Cache eviction job {result} successfully.")
 
 
 def update_processor_config(conn, table_prefix: str, job_name: str, **kwargs):
@@ -406,7 +487,7 @@ def update_processor_config(conn, table_prefix: str, job_name: str, **kwargs):
     logger.info("Processor configuration updated successfully.")
 
 
-def handle_setup(table_prefix: str, frequency: int, enabled: bool, strategy: str, threshold: int):
+def handle_setup(table_prefix: str, frequency: int, enabled: bool, strategy: str, threshold: int, job_owner: str | None = None, create_role: bool = False):
     """Handle the main setup logic."""
     logger.info("Starting PostgreSQL cache eviction cross-database setup...")
 
@@ -414,6 +495,16 @@ def handle_setup(table_prefix: str, frequency: int, enabled: bool, strategy: str
     cache_conn = get_db_connection()
     cron_conn = get_pg_cron_connection()
     target_database = get_cache_database_name()
+
+    # Handle job_owner role creation if requested
+    if job_owner:
+        actual_cron_conn_for_role = cache_conn if get_cron_database_name() == get_cache_database_name() else cron_conn
+        ok, msg = ensure_role_exists(actual_cron_conn_for_role, job_owner, create_if_missing=create_role)
+        if ok:
+            logger.info(msg)
+        else:
+            logger.warning(f"{msg} — falling back to current_user")
+            job_owner = None
 
     if not check_pg_cron_installed():
         logger.error("pg_cron extension is not installed. Please install it first.")
@@ -434,7 +525,20 @@ def handle_setup(table_prefix: str, frequency: int, enabled: bool, strategy: str
 
     # Insert configuration in cron database for pg_cron job management only
     actual_cron_conn = cache_conn if get_cron_database_name() == get_cache_database_name() else cron_conn
-    insert_initial_config(actual_cron_conn, job_name, table_prefix, frequency, enabled, strategy, threshold, target_database)
+    insert_initial_config(actual_cron_conn, job_name, table_prefix, frequency, enabled, strategy, threshold, target_database, job_owner=job_owner)
+
+    # Optional: schedule eviction log cleanup if helper functions are available.
+    try:
+        with actual_cron_conn.cursor() as cur:
+            cur.execute(
+                "SELECT partitioncache_schedule_eviction_log_cleanup(%s, %s, %s, %s)",
+                [table_prefix, target_database, 30, "0 3 * * *"],
+            )
+        actual_cron_conn.commit()
+        logger.info("Scheduled eviction log cleanup (daily, 30d retention)")
+    except Exception as e:
+        actual_cron_conn.rollback()
+        logger.warning(f"Could not schedule eviction log cleanup: {e}")
 
     logger.info("Setup complete. The eviction job is created and configured via the config table.")
 
@@ -564,6 +668,109 @@ def manual_run(table_prefix):
             cron_conn.close()
 
 
+def verify_eviction_setup(table_prefix: str) -> int:
+    """Verify eviction installation across cache and cron databases."""
+    target_database = get_cache_database_name()
+    job_name = construct_eviction_job_name(target_database, table_prefix)
+    required_ok = True
+    warnings = 0
+
+    print("Verifying PostgreSQL eviction setup...")
+    print(f"  Target DB: {target_database}")
+    print(f"  Job Name:  {job_name}")
+
+    cache_conn = get_db_connection()
+    try:
+        print("\n[Cache Database Checks]")
+        for table_name in [f"{table_prefix}_eviction_log"]:
+            exists = table_exists(cache_conn, table_name)
+            print(f"  {'[OK]' if exists else '[ERR]'} table {table_name}")
+            required_ok = required_ok and exists
+
+        for function_name in [
+            "partitioncache_run_eviction_job_with_params",
+            "partitioncache_initialize_eviction_cache_log_table",
+        ]:
+            exists = function_exists(cache_conn, function_name)
+            print(f"  {'[OK]' if exists else '[ERR]'} function {function_name}")
+            required_ok = required_ok and exists
+
+        for function_name in ["partitioncache_cleanup_eviction_logs"]:
+            exists = function_exists(cache_conn, function_name)
+            if exists:
+                print(f"  [OK] function {function_name}")
+            else:
+                print(f"  [WARN] function {function_name} not installed")
+                warnings += 1
+    finally:
+        cache_conn.close()
+
+    cron_conn = get_pg_cron_connection()
+    try:
+        print("\n[Cron Database Checks]")
+        config_table = f"{table_prefix}_eviction_config"
+        config_exists = table_exists(cron_conn, config_table)
+        print(f"  {'[OK]' if config_exists else '[ERR]'} table {config_table}")
+        required_ok = required_ok and config_exists
+
+        if config_exists:
+            with cron_conn.cursor() as cur:
+                cur.execute(sql.SQL("SELECT enabled FROM {} WHERE job_name = %s").format(sql.Identifier(config_table)), [job_name])
+                row = cur.fetchone()
+                if row is None:
+                    print(f"  [ERR] config row for job '{job_name}' not found")
+                    required_ok = False
+                else:
+                    print(f"  [OK] config row exists (enabled={row[0]})")
+
+        pg_cron_installed = False
+        try:
+            with cron_conn.cursor() as cur:
+                cur.execute("SELECT 1 FROM pg_extension WHERE extname = 'pg_cron'")
+                pg_cron_installed = cur.fetchone() is not None
+        except Exception:
+            pg_cron_installed = False
+
+        if pg_cron_installed:
+            print("  [OK] pg_cron extension installed")
+            try:
+                with cron_conn.cursor() as cur:
+                    cur.execute("SELECT COUNT(*) FROM cron.job WHERE jobname = %s", [job_name])
+                    count_row = cur.fetchone()
+                    count = int(count_row[0]) if count_row else 0
+                    if count > 0:
+                        print("  [OK] scheduled cron job found")
+                    else:
+                        print("  [WARN] no scheduled cron job found (may be disabled)")
+                        warnings += 1
+            except Exception as e:
+                print(f"  [WARN] unable to inspect cron.job entries: {e}")
+                warnings += 1
+        else:
+            print("  [WARN] pg_cron extension not installed (manual mode)")
+            warnings += 1
+
+        for function_name in ["partitioncache_schedule_eviction_log_cleanup"]:
+            exists = function_exists(cron_conn, function_name)
+            if exists:
+                print(f"  [OK] function {function_name}")
+            else:
+                print(f"  [WARN] function {function_name} not installed")
+                warnings += 1
+    finally:
+        cron_conn.close()
+
+    print("\n[Summary]")
+    if required_ok:
+        print("  [OK] required checks passed")
+        if warnings:
+            print(f"  [WARN] optional warnings: {warnings}")
+        return 0
+
+    print("  [ERR] required checks failed")
+    return 1
+
+
 def main():
     """Main function to handle CLI commands."""
 
@@ -583,10 +790,17 @@ def main():
 
     # setup command
     setup_parser = subparsers.add_parser("setup", help="Setup database objects and pg_cron job for eviction")
-    setup_parser.add_argument("--frequency", type=int, default=60, help="Frequency in minutes to run the eviction job (default: 60)")
+    setup_parser.add_argument(
+        "--frequency",
+        type=_parse_eviction_frequency_minutes_arg,
+        default=60,
+        help="Frequency (minutes or 30s/5m/2h/1d, stored as minutes; default: 60)",
+    )
     setup_parser.add_argument("--threshold", type=int, default=1000, help="Cache size threshold to trigger eviction (default: 1000)")
     setup_parser.add_argument("--strategy", choices=["oldest", "largest"], default="oldest", help="Eviction strategy (default: oldest)")
     setup_parser.add_argument("--enable-after-setup", action="store_true", help="Enable the job immediately after setup (default: disabled)")
+    setup_parser.add_argument("--job-owner", type=str, default=os.getenv("PARTITIONCACHE_JOB_OWNER"), help="PostgreSQL role to own the pg_cron job (default: current_user)")
+    setup_parser.add_argument("--create-role", action="store_true", help="Create the --job-owner role if it does not exist")
 
     # remove command
     subparsers.add_parser("remove", help="Remove the pg_cron job and all eviction tables")
@@ -599,7 +813,7 @@ def main():
 
     # update-config command
     update_parser = subparsers.add_parser("update-config", help="Update eviction processor configuration")
-    update_parser.add_argument("--frequency", type=int, help="New frequency in minutes")
+    update_parser.add_argument("--frequency", type=_parse_eviction_frequency_minutes_arg, help="New frequency (minutes or 30s/5m/2h/1d)")
     update_parser.add_argument("--threshold", type=int, help="New cache size threshold")
     update_parser.add_argument("--strategy", choices=["oldest", "largest"], help="New eviction strategy")
 
@@ -612,6 +826,9 @@ def main():
 
     # manual-run command
     subparsers.add_parser("manual-run", help="Manually trigger the eviction job once")
+
+    # verify command
+    subparsers.add_parser("verify", help="Verify eviction setup, tables, functions, and cron wiring")
 
     args = parser.parse_args()
 
@@ -637,11 +854,12 @@ def main():
         target_database = get_cache_database_name()
         job_name = construct_eviction_job_name(target_database, table_prefix)
         conn = get_db_connection()
+        exit_code = 0
 
         if args.command == "setup":
-            handle_setup(table_prefix, args.frequency, args.enable_after_setup, args.strategy, args.threshold)
+            handle_setup(table_prefix, args.frequency, args.enable_after_setup, args.strategy, args.threshold, job_owner=getattr(args, "job_owner", None), create_role=getattr(args, "create_role", False))
         elif args.command == "remove":
-            remove_all_eviction_objects(conn, table_prefix)
+            remove_all_eviction_objects(table_prefix)
         elif args.command == "enable":
             set_processor_enabled(conn, table_prefix, job_name, True)
         elif args.command == "disable":
@@ -655,8 +873,12 @@ def main():
             view_logs(conn, table_prefix, args.limit)
         elif args.command == "manual-run":
             manual_run(table_prefix)
+        elif args.command == "verify":
+            exit_code = verify_eviction_setup(table_prefix)
 
         conn.close()
+        if exit_code:
+            sys.exit(exit_code)
 
     except Exception as e:
         logger.error(f"An error occurred: {e}", exc_info=True)

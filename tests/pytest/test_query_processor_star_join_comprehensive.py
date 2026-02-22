@@ -40,7 +40,7 @@ class TestStarJoinDetection:
         variants_without_p0 = [v for v in variants if "p0_region" not in v]
 
         assert len(variants_without_p0) == 0, "Should NOT have base variants without star-join table"
-        assert len(variants_with_p0) > 0, "Should have variants with star-join table re-added"
+        assert len(variants_with_p0) == 2, "Should have exactly 2 variants with star-join table re-added"
 
         # Verify structure: all variants should have p0_region AS p1
         for variant in variants_with_p0:
@@ -66,21 +66,20 @@ class TestStarJoinDetection:
         # The system generates variants from non-star-join tables AND re-adds star-join to all variants
         # BUT also creates variants with partition key conditions applied directly to regular tables
         variants_with_rm = [v for v in variants if "region_mapping" in v]
-        [v for v in variants if "region_mapping" not in v and ("customers" in v or "orders" in v or "products" in v)]
 
         # The system now generates BOTH types of variants:
         # 1. Variants with star-join table re-added (AS p1)
         # 2. Direct variants where partition key conditions are applied to regular tables
-        assert len(variants_with_rm) > 0, "Should have variants with smart-detected star-join re-added"
+        assert len(variants_with_rm) == 6, "Should have exactly 6 variants with smart-detected star-join re-added"
 
         # Verify star-join table is properly aliased when re-added
         star_join_variants = [v for v in variants_with_rm if " AS p1" in v]
-        assert len(star_join_variants) > 0, "Star-join table should be re-added with p1 alias"
+        assert len(star_join_variants) == 6, "Star-join table should be re-added with p1 alias in all 6 variants"
 
         # Verify partition key conditions are preserved in variants
         # When star-join table has partition key conditions, they are propagated to all variants
         with_pk_condition = [v for v in variants if "region_id > 1000" in v]
-        assert len(with_pk_condition) > 0, "Should have variants with partition key conditions"
+        assert len(with_pk_condition) == 6, "Should have exactly 6 variants with partition key conditions"
 
     def test_explicit_specification(self):
         """Test explicit star-join table specification."""
@@ -109,7 +108,7 @@ class TestStarJoinDetection:
         explicit_without_ch = [v for v in variants_explicit if "central_hub" not in v]
 
         assert len(explicit_without_ch) == 0, "Explicit star-join should be excluded from base variants"
-        assert len(explicit_with_ch) > 0, "Explicit star-join should be re-added to all variants"
+        assert len(explicit_with_ch) == 2, "Explicit star-join should be re-added to all 2 variants"
 
     def test_star_join_with_conditions_not_detected(self):
         """Test that tables with non-partition-key conditions are NOT detected as star-join."""
@@ -130,7 +129,7 @@ class TestStarJoinDetection:
         mapping_as_regular = [v for v in variants if "mapping" in v and " AS t" in v and "active" in v]
         mapping_as_star_join = [v for v in variants if "mapping" in v and " AS p1" in v]
 
-        assert len(mapping_as_regular) > 0, "Table with non-PK conditions should appear as regular table"
+        assert len(mapping_as_regular) == 2, "Table with non-PK conditions should appear as regular table in exactly 2 variants"
         assert len(mapping_as_star_join) == 0, "Table with non-PK conditions should NOT be star-join detected"
 
 
@@ -205,15 +204,13 @@ class TestVariantGenerationPipeline:
         with_pk_condition = [v for v in variants if "IN (SELECT id FROM active_partitions)" in v]
         without_pk_condition = [v for v in variants if "IN (SELECT id FROM active_partitions)" not in v]
 
-        assert len(with_pk_condition) >= 1, "Should have variants with partition key condition"
-        assert len(without_pk_condition) >= 1, "Should have variants without partition key condition"
+        assert len(with_pk_condition) == 2, "Should have exactly 2 variants with partition key condition"
+        assert len(without_pk_condition) == 2, "Should have exactly 2 variants without partition key condition"
 
         # Verify that star-join variants have p0_partition re-added
         star_join_variants = [v for v in variants if "p0_partition AS p1" in v]
-        [v for v in variants if "p0_partition" not in v and "users" in v]
 
-        assert len(star_join_variants) > 0, "Should have variants with star-join table re-added"
-        # Note: System also generates direct variants where partition key conditions are applied to regular tables
+        assert len(star_join_variants) == 2, "Should have exactly 2 variants with star-join table re-added"
 
         # Verify conditions are preserved
         for variant in variants:
@@ -236,7 +233,7 @@ class TestVariantGenerationPipeline:
         )
 
         # Verify we get query-hash pairs
-        assert len(query_hash_pairs) > 0, "Should generate query-hash pairs"
+        assert len(query_hash_pairs) == 3, "Should generate exactly 3 query-hash pairs"
 
         # Verify structure of pairs
         for query_text, hash_value in query_hash_pairs:
@@ -284,8 +281,9 @@ class TestParameterInteractions:
             query, "city_id", min_component_size=1, follow_graph=False, auto_detect_star_join=True, warn_no_partition_key=False
         )
 
-        # follow_graph=False should generate more variants (allows unconnected combinations)
-        assert len(variants_all) >= len(variants_connected), "follow_graph=False should generate more variants"
+        # follow_graph=True produces connected subgraphs only, follow_graph=False allows all combinations
+        assert len(variants_connected) == 6, "follow_graph=True should generate exactly 6 connected variants"
+        assert len(variants_all) == 7, "follow_graph=False should generate exactly 7 variants (all combinations)"
 
         # All variants should still have p0_city re-added
         for variant in variants_connected + variants_all:
@@ -349,7 +347,7 @@ class TestParameterInteractions:
         auto_with_p0 = [v for v in variants_auto if "p0_auto_detected AS p1" in v]
         auto_with_msj = [v for v in variants_auto if "manual_star_join AS p1" in v]
 
-        assert len(auto_with_p0) > 0, "Auto-detection should pick p0_auto_detected"
+        assert len(auto_with_p0) == 3, "Auto-detection should pick p0_auto_detected for all 3 variants"
         assert len(auto_with_msj) == 0, "Auto-detection should not pick manual_star_join"
 
         # Verify explicit parameter overrides auto-detection
@@ -357,7 +355,7 @@ class TestParameterInteractions:
         explicit_with_msj = [v for v in variants_explicit if "manual_star_join AS p1" in v]
 
         assert len(explicit_with_p0) == 0, "Explicit parameter should override auto-detection"
-        assert len(explicit_with_msj) > 0, "Explicit parameter should be used"
+        assert len(explicit_with_msj) == 3, "Explicit parameter should be used for all 3 variants"
 
 
 class TestEdgeCasesAndErrorHandling:
@@ -380,7 +378,7 @@ class TestEdgeCasesAndErrorHandling:
         )
 
         # Should generate normal variants without star-join optimization
-        assert len(variants) > 0, "Should generate variants even without star-join tables"
+        assert len(variants) == 3, "Should generate exactly 3 variants even without star-join tables"
 
         # No variants should have " AS p1" (star-join alias)
         star_join_variants = [v for v in variants if " AS p1" in v]
@@ -397,12 +395,12 @@ class TestEdgeCasesAndErrorHandling:
 
         # Should pick only one table as star-join (alphabetically first)
         # and generate variants with the other table(s)
-        assert len(variants) > 0, "Should generate variants"
+        assert len(variants) == 1, "Should generate exactly 1 variant"
 
         # Only one table should be used as star-join
         # When user alias is "p1", system uses fallback alias "star_join_*"
         star_join_count = sum(1 for v in variants if " AS p1" in v or " AS star_join_" in v)
-        assert star_join_count > 0, "Should have star-join table re-added"
+        assert star_join_count == 1, "Should have exactly 1 variant with star-join table re-added"
 
     def test_complex_partition_key_conditions(self):
         """Test complex partition key conditions - demonstrates attribute vs partition key condition distinction."""
@@ -425,20 +423,20 @@ class TestEdgeCasesAndErrorHandling:
         events_variants = [v for v in variants if "events" in v]
         ptp_variants = [v for v in variants if "p0_time_partition" in v]
 
-        assert len(events_variants) > 0, "Should have variants with events table"
-        assert len(ptp_variants) > 0, "Should have variants with p0_time_partition table"
+        assert len(events_variants) == 7, "Should have exactly 7 variants with events table"
+        assert len(ptp_variants) == 4, "Should have exactly 4 variants with p0_time_partition table"
 
         # Since star-join is detected, should have " AS p1" aliases
         star_join_aliases = [v for v in variants if " AS p1" in v]
-        assert len(star_join_aliases) > 0, "Should have star-join aliases when star-join detected"
+        assert len(star_join_aliases) == 4, "Should have exactly 4 star-join aliases when star-join detected"
 
         # Verify that NOT IN is preserved (NOT keyword should be maintained)
         not_in_variants = [v for v in variants if "NOT " in v and " IN (" in v]
-        assert len(not_in_variants) > 0, "NOT IN conditions should be preserved"
+        assert len(not_in_variants) == 4, "Should have exactly 4 variants with NOT IN conditions preserved"
 
         # Verify BETWEEN conditions are processed (may be normalized to >= and <= conditions)
         between_or_range_variants = [v for v in variants if ("BETWEEN" in v or (">=" in v and "<=" in v))]
-        assert len(between_or_range_variants) > 0, "BETWEEN conditions should be preserved or normalized to range conditions"
+        assert len(between_or_range_variants) == 4, "Should have exactly 4 variants with BETWEEN/range conditions"
 
     def test_true_partition_key_conditions_on_star_join(self):
         """Test true partition key conditions (IN subqueries) on star-join tables."""
@@ -455,17 +453,15 @@ class TestEdgeCasesAndErrorHandling:
         # Should generate variants with and without the IN condition
 
         with_star_join = [v for v in variants if "p0_pure_partition AS p1" in v]
-        [v for v in variants if "p0_pure_partition" in v and " AS p1" not in v]
 
-        assert len(with_star_join) > 0, "Should have variants with star-join table re-added"
-        # Note: System behavior may vary on whether base variants without star-join are generated
+        assert len(with_star_join) == 2, "Should have exactly 2 variants with star-join table re-added"
 
         # Verify that partition key conditions create multiple variants
         with_in_condition = [v for v in variants if "IN (SELECT id FROM active_partitions)" in v]
         without_in_condition = [v for v in variants if "IN (SELECT id FROM active_partitions)" not in v]
 
-        assert len(with_in_condition) > 0, "Should have variants with IN condition"
-        assert len(without_in_condition) > 0, "Should have variants without IN condition"
+        assert len(with_in_condition) == 2, "Should have exactly 2 variants with IN condition"
+        assert len(without_in_condition) == 2, "Should have exactly 2 variants without IN condition"
 
     def test_star_join_eliminates_redundant_joins(self):
         """Test that star-join optimization eliminates redundant joins between tables."""
@@ -490,7 +486,7 @@ class TestEdgeCasesAndErrorHandling:
 
         # All multi-table variants should follow star-join pattern
         multi_table_variants = [v for v in variants if v.count(" AS t") >= 2]
-        assert len(multi_table_variants) > 0, "Should have multi-table variants for testing"
+        assert len(multi_table_variants) == 4, "Should have exactly 4 multi-table variants for testing"
 
         for variant in multi_table_variants:
             # Should have star-join table re-added
@@ -506,7 +502,7 @@ class TestEdgeCasesAndErrorHandling:
             star_joins = [j for j in join_conditions if " = p1.region_id" in j or "p1.region_id = " in j]
 
             assert len(direct_joins) == 0, f"Should have no direct table-to-table joins, found: {direct_joins}"
-            assert len(star_joins) > 0, f"Should have star-join pattern joins, found: {star_joins}"
+            assert len(star_joins) >= 2, f"Each multi-table variant should have at least 2 star-join pattern joins, found: {star_joins}"
 
             # Verify all tables join to star-join table
             table_count = variant.count(" AS t")
@@ -607,7 +603,7 @@ class TestRegressionTests:
 
         # All multi-table variants should follow star-join pattern
         multi_table_variants = [v for v in variants if v.count(" AS t") >= 2]
-        assert len(multi_table_variants) > 0, "Should have multi-table variants for testing"
+        assert len(multi_table_variants) == 4, "Should have exactly 4 multi-table variants for testing"
 
         for variant in multi_table_variants:
             # Should have star-join table re-added
@@ -623,7 +619,7 @@ class TestRegressionTests:
             star_joins = [j for j in join_conditions if " = p1.region_id" in j or "p1.region_id = " in j]
 
             assert len(direct_joins) == 0, f"Should have no direct table-to-table joins, found: {direct_joins}"
-            assert len(star_joins) > 0, f"Should have star-join pattern joins, found: {star_joins}"
+            assert len(star_joins) >= 2, f"Each multi-table variant should have at least 2 star-join pattern joins, found: {star_joins}"
 
             # Verify all tables join to star-join table
             table_count = variant.count(" AS t")

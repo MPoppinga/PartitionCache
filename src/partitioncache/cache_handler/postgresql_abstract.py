@@ -38,6 +38,9 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
         self.db = psycopg.connect(dbname=db_name, host=db_host, password=db_password, port=db_port, user=db_user, options=f"-c statement_timeout={int(timeout)*1000}" )
         self.tableprefix = db_tableprefix
         self.cursor = self.db.cursor()
+        # Datatype cache must be instance-scoped: different tests/backends can reuse
+        # the same partition key name (e.g. "zipcode") with different prefixes/datatypes.
+        self._cached_datatype = {}
 
         # Create metadata tables with supported datatypes
         self._recreate_metadata_table(self.get_supported_datatypes())

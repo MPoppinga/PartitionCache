@@ -183,7 +183,9 @@ def query_fragment_processor(args, constraint_args):
             logger.debug(f"Generated {len(query_hash_pairs)} fragments from original query")
 
             # Push fragments to query fragment queue using the partition_key and datatype from queue
-            success = push_to_query_fragment_queue(query_hash_pairs, partition_key, partition_datatype)
+            # For spatial queries, resolve and pass cache_backend so the processor knows which handler to use
+            queue_cache_backend = resolve_cache_backend(args) if is_spatial else None
+            success = push_to_query_fragment_queue(query_hash_pairs, partition_key, partition_datatype, cache_backend=queue_cache_backend)
             if success:
                 logger.debug(f"Pushed {len(query_hash_pairs)} fragments to query fragment queue")
             else:
@@ -296,7 +298,7 @@ def apply_cache_optimization(query: str, query_hash: str, partition_key: str, pa
     return query, False, stats
 
 
-def run_and_store_query(query: str, query_hash: str, partition_key: str, partition_datatype: str | None = None):
+def run_and_store_query(query: str, query_hash: str, partition_key: str, partition_datatype: str | None = None, item_cache_backend: str | None = None):
     """Worker function to execute and store a query."""
     logger.info(f"WORKER THREAD START: Processing query {query_hash}")
 
@@ -307,7 +309,7 @@ def run_and_store_query(query: str, query_hash: str, partition_key: str, partiti
     success = False
 
     try:
-        cache_backend = resolve_cache_backend(args)
+        cache_backend = item_cache_backend or resolve_cache_backend(args)
         cache_handler = get_cache_handler(cache_backend, singleton=True)
         logger.info(f"Got cache handler for {query_hash}")
 
@@ -609,7 +611,7 @@ def fragment_executor():
                         # No more jobs available or timeout
                         break
 
-                    query, hash_value, partition_key, partition_datatype = fragment_result
+                    query, hash_value, partition_key, partition_datatype, item_cache_backend = fragment_result
                     logger.debug(f"Found fragment in fragment queue: {hash_value}")
 
                     # Check if already in cache (unless force-recalculate)
@@ -628,7 +630,7 @@ def fragment_executor():
 
                     # Submit the job
                     with status_lock:
-                        future = pool.submit(run_and_store_query, query, hash_value, partition_key, partition_datatype)
+                        future = pool.submit(run_and_store_query, query, hash_value, partition_key, partition_datatype, item_cache_backend)
                         active_futures[future] = hash_value
                         logger.info(f"Submitted to threadpool: {hash_value} (active: {len(active_futures)})")
 

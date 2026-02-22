@@ -119,9 +119,19 @@ def e2e_cache_client(db_session):
     """
     from partitioncache.cache_handler import get_cache_handler
 
+    # Keep cache handler DB_* env aligned with the active db_session to avoid
+    # test-order-dependent mismatches when other tests mutate process env vars.
+    db_info = db_session.info
+    os.environ["DB_HOST"] = db_info.host or os.getenv("DB_HOST", "localhost")
+    os.environ["DB_PORT"] = str(db_info.port)
+    os.environ["DB_USER"] = db_info.user or os.getenv("DB_USER", "integration_user")
+    os.environ["DB_NAME"] = db_info.dbname or os.getenv("DB_NAME", "partitioncache_integration")
+
     # Only use postgresql_array for E2E workflow tests
     cache_backend = "postgresql_array"
     cache_handler = get_cache_handler(cache_backend)
+    cache_handler.register_partition_key("zipcode", "integer")
+    cache_handler.register_partition_key("region", "text")
 
     yield cache_handler
 
@@ -556,7 +566,7 @@ class TestEndToEndWorkflows:
             # Use test data partition values
             test_partition_values = {1001, 1002, 90210}
             for hash_key in hashes:
-                e2e_cache_client.set_cache(hash_key, test_partition_values, partition_key)
+                assert e2e_cache_client.set_cache(hash_key, test_partition_values, partition_key), f"Failed to cache hash {hash_key}"
 
             # Measure cache-enabled performance
             start_time = time.time()

@@ -64,13 +64,14 @@ CREATE TABLE original_query_queue (
     UNIQUE(query, partition_key)
 );
 
--- Query Fragment Queue  
+-- Query Fragment Queue
 CREATE TABLE query_fragment_queue (
     id SERIAL PRIMARY KEY,
     query TEXT NOT NULL,
     hash TEXT NOT NULL,
     partition_key TEXT NOT NULL,
     partition_datatype TEXT,
+    cache_backend TEXT,
     priority INTEGER NOT NULL DEFAULT 1,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -141,7 +142,7 @@ partitioncache.push_to_original_query_queue(
 )
 ```
 
-#### `push_to_query_fragment_queue(query_hash_pairs: list[tuple[str, str]], partition_key: str = "partition_key", partition_datatype: str = "integer", queue_provider: str | None = None)`
+#### `push_to_query_fragment_queue(query_hash_pairs: list[tuple[str, str]], partition_key: str = "partition_key", partition_datatype: str = "integer", queue_provider: str | None = None, cache_backend: str | None = None)`
 Add processed query fragments to the query fragment queue:
 
 ```python
@@ -151,6 +152,12 @@ query_hash_pairs = [
     ("SELECT * FROM users WHERE age > 25 AND user_id = 2", "hash456")
 ]
 partitioncache.push_to_query_fragment_queue(query_hash_pairs, "user_id", "integer")
+
+# Add spatial query fragments with explicit cache backend
+partitioncache.push_to_query_fragment_queue(
+    query_hash_pairs, "spatial_key", "geometry",
+    cache_backend="postgis_h3"
+)
 ```
 
 #### `pop_from_original_query_queue(queue_provider: str | None = None)`
@@ -168,11 +175,12 @@ if result:
 Retrieve query fragments for execution:
 
 ```python
-# Returns (query, hash, partition_key, partition_datatype) tuple or None
+# Returns (query, hash, partition_key, partition_datatype, cache_backend) tuple or None
 result = partitioncache.pop_from_query_fragment_queue()
 if result:
-    query, hash_val, partition_key, partition_datatype = result
+    query, hash_val, partition_key, partition_datatype, cache_backend = result
     print(f"Executing query {hash_val} for partition: {partition_key}")
+    # cache_backend is None for non-spatial queries, or e.g. "postgis_h3" for spatial
 ```
 
 #### `get_queue_lengths(queue_provider: str | None = None)`
@@ -198,7 +206,7 @@ The monitor implements a sophisticated two-threaded architecture:
 - Pushes fragments with partition key to query fragment queue
 
 **Thread 2: Execution Pool**
-- Consumes `(query, hash, partition_key, partition_datatype)` from query fragment queue
+- Consumes `(query, hash, partition_key, partition_datatype, cache_backend)` from query fragment queue
 - Executes fragments against database
 - Stores results in cache with partition key tracking
 
@@ -286,10 +294,10 @@ The system uses PostgreSQL's `SELECT FOR UPDATE SKIP LOCKED` pattern for optimal
 
 ```sql
 -- Multiple processors can run simultaneously without blocking
-SELECT id, query, hash, partition_key 
-FROM query_fragment_queue 
-ORDER BY priority DESC, created_at ASC 
-FOR UPDATE SKIP LOCKED 
+SELECT id, query, hash, partition_key, partition_datatype, cache_backend
+FROM query_fragment_queue
+ORDER BY priority DESC, created_at ASC
+FOR UPDATE SKIP LOCKED
 LIMIT 1;
 ```
 

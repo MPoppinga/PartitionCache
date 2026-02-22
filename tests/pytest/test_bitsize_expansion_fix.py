@@ -127,7 +127,7 @@ class TestBitsizeExpansionFix:
 
             assert result is True
             # Verify that _ensure_partition_table was called and would expand bitsize
-            assert cache_handler._get_partition_bitsize.call_count >= 2
+            assert cache_handler._get_partition_bitsize.call_count == 3
 
     def test_validation_logic_edge_cases(self, cache_handler):
         """Test edge cases around the validation logic."""

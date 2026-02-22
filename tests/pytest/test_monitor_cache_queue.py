@@ -69,6 +69,7 @@ def mock_args():
     args.disable_optimized_polling = False
     args.force_recalculate = False
     args.log_query_times = None
+    args.disable_lazy_insertion = False
     return args
 
 
@@ -132,7 +133,7 @@ class TestQueryFragmentProcessor:
             skip_partition_key_joins=False,
             geometry_column=None,
         )
-        mock_push_fragments.assert_called_once_with([("SELECT DISTINCT t1.partition_key FROM test_table t1", "hash1")], "test_partition_key", "integer")
+        mock_push_fragments.assert_called_once_with([("SELECT DISTINCT t1.partition_key FROM test_table t1", "hash1")], "test_partition_key", "integer", cache_backend=None)
 
     @patch("partitioncache.cli.monitor_cache_queue.exit_event")
     @patch("partitioncache.cli.monitor_cache_queue.pop_from_original_query_queue_blocking")
@@ -418,7 +419,8 @@ class TestRunAndStoreQuery:
         hash_part, time_part = lines[0].split(',')
         assert hash_part == "test_hash"
         execution_time = float(time_part)
-        assert execution_time >= 0
+        assert execution_time >= 0  # Timing value from mocked instant execution
+        assert execution_time < 1.0  # Mocked DB calls should complete in well under 1 second
 
 
 class TestPrintStatus:
@@ -508,8 +510,8 @@ class TestFragmentExecutorComponents:
                                     return call_count[0] > 3  # Exit after a few calls
                                 mock_exit_event.is_set.side_effect = mock_exit_side_effect
                                 # Return cached query once, then None to prevent infinite loop
-                                mock_pop.side_effect = [("SELECT * FROM test", "cached_hash", "test_partition_key", "integer"), None]
-                                mock_pop_blocking.side_effect = [("SELECT * FROM test", "cached_hash", "test_partition_key", "integer"), None]
+                                mock_pop.side_effect = [("SELECT * FROM test", "cached_hash", "test_partition_key", "integer", None), None]
+                                mock_pop_blocking.side_effect = [("SELECT * FROM test", "cached_hash", "test_partition_key", "integer", None), None]
                                 mock_get_lengths.return_value = {"original_query_queue": 0, "query_fragment_queue": 0}
                                 mock_time.return_value = 1000.0
 
@@ -627,7 +629,7 @@ class TestIntegration:
             geometry_column=None,
         )
         mock_push_to_outgoing.assert_called_once_with(
-            [("SELECT DISTINCT t1.partition_key FROM test_table t1 WHERE t1.id = 1", "hash1")], "test_partition_key", "integer"
+            [("SELECT DISTINCT t1.partition_key FROM test_table t1 WHERE t1.id = 1", "hash1")], "test_partition_key", "integer", cache_backend=None
         )
 
 

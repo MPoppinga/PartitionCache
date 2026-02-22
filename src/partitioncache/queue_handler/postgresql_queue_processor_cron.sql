@@ -9,7 +9,7 @@ DECLARE
     v_config_table TEXT;
 BEGIN
     v_config_table := p_queue_prefix || '_processor_config';
-    
+
     -- Configuration table to control the processor (lives in cron database)
     EXECUTE format('
         CREATE TABLE IF NOT EXISTS %I (
@@ -25,9 +25,75 @@ BEGIN
             target_database TEXT NOT NULL, -- Database where work should be executed
             result_limit INTEGER DEFAULT NULL CHECK (result_limit IS NULL OR result_limit > 0), -- Limit number of partition keys, NULL = disabled
             default_bitsize INTEGER DEFAULT NULL CHECK (default_bitsize IS NULL OR default_bitsize > 0),
+            job_owner TEXT DEFAULT current_user, -- Role used to run the pg_cron job
             job_ids BIGINT[] DEFAULT ARRAY[]::BIGINT[], -- Store pg_cron job IDs for management
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )', v_config_table);
+
+    -- Migration: add job_owner column for existing installations
+    EXECUTE format('ALTER TABLE %I ADD COLUMN IF NOT EXISTS job_owner TEXT DEFAULT current_user', v_config_table);
+END;
+$$ LANGUAGE plpgsql;
+
+-- Function to schedule processor log cleanup in the target database.
+CREATE OR REPLACE FUNCTION partitioncache_schedule_processor_log_cleanup(
+    p_queue_prefix TEXT DEFAULT 'partitioncache_queue',
+    p_target_database TEXT DEFAULT NULL,
+    p_retention_days INTEGER DEFAULT 30,
+    p_schedule TEXT DEFAULT '0 3 * * *'
+)
+RETURNS BIGINT AS $$
+DECLARE
+    v_job_name TEXT;
+    v_command TEXT;
+    v_job_id BIGINT;
+    v_target_db TEXT;
+BEGIN
+    v_job_name := 'partitioncache_processor_log_cleanup_' || p_queue_prefix;
+
+    IF p_target_database IS NULL THEN
+        EXECUTE format('SELECT target_database FROM %I LIMIT 1', p_queue_prefix || '_processor_config') INTO v_target_db;
+        IF v_target_db IS NULL THEN
+            RAISE EXCEPTION 'No target database specified and none found in config';
+        END IF;
+    ELSE
+        v_target_db := p_target_database;
+    END IF;
+
+    BEGIN
+        PERFORM cron.unschedule(v_job_name);
+    EXCEPTION WHEN OTHERS THEN
+        -- Ignore if missing.
+    END;
+
+    v_command := format('SELECT partitioncache_cleanup_processor_logs(%L, %L)', p_queue_prefix, p_retention_days);
+
+    SELECT cron.schedule_in_database(
+        v_job_name,
+        p_schedule,
+        v_command,
+        v_target_db
+    ) INTO v_job_id;
+
+    RETURN v_job_id;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Function to unschedule processor log cleanup.
+CREATE OR REPLACE FUNCTION partitioncache_unschedule_processor_log_cleanup(
+    p_queue_prefix TEXT DEFAULT 'partitioncache_queue'
+)
+RETURNS VOID AS $$
+DECLARE
+    v_job_name TEXT;
+BEGIN
+    v_job_name := 'partitioncache_processor_log_cleanup_' || p_queue_prefix;
+
+    BEGIN
+        PERFORM cron.unschedule(v_job_name);
+    EXCEPTION WHEN OTHERS THEN
+        RAISE NOTICE 'Could not unschedule processor log cleanup job %: %', v_job_name, SQLERRM;
+    END;
 END;
 $$ LANGUAGE plpgsql;
 
@@ -38,7 +104,7 @@ DECLARE
     v_command TEXT;
     v_job_base TEXT;
     v_timeout_seconds INTEGER;
-    v_timeout_statement TEXT;
+    v_job_owner TEXT;
     v_target_database TEXT;
     v_job_name TEXT;
     v_job_id BIGINT;
@@ -59,14 +125,14 @@ BEGIN
 
     -- If pg_cron is not available, skip cron operations but allow trigger to proceed
     IF NOT v_pg_cron_available THEN
-        RAISE NOTICE 'pg_cron extension not available, skipping cron job synchronization for job: %', 
+        RAISE NOTICE 'pg_cron extension not available, skipping cron job synchronization for job: %',
             CASE WHEN TG_OP = 'DELETE' THEN OLD.job_name ELSE NEW.job_name END;
-        
+
         -- Clear job_ids array since no jobs can be scheduled
         IF TG_OP != 'DELETE' THEN
             NEW.job_ids := ARRAY[]::BIGINT[];
         END IF;
-        
+
         RETURN CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END;
     END IF;
 
@@ -87,13 +153,19 @@ BEGIN
     v_job_base := NEW.job_name;
     v_target_database := COALESCE(NEW.target_database, current_database()); -- Use target database from config, fallback to current
     v_timeout_seconds := COALESCE(NEW.timeout_seconds, 1800);
+    v_job_owner := COALESCE(NEW.job_owner, current_user);
 
-    -- Set timeout for the target database session
-    v_timeout_statement := 'SET LOCAL statement_timeout = ' || (v_timeout_seconds * 1000)::TEXT;
+    -- Set statement_timeout on the job owner role (persistent across sessions)
+    BEGIN
+        EXECUTE format('ALTER ROLE %I SET statement_timeout = %L',
+                       v_job_owner, (v_timeout_seconds * 1000)::TEXT || 'ms');
+    EXCEPTION WHEN OTHERS THEN
+        RAISE NOTICE 'Could not set statement_timeout on role %: %', v_job_owner, SQLERRM;
+    END;
 
-    -- Build command to execute in target database with proper timeout and parameters
-    v_command := format('BEGIN; %s; SELECT * FROM partitioncache_run_single_job_with_params(%L, %L, %L, %L, %L, %L, %L); COMMIT;', 
-                       v_timeout_statement, NEW.job_name, NEW.table_prefix, NEW.queue_prefix, 
+    -- Build command to execute in target database (no transaction wrapper needed)
+    v_command := format('SELECT * FROM partitioncache_run_single_job_with_params(%L, %L, %L, %L, %L, %L, %L)',
+                       NEW.job_name, NEW.table_prefix, NEW.queue_prefix,
                        NEW.cache_backend, NEW.timeout_seconds, NEW.result_limit, NEW.default_bitsize);
 
     -- First, unschedule existing jobs if this is an UPDATE
@@ -110,14 +182,14 @@ BEGIN
     -- Create new jobs using pg_cron API with cross-database execution
     FOR i IN 1..NEW.max_parallel_jobs LOOP
         v_job_name := v_job_base || '_' || i;
-        
+
         BEGIN
             -- Use schedule_in_database to run jobs in the target database
             -- Convert frequency to proper cron format
             IF NEW.frequency_seconds < 60 THEN
                 v_schedule := CONCAT(NEW.frequency_seconds, ' seconds');
             ELSE
-                -- Convert to cron format for intervals ≥60 seconds
+                -- Convert to cron format for intervals >= 60 seconds
                 IF NEW.frequency_seconds % 60 = 0 THEN
                     -- Even minutes: use minute interval
                     v_schedule := CONCAT('*/', NEW.frequency_seconds / 60, ' * * * *');
@@ -126,19 +198,19 @@ BEGIN
                     v_schedule := CONCAT('*/', NEW.frequency_seconds, ' * * * * *');
                 END IF;
             END IF;
-            
+
             -- This should only be reached if pg_cron is available (checked above)
             SELECT cron.schedule_in_database(
                 v_job_name,
                 v_schedule,
                 v_command,
                 v_target_database,
-                current_user,
+                v_job_owner,
                 NEW.enabled
             ) INTO v_job_id;
-            
+
             v_new_job_ids := array_append(v_new_job_ids, v_job_id);
-            
+
         EXCEPTION WHEN OTHERS THEN
             RAISE WARNING 'Failed to schedule job %: %', v_job_name, SQLERRM;
         END;
@@ -184,7 +256,7 @@ BEGIN
             FOR EACH ROW
             EXECUTE FUNCTION partitioncache_sync_cron_job()
         ', v_trigger_name, v_config_table);
-        
+
         RAISE NOTICE 'Created pg_cron trigger % for table %', v_trigger_name, v_config_table;
     ELSE
         RAISE NOTICE 'pg_cron extension not available, skipping trigger creation for table %', v_config_table;
@@ -220,21 +292,21 @@ BEGIN
                 v_table_suffix := 'custom';  -- Fallback for edge cases with only underscores
             END IF;
         END IF;
-        
+
         v_job_name := 'partitioncache_process_queue_' || p_target_database || '_' || v_table_suffix;
     ELSE
         -- Fallback for single table prefix per database
         v_job_name := 'partitioncache_process_queue_' || p_target_database;
     END IF;
-    
-    
+
+
     RETURN v_job_name;
 END;
 $$ LANGUAGE plpgsql;
 
 -- Function to enable or disable the queue processor (from cron database)
 CREATE OR REPLACE FUNCTION partitioncache_set_processor_enabled_cron(
-    p_enabled BOOLEAN, 
+    p_enabled BOOLEAN,
     p_queue_prefix TEXT DEFAULT 'partitioncache_queue',
     p_target_database TEXT DEFAULT NULL,
     p_job_name TEXT DEFAULT NULL
@@ -246,7 +318,7 @@ DECLARE
     v_target_db TEXT;
 BEGIN
     v_config_table := p_queue_prefix || '_processor_config';
-    
+
     -- Determine target database
     v_target_db := p_target_database;
     IF v_target_db IS NULL THEN
@@ -257,7 +329,7 @@ BEGIN
             RAISE EXCEPTION 'target_database is required when config table is empty or inaccessible';
         END;
     END IF;
-    
+
     -- Dynamic job name construction using helper function
     IF p_job_name IS NOT NULL THEN
         v_job_name := p_job_name;
@@ -267,9 +339,9 @@ BEGIN
             v_table_prefix TEXT;
             v_found_configs INTEGER := 0;
         BEGIN
-            EXECUTE format('SELECT COUNT(*), MAX(table_prefix) FROM %I WHERE target_database = %L', 
+            EXECUTE format('SELECT COUNT(*), MAX(table_prefix) FROM %I WHERE target_database = %L',
                           v_config_table, v_target_db) INTO v_found_configs, v_table_prefix;
-            
+
             IF v_found_configs = 1 THEN
                 -- Single config found - use table_prefix for job name construction
                 v_job_name := partitioncache_construct_job_name(v_target_db, v_table_prefix);
@@ -282,7 +354,7 @@ BEGIN
             END IF;
         END;
     END IF;
-    
+
     EXECUTE format(
         'UPDATE %I SET enabled = %L, updated_at = NOW() WHERE job_name = %L',
         v_config_table, p_enabled, v_job_name
@@ -293,7 +365,7 @@ $$ LANGUAGE plpgsql;
 -- Function to update processor configuration (from cron database)
 CREATE OR REPLACE FUNCTION partitioncache_update_processor_config_cron(
     p_job_name TEXT DEFAULT NULL,
-    p_enabled BOOLEAN DEFAULT NULL, 
+    p_enabled BOOLEAN DEFAULT NULL,
     p_max_parallel_jobs INTEGER DEFAULT NULL,
     p_frequency_seconds INTEGER DEFAULT NULL,
     p_timeout_seconds INTEGER DEFAULT NULL,
@@ -301,7 +373,8 @@ CREATE OR REPLACE FUNCTION partitioncache_update_processor_config_cron(
     p_target_database TEXT DEFAULT NULL,
     p_result_limit INTEGER DEFAULT NULL,
     p_default_bitsize INTEGER DEFAULT NULL,
-    p_queue_prefix TEXT DEFAULT 'partitioncache_queue'
+    p_queue_prefix TEXT DEFAULT 'partitioncache_queue',
+    p_job_owner TEXT DEFAULT NULL
 )
 RETURNS VOID AS $$
 DECLARE
@@ -312,7 +385,7 @@ DECLARE
     v_target_db TEXT;
 BEGIN
     v_config_table := p_queue_prefix || '_processor_config';
-    
+
     -- Determine target database for job name construction
     v_target_db := p_target_database;
     IF v_target_db IS NULL AND p_job_name IS NULL THEN
@@ -323,7 +396,7 @@ BEGIN
             RAISE EXCEPTION 'target_database is required when job_name is not provided and config is empty';
         END;
     END IF;
-    
+
     -- Dynamic job name construction using helper function
     IF p_job_name IS NOT NULL THEN
         v_job_name := p_job_name;
@@ -333,9 +406,9 @@ BEGIN
             v_table_prefix TEXT;
             v_found_configs INTEGER := 0;
         BEGIN
-            EXECUTE format('SELECT COUNT(*), MAX(table_prefix) FROM %I WHERE target_database = %L', 
+            EXECUTE format('SELECT COUNT(*), MAX(table_prefix) FROM %I WHERE target_database = %L',
                           v_config_table, v_target_db) INTO v_found_configs, v_table_prefix;
-            
+
             IF v_found_configs = 1 THEN
                 -- Single config found - use table_prefix for job name construction
                 v_job_name := partitioncache_construct_job_name(v_target_db, v_table_prefix);
@@ -373,6 +446,9 @@ BEGIN
     END IF;
     IF p_default_bitsize IS NOT NULL THEN
         v_set_clauses := array_append(v_set_clauses, format('default_bitsize = %L', p_default_bitsize));
+    END IF;
+    IF p_job_owner IS NOT NULL THEN
+        v_set_clauses := array_append(v_set_clauses, format('job_owner = %L', p_job_owner));
     END IF;
 
     -- Only execute if there's something to update

@@ -43,6 +43,17 @@ class TestSpatialCache:
 
         return results, elapsed
 
+    def _backend_supports_datatype(self, backend: str, datatype: str) -> bool:
+        """Check whether the selected backend supports a partition datatype."""
+        try:
+            handler = partitioncache.get_cache_handler(backend, singleton=True)
+            supports = getattr(handler.__class__, "supports_datatype", None)
+            if callable(supports):
+                return bool(supports(datatype))
+        except Exception:
+            return False
+        return True
+
     def _load_query_from_file(self, query_file: str) -> str:
         """Load query from file."""
         query_path = Path(__file__).parent / "spatial_queries" / query_file
@@ -55,64 +66,85 @@ class TestSpatialCache:
 
     def _test_cache_effectiveness(self, query: str, partition_key: str, partition_datatype: str = "integer") -> dict:
         """Test cache effectiveness for a given query."""
+        import time
+
         # Execute without cache
         results_no_cache, time_no_cache = self._execute_query(query)
 
         # Test with cache
         backend = self._get_cache_backend()
+        if not self._backend_supports_datatype(backend, partition_datatype):
+            pytest.skip(f"{backend} does not support datatype '{partition_datatype}'")
 
-        with partitioncache.create_cache_helper(backend, partition_key, partition_datatype) as cache:
-            # Get partition keys (this may be empty for first run)
-            import time
+        prefix_env_var = {
+            "postgresql_array": "PG_ARRAY_CACHE_TABLE_PREFIX",
+            "postgresql_bit": "PG_BIT_CACHE_TABLE_PREFIX",
+            "postgresql_roaringbit": "PG_ROARINGBIT_CACHE_TABLE_PREFIX",
+        }.get(backend)
+        original_prefix = None
+        if prefix_env_var:
+            original_prefix = os.getenv(prefix_env_var)
+            unique_token = f"{time.time_ns() & 0xFFFFFF:x}"
+            os.environ[prefix_env_var] = f"spatial_{os.getpid()}_{unique_token}"
 
-            start_time = time.perf_counter()
+        try:
+            with partitioncache.create_cache_helper(backend, partition_key, partition_datatype) as cache:
+                # Get partition keys (this may be empty for first run)
 
-            partition_keys, num_subqueries, num_hits = partitioncache.get_partition_keys(
-                query=query,
-                cache_handler=cache.underlying_handler,
-                partition_key=partition_key,
-                min_component_size=1,
-            )
+                start_time = time.perf_counter()
 
-            cache_lookup_time = time.perf_counter() - start_time
-
-            if partition_keys:
-                # Apply cache optimization
-                optimized_query = partitioncache.extend_query_with_partition_keys(
-                    query,
-                    partition_keys,
+                partition_keys, num_subqueries, num_hits = partitioncache.get_partition_keys(
+                    query=query,
+                    cache_handler=cache.underlying_handler,
                     partition_key=partition_key,
-                    method="IN",
-                    p0_alias="p1",
+                    min_component_size=1,
                 )
 
-                results_with_cache, time_with_cache = self._execute_query(optimized_query)
-                total_cache_time = cache_lookup_time + time_with_cache
+                cache_lookup_time = time.perf_counter() - start_time
 
-                # Verify results are consistent
-                assert len(results_no_cache) >= len(results_with_cache), "Cache should not return more results than full query"
+                if partition_keys:
+                    # Apply cache optimization
+                    optimized_query = partitioncache.extend_query_with_partition_keys(
+                        query,
+                        partition_keys,
+                        partition_key=partition_key,
+                        method="IN",
+                        p0_alias="p1",
+                    )
 
-                return {
-                    "results_count": len(results_no_cache),
-                    "cached_results_count": len(results_with_cache),
-                    "time_no_cache": time_no_cache,
-                    "time_with_cache": total_cache_time,
-                    "cache_hits": num_hits,
-                    "num_subqueries": num_subqueries,
-                    "speedup": time_no_cache / total_cache_time if total_cache_time > 0 else 0,
-                    "cache_effective": num_hits > 0,
-                }
-            else:
-                return {
-                    "results_count": len(results_no_cache),
-                    "cached_results_count": 0,
-                    "time_no_cache": time_no_cache,
-                    "time_with_cache": cache_lookup_time,
-                    "cache_hits": 0,
-                    "num_subqueries": num_subqueries,
-                    "speedup": 0,
-                    "cache_effective": False,
-                }
+                    results_with_cache, time_with_cache = self._execute_query(optimized_query)
+                    total_cache_time = cache_lookup_time + time_with_cache
+
+                    # Verify results are consistent
+                    assert len(results_no_cache) >= len(results_with_cache), "Cache should not return more results than full query"
+
+                    return {
+                        "results_count": len(results_no_cache),
+                        "cached_results_count": len(results_with_cache),
+                        "time_no_cache": time_no_cache,
+                        "time_with_cache": total_cache_time,
+                        "cache_hits": num_hits,
+                        "num_subqueries": num_subqueries,
+                        "speedup": time_no_cache / total_cache_time if total_cache_time > 0 else 0,
+                        "cache_effective": num_hits > 0,
+                    }
+                else:
+                    return {
+                        "results_count": len(results_no_cache),
+                        "cached_results_count": 0,
+                        "time_no_cache": time_no_cache,
+                        "time_with_cache": cache_lookup_time,
+                        "cache_hits": 0,
+                        "num_subqueries": num_subqueries,
+                        "speedup": 0,
+                        "cache_effective": False,
+                    }
+        finally:
+            if prefix_env_var:
+                if original_prefix is None:
+                    os.environ.pop(prefix_env_var, None)
+                else:
+                    os.environ[prefix_env_var] = original_prefix
 
     def test_spatial_data_exists(self):
         """Test that spatial test data exists."""
@@ -229,8 +261,11 @@ class TestSpatialCache:
         ]
 
         performance_results = []
+        backend = self._get_cache_backend()
 
         for query_file, partition_key, datatype in test_queries:
+            if not self._backend_supports_datatype(backend, datatype):
+                continue
             query = self._load_query_from_file(query_file)
             result = self._test_cache_effectiveness(query, partition_key, datatype)
 
@@ -243,6 +278,9 @@ class TestSpatialCache:
                     "results_count": result["results_count"],
                 }
             )
+
+        if not performance_results:
+            pytest.skip(f"No compatible partition datatype tests for backend {backend}")
 
         print("\nPerformance Comparison:")
         print("-" * 60)
@@ -269,14 +307,10 @@ class TestSpatialCache:
         if backend == "postgresql_roaringbit":
             # Check if roaringbitmap extension is available
             try:
-                import psycopg
-
-                conn = psycopg.connect(self.conn_str)
-                cur = conn.cursor()
-                cur.execute("SELECT 1 FROM pg_extension WHERE extname = 'roaringbitmap'")
-                if not cur.fetchone():
-                    pytest.skip("roaringbitmap extension not available")
-                conn.close()
+                with self.conn.cursor() as cur:
+                    cur.execute("SELECT 1 FROM pg_extension WHERE extname = 'roaringbitmap'")
+                    if not cur.fetchone():
+                        pytest.skip("roaringbitmap extension not available")
                 print("✅ roaringbitmap extension is available")
             except Exception as e:
                 pytest.skip(f"Cannot check roaringbitmap extension: {e}")
