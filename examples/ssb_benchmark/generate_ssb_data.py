@@ -2,7 +2,7 @@
 """
 SSB (Star Schema Benchmark) Data Generator for PartitionCache.
 
-Generates all 5 SSB tables with realistic data distributions following the SSB specification.
+Generates all 5 SSB tables with data following the SSB specification.
 Supports DuckDB and PostgreSQL backends.
 
 Tables:
@@ -11,6 +11,31 @@ Tables:
     - supplier (dimension): ~20 rows at SF=0.01
     - part (dimension): ~2K rows at SF=0.01
     - date_dim (dimension): 2,556 rows (fixed, 1992-01-01 to 1998-12-31)
+
+Data Generation Limitations:
+    This generator uses custom Python code rather than the official ``ssb-dbgen``
+    tool. The generated data differs from spec-compliant output in several ways:
+
+    - **Distributions**: Values are drawn from uniform random distributions instead
+      of the TPC-H-derived skewed distributions (Zipf, seasonal patterns) prescribed
+      by the SSB specification.
+    - **Names/Addresses**: Simplified placeholder strings ("Customer 1", "Address 42")
+      are used instead of grammar-based generation from syllable tables.
+    - **Determinism**: Results are reproducible with a fixed seed within this script
+      but are not cross-platform equivalent with official ``ssb-dbgen`` output.
+
+    What IS correct:
+    - Table schemas, column types, and foreign key relationships
+    - Date dimension hierarchy encoding (year, month, weeknum, etc.)
+    - Scale factor cardinality ratios (customers, suppliers, parts, lineorders)
+    - Value domains (regions, nations, categories, brands)
+
+    For PartitionCache benchmarking, these differences are acceptable: the benchmark
+    tests cache mechanics (variant decomposition, cross-dimension reuse, hierarchy
+    drill-down) rather than data-dependent optimizer behavior.
+
+    For spec-compliant data, use the official SSB generator:
+    https://github.com/eyalroz/ssb-dbgen
 
 Usage:
     python generate_ssb_data.py --scale-factor 0.01 --db-backend duckdb

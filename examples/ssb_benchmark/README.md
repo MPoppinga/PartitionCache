@@ -40,6 +40,21 @@ python run_ssb_benchmark.py --scale-factor 0.01 --db-backend postgresql --mode a
 python run_ssb_benchmark.py --scale-factor 0.01 --db-backend postgresql --mode backend-comparison
 ```
 
+## Data Generation
+
+The data generator uses **custom Python code** to create SSB tables. Unlike the TPC-H benchmark (which uses DuckDB's built-in generator), DuckDB does not ship a built-in SSB generator.
+
+Limitations compared to the official `ssb-dbgen`:
+- **Distributions**: Uniform random instead of TPC-H-derived skew (Zipf, seasonal patterns)
+- **Names/Addresses**: Simplified placeholders ("Customer 1") instead of grammar-based generation
+- **Determinism**: Reproducible with `--seed` but not equivalent to official `ssb-dbgen` output
+
+What IS correct: schemas, date dimension hierarchy, scale factor cardinalities, value domains (regions, nations, categories, brands).
+
+For PartitionCache benchmarking this is sufficient - the benchmark tests cache mechanics (variant decomposition, cross-dimension reuse, hierarchy drill-down), not data-dependent optimizer behavior.
+
+For spec-compliant data, use the official SSB generator: https://github.com/eyalroz/ssb-dbgen
+
 ## Multiple Partition Keys
 
 Each lineorder FK column is a separate partition key:
@@ -194,6 +209,34 @@ When `--output` is specified, results are saved with metadata:
   "results": [...]
 }
 ```
+
+## Search Space Reduction Metrics
+
+The benchmark reports **search space reduction** per partition key for each query. This metric shows how much the cache narrows the fact table scan:
+
+```
+Search Space Reduction:
+  lo_custkey:   300 total -> 45 cached (85.0% reduction)
+  lo_suppkey:    20 total ->  4 cached (80.0% reduction)
+  lo_orderdate: 2400 total -> 1800 cached (25.0% reduction)
+```
+
+- **total**: `COUNT(DISTINCT pk)` across the entire `lineorder` table (computed once at startup)
+- **cached**: number of distinct PK values in the intersected cache entry
+- **reduction**: `(1 - cached / total) * 100` - percentage of the search space eliminated
+
+Higher reduction means the cache provides a tighter constraint. The summary table includes an average reduction column per query when these metrics are available.
+
+In JSON output (`--output`), each partition key's `apply_stats` entry includes:
+```json
+"search_space_reduction": {
+  "total_distinct": 300,
+  "cached_set_size": 45,
+  "reduction_pct": 85.0
+}
+```
+
+The `fact_table_stats` are also included in the `metadata` section.
 
 ## Scale Factors
 
