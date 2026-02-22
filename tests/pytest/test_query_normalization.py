@@ -5,6 +5,9 @@ Tests that clean_query() properly normalizes JOIN ON syntax to comma-separated F
 with conditions in WHERE, and strips GROUP BY/HAVING clauses.
 """
 
+import sqlglot
+from sqlglot import exp
+
 from partitioncache.query_processor import (
     clean_query,
     extract_and_group_query_conditions,
@@ -242,3 +245,162 @@ class TestFragmentEquivalence:
         ))
 
         assert orig_hashes == adapted_hashes
+
+
+class TestJoinNormalizationSubqueryScope:
+    """JOIN normalization must only affect the outermost SELECT scope,
+    not JOINs inside subqueries (EXISTS, IN, scalar subqueries, CTEs)."""
+
+    @staticmethod
+    def _get_outer_top_level_conditions(sql: str) -> list[exp.Expression]:
+        """Parse SQL and return only the top-level WHERE conditions of the outermost SELECT,
+        excluding conditions nested inside EXISTS/IN subqueries."""
+        parsed = sqlglot.parse_one(sql)
+        outer_select = parsed if isinstance(parsed, exp.Select) else parsed.find(exp.Select)
+        assert outer_select is not None
+        outer_where = outer_select.args.get("where")
+        if not outer_where:
+            return []
+        where_expr = outer_where.this
+        if isinstance(where_expr, exp.And):
+            return list(where_expr.flatten())
+        return [where_expr]
+
+    def test_join_inside_exists_not_promoted_to_outer_where(self):
+        """JOIN ON inside an EXISTS subquery must stay inside the subquery."""
+        query = (
+            "SELECT t.trip_id FROM taxi_trips AS t "
+            "WHERE t.fare > 10 "
+            "AND EXISTS ("
+            "SELECT 1 FROM pois AS p JOIN regions AS r ON p.region_id = r.id "
+            "WHERE ST_DWithin(t.geom, p.geom, 500)"
+            ")"
+        )
+        from partitioncache.query_processor import normalize_joins_to_cross_join
+
+        result = normalize_joins_to_cross_join(query)
+
+        # Get top-level conditions of the outer WHERE
+        conditions = self._get_outer_top_level_conditions(result)
+
+        # The outer FROM only has alias 't'. Any top-level condition referencing
+        # 'r' or having 'region_id' means an inner condition leaked out.
+        for cond in conditions:
+            # Skip EXISTS/IN nodes — those legitimately contain subquery refs
+            if cond.find(exp.Exists) or cond.find(exp.In):
+                continue
+            cond_sql = cond.sql()
+            referenced_tables = {col.table for col in cond.find_all(exp.Column) if col.table}
+            assert "r" not in referenced_tables, (
+                f"Inner join condition leaked to outer WHERE as top-level condition: {cond_sql}\n"
+                f"Full result: {result}"
+            )
+
+    def test_join_inside_in_subquery_not_promoted(self):
+        """JOIN ON inside an IN-subquery must stay inside the subquery."""
+        query = (
+            "SELECT t.trip_id FROM taxi_trips AS t "
+            "WHERE t.region_id IN ("
+            "SELECT r.id FROM regions AS r "
+            "JOIN countries AS c ON r.country_id = c.id "
+            "WHERE c.name = 'Germany'"
+            ")"
+        )
+        from partitioncache.query_processor import normalize_joins_to_cross_join
+
+        result = normalize_joins_to_cross_join(query)
+
+        # Get top-level conditions of the outer WHERE
+        conditions = self._get_outer_top_level_conditions(result)
+
+        # 'c' and 'country_id' should not appear as a standalone outer condition
+        for cond in conditions:
+            if cond.find(exp.Exists) or cond.find(exp.In):
+                continue
+            referenced_tables = {col.table for col in cond.find_all(exp.Column) if col.table}
+            assert "c" not in referenced_tables, (
+                f"Inner join condition leaked to outer WHERE: {cond.sql()}\n"
+                f"Full result: {result}"
+            )
+
+    def test_clean_query_with_nested_join_produces_valid_sql(self):
+        """clean_query on a query with JOINs inside EXISTS must produce valid SQL."""
+        query = (
+            "SELECT t.trip_id FROM taxi_trips AS t "
+            "WHERE t.fare > 10 "
+            "AND EXISTS ("
+            "SELECT 1 FROM pois AS p JOIN regions AS r ON p.region_id = r.id "
+            "WHERE ST_DWithin(t.geom, p.geom, 500)"
+            ")"
+        )
+        result = clean_query(query)
+
+        # Must be parseable (valid SQL)
+        parsed = sqlglot.parse_one(result)
+        assert parsed is not None
+
+        # The EXISTS subquery must still exist in the result
+        assert "EXISTS" in result.upper()
+
+
+class TestStripSelectPreservation:
+    """generate_all_query_hash_pairs() calls clean_query() which rewrites SELECT
+    to *. When strip_select=False, the original columns should be preserved."""
+
+    @staticmethod
+    def _extract_select_clause(sql: str) -> str:
+        """Extract the SELECT clause (between SELECT and FROM) from a SQL string."""
+        parsed = sqlglot.parse_one(sql)
+        select_stmt = parsed if isinstance(parsed, exp.Select) else parsed.find(exp.Select)
+        if select_stmt and select_stmt.expressions:
+            return ", ".join(e.sql() for e in select_stmt.expressions)
+        return ""
+
+    def test_strip_select_false_preserves_columns(self):
+        """With strip_select=False, fragment SELECT clauses should contain original column names."""
+        query = (
+            "SELECT t.trip_id, t.fare, t.duration "
+            "FROM taxi_trips AS t "
+            "WHERE t.fare > 10 AND t.city_id = 5"
+        )
+        pairs = generate_all_query_hash_pairs(
+            query=query,
+            partition_key="city_id",
+            strip_select=False,
+        )
+
+        assert len(pairs) > 0
+
+        # Check only the SELECT clause of each fragment (not WHERE clause)
+        all_queries = [q for q, _ in pairs]
+        select_clauses = [self._extract_select_clause(q) for q in all_queries]
+        has_original_columns = any(
+            "trip_id" in sc.lower() or "fare" in sc.lower() or "duration" in sc.lower()
+            for sc in select_clauses
+        )
+        assert has_original_columns, (
+            f"strip_select=False should preserve original SELECT columns, "
+            f"but SELECT clauses are: {select_clauses}"
+        )
+
+    def test_strip_select_true_uses_partition_key_select(self):
+        """With strip_select=True (default), fragment SELECT uses partition key only."""
+        query = (
+            "SELECT t.trip_id, t.fare, t.duration "
+            "FROM taxi_trips AS t "
+            "WHERE t.fare > 10 AND t.city_id = 5"
+        )
+        pairs = generate_all_query_hash_pairs(
+            query=query,
+            partition_key="city_id",
+            strip_select=True,
+        )
+        assert len(pairs) > 0
+
+        # Check SELECT clauses don't have trip_id (only partition key)
+        all_queries = [q for q, _ in pairs]
+        select_clauses = [self._extract_select_clause(q) for q in all_queries]
+        has_trip_id = any("trip_id" in sc.lower() for sc in select_clauses)
+        assert not has_trip_id, (
+            f"strip_select=True should NOT preserve trip_id in SELECT: {select_clauses}"
+        )

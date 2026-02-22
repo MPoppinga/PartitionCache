@@ -1082,3 +1082,46 @@ class TestMuseumHotelExistsQuery:
             f"Expected at least 1 fragment with both osm_pois and EXISTS:\n"
             + "\n".join(f"  {f}" for f in fragments)
         )
+
+
+class TestOrphanRemovalDistinctPreservation:
+    """_remove_orphaned_tables must preserve DISTINCT modifier when reconstructing SQL."""
+
+    def test_distinct_preserved_after_orphan_removal(self):
+        """When orphan removal triggers on a SELECT DISTINCT query,
+        DISTINCT must be preserved in the reconstructed SQL."""
+        from partitioncache.query_processor import _remove_orphaned_tables
+
+        query = (
+            "SELECT DISTINCT t.trip_id, t.fare "
+            "FROM taxi_trips AS t, pois AS p "
+            "WHERE t.fare > 10"
+        )
+        parsed = sqlglot.parse_one(query)
+        result = _remove_orphaned_tables(parsed)
+        result_sql = result.sql()
+
+        # 'p' should be removed (orphaned — no condition references it)
+        assert "pois" not in result_sql.lower(), f"Orphan table 'pois' not removed: {result_sql}"
+
+        # DISTINCT must be preserved
+        assert "DISTINCT" in result_sql.upper(), (
+            f"DISTINCT modifier was dropped during orphan removal: {result_sql}"
+        )
+
+    def test_non_distinct_query_orphan_removal_no_distinct_added(self):
+        """Non-DISTINCT queries must NOT gain DISTINCT after orphan removal."""
+        from partitioncache.query_processor import _remove_orphaned_tables
+
+        query = (
+            "SELECT t.trip_id, t.fare "
+            "FROM taxi_trips AS t, pois AS p "
+            "WHERE t.fare > 10"
+        )
+        parsed = sqlglot.parse_one(query)
+        result = _remove_orphaned_tables(parsed)
+        result_sql = result.sql()
+
+        assert "DISTINCT" not in result_sql.upper(), (
+            f"Non-DISTINCT query gained DISTINCT after orphan removal: {result_sql}"
+        )

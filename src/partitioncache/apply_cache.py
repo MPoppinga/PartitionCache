@@ -860,6 +860,7 @@ def apply_cache(
     remove_constraints_add: list[str] | None = None,
     geometry_column: str | None = None,
     buffer_distance: float | None = None,
+    **kwargs: Any,
 ) -> tuple[str, dict[str, int]]:
     """
     Complete wrapper function that applies partition cache to a query using regular cache handlers.
@@ -929,6 +930,15 @@ def apply_cache(
         )
         ```
     """
+    # Handle deprecated star_join_* parameter names
+    deprecated = _handle_deprecated_kwargs(kwargs, "apply_cache")
+    if "partition_join_table" in deprecated:
+        if partition_join_table is not None:
+            raise TypeError("Cannot pass both 'partition_join_table' and deprecated 'star_join_table'")
+        partition_join_table = deprecated["partition_join_table"]
+    if "auto_detect_partition_join" in deprecated:
+        auto_detect_partition_join = deprecated["auto_detect_partition_join"]
+
     # Determine if we're in spatial mode
     is_spatial = geometry_column is not None
 

@@ -76,7 +76,12 @@ def normalize_joins_to_cross_join(query: str) -> str:
     if not select:
         return query
 
-    joins = list(select.find_all(exp.Join))
+    # Only collect JOINs at the current SELECT scope — skip JOINs inside subqueries/CTEs/EXISTS
+    joins = [
+        j
+        for j in select.find_all(exp.Join)
+        if not j.find_ancestor(exp.Subquery) and not j.find_ancestor(exp.Exists) and not j.find_ancestor(exp.In)
+    ]
     if not joins:
         return query  # No JOINs to convert
 
@@ -695,6 +700,7 @@ def generate_partial_queries(
     strip_select: bool = True,
     skip_partition_key_joins: bool = False,
     geometry_column: str | None = None,
+    pre_clean_select_clause: str | None = None,
 ) -> list[str]:
     """
     This function takes a query and returns the list of all possible partial queries.
@@ -729,9 +735,10 @@ def generate_partial_queries(
     # init variables
     ret: list[str] = []  # List of all possible partial queries for return
 
-    # Extract original SELECT clause if strip_select=False
-    original_select_clause = None
-    if not strip_select:
+    # Extract original SELECT clause if strip_select=False.
+    # Use pre_clean_select_clause if provided (e.g., extracted before clean_query replaces SELECT with *).
+    original_select_clause = pre_clean_select_clause
+    if not strip_select and original_select_clause is None:
         try:
             parsed_query = sqlglot.parse_one(query)
             if parsed_query and parsed_query.find(exp.Select):
@@ -1467,8 +1474,9 @@ def _remove_orphaned_tables(parsed: exp.Expression) -> exp.Expression:
             new_conditions.append(condition)
 
     select_clause = ", ".join(expr.sql() for expr in select.expressions)
+    distinct_keyword = "DISTINCT " if select.args.get("distinct") else ""
     from_parts = [t.sql() for _, t in kept_tables]
-    sql = f"SELECT {select_clause} FROM {', '.join(from_parts)}"
+    sql = f"SELECT {distinct_keyword}{select_clause} FROM {', '.join(from_parts)}"
     if new_conditions:
         where_parts = [c.sql() for c in new_conditions]
         sql += f" WHERE {' AND '.join(where_parts)}"
@@ -1650,6 +1658,18 @@ def generate_all_query_hash_pairs(
 
     query_set: set[str] = set()
 
+    # If strip_select=False, extract the original SELECT clause BEFORE clean_query()
+    # replaces it with *, so downstream generate_partial_queries can preserve it.
+    pre_clean_select_clause: str | None = None
+    if not strip_select:
+        try:
+            _parsed = sqlglot.parse_one(query)
+            _sel = _parsed.find(exp.Select) if not isinstance(_parsed, exp.Select) else _parsed
+            if _sel and _sel.expressions and not (len(_sel.expressions) == 1 and isinstance(_sel.expressions[0], exp.Star)):
+                pre_clean_select_clause = ", ".join(e.sql() for e in _sel.expressions)
+        except Exception:
+            pre_clean_select_clause = None
+
     # Clean the query
     query = clean_query(query)
 
@@ -1669,6 +1689,7 @@ def generate_all_query_hash_pairs(
             strip_select=strip_select,
             skip_partition_key_joins=skip_partition_key_joins,
             geometry_column=geometry_column,
+            pre_clean_select_clause=pre_clean_select_clause,
         )
     )
     query_set.update(query_set_diff_combinations)
@@ -1692,6 +1713,7 @@ def generate_all_query_hash_pairs(
                 strip_select=strip_select,
                 skip_partition_key_joins=skip_partition_key_joins,
                 geometry_column=geometry_column,
+                pre_clean_select_clause=pre_clean_select_clause,
             )
         )
     )
