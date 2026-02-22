@@ -358,16 +358,16 @@ def add_variant_generation_args(parser: argparse.ArgumentParser) -> None:
         help="Only generate variants from tables forming connected subgraphs via multi-table predicates like distance conditions or non-equijoin conditions (default: True or PARTITION_CACHE_FOLLOW_GRAPH)",
     )
     variant_group.add_argument(
-        "--no-auto-detect-star-join",
+        "--no-auto-detect-partition-join",
         action="store_true",
         default=os.getenv("PARTITION_CACHE_NO_AUTO_DETECT_STAR_JOIN", "false").lower() in ("true", "1", "yes"),
-        help="Disable automatic star-join table detection based on query pattern (default: False or PARTITION_CACHE_NO_AUTO_DETECT_STAR_JOIN)",
+        help="Disable automatic partition-join table detection based on query pattern (default: False or PARTITION_CACHE_NO_AUTO_DETECT_STAR_JOIN)",
     )
     variant_group.add_argument(
-        "--star-join-table",
+        "--partition-join-table",
         type=str,
         default=os.getenv("PARTITION_CACHE_STAR_JOIN_TABLE", None),
-        help="Explicitly specify star-join table alias or name (only one star-join table per query, or set PARTITION_CACHE_STAR_JOIN_TABLE)",
+        help="Explicitly specify partition-join table alias or name (only one partition-join table per query, or set PARTITION_CACHE_STAR_JOIN_TABLE)",
     )
     variant_group.add_argument(
         "--max-component-size",

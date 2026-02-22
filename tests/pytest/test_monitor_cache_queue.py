@@ -46,9 +46,9 @@ def mock_args():
     # Add common variant generation args
     args.min_component_size = 1
     args.follow_graph = True
-    args.no_auto_detect_star_join = False
+    args.no_auto_detect_partition_join = False
     args.max_component_size = None
-    args.star_join_table = None
+    args.partition_join_table = None
     args.no_warn_partition_key = False
     args.bucket_steps = 1.0
     args.add_constraints = None
@@ -122,9 +122,9 @@ class TestQueryFragmentProcessor:
             min_component_size=mock_args.min_component_size,
             follow_graph=mock_args.follow_graph,
             keep_all_attributes=True,
-            auto_detect_star_join=not mock_args.no_auto_detect_star_join,
+            auto_detect_partition_join=not mock_args.no_auto_detect_partition_join,
             max_component_size=mock_args.max_component_size,
-            star_join_table=mock_args.star_join_table,
+            partition_join_table=mock_args.partition_join_table,
             warn_no_partition_key=not mock_args.no_warn_partition_key,
             bucket_steps=mock_args.bucket_steps,
             add_constraints=None,
@@ -617,9 +617,9 @@ class TestIntegration:
             min_component_size=mock_args.min_component_size,
             follow_graph=mock_args.follow_graph,
             keep_all_attributes=True,
-            auto_detect_star_join=not mock_args.no_auto_detect_star_join,
+            auto_detect_partition_join=not mock_args.no_auto_detect_partition_join,
             max_component_size=mock_args.max_component_size,
-            star_join_table=mock_args.star_join_table,
+            partition_join_table=mock_args.partition_join_table,
             warn_no_partition_key=not mock_args.no_warn_partition_key,
             bucket_steps=mock_args.bucket_steps,
             add_constraints=None,
