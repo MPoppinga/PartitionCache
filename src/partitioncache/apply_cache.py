@@ -9,13 +9,13 @@ It utilizes the given cache to extend the SQL query with the set of possible par
 import random
 from datetime import datetime
 from logging import getLogger
-from typing import Literal
+from typing import Any, Literal
 
 import sqlglot
 import sqlglot.expressions as exp
 
 from partitioncache.cache_handler.abstract import AbstractCacheHandler, AbstractCacheHandler_Lazy
-from partitioncache.query_processor import compute_buffer_distance, detect_star_join_from_query, generate_all_hashes
+from partitioncache.query_processor import _handle_deprecated_kwargs, compute_buffer_distance, detect_partition_join_from_query, generate_all_hashes
 
 logger = getLogger("PartitionCache")
 
@@ -26,12 +26,16 @@ def get_partition_keys(
     partition_key: str,
     min_component_size=2,
     canonicalize_queries=False,
-    auto_detect_star_join: bool = True,
-    star_join_table: str | None = None,
+    follow_graph: bool = True,
+    auto_detect_partition_join: bool = True,
+    partition_join_table: str | None = None,
     bucket_steps: float = 1.0,
     add_constraints: dict[str, str] | None = None,
     remove_constraints_all: list[str] | None = None,
     remove_constraints_add: list[str] | None = None,
+    skip_partition_key_joins: bool = False,
+    geometry_column: str | None = None,
+    **kwargs: Any,
 ) -> tuple[set[int] | set[str] | set[float] | set[datetime] | None, int, int]:
     """
     Using the partition cache to get the partition keys for a given query.
@@ -42,8 +46,8 @@ def get_partition_keys(
         partition_key: The identifier for the partition.
         min_component_size: Minimum size of query components to consider.
         canonicalize_queries: Whether to canonicalize queries before hashing.
-        auto_detect_star_join: Whether to auto-detect star-join tables.
-        star_join_table: Explicitly specified star-join table alias or name.
+        auto_detect_partition_join: Whether to auto-detect partition-join tables.
+        partition_join_table: Explicitly specified partition-join table alias or name.
         bucket_steps: Step size for normalizing distance conditions (e.g., 1.0, 0.5, etc.)
         add_constraints: Dict mapping table names to constraints to add (e.g., {"table": "col = val"})
         remove_constraints_all: List of attribute names to remove from all query variants
@@ -55,21 +59,31 @@ def get_partition_keys(
        - int: Total number of query variant hashes generated
        - int: Number of cache hits
     """
+    # Handle deprecated star_join_* parameter names
+    deprecated = _handle_deprecated_kwargs(kwargs, "get_partition_keys")
+    if "partition_join_table" in deprecated:
+        if partition_join_table is not None:
+            raise TypeError("Cannot pass both 'partition_join_table' and deprecated 'star_join_table'")
+        partition_join_table = deprecated["partition_join_table"]
+    if "auto_detect_partition_join" in deprecated:
+        auto_detect_partition_join = deprecated["auto_detect_partition_join"]
 
     # Generate all hashes for the given query (Only consider subqueries with two ore more components that are connected, allow modifying attributes)
     cache_entry_hashes = generate_all_hashes(
         query=query,
         partition_key=partition_key,
         min_component_size=min_component_size,
-        follow_graph=True,
+        follow_graph=follow_graph,
         fix_attributes=False,
         canonicalize_queries=canonicalize_queries,
-        auto_detect_star_join=auto_detect_star_join,
-        star_join_table=star_join_table,
+        auto_detect_partition_join=auto_detect_partition_join,
+        partition_join_table=partition_join_table,
         bucket_steps=bucket_steps,
         add_constraints=add_constraints,
         remove_constraints_all=remove_constraints_all,
         remove_constraints_add=remove_constraints_add,
+        skip_partition_key_joins=skip_partition_key_joins,
+        geometry_column=geometry_column,
     )
 
     logger.info(f"Found {len(cache_entry_hashes)} subqueries in query")
@@ -88,14 +102,15 @@ def get_partition_keys_lazy(
     min_component_size=2,
     canonicalize_queries=False,
     follow_graph=True,
-    auto_detect_star_join: bool = True,
-    star_join_table: str | None = None,
+    auto_detect_partition_join: bool = True,
+    partition_join_table: str | None = None,
     bucket_steps: float = 1.0,
     add_constraints: dict[str, str] | None = None,
     remove_constraints_all: list[str] | None = None,
     remove_constraints_add: list[str] | None = None,
     skip_partition_key_joins: bool = False,
     geometry_column: str | None = None,
+    **kwargs: Any,
 ) -> tuple[str | None, int, int]:
     """
     Gets the lazy intersection representation of the partition keys for the given query.
@@ -107,8 +122,8 @@ def get_partition_keys_lazy(
         min_component_size (int): Minimum size of query components to consider for cache lookup.
         canonicalize_queries (bool): Whether to canonicalize queries before hashing.
         follow_graph (bool): Whether to follow the query graph for generating variants.
-        auto_detect_star_join: Whether to auto-detect star-join tables.
-        star_join_table: Explicitly specified star-join table alias or name.
+        auto_detect_partition_join: Whether to auto-detect partition-join tables.
+        partition_join_table: Explicitly specified partition-join table alias or name.
         bucket_steps: Step size for normalizing distance conditions (e.g., 1.0, 0.5, etc.)
         add_constraints: Dict mapping table names to constraints to add (e.g., {"table": "col = val"})
         remove_constraints_all: List of attribute names to remove from all query variants
@@ -123,6 +138,15 @@ def get_partition_keys_lazy(
     Raises:
         ValueError: If cache handler does not support lazy intersection.
     """
+    # Handle deprecated star_join_* parameter names
+    deprecated = _handle_deprecated_kwargs(kwargs, "get_partition_keys_lazy")
+    if "partition_join_table" in deprecated:
+        if partition_join_table is not None:
+            raise TypeError("Cannot pass both 'partition_join_table' and deprecated 'star_join_table'")
+        partition_join_table = deprecated["partition_join_table"]
+    if "auto_detect_partition_join" in deprecated:
+        auto_detect_partition_join = deprecated["auto_detect_partition_join"]
+
     hashses = generate_all_hashes(
         query=query,
         partition_key=partition_key,
@@ -130,8 +154,8 @@ def get_partition_keys_lazy(
         fix_attributes=False,
         canonicalize_queries=canonicalize_queries,
         follow_graph=follow_graph,
-        auto_detect_star_join=auto_detect_star_join,
-        star_join_table=star_join_table,
+        auto_detect_partition_join=auto_detect_partition_join,
+        partition_join_table=partition_join_table,
         bucket_steps=bucket_steps,
         add_constraints=add_constraints,
         remove_constraints_all=remove_constraints_all,
@@ -148,18 +172,18 @@ def get_partition_keys_lazy(
     return lazy_cache_subquery, len(hashses), used_hashes
 
 
-def find_p0_alias(query: str, partition_key: str, auto_detect_star_join: bool = True, star_join_table: str | None = None) -> str:
+def find_p0_alias(query: str, partition_key: str, auto_detect_partition_join: bool = True, partition_join_table: str | None = None) -> str:
     """
     Find the appropriate table alias for cache restrictions.
 
-    Uses the query processor's star-join detection logic.
-    If no star-join table is detected, falls back to the first table in the query.
+    Uses the query processor's partition-join detection logic.
+    If no partition-join table is detected, falls back to the first table in the query.
 
     Args:
         query: SQL query to analyze
         partition_key: The partition key column name
-        auto_detect_star_join: Whether to auto-detect star-join tables
-        star_join_table: Explicitly specified star-join table alias or name
+        auto_detect_partition_join: Whether to auto-detect partition-join tables
+        partition_join_table: Explicitly specified partition-join table alias or name
 
     Returns:
         The alias to use for cache restrictions
@@ -170,19 +194,19 @@ def find_p0_alias(query: str, partition_key: str, auto_detect_star_join: bool = 
     if first_table is None:
         raise ValueError("No table found in query")
 
-    # Use query processor's star-join detection only if query has FROM clause
+    # Use query processor's partition-join detection only if query has FROM clause
     try:
-        star_join_alias = detect_star_join_from_query(
+        partition_join_alias = detect_partition_join_from_query(
             query=query,
             partition_key=partition_key,
-            auto_detect_star_join=auto_detect_star_join,
-            star_join_table=star_join_table,
+            auto_detect_partition_join=auto_detect_partition_join,
+            partition_join_table=partition_join_table,
         )
 
-        if star_join_alias:
-            return star_join_alias
+        if partition_join_alias:
+            return partition_join_alias
     except (IndexError, ValueError):
-        # If star-join detection fails (e.g., no FROM clause), fall through to default
+        # If partition-join detection fails (e.g., no FROM clause), fall through to default
         pass
 
     # Fallback to first table
@@ -337,8 +361,8 @@ def extend_query_with_partition_keys(
     method: Literal["IN", "VALUES", "TMP_TABLE_JOIN", "TMP_TABLE_IN"] = "IN",
     p0_alias: str | None = None,
     analyze_tmp_table: bool = True,
-    auto_detect_star_join: bool = True,
-    star_join_table: str | None = None,
+    auto_detect_partition_join: bool = True,
+    partition_join_table: str | None = None,
 ) -> str:
     """
     Extend a given SQL query with the cache functionality.
@@ -353,8 +377,8 @@ def extend_query_with_partition_keys(
         method (Literal["IN", "VALUES", "TMP_TABLE_IN", "TMP_TABLE_JOIN"]): The method to use to extend the query.
         p0_alias (str | None): The alias of the table to use for the partition key.
         analyze_tmp_table (bool): Whether to create index and analyze. (only for temporary table methods)
-        auto_detect_star_join: Whether to auto-detect star-join tables.
-        star_join_table: Explicitly specified star-join table alias or name.
+        auto_detect_partition_join: Whether to auto-detect partition-join tables.
+        partition_join_table: Explicitly specified partition-join table alias or name.
 
     Returns:
         str: The extended SQL query as string.
@@ -364,7 +388,7 @@ def extend_query_with_partition_keys(
 
     if p0_alias is None and method != "TMP_TABLE_JOIN":
         # No alias provided, try to find it (TMP_TABLE_JOIN does join on all tables)
-        p0_alias = find_p0_alias(query, partition_key, auto_detect_star_join, star_join_table)
+        p0_alias = find_p0_alias(query, partition_key, auto_detect_partition_join, partition_join_table)
 
     parsed_query = sqlglot.parse_one(query)
 
@@ -444,8 +468,8 @@ def extend_query_with_partition_keys_lazy(
     method: Literal["IN_SUBQUERY", "TMP_TABLE_IN", "TMP_TABLE_JOIN"] = "IN_SUBQUERY",
     p0_alias: str | None = None,
     analyze_tmp_table: bool = True,
-    auto_detect_star_join: bool = True,
-    star_join_table: str | None = None,
+    auto_detect_partition_join: bool = True,
+    partition_join_table: str | None = None,
 ) -> str:
     """
     Extend a given SQL query with the cache functionality using a lazy SQL subquery.
@@ -461,8 +485,8 @@ def extend_query_with_partition_keys_lazy(
         p0_alias (str | None): The alias of the table to use for the partition key. If None, will be auto-detected.
             When use_p0_table=True, cache restrictions automatically target the p0 table regardless of this parameter.
         analyze_tmp_table (bool): Whether to create index and analyze. (only for temporary table methods)
-        auto_detect_star_join: Whether to auto-detect star-join tables.
-        star_join_table: Explicitly specified star-join table alias or name.
+        auto_detect_partition_join: Whether to auto-detect partition-join tables.
+        partition_join_table: Explicitly specified partition-join table alias or name.
 
     Returns:
         str: The extended SQL query as string.
@@ -472,7 +496,7 @@ def extend_query_with_partition_keys_lazy(
 
     if p0_alias is None and method != "TMP_TABLE_JOIN":
         # No alias provided, try to find it (TMP_TABLE_JOIN does join on all tables)
-        p0_alias = find_p0_alias(query, partition_key, auto_detect_star_join, star_join_table)
+        p0_alias = find_p0_alias(query, partition_key, auto_detect_partition_join, partition_join_table)
 
     parsed_query = sqlglot.parse_one(query)
 
@@ -534,8 +558,8 @@ def extend_query_with_spatial_filter_lazy(
     geometry_column: str,
     buffer_distance: float,
     p0_alias: str | None = None,
-    auto_detect_star_join: bool = True,
-    star_join_table: str | None = None,
+    auto_detect_partition_join: bool = True,
+    partition_join_table: str | None = None,
 ) -> str:
     """
     Extend a SQL query with a spatial filter using ST_DWithin on geography.
@@ -548,8 +572,8 @@ def extend_query_with_spatial_filter_lazy(
         geometry_column: The geometry column name in the target table.
         buffer_distance: Buffer distance in meters (uses geography cast).
         p0_alias: Table alias to apply the filter to. If None, auto-detected.
-        auto_detect_star_join: Whether to auto-detect star-join tables for alias detection.
-        star_join_table: Explicitly specified star-join table alias or name.
+        auto_detect_partition_join: Whether to auto-detect partition-join tables for alias detection.
+        partition_join_table: Explicitly specified partition-join table alias or name.
 
     Returns:
         The extended SQL query with spatial filter.
@@ -586,8 +610,8 @@ def extend_query_with_spatial_filter(
     buffer_distance: float,
     srid: int = 4326,
     p0_alias: str | None = None,
-    auto_detect_star_join: bool = True,
-    star_join_table: str | None = None,
+    auto_detect_partition_join: bool = True,
+    partition_join_table: str | None = None,
 ) -> str:
     """
     Extend a SQL query with a pre-computed spatial filter geometry (WKB bytes).
@@ -609,8 +633,8 @@ def extend_query_with_spatial_filter(
         buffer_distance: Buffer distance in meters (uses geography cast).
         srid: SRID of the spatial filter geometry (default: 4326).
         p0_alias: Table alias to apply the filter to. If None, auto-detected.
-        auto_detect_star_join: Whether to auto-detect star-join tables for alias detection.
-        star_join_table: Explicitly specified star-join table alias or name.
+        auto_detect_partition_join: Whether to auto-detect partition-join tables for alias detection.
+        partition_join_table: Explicitly specified partition-join table alias or name.
 
     Returns:
         The extended SQL query with spatial filter.
@@ -652,8 +676,8 @@ def apply_cache_lazy(
     analyze_tmp_table: bool = True,
     use_p0_table: bool = False,
     p0_table_name: str | None = None,
-    auto_detect_star_join: bool = True,
-    star_join_table: str | None = None,
+    auto_detect_partition_join: bool = True,
+    partition_join_table: str | None = None,
     bucket_steps: float = 1.0,
     add_constraints: dict[str, str] | None = None,
     remove_constraints_all: list[str] | None = None,
@@ -677,8 +701,8 @@ def apply_cache_lazy(
         analyze_tmp_table (bool): Whether to create index and analyze for temporary table methods.
         use_p0_table (bool): Whether to rewrite the query to use a p0 table (star-schema).
         p0_table_name (str | None): Name of the p0 table. Defaults to {partition_key}_mv.
-        auto_detect_star_join: Whether to auto-detect star-join tables.
-        star_join_table: Explicitly specified star-join table alias or name.
+        auto_detect_partition_join: Whether to auto-detect partition-join tables.
+        partition_join_table: Explicitly specified partition-join table alias or name.
         bucket_steps: Step size for normalizing distance conditions (e.g., 1.0, 0.5, etc.)
         add_constraints: Dict mapping table names to constraints to add (e.g., {"table": "col = val"})
         remove_constraints_all: List of attribute names to remove from all query variants
@@ -708,8 +732,8 @@ def apply_cache_lazy(
             fix_attributes=False,
             canonicalize_queries=canonicalize_queries,
             follow_graph=follow_graph,
-            auto_detect_star_join=False,
-            star_join_table=star_join_table,
+            auto_detect_partition_join=False,
+            partition_join_table=partition_join_table,
             bucket_steps=bucket_steps,
             add_constraints=add_constraints,
             remove_constraints_all=remove_constraints_all,
@@ -751,8 +775,8 @@ def apply_cache_lazy(
             geometry_column=geometry_column,
             buffer_distance=buffer_distance,
             p0_alias=p0_alias,
-            auto_detect_star_join=auto_detect_star_join,
-            star_join_table=star_join_table,
+            auto_detect_partition_join=auto_detect_partition_join,
+            partition_join_table=partition_join_table,
         )
 
         stats["enhanced"] = 1
@@ -767,8 +791,8 @@ def apply_cache_lazy(
         min_component_size=min_component_size,
         canonicalize_queries=canonicalize_queries,
         follow_graph=follow_graph,
-        auto_detect_star_join=auto_detect_star_join,
-        star_join_table=star_join_table,
+        auto_detect_partition_join=auto_detect_partition_join,
+        partition_join_table=partition_join_table,
         bucket_steps=bucket_steps,
         add_constraints=add_constraints,
         remove_constraints_all=remove_constraints_all,
@@ -809,8 +833,8 @@ def apply_cache_lazy(
         method=method,
         p0_alias=cache_target_alias,
         analyze_tmp_table=analyze_tmp_table,
-        auto_detect_star_join=auto_detect_star_join,
-        star_join_table=star_join_table,
+        auto_detect_partition_join=auto_detect_partition_join,
+        partition_join_table=partition_join_table,
     )
 
     stats["enhanced"] = 1
@@ -828,8 +852,8 @@ def apply_cache(
     analyze_tmp_table: bool = True,
     use_p0_table: bool = False,
     p0_table_name: str | None = None,
-    auto_detect_star_join: bool = True,
-    star_join_table: str | None = None,
+    auto_detect_partition_join: bool = True,
+    partition_join_table: str | None = None,
     bucket_steps: float = 1.0,
     add_constraints: dict[str, str] | None = None,
     remove_constraints_all: list[str] | None = None,
@@ -862,8 +886,8 @@ def apply_cache(
         analyze_tmp_table (bool): Whether to create index and analyze for temporary table methods.
         use_p0_table (bool): Whether to rewrite the query to use a p0 table for optimizer hints.
         p0_table_name (str | None): Name of the p0 table. Defaults to {partition_key}_mv.
-        auto_detect_star_join: Whether to auto-detect star-join tables.
-        star_join_table: Explicitly specified star-join table alias or name.
+        auto_detect_partition_join: Whether to auto-detect partition-join tables.
+        partition_join_table: Explicitly specified partition-join table alias or name.
         bucket_steps: Step size for normalizing distance conditions (e.g., 1.0, 0.5, etc.)
         add_constraints: Dict mapping table names to constraints to add (e.g., {"table": "col = val"})
         remove_constraints_all: List of attribute names to remove from all query variants
@@ -926,8 +950,8 @@ def apply_cache(
             follow_graph=True,
             fix_attributes=False,
             canonicalize_queries=canonicalize_queries,
-            auto_detect_star_join=False,
-            star_join_table=star_join_table,
+            auto_detect_partition_join=False,
+            partition_join_table=partition_join_table,
             bucket_steps=bucket_steps,
             add_constraints=add_constraints,
             remove_constraints_all=remove_constraints_all,
@@ -964,8 +988,8 @@ def apply_cache(
             buffer_distance=buffer_distance,
             srid=spatial_srid,
             p0_alias=p0_alias,
-            auto_detect_star_join=auto_detect_star_join,
-            star_join_table=star_join_table,
+            auto_detect_partition_join=auto_detect_partition_join,
+            partition_join_table=partition_join_table,
         )
 
         stats["enhanced"] = 1
@@ -980,8 +1004,8 @@ def apply_cache(
         partition_key=partition_key,
         min_component_size=min_component_size,
         canonicalize_queries=canonicalize_queries,
-        auto_detect_star_join=auto_detect_star_join,
-        star_join_table=star_join_table,
+        auto_detect_partition_join=auto_detect_partition_join,
+        partition_join_table=partition_join_table,
         bucket_steps=bucket_steps,
         add_constraints=add_constraints,
         remove_constraints_all=remove_constraints_all,
@@ -1026,8 +1050,8 @@ def apply_cache(
         method=method,
         p0_alias=cache_target_alias,
         analyze_tmp_table=analyze_tmp_table,
-        auto_detect_star_join=auto_detect_star_join,
-        star_join_table=star_join_table,
+        auto_detect_partition_join=auto_detect_partition_join,
+        partition_join_table=partition_join_table,
     )
 
     stats["enhanced"] = 1

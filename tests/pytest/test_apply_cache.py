@@ -56,13 +56,13 @@ class TestFindP0Alias:
         result = find_p0_alias(query, "zipcode")
         assert result == "p0"
 
-    def test_detects_star_join_table(self):
-        """Test that mv table is detected  when it's a proper star-join."""
-        # With only 2 tables, the mv table won't be auto-detected as star-join
-        # It needs to join multiple tables to be considered a star-join
+    def test_detects_partition_join_table(self):
+        """Test that mv table is detected  when it's a proper partition-join."""
+        # With only 2 tables, the mv table won't be auto-detected as partition-join
+        # It needs to join multiple tables to be considered a partition-join
         query = "SELECT * FROM users AS u, zipcode_mv AS zips WHERE u.zipcode = zips.zipcode"
         result = find_p0_alias(query, "zipcode")
-        # Should return first table since it's not detected as star-join with only 2 tables
+        # Should return first table since it's not detected as partition-join with only 2 tables
         assert result == "u"
 
         # Test with 3+ tables where zipcode_mv joins all others
@@ -71,7 +71,7 @@ class TestFindP0Alias:
         WHERE u.zipcode = zips.zipcode AND o.zipcode = zips.zipcode
         """
         result_star = find_p0_alias(query_star, "zipcode")
-        # Now it should detect zips as the star-join table
+        # Now it should detect zips as the partition-join table
         assert result_star == "zips"
 
 

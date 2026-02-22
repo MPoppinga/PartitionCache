@@ -87,7 +87,7 @@ if 'float' in backends['postgresql_array']:
 
 ### Query Processing
 
-#### `get_partition_keys(query: str, cache_handler: AbstractCacheHandler, partition_key: str, min_component_size=2, canonicalize_queries=False, auto_detect_star_join: bool = True, star_join_table: str | None = None, bucket_steps: float = 1.0, add_constraints: dict[str, str] | None = None, remove_constraints_all: list[str] | None = None, remove_constraints_add: list[str] | None = None)`
+#### `get_partition_keys(query: str, cache_handler: AbstractCacheHandler, partition_key: str, min_component_size=2, canonicalize_queries=False, auto_detect_partition_join: bool = True, partition_join_table: str | None = None, bucket_steps: float = 1.0, add_constraints: dict[str, str] | None = None, remove_constraints_all: list[str] | None = None, remove_constraints_add: list[str] | None = None)`
 
 Retrieves cached partition keys for a query with comprehensive statistics.
 
@@ -97,8 +97,8 @@ Retrieves cached partition keys for a query with comprehensive statistics.
 - `partition_key` (str): Partition column name
 - `min_component_size` (int): The minimum number of tables in the partial queries.
 - `canonicalize_queries` (bool): If True, the query is canonicalized before hashing.
-- `auto_detect_star_join` (bool): Whether to auto-detect star-join tables (default: True)
-- `star_join_table` (str | None): Explicitly specified star-join table alias or name
+- `auto_detect_partition_join` (bool): Whether to auto-detect partition-join tables (default: True)
+- `partition_join_table` (str | None): Explicitly specified partition-join table alias or name
 - `bucket_steps` (float): Step size for normalizing distance conditions (default: 1.0)
 - `add_constraints` (dict[str, str] | None): Dict mapping table names to constraints to add
 - `remove_constraints_all` (list[str] | None): List of attribute names to remove from all query variants
@@ -173,8 +173,8 @@ print(optimized)
 - `analyze_tmp_table` (bool, optional): Enable temp table analysis (default: True)
 - `use_p0_table` (bool, optional): Rewrite the query to use a p0 table/star-schema (default: False)
 - `p0_table_name` (str | None, optional): Name of the p0 table. Defaults to `{partition_key}_mv`
-- `auto_detect_star_join` (bool, optional): Whether to auto-detect star-join tables (default: True)
-- `star_join_table` (str | None, optional): Explicitly specified star-join table alias or name
+- `auto_detect_partition_join` (bool, optional): Whether to auto-detect partition-join tables (default: True)
+- `partition_join_table` (str | None, optional): Explicitly specified partition-join table alias or name
 - `bucket_steps` (float, optional): Step size for normalizing distance conditions (default: 1.0)
 - `add_constraints` (dict[str, str] | None, optional): Dict mapping table names to constraints to add
 - `remove_constraints_all` (list[str] | None, optional): List of attribute names to remove from all query variants

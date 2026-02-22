@@ -49,7 +49,7 @@ class TestBuildSelectClauseGeometryColumn:
             table_aliases=["t1"],
             original_to_new_alias_mapping={},
             partition_key="spatial_h3",
-            star_join_alias=None,
+            partition_join_alias=None,
             geometry_column="geom",
         )
         assert "geom" in result
@@ -64,20 +64,20 @@ class TestBuildSelectClauseGeometryColumn:
             table_aliases=["t1"],
             original_to_new_alias_mapping={},
             partition_key="pdb_id",
-            star_join_alias=None,
+            partition_join_alias=None,
             geometry_column=None,
         )
         assert result == "SELECT DISTINCT t1.pdb_id"
 
-    def test_geometry_column_with_star_join(self):
-        """When geometry_column is set with star_join_alias, use star join alias."""
+    def test_geometry_column_with_partition_join(self):
+        """When geometry_column is set with partition_join_alias, use partition join alias."""
         result = _build_select_clause(
             strip_select=True,
             original_select_clause=None,
             table_aliases=["t1"],
             original_to_new_alias_mapping={},
             partition_key="spatial_h3",
-            star_join_alias="p1",
+            partition_join_alias="p1",
             geometry_column="geom",
         )
         assert result == "SELECT DISTINCT p1.geom"
@@ -90,7 +90,7 @@ class TestBuildSelectClauseGeometryColumn:
             table_aliases=["t1"],
             original_to_new_alias_mapping={"orig": "t1"},
             partition_key="spatial_h3",
-            star_join_alias=None,
+            partition_join_alias=None,
             geometry_column="geom",
         )
         assert "SELECT t1.name, t1.value" in result
@@ -162,6 +162,179 @@ class TestGeneratePartialQueriesSkipJoins:
 
         # Should produce valid query fragments
         assert len(results) > 0
+
+
+class TestStarJoinSpatialReaddition:
+    """Test partition-join table with spatial conditions are correctly re-added to fragments."""
+
+    FLAT_SPATIAL_QUERY = (
+        "SELECT t.trip_id "
+        "FROM taxi_trips t, osm_pois p_start, osm_pois p_end "
+        "WHERE t.duration_seconds > 2700 "
+        "AND ST_DWithin(t.pickup_geom, p_start.geom, 200) "
+        "AND p_start.poi_type = 'museum' "
+        "AND ST_DWithin(t.dropoff_geom, p_end.geom, 200) "
+        "AND p_end.poi_type = 'hotel'"
+    )
+
+    FLAT_SPATIAL_QUERY_COMPLEX = (
+        "SELECT t.trip_id "
+        "FROM taxi_trips t, osm_pois p_start, osm_pois p_end "
+        "WHERE t.duration_seconds > 2700 "
+        "AND t.trip_distance * 1609.34 / NULLIF(ST_Distance(t.pickup_geom, t.dropoff_geom), 0) > 3 "
+        "AND t.pickup_hour BETWEEN 1 AND 4 "
+        "AND ST_DWithin(t.pickup_geom, p_start.geom, 200) "
+        "AND p_start.poi_type = 'museum' "
+        "AND ST_DWithin(t.dropoff_geom, p_end.geom, 200) "
+        "AND p_end.poi_type = 'hotel'"
+    )
+
+    TRIPLE_SPATIAL_QUERY = (
+        "SELECT t.trip_id "
+        "FROM taxi_trips t, osm_pois p_start, osm_pois p_end1, osm_pois p_end2 "
+        "WHERE t.fare_amount / NULLIF(t.trip_distance, 0) > 8 "
+        "AND t.pickup_hour BETWEEN 1 AND 4 "
+        "AND ST_DWithin(t.pickup_geom, p_start.geom, 150) "
+        "AND p_start.poi_type = 'bar' "
+        "AND ST_DWithin(t.dropoff_geom, p_end1.geom, 150) "
+        "AND p_end1.poi_type = 'bar' "
+        "AND ST_DWithin(t.dropoff_geom, p_end2.geom, 200) "
+        "AND p_end2.poi_type = 'hotel'"
+    )
+
+    def test_partition_join_generates_fragments(self):
+        """Flat spatial query with partition_join_table generates fragments."""
+        pairs = generate_all_query_hash_pairs(
+            query=self.FLAT_SPATIAL_QUERY,
+            partition_key="trip_id",
+            min_component_size=1,
+            strip_select=True,
+            auto_detect_partition_join=False,
+            skip_partition_key_joins=True,
+            partition_join_table="taxi_trips",
+            follow_graph=False,
+        )
+
+        assert len(pairs) > 0, "Should generate at least one fragment"
+        # All fragments should SELECT trip_id from the partition-join table
+        for fragment, _hash in pairs:
+            assert "trip_id" in fragment.lower(), f"Fragment should select trip_id: {fragment}"
+
+    def test_partition_join_fragments_contain_spatial_conditions(self):
+        """Fragments should contain ST_DWithin spatial conditions, not PK equality joins."""
+        pairs = generate_all_query_hash_pairs(
+            query=self.FLAT_SPATIAL_QUERY,
+            partition_key="trip_id",
+            min_component_size=1,
+            strip_select=True,
+            auto_detect_partition_join=False,
+            skip_partition_key_joins=True,
+            partition_join_table="taxi_trips",
+            follow_graph=False,
+        )
+
+        # Multi-table fragments should have ST_DWithin, not trip_id = trip_id joins
+        multi_table_fragments = [f for f, _ in pairs if "osm_pois" in f.lower()]
+        assert len(multi_table_fragments) > 0, "Should have multi-table fragments"
+        for fragment in multi_table_fragments:
+            assert "st_dwithin" in fragment.lower(), (
+                f"Multi-table fragment should use ST_DWithin, not PK joins: {fragment}"
+            )
+
+    def test_partition_join_includes_single_table_conditions(self):
+        """Partition-join fragments should include attribute conditions from the fact table."""
+        pairs = generate_all_query_hash_pairs(
+            query=self.FLAT_SPATIAL_QUERY,
+            partition_key="trip_id",
+            min_component_size=1,
+            strip_select=True,
+            auto_detect_partition_join=False,
+            skip_partition_key_joins=True,
+            partition_join_table="taxi_trips",
+            follow_graph=False,
+        )
+
+        # At least one fragment should contain duration_seconds condition
+        has_duration = any("duration_seconds" in f.lower() for f, _ in pairs)
+        assert has_duration, "Should have at least one fragment with duration_seconds condition"
+
+    def test_partition_join_complex_includes_other_functions(self):
+        """Complex conditions like T_INDIRECT should be included in partition-join fragments."""
+        pairs = generate_all_query_hash_pairs(
+            query=self.FLAT_SPATIAL_QUERY_COMPLEX,
+            partition_key="trip_id",
+            min_component_size=1,
+            strip_select=True,
+            auto_detect_partition_join=False,
+            skip_partition_key_joins=True,
+            partition_join_table="taxi_trips",
+            follow_graph=False,
+        )
+
+        # The T_INDIRECT condition (trip_distance * 1609.34 / NULLIF(ST_Distance(...))) should appear
+        has_indirect = any("st_distance" in f.lower() for f, _ in pairs)
+        assert has_indirect, (
+            "Complex single-table conditions (other_functions) should be included in fragments"
+        )
+
+    def test_triple_spatial_generates_more_fragments(self):
+        """A query with 3 spatial joins should generate more fragments than 2."""
+        pairs_double = generate_all_query_hash_pairs(
+            query=self.FLAT_SPATIAL_QUERY,
+            partition_key="trip_id",
+            min_component_size=1,
+            strip_select=True,
+            auto_detect_partition_join=False,
+            skip_partition_key_joins=True,
+            partition_join_table="taxi_trips",
+            follow_graph=False,
+        )
+
+        pairs_triple = generate_all_query_hash_pairs(
+            query=self.TRIPLE_SPATIAL_QUERY,
+            partition_key="trip_id",
+            min_component_size=1,
+            strip_select=True,
+            auto_detect_partition_join=False,
+            skip_partition_key_joins=True,
+            partition_join_table="taxi_trips",
+            follow_graph=False,
+        )
+
+        assert len(pairs_triple) > len(pairs_double), (
+            f"Triple spatial ({len(pairs_triple)}) should have more fragments than double ({len(pairs_double)})"
+        )
+
+    def test_hash_consistency_population_vs_lookup(self):
+        """Hashes from generate_all_query_hash_pairs should match generate_all_hashes with same params."""
+        pairs = generate_all_query_hash_pairs(
+            query=self.FLAT_SPATIAL_QUERY,
+            partition_key="trip_id",
+            min_component_size=1,
+            strip_select=True,
+            auto_detect_partition_join=False,
+            skip_partition_key_joins=True,
+            partition_join_table="taxi_trips",
+            follow_graph=False,
+        )
+        pair_hashes = {h for _, h in pairs}
+
+        lookup_hashes = generate_all_hashes(
+            query=self.FLAT_SPATIAL_QUERY,
+            partition_key="trip_id",
+            min_component_size=1,
+            strip_select=True,
+            auto_detect_partition_join=False,
+            skip_partition_key_joins=True,
+            partition_join_table="taxi_trips",
+            follow_graph=False,
+        )
+        lookup_hash_set = set(lookup_hashes)
+
+        assert pair_hashes == lookup_hash_set, (
+            f"Hash mismatch: population has {pair_hashes - lookup_hash_set} extra, "
+            f"lookup has {lookup_hash_set - pair_hashes} extra"
+        )
 
 
 class TestGenerateAllHashesSpatialParams:
