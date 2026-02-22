@@ -28,7 +28,7 @@ _DEPRECATED_PARAM_ALIASES: dict[str, str] = {
 }
 
 
-def _handle_deprecated_kwargs(kwargs: dict[str, Any], func_name: str) -> dict[str, Any]:
+def handle_deprecated_kwargs(kwargs: dict[str, Any], func_name: str) -> dict[str, Any]:
     """Handle backward-compatible deprecated parameter names.
 
     Translates old star_join_* parameter names to partition_join_* equivalents,
@@ -64,6 +64,11 @@ def normalize_joins_to_cross_join(query: str) -> str:
     Args:
         query: SQL query string to normalize
 
+    Note:
+        Outer JOINs (LEFT, RIGHT, FULL) are converted to comma joins, which changes
+        semantics: NULL-preserving behavior of outer joins is lost. A warning is
+        logged when this conversion occurs.
+
     Returns:
         Normalized query with JOINs converted to comma joins
     """
@@ -88,6 +93,12 @@ def normalize_joins_to_cross_join(query: str) -> str:
     # Only process joins that have ON conditions (explicit joins)
     join_conditions = []
     for join in joins:
+        if join.args.get("side"):
+            logger.warning(
+                "normalize_joins_to_cross_join: converting %s JOIN to comma join; "
+                "outer join semantics (NULL preservation) will be lost",
+                join.args.get("side"),
+            )
         on_clause = join.args.get("on")
         if on_clause:
             # The on arg is the condition expression directly
@@ -422,32 +433,25 @@ def extract_and_group_query_conditions(
         # Multi-reference, multi-alias, or zero-alias conditions need alias substitution
         # Filter against outer FROM aliases to exclude inner subquery table references
         all_alias: set = set(re.findall(r"[a-zA-Z_]\w*(?=\.)", condition)) & set(table_aliases)
-        if sqlglot.parse_one(condition).find(exp.Func):
+        parsed = sqlglot.parse_one(condition)
+        table_identifiers = tuple(sorted({col.table for col in parsed.find_all(exp.Column) if col.table}))
+        if parsed.find(exp.Func):
             if len(all_alias) == 2:
                 all_alias_list = sorted(all_alias)
                 distance_conditions[(all_alias_list[0], all_alias_list[1])].append(condition)
                 continue
             else:
-                parsed = sqlglot.parse_one(condition)
-                table_identifiers = tuple(sorted({col.table for col in parsed.find_all(exp.Column) if col.table}))
                 other_functions[table_identifiers].append(condition)
                 continue
 
-        elif sqlglot.parse_one(condition).find(exp.Or):
-            parsed = sqlglot.parse_one(condition)
-            table_identifiers = tuple(sorted({col.table for col in parsed.find_all(exp.Column) if col.table}))
+        elif parsed.find(exp.Or):
             or_conditions[table_identifiers].append(condition)
             continue
         else:
             if len(all_alias) == 2:
-                # get all aliases with sqlglot
-                parsed = sqlglot.parse_one(condition)
-                table_identifiers = tuple(sorted({col.table for col in parsed.find_all(exp.Column) if col.table}))
                 distance_conditions[(table_identifiers[0], table_identifiers[1])].append(condition)
                 continue
             else:
-                parsed = sqlglot.parse_one(condition)
-                table_identifiers = tuple(sorted({col.table for col in parsed.find_all(exp.Column) if col.table}))
                 other_functions[table_identifiers].append(condition)
                 continue
 
@@ -726,6 +730,9 @@ def generate_partial_queries(
             Used for spatial queries where tables are linked by distance conditions, not equijoins.
         geometry_column: str | None: If set, use this geometry column instead of partition_key in SELECT clause.
             Used for spatial cache handlers (H3, BBox) where the SELECT needs the geometry column.
+        pre_clean_select_clause: str | None: Pre-extracted SELECT clause from before clean_query() replaces
+            SELECT with *. When provided, this is used to preserve the original SELECT clause in partial queries
+            when strip_select=False.
 
     Returns:
         List[str]: List of all possible partial queries
@@ -755,7 +762,7 @@ def generate_partial_queries(
         distance_conditions,
         other_functions,
         partition_key_conditions,
-        or_conditions,  # TODO Fix # TODO what to fix here?
+        or_conditions,
         table_aliases,
         alias_to_table_map,
         partition_key_joins,
@@ -1470,7 +1477,7 @@ def _remove_orphaned_tables(parsed: exp.Expression) -> exp.Expression:
         for col in condition.find_all(exp.Column):
             if col.table:
                 referenced.add(col.table.lower())
-        if not referenced or (referenced - orphaned):
+        if not referenced or not (referenced & orphaned):
             new_conditions.append(condition)
 
     select_clause = ", ".join(expr.sql() for expr in select.expressions)
@@ -1648,7 +1655,7 @@ def generate_all_query_hash_pairs(
         List of tuples containing (query_text, query_hash) pairs
     """
     # Handle deprecated star_join_* parameter names (only apply if explicit param is at default)
-    deprecated = _handle_deprecated_kwargs(kwargs, "generate_all_query_hash_pairs")
+    deprecated = handle_deprecated_kwargs(kwargs, "generate_all_query_hash_pairs")
     if "partition_join_table" in deprecated:
         if partition_join_table is not None:
             raise TypeError("Cannot pass both 'partition_join_table' and deprecated 'star_join_table'")
@@ -1950,7 +1957,7 @@ def generate_all_hashes(
     Generates all hashes for the given query.
     """
     # Handle deprecated star_join_* parameter names (only apply if explicit param is at default)
-    deprecated = _handle_deprecated_kwargs(kwargs, "generate_all_hashes")
+    deprecated = handle_deprecated_kwargs(kwargs, "generate_all_hashes")
     if "partition_join_table" in deprecated:
         if partition_join_table is not None:
             raise TypeError("Cannot pass both 'partition_join_table' and deprecated 'star_join_table'")

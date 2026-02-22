@@ -636,7 +636,7 @@ class TestDataSetup:
                 stats["spatial_points_count"] = cur.fetchone()[0]
                 cur.execute("SELECT COUNT(*) FROM test_businesses")
                 stats["businesses_count"] = cur.fetchone()[0]
-            except:
+            except Exception:
                 stats["spatial_points_count"] = 0
                 stats["businesses_count"] = 0
 
@@ -644,7 +644,7 @@ class TestDataSetup:
             try:
                 cur.execute("SELECT COUNT(*) FROM test_orders")
                 stats["orders_count"] = cur.fetchone()[0]
-            except:
+            except Exception:
                 stats["orders_count"] = 0
 
             # Check TPC-H dataset
@@ -653,7 +653,7 @@ class TestDataSetup:
                 stats["tpch_orders_count"] = cur.fetchone()[0]
                 cur.execute("SELECT COUNT(*) FROM test_customers")
                 stats["tpch_customers_count"] = cur.fetchone()[0]
-            except:
+            except Exception:
                 stats["tpch_orders_count"] = 0
                 stats["tpch_customers_count"] = 0
 
@@ -669,7 +669,7 @@ class TestDataSetup:
                 stats["ssb_part_count"] = cur.fetchone()[0]
                 cur.execute("SELECT COUNT(*) FROM date_dim")
                 stats["ssb_date_count"] = cur.fetchone()[0]
-            except:
+            except Exception:
                 stats["ssb_lineorder_count"] = 0
                 stats["ssb_customer_count"] = 0
                 stats["ssb_supplier_count"] = 0

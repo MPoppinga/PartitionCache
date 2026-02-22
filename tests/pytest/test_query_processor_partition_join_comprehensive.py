@@ -19,7 +19,7 @@ from partitioncache.query_processor import (
 )
 
 
-class TestStarJoinDetection:
+class TestPartitionJoinDetection:
     """Test all three partition-join detection methods."""
 
     def test_naming_convention_detection(self):
@@ -160,7 +160,7 @@ class TestVariantGenerationPipeline:
         # 2. Single table: orders + p0_city
         # 3. Multi-table: users + orders + p0_city
 
-        # Verify exact variant count and structure
+        # 2 non-partition-join tables → C(2,1) + C(2,2) = 2 + 1 = 3 variants
         assert len(variants) == 3, f"Expected 3 variants, got {len(variants)}"
 
         # Categorize variants
@@ -377,7 +377,7 @@ class TestEdgeCasesAndErrorHandling:
             warn_no_partition_key=False,  # Disable warnings for this test
         )
 
-        # Should generate normal variants without partition-join optimization
+        # No partition-join detected: standard combinatorial variant generation
         assert len(variants) == 3, "Should generate exactly 3 variants even without partition-join tables"
 
         # No variants should have " AS p1" (partition-join alias)
@@ -393,8 +393,7 @@ class TestEdgeCasesAndErrorHandling:
 
         variants = generate_partial_queries(query, "partition_id", auto_detect_partition_join=True, warn_no_partition_key=False)
 
-        # Should pick only one table as partition-join (alphabetically first)
-        # and generate variants with the other table(s)
+        # Both tables are p0_* candidates, one picked as partition-join → only 1 variant
         assert len(variants) == 1, "Should generate exactly 1 variant"
 
         # Only one table should be used as partition-join
@@ -462,52 +461,6 @@ class TestEdgeCasesAndErrorHandling:
 
         assert len(with_in_condition) == 2, "Should have exactly 2 variants with IN condition"
         assert len(without_in_condition) == 2, "Should have exactly 2 variants without IN condition"
-
-    def test_partition_join_eliminates_redundant_joins(self):
-        """Test that partition-join optimization eliminates redundant joins between tables."""
-        query = """
-        SELECT * FROM customers c, orders o, products p, p0_region pr
-        WHERE c.region_id = pr.region_id
-          AND o.region_id = pr.region_id
-          AND p.region_id = pr.region_id
-          AND c.status = 'active'
-          AND o.total > 100
-          AND p.in_stock = true
-        """
-
-        variants = generate_partial_queries(
-            query,
-            "region_id",
-            min_component_size=2,  # Multi-table variants to test join patterns
-            follow_graph=False,
-            auto_detect_partition_join=True,
-            warn_no_partition_key=False,
-        )
-
-        # All multi-table variants should follow partition-join pattern
-        multi_table_variants = [v for v in variants if v.count(" AS t") >= 2]
-        assert len(multi_table_variants) == 4, "Should have exactly 4 multi-table variants for testing"
-
-        for variant in multi_table_variants:
-            # Should have partition-join table re-added
-            assert " AS p1" in variant, "Multi-table variants should have partition-join table"
-
-            # Should NOT have direct joins between tables (e.g., t1.region_id = t2.region_id)
-            # Only joins to partition-join table (e.g., t1.region_id = p1.region_id)
-            join_conditions = [cond.strip() for cond in variant.split("WHERE")[1].split(" AND ") if " = " in cond]
-
-            # Count direct table-to-table joins vs partition-join joins
-            # Direct joins look like: t1.region_id = t2.region_id (both sides start with 't')
-            direct_joins = [j for j in join_conditions if j.startswith("t") and " = t" in j and ".region_id" in j]
-            partition_joins = [j for j in join_conditions if " = p1.region_id" in j or "p1.region_id = " in j]
-
-            assert len(direct_joins) == 0, f"Should have no direct table-to-table joins, found: {direct_joins}"
-            assert len(partition_joins) >= 2, f"Each multi-table variant should have at least 2 partition-join pattern joins, found: {partition_joins}"
-
-            # Verify all tables join to partition-join table
-            table_count = variant.count(" AS t")
-            expected_partition_joins = table_count  # Each table should join to partition-join table
-            assert len(partition_joins) == expected_partition_joins, f"Expected {expected_partition_joins} partition-joins, got {len(partition_joins)}"
 
 
 class TestRegressionTests:

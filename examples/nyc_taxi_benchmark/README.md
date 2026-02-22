@@ -12,7 +12,7 @@ cp .env.example .env
 # Edit .env with your PostgreSQL credentials
 
 # 2. Generate data (1 month ~ 14M trips)
-python generate_nyc_taxi_data.py --months 1 --year 2014 --month 1
+python generate_nyc_taxi_data.py --months 1 --year 2010 --month 1
 
 # 3. Run benchmark
 python run_nyc_taxi_benchmark.py --mode all
@@ -30,10 +30,10 @@ python run_nyc_taxi_benchmark.py --mode backend-comparison
 ## Prerequisites
 
 - PostgreSQL with **PostGIS** extension
-- Python packages: `duckdb`, `psycopg[binary]`, `python-dotenv`, `requests`
+- Python packages: `duckdb`, `psycopg[binary]`, `python-dotenv`
 
 ```bash
-pip install duckdb psycopg[binary] python-dotenv requests
+pip install duckdb psycopg[binary] python-dotenv
 ```
 
 ## Data Sources
@@ -56,8 +56,8 @@ pip install duckdb psycopg[binary] python-dotenv requests
 | trip_id | INTEGER PK | Sequential ID |
 | pickup_datetime | TIMESTAMP | Pickup time |
 | dropoff_datetime | TIMESTAMP | Dropoff time |
-| pickup_geom | GEOMETRY(Point, 4326) | Pickup GPS point |
-| dropoff_geom | GEOMETRY(Point, 4326) | Dropoff GPS point |
+| pickup_geom | GEOMETRY(Point, 32118) | Pickup GPS point |
+| dropoff_geom | GEOMETRY(Point, 32118) | Dropoff GPS point |
 | passenger_count | INTEGER | |
 | trip_distance | DOUBLE PRECISION | Miles (taximeter) |
 | fare_amount | DOUBLE PRECISION | |
@@ -78,7 +78,9 @@ pip install duckdb psycopg[binary] python-dotenv requests
 | name | VARCHAR | POI name |
 | poi_type | VARCHAR | restaurant, hotel, hospital, museum, station, bar, park, theatre, university, attraction |
 | poi_category | VARCHAR | food, accommodation, medical, attraction, transport, nightlife, recreation, culture, education |
-| geom | GEOMETRY(Point, 4326) | Location |
+| geom | GEOMETRY(Point, 32118) | Location |
+
+> **Note:** Coordinates are transformed from WGS84 (EPSG:4326) to NYS State Plane (EPSG:32118) during data generation for metric-distance spatial queries.
 
 **No bridge/proximity table** — spatial distances are computed live via `ST_DWithin()`, making PartitionCache valuable.
 
@@ -86,7 +88,7 @@ pip install duckdb psycopg[binary] python-dotenv requests
 
 | Config | Months | Approx Trips | Notes |
 |--------|--------|-------------|-------|
-| small | 1 | ~14M | Quick testing (Jan 2014) |
+| small | 1 | ~14M | Quick testing (Jan 2010) |
 | medium | 3 | ~42M | Standard benchmark |
 | large | 12 | ~170M | Full year evaluation |
 

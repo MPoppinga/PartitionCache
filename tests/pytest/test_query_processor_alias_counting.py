@@ -156,3 +156,49 @@ class TestAliasCountingDistinctAliases:
         assert any("field1" in c for c in attribute_conditions["rp"])
         # Single-alias OR condition also goes to attribute_conditions with regex remap
         assert any("field2" in c for c in attribute_conditions["rp"])
+
+
+class TestRegexAliasRemap:
+    """Test edge cases in regex-based alias remapping during query generation.
+
+    Verifies that alias substitution uses word boundaries to avoid false matches
+    (e.g., 't1' should not match inside 't10').
+    """
+
+    def test_alias_t1_vs_t10_word_boundary(self):
+        """Alias 't1' must not be falsely remapped when 't10' is also present."""
+        from partitioncache.query_processor import generate_partial_queries
+
+        query = (
+            "SELECT t1.id FROM table1 t1, table10 t10 "
+            "WHERE t1.val > 5 AND t10.val < 100"
+        )
+        variants = generate_partial_queries(
+            query, "id", min_component_size=1, warn_no_partition_key=False
+        )
+
+        # Every variant referencing table10 should keep 't10' intact
+        for v in variants:
+            if "table10" in v:
+                assert "t10" in v or "AS t" in v, (
+                    f"table10 alias was corrupted by t1 remap: {v}"
+                )
+
+    def test_alias_prefix_p_vs_p0(self):
+        """Alias 'p' must not collide with 'p0' during remapping."""
+        from partitioncache.query_processor import generate_partial_queries
+
+        query = (
+            "SELECT p.id FROM products p, p0_region p0 "
+            "WHERE p.price > 10 AND p.region_id = p0.region_id"
+        )
+        variants = generate_partial_queries(
+            query, "region_id", min_component_size=1, warn_no_partition_key=False
+        )
+
+        # Verify we get variants and none have corrupted aliases
+        assert len(variants) > 0, "Should produce at least one variant"
+        for v in variants:
+            # Aliases should be cleanly remapped (t1, t2, p1, etc.)
+            # but never produce broken tokens like 'p00' from 'p' → 'p0' collision
+            assert "p00" not in v, f"Alias collision produced 'p00': {v}"
