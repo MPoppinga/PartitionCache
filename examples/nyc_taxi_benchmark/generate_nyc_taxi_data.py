@@ -154,8 +154,8 @@ TAXI_TRIPS_DDL = """
         trip_id INTEGER PRIMARY KEY,
         pickup_datetime TIMESTAMP NOT NULL,
         dropoff_datetime TIMESTAMP NOT NULL,
-        pickup_geom GEOGRAPHY(Point, 4326) NOT NULL,
-        dropoff_geom GEOGRAPHY(Point, 4326) NOT NULL,
+        pickup_geom GEOMETRY(Point, 32118) NOT NULL,
+        dropoff_geom GEOMETRY(Point, 32118) NOT NULL,
         passenger_count INTEGER,
         trip_distance DOUBLE PRECISION,
         fare_amount DOUBLE PRECISION,
@@ -178,7 +178,7 @@ OSM_POIS_DDL = """
         name VARCHAR,
         poi_type VARCHAR,
         poi_category VARCHAR,
-        geom GEOGRAPHY(Point, 4326) NOT NULL
+        geom GEOMETRY(Point, 32118) NOT NULL
     )
 """
 
@@ -658,8 +658,8 @@ def main():
                     )
                     SELECT
                         trip_id, pickup_datetime, dropoff_datetime,
-                        ST_SetSRID(ST_MakePoint(pickup_longitude, pickup_latitude), 4326)::geography,
-                        ST_SetSRID(ST_MakePoint(dropoff_longitude, dropoff_latitude), 4326)::geography,
+                        ST_Transform(ST_SetSRID(ST_MakePoint(pickup_longitude, pickup_latitude), 4326), 32118),
+                        ST_Transform(ST_SetSRID(ST_MakePoint(dropoff_longitude, dropoff_latitude), 4326), 32118),
                         passenger_count, trip_distance,
                         fare_amount, tip_amount, tolls_amount, total_amount,
                         payment_type, rate_code_id,
@@ -707,7 +707,7 @@ def main():
                 INSERT INTO osm_pois (poi_id, name, poi_type, poi_category, geom)
                 SELECT
                     poi_id, name, poi_type, poi_category,
-                    ST_SetSRID(ST_MakePoint(longitude, latitude), 4326)::geography
+                    ST_Transform(ST_SetSRID(ST_MakePoint(longitude, latitude), 4326), 32118)
                 FROM osm_pois_staging
             """)
 
@@ -727,13 +727,13 @@ def main():
 
         with pg_conn.cursor() as cur:
             indexes = [
-                # Geography columns use plain GiST indexes (no cast needed)
-                ("idx_trips_pickup_geog", "CREATE INDEX idx_trips_pickup_geog ON taxi_trips USING GIST (pickup_geom)"),
-                ("idx_trips_dropoff_geog", "CREATE INDEX idx_trips_dropoff_geog ON taxi_trips USING GIST (dropoff_geom)"),
+                # EPSG:32118 geometry columns use plain GiST indexes (meters natively)
+                ("idx_trips_pickup_geom", "CREATE INDEX idx_trips_pickup_geom ON taxi_trips USING GIST (pickup_geom)"),
+                ("idx_trips_dropoff_geom", "CREATE INDEX idx_trips_dropoff_geom ON taxi_trips USING GIST (dropoff_geom)"),
                 ("idx_trips_duration", "CREATE INDEX idx_trips_duration ON taxi_trips (duration_seconds)"),
                 ("idx_trips_distance", "CREATE INDEX idx_trips_distance ON taxi_trips (trip_distance)"),
                 ("idx_trips_pickup_hour", "CREATE INDEX idx_trips_pickup_hour ON taxi_trips (pickup_hour)"),
-                ("idx_pois_geog", "CREATE INDEX idx_pois_geog ON osm_pois USING GIST (geom)"),
+                ("idx_pois_geom", "CREATE INDEX idx_pois_geom ON osm_pois USING GIST (geom)"),
                 ("idx_pois_type", "CREATE INDEX idx_pois_type ON osm_pois (poi_type)"),
             ]
 

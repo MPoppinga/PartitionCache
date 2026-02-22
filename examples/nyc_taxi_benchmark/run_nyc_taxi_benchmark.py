@@ -186,12 +186,18 @@ class CacheManager:
 
 # --- Benchmark Core ---
 
-def populate_cache_for_query(executor, cache_manager, adapted_query, partition_keys):
+def populate_cache_for_query(executor, cache_manager, adapted_query, partition_keys, *, cache_query=None):
     """
-    Populate cache for a single adapted query across all its partition keys.
+    Populate cache for a query across all its partition keys.
+
+    Args:
+        cache_query: Query to use for hash generation. If None, uses adapted_query.
+            When set, allows using original queries (with JOINs, GROUP BY, etc.)
+            since clean_query() normalizes them to the same hashes.
 
     Returns dict with per-partition-key stats including population_time.
     """
+    cache_query = cache_query or adapted_query
     stats = {}
 
     for pk in partition_keys:
@@ -202,13 +208,13 @@ def populate_cache_for_query(executor, cache_manager, adapted_query, partition_k
 
         # Generate all variant fragments for this partition key
         pairs = generate_all_query_hash_pairs(
-            query=adapted_query,
+            query=cache_query,
             partition_key=pk,
             min_component_size=1,
             strip_select=True,
-            auto_detect_star_join=False,
+            auto_detect_partition_join=False,
             skip_partition_key_joins=True,
-            star_join_table="taxi_trips",
+            partition_join_table="taxi_trips",
             follow_graph=False,
         )
 
@@ -241,13 +247,17 @@ def populate_cache_for_query(executor, cache_manager, adapted_query, partition_k
     return stats
 
 
-def apply_cache_to_query(cache_manager, adapted_query, original_query, partition_keys, fact_stats=None):
+def apply_cache_to_query(cache_manager, adapted_query, original_query, partition_keys, fact_stats=None, *, cache_query=None):
     """
     Apply cached restrictions for all partition keys to the original query.
+
+    Args:
+        cache_query: Query to use for hash generation. If None, uses adapted_query.
 
     Returns (enhanced_query, per_pk_stats, cache_apply_time).
     If fact_stats is provided, each pk_stats entry includes search_space_reduction.
     """
+    cache_query = cache_query or adapted_query
     apply_start = time.perf_counter()
     enhanced = original_query
     pk_stats = {}
@@ -256,13 +266,13 @@ def apply_cache_to_query(cache_manager, adapted_query, original_query, partition
         handler = cache_manager.get_handler(pk)
 
         cached_keys, num_generated, num_hits = partitioncache.get_partition_keys(
-            query=adapted_query,
+            query=cache_query,
             cache_handler=handler.underlying_handler,
             partition_key=pk,
             min_component_size=1,
-            auto_detect_star_join=False,
+            auto_detect_partition_join=False,
             skip_partition_key_joins=True,
-            star_join_table="taxi_trips",
+            partition_join_table="taxi_trips",
             follow_graph=False,
         )
 
@@ -324,16 +334,16 @@ def run_single_query(executor, cache_manager, query_name, query_dir, repeat=1, f
     if repeat > 1:
         result["baseline_stddev"] = statistics.stdev(baseline_times)
 
-    # 2. Populate cache
+    # 2. Populate cache (use original query — clean_query normalizes JOINs, GROUP BY, etc.)
     cache_start = time.perf_counter()
-    cache_stats = populate_cache_for_query(executor, cache_manager, adapted_query, pks)
+    cache_stats = populate_cache_for_query(executor, cache_manager, adapted_query, pks, cache_query=original_query)
     cache_pop_time = time.perf_counter() - cache_start
     result["cache_population_time"] = cache_pop_time
     result["cache_stats"] = cache_stats
 
     # 3. Apply cache and run enhanced query (with repeat)
     enhanced_query, pk_stats, cache_apply_time = apply_cache_to_query(
-        cache_manager, adapted_query, original_query, pks, fact_stats=fact_stats,
+        cache_manager, adapted_query, original_query, pks, fact_stats=fact_stats, cache_query=original_query,
     )
     result["apply_stats"] = pk_stats
     result["cache_apply_time"] = cache_apply_time
@@ -436,7 +446,7 @@ def run_cross_dimension(executor, cache_manager, query_dir, repeat=1, fact_stats
                     cache_handler=handler.underlying_handler,
                     partition_key=pk,
                     min_component_size=1,
-                    auto_detect_star_join=False,
+                    auto_detect_partition_join=False,
                 )
                 pre_hits[pk] = {"variants": num_gen, "hits_before": num_hits}
 
@@ -526,7 +536,7 @@ def run_cross_dimension(executor, cache_manager, query_dir, repeat=1, fact_stats
                 cache_handler=handler.underlying_handler,
                 partition_key=pk,
                 min_component_size=1,
-                auto_detect_star_join=False,
+                auto_detect_partition_join=False,
             )
             pre_hits[pk] = {"variants": num_gen, "hits_before": num_hits}
 
@@ -695,7 +705,7 @@ def run_hierarchy(executor, cache_manager, query_dir, repeat=1, fact_stats=None)
                     cache_handler=handler.underlying_handler,
                     partition_key=pk,
                     min_component_size=1,
-                    auto_detect_star_join=False,
+                    auto_detect_partition_join=False,
                 )
                 pre_hits[pk] = {"variants": num_gen, "hits_before": num_hits}
 

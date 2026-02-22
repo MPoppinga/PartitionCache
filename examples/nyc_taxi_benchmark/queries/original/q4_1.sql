@@ -7,10 +7,16 @@ SELECT EXTRACT(DOW FROM t.pickup_datetime) AS day_of_week,
        AVG(t.tip_amount) AS avg_tip,
        AVG(t.tip_amount / NULLIF(t.fare_amount, 0)) AS avg_tip_pct
 FROM taxi_trips t
-JOIN osm_pois p_start ON ST_DWithin(t.pickup_geom, p_start.geom, 150)
-JOIN osm_pois p_end ON ST_DWithin(t.dropoff_geom, p_end.geom, 200)
-WHERE p_start.poi_type = 'bar'
-  AND p_end.poi_type = 'hotel'
-  AND t.pickup_hour BETWEEN 1 AND 4
+WHERE t.pickup_hour BETWEEN 1 AND 4
+  AND EXISTS (
+    SELECT 1 FROM osm_pois p_start
+    WHERE p_start.poi_type = 'bar'
+      AND ST_DWithin(t.pickup_geom, p_start.geom, 150)
+  )
+  AND EXISTS (
+    SELECT 1 FROM osm_pois p_end
+    WHERE p_end.poi_type = 'hotel'
+      AND ST_DWithin(t.dropoff_geom, p_end.geom, 200)
+  )
 GROUP BY EXTRACT(DOW FROM t.pickup_datetime)
 ORDER BY day_of_week

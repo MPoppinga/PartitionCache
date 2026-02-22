@@ -6,10 +6,10 @@ SELECT p_start.name AS from_hospital,
        COUNT(*) AS trip_count,
        AVG(t.duration_seconds) AS avg_duration,
        AVG(t.fare_amount) AS avg_fare
-FROM taxi_trips t
-JOIN osm_pois p_start ON ST_DWithin(t.pickup_geom, p_start.geom, 300)
-JOIN osm_pois p_end ON ST_DWithin(t.dropoff_geom, p_end.geom, 300)
-WHERE p_start.poi_type = 'hospital'
+FROM taxi_trips t, osm_pois p_start, osm_pois p_end
+WHERE ST_DWithin(t.pickup_geom, p_start.geom, 300)
+  AND ST_DWithin(t.dropoff_geom, p_end.geom, 300)
+  AND p_start.poi_type = 'hospital'
   AND p_end.poi_type = 'hospital'
   AND t.pickup_hour BETWEEN 1 AND 4
 GROUP BY p_start.name, p_end.name
