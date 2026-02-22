@@ -27,6 +27,10 @@ from partitioncache.logging_utils import get_thread_aware_logger
 logger = get_thread_aware_logger("PartitionCache")
 
 
+class DuckDBImportError(ImportError):
+    """Backward-compatible exception type used by integration tests and CLI wrappers."""
+
+
 def validate_table_name(table_name: str) -> None:
     """
     Validate table name to prevent SQL injection.
