@@ -6,6 +6,7 @@ import hashlib
 import itertools
 import logging
 import re
+import warnings
 from collections import defaultdict
 from itertools import combinations
 from typing import Any
@@ -20,6 +21,100 @@ import sqlglot.optimizer.simplify
 
 logger = logging.getLogger("PartitionCache")
 
+# Mapping of deprecated parameter names to their new names
+_DEPRECATED_PARAM_ALIASES: dict[str, str] = {
+    "star_join_table": "partition_join_table",
+    "auto_detect_star_join": "auto_detect_partition_join",
+}
+
+
+def _handle_deprecated_kwargs(kwargs: dict[str, Any], func_name: str) -> dict[str, Any]:
+    """Handle backward-compatible deprecated parameter names.
+
+    Translates old star_join_* parameter names to partition_join_* equivalents,
+    emitting a DeprecationWarning for each one used.
+    """
+    result: dict[str, Any] = {}
+    for old_name, new_name in _DEPRECATED_PARAM_ALIASES.items():
+        if old_name in kwargs:
+            warnings.warn(
+                f"Parameter '{old_name}' is deprecated in {func_name}(), "
+                f"use '{new_name}' instead.",
+                DeprecationWarning,
+                stacklevel=3,
+            )
+            result[new_name] = kwargs.pop(old_name)
+    if kwargs:
+        raise TypeError(f"{func_name}() got unexpected keyword arguments: {list(kwargs.keys())}")
+    return result
+
+
+def normalize_joins_to_cross_join(query: str) -> str:
+    """
+    Convert explicit JOIN ON syntax to comma-separated FROM with conditions in WHERE.
+
+    This normalization ensures that queries using JOIN ON syntax produce the same
+    cache fragments as equivalent queries using comma joins with WHERE conditions.
+
+    Example:
+        SELECT t.id FROM trips t JOIN pois p ON ST_DWithin(t.geom, p.geom, 500) WHERE t.fare > 10
+        →
+        SELECT t.id FROM trips AS t, pois AS p WHERE ST_DWithin(t.geom, p.geom, 500) AND t.fare > 10
+
+    Args:
+        query: SQL query string to normalize
+
+    Returns:
+        Normalized query with JOINs converted to comma joins
+    """
+    try:
+        parsed = sqlglot.parse_one(query)
+    except Exception:
+        return query
+
+    select = parsed if isinstance(parsed, exp.Select) else parsed.find(exp.Select)
+    if not select:
+        return query
+
+    joins = list(select.find_all(exp.Join))
+    if not joins:
+        return query  # No JOINs to convert
+
+    # Only process joins that have ON conditions (explicit joins)
+    join_conditions = []
+    for join in joins:
+        on_clause = join.args.get("on")
+        if on_clause:
+            # The on arg is the condition expression directly
+            join_conditions.append(on_clause)
+            # Convert to comma join by clearing ON, kind, and side
+            join.set("on", None)
+            join.set("kind", None)
+            join.set("side", None)
+        elif join.args.get("kind") or join.args.get("side"):
+            # JOIN without ON but with kind (e.g., CROSS JOIN) — just strip kind
+            join.set("kind", None)
+            join.set("side", None)
+
+    # Add collected ON conditions to WHERE clause
+    if join_conditions:
+        existing_where = select.args.get("where")
+        if existing_where:
+            combined = existing_where.this
+            for cond in join_conditions:
+                combined = exp.And(this=combined, expression=cond)
+            select.set("where", exp.Where(this=combined))
+        else:
+            if len(join_conditions) == 1:
+                select.set("where", exp.Where(this=join_conditions[0]))
+            else:
+                combined = join_conditions[0]
+                for cond in join_conditions[1:]:
+                    combined = exp.And(this=combined, expression=cond)
+                select.set("where", exp.Where(this=combined))
+
+    return parsed.sql()
+
 
 def clean_query(query: str) -> str:
     """
@@ -29,9 +124,15 @@ def clean_query(query: str) -> str:
     are accessed, ensuring that semantically equivalent queries for caching purposes generate
     the same hash variants.
 
+    Normalizes:
+    - JOIN ON syntax → comma-separated FROM with conditions in WHERE
+
     Removes:
+    - SELECT expressions (replaced with *, don't affect partition key access patterns)
     - ORDER BY clauses (don't affect partition key access patterns)
     - LIMIT clauses (don't affect partition key access patterns)
+    - GROUP BY clauses (don't affect partition key access patterns)
+    - HAVING clauses (don't affect partition key access patterns)
     - Comments
     - Trailing semicolons
     - Unnecessary parentheses in WHERE clauses
@@ -54,6 +155,9 @@ def clean_query(query: str) -> str:
     # Remove trailing semicolons (they're not part of the SQL statement)
     query = query.rstrip().rstrip(";")
 
+    # Normalize JOINs to comma syntax before parsing for optimization
+    query = normalize_joins_to_cross_join(query)
+
     # Parse the query
     parsed = sqlglot.parse_one(query)
 
@@ -63,8 +167,7 @@ def clean_query(query: str) -> str:
     # Simplification e.g. Sort comparison operators to ensure consistent order
     parsed = sqlglot.optimizer.simplify.simplify(parsed)
 
-    # Remove ORDER BY and LIMIT clauses - they don't affect which partition keys are accessed
-    # We need to process all SELECT statements (including subqueries)
+    # Remove clauses that don't affect which partition keys are accessed
     for select_stmt in parsed.find_all(exp.Select):
         # Remove ORDER BY
         if select_stmt.args.get("order"):
@@ -75,6 +178,23 @@ def clean_query(query: str) -> str:
         if select_stmt.args.get("limit"):
             select_stmt.set("limit", None)
             logger.debug("Removed LIMIT clause for cache variant generation")
+
+        # Remove GROUP BY
+        if select_stmt.args.get("group"):
+            select_stmt.set("group", None)
+            logger.debug("Removed GROUP BY clause for cache variant generation")
+
+        # Remove HAVING
+        if select_stmt.args.get("having"):
+            select_stmt.set("having", None)
+            logger.debug("Removed HAVING clause for cache variant generation")
+
+    # Replace only the outermost SELECT expressions with * to avoid confusing
+    # downstream regex-based parsing (e.g., aliases containing SQL keywords like FROM)
+    # Only the outermost SELECT is replaced; subqueries/CTEs keep their columns
+    outermost_select = parsed if isinstance(parsed, exp.Select) else parsed.find(exp.Select)
+    if outermost_select:
+        outermost_select.set("expressions", [exp.Star()])
 
     query = parsed.sql()
 
@@ -204,7 +324,7 @@ def extract_and_group_query_conditions(
     dict[str, list[str]],
     dict[tuple[str, str], list[str]],
     dict[tuple, list[str]],
-    list[str],
+    dict[str, list[str]],
     dict[tuple, list[str]],
     list[str],
     dict[str, str],
@@ -214,10 +334,10 @@ def extract_and_group_query_conditions(
     Extracts all conditions from a query
     Splits it by distance functions, attributes and subqueries for the partition key
     """
-    attribute_conditions: dict[str, list[str]] = {}  # {table_alias: [conditions]}
+    attribute_conditions: dict[str, list[str]] = {}  # {table_alias: [conditions(w/alias)]}
     distance_conditions: dict[tuple[str, str], list[str]] = defaultdict(list)  # {(table_alias1, table_alias2): [conditions]}
     other_functions: dict[tuple, list[str]] = defaultdict(list)  # {(table_alias1, ...): [conditions]}
-    partition_key_conditions: list[str] = []  # List of all subqueries
+    partition_key_conditions: dict[str, list[str]] = defaultdict(list)  # {table_alias: [conditions(w/alias)]}
     or_conditions: dict[tuple, list[str]] = defaultdict(list)  # {(table_alias1, table_alias2, ...): [conditions(w/alias)]}
     partition_key_joins: dict[tuple[str, str], list[str]] = defaultdict(list)  # Track PK joins for star detection
 
@@ -269,71 +389,62 @@ def extract_and_group_query_conditions(
         elif condition.count(partition_key) >= 1 and (
             sqlglot.parse_one(condition).find(exp.In) or any(op in condition for op in ["BETWEEN", ">", "<", "=", "!=", "<>"])
         ):
-            # if partition_key is in condition, it is a partition key condition (IN, BETWEEN, comparison, etc.)
-            # Preserve the full condition including NOT, BETWEEN, comparison operators
-            # Find the partition key part after the table alias
-            if "." in condition:
-                parts = condition.split(".")
-                if len(parts) >= 2:
-                    # Preserve everything from the partition key onwards, including NOT prefix if present
-                    table_part = parts[0].strip()
-                    condition_part = ".".join(parts[1:])
-
-                    # Handle NOT prefix properly
-                    if table_part.upper().startswith("NOT "):
-                        # Extract table alias and preserve NOT
-                        con = f"NOT {condition_part}"
-                    else:
-                        con = condition_part
-                    partition_key_conditions.append(con)
-                    continue
-            # Fallback: use the condition as-is if parsing fails
-            partition_key_conditions.append(condition)
+            # Partition key condition (IN, BETWEEN, comparison, etc.) — store with alias intact
+            pk_alias_match = re.match(r'(?:NOT\s+)?(\w+)\.', condition)
+            if pk_alias_match:
+                pk_alias = pk_alias_match.group(1)
+            elif table_aliases:
+                pk_alias = table_aliases[0]
+            else:
+                pk_alias = "unknown"
+            partition_key_conditions[pk_alias].append(condition)
             continue
 
-        # count how many times a table alias is in the condition
-        nr_alias_in_condition = 0
+        # count how many distinct table aliases are in the condition
+        aliases_present: set[str] = set()
         for alias in table_aliases:
-            nr_alias_in_condition += condition.count(f"{alias}.")  # TODO Needs to be more robust
+            if f"{alias}." in condition:
+                aliases_present.add(alias)
+        nr_alias_in_condition = len(aliases_present)
 
-        # if only one table alias is in the condition, it is an attribute condition
+        # if only one table alias, it is an attribute condition — store with alias intact
+        # Regex remap handles single-ref and multi-ref conditions correctly during reassembly
         if nr_alias_in_condition == 1 and "." in condition:
-            al, *cons = condition.split(".")
-            con = ".".join(cons)
-            attribute_conditions[al].append(con)
+            alias = next(iter(aliases_present))
+            attribute_conditions[alias].append(condition)
             continue
 
-        # if two table aliases are in the condition
-        else:
-            all_alias: set = set(re.findall(r"[a-zA-Z_]\w*(?=\.)", condition))
-            if sqlglot.parse_one(condition).find(exp.Func):
-                if len(all_alias) == 2:
-                    all_alias_list = sorted(all_alias)
-                    distance_conditions[(all_alias_list[0], all_alias_list[1])].append(condition)
-                    continue
-                else:
-                    parsed = sqlglot.parse_one(condition)
-                    table_identifiers = tuple(sorted({col.table for col in parsed.find_all(exp.Column) if col.table}))
-                    other_functions[table_identifiers].append(condition)
-                    continue
-
-            elif sqlglot.parse_one(condition).find(exp.Or):
-                parsed = sqlglot.parse_one(condition)
-                table_identifiers = tuple(sorted({col.table for col in parsed.find_all(exp.Column) if col.table}))
-                or_conditions[table_identifiers].append(condition)
+        # Multi-reference, multi-alias, or zero-alias conditions need alias substitution
+        # Filter against outer FROM aliases to exclude inner subquery table references
+        all_alias: set = set(re.findall(r"[a-zA-Z_]\w*(?=\.)", condition)) & set(table_aliases)
+        if sqlglot.parse_one(condition).find(exp.Func):
+            if len(all_alias) == 2:
+                all_alias_list = sorted(all_alias)
+                distance_conditions[(all_alias_list[0], all_alias_list[1])].append(condition)
                 continue
             else:
-                if len(all_alias) == 2:
-                    # get all aliases with sqlglot
-                    parsed = sqlglot.parse_one(condition)
-                    table_identifiers = tuple(sorted({col.table for col in parsed.find_all(exp.Column) if col.table}))
-                    distance_conditions[(table_identifiers[0], table_identifiers[1])].append(condition)
-                    continue
-                else:
-                    parsed = sqlglot.parse_one(condition)
-                    table_identifiers = tuple(sorted({col.table for col in parsed.find_all(exp.Column) if col.table}))
-                    other_functions[table_identifiers].append(condition)
-                    continue
+                parsed = sqlglot.parse_one(condition)
+                table_identifiers = tuple(sorted({col.table for col in parsed.find_all(exp.Column) if col.table}))
+                other_functions[table_identifiers].append(condition)
+                continue
+
+        elif sqlglot.parse_one(condition).find(exp.Or):
+            parsed = sqlglot.parse_one(condition)
+            table_identifiers = tuple(sorted({col.table for col in parsed.find_all(exp.Column) if col.table}))
+            or_conditions[table_identifiers].append(condition)
+            continue
+        else:
+            if len(all_alias) == 2:
+                # get all aliases with sqlglot
+                parsed = sqlglot.parse_one(condition)
+                table_identifiers = tuple(sorted({col.table for col in parsed.find_all(exp.Column) if col.table}))
+                distance_conditions[(table_identifiers[0], table_identifiers[1])].append(condition)
+                continue
+            else:
+                parsed = sqlglot.parse_one(condition)
+                table_identifiers = tuple(sorted({col.table for col in parsed.find_all(exp.Column) if col.table}))
+                other_functions[table_identifiers].append(condition)
+                continue
 
     return (
         attribute_conditions,
@@ -347,29 +458,29 @@ def extract_and_group_query_conditions(
     )
 
 
-def detect_star_join_table(
+def detect_partition_join_table(
     table_aliases: list[str],
     alias_to_table_map: dict[str, str],
     attribute_conditions: dict[str, list[str]],
     distance_conditions: dict[tuple[str, str], list[str]],
     partition_key_joins: dict[tuple[str, str], list[str]],
     partition_key: str,
-    auto_detect_star_join: bool = True,
-    star_join_table: str | None = None,
+    auto_detect_partition_join: bool = True,
+    partition_join_table: str | None = None,
 ) -> str | None:
     """
-    Detect star-join table based on explicit specification or auto-detection patterns.
+    Detect partition-join table based on explicit specification or auto-detection patterns.
 
-    Star-join tables (formerly "p0 tables") are special tables that serve as central join
+    Partition-join tables (formerly "p0 tables") are special tables that serve as central join
     points in star-schema patterns. They are automatically detected and handled specially
     to optimize query variant generation.
 
     Detection Process:
-    1. **Explicit specification**: Tables can be marked as star-join via star_join_table parameter
+    1. **Explicit specification**: Tables can be marked as partition-join via partition_join_table parameter
        - Matches by alias first, then by table name
-       - Only one star-join table is used per query
+       - Only one partition-join table is used per query
 
-    2. **Auto-detection** (when auto_detect_star_join=True, default):
+    2. **Auto-detection** (when auto_detect_partition_join=True, default):
        a. Tables with names starting with 'p0' AND no attribute conditions
        b. Smart detection: Tables that join ALL other tables AND have ONLY partition key conditions
 
@@ -380,38 +491,38 @@ def detect_star_join_table(
         distance_conditions: Distance conditions between table pairs
         partition_key_joins: Explicit partition key joins between tables
         partition_key: The partition key column name
-        auto_detect_star_join: Whether to auto-detect star-join tables
-        star_join_table: Explicitly specified star-join table alias or name
+        auto_detect_partition_join: Whether to auto-detect partition-join tables
+        partition_join_table: Explicitly specified partition-join table alias or name
 
     Returns:
-        The alias of the detected star-join table, or None if no star-join table is found
+        The alias of the detected partition-join table, or None if no partition-join table is found
 
     Raises:
         None - function handles all edge cases gracefully
     """
-    detected_star_join_alias = None
+    detected_partition_join_alias = None
 
-    # First, check explicitly specified star-join table if provided
-    if star_join_table:
+    # First, check explicitly specified partition-join table if provided
+    if partition_join_table:
         # Try to match by alias first, then by table name
-        if star_join_table in table_aliases:
-            detected_star_join_alias = star_join_table
-            logger.info(f"Using explicit star-join table by alias: {star_join_table}")
+        if partition_join_table in table_aliases:
+            detected_partition_join_alias = partition_join_table
+            logger.info(f"Using explicit partition-join table by alias: {partition_join_table}")
         else:
             # Try to match by table name
             for alias, table_name in alias_to_table_map.items():
-                if table_name == star_join_table:
-                    detected_star_join_alias = alias
-                    logger.info(f"Using explicit star-join table by name: {star_join_table} -> alias {alias}")
+                if table_name == partition_join_table:
+                    detected_partition_join_alias = alias
+                    logger.info(f"Using explicit partition-join table by name: {partition_join_table} -> alias {alias}")
                     break
 
-            if not detected_star_join_alias:
-                logger.warning(f"Could not match star-join table specification '{star_join_table}' to any alias or table name")
+            if not detected_partition_join_alias:
+                logger.warning(f"Could not match partition-join table specification '{partition_join_table}' to any alias or table name")
                 logger.warning(f"Available aliases: {table_aliases}")
                 logger.warning(f"Available tables: {list(alias_to_table_map.values())}")
 
-    # If no explicit star-join specified and auto-detection is enabled
-    if not detected_star_join_alias and auto_detect_star_join:
+    # If no explicit partition-join specified and auto-detection is enabled
+    if not detected_partition_join_alias and auto_detect_partition_join:
         candidates = []
 
         # 1. Check naming convention (p0_*)
@@ -466,57 +577,57 @@ def detect_star_join_table(
 
         # Use first candidate found
         if candidates:
-            detected_star_join_alias, detection_method = candidates[0]
+            detected_partition_join_alias, detection_method = candidates[0]
             logger.info(
-                f"Auto-detected star-join table via {detection_method}: {detected_star_join_alias} -> {alias_to_table_map.get(detected_star_join_alias, detected_star_join_alias)}"
+                f"Auto-detected partition-join table via {detection_method}: {detected_partition_join_alias} -> {alias_to_table_map.get(detected_partition_join_alias, detected_partition_join_alias)}"
             )
             if len(candidates) > 1:
-                logger.info(f"Multiple star-join candidates found: {[c[0] for c in candidates]}. Using '{detected_star_join_alias}'")
+                logger.info(f"Multiple partition-join candidates found: {[c[0] for c in candidates]}. Using '{detected_partition_join_alias}'")
 
-    return detected_star_join_alias
+    return detected_partition_join_alias
 
 
-def detect_star_join_from_query(
+def detect_partition_join_from_query(
     query: str,
     partition_key: str,
-    auto_detect_star_join: bool = True,
-    star_join_table: str | None = None,
+    auto_detect_partition_join: bool = True,
+    partition_join_table: str | None = None,
 ) -> str | None:
     """
-    Public wrapper to detect star-join table from a SQL query.
+    Public wrapper to detect partition-join table from a SQL query.
 
-    This function extracts query conditions and uses the internal star-join detection
-    logic to identify star-join tables in the query.
+    This function extracts query conditions and uses the internal partition-join detection
+    logic to identify partition-join tables in the query.
 
     Args:
         query: SQL query to analyze
         partition_key: The partition key column name
-        auto_detect_star_join: Whether to auto-detect star-join tables
-        star_join_table: Explicitly specified star-join table alias or name
+        auto_detect_partition_join: Whether to auto-detect partition-join tables
+        partition_join_table: Explicitly specified partition-join table alias or name
 
     Returns:
-        The alias of the detected star-join table, or None if no star-join table is found
+        The alias of the detected partition-join table, or None if no partition-join table is found
     """
     (
         attribute_conditions,
         distance_conditions,
-        other_functions,
-        partition_key_conditions,
-        or_conditions,
+        _other_functions,
+        _partition_key_conditions,
+        _or_conditions,
         table_aliases,
         alias_to_table_map,
         partition_key_joins,
     ) = extract_and_group_query_conditions(query, partition_key)
 
-    return detect_star_join_table(
+    return detect_partition_join_table(
         table_aliases,
         alias_to_table_map,
         attribute_conditions,
         distance_conditions,
         partition_key_joins,
         partition_key,
-        auto_detect_star_join,
-        star_join_table,
+        auto_detect_partition_join,
+        partition_join_table,
     )
 
 
@@ -526,7 +637,7 @@ def _build_select_clause(
     table_aliases: list[str],
     original_to_new_alias_mapping: dict[str, str],
     partition_key: str,
-    star_join_alias: str | None = None,
+    partition_join_alias: str | None = None,
     geometry_column: str | None = None,
 ) -> str:
     """
@@ -538,7 +649,7 @@ def _build_select_clause(
         table_aliases: List of new table aliases in the partial query (e.g., ['t1', 't2'])
         original_to_new_alias_mapping: Mapping from original aliases to new aliases
         partition_key: The partition key column name
-        star_join_alias: Alias of the star-join table if present (e.g., 'p1')
+        partition_join_alias: Alias of the partition-join table if present (e.g., 'p1')
         geometry_column: If set, use this column instead of partition_key in SELECT (for spatial queries)
 
     Returns:
@@ -548,9 +659,9 @@ def _build_select_clause(
         # Determine which column to select
         select_column = geometry_column if geometry_column else partition_key
 
-        # For star-join queries, prefer selecting from the star-join table
-        if star_join_alias:
-            return f"SELECT DISTINCT {star_join_alias}.{select_column}"
+        # For partition-join queries, prefer selecting from the partition-join table
+        if partition_join_alias:
+            return f"SELECT DISTINCT {partition_join_alias}.{select_column}"
         else:
             # Default behavior: select only partition key from first table
             return f"SELECT DISTINCT {table_aliases[0]}.{select_column}"
@@ -577,9 +688,9 @@ def generate_partial_queries(
     follow_graph: bool = True,
     keep_all_attributes: bool = True,
     other_functions_as_distance_conditions: bool = True,
-    auto_detect_star_join: bool = True,
+    auto_detect_partition_join: bool = True,
     max_component_size: int | None = None,
-    star_join_table: str | None = None,
+    partition_join_table: str | None = None,
     warn_no_partition_key: bool = True,
     strip_select: bool = True,
     skip_partition_key_joins: bool = False,
@@ -597,11 +708,11 @@ def generate_partial_queries(
         keep_all_attributes: bool: If True, the function will only return partial queries with the original attributes.
             If False, it will return also partial queries with fewer attributes
         other_functions_as_distance_conditions: bool: Whether to treat other functions as distance conditions
-        auto_detect_star_join: bool: If True, automatically detect star-join tables based on pattern
-            (joins all tables with only partition key conditions). If False, only use star_join_table
-        max_component_size: int: Maximum number of tables in generated variants (excluding star-join)
-        star_join_table: str: Explicit table alias or name to treat as the star-join table.
-            Only one star-join table is allowed per query
+        auto_detect_partition_join: bool: If True, automatically detect partition-join tables based on pattern
+            (joins all tables with only partition key conditions). If False, only use partition_join_table
+        max_component_size: int: Maximum number of tables in generated variants (excluding partition-join)
+        partition_join_table: str: Explicit table alias or name to treat as the partition-join table.
+            Only one partition-join table is allowed per query
         warn_no_partition_key: bool: If True, emit warnings for tables not using the partition key
         strip_select: bool: If True (default), strip SELECT clause to only select partition keys.
             If False, preserve original SELECT clause with proper alias mapping for partial queries.
@@ -643,25 +754,25 @@ def generate_partial_queries(
         partition_key_joins,
     ) = extract_and_group_query_conditions(query, partition_key)
 
-    # Detect star-join tables - special tables used for partition key joins
+    # Detect partition-join tables - special tables used for partition key joins
     # These tables are excluded from variant generation and re-added to each variant
-    detected_star_join_alias = detect_star_join_table(
+    detected_partition_join_alias = detect_partition_join_table(
         table_aliases,
         alias_to_table_map,
         attribute_conditions,
         distance_conditions,
         partition_key_joins,
         partition_key,
-        auto_detect_star_join,
-        star_join_table,
+        auto_detect_partition_join,
+        partition_join_table,
     )
 
     # Emit warnings for tables not using partition key if requested
     # Skip warning in spatial mode — partition_key is a namespace, not a column
     if warn_no_partition_key and not geometry_column:
         for alias in table_aliases:
-            if alias == detected_star_join_alias:
-                continue  # Star-join tables are expected to use partition key
+            if alias == detected_partition_join_alias:
+                continue  # Partition-join tables are expected to use partition key
 
             # Check if this table uses the partition key
             uses_partition_key = False
@@ -693,17 +804,17 @@ def generate_partial_queries(
             if not uses_partition_key:
                 logger.warning(f"Table '{alias}' ({alias_to_table_map.get(alias, alias)}) does not use partition key '{partition_key}'")
 
-    # Filter aliases for variant generation - always exclude star-join table
-    if detected_star_join_alias:
-        aliases_for_variants = [a for a in table_aliases if a != detected_star_join_alias]
+    # Filter aliases for variant generation - always exclude partition-join table
+    if detected_partition_join_alias:
+        aliases_for_variants = [a for a in table_aliases if a != detected_partition_join_alias]
     else:
         aliases_for_variants = table_aliases
 
-    # Filter distance conditions to exclude star-join table
+    # Filter distance conditions to exclude partition-join table
     distance_conditions_filtered = {}
-    if detected_star_join_alias:
+    if detected_partition_join_alias:
         for (alias1, alias2), conditions in distance_conditions.items():
-            if alias1 != detected_star_join_alias and alias2 != detected_star_join_alias:
+            if alias1 != detected_partition_join_alias and alias2 != detected_partition_join_alias:
                 distance_conditions_filtered[(alias1, alias2)] = conditions
     else:
         distance_conditions_filtered = distance_conditions
@@ -773,7 +884,7 @@ def generate_partial_queries(
                 i += 1
                 table_alias = f"t{i}"  # Enumerate table aliases
                 new_table_list.append(table_alias)
-                query_where.extend([f"{table_alias}.{x}" for x in var_attribute_conditions[table_condition_key]])
+                query_where.extend([re.sub(rf'\b{re.escape(table_condition_key)}\.', f'{table_alias}.', x) for x in var_attribute_conditions[table_condition_key]])
 
                 # set the correct table alias in the distance conditions
                 pattern = rf"\b{re.escape(table_condition_key)}\b"
@@ -799,37 +910,65 @@ def generate_partial_queries(
                 # Build mapping from original alias to new alias for SELECT clause mapping
                 original_to_new_alias_mapping[table_condition_key] = new_alias
 
-            # Re-add star-join table if one was detected
-            if detected_star_join_alias:
-                # ONLY create variant with star-join table re-added
-                # (no base variant without star-join for star-schema queries)
-                star_join_table_name = alias_to_table_map.get(detected_star_join_alias, detected_star_join_alias)
-                # Use p1 as default alias for star-join table (for backward compatibility)
+            # Re-add partition-join table if one was detected
+            if detected_partition_join_alias:
+                # ONLY create variant with partition-join table re-added
+                # (no base variant without partition-join for star-schema queries)
+                partition_join_table_name = alias_to_table_map.get(detected_partition_join_alias, detected_partition_join_alias)
+                # Use p1 as default alias for partition-join table (for backward compatibility)
                 # but check for conflicts and use alternative if needed
-                star_join_new_alias = "p1"
-                if star_join_new_alias in new_table_list or star_join_new_alias in table_aliases:
+                partition_join_new_alias = "p1"
+                if partition_join_new_alias in new_table_list or partition_join_new_alias in table_aliases:
                     # If p1 conflicts, use a unique alias
-                    star_join_new_alias = f"star_join_{abs(hash(star_join_table_name)) % 10000}"
-                star_join_table_spec = f"{star_join_table_name} AS {star_join_new_alias}"
-                # Add star-join alias mapping
-                original_to_new_alias_mapping[detected_star_join_alias] = star_join_new_alias
+                    partition_join_new_alias = f"partition_join_{abs(hash(partition_join_table_name)) % 10000}"
+                partition_join_table_spec = f"{partition_join_table_name} AS {partition_join_new_alias}"
+                # Add partition-join alias mapping
+                original_to_new_alias_mapping[detected_partition_join_alias] = partition_join_new_alias
 
                 # Build combined table list
-                combined_table_list = new_table_list_with_alias + [star_join_table_spec]
+                combined_table_list = new_table_list_with_alias + [partition_join_table_spec]
 
-                # Add partition key joins from each table to star-join table
-                star_join_joins = []
-                for table_alias in new_table_list:
-                    star_join_joins.append(f"{table_alias}.{partition_key} = {star_join_new_alias}.{partition_key}")
+                # Add joins from each table to partition-join table
+                partition_join_joins = []
+                if skip_partition_key_joins:
+                    # Spatial mode: re-add original distance/spatial conditions
+                    # between partition-join table and each variant table
+                    for orig_alias in table_conditions_keys:
+                        new_alias = original_to_new_alias_mapping[orig_alias]
+                        for (a1, a2), conds in distance_conditions.items():
+                            if (a1 == detected_partition_join_alias and a2 == orig_alias) or \
+                               (a2 == detected_partition_join_alias and a1 == orig_alias):
+                                for cond in conds:
+                                    mapped = cond
+                                    mapped = re.sub(rf'\b{re.escape(detected_partition_join_alias)}\b', partition_join_new_alias, mapped)
+                                    mapped = re.sub(rf'\b{re.escape(orig_alias)}\b', new_alias, mapped)
+                                    partition_join_joins.append(mapped)
+                        # Also re-add other_functions between partition-join and variant tables
+                        for keys, oconds in other_functions.items():
+                            if detected_partition_join_alias in keys and orig_alias in keys:
+                                for cond in oconds:
+                                    mapped = cond
+                                    mapped = re.sub(rf'\b{re.escape(detected_partition_join_alias)}\b', partition_join_new_alias, mapped)
+                                    mapped = re.sub(rf'\b{re.escape(orig_alias)}\b', new_alias, mapped)
+                                    partition_join_joins.append(mapped)
+                else:
+                    for table_alias in new_table_list:
+                        partition_join_joins.append(f"{table_alias}.{partition_key} = {partition_join_new_alias}.{partition_key}")
 
-                # Add any star-join table conditions if they exist
-                star_join_conditions = []
-                if detected_star_join_alias in attribute_conditions:
-                    for cond in attribute_conditions[detected_star_join_alias]:
-                        star_join_conditions.append(f"{star_join_new_alias}.{cond}")
+                # Add any partition-join table conditions if they exist
+                partition_join_conditions_list = []
+                if detected_partition_join_alias in attribute_conditions:
+                    for cond in attribute_conditions[detected_partition_join_alias]:
+                        partition_join_conditions_list.append(re.sub(rf'\b{re.escape(detected_partition_join_alias)}\.', f'{partition_join_new_alias}.', cond))
+                # Also include single-table other_functions that only reference the partition-join table
+                for keys, oconds in other_functions.items():
+                    if len(keys) == 1 and keys[0] == detected_partition_join_alias:
+                        for cond in oconds:
+                            mapped_cond = re.sub(rf'\b{re.escape(detected_partition_join_alias)}\b', partition_join_new_alias, cond)
+                            partition_join_conditions_list.append(mapped_cond)
 
-                # Build the combined query with star-join table
-                # IMPORTANT: Remove direct joins between tables when star-join is present
+                # Build the combined query with partition-join table
+                # IMPORTANT: Remove direct joins between tables when partition-join is present
                 # Only keep attribute conditions and distance conditions, not partition key joins
                 query_where_without_pk_joins = []
                 for condition in query_where:
@@ -854,33 +993,27 @@ def generate_partial_queries(
                     # Keep all other conditions (attribute conditions, distance conditions, etc.)
                     query_where_without_pk_joins.append(condition)
 
-                combined_where = query_where_without_pk_joins + star_join_joins + star_join_conditions
+                combined_where = query_where_without_pk_joins + partition_join_joins + partition_join_conditions_list
                 select_clause = _build_select_clause(
-                    strip_select, original_select_clause, new_table_list, original_to_new_alias_mapping, partition_key, star_join_new_alias, geometry_column
+                    strip_select, original_select_clause, new_table_list, original_to_new_alias_mapping, partition_key, partition_join_new_alias, geometry_column
                 )
-                q_with_star_join = f"{select_clause} FROM {', '.join(combined_table_list)} WHERE {' AND '.join(combined_where)}"
-                ret.append(q_with_star_join)
+                q_with_partition_join = f"{select_clause} FROM {', '.join(combined_table_list)} WHERE {' AND '.join(combined_where)}"
+                ret.append(q_with_partition_join)
 
                 # If there are partition key conditions (like IN subqueries), create variants
-                if partition_key_conditions:
-                    # For star-join tables with partition key conditions, apply them to the star-join alias
-                    for i in range(1, len(partition_key_conditions) + 1):
-                        for comb in itertools.combinations(partition_key_conditions, i):
+                # Flatten partition_key_conditions dict for combinatorial generation
+                all_pk_conditions_pj = [(alias, cond) for alias, conds in partition_key_conditions.items() for cond in conds]
+                if all_pk_conditions_pj:
+                    # For partition-join tables with partition key conditions, apply them to the partition-join alias
+                    for i in range(1, len(all_pk_conditions_pj) + 1):
+                        for comb in itertools.combinations(all_pk_conditions_pj, i):
                             query_where_comb = combined_where.copy()
-                            # Apply partition key conditions to the star-join table
-                            for subquery in comb:
-                                # Handle NOT conditions properly to maintain valid SQL syntax
-                                if subquery.startswith("NOT "):
-                                    # NOT condition: place NOT before the table alias
-                                    condition_part = subquery[4:]  # Remove "NOT "
-                                    star_join_subquery = f"NOT {star_join_new_alias}.{condition_part}"
-                                else:
-                                    # Regular condition: place table alias normally
-                                    star_join_subquery = f"{star_join_new_alias}.{subquery}"
-                                query_where_comb.append(star_join_subquery)
+                            for orig_alias, subquery in comb:
+                                remapped = re.sub(rf'\b{re.escape(orig_alias)}\.', f'{partition_join_new_alias}.', subquery)
+                                query_where_comb.append(remapped)
                             # Build WHERE clause only if conditions exist
                             select_clause = _build_select_clause(
-                                strip_select, original_select_clause, new_table_list, original_to_new_alias_mapping, partition_key, star_join_new_alias, geometry_column
+                                strip_select, original_select_clause, new_table_list, original_to_new_alias_mapping, partition_key, partition_join_new_alias, geometry_column
                             )
                             if query_where_comb:
                                 q = f"{select_clause} FROM {', '.join(combined_table_list)} WHERE {' AND '.join(query_where_comb)}"
@@ -897,22 +1030,16 @@ def generate_partial_queries(
                     q = f"{select_clause} FROM {', '.join(new_table_list_with_alias)}"
                 ret.append(q)
 
-            if partition_key_conditions:  # TODO handle CTE expressions
-                # Create variants of the query with subqueries
-                for i in range(1, len(partition_key_conditions) + 1):
-                    for comb in itertools.combinations(partition_key_conditions, i):
+            # Flatten partition_key_conditions for combinatorial generation
+            all_pk_conditions = [(alias, cond) for alias, conds in partition_key_conditions.items() for cond in conds]
+            if all_pk_conditions:  # TODO handle CTE expressions
+                # Create variants of the query with partition key conditions
+                for i in range(1, len(all_pk_conditions) + 1):
+                    for comb in itertools.combinations(all_pk_conditions, i):
                         query_where_comb = query_where.copy()
-                        # For each combination of subqueries, create a new partial query
-                        for subquery in comb:  # Add all partition_key_conditions of this combination to the query
-                            # Handle NOT conditions properly to maintain valid SQL syntax
-                            if subquery.startswith("NOT "):
-                                # NOT condition: place NOT before the table alias
-                                condition_part = subquery[4:]  # Remove "NOT "
-                                p_subquery = f"NOT {new_table_list[0]}.{condition_part}"
-                            else:
-                                # Regular condition: place table alias normally
-                                p_subquery = f"{new_table_list[0]}.{subquery}"
-                            query_where_comb.append(p_subquery)
+                        for orig_alias, subquery in comb:
+                            remapped = re.sub(rf'\b{re.escape(orig_alias)}\.', f'{new_table_list[0]}.', subquery)
+                            query_where_comb.append(remapped)
                         # Build WHERE clause only if conditions exist
                         select_clause = _build_select_clause(
                             strip_select, original_select_clause, new_table_list, original_to_new_alias_mapping, partition_key, None, geometry_column
@@ -924,17 +1051,18 @@ def generate_partial_queries(
                         ret.append(q)
 
     # Add also the raw partition_key queries
-    for partition_key_part in partition_key_conditions:
-        # Get part in brackets
-        part = re.search(r"\((.*)\)", partition_key_part)
-        if part:
-            spart = part.group(1)
-        else:
-            continue
-        sublist = spart.split("INTERSECT")
-        for sub in sublist:
-            sub = sub.strip()
-            ret.append(sub)
+    for pk_conds in partition_key_conditions.values():
+        for partition_key_part in pk_conds:
+            # Get part in brackets
+            part = re.search(r"\((.*)\)", partition_key_part)
+            if part:
+                spart = part.group(1)
+            else:
+                continue
+            sublist = spart.split("INTERSECT")
+            for sub in sublist:
+                sub = sub.strip()
+                ret.append(sub)
 
     # Process each query with sqlglot, skipping non-SQL fragments
     result = []
@@ -1248,6 +1376,111 @@ def _add_constraints_to_query(query: str, add_constraints: dict[str, str]) -> st
         return query
 
 
+def _remove_orphaned_tables(parsed: exp.Expression) -> exp.Expression:
+    """Remove tables from FROM that have no remaining WHERE conditions connecting them.
+
+    When a condition (e.g., ST_DWithin) linking a dimension table to the main table is removed,
+    the dimension table becomes "orphaned" — it has no remaining conditions connecting it.
+    This function detects and removes such orphaned tables and their stale conditions.
+
+    Uses connectivity analysis: builds a graph of aliases connected by shared conditions,
+    then removes aliases not reachable from the first (anchor) table.
+    Reconstructs SQL from scratch to avoid dangling AST references.
+    """
+    select = parsed if isinstance(parsed, exp.Select) else parsed.find(exp.Select)
+    if not select:
+        return parsed
+
+    # 1. Get all table aliases from FROM (outer-level only, not subquery tables)
+    from_clause = select.find(exp.From)
+    if not from_clause:
+        return parsed
+
+    table_info: list[tuple[str, exp.Table]] = []  # (lowercase_alias, Table node)
+    from_table = from_clause.this
+    if isinstance(from_table, exp.Table):
+        alias = str(from_table.alias or from_table.name).lower()
+        table_info.append((alias, from_table))
+
+    # Comma-joined tables appear as Join nodes in sqlglot
+    for join in select.find_all(exp.Join):
+        if join.find_ancestor(exp.Subquery):
+            continue
+        if isinstance(join.this, exp.Table):
+            alias = str(join.this.alias or join.this.name).lower()
+            table_info.append((alias, join.this))
+
+    alias_set = {a for a, _ in table_info}
+    if len(alias_set) <= 1:
+        return parsed
+
+    # 2. Get remaining WHERE conditions
+    where = select.args.get("where")
+    if not where:
+        return parsed
+
+    conditions = []
+    where_expr = where.this
+    if isinstance(where_expr, exp.And):
+        conditions = list(where_expr.flatten())
+    else:
+        conditions = [where_expr]
+
+    # 3. Build connectivity graph
+    G = nx.Graph()
+    G.add_nodes_from(alias_set)
+
+    for condition in conditions:
+        referenced = set()
+        for col in condition.find_all(exp.Column):
+            if col.table and col.table.lower() in alias_set:
+                referenced.add(col.table.lower())
+        for exists_node in condition.find_all(exp.Exists):
+            for col in exists_node.find_all(exp.Column):
+                if col.table and col.table.lower() in alias_set:
+                    referenced.add(col.table.lower())
+
+        ref_list = list(referenced)
+        for i in range(len(ref_list)):
+            for j in range(i + 1, len(ref_list)):
+                G.add_edge(ref_list[i], ref_list[j])
+
+    # 4. Connected component from anchor (first table)
+    anchor = table_info[0][0]
+    connected = set(nx.node_connected_component(G, anchor)) if anchor in G else {anchor}
+
+    # 5. Orphaned aliases
+    orphaned = alias_set - connected
+    if not orphaned:
+        return parsed
+
+    # 6. Reconstruct SQL without orphaned tables (avoids dangling AST commas)
+    kept_tables = [(a, t) for a, t in table_info if a not in orphaned]
+
+    new_conditions = []
+    for condition in conditions:
+        referenced = set()
+        for col in condition.find_all(exp.Column):
+            if col.table:
+                referenced.add(col.table.lower())
+        if not referenced or (referenced - orphaned):
+            new_conditions.append(condition)
+
+    select_clause = ", ".join(expr.sql() for expr in select.expressions)
+    from_parts = [t.sql() for _, t in kept_tables]
+    sql = f"SELECT {select_clause} FROM {', '.join(from_parts)}"
+    if new_conditions:
+        where_parts = [c.sql() for c in new_conditions]
+        sql += f" WHERE {' AND '.join(where_parts)}"
+
+    for clause_name in ["group", "order", "limit", "having"]:
+        clause = select.args.get(clause_name)
+        if clause:
+            sql += f" {clause.sql()}"
+
+    return sqlglot.parse_one(sql)
+
+
 def _remove_constraints_from_query(query: str, attributes_to_remove: list[str]) -> str:
     """
     Remove constraints involving specific attributes from a query.
@@ -1301,6 +1534,9 @@ def _remove_constraints_from_query(query: str, attributes_to_remove: list[str]) 
                 # Single condition in WHERE
                 if contains_attribute(where, attributes_to_remove):
                     select.set("where", None)
+
+        # Remove orphaned tables (tables with no remaining conditions connecting them)
+        parsed = _remove_orphaned_tables(parsed)
 
         return parsed.sql()
     except Exception as e:
@@ -1367,9 +1603,9 @@ def generate_all_query_hash_pairs(
     follow_graph: bool = True,
     keep_all_attributes: bool = True,
     canonicalize_queries: bool = False,
-    auto_detect_star_join: bool = True,
+    auto_detect_partition_join: bool = True,
     max_component_size: int | None = None,
-    star_join_table: str | None = None,
+    partition_join_table: str | None = None,
     warn_no_partition_key: bool = True,
     strip_select: bool = True,
     bucket_steps: float = 1.0,
@@ -1378,6 +1614,7 @@ def generate_all_query_hash_pairs(
     remove_constraints_add: list[str] | None = None,
     skip_partition_key_joins: bool = False,
     geometry_column: str | None = None,
+    **kwargs: Any,
 ) -> list[tuple[str, str]]:
     """
     Generate all query hash pairs for a given query with configurable variant generation.
@@ -1389,9 +1626,9 @@ def generate_all_query_hash_pairs(
         follow_graph: Whether to follow multi-point non-equality joins (e.g. spatial constraints)
         keep_all_attributes: Whether to keep all attributes in variants fixed
         canonicalize_queries: Whether to canonicalize queries for consistent hashing
-        auto_detect_star_join: Automatically detect star join patterns
+        auto_detect_partition_join: Automatically detect partition join patterns
         max_component_size: Maximum size for query components
-        star_join_table: Specific table to use as star join center
+        partition_join_table: Specific table to use as partition join center
         warn_no_partition_key: Whether to warn if partition key is missing
         strip_select: Whether to strip SELECT clause
         bucket_steps: Step size for normalizing distance conditions (e.g., 1.0, 0.5, etc.)
@@ -1402,6 +1639,15 @@ def generate_all_query_hash_pairs(
     Returns:
         List of tuples containing (query_text, query_hash) pairs
     """
+    # Handle deprecated star_join_* parameter names (only apply if explicit param is at default)
+    deprecated = _handle_deprecated_kwargs(kwargs, "generate_all_query_hash_pairs")
+    if "partition_join_table" in deprecated:
+        if partition_join_table is not None:
+            raise TypeError("Cannot pass both 'partition_join_table' and deprecated 'star_join_table'")
+        partition_join_table = deprecated["partition_join_table"]
+    if "auto_detect_partition_join" in deprecated:
+        auto_detect_partition_join = deprecated["auto_detect_partition_join"]
+
     query_set: set[str] = set()
 
     # Clean the query
@@ -1416,9 +1662,9 @@ def generate_all_query_hash_pairs(
             follow_graph,
             keep_all_attributes,
             other_functions_as_distance_conditions=True,
-            auto_detect_star_join=auto_detect_star_join,
+            auto_detect_partition_join=auto_detect_partition_join,
             max_component_size=max_component_size,
-            star_join_table=star_join_table,
+            partition_join_table=partition_join_table,
             warn_no_partition_key=warn_no_partition_key,
             strip_select=strip_select,
             skip_partition_key_joins=skip_partition_key_joins,
@@ -1439,9 +1685,9 @@ def generate_all_query_hash_pairs(
                 follow_graph,
                 keep_all_attributes,
                 other_functions_as_distance_conditions=True,  # TODO evaluate if how performance is affected if is turned off
-                auto_detect_star_join=auto_detect_star_join,
+                auto_detect_partition_join=auto_detect_partition_join,
                 max_component_size=max_component_size,
-                star_join_table=star_join_table,
+                partition_join_table=partition_join_table,
                 warn_no_partition_key=warn_no_partition_key,
                 strip_select=strip_select,
                 skip_partition_key_joins=skip_partition_key_joins,
@@ -1665,9 +1911,9 @@ def generate_all_hashes(
     follow_graph=True,
     fix_attributes=True,
     canonicalize_queries=False,
-    auto_detect_star_join: bool = True,
+    auto_detect_partition_join: bool = True,
     max_component_size: int | None = None,
-    star_join_table: str | None = None,
+    partition_join_table: str | None = None,
     warn_no_partition_key: bool = True,
     strip_select: bool = True,
     bucket_steps: float = 1.0,
@@ -1676,10 +1922,20 @@ def generate_all_hashes(
     remove_constraints_add: list[str] | None = None,
     skip_partition_key_joins: bool = False,
     geometry_column: str | None = None,
+    **kwargs: Any,
 ) -> list[str]:
     """
     Generates all hashes for the given query.
     """
+    # Handle deprecated star_join_* parameter names (only apply if explicit param is at default)
+    deprecated = _handle_deprecated_kwargs(kwargs, "generate_all_hashes")
+    if "partition_join_table" in deprecated:
+        if partition_join_table is not None:
+            raise TypeError("Cannot pass both 'partition_join_table' and deprecated 'star_join_table'")
+        partition_join_table = deprecated["partition_join_table"]
+    if "auto_detect_partition_join" in deprecated:
+        auto_detect_partition_join = deprecated["auto_detect_partition_join"]
+
     qh_pairs = generate_all_query_hash_pairs(
         query=query,
         partition_key=partition_key,
@@ -1687,9 +1943,9 @@ def generate_all_hashes(
         follow_graph=follow_graph,
         keep_all_attributes=fix_attributes,
         canonicalize_queries=canonicalize_queries,
-        auto_detect_star_join=auto_detect_star_join,
+        auto_detect_partition_join=auto_detect_partition_join,
         max_component_size=max_component_size,
-        star_join_table=star_join_table,
+        partition_join_table=partition_join_table,
         warn_no_partition_key=warn_no_partition_key,
         strip_select=strip_select,
         bucket_steps=bucket_steps,
