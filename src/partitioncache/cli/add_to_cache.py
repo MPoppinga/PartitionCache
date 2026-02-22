@@ -112,7 +112,8 @@ def main():
                     try:
                         cache_handler = partitioncache.get_cache_handler(resolve_cache_backend(args), singleton=True)
                         geometry_column = getattr(cache_handler, "geometry_column", "geom")
-                    except Exception:
+                    except Exception as e:
+                        logger.debug("Could not resolve geometry column from cache handler, using default 'geom': %s", e)
                         geometry_column = "geom"
 
             query_hash_pairs = generate_all_query_hash_pairs(
@@ -208,15 +209,15 @@ def main():
                     logger.error(f"Spatial datatype '{args.partition_datatype}' requires a handler with set_cache_lazy support")
                     exit(1)
 
-                for query, hash_value in query_hash_pairs:
+                for fragment_query, hash_value in query_hash_pairs:
                     if cache.exists(hash_value):
                         logger.debug(f"Query {hash_value} already in cache")
-                        cache.set_query(hash_value, query)
+                        cache.set_query(hash_value, fragment_query)
                         continue
 
-                    success = cache_handler.set_cache_lazy(hash_value, query, args.partition_key)
+                    success = cache_handler.set_cache_lazy(hash_value, fragment_query, args.partition_key)
                     if success:
-                        cache.set_query(hash_value, query)
+                        cache.set_query(hash_value, fragment_query)
                         logger.debug(f"Lazily stored spatial query {hash_value}")
                     else:
                         logger.warning(f"Failed to lazily store spatial query {hash_value}")
@@ -236,17 +237,17 @@ def main():
                     raise ValueError(f"Unsupported database backend: {args.db_backend}")
 
                 # Process each query-hash pair
-                for query, hash_value in query_hash_pairs:
+                for fragment_query, hash_value in query_hash_pairs:
                     if cache.exists(hash_value):
                         logger.debug(f"Query {hash_value} already in cache")
-                        cache.set_query(hash_value, query)
+                        cache.set_query(hash_value, fragment_query)
                         continue
 
                     # Execute query and store results
-                    result = set(db_handler.execute(query))
+                    result = set(db_handler.execute(fragment_query))
                     if result:
                         cache.set_cache(hash_value, result)
-                        cache.set_query(hash_value, query)
+                        cache.set_query(hash_value, fragment_query)
                         logger.debug(f"Stored query {hash_value} with {len(result)} results")
                     else:
                         logger.warning(f"Query {hash_value} returned no results")

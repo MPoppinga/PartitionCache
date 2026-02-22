@@ -15,7 +15,7 @@ import sqlglot
 import sqlglot.expressions as exp
 
 from partitioncache.cache_handler.abstract import AbstractCacheHandler, AbstractCacheHandler_Lazy
-from partitioncache.query_processor import _handle_deprecated_kwargs, compute_buffer_distance, detect_partition_join_from_query, generate_all_hashes
+from partitioncache.query_processor import compute_buffer_distance, detect_partition_join_from_query, generate_all_hashes, handle_deprecated_kwargs
 
 logger = getLogger("PartitionCache")
 
@@ -60,7 +60,7 @@ def get_partition_keys(
        - int: Number of cache hits
     """
     # Handle deprecated star_join_* parameter names
-    deprecated = _handle_deprecated_kwargs(kwargs, "get_partition_keys")
+    deprecated = handle_deprecated_kwargs(kwargs, "get_partition_keys")
     if "partition_join_table" in deprecated:
         if partition_join_table is not None:
             raise TypeError("Cannot pass both 'partition_join_table' and deprecated 'star_join_table'")
@@ -101,7 +101,7 @@ def get_partition_keys_lazy(
     partition_key: str,
     min_component_size=2,
     canonicalize_queries=False,
-    follow_graph=True,
+    follow_graph: bool = True,
     auto_detect_partition_join: bool = True,
     partition_join_table: str | None = None,
     bucket_steps: float = 1.0,
@@ -139,7 +139,7 @@ def get_partition_keys_lazy(
         ValueError: If cache handler does not support lazy intersection.
     """
     # Handle deprecated star_join_* parameter names
-    deprecated = _handle_deprecated_kwargs(kwargs, "get_partition_keys_lazy")
+    deprecated = handle_deprecated_kwargs(kwargs, "get_partition_keys_lazy")
     if "partition_join_table" in deprecated:
         if partition_join_table is not None:
             raise TypeError("Cannot pass both 'partition_join_table' and deprecated 'star_join_table'")
@@ -147,7 +147,7 @@ def get_partition_keys_lazy(
     if "auto_detect_partition_join" in deprecated:
         auto_detect_partition_join = deprecated["auto_detect_partition_join"]
 
-    hashses = generate_all_hashes(
+    hashes = generate_all_hashes(
         query=query,
         partition_key=partition_key,
         min_component_size=min_component_size,
@@ -167,9 +167,9 @@ def get_partition_keys_lazy(
     if not isinstance(cache_handler, AbstractCacheHandler_Lazy):
         raise ValueError("Cache handler does not support lazy intersection")
 
-    lazy_cache_subquery, used_hashes = cache_handler.get_intersected_lazy(set(hashses), partition_key=partition_key)
+    lazy_cache_subquery, used_hashes = cache_handler.get_intersected_lazy(set(hashes), partition_key=partition_key)
 
-    return lazy_cache_subquery, len(hashses), used_hashes
+    return lazy_cache_subquery, len(hashes), used_hashes
 
 
 def find_p0_alias(query: str, partition_key: str, auto_detect_partition_join: bool = True, partition_join_table: str | None = None) -> str:
@@ -684,6 +684,7 @@ def apply_cache_lazy(
     remove_constraints_add: list[str] | None = None,
     geometry_column: str | None = None,
     buffer_distance: float | None = None,
+    **kwargs: Any,
 ) -> tuple[str, dict[str, int]]:
     """
     Complete wrapper function that applies partition cache to a query using lazy intersection.
@@ -717,6 +718,15 @@ def apply_cache_lazy(
     Returns:
         tuple[str, dict[str, int]]: Enhanced query and statistics.
     """
+    # Handle deprecated kwargs
+    deprecated = handle_deprecated_kwargs(kwargs, "apply_cache_lazy")
+    if "partition_join_table" in deprecated:
+        if partition_join_table is not None:
+            raise TypeError("Cannot pass both 'partition_join_table' and deprecated 'star_join_table'")
+        partition_join_table = deprecated["partition_join_table"]
+    if "auto_detect_partition_join" in deprecated:
+        auto_detect_partition_join = deprecated["auto_detect_partition_join"]
+
     # Determine if we're in spatial mode
     is_spatial = geometry_column is not None
 
@@ -931,7 +941,7 @@ def apply_cache(
         ```
     """
     # Handle deprecated star_join_* parameter names
-    deprecated = _handle_deprecated_kwargs(kwargs, "apply_cache")
+    deprecated = handle_deprecated_kwargs(kwargs, "apply_cache")
     if "partition_join_table" in deprecated:
         if partition_join_table is not None:
             raise TypeError("Cannot pass both 'partition_join_table' and deprecated 'star_join_table'")

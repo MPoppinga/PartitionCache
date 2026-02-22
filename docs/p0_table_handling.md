@@ -59,8 +59,8 @@ The partition-join optimization process:
 The optimization is based on the mathematical property that partition-join tables don't affect the selectivity of queries when they only provide partition key equality:
 
 ```
-Original: A ⋈ B ⋈ C ⋈ StarJoin (on partition key)
-Equivalent: (A ⋈ B ⋈ C) ⋈ StarJoin (on partition key)
+Original: A ⋈ B ⋈ C ⋈ PartitionJoin (on partition key)
+Equivalent: (A ⋈ B ⋈ C) ⋈ PartitionJoin (on partition key)
 ```
 
 Since the partition-join table must be included for correctness but doesn't affect which rows match, we can:

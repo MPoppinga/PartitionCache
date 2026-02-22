@@ -154,12 +154,14 @@ def query_fragment_processor(args, constraint_args):
 
             # Detect spatial mode and resolve geometry column from handler
             is_spatial = partition_datatype == "geometry"
+            resolved_backend = resolve_cache_backend(args) if is_spatial else None
             geometry_column = None
             if is_spatial:
                 try:
-                    spatial_cache_handler = get_cache_handler(resolve_cache_backend(args), singleton=True)
+                    spatial_cache_handler = get_cache_handler(resolved_backend, singleton=True)
                     geometry_column = getattr(spatial_cache_handler, "geometry_column", "geom")
-                except Exception:
+                except Exception as e:
+                    logger.debug("Could not resolve geometry column from cache handler, using default 'geom': %s", e)
                     geometry_column = "geom"
 
             # Process the query into fragments using the partition_key from queue
@@ -184,7 +186,7 @@ def query_fragment_processor(args, constraint_args):
 
             # Push fragments to query fragment queue using the partition_key and datatype from queue
             # For spatial queries, resolve and pass cache_backend so the processor knows which handler to use
-            queue_cache_backend = resolve_cache_backend(args) if is_spatial else None
+            queue_cache_backend = resolved_backend
             success = push_to_query_fragment_queue(query_hash_pairs, partition_key, partition_datatype, cache_backend=queue_cache_backend)
             if success:
                 logger.debug(f"Pushed {len(query_hash_pairs)} fragments to query fragment queue")

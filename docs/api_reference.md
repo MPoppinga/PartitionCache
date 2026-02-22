@@ -157,7 +157,7 @@ print(optimized)
 # SELECT * FROM users WHERE age > 25 AND user_id IN (1, 5, 10, 15, 20)
 ```
 
-#### `apply_cache_lazy(query, cache_handler, partition_key, ..., geometry_column=None, buffer_distance=None)`
+#### `apply_cache_lazy(query: str, cache_handler: AbstractCacheHandler_Lazy, partition_key: str, method: str = "IN_SUBQUERY", ..., geometry_column: str | None = None, buffer_distance: float | None = None, **kwargs)`
 
 **Recommended** - High-performance cache application with lazy evaluation. Supports spatial mode.
 

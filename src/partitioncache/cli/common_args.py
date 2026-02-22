@@ -15,8 +15,6 @@ from pathlib import Path
 from typing import Any
 
 import dotenv
-import psycopg
-from psycopg import sql as psycopg_sql
 
 logger = getLogger("PartitionCache")
 
@@ -126,7 +124,7 @@ def add_spatial_args(parser: argparse.ArgumentParser, include_buffer_distance: b
         spatial_group.add_argument(
             "--buffer-distance",
             type=float,
-            default=float(os.getenv("PARTITION_CACHE_BUFFER_DISTANCE", "0")) or None,
+            default=float(os.getenv("PARTITION_CACHE_BUFFER_DISTANCE")) if os.getenv("PARTITION_CACHE_BUFFER_DISTANCE") else None,
             help="Buffer distance in meters for spatial cache application. "
             "If not set, auto-derived from ST_DWithin distances in the query.",
         )
@@ -531,6 +529,8 @@ def setup_logging(verbose: bool = False) -> None:
 
 def get_db_connection():
     """Get database connection using environment variables."""
+    import psycopg
+
     return psycopg.connect(
         host=os.getenv("DB_HOST"),
         port=int(os.getenv("DB_PORT", "5432")),
@@ -542,6 +542,8 @@ def get_db_connection():
 
 def get_pg_cron_connection():
     """Get pg_cron database connection using environment variables."""
+    import psycopg
+
     return psycopg.connect(
         host=os.getenv("PG_CRON_HOST", os.getenv("DB_HOST")),
         port=int(os.getenv("PG_CRON_PORT", os.getenv("DB_PORT", "5432"))),
@@ -592,6 +594,8 @@ def ensure_role_exists(conn, role_name: str, create_if_missing: bool = False) ->
         Tuple of (success, message).  *success* is True when the role exists
         (either pre-existing or newly created).
     """
+    from psycopg import sql as psycopg_sql
+
     with conn.cursor() as cur:
         cur.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", [role_name])
         if cur.fetchone() is not None:
