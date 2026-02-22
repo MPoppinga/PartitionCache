@@ -1,10 +1,10 @@
-# Star-Join Table Handling in PartitionCache
+# Partition-Join Table Handling in PartitionCache
 
 ## Overview
 
 Partition-join tables ("p0 tables") are special tables used solely for partition key joins in star-schema query patterns. These tables serve as the central hub connecting other tables through the partition key, without contributing any filtering conditions. PartitionCache automatically detects and optimizes these tables by excluding them from variant generation and then re-adding them to each variant, significantly reducing the total number of generated variants while maintaining query correctness.
 
-## How Star-Join Detection Works
+## How Partition-Join Detection Works
 
 The system uses a three-tier detection approach to identify partition-join tables:
 
@@ -48,10 +48,10 @@ WHERE u.city_id = p0.city_id
 The partition-join optimization process:
 
 1. **Parse Query**: Extract tables, conditions, and join relationships
-2. **Detect Star-Join**: Identify partition-join table using the three-tier approach
+2. **Detect Partition-Join**: Identify partition-join table using the three-tier approach
 3. **Build Graph**: Create connected component graph of non-partition-join tables
 4. **Generate Base Variants**: Create combinations of non-partition-join tables
-5. **Re-add Star-Join**: Add the partition-join table to EVERY variant
+5. **Re-add Partition-Join**: Add the partition-join table to EVERY variant
 6. **Optimize Joins**: Ensure all tables join to partition-join table on partition key
 
 ### Why This Works
@@ -141,8 +141,8 @@ pcache-add \
 - `PARTITION_CACHE_MIN_COMPONENT_SIZE`: Minimum tables in variants (default: 1)
 - `PARTITION_CACHE_MAX_COMPONENT_SIZE`: Maximum tables in variants (default: no limit)
 - `PARTITION_CACHE_FOLLOW_GRAPH`: Generate only connected subgraphs (default: true)
-- `PARTITION_CACHE_NO_AUTO_DETECT_STAR_JOIN`: Disable smart detection (default: false)
-- `PARTITION_CACHE_STAR_JOIN_TABLE`: Single partition-join table alias or name
+- `PARTITION_CACHE_NO_AUTO_DETECT_PARTITION_JOIN`: Disable smart detection (default: false). Also accepts legacy `PARTITION_CACHE_NO_AUTO_DETECT_STAR_JOIN`.
+- `PARTITION_CACHE_PARTITION_JOIN_TABLE`: Single partition-join table alias or name. Also accepts legacy `PARTITION_CACHE_STAR_JOIN_TABLE`.
 - `PARTITION_CACHE_NO_WARN_PARTITION_KEY`: Disable partition key warnings (default: false)
 
 ### API Parameters
@@ -197,7 +197,7 @@ All functions support the same partition-join parameters:
 - `auto_detect_partition_join: bool = True` - Enable smart partition-join detection
 - `partition_join_table: str | None = None` - Explicitly mark ONE table as partition-join (by alias or name)
 
-## When to Use Star-Join Optimization
+## When to Use Partition-Join Optimization
 
 ### Good Use Cases
 

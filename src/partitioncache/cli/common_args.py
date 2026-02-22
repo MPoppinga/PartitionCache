@@ -360,14 +360,14 @@ def add_variant_generation_args(parser: argparse.ArgumentParser) -> None:
     variant_group.add_argument(
         "--no-auto-detect-partition-join",
         action="store_true",
-        default=os.getenv("PARTITION_CACHE_NO_AUTO_DETECT_STAR_JOIN", "false").lower() in ("true", "1", "yes"),
-        help="Disable automatic partition-join table detection based on query pattern (default: False or PARTITION_CACHE_NO_AUTO_DETECT_STAR_JOIN)",
+        default=os.getenv("PARTITION_CACHE_NO_AUTO_DETECT_PARTITION_JOIN", os.getenv("PARTITION_CACHE_NO_AUTO_DETECT_STAR_JOIN", "false")).lower() in ("true", "1", "yes"),
+        help="Disable automatic partition-join table detection based on query pattern (default: False or PARTITION_CACHE_NO_AUTO_DETECT_PARTITION_JOIN)",
     )
     variant_group.add_argument(
         "--partition-join-table",
         type=str,
-        default=os.getenv("PARTITION_CACHE_STAR_JOIN_TABLE", None),
-        help="Explicitly specify partition-join table alias or name (only one partition-join table per query, or set PARTITION_CACHE_STAR_JOIN_TABLE)",
+        default=os.getenv("PARTITION_CACHE_PARTITION_JOIN_TABLE", os.getenv("PARTITION_CACHE_STAR_JOIN_TABLE", None)),
+        help="Explicitly specify partition-join table alias or name (only one partition-join table per query, or set PARTITION_CACHE_PARTITION_JOIN_TABLE)",
     )
     variant_group.add_argument(
         "--max-component-size",
