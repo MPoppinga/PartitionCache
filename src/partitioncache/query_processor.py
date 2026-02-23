@@ -648,6 +648,7 @@ def _build_select_clause(
     partition_key: str,
     partition_join_alias: str | None = None,
     geometry_column: str | None = None,
+    partition_key_source_alias: str | None = None,
 ) -> str:
     """
     Build the SELECT clause for a partial query.
@@ -660,6 +661,8 @@ def _build_select_clause(
         partition_key: The partition key column name
         partition_join_alias: Alias of the partition-join table if present (e.g., 'p1')
         geometry_column: If set, use this column instead of partition_key in SELECT (for spatial queries)
+        partition_key_source_alias: If set, use this alias for the partition key SELECT instead of
+            table_aliases[0]. Used when not all tables have the partition key column.
 
     Returns:
         Complete SELECT clause string (with SELECT keyword)
@@ -671,6 +674,8 @@ def _build_select_clause(
         # For partition-join queries, prefer selecting from the partition-join table
         if partition_join_alias:
             return f"SELECT DISTINCT {partition_join_alias}.{select_column}"
+        elif partition_key_source_alias:
+            return f"SELECT DISTINCT {partition_key_source_alias}.{select_column}"
         else:
             # Default behavior: select only partition key from first table
             return f"SELECT DISTINCT {table_aliases[0]}.{select_column}"
@@ -705,6 +710,7 @@ def generate_partial_queries(
     skip_partition_key_joins: bool = False,
     geometry_column: str | None = None,
     pre_clean_select_clause: str | None = None,
+    partition_key_source_table: str | None = None,
 ) -> list[str]:
     """
     This function takes a query and returns the list of all possible partial queries.
@@ -733,6 +739,10 @@ def generate_partial_queries(
         pre_clean_select_clause: str | None: Pre-extracted SELECT clause from before clean_query() replaces
             SELECT with *. When provided, this is used to preserve the original SELECT clause in partial queries
             when strip_select=False.
+        partition_key_source_table: str | None: Table name that contains the partition key column.
+            When set, only fragments that include this table are generated, and the SELECT clause
+            references the correct alias for this table. Required when skip_partition_key_joins=True
+            and not all tables have the partition key column (e.g., fact + dimension table queries).
 
     Returns:
         List[str]: List of all possible partial queries
@@ -816,7 +826,44 @@ def generate_partial_queries(
                         break
 
             if not uses_partition_key:
-                logger.warning(f"Table '{alias}' ({alias_to_table_map.get(alias, alias)}) does not use partition key '{partition_key}'")
+                table_name = alias_to_table_map.get(alias, alias)
+                if partition_key_source_table and not detected_partition_join_alias:
+                    if table_name == partition_key_source_table:
+                        # Source table has the PK column but doesn't reference it in conditions
+                        # (only in SELECT). Expected when it's the sole partition table with no partition-join.
+                        logger.info(
+                            f"Table '{alias}' ({table_name}) does not reference partition key "
+                            f"'{partition_key}' in conditions (partition key source table)"
+                        )
+                    else:
+                        # Check if this table is connected to any source-table alias via joins
+                        source_aliases = {a for a, t in alias_to_table_map.items() if t == partition_key_source_table}
+                        connected_to_source = False
+                        for (a1, a2) in distance_conditions:
+                            if (a1 == alias and a2 in source_aliases) or (a2 == alias and a1 in source_aliases):
+                                connected_to_source = True
+                                break
+                        if not connected_to_source:
+                            for keys in other_functions:
+                                if alias in keys and any(sa in keys for sa in source_aliases):
+                                    connected_to_source = True
+                                    break
+                        if connected_to_source:
+                            # Dimension table connected to the source table via join
+                            logger.info(
+                                f"Table '{alias}' ({table_name}) does not have partition key "
+                                f"'{partition_key}' (dimension table joined to '{partition_key_source_table}')"
+                            )
+                        else:
+                            # Not connected to source — genuine warning
+                            logger.warning(
+                                f"Table '{alias}' ({table_name}) does not use partition key '{partition_key}'"
+                            )
+                else:
+                    # No source table context — keep original warning
+                    logger.warning(
+                        f"Table '{alias}' ({table_name}) does not use partition key '{partition_key}'"
+                    )
 
     # Filter aliases for variant generation - always exclude partition-join table
     if detected_partition_join_alias:
@@ -845,6 +892,16 @@ def generate_partial_queries(
     all_query_combinations = []
     for v in query_combinations.values():
         all_query_combinations.extend(v)
+
+    # Filter out combinations that don't include the partition key source table.
+    # Skip this when a partition-join table is detected — the partition-join mechanism
+    # already handles SELECT correctly and re-adds the fact table to all fragments.
+    if partition_key_source_table and not detected_partition_join_alias:
+        source_aliases = {alias for alias, table in alias_to_table_map.items() if table == partition_key_source_table}
+        all_query_combinations = [
+            combo for combo in all_query_combinations
+            if any(alias in source_aliases for alias in combo)
+        ]
 
     # Make sure Table conditions are sorted
     for key in attribute_conditions.keys():
@@ -923,6 +980,14 @@ def generate_partial_queries(
                 new_table_list_with_alias.append(f"{original_table} AS {new_alias}")
                 # Build mapping from original alias to new alias for SELECT clause mapping
                 original_to_new_alias_mapping[table_condition_key] = new_alias
+
+            # Resolve partition_key_source_alias: find the new alias that maps to the source table
+            pk_source_alias: str | None = None
+            if partition_key_source_table:
+                for orig_alias, new_alias in original_to_new_alias_mapping.items():
+                    if alias_to_table_map.get(orig_alias, orig_alias) == partition_key_source_table:
+                        pk_source_alias = new_alias
+                        break
 
             # Re-add partition-join table if one was detected
             if detected_partition_join_alias:
@@ -1037,7 +1102,7 @@ def generate_partial_queries(
             else:
                 # Normal case without p0 exclusion
                 # Build WHERE clause only if conditions exist
-                select_clause = _build_select_clause(strip_select, original_select_clause, new_table_list, original_to_new_alias_mapping, partition_key, None, geometry_column)
+                select_clause = _build_select_clause(strip_select, original_select_clause, new_table_list, original_to_new_alias_mapping, partition_key, None, geometry_column, pk_source_alias)
                 if query_where:
                     q = f"{select_clause} FROM {', '.join(new_table_list_with_alias)} WHERE {' AND '.join(query_where)}"
                 else:
@@ -1056,7 +1121,7 @@ def generate_partial_queries(
                             query_where_comb.append(remapped)
                         # Build WHERE clause only if conditions exist
                         select_clause = _build_select_clause(
-                            strip_select, original_select_clause, new_table_list, original_to_new_alias_mapping, partition_key, None, geometry_column
+                            strip_select, original_select_clause, new_table_list, original_to_new_alias_mapping, partition_key, None, geometry_column, pk_source_alias
                         )
                         if query_where_comb:
                             q = f"{select_clause} FROM {', '.join(new_table_list_with_alias)} WHERE {' AND '.join(query_where_comb)}"
@@ -1629,6 +1694,7 @@ def generate_all_query_hash_pairs(
     remove_constraints_add: list[str] | None = None,
     skip_partition_key_joins: bool = False,
     geometry_column: str | None = None,
+    partition_key_source_table: str | None = None,
     **kwargs: Any,
 ) -> list[tuple[str, str]]:
     """
@@ -1650,6 +1716,13 @@ def generate_all_query_hash_pairs(
         add_constraints: Dict mapping table names to constraints to add (e.g., {"table": "col = val"})
         remove_constraints_all: List of attribute names to remove from all query variants
         remove_constraints_add: List of attribute names to remove, creating additional variants
+        partition_key_source_table: Table name that contains the partition key column.
+            When set, only fragments that include this table are generated, and the SELECT clause
+            references the correct alias. Used when skip_partition_key_joins=True and not all
+            tables have the partition key column (e.g., fact + dimension table queries).
+            When None and skip_partition_key_joins=True, the system auto-detects the source table
+            by parsing the original SELECT clause for a table-qualified partition key reference
+            (e.g., ``SELECT t.trip_id`` resolves alias ``t`` to its table name).
 
     Returns:
         List of tuples containing (query_text, query_hash) pairs
@@ -1677,6 +1750,28 @@ def generate_all_query_hash_pairs(
         except Exception:
             pre_clean_select_clause = None
 
+    # Auto-detect partition_key_source_table from original SELECT clause
+    # Only when not explicitly set and skip_partition_key_joins is active
+    # (when skip_partition_key_joins=False, equijoins are generated so t1 is always valid)
+    if partition_key_source_table is None and skip_partition_key_joins:
+        try:
+            _parsed_for_pk = sqlglot.parse_one(query)
+            _sel_for_pk = _parsed_for_pk if isinstance(_parsed_for_pk, exp.Select) else _parsed_for_pk.find(exp.Select)
+            if _sel_for_pk:
+                for _expr in _sel_for_pk.expressions:
+                    _col = _expr.find(exp.Column)
+                    if _col and _col.name == partition_key and _col.table:
+                        _from = _parsed_for_pk.find(exp.From)
+                        if _from:
+                            for _tbl in _from.find_all(exp.Table):
+                                if (_tbl.alias or _tbl.name) == _col.table:
+                                    partition_key_source_table = _tbl.name
+                                    break
+                    if partition_key_source_table:
+                        break
+        except Exception:
+            pass
+
     # Clean the query
     query = clean_query(query)
 
@@ -1697,6 +1792,7 @@ def generate_all_query_hash_pairs(
             skip_partition_key_joins=skip_partition_key_joins,
             geometry_column=geometry_column,
             pre_clean_select_clause=pre_clean_select_clause,
+            partition_key_source_table=partition_key_source_table,
         )
     )
     query_set.update(query_set_diff_combinations)
@@ -1721,6 +1817,7 @@ def generate_all_query_hash_pairs(
                 skip_partition_key_joins=skip_partition_key_joins,
                 geometry_column=geometry_column,
                 pre_clean_select_clause=pre_clean_select_clause,
+                partition_key_source_table=partition_key_source_table,
             )
         )
     )
