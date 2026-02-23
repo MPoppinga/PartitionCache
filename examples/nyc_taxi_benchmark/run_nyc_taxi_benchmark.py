@@ -21,15 +21,19 @@ Usage:
     python run_nyc_taxi_benchmark.py --mode spatial
     python run_nyc_taxi_benchmark.py --mode all --repeat 3
     python run_nyc_taxi_benchmark.py --mode backend-comparison
+    python run_nyc_taxi_benchmark.py --mode api-comparison
+    python run_nyc_taxi_benchmark.py --mode all --api lazy --method IN_SUBQUERY
+    python run_nyc_taxi_benchmark.py --mode backend-comparison --api both
 """
 
 import argparse
 import json
 import os
+import re
 import statistics
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 # Add project root to path
@@ -91,7 +95,7 @@ def compute_fact_table_stats(executor):
     executor.max_trip_id = max_trip_id
 
     stats = {"trip_id": total_count}
-    print(f"\nFact table (taxi_trips) statistics:")
+    print("\nFact table (taxi_trips) statistics:")
     print(f"  trip_id: {total_count:,} rows, max value: {max_trip_id:,}")
     return stats
 
@@ -118,10 +122,24 @@ class PostgreSQLExecutor:
         self.max_trip_id = 0
 
     def execute(self, query):
-        """Execute query and return (rows, elapsed_seconds)."""
+        """Execute query and return (rows, elapsed_seconds).
+
+        Handles multi-statement queries (e.g. from TMP_TABLE_IN/JOIN methods)
+        by splitting on semicolons, executing setup statements first, then
+        fetching results from the final SELECT.
+        """
         with self.conn.cursor() as cur:
             start = time.perf_counter()
-            cur.execute(query)
+            # Split multi-statement queries (CREATE TEMP TABLE; INSERT; ...; SELECT)
+            statements = [s.strip() for s in query.split(";") if s.strip()]
+            if len(statements) > 1:
+                # Execute setup statements (CREATE, INSERT, INDEX, ANALYZE)
+                for stmt in statements[:-1]:
+                    cur.execute(stmt)
+                # Execute final SELECT and fetch
+                cur.execute(statements[-1])
+            else:
+                cur.execute(query)
             rows = cur.fetchall()
             elapsed = time.perf_counter() - start
         return rows, elapsed
@@ -186,18 +204,18 @@ class CacheManager:
 
 # --- Benchmark Core ---
 
-def populate_cache_for_query(executor, cache_manager, adapted_query, partition_keys, *, cache_query=None):
+def populate_cache_for_query(executor, cache_manager, query, partition_keys):
     """
     Populate cache for a query across all its partition keys.
 
-    Args:
-        cache_query: Query to use for hash generation. If None, uses adapted_query.
-            When set, allows using original queries (with JOINs, GROUP BY, etc.)
-            since clean_query() normalizes them to the same hashes.
+    Uses the public PartitionCache API:
+      1. generate_all_query_hash_pairs() decomposes the query into variant fragments
+         (with keep_all_attributes=False to create variants by omitting conditions)
+      2. Each fragment is executed against the database
+      3. Results are stored via the PartitionCacheHelper
 
     Returns dict with per-partition-key stats including population_time.
     """
-    cache_query = cache_query or adapted_query
     stats = {}
 
     for pk in partition_keys:
@@ -206,17 +224,32 @@ def populate_cache_for_query(executor, cache_manager, adapted_query, partition_k
 
         pk_start = time.perf_counter()
 
-        # Generate all variant fragments for this partition key
+        # Generate all variant fragments for this partition key.
+        # keep_all_attributes=False creates variants by omitting individual conditions,
+        # enabling cache reuse when queries share subsets of conditions.
+        # No partition_join_table specified — all tables participate in variant generation.
         pairs = generate_all_query_hash_pairs(
-            query=cache_query,
+            query=query,
             partition_key=pk,
             min_component_size=1,
+            keep_all_attributes=False,
             strip_select=True,
             auto_detect_partition_join=False,
             skip_partition_key_joins=True,
-            partition_join_table="taxi_trips",
             follow_graph=False,
         )
+
+        # Filter out fragments where a dimension table appears in the outer FROM clause.
+        # Multi-table fragments may assign osm_pois as t1, making "t1.trip_id" fail
+        # (osm_pois has no trip_id column). However, EXISTS subqueries referencing
+        # osm_pois are fine — they're evaluated within the fact table context.
+        def fact_table_in_from(fragment_sql):
+            m = re.search(r"FROM\s+(.*?)\s+WHERE", fragment_sql, re.IGNORECASE | re.DOTALL)
+            if m:
+                from_clause = m.group(1)
+                return "taxi_trips" in from_clause and "osm_pois" not in from_clause
+            return False
+        pairs = [(q, h) for q, h in pairs if fact_table_in_from(q)]
 
         pk_stats["fragments_generated"] = len(pairs)
 
@@ -247,32 +280,34 @@ def populate_cache_for_query(executor, cache_manager, adapted_query, partition_k
     return stats
 
 
-def apply_cache_to_query(cache_manager, adapted_query, original_query, partition_keys, fact_stats=None, *, cache_query=None):
+def apply_cache_to_query(cache_manager, query, partition_keys, fact_stats=None, method="TMP_TABLE_IN"):
     """
-    Apply cached restrictions for all partition keys to the original query.
+    Apply cached restrictions for all partition keys to the query.
 
-    Args:
-        cache_query: Query to use for hash generation. If None, uses adapted_query.
+    Uses the public PartitionCache API:
+      1. get_partition_keys() generates hashes (with fix_attributes=False internally)
+         and intersects cached partition key sets
+      2. extend_query_with_partition_keys() adds cache restriction to the query
+
+    Supported methods: "IN", "VALUES", "TMP_TABLE_IN", "TMP_TABLE_JOIN"
 
     Returns (enhanced_query, per_pk_stats, cache_apply_time).
     If fact_stats is provided, each pk_stats entry includes search_space_reduction.
     """
-    cache_query = cache_query or adapted_query
     apply_start = time.perf_counter()
-    enhanced = original_query
+    enhanced = query
     pk_stats = {}
 
     for pk in partition_keys:
         handler = cache_manager.get_handler(pk)
 
         cached_keys, num_generated, num_hits = partitioncache.get_partition_keys(
-            query=cache_query,
+            query=query,
             cache_handler=handler.underlying_handler,
             partition_key=pk,
             min_component_size=1,
             auto_detect_partition_join=False,
             skip_partition_key_joins=True,
-            partition_join_table="taxi_trips",
             follow_graph=False,
         )
 
@@ -300,7 +335,7 @@ def apply_cache_to_query(cache_manager, adapted_query, original_query, partition
                     enhanced,
                     cached_keys,
                     partition_key=pk,
-                    method="IN",
+                    method=method,
                     p0_alias="t",
                 )
             except Exception as e:
@@ -310,15 +345,64 @@ def apply_cache_to_query(cache_manager, adapted_query, original_query, partition
     return enhanced, pk_stats, cache_apply_time
 
 
-def run_single_query(executor, cache_manager, query_name, query_dir, repeat=1, fact_stats=None):
-    """Run a single query through the full benchmark pipeline."""
-    adapted_query = load_query(os.path.join(query_dir, "adapted"), query_name)
+def apply_cache_to_query_lazy(cache_manager, query, partition_keys, method="IN_SUBQUERY"):
+    """
+    Apply cached restrictions using the lazy API (database-side intersection).
+
+    Uses partitioncache.apply_cache_lazy() which generates SQL subqueries
+    instead of materializing partition keys in Python — PostgreSQL handles
+    the intersection.
+
+    Supported methods: "IN_SUBQUERY", "TMP_TABLE_IN", "TMP_TABLE_JOIN"
+
+    Returns (enhanced_query, per_pk_stats, cache_apply_time).
+    """
+    apply_start = time.perf_counter()
+    enhanced = query
+    pk_stats = {}
+
+    for pk in partition_keys:
+        handler = cache_manager.get_handler(pk)
+
+        enhanced, stats = partitioncache.apply_cache_lazy(
+            query=enhanced,
+            cache_handler=handler.underlying_handler,
+            partition_key=pk,
+            method=method,
+            min_component_size=1,
+            auto_detect_partition_join=False,
+            skip_partition_key_joins=True,
+            follow_graph=False,
+            p0_alias="t",
+        )
+
+        entry = {
+            "variants_checked": stats.get("generated_variants", 0),
+            "cache_hits": stats.get("cache_hits", 0),
+        }
+        pk_stats[pk] = entry
+
+    cache_apply_time = time.perf_counter() - apply_start
+    return enhanced, pk_stats, cache_apply_time
+
+
+def run_single_query(executor, cache_manager, query_name, query_dir, repeat=1, fact_stats=None, method="TMP_TABLE_IN", api="non-lazy"):
+    """Run a single query through the full benchmark pipeline.
+
+    Workflow:
+      1. Execute the original query as baseline
+      2. Populate cache using generate_all_query_hash_pairs(keep_all_attributes=False)
+         which decomposes the query into variant fragments by omitting conditions
+      3. Apply cache using get_partition_keys() + extend_query_with_partition_keys()
+      4. Execute the enhanced query and compare results
+    """
     original_query = load_query(os.path.join(query_dir, "original"), query_name)
     pks = QUERY_PARTITION_KEYS[query_name]
 
     result = {
         "query": query_name,
         "partition_keys": pks,
+        "api": api,
     }
 
     # 1. Baseline: run original query (with repeat)
@@ -334,17 +418,22 @@ def run_single_query(executor, cache_manager, query_name, query_dir, repeat=1, f
     if repeat > 1:
         result["baseline_stddev"] = statistics.stdev(baseline_times)
 
-    # 2. Populate cache (use original query — clean_query normalizes JOINs, GROUP BY, etc.)
+    # 2. Populate cache from original query with variant generation
     cache_start = time.perf_counter()
-    cache_stats = populate_cache_for_query(executor, cache_manager, adapted_query, pks, cache_query=original_query)
+    cache_stats = populate_cache_for_query(executor, cache_manager, original_query, pks)
     cache_pop_time = time.perf_counter() - cache_start
     result["cache_population_time"] = cache_pop_time
     result["cache_stats"] = cache_stats
 
     # 3. Apply cache and run enhanced query (with repeat)
-    enhanced_query, pk_stats, cache_apply_time = apply_cache_to_query(
-        cache_manager, adapted_query, original_query, pks, fact_stats=fact_stats, cache_query=original_query,
-    )
+    if api == "lazy":
+        enhanced_query, pk_stats, cache_apply_time = apply_cache_to_query_lazy(
+            cache_manager, original_query, pks, method=method,
+        )
+    else:
+        enhanced_query, pk_stats, cache_apply_time = apply_cache_to_query(
+            cache_manager, original_query, pks, fact_stats=fact_stats, method=method,
+        )
     result["apply_stats"] = pk_stats
     result["cache_apply_time"] = cache_apply_time
 
@@ -369,16 +458,16 @@ def run_single_query(executor, cache_manager, query_name, query_dir, repeat=1, f
 
 # --- Benchmark Modes ---
 
-def run_all_queries(executor, cache_manager, query_dir, repeat=1, fact_stats=None):
+def run_all_queries(executor, cache_manager, query_dir, repeat=1, fact_stats=None, method="TMP_TABLE_IN", api="non-lazy"):
     """Run all NYC Taxi queries."""
     print("\n" + "=" * 80)
-    print(f"NYC Taxi Benchmark: All Queries ({len(ALL_QUERIES)} queries)")
+    print(f"NYC Taxi Benchmark: All Queries ({len(ALL_QUERIES)} queries, method={method}, api={api})")
     print("=" * 80)
 
     results = []
     for query_name in ALL_QUERIES:
         print(f"\n--- {query_name} ---")
-        result = run_single_query(executor, cache_manager, query_name, query_dir, repeat=repeat, fact_stats=fact_stats)
+        result = run_single_query(executor, cache_manager, query_name, query_dir, repeat=repeat, fact_stats=fact_stats, method=method, api=api)
         results.append(result)
         print_query_result(result)
 
@@ -386,7 +475,7 @@ def run_all_queries(executor, cache_manager, query_dir, repeat=1, fact_stats=Non
     return results
 
 
-def run_flight(executor, cache_manager, query_dir, flight_num, repeat=1, fact_stats=None):
+def run_flight(executor, cache_manager, query_dir, flight_num, repeat=1, fact_stats=None, method="TMP_TABLE_IN", api="non-lazy"):
     """Run a single query flight."""
     queries = QUERY_FLIGHTS.get(flight_num)
     if not queries:
@@ -395,13 +484,13 @@ def run_flight(executor, cache_manager, query_dir, flight_num, repeat=1, fact_st
         return []
 
     print(f"\n{'=' * 80}")
-    print(f"NYC Taxi Benchmark: Flight Q{flight_num}")
+    print(f"NYC Taxi Benchmark: Flight Q{flight_num} (method={method}, api={api})")
     print(f"{'=' * 80}")
 
     results = []
     for query_name in queries:
         print(f"\n--- {query_name} ---")
-        result = run_single_query(executor, cache_manager, query_name, query_dir, repeat=repeat, fact_stats=fact_stats)
+        result = run_single_query(executor, cache_manager, query_name, query_dir, repeat=repeat, fact_stats=fact_stats, method=method, api=api)
         results.append(result)
         print_query_result(result)
 
@@ -409,7 +498,7 @@ def run_flight(executor, cache_manager, query_dir, flight_num, repeat=1, fact_st
     return results
 
 
-def run_cross_dimension(executor, cache_manager, query_dir, repeat=1, fact_stats=None):
+def run_cross_dimension(executor, cache_manager, query_dir, repeat=1, fact_stats=None, method="TMP_TABLE_IN", api="non-lazy"):
     """
     Cross-dimension cache reuse evaluation.
 
@@ -431,7 +520,6 @@ def run_cross_dimension(executor, cache_manager, query_dir, repeat=1, fact_stats
         queries = QUERY_FLIGHTS[flight_num]
 
         for i, query_name in enumerate(queries):
-            adapted_query = load_query(os.path.join(query_dir, "adapted"), query_name)
             original_query = load_query(os.path.join(query_dir, "original"), query_name)
             pks = QUERY_PARTITION_KEYS[query_name]
 
@@ -442,7 +530,7 @@ def run_cross_dimension(executor, cache_manager, query_dir, repeat=1, fact_stats
             for pk in pks:
                 handler = cache_manager.get_handler(pk)
                 _, num_gen, num_hits = partitioncache.get_partition_keys(
-                    query=adapted_query,
+                    query=original_query,
                     cache_handler=handler.underlying_handler,
                     partition_key=pk,
                     min_component_size=1,
@@ -462,13 +550,18 @@ def run_cross_dimension(executor, cache_manager, query_dir, repeat=1, fact_stats
 
             # Populate
             cache_start = time.perf_counter()
-            cache_stats = populate_cache_for_query(executor, cache_manager, adapted_query, pks)
+            cache_stats = populate_cache_for_query(executor, cache_manager, original_query, pks)
             cache_pop_time = time.perf_counter() - cache_start
 
             # Apply and run (with repeat)
-            enhanced_query, pk_stats, cache_apply_time = apply_cache_to_query(
-                cache_manager, adapted_query, original_query, pks, fact_stats=fact_stats,
-            )
+            if api == "lazy":
+                enhanced_query, pk_stats, cache_apply_time = apply_cache_to_query_lazy(
+                    cache_manager, original_query, pks, method=method,
+                )
+            else:
+                enhanced_query, pk_stats, cache_apply_time = apply_cache_to_query(
+                    cache_manager, original_query, pks, fact_stats=fact_stats, method=method,
+                )
             cached_times = []
             cached_rows = None
             for _ in range(repeat):
@@ -483,6 +576,7 @@ def run_cross_dimension(executor, cache_manager, query_dir, repeat=1, fact_stats
             result = {
                 "query": query_name,
                 "partition_keys": pks,
+                "api": api,
                 "baseline_rows": len(baseline_rows),
                 "baseline_time": baseline_time,
                 "cache_population_time": cache_pop_time,
@@ -510,7 +604,7 @@ def run_cross_dimension(executor, cache_manager, query_dir, repeat=1, fact_stats
                 shared = hits_before
                 print(f"    {pk}: {pk_stats[pk]['variants_checked']} variants, "
                       f"{hits_after} hits ({shared} pre-existing, {new_hits} new), "
-                      f"{pk_stats[pk]['partition_keys_found']} keys")
+                      f"{pk_stats[pk].get('partition_keys_found', 'n/a')} keys")
             print(f"  Cached: {len(cached_rows)} rows in {cached_time:.4f}s "
                   f"(speedup: {speedup:.2f}x, match: {result['result_match']})")
 
@@ -521,7 +615,6 @@ def run_cross_dimension(executor, cache_manager, query_dir, repeat=1, fact_stats
     q7_queries = QUERY_FLIGHTS[7]
 
     for i, query_name in enumerate(q7_queries):
-        adapted_query = load_query(os.path.join(query_dir, "adapted"), query_name)
         original_query = load_query(os.path.join(query_dir, "original"), query_name)
         pks = QUERY_PARTITION_KEYS[query_name]
 
@@ -532,7 +625,7 @@ def run_cross_dimension(executor, cache_manager, query_dir, repeat=1, fact_stats
         for pk in pks:
             handler = cache_manager.get_handler(pk)
             _, num_gen, num_hits = partitioncache.get_partition_keys(
-                query=adapted_query,
+                query=original_query,
                 cache_handler=handler.underlying_handler,
                 partition_key=pk,
                 min_component_size=1,
@@ -552,13 +645,18 @@ def run_cross_dimension(executor, cache_manager, query_dir, repeat=1, fact_stats
 
         # Populate
         cache_start = time.perf_counter()
-        cache_stats = populate_cache_for_query(executor, cache_manager, adapted_query, pks)
+        cache_stats = populate_cache_for_query(executor, cache_manager, original_query, pks)
         cache_pop_time = time.perf_counter() - cache_start
 
         # Apply and run (with repeat)
-        enhanced_query, pk_stats, cache_apply_time = apply_cache_to_query(
-            cache_manager, adapted_query, original_query, pks, fact_stats=fact_stats,
-        )
+        if api == "lazy":
+            enhanced_query, pk_stats, cache_apply_time = apply_cache_to_query_lazy(
+                cache_manager, original_query, pks, method=method,
+            )
+        else:
+            enhanced_query, pk_stats, cache_apply_time = apply_cache_to_query(
+                cache_manager, original_query, pks, fact_stats=fact_stats,
+            )
         cached_times = []
         cached_rows = None
         for _ in range(repeat):
@@ -573,6 +671,7 @@ def run_cross_dimension(executor, cache_manager, query_dir, repeat=1, fact_stats
         result = {
             "query": query_name,
             "partition_keys": pks,
+            "api": api,
             "baseline_rows": len(baseline_rows),
             "baseline_time": baseline_time,
             "cache_population_time": cache_pop_time,
@@ -600,7 +699,7 @@ def run_cross_dimension(executor, cache_manager, query_dir, repeat=1, fact_stats
             marker = " *** CROSS-DIM REUSE ***" if shared > 0 else ""
             print(f"    {pk}: {pk_stats[pk]['variants_checked']} variants, "
                   f"{hits_after} hits ({shared} pre-existing, {new_hits} new), "
-                  f"{pk_stats[pk]['partition_keys_found']} keys{marker}")
+                  f"{pk_stats[pk].get('partition_keys_found', 'n/a')} keys{marker}")
         print(f"  Cached: {len(cached_rows)} rows in {cached_time:.4f}s "
               f"(speedup: {speedup:.2f}x, match: {result['result_match']})")
 
@@ -612,7 +711,7 @@ def run_cross_dimension(executor, cache_manager, query_dir, repeat=1, fact_stats
                 total_cross_dim_hits += r["pre_existing_hits"][pk]["hits_before"]
 
     print(f"\n{'=' * 80}")
-    print(f"Cross-dimension reuse summary:")
+    print("Cross-dimension reuse summary:")
     print(f"  Total pre-existing cache hits across all queries: {total_cross_dim_hits}")
     print(f"  Queries evaluated: {len(results)}")
     all_match = all(r["result_match"] for r in results)
@@ -621,7 +720,7 @@ def run_cross_dimension(executor, cache_manager, query_dir, repeat=1, fact_stats
     return results
 
 
-def run_cold_vs_warm(executor, cache_manager, query_dir, repeat=1, fact_stats=None):
+def run_cold_vs_warm(executor, cache_manager, query_dir, repeat=1, fact_stats=None, method="TMP_TABLE_IN", api="non-lazy"):
     """Compare cold cache (no pre-existing entries) vs warm cache (reuse from prior queries)."""
     print("\n" + "=" * 80)
     print("NYC Taxi Benchmark: Cold vs Warm Cache")
@@ -634,7 +733,7 @@ def run_cold_vs_warm(executor, cache_manager, query_dir, repeat=1, fact_stats=No
     cold_results = []
     for query_name in QUERY_FLIGHTS[7]:
         print(f"\n--- {query_name} (cold) ---")
-        result = run_single_query(executor, cache_manager, query_name, query_dir, repeat=repeat, fact_stats=fact_stats)
+        result = run_single_query(executor, cache_manager, query_name, query_dir, repeat=repeat, fact_stats=fact_stats, method=method, api=api)
         result["mode"] = "cold"
         cold_results.append(result)
         print_query_result(result)
@@ -644,7 +743,7 @@ def run_cold_vs_warm(executor, cache_manager, query_dir, repeat=1, fact_stats=No
     warm_results = []
     for query_name in QUERY_FLIGHTS[7]:
         print(f"\n--- {query_name} (warm) ---")
-        result = run_single_query(executor, cache_manager, query_name, query_dir, repeat=repeat, fact_stats=fact_stats)
+        result = run_single_query(executor, cache_manager, query_name, query_dir, repeat=repeat, fact_stats=fact_stats, method=method, api=api)
         result["mode"] = "warm"
         warm_results.append(result)
         print_query_result(result)
@@ -653,7 +752,7 @@ def run_cold_vs_warm(executor, cache_manager, query_dir, repeat=1, fact_stats=No
     print(f"\n{'=' * 80}")
     print(f"{'Query':<8} {'Cold Total':>12} {'Warm Total':>12} {'Savings':>10}")
     print("-" * 44)
-    for cold, warm in zip(cold_results, warm_results):
+    for cold, warm in zip(cold_results, warm_results, strict=False):
         cold_total = cold["cache_population_time"] + cold["cached_time"]
         warm_total = warm["cache_population_time"] + warm["cached_time"]
         savings = (cold_total - warm_total) / cold_total * 100 if cold_total > 0 else 0
@@ -662,7 +761,7 @@ def run_cold_vs_warm(executor, cache_manager, query_dir, repeat=1, fact_stats=No
     return cold_results + warm_results
 
 
-def run_hierarchy(executor, cache_manager, query_dir, repeat=1, fact_stats=None):
+def run_hierarchy(executor, cache_manager, query_dir, repeat=1, fact_stats=None, method="TMP_TABLE_IN", api="non-lazy"):
     """
     Hierarchical drill-down evaluation.
 
@@ -684,12 +783,11 @@ def run_hierarchy(executor, cache_manager, query_dir, repeat=1, fact_stats=None)
         queries = QUERY_FLIGHTS[flight_num]
 
         print(f"\n### {flight_label}")
-        print(f"Constant conditions kept the same; only the target dimension drills deeper.\n")
+        print("Constant conditions kept the same; only the target dimension drills deeper.\n")
 
         flight_results = []
 
         for query_name in queries:
-            adapted_query = load_query(os.path.join(query_dir, "adapted"), query_name)
             original_query = load_query(os.path.join(query_dir, "original"), query_name)
             pks = QUERY_PARTITION_KEYS[query_name]
             level_label = HIERARCHY_LABELS.get(query_name, query_name)
@@ -701,7 +799,7 @@ def run_hierarchy(executor, cache_manager, query_dir, repeat=1, fact_stats=None)
             for pk in pks:
                 handler = cache_manager.get_handler(pk)
                 _, num_gen, num_hits = partitioncache.get_partition_keys(
-                    query=adapted_query,
+                    query=original_query,
                     cache_handler=handler.underlying_handler,
                     partition_key=pk,
                     min_component_size=1,
@@ -721,13 +819,18 @@ def run_hierarchy(executor, cache_manager, query_dir, repeat=1, fact_stats=None)
 
             # Populate cache
             cache_start = time.perf_counter()
-            cache_stats = populate_cache_for_query(executor, cache_manager, adapted_query, pks)
+            cache_stats = populate_cache_for_query(executor, cache_manager, original_query, pks)
             cache_pop_time = time.perf_counter() - cache_start
 
             # Apply cache and run enhanced query (with repeat)
-            enhanced_query, pk_stats, cache_apply_time = apply_cache_to_query(
-                cache_manager, adapted_query, original_query, pks,
-            )
+            if api == "lazy":
+                enhanced_query, pk_stats, cache_apply_time = apply_cache_to_query_lazy(
+                    cache_manager, original_query, pks, method=method,
+                )
+            else:
+                enhanced_query, pk_stats, cache_apply_time = apply_cache_to_query(
+                    cache_manager, original_query, pks, method=method,
+                )
             cached_times = []
             cached_rows = None
             for _ in range(repeat):
@@ -773,7 +876,7 @@ def run_hierarchy(executor, cache_manager, query_dir, repeat=1, fact_stats=None)
                 pop_time = cache_stats[pk].get("population_time", 0)
                 print(f"    {pk}: {pk_stats[pk]['variants_checked']} variants, "
                       f"{hits_after} hits ({reused} reused, {new_hits} new), "
-                      f"{pk_stats[pk]['partition_keys_found']} keys, "
+                      f"{pk_stats[pk].get('partition_keys_found', 'n/a')} keys, "
                       f"pop: {pop_time:.4f}s{marker}")
             print(f"  Cached: {len(cached_rows)} rows in {cached_time:.4f}s "
                   f"(speedup: {speedup:.2f}x, match: {result['result_match']})")
@@ -794,14 +897,14 @@ def run_hierarchy(executor, cache_manager, query_dir, repeat=1, fact_stats=None)
     # Overall summary
     print(f"\n{'=' * 80}")
     all_match = all(r["result_match"] for r in all_results)
-    print(f"Hierarchy drill-down summary:")
+    print("Hierarchy drill-down summary:")
     print(f"  Queries evaluated: {len(all_results)}")
     print(f"  All results correct: {all_match}")
 
     return all_results
 
 
-def run_spatial(executor, cache_manager, query_dir, repeat=1, fact_stats=None):
+def run_spatial(executor, cache_manager, query_dir, repeat=1, fact_stats=None, method="TMP_TABLE_IN", api="non-lazy"):
     """
     Run only spatial-heavy queries.
 
@@ -816,7 +919,7 @@ def run_spatial(executor, cache_manager, query_dir, repeat=1, fact_stats=None):
     results = []
     for query_name in SPATIAL_QUERIES:
         print(f"\n--- {query_name} ---")
-        result = run_single_query(executor, cache_manager, query_name, query_dir, repeat=repeat, fact_stats=fact_stats)
+        result = run_single_query(executor, cache_manager, query_name, query_dir, repeat=repeat, fact_stats=fact_stats, method=method, api=api)
         results.append(result)
         print_query_result(result)
 
@@ -824,84 +927,349 @@ def run_spatial(executor, cache_manager, query_dir, repeat=1, fact_stats=None):
     return results
 
 
-def run_backend_comparison(executor, cache_manager, query_dir, max_trip_id=0, repeat=1, fact_stats=None):
+def run_backend_comparison(executor, query_dir, max_trip_id=0, repeat=1, fact_stats=None, method="TMP_TABLE_IN", api="non-lazy"):
     """
     Compare different PostgreSQL cache backends on a fixed set of representative queries.
 
     Runs q1_1, q3_1, q5_1 with postgresql_array, postgresql_bit, and
     postgresql_roaringbit backends.
+
+    Args:
+        api: "non-lazy" (default), "lazy", or "both" to run both API paths per backend.
     """
     print("\n" + "=" * 80)
-    print("NYC Taxi Benchmark: Backend Comparison")
+    print(f"NYC Taxi Benchmark: Backend Comparison (api={api})")
     print("=" * 80)
 
     representative_queries = ["q1_1", "q3_1", "q5_1"]
     backends = ["postgresql_array", "postgresql_bit", "postgresql_roaringbit"]
 
+    # Determine which API modes to run
+    if api == "both":
+        api_modes = ["non-lazy", "lazy"]
+    else:
+        api_modes = [api]
+
     all_results = {}
 
     for backend in backends:
-        print(f"\n### Backend: {backend}")
+        for api_mode in api_modes:
+            label = f"{backend}/{api_mode}" if len(api_modes) > 1 else backend
+            print(f"\n### Backend: {label}")
 
-        try:
-            cm = CacheManager(backend, max_trip_id=max_trip_id)
-            # Test that we can create a handler
-            cm.get_handler("trip_id")
-        except Exception as e:
-            print(f"  Skipped: {e}")
-            continue
+            # Map method for lazy API
+            effective_method = method
+            if api_mode == "lazy" and method in ("IN", "VALUES"):
+                effective_method = "IN_SUBQUERY"
+                print(f"  (method auto-mapped to {effective_method} for lazy API)")
 
-        try:
-            cm.clear_all()
-        except Exception:
-            pass
-
-        backend_results = []
-
-        for query_name in representative_queries:
-            print(f"\n--- {query_name} ---")
             try:
-                result = run_single_query(executor, cm, query_name, query_dir, repeat=repeat, fact_stats=fact_stats)
-                backend_results.append(result)
-                print_query_result(result)
+                cm = CacheManager(backend, max_trip_id=max_trip_id)
+                cm.get_handler("trip_id")
             except Exception as e:
-                print(f"  Error: {e}")
-                backend_results.append({
-                    "query": query_name,
-                    "error": str(e),
-                })
+                print(f"  Skipped: {e}")
+                continue
 
-        all_results[backend] = backend_results
+            try:
+                cm.clear_all()
+            except Exception:
+                pass
 
-        try:
-            cm.clear_all()
-            cm.close()
-        except Exception:
-            pass
+            backend_results = []
+
+            for query_name in representative_queries:
+                print(f"\n--- {query_name} ---")
+                try:
+                    result = run_single_query(
+                        executor, cm, query_name, query_dir,
+                        repeat=repeat, fact_stats=fact_stats,
+                        method=effective_method, api=api_mode,
+                    )
+                    result["cache_backend"] = backend
+                    backend_results.append(result)
+                    print_query_result(result)
+                except Exception as e:
+                    print(f"  Error: {e}")
+                    backend_results.append({
+                        "query": query_name,
+                        "error": str(e),
+                        "cache_backend": backend,
+                        "api": api_mode,
+                    })
+
+            all_results[label] = backend_results
+
+            try:
+                cm.clear_all()
+                cm.close()
+            except Exception:
+                pass
 
     # Comparison table
     print(f"\n{'=' * 80}")
     print("Backend Comparison Summary")
-    print(f"\n{'Backend':<25} {'Query':<8} {'Pop Time':>10} {'Cached':>10} {'Speedup':>9}")
-    print("-" * 65)
-    for backend, results in all_results.items():
+    header = f"{'Backend':<35} {'Query':<8} {'Pop Time':>10} {'Cached':>10} {'Speedup':>9}"
+    if len(api_modes) > 1:
+        header = f"{'Backend/API':<35} {'Query':<8} {'Pop Time':>10} {'Cached':>10} {'Speedup':>9}"
+    print(f"\n{header}")
+    print("-" * 75)
+    for label, results in all_results.items():
         for r in results:
             if "error" in r:
-                print(f"{backend:<25} {r['query']:<8} {'ERROR':>10} {'':>10} {'':>9}")
+                print(f"{label:<35} {r['query']:<8} {'ERROR':>10} {'':>10} {'':>9}")
             else:
-                print(f"{backend:<25} {r['query']:<8} "
+                print(f"{label:<35} {r['query']:<8} "
                       f"{r['cache_population_time']:>9.4f}s "
                       f"{r['cached_time']:>9.4f}s "
                       f"{r['speedup']:>8.2f}x")
 
     # Flatten results for return
     flat_results = []
-    for backend, results in all_results.items():
-        for r in results:
-            r_copy = dict(r)
-            r_copy["cache_backend"] = backend
-            flat_results.append(r_copy)
+    for _label, results in all_results.items():
+        flat_results.extend(results)
 
+    return flat_results
+
+
+def run_method_comparison(executor, cache_manager, query_dir, repeat=1, fact_stats=None):
+    """
+    Compare different query extension methods on a fixed set of queries.
+
+    Runs representative queries with each method (IN, VALUES, TMP_TABLE_IN,
+    TMP_TABLE_JOIN) to compare performance characteristics. Cache is populated
+    once and reused across methods.
+    """
+    print("\n" + "=" * 80)
+    print("NYC Taxi Benchmark: Method Comparison")
+    print("=" * 80)
+
+    representative_queries = ["q1_1", "q1_2", "q3_1"]
+    methods = ["IN", "VALUES", "TMP_TABLE_IN", "TMP_TABLE_JOIN"]
+
+    # First populate cache with all representative queries
+    print("\n### Phase 1: Populate cache")
+    for query_name in representative_queries:
+        original_query = load_query(os.path.join(query_dir, "original"), query_name)
+        pks = QUERY_PARTITION_KEYS[query_name]
+        cache_stats = populate_cache_for_query(executor, cache_manager, original_query, pks)
+        for pk, stats in cache_stats.items():
+            print(f"  {query_name}/{pk}: {stats['fragments_generated']} fragments, "
+                  f"{stats['fragments_executed']} executed")
+
+    # Run each method
+    all_results = {}
+    for method_name in methods:
+        print(f"\n### Method: {method_name}")
+        method_results = []
+
+        for query_name in representative_queries:
+            print(f"\n--- {query_name} ({method_name}) ---")
+            original_query = load_query(os.path.join(query_dir, "original"), query_name)
+            pks = QUERY_PARTITION_KEYS[query_name]
+
+            # Baseline
+            rows, baseline_time = executor.execute(original_query)
+            baseline_rows = len(rows)
+
+            # Apply cache and run
+            try:
+                enhanced_query, pk_stats, cache_apply_time = apply_cache_to_query(
+                    cache_manager, original_query, pks, fact_stats=fact_stats, method=method_name,
+                )
+                cached_rows_result, cached_time = executor.execute(enhanced_query)
+                cached_rows = len(cached_rows_result)
+                speedup = baseline_time / cached_time if cached_time > 0 else float("inf")
+                match = baseline_rows == cached_rows
+
+                result = {
+                    "query": query_name,
+                    "method": method_name,
+                    "baseline_time": baseline_time,
+                    "cached_time": cached_time,
+                    "cache_apply_time": cache_apply_time,
+                    "speedup": speedup,
+                    "result_match": match,
+                    "baseline_rows": baseline_rows,
+                    "cached_rows": cached_rows,
+                }
+                method_results.append(result)
+
+                print(f"  Baseline: {baseline_rows} rows in {baseline_time:.4f}s")
+                print(f"  Cached: {cached_rows} rows in {cached_time:.4f}s "
+                      f"(speedup: {speedup:.2f}x, match: {match})")
+            except Exception as e:
+                print(f"  Error: {e}")
+                method_results.append({
+                    "query": query_name,
+                    "method": method_name,
+                    "error": str(e),
+                })
+
+        all_results[method_name] = method_results
+
+    # Comparison table
+    print(f"\n{'=' * 80}")
+    print("Method Comparison Summary")
+    print(f"\n{'Method':<18} {'Query':<8} {'Baseline':>10} {'Cached':>10} {'Apply':>10} {'Speedup':>9} {'Match':>7}")
+    print("-" * 75)
+    for method_name, results in all_results.items():
+        for r in results:
+            if "error" in r:
+                print(f"{method_name:<18} {r['query']:<8} {'ERROR':>10}")
+            else:
+                print(f"{method_name:<18} {r['query']:<8} "
+                      f"{r['baseline_time']:>9.4f}s "
+                      f"{r['cached_time']:>9.4f}s "
+                      f"{r['cache_apply_time']:>9.4f}s "
+                      f"{r['speedup']:>8.2f}x "
+                      f"{'Y' if r['result_match'] else 'N':>6}")
+
+    # Flatten
+    flat_results = []
+    for _method_name, results in all_results.items():
+        flat_results.extend(results)
+    return flat_results
+
+
+def run_api_comparison(executor, cache_manager, query_dir, repeat=1, fact_stats=None):
+    """
+    Compare non-lazy vs lazy API with all applicable methods.
+
+    Tests all API+method combinations on representative queries:
+      non-lazy: IN, VALUES, TMP_TABLE_IN, TMP_TABLE_JOIN
+      lazy: IN_SUBQUERY, TMP_TABLE_IN, TMP_TABLE_JOIN
+
+    Cache is populated once and reused across all combinations.
+    """
+    print("\n" + "=" * 80)
+    print("NYC Taxi Benchmark: API Comparison (non-lazy vs lazy)")
+    print("=" * 80)
+
+    representative_queries = ["q1_1", "q1_2", "q3_1"]
+
+    combinations = [
+        ("non-lazy", "IN"),
+        ("non-lazy", "VALUES"),
+        ("non-lazy", "TMP_TABLE_IN"),
+        ("non-lazy", "TMP_TABLE_JOIN"),
+        ("lazy", "IN_SUBQUERY"),
+        ("lazy", "TMP_TABLE_IN"),
+        ("lazy", "TMP_TABLE_JOIN"),
+    ]
+
+    # Phase 1: Populate cache
+    print("\n### Phase 1: Populate cache")
+    for query_name in representative_queries:
+        original_query = load_query(os.path.join(query_dir, "original"), query_name)
+        pks = QUERY_PARTITION_KEYS[query_name]
+        cache_stats = populate_cache_for_query(executor, cache_manager, original_query, pks)
+        for pk, stats in cache_stats.items():
+            print(f"  {query_name}/{pk}: {stats['fragments_generated']} fragments, "
+                  f"{stats['fragments_executed']} executed")
+
+    # Phase 2: Run baselines
+    print("\n### Phase 2: Baselines")
+    baselines = {}
+    for query_name in representative_queries:
+        original_query = load_query(os.path.join(query_dir, "original"), query_name)
+        baseline_times = []
+        baseline_rows = None
+        for _ in range(repeat):
+            rows, elapsed = executor.execute(original_query)
+            baseline_times.append(elapsed)
+            if baseline_rows is None:
+                baseline_rows = rows
+        baselines[query_name] = {
+            "time": statistics.mean(baseline_times),
+            "rows": len(baseline_rows),
+        }
+        print(f"  {query_name}: {baselines[query_name]['rows']} rows in {baselines[query_name]['time']:.4f}s")
+
+    # Phase 3: Run each combination
+    all_results = {}
+    for api_mode, method_name in combinations:
+        label = f"{api_mode}/{method_name}"
+        print(f"\n### {label}")
+        combo_results = []
+
+        for query_name in representative_queries:
+            print(f"\n--- {query_name} ({label}) ---")
+            original_query = load_query(os.path.join(query_dir, "original"), query_name)
+            pks = QUERY_PARTITION_KEYS[query_name]
+
+            try:
+                if api_mode == "lazy":
+                    enhanced_query, pk_stats, cache_apply_time = apply_cache_to_query_lazy(
+                        cache_manager, original_query, pks, method=method_name,
+                    )
+                else:
+                    enhanced_query, pk_stats, cache_apply_time = apply_cache_to_query(
+                        cache_manager, original_query, pks, fact_stats=fact_stats, method=method_name,
+                    )
+
+                cached_times = []
+                cached_rows_result = None
+                for _ in range(repeat):
+                    rows, elapsed = executor.execute(enhanced_query)
+                    cached_times.append(elapsed)
+                    if cached_rows_result is None:
+                        cached_rows_result = rows
+                cached_time = statistics.mean(cached_times)
+                cached_rows = len(cached_rows_result)
+
+                baseline = baselines[query_name]
+                speedup = baseline["time"] / cached_time if cached_time > 0 else float("inf")
+                match = baseline["rows"] == cached_rows
+
+                result = {
+                    "query": query_name,
+                    "api": api_mode,
+                    "method": method_name,
+                    "baseline_time": baseline["time"],
+                    "cached_time": cached_time,
+                    "cache_apply_time": cache_apply_time,
+                    "speedup": speedup,
+                    "result_match": match,
+                    "baseline_rows": baseline["rows"],
+                    "cached_rows": cached_rows,
+                }
+                combo_results.append(result)
+
+                print(f"  Baseline: {baseline['rows']} rows in {baseline['time']:.4f}s")
+                print(f"  Cached: {cached_rows} rows in {cached_time:.4f}s "
+                      f"(speedup: {speedup:.2f}x, match: {match})")
+            except Exception as e:
+                print(f"  Error: {e}")
+                combo_results.append({
+                    "query": query_name,
+                    "api": api_mode,
+                    "method": method_name,
+                    "error": str(e),
+                })
+
+        all_results[label] = combo_results
+
+    # Comparison table
+    print(f"\n{'=' * 80}")
+    print("API Comparison Summary")
+    print(f"\n{'API/Method':<25} {'Query':<8} {'Baseline':>10} {'Cached':>10} {'Apply':>10} {'Speedup':>9} {'Match':>7}")
+    print("-" * 82)
+    for label, results in all_results.items():
+        for r in results:
+            if "error" in r:
+                print(f"{label:<25} {r['query']:<8} {'ERROR':>10}")
+            else:
+                print(f"{label:<25} {r['query']:<8} "
+                      f"{r['baseline_time']:>9.4f}s "
+                      f"{r['cached_time']:>9.4f}s "
+                      f"{r['cache_apply_time']:>9.4f}s "
+                      f"{r['speedup']:>8.2f}x "
+                      f"{'Y' if r['result_match'] else 'N':>6}")
+
+    # Flatten
+    flat_results = []
+    for _label, results in all_results.items():
+        flat_results.extend(results)
     return flat_results
 
 
@@ -1004,7 +1372,13 @@ def main():
     parser.add_argument("--cache-backend", type=str, default="postgresql_array",
                         help="Cache backend: postgresql_array, postgresql_bit, postgresql_roaringbit")
     parser.add_argument("--mode", nargs="+", default=["all"],
-                        help="Benchmark mode: all | flight N | cross-dimension | cold-vs-warm | hierarchy | spatial | backend-comparison")
+                        help="Benchmark mode: all | flight N | cross-dimension | cold-vs-warm | hierarchy | spatial | backend-comparison | method-comparison | api-comparison")
+    parser.add_argument("--method", type=str, default="IN",
+                        choices=["IN", "VALUES", "TMP_TABLE_IN", "TMP_TABLE_JOIN", "IN_SUBQUERY"],
+                        help="Query extension method (default: IN)")
+    parser.add_argument("--api", type=str, default="non-lazy",
+                        choices=["non-lazy", "lazy", "both"],
+                        help="API path: non-lazy (Python-side intersection), lazy (DB-side intersection), both (default: non-lazy)")
     parser.add_argument("--repeat", type=int, default=1,
                         help="Number of repetitions for timing (default: 1)")
     parser.add_argument("--output", type=str, default=None,
@@ -1033,24 +1407,42 @@ def main():
 
         mode = args.mode[0]
 
+        method = args.method
+        api = args.api
+
+        # Auto-map invalid method/api combos
+        if api == "lazy" and method in ("IN", "VALUES"):
+            print(f"Note: method '{method}' not available for lazy API, using IN_SUBQUERY")
+            method = "IN_SUBQUERY"
+        if api == "non-lazy" and method == "IN_SUBQUERY":
+            print("Note: method 'IN_SUBQUERY' not available for non-lazy API, using IN")
+            method = "IN"
+
+        print(f"Method: {method}")
+        print(f"API: {api}")
+
         if mode == "all":
-            results = run_all_queries(executor, cache_manager, query_dir, repeat=args.repeat, fact_stats=fact_stats)
+            results = run_all_queries(executor, cache_manager, query_dir, repeat=args.repeat, fact_stats=fact_stats, method=method, api=api)
         elif mode == "flight":
             flight_num = int(args.mode[1]) if len(args.mode) > 1 else 1
-            results = run_flight(executor, cache_manager, query_dir, flight_num, repeat=args.repeat, fact_stats=fact_stats)
+            results = run_flight(executor, cache_manager, query_dir, flight_num, repeat=args.repeat, fact_stats=fact_stats, method=method, api=api)
         elif mode == "cross-dimension":
-            results = run_cross_dimension(executor, cache_manager, query_dir, repeat=args.repeat, fact_stats=fact_stats)
+            results = run_cross_dimension(executor, cache_manager, query_dir, repeat=args.repeat, fact_stats=fact_stats, method=method, api=api)
         elif mode == "cold-vs-warm":
-            results = run_cold_vs_warm(executor, cache_manager, query_dir, repeat=args.repeat, fact_stats=fact_stats)
+            results = run_cold_vs_warm(executor, cache_manager, query_dir, repeat=args.repeat, fact_stats=fact_stats, method=method, api=api)
         elif mode == "hierarchy":
-            results = run_hierarchy(executor, cache_manager, query_dir, repeat=args.repeat, fact_stats=fact_stats)
+            results = run_hierarchy(executor, cache_manager, query_dir, repeat=args.repeat, fact_stats=fact_stats, method=method, api=api)
         elif mode == "spatial":
-            results = run_spatial(executor, cache_manager, query_dir, repeat=args.repeat, fact_stats=fact_stats)
+            results = run_spatial(executor, cache_manager, query_dir, repeat=args.repeat, fact_stats=fact_stats, method=method, api=api)
         elif mode == "backend-comparison":
             results = run_backend_comparison(
-                executor, cache_manager, query_dir,
-                max_trip_id=max_trip_id, repeat=args.repeat, fact_stats=fact_stats,
+                executor, query_dir,
+                max_trip_id=max_trip_id, repeat=args.repeat, fact_stats=fact_stats, method=method, api=api,
             )
+        elif mode == "method-comparison":
+            results = run_method_comparison(executor, cache_manager, query_dir, repeat=args.repeat, fact_stats=fact_stats)
+        elif mode == "api-comparison":
+            results = run_api_comparison(executor, cache_manager, query_dir, repeat=args.repeat, fact_stats=fact_stats)
         else:
             print(f"Unknown mode: {mode}")
             sys.exit(1)
@@ -1060,10 +1452,12 @@ def main():
             output_data = {
                 "metadata": {
                     "mode": mode,
+                    "method": method,
+                    "api": api,
                     "db_backend": "postgresql",
                     "cache_backend": cache_type,
                     "repeat": args.repeat,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "timestamp": datetime.now(UTC).isoformat(),
                     "fact_table_stats": fact_stats,
                     "max_trip_id": max_trip_id,
                 },
@@ -1083,7 +1477,10 @@ def main():
             print(f"\nResults saved to {args.output}")
 
     finally:
-        cache_manager.close()
+        try:
+            cache_manager.close()  # noqa: F821
+        except NameError:
+            pass
         executor.close()
 
 

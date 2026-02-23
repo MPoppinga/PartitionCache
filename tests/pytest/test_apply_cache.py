@@ -229,11 +229,11 @@ class TestExtendQueryWithPartitionKeys:
         partition_keys = {1, 2, 3}
         result = extend_query_with_partition_keys(query, partition_keys, "region_id", method="TMP_TABLE_IN", p0_alias="u")
 
-        assert "CREATE TEMPORARY TABLE tmp_partition_keys" in result
+        assert "CREATE TEMPORARY TABLE tmp_cache_keys_" in result
         assert "partition_key INT PRIMARY KEY" in result
-        assert "INSERT INTO tmp_partition_keys" in result
+        assert "INSERT INTO tmp_cache_keys_" in result
         assert "VALUES(1),(2),(3)" in result or "VALUES(1,2,3)" in result
-        assert "u.region_id IN (SELECT partition_key FROM tmp_partition_keys)" in result
+        assert "u.region_id IN (SELECT partition_key FROM tmp_cache_keys_" in result
 
     def test_tmp_table_in_with_strings(self):
         """Test TMP_TABLE_IN method with string partition keys."""
@@ -251,8 +251,8 @@ class TestExtendQueryWithPartitionKeys:
         partition_keys = {1, 2}
         result = extend_query_with_partition_keys(query, partition_keys, "region_id", method="TMP_TABLE_JOIN", p0_alias="u")
 
-        assert "CREATE TEMPORARY TABLE tmp_partition_keys" in result
-        assert "INSERT INTO tmp_partition_keys" in result
+        assert "CREATE TEMPORARY TABLE tmp_cache_keys_" in result
+        assert "INSERT INTO tmp_cache_keys_" in result
         # Should contain join logic somewhere
         assert "tmp_" in result
 
@@ -262,7 +262,7 @@ class TestExtendQueryWithPartitionKeys:
         partition_keys = {1, 2}
         result = extend_query_with_partition_keys(query, partition_keys, "region_id", method="TMP_TABLE_IN", p0_alias="u", analyze_tmp_table=False)
 
-        assert "ANALYZE tmp_partition_keys" not in result
+        assert "ANALYZE" not in result
         assert "CREATE INDEX" not in result
 
     def test_analyze_tmp_table_true(self):
@@ -271,7 +271,7 @@ class TestExtendQueryWithPartitionKeys:
         partition_keys = {1, 2}
         result = extend_query_with_partition_keys(query, partition_keys, "region_id", method="TMP_TABLE_IN", p0_alias="u", analyze_tmp_table=True)
 
-        assert "ANALYZE tmp_partition_keys" in result
+        assert "ANALYZE tmp_cache_keys_" in result
         assert "CREATE INDEX" in result
 
     def test_float_partition_keys(self):
@@ -359,7 +359,7 @@ class TestExtendQueryWithPartitionKeys:
         result = extend_query_with_partition_keys(query, partition_keys, "region_id", method="TMP_TABLE_JOIN")
 
         # When p0_alias is None for TMP_TABLE_JOIN, it should join on all tables
-        assert "CREATE TEMPORARY TABLE tmp_partition_keys" in result
+        assert "CREATE TEMPORARY TABLE tmp_cache_keys_" in result
 
     def test_tmp_table_in_no_existing_where(self):
         """Test TMP_TABLE_IN method when query has no WHERE clause."""
@@ -367,8 +367,8 @@ class TestExtendQueryWithPartitionKeys:
         partition_keys = {1, 2}
         result = extend_query_with_partition_keys(query, partition_keys, "region_id", method="TMP_TABLE_IN", p0_alias="u")
 
-        assert "WHERE u.region_id IN (SELECT partition_key FROM tmp_partition_keys)" in result
-        assert "CREATE TEMPORARY TABLE tmp_partition_keys" in result
+        assert "u.region_id IN (SELECT partition_key FROM tmp_cache_keys_" in result
+        assert "CREATE TEMPORARY TABLE tmp_cache_keys_" in result
 
     def test_values_method_with_existing_where(self):
         """Test VALUES method when query already has WHERE clause."""

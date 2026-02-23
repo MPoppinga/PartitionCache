@@ -339,19 +339,24 @@ def _add_where_condition(parsed_query: exp.Expression, condition_expr: exp.Expre
         existing_where.args["this"] = exp.and_(existing_where.args["this"], condition_expr)
 
 
-def _create_tmp_table_setup(partition_keys: set[int] | set[str] | set[float] | set[datetime], analyze_tmp_table: bool) -> str:
-    """Create the SQL for temporary table setup."""
+def _create_tmp_table_setup(partition_keys: set[int] | set[str] | set[float] | set[datetime], analyze_tmp_table: bool) -> tuple[str, str]:
+    """Create the SQL for temporary table setup.
+
+    Returns:
+        tuple[str, str]: (setup_sql, table_name) where table_name is a random temporary table name.
+    """
+    table_name = f"tmp_cache_keys_{random.randint(100000, 999999)}"
     partition_keys_str = "),(".join(_format_partition_key_for_sql(pk) for pk in partition_keys)
     partition_key_type = _get_partition_key_sql_type(partition_keys)
 
-    setup_sql = f"""CREATE TEMPORARY TABLE tmp_partition_keys (partition_key {partition_key_type} PRIMARY KEY);
-                    INSERT INTO tmp_partition_keys (partition_key) (VALUES({partition_keys_str}));
+    setup_sql = f"""CREATE TEMPORARY TABLE {table_name} (partition_key {partition_key_type} PRIMARY KEY);
+                    INSERT INTO {table_name} (partition_key) (VALUES({partition_keys_str}));
                     """
 
     if analyze_tmp_table:
-        setup_sql += "CREATE INDEX tmp_partition_keys_idx ON tmp_partition_keys USING HASH(partition_key);ANALYZE tmp_partition_keys;"
+        setup_sql += f"CREATE INDEX {table_name}_idx ON {table_name} USING HASH(partition_key);ANALYZE {table_name};"
 
-    return setup_sql
+    return setup_sql, table_name
 
 
 def extend_query_with_partition_keys(
@@ -405,7 +410,7 @@ def extend_query_with_partition_keys(
         return parsed_query.sql()
 
     elif method == "TMP_TABLE_JOIN":
-        tmp_table_setup = _create_tmp_table_setup(partition_keys, analyze_tmp_table)
+        tmp_table_setup, table_name = _create_tmp_table_setup(partition_keys, analyze_tmp_table)
 
         # Add as inner join to all tables
         from_clauses: list[exp.Join | exp.From] = list(parsed_query.find_all(exp.Join))
@@ -427,7 +432,7 @@ def extend_query_with_partition_keys(
                 from_clause.this.sql()  # Original table
                 + " "  # Space between tables
                 + exp.Join(
-                    this=exp.Identifier(this=f"tmp_partition_keys AS tmp_{table_alias}"),
+                    this=exp.Identifier(this=f"{table_name} AS tmp_{table_alias}"),
                     on=exp.EQ(
                         this=exp.Identifier(this=f"tmp_{table_alias}.partition_key"),
                         expression=exp.Identifier(this=f"{table_alias}.{partition_key}"),
@@ -442,8 +447,8 @@ def extend_query_with_partition_keys(
         return tmp_table_setup + parsed_query.sql()
 
     elif method == "TMP_TABLE_IN":
-        tmp_table_setup = _create_tmp_table_setup(partition_keys, analyze_tmp_table)
-        partition_expr = sqlglot.parse_one(f"{p0_alias}.{partition_key} IN (SELECT partition_key FROM tmp_partition_keys)")
+        tmp_table_setup, table_name = _create_tmp_table_setup(partition_keys, analyze_tmp_table)
+        partition_expr = sqlglot.parse_one(f"{p0_alias}.{partition_key} IN (SELECT partition_key FROM {table_name})")
         _add_where_condition(parsed_query, partition_expr)
         return tmp_table_setup + parsed_query.sql()
 
@@ -682,6 +687,7 @@ def apply_cache_lazy(
     add_constraints: dict[str, str] | None = None,
     remove_constraints_all: list[str] | None = None,
     remove_constraints_add: list[str] | None = None,
+    skip_partition_key_joins: bool = False,
     geometry_column: str | None = None,
     buffer_distance: float | None = None,
     **kwargs: Any,
@@ -807,6 +813,7 @@ def apply_cache_lazy(
         add_constraints=add_constraints,
         remove_constraints_all=remove_constraints_all,
         remove_constraints_add=remove_constraints_add,
+        skip_partition_key_joins=skip_partition_key_joins,
     )
 
     # Step 2: Optionally rewrite with p0 table
@@ -859,6 +866,7 @@ def apply_cache(
     p0_alias: str | None = None,
     min_component_size: int = 2,
     canonicalize_queries: bool = False,
+    follow_graph: bool = True,
     analyze_tmp_table: bool = True,
     use_p0_table: bool = False,
     p0_table_name: str | None = None,
@@ -868,6 +876,7 @@ def apply_cache(
     add_constraints: dict[str, str] | None = None,
     remove_constraints_all: list[str] | None = None,
     remove_constraints_add: list[str] | None = None,
+    skip_partition_key_joins: bool = False,
     geometry_column: str | None = None,
     buffer_distance: float | None = None,
     **kwargs: Any,
@@ -894,6 +903,7 @@ def apply_cache(
             Ignored when use_p0_table=True (cache targets p0 table automatically).
         min_component_size (int): Minimum size of query components to consider for cache lookup.
         canonicalize_queries (bool): Whether to canonicalize queries before hashing.
+        follow_graph (bool): Whether to follow the query graph for generating variants.
         analyze_tmp_table (bool): Whether to create index and analyze for temporary table methods.
         use_p0_table (bool): Whether to rewrite the query to use a p0 table for optimizer hints.
         p0_table_name (str | None): Name of the p0 table. Defaults to {partition_key}_mv.
@@ -903,6 +913,7 @@ def apply_cache(
         add_constraints: Dict mapping table names to constraints to add (e.g., {"table": "col = val"})
         remove_constraints_all: List of attribute names to remove from all query variants
         remove_constraints_add: List of attribute names to remove, creating additional variants
+        skip_partition_key_joins (bool): If True, skip partition key joins in fragment generation.
         geometry_column: If set, enables spatial cache mode. Uses this geometry column for fragment
             SELECT clauses and spatial filter application. Requires a spatial cache handler with
             get_spatial_filter() method.
@@ -1024,12 +1035,14 @@ def apply_cache(
         partition_key=partition_key,
         min_component_size=min_component_size,
         canonicalize_queries=canonicalize_queries,
+        follow_graph=follow_graph,
         auto_detect_partition_join=auto_detect_partition_join,
         partition_join_table=partition_join_table,
         bucket_steps=bucket_steps,
         add_constraints=add_constraints,
         remove_constraints_all=remove_constraints_all,
         remove_constraints_add=remove_constraints_add,
+        skip_partition_key_joins=skip_partition_key_joins,
     )
 
     # Step 2: Optionally rewrite original query with p0 table
