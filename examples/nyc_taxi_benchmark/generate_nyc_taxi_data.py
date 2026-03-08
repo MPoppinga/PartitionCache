@@ -10,7 +10,7 @@ DOLocationID). Only 2009-2010 Parquet files on the CDN retain GPS coordinates.
 
 Tables:
     - taxi_trips (fact table): ~14M rows per month
-    - osm_pois (dimension): ~20K-50K NYC POIs
+    - osm_pois (dimension): ~50K-100K NYC POIs
 
 Usage:
     python generate_nyc_taxi_data.py --months 1 --year 2010 --month 1
@@ -42,18 +42,31 @@ NYC_LON_MAX = -73.700
 OVERPASS_API_URL = "https://overpass-api.de/api/interpreter"
 
 # OSM POI type definitions: (osm_tag_key, osm_tag_value, query_type, poi_type, poi_category)
-# query_type: "node" for standard node queries, "nwr" for node/way/relation (parks need centroids)
+# query_type: "nwr" for node/way/relation queries (uses "out center" for way/relation centroids)
 OSM_POI_TYPES = [
-    ("amenity", "restaurant", "node", "restaurant", "food"),
-    ("amenity", "hospital", "node", "hospital", "medical"),
-    ("tourism", "hotel", "node", "hotel", "accommodation"),
-    ("tourism", "museum", "node", "museum", "attraction"),
-    ("tourism", "attraction", "node", "attraction", "attraction"),
-    ("railway", "station", "node", "station", "transport"),
-    ("amenity", "bar", "node", "bar", "nightlife"),
+    ("amenity", "restaurant", "nwr", "restaurant", "food"),
+    ("amenity", "hospital", "nwr", "hospital", "medical"),
+    ("tourism", "hotel", "nwr", "hotel", "accommodation"),
+    ("tourism", "museum", "nwr", "museum", "attraction"),
+    ("tourism", "attraction", "nwr", "attraction", "attraction"),
+    ("railway", "station", "nwr", "station", "transport"),
+    ("amenity", "bar", "nwr", "bar", "nightlife"),
     ("leisure", "park", "nwr", "park", "recreation"),
-    ("amenity", "theatre", "node", "theatre", "culture"),
-    ("amenity", "university", "node", "university", "education"),
+    ("amenity", "theatre", "nwr", "theatre", "culture"),
+    ("amenity", "university", "nwr", "university", "education"),
+    # Additional POI types for better coverage
+    ("amenity", "cafe", "nwr", "cafe", "food"),
+    ("amenity", "fast_food", "nwr", "fast_food", "food"),
+    ("amenity", "pharmacy", "nwr", "pharmacy", "medical"),
+    ("amenity", "clinic", "nwr", "clinic", "medical"),
+    ("amenity", "school", "nwr", "school", "education"),
+    ("amenity", "library", "nwr", "library", "culture"),
+    ("amenity", "cinema", "nwr", "cinema", "culture"),
+    ("amenity", "nightclub", "nwr", "nightclub", "nightlife"),
+    ("shop", "supermarket", "nwr", "supermarket", "shopping"),
+    ("amenity", "place_of_worship", "nwr", "place_of_worship", "religion"),
+    ("amenity", "police", "nwr", "police", "services"),
+    ("amenity", "fire_station", "nwr", "fire_station", "services"),
 ]
 
 # Column name mappings for different TLC Parquet schemas.

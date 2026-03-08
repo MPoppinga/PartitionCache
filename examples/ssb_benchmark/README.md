@@ -8,37 +8,39 @@ The key features demonstrated are **multiple partition keys per query**, **cross
 
 ```bash
 # 1. Generate data (SF=0.01 ~ 60K lineorder rows)
-python generate_ssb_data.py --scale-factor 0.01 --db-backend duckdb
+python examples/ssb_benchmark/generate_ssb_data.py --scale-factor 0.01 --db-backend duckdb
 
-# 2. Run benchmark
-python run_ssb_benchmark.py --scale-factor 0.01 --db-backend duckdb --mode all
+# 2. Run benchmark (unified runner)
+python examples/benchmark/run_benchmark.py --config config/ssb.yaml --db-backend duckdb --mode all
 
 # 3. Cross-dimension reuse evaluation
-python run_ssb_benchmark.py --scale-factor 0.01 --db-backend duckdb --mode cross-dimension
+python examples/benchmark/run_benchmark.py --config config/ssb.yaml --db-backend duckdb --mode cross-dimension
 
 # 4. Hierarchical drill-down evaluation
-python run_ssb_benchmark.py --scale-factor 0.01 --db-backend duckdb --mode hierarchy
+python examples/benchmark/run_benchmark.py --config config/ssb.yaml --db-backend duckdb --mode hierarchy
 
 # 5. Repeated timing for stable measurements
-python run_ssb_benchmark.py --scale-factor 0.01 --db-backend duckdb --mode all --repeat 3
+python examples/benchmark/run_benchmark.py --config config/ssb.yaml --db-backend duckdb --mode all --repeat 3
 ```
 
 ## Quick Start (PostgreSQL)
 
 ```bash
 # 1. Copy and edit environment config
-cp .env.example .env
+cp examples/ssb_benchmark/.env.example examples/ssb_benchmark/.env
 # Edit .env with your PostgreSQL credentials
 
 # 2. Generate data
-python generate_ssb_data.py --scale-factor 0.01 --db-backend postgresql
+python examples/ssb_benchmark/generate_ssb_data.py --scale-factor 0.01 --db-backend postgresql
 
 # 3. Run benchmark
-python run_ssb_benchmark.py --scale-factor 0.01 --db-backend postgresql --mode all
+python examples/benchmark/run_benchmark.py --config config/ssb.yaml --db-backend postgresql --mode all
 
 # 4. Compare cache backends
-python run_ssb_benchmark.py --scale-factor 0.01 --db-backend postgresql --mode backend-comparison
+python examples/benchmark/run_benchmark.py --config config/ssb.yaml --db-backend postgresql --mode backend-comparison
 ```
+
+> **Note:** The benchmark runner has moved to `examples/benchmark/run_benchmark.py`. See [examples/benchmark/README.md](../benchmark/README.md) for full documentation.
 
 ## Data Generation
 
@@ -280,7 +282,6 @@ The SELECT column is irrelevant when `strip_select=True` - it gets replaced with
 ```
 examples/ssb_benchmark/
   generate_ssb_data.py         # Data generator (DuckDB + PostgreSQL)
-  run_ssb_benchmark.py         # Benchmark evaluation script
   .env.example                 # PostgreSQL config template
   README.md                    # This file
   queries/
@@ -293,6 +294,10 @@ examples/ssb_benchmark/
       q6_1.sql ... q6_3.sql    # Flight 6: part hierarchy drill-down (3 queries)
       q7_1.sql ... q7_3.sql    # Flight 7: single partition key (3 queries)
       q8_1.sql ... q8_3.sql    # Flight 8: multi-PK combinations (3 queries)
-    adapted/                   # 25 PC-adapted query templates
+    adapted/                   # 25 PC-adapted query templates (legacy)
       q1_1.sql ... q8_3.sql    # Same structure as original/
+
+examples/benchmark/
+  run_benchmark.py             # Unified benchmark runner
+  config/ssb.yaml              # SSB benchmark configuration
 ```

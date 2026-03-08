@@ -1,0 +1,110 @@
+name: "NYC Taxi Benchmark"
+fact_table: "taxi_trips"
+p0_alias: "t"
+
+env_file: "examples/nyc_taxi_benchmark/.env"
+query_dir: "examples/nyc_taxi_benchmark/queries"
+
+data_setup:
+  script: "examples/nyc_taxi_benchmark/generate_nyc_taxi_data.py"
+  docker_compose: "examples/nyc_taxi_benchmark/docker-compose.yml"
+  example_command: "python examples/nyc_taxi_benchmark/generate_nyc_taxi_data.py"
+  required_tables: ["taxi_trips", "osm_pois"]
+
+executors:
+  duckdb:
+    enabled: false
+  postgresql:
+    enabled: true
+
+partition_keys:
+  trip_id: { datatype: integer }
+
+query_partition_keys:
+  q1_1: [trip_id]
+  q1_2: [trip_id]
+  q1_3: [trip_id]
+  q2_1: [trip_id]
+  q2_2: [trip_id]
+  q2_3: [trip_id]
+  q3_1: [trip_id]
+  q3_2: [trip_id]
+  q3_3: [trip_id]
+  q4_1: [trip_id]
+  q4_2: [trip_id]
+  q4_3: [trip_id]
+  q5_1: [trip_id]
+  q5_2: [trip_id]
+  q5_3: [trip_id]
+  q6_1: [trip_id]
+  q6_2: [trip_id]
+  q6_3: [trip_id]
+  q7_1: [trip_id]
+  q7_2: [trip_id]
+  q7_3: [trip_id]
+  q7_4: [trip_id]
+  q8_1: [trip_id]
+  q8_2: [trip_id]
+  q8_3: [trip_id]
+  q9_1: [trip_id]
+  q9_2: [trip_id]
+  q9_3: [trip_id]
+  q10_1: [trip_id]
+  q10_2: [trip_id]
+  q10_3: [trip_id]
+
+query_flights:
+  1: [q1_1, q1_2, q1_3]
+  2: [q2_1, q2_2, q2_3]
+  3: [q3_1, q3_2, q3_3]
+  4: [q4_1, q4_2, q4_3]
+  5: [q5_1, q5_2, q5_3]
+  6: [q6_1, q6_2, q6_3]
+  7: [q7_1, q7_2, q7_3, q7_4]
+  8: [q8_1, q8_2, q8_3]
+  9: [q9_1, q9_2, q9_3]
+  10: [q10_1, q10_2, q10_3]
+
+hierarchy_labels:
+  q5_1: "Park (broadest, ~4-8%)"
+  q5_2: "Museum (mid, ~3-6%)"
+  q5_3: "Theatre (narrowest, ~1-3%)"
+  q6_1: "Anomaly (broadest)"
+  q6_2: "Anomaly + Far (mid)"
+  q6_3: "Anomaly + Far + Long (narrowest)"
+
+spatial_queries: [q1_1, q2_1, q3_1, q3_3, q5_1, q5_2, q5_3, q7_2]
+
+query_processing:
+  keep_all_attributes: false
+  follow_graph: false
+  strip_select: true
+  auto_detect_partition_join: false
+  skip_partition_key_joins: true
+
+fragment_filter:
+  require_in_from: [taxi_trips]
+  exclude_from_from: [osm_pois]
+
+cache:
+  table_prefix: "nyc_taxi_cache"
+  bitsize_strategy: data_driven
+
+backends:
+  postgresql: [postgresql_array, postgresql_bit, postgresql_roaringbit]
+
+fact_stats:
+  strategy: count_with_max
+  table: "taxi_trips"
+  count_column: "*"
+  max_column: "trip_id"
+
+modes:
+  cross_dimension:
+    phase1_flights: [1, 2, 3, 4]
+    phase2_flights: [7]
+  hierarchy:
+    flights: [5, 6]
+  cold_warm:
+    flight: 7
+  representative_queries: [q1_1, q3_1, q5_1]

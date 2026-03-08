@@ -10,36 +10,38 @@ This example demonstrates PartitionCache on **real-world NYC taxi data with spat
 
 ```bash
 # 1. Start PostgreSQL with PostGIS
-docker compose up -d
+docker compose -f examples/nyc_taxi_benchmark/docker-compose.yml up -d
 
 # 2. Copy and edit environment config
-cp .env.example .env
+cp examples/nyc_taxi_benchmark/.env.example examples/nyc_taxi_benchmark/.env
 # Edit .env with your PostgreSQL credentials (defaults match docker-compose.yml)
 
 # 3. Generate data (1 month ~ 14M trips)
-python generate_nyc_taxi_data.py --months 1 --year 2010 --month 1
+python examples/nyc_taxi_benchmark/generate_nyc_taxi_data.py --months 1 --year 2010 --month 1
 
-# 4. Run full benchmark
-python run_nyc_taxi_benchmark.py --mode all --output results.json
+# 4. Run full benchmark (unified runner)
+python examples/benchmark/run_benchmark.py --config config/nyc_taxi.yaml --mode all --output results.json
 
 # 5. Compare query extension methods
-python run_nyc_taxi_benchmark.py --mode method-comparison
+python examples/benchmark/run_benchmark.py --config config/nyc_taxi.yaml --mode method-comparison
 
 # 6. Cross-dimension reuse evaluation
-python run_nyc_taxi_benchmark.py --mode cross-dimension
+python examples/benchmark/run_benchmark.py --config config/nyc_taxi.yaml --mode cross-dimension
 
 # 7. Hierarchical drill-down evaluation
-python run_nyc_taxi_benchmark.py --mode hierarchy
+python examples/benchmark/run_benchmark.py --config config/nyc_taxi.yaml --mode hierarchy
 
 # 8. Compare non-lazy vs lazy API with all methods
-python run_nyc_taxi_benchmark.py --mode api-comparison
+python examples/benchmark/run_benchmark.py --config config/nyc_taxi.yaml --mode api-comparison
 
 # 9. Backend comparison with both API paths
-python run_nyc_taxi_benchmark.py --mode backend-comparison --api both
+python examples/benchmark/run_benchmark.py --config config/nyc_taxi.yaml --mode backend-comparison --api both
 
 # 10. Run with lazy API (database-side intersection)
-python run_nyc_taxi_benchmark.py --mode all --api lazy --method IN_SUBQUERY
+python examples/benchmark/run_benchmark.py --config config/nyc_taxi.yaml --mode all --api lazy --method IN_SUBQUERY
 ```
+
+> **Note:** The benchmark runner has moved to `examples/benchmark/run_benchmark.py`. See [examples/benchmark/README.md](../benchmark/README.md) for full documentation.
 
 ## Prerequisites
 
@@ -369,12 +371,15 @@ The `IN` method consistently outperforms temp table approaches for this workload
 examples/nyc_taxi_benchmark/
   docker-compose.yml              # PostgreSQL + PostGIS container
   generate_nyc_taxi_data.py       # Download taxi Parquet + OSM POIs -> PostgreSQL
-  run_nyc_taxi_benchmark.py       # Benchmark runner
   .env.example                    # PostgreSQL + cache backend config
   README.md                       # This file
   queries/
     original/                     # 25 analytical queries (EXISTS, GROUP BY, ORDER BY)
       q1_1.sql .. q8_3.sql
-    adapted/                      # 25 PartitionCache-ready queries (IN-subqueries)
+    adapted/                      # 25 PartitionCache-ready queries (IN-subqueries, legacy)
       q1_1.sql .. q8_3.sql
+
+examples/benchmark/
+  run_benchmark.py                # Unified benchmark runner
+  config/nyc_taxi.yaml            # NYC Taxi benchmark configuration
 ```
