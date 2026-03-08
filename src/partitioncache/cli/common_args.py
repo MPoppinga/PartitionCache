@@ -422,7 +422,7 @@ def resolve_cache_backend(args: argparse.Namespace) -> str:
 
     if not cache_backend:
         print("Error: No cache backend specified. Use --cache-backend or set CACHE_BACKEND environment variable")
-        print("Available backends: postgresql_array, postgresql_bit, postgresql_roaringbit, redis_set, redis_bit, rocksdb_set, rocksdb_bit, rocksdict, postgis_h3, postgis_bbox")
+        print("Available backends: postgresql_array, postgresql_bit, postgresql_roaringbit, redis_set, redis_bit, rocksdb_set, rocksdb_bit, rocksdict, postgis_bbox, rocksdict_h3_grouped")
         sys.exit(1)
 
     return cache_backend

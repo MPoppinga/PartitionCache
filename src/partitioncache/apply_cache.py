@@ -326,7 +326,13 @@ def _get_partition_key_sql_type(partition_keys: set[int] | set[str] | set[float]
     if not partition_keys:
         return "TEXT"
     sample_key = next(iter(partition_keys))
-    return "INT" if isinstance(sample_key, int) else "TEXT"
+    if isinstance(sample_key, int):
+        # Use BIGINT if any value exceeds 32-bit integer range (e.g. H3 cell IDs)
+        max_int32 = 2**31 - 1
+        if any(abs(k) > max_int32 for k in partition_keys if isinstance(k, int)):  # type: ignore[arg-type]
+            return "BIGINT"
+        return "INT"
+    return "TEXT"
 
 
 def _add_where_condition(parsed_query: exp.Expression, condition_expr: exp.Expression) -> None:
@@ -354,7 +360,8 @@ def _create_tmp_table_setup(partition_keys: set[int] | set[str] | set[float] | s
                     """
 
     if analyze_tmp_table:
-        setup_sql += f"CREATE INDEX {table_name}_idx ON {table_name} USING HASH(partition_key);ANALYZE {table_name};"
+        # Use standard B-tree index (HASH indexes are PostgreSQL-specific and not supported by DuckDB)
+        setup_sql += f"CREATE INDEX {table_name}_idx ON {table_name} (partition_key);ANALYZE {table_name};"
 
     return setup_sql, table_name
 
@@ -562,23 +569,45 @@ def extend_query_with_spatial_filter_lazy(
     spatial_filter_sql: str,
     geometry_column: str,
     buffer_distance: float,
+    srid: int = 4326,
     p0_alias: str | None = None,
     auto_detect_partition_join: bool = True,
     partition_join_table: str | None = None,
+    use_intersects: bool = False,
+    spatial_method: Literal["SUBDIVIDE_INLINE", "SUBDIVIDE_TMP_TABLE"] = "SUBDIVIDE_TMP_TABLE",
+    subdivide_max_vertices: int = 256,
 ) -> str:
     """
-    Extend a SQL query with a spatial filter using ST_DWithin on geography.
+    Extend a SQL query with a spatial filter using ST_DWithin or ST_Intersects.
 
-    Adds a WHERE condition: ST_DWithin(ST_Transform({alias}.{geometry_column}, 4326)::geography, ST_Transform(({spatial_filter_sql})::geometry, 4326)::geography, {buffer_distance})
+    Uses ST_Subdivide to break the filter geometry into smaller pieces with tight
+    bounding boxes, enabling efficient GiST index usage.
+
+    When ``use_intersects=False`` (default), uses ST_DWithin with buffer_distance:
+        For geographic SRIDs (4326): ST_DWithin(...::geography, ...::geography, {dist})
+        For metric SRIDs (e.g., 25832): ST_DWithin({alias}.{geom}, ({filter})::geometry, {dist})
+
+    When ``use_intersects=True``, uses ST_Intersects (no additional buffer). Use this
+    when the spatial filter geometry already includes the buffer distance (e.g., BBox handler).
+        For metric SRIDs: ST_Intersects({alias}.{geom}, ({filter})::geometry)
+        For geographic SRIDs (4326): ST_Intersects(...::geography, ...::geography)
 
     Args:
         query: The original SQL query.
         spatial_filter_sql: SQL subquery returning a geometry to filter against.
         geometry_column: The geometry column name in the target table.
-        buffer_distance: Buffer distance in meters (uses geography cast).
+        buffer_distance: Buffer distance in meters. Ignored when use_intersects=True.
+        srid: SRID of the spatial data. If 4326, uses geography cast. Otherwise uses geometry directly.
         p0_alias: Table alias to apply the filter to. If None, auto-detected.
         auto_detect_partition_join: Whether to auto-detect partition-join tables for alias detection.
         partition_join_table: Explicitly specified partition-join table alias or name.
+        use_intersects: If True, use ST_Intersects instead of ST_DWithin. Use when the
+            spatial filter geometry already includes the buffer distance.
+        spatial_method: Method for applying the spatial filter:
+            - "SUBDIVIDE_TMP_TABLE": Create a temp table with ST_Subdivide + GiST index (default, optimal).
+            - "SUBDIVIDE_INLINE": Inline ST_Subdivide in an EXISTS subquery (simpler, no temp table).
+        subdivide_max_vertices: Maximum vertices per subdivided piece (default 256). Lower values
+            create more, smaller pieces with tighter bounding boxes for better GiST selectivity.
 
     Returns:
         The extended SQL query with spatial filter.
@@ -594,18 +623,85 @@ def extend_query_with_spatial_filter_lazy(
             raise ValueError("No table found in query")
         p0_alias = first_table.alias_or_name
 
-    # Build ST_DWithin condition with geography cast for meter-based distance
-    # Transform both sides to WGS84 (SRID 4326) before geography cast,
-    # since ::geography only supports lon/lat coordinate systems
-    spatial_condition = (
-        f"ST_DWithin(ST_Transform({p0_alias}.{geometry_column}, 4326)::geography, "
-        f"ST_Transform(({spatial_filter_sql})::geometry, 4326)::geography, {buffer_distance})"
-    )
+    geom_expr = f"({spatial_filter_sql})::geometry"
 
-    parsed_query = sqlglot.parse_one(query)
-    spatial_expr = sqlglot.parse_one(spatial_condition)
-    _add_where_condition(parsed_query, spatial_expr)
-    return parsed_query.sql()
+    if spatial_method == "SUBDIVIDE_TMP_TABLE":
+        sf_table = f"_pcache_sf_{random.randint(100000, 999999)}"
+
+        if srid == 4326:
+            dump_expr = f"ST_Transform({geom_expr}, 4326)"
+        else:
+            dump_expr = geom_expr
+
+        prep_sql = (
+            f"DROP TABLE IF EXISTS {sf_table}; "
+            f"CREATE TEMPORARY TABLE {sf_table} AS "
+            f"SELECT ST_Subdivide((ST_Dump({dump_expr})).geom, {subdivide_max_vertices}) AS geom; "
+            f"CREATE INDEX ON {sf_table} USING GIST (geom); "
+            f"ANALYZE {sf_table}; "
+        )
+
+        if use_intersects:
+            if srid == 4326:
+                spatial_condition = (
+                    f"EXISTS (SELECT 1 FROM {sf_table} sf "
+                    f"WHERE ST_Intersects(ST_Transform({p0_alias}.{geometry_column}, 4326)::geography, sf.geom::geography))"
+                )
+            else:
+                spatial_condition = (
+                    f"EXISTS (SELECT 1 FROM {sf_table} sf "
+                    f"WHERE ST_Intersects({p0_alias}.{geometry_column}, sf.geom))"
+                )
+        elif srid == 4326:
+            spatial_condition = (
+                f"EXISTS (SELECT 1 FROM {sf_table} sf "
+                f"WHERE ST_DWithin(ST_Transform({p0_alias}.{geometry_column}, 4326)::geography, sf.geom::geography, {buffer_distance}))"
+            )
+        else:
+            spatial_condition = (
+                f"EXISTS (SELECT 1 FROM {sf_table} sf "
+                f"WHERE ST_DWithin({p0_alias}.{geometry_column}, sf.geom, {buffer_distance}))"
+            )
+
+        parsed_query = sqlglot.parse_one(query)
+        spatial_expr = sqlglot.parse_one(spatial_condition)
+        _add_where_condition(parsed_query, spatial_expr)
+        return prep_sql + parsed_query.sql()
+
+    else:  # SUBDIVIDE_INLINE
+        # Use ST_Subdivide directly (handles multi-geometries internally).
+        # Cannot chain ST_Dump + ST_Subdivide as nested SRFs in FROM clause.
+        if srid == 4326:
+            subdivide_expr = f"ST_Subdivide(ST_Transform({geom_expr}, 4326), {subdivide_max_vertices})"
+        else:
+            subdivide_expr = f"ST_Subdivide({geom_expr}, {subdivide_max_vertices})"
+
+        if use_intersects:
+            if srid == 4326:
+                spatial_condition = (
+                    f"EXISTS (SELECT 1 FROM {subdivide_expr} AS _pcache_sf "
+                    f"WHERE ST_Intersects(ST_Transform({p0_alias}.{geometry_column}, 4326)::geography, _pcache_sf::geography))"
+                )
+            else:
+                spatial_condition = (
+                    f"EXISTS (SELECT 1 FROM {subdivide_expr} AS _pcache_sf "
+                    f"WHERE ST_Intersects({p0_alias}.{geometry_column}, _pcache_sf))"
+                )
+        elif srid == 4326:
+            spatial_condition = (
+                f"EXISTS (SELECT 1 FROM {subdivide_expr} AS _pcache_sf "
+                f"WHERE ST_DWithin(ST_Transform({p0_alias}.{geometry_column}, 4326)::geography, _pcache_sf::geography, {buffer_distance}))"
+            )
+        else:
+            spatial_condition = (
+                f"EXISTS (SELECT 1 FROM {subdivide_expr} AS _pcache_sf "
+                f"WHERE ST_DWithin({p0_alias}.{geometry_column}, _pcache_sf, {buffer_distance}))"
+            )
+
+        parsed_query = sqlglot.parse_one(query)
+        spatial_expr = sqlglot.parse_one(spatial_condition)
+        _add_where_condition(parsed_query, spatial_expr)
+        return parsed_query.sql()
 
 
 def extend_query_with_spatial_filter(
@@ -617,6 +713,9 @@ def extend_query_with_spatial_filter(
     p0_alias: str | None = None,
     auto_detect_partition_join: bool = True,
     partition_join_table: str | None = None,
+    use_intersects: bool = False,
+    spatial_method: Literal["SUBDIVIDE_INLINE", "SUBDIVIDE_TMP_TABLE"] = "SUBDIVIDE_TMP_TABLE",
+    subdivide_max_vertices: int = 256,
 ) -> str:
     """
     Extend a SQL query with a pre-computed spatial filter geometry (WKB bytes).
@@ -624,22 +723,29 @@ def extend_query_with_spatial_filter(
     Non-lazy counterpart to extend_query_with_spatial_filter_lazy(). Instead of embedding
     a SQL subquery, this uses a WKB literal from a pre-executed spatial filter.
 
-    Adds a WHERE condition:
-        ST_DWithin(
-            ST_Transform({alias}.{geometry_column}, 4326)::geography,
-            ST_Transform(ST_GeomFromWKB('\\xhex', {srid})::geometry, 4326)::geography,
-            {buffer_distance}
-        )
+    Uses ST_Subdivide to break the filter geometry into smaller pieces with tight
+    bounding boxes, enabling efficient GiST index usage.
+
+    When ``use_intersects=False`` (default), uses ST_DWithin with buffer_distance.
+    When ``use_intersects=True``, uses ST_Intersects (no additional buffer). Use this
+    when the spatial filter geometry already includes the buffer distance.
 
     Args:
         query: The original SQL query.
         spatial_filter_wkb: Pre-computed spatial filter geometry as WKB bytes.
         geometry_column: The geometry column name in the target table.
-        buffer_distance: Buffer distance in meters (uses geography cast).
-        srid: SRID of the spatial filter geometry (default: 4326).
+        buffer_distance: Buffer distance in meters. Ignored when use_intersects=True.
+        srid: SRID of the spatial filter geometry (default: 4326). If 4326, uses geography cast.
         p0_alias: Table alias to apply the filter to. If None, auto-detected.
         auto_detect_partition_join: Whether to auto-detect partition-join tables for alias detection.
         partition_join_table: Explicitly specified partition-join table alias or name.
+        use_intersects: If True, use ST_Intersects instead of ST_DWithin. Use when the
+            spatial filter geometry already includes the buffer distance.
+        spatial_method: Method for applying the spatial filter:
+            - "SUBDIVIDE_TMP_TABLE": Create a temp table with ST_Subdivide + GiST index (default, optimal).
+            - "SUBDIVIDE_INLINE": Inline ST_Subdivide in an EXISTS subquery (simpler, no temp table).
+        subdivide_max_vertices: Maximum vertices per subdivided piece (default 256). Lower values
+            create more, smaller pieces with tighter bounding boxes for better GiST selectivity.
 
     Returns:
         The extended SQL query with spatial filter.
@@ -656,17 +762,206 @@ def extend_query_with_spatial_filter(
 
     # Convert WKB bytes to hex string for SQL embedding
     wkb_hex = spatial_filter_wkb.hex()
+    wkb_geom = f"ST_GeomFromWKB('\\x{wkb_hex}', {srid})"
 
-    # Build ST_DWithin condition with WKB literal
-    spatial_condition = (
-        f"ST_DWithin(ST_Transform({p0_alias}.{geometry_column}, 4326)::geography, "
-        f"ST_Transform(ST_GeomFromWKB('\\x{wkb_hex}', {srid})::geometry, 4326)::geography, {buffer_distance})"
+    if spatial_method == "SUBDIVIDE_TMP_TABLE":
+        sf_table = f"_pcache_sf_{random.randint(100000, 999999)}"
+
+        if srid == 4326:
+            dump_expr = f"ST_Transform({wkb_geom}::geometry, 4326)"
+        else:
+            dump_expr = f"{wkb_geom}::geometry"
+
+        prep_sql = (
+            f"DROP TABLE IF EXISTS {sf_table}; "
+            f"CREATE TEMPORARY TABLE {sf_table} AS "
+            f"SELECT ST_Subdivide((ST_Dump({dump_expr})).geom, {subdivide_max_vertices}) AS geom; "
+            f"CREATE INDEX ON {sf_table} USING GIST (geom); "
+            f"ANALYZE {sf_table}; "
+        )
+
+        if use_intersects:
+            if srid == 4326:
+                spatial_condition = (
+                    f"EXISTS (SELECT 1 FROM {sf_table} sf "
+                    f"WHERE ST_Intersects(ST_Transform({p0_alias}.{geometry_column}, 4326)::geography, sf.geom::geography))"
+                )
+            else:
+                spatial_condition = (
+                    f"EXISTS (SELECT 1 FROM {sf_table} sf "
+                    f"WHERE ST_Intersects({p0_alias}.{geometry_column}, sf.geom))"
+                )
+        elif srid == 4326:
+            spatial_condition = (
+                f"EXISTS (SELECT 1 FROM {sf_table} sf "
+                f"WHERE ST_DWithin(ST_Transform({p0_alias}.{geometry_column}, 4326)::geography, sf.geom::geography, {buffer_distance}))"
+            )
+        else:
+            spatial_condition = (
+                f"EXISTS (SELECT 1 FROM {sf_table} sf "
+                f"WHERE ST_DWithin({p0_alias}.{geometry_column}, sf.geom, {buffer_distance}))"
+            )
+
+        parsed_query = sqlglot.parse_one(query)
+        spatial_expr = sqlglot.parse_one(spatial_condition)
+        _add_where_condition(parsed_query, spatial_expr)
+        return prep_sql + parsed_query.sql()
+
+    else:  # SUBDIVIDE_INLINE
+        # Use ST_Subdivide directly (handles multi-geometries internally).
+        # Cannot chain ST_Dump + ST_Subdivide as nested SRFs in FROM clause.
+        if srid == 4326:
+            subdivide_expr = f"ST_Subdivide(ST_Transform({wkb_geom}::geometry, 4326), {subdivide_max_vertices})"
+        else:
+            subdivide_expr = f"ST_Subdivide({wkb_geom}::geometry, {subdivide_max_vertices})"
+
+        if use_intersects:
+            if srid == 4326:
+                spatial_condition = (
+                    f"EXISTS (SELECT 1 FROM {subdivide_expr} AS _pcache_sf "
+                    f"WHERE ST_Intersects(ST_Transform({p0_alias}.{geometry_column}, 4326)::geography, _pcache_sf::geography))"
+                )
+            else:
+                spatial_condition = (
+                    f"EXISTS (SELECT 1 FROM {subdivide_expr} AS _pcache_sf "
+                    f"WHERE ST_Intersects({p0_alias}.{geometry_column}, _pcache_sf))"
+                )
+        elif srid == 4326:
+            spatial_condition = (
+                f"EXISTS (SELECT 1 FROM {subdivide_expr} AS _pcache_sf "
+                f"WHERE ST_DWithin(ST_Transform({p0_alias}.{geometry_column}, 4326)::geography, _pcache_sf::geography, {buffer_distance}))"
+            )
+        else:
+            spatial_condition = (
+                f"EXISTS (SELECT 1 FROM {subdivide_expr} AS _pcache_sf "
+                f"WHERE ST_DWithin({p0_alias}.{geometry_column}, _pcache_sf, {buffer_distance}))"
+            )
+
+        parsed_query = sqlglot.parse_one(query)
+        spatial_expr = sqlglot.parse_one(spatial_condition)
+        _add_where_condition(parsed_query, spatial_expr)
+        return parsed_query.sql()
+
+
+def extend_query_with_h3_cell_filter_lazy(
+    query: str,
+    cell_sql: str,
+    geometry_column: str,
+    srid: int,
+    resolution: int,
+    p0_alias: str | None = None,
+) -> str:
+    """
+    Extend a SQL query with an H3 cell membership filter (lazy/SQL-based).
+
+    Instead of geometry reconstruction (ST_Intersects/ST_DWithin), uses pure H3 cell
+    lookup: h3_lat_lng_to_cell(centroid, resolution)::bigint IN (SELECT cell FROM tmp_table).
+
+    Creates a temp table from the cell SQL, indexes it, and adds a WHERE condition.
+
+    Args:
+        query: The original SQL query.
+        cell_sql: SQL query producing rows of (cell BIGINT) — the allowed H3 cells.
+        geometry_column: The geometry column name in the target table.
+        srid: SRID of the geometry data. If != 4326, ST_Transform is applied before h3_lat_lng_to_cell.
+        resolution: H3 resolution level (0-15).
+        p0_alias: Table alias to apply the filter to. If None, auto-detected.
+
+    Returns:
+        The extended SQL query with H3 cell membership filter.
+    """
+    if not cell_sql or not cell_sql.strip():
+        return query
+
+    if p0_alias is None:
+        parsed_query = sqlglot.parse_one(query)
+        first_table = parsed_query.find(exp.Table)
+        if first_table is None:
+            raise ValueError("No table found in query")
+        p0_alias = first_table.alias_or_name
+
+    tmp_table = f"_pcache_h3_cells_{random.randint(100000, 999999)}"
+
+    # Build centroid expression with SRID handling
+    if srid != 4326:
+        centroid_expr = f"ST_Transform(ST_Centroid({p0_alias}.{geometry_column}), 4326)::point"
+    else:
+        centroid_expr = f"ST_Centroid({p0_alias}.{geometry_column})::point"
+
+    prep_sql = (
+        f"DROP TABLE IF EXISTS {tmp_table}; "
+        f"CREATE TEMPORARY TABLE {tmp_table} AS {cell_sql}; "
+        f"CREATE INDEX ON {tmp_table} USING btree (cell); "
+        f"ANALYZE {tmp_table}; "
     )
+
+    spatial_condition = f"h3_lat_lng_to_cell({centroid_expr}, {resolution})::bigint IN (SELECT cell FROM {tmp_table})"
 
     parsed_query = sqlglot.parse_one(query)
     spatial_expr = sqlglot.parse_one(spatial_condition)
     _add_where_condition(parsed_query, spatial_expr)
-    return parsed_query.sql()
+    return prep_sql + parsed_query.sql()
+
+
+def extend_query_with_h3_cell_filter(
+    query: str,
+    cell_ids: set[int],
+    geometry_column: str,
+    srid: int,
+    resolution: int,
+    p0_alias: str | None = None,
+) -> str:
+    """
+    Extend a SQL query with an H3 cell membership filter (non-lazy/pre-computed).
+
+    Same as extend_query_with_h3_cell_filter_lazy but uses pre-computed cell IDs
+    instead of a SQL subquery. Creates a temp table from VALUES clause.
+
+    Args:
+        query: The original SQL query.
+        cell_ids: Set of H3 cell IDs (as bigint) to filter against.
+        geometry_column: The geometry column name in the target table.
+        srid: SRID of the geometry data. If != 4326, ST_Transform is applied before h3_lat_lng_to_cell.
+        resolution: H3 resolution level (0-15).
+        p0_alias: Table alias to apply the filter to. If None, auto-detected.
+
+    Returns:
+        The extended SQL query with H3 cell membership filter.
+    """
+    if not cell_ids:
+        return query
+
+    if p0_alias is None:
+        parsed_query = sqlglot.parse_one(query)
+        first_table = parsed_query.find(exp.Table)
+        if first_table is None:
+            raise ValueError("No table found in query")
+        p0_alias = first_table.alias_or_name
+
+    tmp_table = f"_pcache_h3_cells_{random.randint(100000, 999999)}"
+
+    # Build centroid expression with SRID handling
+    if srid != 4326:
+        centroid_expr = f"ST_Transform(ST_Centroid({p0_alias}.{geometry_column}), 4326)::point"
+    else:
+        centroid_expr = f"ST_Centroid({p0_alias}.{geometry_column})::point"
+
+    # Build VALUES clause for cell IDs
+    values_list = ", ".join(f"({cell_id}::bigint)" for cell_id in sorted(cell_ids))
+
+    prep_sql = (
+        f"DROP TABLE IF EXISTS {tmp_table}; "
+        f"CREATE TEMPORARY TABLE {tmp_table} AS SELECT cell FROM (VALUES {values_list}) AS v(cell); "
+        f"CREATE INDEX ON {tmp_table} USING btree (cell); "
+        f"ANALYZE {tmp_table}; "
+    )
+
+    spatial_condition = f"h3_lat_lng_to_cell({centroid_expr}, {resolution})::bigint IN (SELECT cell FROM {tmp_table})"
+
+    parsed_query = sqlglot.parse_one(query)
+    spatial_expr = sqlglot.parse_one(spatial_condition)
+    _add_where_condition(parsed_query, spatial_expr)
+    return prep_sql + parsed_query.sql()
 
 
 def apply_cache_lazy(
@@ -690,6 +985,8 @@ def apply_cache_lazy(
     skip_partition_key_joins: bool = False,
     geometry_column: str | None = None,
     buffer_distance: float | None = None,
+    spatial_method: Literal["SUBDIVIDE_INLINE", "SUBDIVIDE_TMP_TABLE"] = "SUBDIVIDE_TMP_TABLE",
+    subdivide_max_vertices: int = 256,
     **kwargs: Any,
 ) -> tuple[str, dict[str, int]]:
     """
@@ -720,6 +1017,9 @@ def apply_cache_lazy(
         buffer_distance: Buffer distance in meters for spatial filter. If None and geometry_column
             is set, auto-derived from distance constraints in the query (graph diameter).
             Required when geometry_column is set and query has no distance constraints.
+        spatial_method: Method for applying the spatial filter:
+            - "SUBDIVIDE_TMP_TABLE": Create a temp table with ST_Subdivide + GiST index (default, optimal).
+            - "SUBDIVIDE_INLINE": Inline ST_Subdivide in an EXISTS subquery (simpler, no temp table).
 
     Returns:
         tuple[str, dict[str, int]]: Enhanced query and statistics.
@@ -785,15 +1085,34 @@ def apply_cache_lazy(
         if not spatial_filter_sql:
             return query, stats
 
-        enhanced_query = extend_query_with_spatial_filter_lazy(
-            query=query,
-            spatial_filter_sql=spatial_filter_sql,
-            geometry_column=geometry_column,
-            buffer_distance=buffer_distance,
-            p0_alias=p0_alias,
-            auto_detect_partition_join=auto_detect_partition_join,
-            partition_join_table=partition_join_table,
-        )
+        srid = getattr(cache_handler, "srid", 4326)
+        spatial_filter_type = getattr(cache_handler, "spatial_filter_type", "geometry")
+
+        if spatial_filter_type == "h3_cell":
+            resolution = getattr(cache_handler, "resolution", 9)
+            enhanced_query = extend_query_with_h3_cell_filter_lazy(
+                query=query,
+                cell_sql=spatial_filter_sql,
+                geometry_column=geometry_column,
+                srid=srid,
+                resolution=resolution,
+                p0_alias=p0_alias,
+            )
+        else:
+            use_intersects = getattr(cache_handler, "spatial_filter_includes_buffer", False)
+            enhanced_query = extend_query_with_spatial_filter_lazy(
+                query=query,
+                spatial_filter_sql=spatial_filter_sql,
+                geometry_column=geometry_column,
+                buffer_distance=buffer_distance,
+                srid=srid,
+                p0_alias=p0_alias,
+                auto_detect_partition_join=auto_detect_partition_join,
+                partition_join_table=partition_join_table,
+                use_intersects=use_intersects,
+                spatial_method=spatial_method,
+                subdivide_max_vertices=subdivide_max_vertices,
+            )
 
         stats["enhanced"] = 1
         return enhanced_query, stats
@@ -879,6 +1198,8 @@ def apply_cache(
     skip_partition_key_joins: bool = False,
     geometry_column: str | None = None,
     buffer_distance: float | None = None,
+    spatial_method: Literal["SUBDIVIDE_INLINE", "SUBDIVIDE_TMP_TABLE"] = "SUBDIVIDE_TMP_TABLE",
+    subdivide_max_vertices: int = 256,
     **kwargs: Any,
 ) -> tuple[str, dict[str, int]]:
     """
@@ -920,6 +1241,9 @@ def apply_cache(
         buffer_distance: Buffer distance in meters for spatial filter. If None and geometry_column
             is set, auto-derived from distance constraints in the query (graph diameter).
             Required when geometry_column is set and query has no distance constraints.
+        spatial_method: Method for applying the spatial filter:
+            - "SUBDIVIDE_TMP_TABLE": Create a temp table with ST_Subdivide + GiST index (default, optimal).
+            - "SUBDIVIDE_INLINE": Inline ST_Subdivide in an EXISTS subquery (simpler, no temp table).
 
     Returns:
         tuple[str, dict[str, int]]: A tuple containing:
@@ -994,7 +1318,7 @@ def apply_cache(
         generated_variants = len(cache_entry_hashes)
         stats: dict[str, int] = {"generated_variants": generated_variants, "cache_hits": 0, "enhanced": 0, "p0_rewritten": 0}
 
-        # Step 2: Get pre-computed spatial filter geometry as WKB bytes + SRID
+        # Step 2: Get pre-computed spatial filter from cache handler
         spatial_result = cache_handler.get_spatial_filter(  # type: ignore[attr-defined]
             keys=set(cache_entry_hashes),
             partition_key=partition_key,
@@ -1005,23 +1329,42 @@ def apply_cache(
             logger.info(f"No spatial cache hits found for query. Generated {generated_variants} subqueries")
             return query, stats
 
-        spatial_filter_wkb, spatial_srid = spatial_result
-
         # Count cache hits (similar to lazy path logic)
         used_hashes = len(cache_handler.filter_existing_keys(set(cache_entry_hashes), partition_key))  # type: ignore[attr-defined]
         stats["cache_hits"] = used_hashes
 
-        # Step 3: Apply spatial filter to query
-        enhanced_query = extend_query_with_spatial_filter(
-            query=query,
-            spatial_filter_wkb=spatial_filter_wkb,
-            geometry_column=geometry_column,
-            buffer_distance=buffer_distance,
-            srid=spatial_srid,
-            p0_alias=p0_alias,
-            auto_detect_partition_join=auto_detect_partition_join,
-            partition_join_table=partition_join_table,
-        )
+        # Step 3: Apply spatial filter to query — route by spatial_filter_type
+        srid = getattr(cache_handler, "srid", 4326)
+        spatial_filter_type = getattr(cache_handler, "spatial_filter_type", "geometry")
+
+        if spatial_filter_type == "h3_cell":
+            # H3 path: spatial_result is set[int] (cell IDs)
+            resolution = getattr(cache_handler, "resolution", 9)
+            enhanced_query = extend_query_with_h3_cell_filter(
+                query=query,
+                cell_ids=spatial_result,
+                geometry_column=geometry_column,
+                srid=srid,
+                resolution=resolution,
+                p0_alias=p0_alias,
+            )
+        else:
+            # Geometry path: spatial_result is (WKB bytes, SRID)
+            spatial_filter_wkb, spatial_srid = spatial_result
+            use_intersects = getattr(cache_handler, "spatial_filter_includes_buffer", False)
+            enhanced_query = extend_query_with_spatial_filter(
+                query=query,
+                spatial_filter_wkb=spatial_filter_wkb,
+                geometry_column=geometry_column,
+                buffer_distance=buffer_distance,
+                srid=spatial_srid,
+                p0_alias=p0_alias,
+                auto_detect_partition_join=auto_detect_partition_join,
+                partition_join_table=partition_join_table,
+                use_intersects=use_intersects,
+                spatial_method=spatial_method,
+                subdivide_max_vertices=subdivide_max_vertices,
+            )
 
         stats["enhanced"] = 1
         logger.info(f"Successfully enhanced query with spatial cache. Generated {generated_variants} subqueries, {used_hashes} cache hits")

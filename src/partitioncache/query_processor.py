@@ -695,6 +695,47 @@ def _build_select_clause(
         return f"SELECT DISTINCT {table_aliases[0]}.{partition_key}"
 
 
+def _build_spatial_grouped_query(
+    table_aliases: list[str],
+    table_list_with_alias: list[str],
+    where_conditions: list[str],
+    geometry_column: str,
+) -> str:
+    """
+    Build a query selecting geometry from every alias as separate columns.
+
+    For single-alias fragments, returns a standard SELECT DISTINCT with one geometry column.
+    For multi-alias fragments, selects each alias's geometry as a separate column
+    (geom_1, geom_2, ...) so the caller can convert each to an H3 cell independently
+    and store them as grouped match sets (frozenset of cell IDs per row).
+
+    PostGIS handlers (BBox) that need a single geometry column handle the flattening
+    internally in their ``set_cache_lazy()`` method.
+
+    Args:
+        table_aliases: List of table aliases in the fragment (e.g., ['t1', 't2'])
+        table_list_with_alias: List of "table AS alias" strings (e.g., ['pois AS t1', 'pois AS t2'])
+        where_conditions: List of WHERE clause conditions
+        geometry_column: Geometry column name (e.g., 'geom')
+
+    Returns:
+        Complete SQL query string (without trailing semicolon)
+    """
+    from_clause = ", ".join(table_list_with_alias)
+    where_clause = f" WHERE {' AND '.join(where_conditions)}" if where_conditions else ""
+
+    if len(table_aliases) <= 1:
+        # Single-alias: standard SELECT DISTINCT
+        alias = table_aliases[0] if table_aliases else "t1"
+        return f"SELECT DISTINCT {alias}.{geometry_column} FROM {from_clause}{where_clause}"
+
+    # Multi-alias: select each alias's geometry as a separate column
+    select_cols = []
+    for i, alias in enumerate(table_aliases, 1):
+        select_cols.append(f"{alias}.{geometry_column} AS {geometry_column}_{i}")
+    return f"SELECT DISTINCT {', '.join(select_cols)} FROM {from_clause}{where_clause}"
+
+
 def generate_partial_queries(
     query: str,
     partition_key: str,
@@ -743,6 +784,11 @@ def generate_partial_queries(
             When set, only fragments that include this table are generated, and the SELECT clause
             references the correct alias for this table. Required when skip_partition_key_joins=True
             and not all tables have the partition key column (e.g., fact + dimension table queries).
+            Can be a table name (e.g., "pois") or a specific alias (e.g., "p1"). When an alias
+            is provided, only fragments containing that exact alias are generated — this is
+            essential for self-join queries where multiple aliases map to the same table but
+            fragments must consistently select from the same alias (e.g., spatial queries where
+            each fragment must store geometry cells for the same fact alias).
 
     Returns:
         List[str]: List of all possible partial queries
@@ -893,15 +939,29 @@ def generate_partial_queries(
     for v in query_combinations.values():
         all_query_combinations.extend(v)
 
-    # Filter out combinations that don't include the partition key source table.
+    # Filter out combinations that don't include the partition key source table/alias.
     # Skip this when a partition-join table is detected — the partition-join mechanism
     # already handles SELECT correctly and re-adds the fact table to all fragments.
+    #
+    # partition_key_source_table can be either:
+    # - A table NAME (e.g., "pois") — filters to combinations containing any alias of that table
+    # - An ALIAS (e.g., "p1") — filters to combinations containing that specific alias.
+    #   Useful for fact+dimension queries where only one table has the partition key.
     if partition_key_source_table and not detected_partition_join_alias:
-        source_aliases = {alias for alias, table in alias_to_table_map.items() if table == partition_key_source_table}
-        all_query_combinations = [
-            combo for combo in all_query_combinations
-            if any(alias in source_aliases for alias in combo)
-        ]
+        if partition_key_source_table in table_aliases:
+            # It's an alias — filter to combinations containing this specific alias
+            _pks_alias = partition_key_source_table
+            all_query_combinations = [
+                combo for combo in all_query_combinations
+                if _pks_alias in combo
+            ]
+        else:
+            # It's a table name — filter to combinations containing any alias of this table
+            source_aliases = {alias for alias, table in alias_to_table_map.items() if table == partition_key_source_table}
+            all_query_combinations = [
+                combo for combo in all_query_combinations
+                if any(alias in source_aliases for alias in combo)
+            ]
 
     # Make sure Table conditions are sorted
     for key in attribute_conditions.keys():
@@ -981,13 +1041,18 @@ def generate_partial_queries(
                 # Build mapping from original alias to new alias for SELECT clause mapping
                 original_to_new_alias_mapping[table_condition_key] = new_alias
 
-            # Resolve partition_key_source_alias: find the new alias that maps to the source table
+            # Resolve partition_key_source_alias: find the new alias that maps to the source table/alias
             pk_source_alias: str | None = None
             if partition_key_source_table:
-                for orig_alias, new_alias in original_to_new_alias_mapping.items():
-                    if alias_to_table_map.get(orig_alias, orig_alias) == partition_key_source_table:
-                        pk_source_alias = new_alias
-                        break
+                if partition_key_source_table in original_to_new_alias_mapping:
+                    # Source is an alias — resolve directly
+                    pk_source_alias = original_to_new_alias_mapping[partition_key_source_table]
+                else:
+                    # Source is a table name — find any alias that maps to it
+                    for orig_alias, new_alias in original_to_new_alias_mapping.items():
+                        if alias_to_table_map.get(orig_alias, orig_alias) == partition_key_source_table:
+                            pk_source_alias = new_alias
+                            break
 
             # Re-add partition-join table if one was detected
             if detected_partition_join_alias:
@@ -1101,12 +1166,16 @@ def generate_partial_queries(
                             ret.append(q)
             else:
                 # Normal case without p0 exclusion
-                # Build WHERE clause only if conditions exist
-                select_clause = _build_select_clause(strip_select, original_select_clause, new_table_list, original_to_new_alias_mapping, partition_key, None, geometry_column, pk_source_alias)
-                if query_where:
-                    q = f"{select_clause} FROM {', '.join(new_table_list_with_alias)} WHERE {' AND '.join(query_where)}"
+                if geometry_column and len(new_table_list) > 1:
+                    # Spatial multi-alias: separate geometry columns per alias for grouped match sets
+                    q = _build_spatial_grouped_query(new_table_list, new_table_list_with_alias, query_where, geometry_column)
                 else:
-                    q = f"{select_clause} FROM {', '.join(new_table_list_with_alias)}"
+                    # Build WHERE clause only if conditions exist
+                    select_clause = _build_select_clause(strip_select, original_select_clause, new_table_list, original_to_new_alias_mapping, partition_key, None, geometry_column, pk_source_alias)
+                    if query_where:
+                        q = f"{select_clause} FROM {', '.join(new_table_list_with_alias)} WHERE {' AND '.join(query_where)}"
+                    else:
+                        q = f"{select_clause} FROM {', '.join(new_table_list_with_alias)}"
                 ret.append(q)
 
             # Flatten partition_key_conditions for combinatorial generation
@@ -1119,14 +1188,18 @@ def generate_partial_queries(
                         for orig_alias, subquery in comb:
                             remapped = re.sub(rf'\b{re.escape(orig_alias)}\.', f'{new_table_list[0]}.', subquery)
                             query_where_comb.append(remapped)
-                        # Build WHERE clause only if conditions exist
-                        select_clause = _build_select_clause(
-                            strip_select, original_select_clause, new_table_list, original_to_new_alias_mapping, partition_key, None, geometry_column, pk_source_alias
-                        )
-                        if query_where_comb:
-                            q = f"{select_clause} FROM {', '.join(new_table_list_with_alias)} WHERE {' AND '.join(query_where_comb)}"
+                        if geometry_column and len(new_table_list) > 1:
+                            # Spatial multi-alias: separate geometry columns per alias for grouped match sets
+                            q = _build_spatial_grouped_query(new_table_list, new_table_list_with_alias, query_where_comb, geometry_column)
                         else:
-                            q = f"{select_clause} FROM {', '.join(new_table_list_with_alias)}"
+                            # Build WHERE clause only if conditions exist
+                            select_clause = _build_select_clause(
+                                strip_select, original_select_clause, new_table_list, original_to_new_alias_mapping, partition_key, None, geometry_column, pk_source_alias
+                            )
+                            if query_where_comb:
+                                q = f"{select_clause} FROM {', '.join(new_table_list_with_alias)} WHERE {' AND '.join(query_where_comb)}"
+                            else:
+                                q = f"{select_clause} FROM {', '.join(new_table_list_with_alias)}"
                         ret.append(q)
 
     # Add also the raw partition_key queries
@@ -1716,13 +1789,12 @@ def generate_all_query_hash_pairs(
         add_constraints: Dict mapping table names to constraints to add (e.g., {"table": "col = val"})
         remove_constraints_all: List of attribute names to remove from all query variants
         remove_constraints_add: List of attribute names to remove, creating additional variants
-        partition_key_source_table: Table name that contains the partition key column.
-            When set, only fragments that include this table are generated, and the SELECT clause
-            references the correct alias. Used when skip_partition_key_joins=True and not all
-            tables have the partition key column (e.g., fact + dimension table queries).
-            When None and skip_partition_key_joins=True, the system auto-detects the source table
-            by parsing the original SELECT clause for a table-qualified partition key reference
-            (e.g., ``SELECT t.trip_id`` resolves alias ``t`` to its table name).
+        partition_key_source_table: Table name or alias that contains the partition key column.
+            When set, only fragments that include this table/alias are generated, and the SELECT
+            clause references the correct alias. Can be a table name (e.g., "pois") or a specific
+            alias (e.g., "p1") for self-join disambiguation. When None and geometry_column is set,
+            auto-detected from the first FROM table. When None and skip_partition_key_joins=True,
+            auto-detected from the original SELECT clause.
 
     Returns:
         List of tuples containing (query_text, query_hash) pairs
@@ -1981,6 +2053,54 @@ def extract_distance_constraints(query: str) -> list[tuple[str, str, float]]:
     return sorted(results)
 
 
+def _extract_point_radius_distances(query: str) -> list[float]:
+    """Extract distances from point-radius ST_DWithin calls (one fixed geometry argument).
+
+    These are ST_DWithin calls where one argument is a table column and the other is a
+    constructed geometry expression (e.g., ST_MakePoint, ST_Transform), not a table alias.
+
+    Returns:
+        List of distances from point-radius constraints.
+    """
+    try:
+        parsed = sqlglot.parse_one(query)
+    except sqlglot.ParseError:
+        return []
+
+    distances: list[float] = []
+    for func in parsed.find_all(exp.Anonymous):
+        if func.name.upper() != "ST_DWITHIN":
+            continue
+        args = func.args.get("expressions", [])
+        if len(args) < 3:
+            continue
+
+        aliases = []
+        for arg in args[:2]:
+            alias = None
+            for col in arg.find_all(exp.Column):
+                if col.table:
+                    alias = col.table
+                    break
+            aliases.append(alias)
+
+        # Point-radius: exactly one alias found (the other is a fixed geometry)
+        if sum(1 for a in aliases if a is not None) != 1:
+            continue
+
+        distance_arg = args[2]
+        literal = distance_arg.find(exp.Literal)
+        if literal is None and isinstance(distance_arg, exp.Literal):
+            literal = distance_arg
+        if literal is not None:
+            try:
+                distances.append(float(literal.this))
+            except (ValueError, TypeError):
+                pass
+
+    return distances
+
+
 def compute_buffer_distance(query: str) -> float:
     """Compute buffer distance as the weighted graph diameter of distance constraints.
 
@@ -1992,16 +2112,17 @@ def compute_buffer_distance(query: str) -> float:
     two largest distances through the hub. For chain patterns, it's the sum along
     the longest path.
 
+    For point-radius queries (ST_DWithin with a fixed point, single alias), returns
+    the maximum point-radius distance as fallback.
+
     Args:
         query: SQL query string to parse.
 
     Returns:
         The weighted graph diameter in the same units as the distance constraints.
-        Returns 0.0 if no distance constraints are found or the graph has fewer than 2 nodes.
+        Returns 0.0 if no distance constraints are found.
     """
     edges = extract_distance_constraints(query)
-    if not edges:
-        return 0.0
 
     G = nx.Graph()
     for alias1, alias2, distance in edges:
@@ -2012,23 +2133,27 @@ def compute_buffer_distance(query: str) -> float:
         else:
             G.add_edge(alias1, alias2, weight=distance)
 
-    if G.number_of_nodes() < 2:
-        return 0.0
+    if G.number_of_nodes() >= 2:
+        # Compute weighted diameter: longest shortest path across all pairs
+        max_distance = 0.0
+        for component in nx.connected_components(G):
+            subgraph = G.subgraph(component)
+            if subgraph.number_of_nodes() < 2:
+                continue
+            # All-pairs shortest paths (weighted)
+            for source in subgraph.nodes():
+                lengths = nx.single_source_dijkstra_path_length(subgraph, source, weight="weight")
+                for _target, length in lengths.items():
+                    if length > max_distance:
+                        max_distance = length
+        return max_distance
 
-    # Compute weighted diameter: longest shortest path across all pairs
-    max_distance = 0.0
-    for component in nx.connected_components(G):
-        subgraph = G.subgraph(component)
-        if subgraph.number_of_nodes() < 2:
-            continue
-        # All-pairs shortest paths (weighted)
-        for source in subgraph.nodes():
-            lengths = nx.single_source_dijkstra_path_length(subgraph, source, weight="weight")
-            for _target, length in lengths.items():
-                if length > max_distance:
-                    max_distance = length
+    # Fallback: check for point-radius constraints (single-alias ST_DWithin)
+    point_radius_distances = _extract_point_radius_distances(query)
+    if point_radius_distances:
+        return max(point_radius_distances)
 
-    return max_distance
+    return 0.0
 
 def generate_all_hashes(
     query: str,
@@ -2048,6 +2173,7 @@ def generate_all_hashes(
     remove_constraints_add: list[str] | None = None,
     skip_partition_key_joins: bool = False,
     geometry_column: str | None = None,
+    partition_key_source_table: str | None = None,
     **kwargs: Any,
 ) -> list[str]:
     """
@@ -2080,6 +2206,7 @@ def generate_all_hashes(
         remove_constraints_add=remove_constraints_add,
         skip_partition_key_joins=skip_partition_key_joins,
         geometry_column=geometry_column,
+        partition_key_source_table=partition_key_source_table,
     )
     return [x[1] for x in qh_pairs]
 

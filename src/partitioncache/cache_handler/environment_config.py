@@ -231,49 +231,6 @@ class EnvironmentConfigManager:
         return config
 
     @staticmethod
-    def get_postgis_h3_config() -> dict[str, Any]:
-        """
-        Get PostGIS H3 cache handler configuration.
-
-        Returns:
-            Dictionary with configuration parameters
-
-        Raises:
-            ValueError: If required environment variables are missing
-        """
-        config: dict[str, Any] = {}
-
-        # PostgreSQL connection (uses PG_H3_ prefix or falls back to DB_ prefix)
-        config["db_host"] = os.getenv("PG_H3_HOST") or os.getenv("DB_HOST")
-        if not config["db_host"]:
-            raise ValueError("PG_H3_HOST or DB_HOST environment variable not set")
-
-        config["db_port"] = int(os.getenv("PG_H3_PORT") or os.getenv("DB_PORT") or "0")
-        if config["db_port"] == 0:
-            raise ValueError("PG_H3_PORT or DB_PORT environment variable not set")
-
-        config["db_user"] = os.getenv("PG_H3_USER") or os.getenv("DB_USER")
-        if not config["db_user"]:
-            raise ValueError("PG_H3_USER or DB_USER environment variable not set")
-
-        config["db_password"] = os.getenv("PG_H3_PASSWORD") or os.getenv("DB_PASSWORD")
-        if not config["db_password"]:
-            raise ValueError("PG_H3_PASSWORD or DB_PASSWORD environment variable not set")
-
-        config["db_name"] = os.getenv("PG_H3_DB") or os.getenv("DB_NAME")
-        if not config["db_name"]:
-            raise ValueError("PG_H3_DB or DB_NAME environment variable not set")
-
-        table_prefix = os.getenv("PG_H3_CACHE_TABLE_PREFIX", "partitioncache_h3")
-        config["db_tableprefix"] = table_prefix
-
-        config["resolution"] = int(os.getenv("PG_H3_RESOLUTION", "9"))
-        config["geometry_column"] = os.getenv("PG_H3_GEOMETRY_COLUMN", "geom")
-        config["srid"] = int(os.getenv("PG_H3_SRID", "4326"))
-
-        return config
-
-    @staticmethod
     def get_postgis_bbox_config() -> dict[str, Any]:
         """
         Get PostGIS BBox cache handler configuration.
@@ -313,6 +270,53 @@ class EnvironmentConfigManager:
         config["cell_size"] = float(os.getenv("PG_BBOX_CELL_SIZE", "0.01"))
         config["geometry_column"] = os.getenv("PG_BBOX_GEOMETRY_COLUMN", "geom")
         config["srid"] = int(os.getenv("PG_BBOX_SRID", "4326"))
+
+        return config
+
+    @staticmethod
+    def get_rocksdict_h3_grouped_config() -> dict[str, Any]:
+        """
+        Get RocksDict H3 Grouped cache handler configuration.
+
+        Requires both a RocksDict path and PostgreSQL connection (for H3 conversion).
+
+        Returns:
+            Dictionary with configuration parameters
+
+        Raises:
+            ValueError: If required environment variables are missing
+        """
+        config: dict[str, Any] = {}
+
+        # RocksDict path
+        db_path = os.getenv("ROCKSDICT_H3_GROUPED_PATH") or os.getenv("ROCKSDB_DICT_PATH")
+        if not db_path:
+            raise ValueError("ROCKSDICT_H3_GROUPED_PATH or ROCKSDB_DICT_PATH environment variable not set")
+        config["db_path"] = db_path
+
+        # PostgreSQL connection (for H3 cell conversion and geometry reconstruction)
+        config["db_host"] = os.getenv("PG_H3_HOST") or os.getenv("DB_HOST")
+        if not config["db_host"]:
+            raise ValueError("PG_H3_HOST or DB_HOST environment variable not set")
+
+        config["db_port"] = int(os.getenv("PG_H3_PORT") or os.getenv("DB_PORT") or "0")
+        if config["db_port"] == 0:
+            raise ValueError("PG_H3_PORT or DB_PORT environment variable not set")
+
+        config["db_user"] = os.getenv("PG_H3_USER") or os.getenv("DB_USER")
+        if not config["db_user"]:
+            raise ValueError("PG_H3_USER or DB_USER environment variable not set")
+
+        config["db_password"] = os.getenv("PG_H3_PASSWORD") or os.getenv("DB_PASSWORD")
+        if not config["db_password"]:
+            raise ValueError("PG_H3_PASSWORD or DB_PASSWORD environment variable not set")
+
+        config["db_name"] = os.getenv("PG_H3_DB") or os.getenv("DB_NAME")
+        if not config["db_name"]:
+            raise ValueError("PG_H3_DB or DB_NAME environment variable not set")
+
+        config["resolution"] = int(os.getenv("PG_H3_RESOLUTION", "9"))
+        config["srid"] = int(os.getenv("PG_H3_SRID", "4326"))
 
         return config
 
@@ -405,10 +409,10 @@ class EnvironmentConfigManager:
                 EnvironmentConfigManager.get_rocksdb_config("dict")
             elif cache_type == "rocksdict_roaringbit":
                 EnvironmentConfigManager.get_rocksdb_config("roaringbit")
+            elif cache_type == "rocksdict_h3_grouped":
+                EnvironmentConfigManager.get_rocksdict_h3_grouped_config()
             elif cache_type == "duckdb_bit":
                 EnvironmentConfigManager.get_duckdb_bit_config()
-            elif cache_type == "postgis_h3":
-                EnvironmentConfigManager.get_postgis_h3_config()
             elif cache_type == "postgis_bbox":
                 EnvironmentConfigManager.get_postgis_bbox_config()
             else:

@@ -3,7 +3,7 @@ Self-contained PostGIS spatial cache integration tests for CI.
 
 These tests seed their own spatial data (pois table with PostGIS geometry)
 inside the CI database and test the full spatial cache pipeline for both
-postgis_h3 and postgis_bbox backends.
+postgis_bbox backend.
 
 Unlike test_spatial_postgis_e2e.py (which requires an external OSM POI database),
 these tests are fully self-contained and work in CI with the PostGIS-enabled
@@ -52,13 +52,6 @@ def _check_postgis_available(conn) -> bool:
     """Return True if PostGIS extension is available."""
     with conn.cursor() as cur:
         cur.execute("SELECT 1 FROM pg_extension WHERE extname = 'postgis'")
-        return cur.fetchone() is not None
-
-
-def _check_h3_available(conn) -> bool:
-    """Return True if h3 extension is available."""
-    with conn.cursor() as cur:
-        cur.execute("SELECT 1 FROM pg_extension WHERE extname = 'h3'")
         return cur.fetchone() is not None
 
 
@@ -158,11 +151,6 @@ SPATIAL_QUERIES = [
 # --------------------------------------------------------------------------- #
 
 BACKEND_CONFIGS = {
-    "postgis_h3": {
-        "partition_key": "spatial_h3",
-        "geometry_column": "geom",
-        "buffer_distance": 500.0,
-    },
     "postgis_bbox": {
         "partition_key": "spatial_bbox",
         "geometry_column": "geom",
@@ -211,12 +199,6 @@ def ci_db_connection():
     with conn.cursor() as cur:
         cur.execute("TRUNCATE pois RESTART IDENTITY")
     conn.close()
-
-
-@pytest.fixture(scope="module")
-def h3_available(ci_db_connection):
-    """Check if h3 extension is available (needed for postgis_h3 backend)."""
-    return _check_h3_available(ci_db_connection)
 
 
 def _populate_cache(handler, partition_key: str, geometry_column: str):
@@ -283,101 +265,6 @@ def _run_multi_statement(conn, sql_text: str) -> list:
 @pytest.mark.skipif(not PSYCOPG_AVAILABLE, reason="psycopg not installed")
 class TestSpatialPostGISCI:
     """Self-contained PostGIS spatial cache tests for CI."""
-
-    # ---- H3 backend tests ---- #
-
-    def test_postgis_h3_cache_populate_and_apply(self, ci_db_connection, h3_available):
-        """Full H3 pipeline: populate cache → apply_cache → verify results."""
-        if not h3_available:
-            pytest.skip("h3 extension not available")
-
-        backend_name = "postgis_h3"
-        config = BACKEND_CONFIGS[backend_name]
-
-        handler = partitioncache.get_cache_handler(backend_name, singleton=False)
-
-        try:
-            _populate_cache(handler, config["partition_key"], config["geometry_column"])
-
-            for query_name, sql_query in SPATIAL_QUERIES:
-                sql_query = sql_query.strip()
-                rows_baseline = _run_query(ci_db_connection, sql_query)
-
-                enhanced_query, stats = partitioncache.apply_cache(
-                    query=sql_query,
-                    cache_handler=handler,
-                    partition_key=config["partition_key"],
-                    geometry_column=config["geometry_column"],
-                    buffer_distance=config["buffer_distance"],
-                    min_component_size=1,
-                )
-
-                if stats["enhanced"]:
-                    rows_enhanced = _run_multi_statement(ci_db_connection, enhanced_query)
-                    assert len(rows_enhanced) >= len(rows_baseline), (
-                        f"[{backend_name}] {query_name}: apply_cache returned fewer rows "
-                        f"({len(rows_enhanced)}) than baseline ({len(rows_baseline)}). "
-                        f"Stats: {stats}"
-                    )
-                    print(
-                        f"  [{backend_name}] {query_name}: "
-                        f"{len(rows_enhanced)}/{len(rows_baseline)} rows "
-                        f"(hits={stats['cache_hits']})"
-                    )
-                else:
-                    print(f"  [{backend_name}] {query_name}: not enhanced (stats={stats})")
-
-        finally:
-            _cleanup_cache_tables(handler, config["partition_key"])
-            handler.close()
-
-    def test_postgis_h3_lazy_apply(self, ci_db_connection, h3_available):
-        """H3 lazy pipeline: populate cache → apply_cache_lazy → verify results."""
-        if not h3_available:
-            pytest.skip("h3 extension not available")
-
-        backend_name = "postgis_h3"
-        config = BACKEND_CONFIGS[backend_name]
-
-        handler = partitioncache.get_cache_handler(backend_name, singleton=False)
-
-        try:
-            _populate_cache(handler, config["partition_key"], config["geometry_column"])
-
-            for query_name, sql_query in SPATIAL_QUERIES:
-                sql_query = sql_query.strip()
-                rows_baseline = _run_query(ci_db_connection, sql_query)
-
-                enhanced_query, stats = partitioncache.apply_cache_lazy(
-                    query=sql_query,
-                    cache_handler=handler,
-                    partition_key=config["partition_key"],
-                    geometry_column=config["geometry_column"],
-                    buffer_distance=config["buffer_distance"],
-                    method="TMP_TABLE_IN",
-                    min_component_size=1,
-                )
-
-                if stats["enhanced"]:
-                    rows_enhanced = _run_multi_statement(ci_db_connection, enhanced_query)
-                    assert len(rows_enhanced) >= len(rows_baseline), (
-                        f"[{backend_name}] {query_name}: apply_cache_lazy returned fewer rows "
-                        f"({len(rows_enhanced)}) than baseline ({len(rows_baseline)}). "
-                        f"Stats: {stats}"
-                    )
-                    print(
-                        f"  [{backend_name}] {query_name} lazy: "
-                        f"{len(rows_enhanced)}/{len(rows_baseline)} rows "
-                        f"(hits={stats['cache_hits']})"
-                    )
-                else:
-                    print(f"  [{backend_name}] {query_name} lazy: not enhanced (stats={stats})")
-
-        finally:
-            _cleanup_cache_tables(handler, config["partition_key"])
-            handler.close()
-
-    # ---- BBox backend tests ---- #
 
     def test_postgis_bbox_cache_populate_and_apply(self, ci_db_connection):
         """Full BBox pipeline: populate cache → apply_cache → verify results."""
@@ -505,66 +392,6 @@ class TestSpatialPostGISCI:
                     assert srid > 0, f"SRID should be positive, got {srid}"
 
                     # Verify WKB is valid geometry in PostGIS
-                    with ci_db_connection.cursor() as cur:
-                        cur.execute(
-                            "SELECT ST_IsValid(ST_GeomFromWKB(%s, %s)), ST_SRID(ST_GeomFromWKB(%s, %s))",
-                            (wkb, srid, wkb, srid),
-                        )
-                        row = cur.fetchone()
-                        assert row is not None
-                        is_valid, returned_srid = row
-                        if is_valid is not None:
-                            assert is_valid, f"WKB geometry not valid for {backend_name}/{query_name}"
-                        assert returned_srid == srid, (
-                            f"SRID mismatch: returned {returned_srid}, expected {srid}"
-                        )
-                    print(f"  [{backend_name}] {query_name}: valid WKB ({len(wkb)} bytes, SRID={srid})")
-
-        finally:
-            _cleanup_cache_tables(handler, config["partition_key"])
-            handler.close()
-
-    def test_spatial_filter_wkb_validity_h3(self, ci_db_connection, h3_available):
-        """Verify H3 get_spatial_filter() returns valid WKB with correct SRID."""
-        if not h3_available:
-            pytest.skip("h3 extension not available")
-
-        backend_name = "postgis_h3"
-        config = BACKEND_CONFIGS[backend_name]
-
-        handler = partitioncache.get_cache_handler(backend_name, singleton=False)
-
-        try:
-            _populate_cache(handler, config["partition_key"], config["geometry_column"])
-
-            for query_name, sql_query in SPATIAL_QUERIES:
-                sql_query = sql_query.strip()
-                from partitioncache.query_processor import generate_all_hashes
-
-                hashes = generate_all_hashes(
-                    sql_query,
-                    partition_key=config["partition_key"],
-                    min_component_size=1,
-                    skip_partition_key_joins=True,
-                    geometry_column=config["geometry_column"],
-                )
-
-                if not hashes:
-                    continue
-
-                result = handler.get_spatial_filter(
-                    keys=set(hashes),
-                    partition_key=config["partition_key"],
-                    buffer_distance=config["buffer_distance"],
-                )
-
-                if result is not None:
-                    wkb, srid = result
-                    assert isinstance(wkb, bytes), f"WKB should be bytes, got {type(wkb)}"
-                    assert len(wkb) > 0, "WKB should not be empty"
-                    assert isinstance(srid, int), f"SRID should be int, got {type(srid)}"
-                    assert srid > 0, f"SRID should be positive, got {srid}"
-
                     with ci_db_connection.cursor() as cur:
                         cur.execute(
                             "SELECT ST_IsValid(ST_GeomFromWKB(%s, %s)), ST_SRID(ST_GeomFromWKB(%s, %s))",

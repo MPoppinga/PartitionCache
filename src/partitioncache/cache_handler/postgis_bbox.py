@@ -1,11 +1,13 @@
 """
 PostGIS Bounding Box Cache Handler.
 
-Stores cache entries as PostGIS MultiPolygon geometries representing grid-based bounding boxes.
-Derives spatial cells from geometry columns by snapping centroids to a grid and creating envelope boxes.
+Stores cache entries as PostGIS geometry collections (MultiPoint, MultiPolygon, etc.)
+by collecting actual geometries from query results.
+Supports spatial filtering via geometric ST_Intersection of buffered multipolygons.
 Requires: PostgreSQL + PostGIS extension.
 """
 
+import warnings
 from logging import getLogger
 
 from psycopg import sql
@@ -19,11 +21,20 @@ class PostGISBBoxCacheHandler(PostGISSpatialAbstractCacheHandler):
     """
     Spatial cache handler using PostGIS bounding box geometries.
 
-    Stores partition data as PostGIS geometry (MultiPolygon of grid cell envelopes).
-    Derives cells by snapping geometry centroids to a grid (ST_SnapToGrid) and
-    creating bounding boxes (ST_MakeEnvelope) around each cell center.
-    Supports spatial filtering via geometric ST_Intersection.
+    Stores partition data as PostGIS geometry collections by collecting actual
+    geometries from query results (ST_Collect). Supports spatial filtering via
+    geometric ST_Intersection of buffered multipolygons.
+
+    .. deprecated:: cell_size parameter
+        The ``cell_size`` parameter is no longer used. Previously, geometries were
+        snapped to a grid and converted to envelope cells. Now raw geometries are
+        stored directly, which is both simpler and more precise.
     """
+
+    @property
+    def spatial_filter_includes_buffer(self) -> bool:
+        """BBox handler bakes buffer_distance into the spatial filter geometry."""
+        return True
 
     def __init__(
         self,
@@ -38,8 +49,14 @@ class PostGISBBoxCacheHandler(PostGISSpatialAbstractCacheHandler):
         srid: int = 4326,
         timeout: str = "0",
     ) -> None:
-        self.cell_size = cell_size
-        self.half_cell = cell_size / 2.0
+        if cell_size != 0.01:
+            warnings.warn(
+                "cell_size parameter is deprecated and no longer used. "
+                "Raw geometries are now stored directly without grid snapping.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        self.cell_size = cell_size  # Kept for backward compat but unused
         super().__init__(db_name, db_host, db_user, db_password, db_port, db_tableprefix, geometry_column, srid, timeout)
 
     def __repr__(self) -> str:
@@ -132,10 +149,11 @@ class PostGISBBoxCacheHandler(PostGISSpatialAbstractCacheHandler):
 
     def set_cache_lazy(self, key: str, query: str, partition_key: str = "partition_key") -> bool:
         """
-        Store bounding box geometry by wrapping the fragment query with grid-based BB aggregation.
+        Store geometry collection by wrapping the fragment query with ST_Collect aggregation.
 
-        The fragment query should return rows with a geometry column. This method wraps it
-        to snap centroids to a grid, create envelope boxes, and collect them into a MultiPolygon.
+        The fragment query should return rows with a geometry column (or multiple geometry
+        columns named geom_1, geom_2, ... for multi-alias spatial fragments). Multi-column
+        fragments are flattened via CROSS JOIN LATERAL VALUES before collection.
         """
         try:
             if "DELETE " in query.upper() or "DROP " in query.upper():
@@ -150,36 +168,54 @@ class PostGISBBoxCacheHandler(PostGISSpatialAbstractCacheHandler):
             table_name = f"{self.tableprefix}_cache_{partition_key}"
             geom_col = self.geometry_column
 
-            # Wrap fragment with grid-based bounding box aggregation
-            lazy_insert_query = sql.SQL(
-                """
-                WITH grid_cells AS (
-                    SELECT ST_SnapToGrid(ST_Centroid(sub.{geom_col}), {cell_size}) AS cell_origin
+            # Detect multi-column geometry format (geom_1, geom_2, ...) from grouped fragments
+            import re
+
+            geom_col_indices = sorted({int(m) for m in re.findall(rf'\b{re.escape(geom_col)}_(\d+)\b', query)})
+
+            if geom_col_indices:
+                # Multi-column fragment: flatten via LATERAL VALUES into single geometry column
+                values_list = ", ".join(f"(sub.{geom_col}_{i})" for i in geom_col_indices)
+                lazy_insert_query = sql.SQL(
+                    """
+                    INSERT INTO {table} (query_hash, partition_keys, partition_keys_count)
+                    SELECT {key},
+                           ST_Collect(DISTINCT g.{geom_col}),
+                           COUNT(DISTINCT g.{geom_col})
                     FROM ({query}) AS sub
-                    GROUP BY cell_origin
+                    CROSS JOIN LATERAL (VALUES """
+                    + values_list
+                    + """) AS g({geom_col})
+                    WHERE g.{geom_col} IS NOT NULL
+                    ON CONFLICT (query_hash) DO UPDATE SET
+                        partition_keys = EXCLUDED.partition_keys,
+                        partition_keys_count = EXCLUDED.partition_keys_count
+                    """
+                ).format(
+                    table=sql.Identifier(table_name),
+                    key=sql.Literal(key),
+                    geom_col=sql.Identifier(geom_col),
+                    query=sql.SQL(query),  # type: ignore[arg-type]
                 )
-                INSERT INTO {table} (query_hash, partition_keys, partition_keys_count)
-                SELECT {key},
-                       ST_Collect(ST_MakeEnvelope(
-                           ST_X(cell_origin) - {half_cell}, ST_Y(cell_origin) - {half_cell},
-                           ST_X(cell_origin) + {half_cell}, ST_Y(cell_origin) + {half_cell},
-                           {srid}
-                       )),
-                       COUNT(*)
-                FROM grid_cells
-                ON CONFLICT (query_hash) DO UPDATE SET
-                    partition_keys = EXCLUDED.partition_keys,
-                    partition_keys_count = EXCLUDED.partition_keys_count
-                """
-            ).format(
-                table=sql.Identifier(table_name),
-                key=sql.Literal(key),
-                geom_col=sql.Identifier(geom_col),
-                cell_size=sql.Literal(self.cell_size),
-                half_cell=sql.Literal(self.half_cell),
-                srid=sql.Literal(self.srid),
-                query=sql.SQL(query),  # type: ignore[arg-type]
-            )
+            else:
+                # Single-column fragment: collect directly
+                lazy_insert_query = sql.SQL(
+                    """
+                    INSERT INTO {table} (query_hash, partition_keys, partition_keys_count)
+                    SELECT {key},
+                           ST_Collect(DISTINCT sub.{geom_col}),
+                           COUNT(DISTINCT sub.{geom_col})
+                    FROM ({query}) AS sub
+                    ON CONFLICT (query_hash) DO UPDATE SET
+                        partition_keys = EXCLUDED.partition_keys,
+                        partition_keys_count = EXCLUDED.partition_keys_count
+                    """
+                ).format(
+                    table=sql.Identifier(table_name),
+                    key=sql.Literal(key),
+                    geom_col=sql.Identifier(geom_col),
+                    query=sql.SQL(query),  # type: ignore[arg-type]
+                )
 
             self.cursor.execute(lazy_insert_query)
             self.db.commit()
@@ -211,7 +247,7 @@ class PostGISBBoxCacheHandler(PostGISSpatialAbstractCacheHandler):
         return bytes(result[0])
 
     def get_intersected(self, keys, partition_key="partition_key"):  # type: ignore[override]
-        """Get geometric intersection of all cached bounding boxes. Returns WKB bytes."""
+        """Get geometric intersection of all cached geometries. Returns WKB bytes."""
         try:
             datatype = self._get_partition_datatype(partition_key)
             if datatype is None:
@@ -234,10 +270,11 @@ class PostGISBBoxCacheHandler(PostGISSpatialAbstractCacheHandler):
             return None, 0
 
     def _get_intersected_sql(self, keys: set[str], partition_key: str) -> sql.Composed:
-        """Build SQL for chained ST_Intersection of geometry bounding boxes.
+        """Build SQL for chained ST_Intersection of raw geometry collections.
 
-        Uses ST_Envelope to reduce multi-polygon collections to simple rectangles
-        before intersection, which is much faster for large cell collections.
+        Directly intersects the stored multipolygon/multipoint geometry collections.
+        For a single key, returns the raw partition_keys geometry.
+        For multiple keys, chains ST_Intersection(A, B).
         """
         table_name = f"{self.tableprefix}_cache_{partition_key}"
         keys_list = list(keys)
@@ -248,16 +285,14 @@ class PostGISBBoxCacheHandler(PostGISSpatialAbstractCacheHandler):
                 key=sql.Literal(keys_list[0]),
             )
 
-        # Build chained ST_Intersection on envelopes (bounding boxes)
-        # Using ST_Envelope reduces multi-polygon collections to simple rectangles
-        # which makes intersection fast even with thousands of cells
-        result = sql.SQL("ST_Envelope((SELECT partition_keys FROM {table} WHERE query_hash = {key}))").format(
+        # Build chained ST_Intersection on raw geometry collections
+        result = sql.SQL("(SELECT partition_keys FROM {table} WHERE query_hash = {key})").format(
             table=sql.Identifier(table_name),
             key=sql.Literal(keys_list[0]),
         )
 
         for i in range(1, len(keys_list)):
-            inner = sql.SQL("ST_Envelope((SELECT partition_keys FROM {table} WHERE query_hash = {key}))").format(
+            inner = sql.SQL("(SELECT partition_keys FROM {table} WHERE query_hash = {key})").format(
                 table=sql.Identifier(table_name),
                 key=sql.Literal(keys_list[i]),
             )
@@ -286,26 +321,22 @@ class PostGISBBoxCacheHandler(PostGISSpatialAbstractCacheHandler):
     def _get_buffered_intersected_sql(
         self, keys: set[str], partition_key: str, buffer_distance: float
     ) -> sql.Composed:
-        """Build SQL for chained ST_Intersection of buffered geometry envelopes.
+        """Build SQL for chained ST_Intersection of buffered geometry collections.
 
-        Each envelope is buffered by ``buffer_distance + cell_size`` before
-        intersection.  This mirrors the H3 handler which buffers by the H3 edge
-        length and prevents the intersection from collapsing to empty when
-        different query fragments cover nearby but non-overlapping areas that
-        are within ``buffer_distance`` of each other.
+        Each stored geometry collection is buffered by ``buffer_distance`` before
+        intersection. This produces the "co-occurrence zone" — the area within
+        ``buffer_distance`` of ALL fragment types simultaneously.
 
-        Without buffering, fragment A (e.g. ice cream shops) and fragment B
-        (e.g. pharmacies) 100 m apart would produce an empty intersection even
-        though ``ST_DWithin(..., 400)`` in the original query matches them.
+        For a single key: ``ST_Buffer(partition_keys, buf)``
+        For multiple keys: ``ST_Intersection(ST_Buffer(A, buf), ST_Buffer(B, buf))``
         """
         table_name = f"{self.tableprefix}_cache_{partition_key}"
         keys_list = list(keys)
-        buf = buffer_distance + self.cell_size
+        buf = buffer_distance
 
         if len(keys_list) == 1:
-            # Single key: buffer the envelope
             return sql.SQL(
-                "ST_Buffer(ST_Envelope((SELECT partition_keys FROM {table} WHERE query_hash = {key})), {buf})"
+                "ST_Buffer((SELECT partition_keys FROM {table} WHERE query_hash = {key}), {buf})"
             ).format(
                 table=sql.Identifier(table_name),
                 key=sql.Literal(keys_list[0]),
@@ -313,7 +344,7 @@ class PostGISBBoxCacheHandler(PostGISSpatialAbstractCacheHandler):
             )
 
         result = sql.SQL(
-            "ST_Buffer(ST_Envelope((SELECT partition_keys FROM {table} WHERE query_hash = {key})), {buf})"
+            "ST_Buffer((SELECT partition_keys FROM {table} WHERE query_hash = {key}), {buf})"
         ).format(
             table=sql.Identifier(table_name),
             key=sql.Literal(keys_list[0]),
@@ -322,7 +353,7 @@ class PostGISBBoxCacheHandler(PostGISSpatialAbstractCacheHandler):
 
         for i in range(1, len(keys_list)):
             inner = sql.SQL(
-                "ST_Buffer(ST_Envelope((SELECT partition_keys FROM {table} WHERE query_hash = {key})), {buf})"
+                "ST_Buffer((SELECT partition_keys FROM {table} WHERE query_hash = {key}), {buf})"
             ).format(
                 table=sql.Identifier(table_name),
                 key=sql.Literal(keys_list[i]),
@@ -341,16 +372,15 @@ class PostGISBBoxCacheHandler(PostGISSpatialAbstractCacheHandler):
         """
         Get spatial filter geometry as WKB bytes for bounding boxes.
 
-        Each cached envelope is buffered by ``buffer_distance + cell_size``
-        before intersection, so that fragments covering nearby but
-        non-overlapping areas still produce a valid spatial filter.
-        This is analogous to the H3 handler buffering by edge length.
+        Each cached geometry collection is buffered by ``buffer_distance`` before
+        intersection. The resulting geometry already includes the full buffer, so
+        callers should use ``ST_Intersects`` (not ``ST_DWithin``) to avoid double-buffering.
 
         Args:
             keys: Set of cache keys to intersect.
             partition_key: Partition key namespace.
             buffer_distance: Buffer distance in the SRID's native unit (meters
-                for metric SRIDs). Applied to each envelope before intersection.
+                for metric SRIDs). Applied to each geometry before intersection.
 
         Returns:
             Tuple of (WKB bytes, SRID) for the spatial filter geometry,
@@ -387,16 +417,15 @@ class PostGISBBoxCacheHandler(PostGISSpatialAbstractCacheHandler):
         """
         Get spatial filter geometry SQL for bounding boxes.
 
-        Each cached envelope is buffered by ``buffer_distance + cell_size``
-        before intersection, so that fragments covering nearby but
-        non-overlapping areas still produce a valid spatial filter.
-        This is analogous to the H3 handler buffering by edge length.
+        Each cached geometry collection is buffered by ``buffer_distance`` before
+        intersection. The resulting geometry already includes the full buffer, so
+        callers should use ``ST_Intersects`` (not ``ST_DWithin``) to avoid double-buffering.
 
         Args:
             keys: Set of cache keys to intersect.
             partition_key: Partition key namespace.
             buffer_distance: Buffer distance in the SRID's native unit (meters
-                for metric SRIDs). Applied to each envelope before intersection.
+                for metric SRIDs). Applied to each geometry before intersection.
 
         Returns:
             SQL string producing a geometry, or None if no cache hits.
