@@ -38,12 +38,36 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
             self.cursor.execute(sql.SQL("SELECT to_regclass('{0}')").format(sql.Identifier(self.tableprefix + "_partition_metadata")))
             result = self.cursor.fetchone()
             # Handle both real database results and mock objects
+            table_exists = False
             try:
                 if result and result[0]:
-                    return
+                    table_exists = True
             except (TypeError, AttributeError):
                 # If result is a Mock or doesn't support subscripting, continue with table creation
                 pass
+
+            if table_exists:
+                # Table exists — ensure it has the bitsize column (may have been created by postgresql_array handler)
+                self.cursor.execute(
+                    sql.SQL("""SELECT column_name FROM information_schema.columns
+                        WHERE table_name = %s AND column_name = 'bitsize'"""),
+                    (self.tableprefix + "_partition_metadata",),
+                )
+                has_bitsize = self.cursor.fetchone() is not None
+                if not has_bitsize:
+                    logger.info(f"BIT METADATA: Adding missing bitsize column to {self.tableprefix}_partition_metadata")
+                    self.cursor.execute(
+                        sql.SQL("ALTER TABLE {0} ADD COLUMN bitsize INTEGER").format(
+                            sql.Identifier(self.tableprefix + "_partition_metadata")
+                        )
+                    )
+                    self.db.commit()
+
+                # Ensure SQL functions and trigger exist
+                self._load_sql_functions()
+                self._create_bitsize_trigger()
+                self.db.commit()
+                return
 
             logger.warning(f"! Setting up {self.tableprefix} cache handler: Loading SQL functions")
             # Load SQL functions first
