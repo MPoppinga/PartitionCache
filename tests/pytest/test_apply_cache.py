@@ -2,12 +2,14 @@
 Tests for the apply_cache module, specifically extend_query_with_partition_keys function.
 """
 
+import warnings
 from datetime import datetime
 from unittest.mock import Mock
 
 import pytest
 
 from partitioncache.apply_cache import (
+    apply_cache,
     apply_cache_lazy,
     extend_query_with_partition_keys,
     extend_query_with_partition_keys_lazy,
@@ -56,13 +58,13 @@ class TestFindP0Alias:
         result = find_p0_alias(query, "zipcode")
         assert result == "p0"
 
-    def test_detects_star_join_table(self):
-        """Test that mv table is detected  when it's a proper star-join."""
-        # With only 2 tables, the mv table won't be auto-detected as star-join
-        # It needs to join multiple tables to be considered a star-join
+    def test_detects_partition_join_table(self):
+        """Test that mv table is detected  when it's a proper partition-join."""
+        # With only 2 tables, the mv table won't be auto-detected as partition-join
+        # It needs to join multiple tables to be considered a partition-join
         query = "SELECT * FROM users AS u, zipcode_mv AS zips WHERE u.zipcode = zips.zipcode"
         result = find_p0_alias(query, "zipcode")
-        # Should return first table since it's not detected as star-join with only 2 tables
+        # Should return first table since it's not detected as partition-join with only 2 tables
         assert result == "u"
 
         # Test with 3+ tables where zipcode_mv joins all others
@@ -71,7 +73,7 @@ class TestFindP0Alias:
         WHERE u.zipcode = zips.zipcode AND o.zipcode = zips.zipcode
         """
         result_star = find_p0_alias(query_star, "zipcode")
-        # Now it should detect zips as the star-join table
+        # Now it should detect zips as the partition-join table
         assert result_star == "zips"
 
 
@@ -227,11 +229,11 @@ class TestExtendQueryWithPartitionKeys:
         partition_keys = {1, 2, 3}
         result = extend_query_with_partition_keys(query, partition_keys, "region_id", method="TMP_TABLE_IN", p0_alias="u")
 
-        assert "CREATE TEMPORARY TABLE tmp_partition_keys" in result
+        assert "CREATE TEMPORARY TABLE tmp_cache_keys_" in result
         assert "partition_key INT PRIMARY KEY" in result
-        assert "INSERT INTO tmp_partition_keys" in result
+        assert "INSERT INTO tmp_cache_keys_" in result
         assert "VALUES(1),(2),(3)" in result or "VALUES(1,2,3)" in result
-        assert "u.region_id IN (SELECT partition_key FROM tmp_partition_keys)" in result
+        assert "u.region_id IN (SELECT partition_key FROM tmp_cache_keys_" in result
 
     def test_tmp_table_in_with_strings(self):
         """Test TMP_TABLE_IN method with string partition keys."""
@@ -249,8 +251,8 @@ class TestExtendQueryWithPartitionKeys:
         partition_keys = {1, 2}
         result = extend_query_with_partition_keys(query, partition_keys, "region_id", method="TMP_TABLE_JOIN", p0_alias="u")
 
-        assert "CREATE TEMPORARY TABLE tmp_partition_keys" in result
-        assert "INSERT INTO tmp_partition_keys" in result
+        assert "CREATE TEMPORARY TABLE tmp_cache_keys_" in result
+        assert "INSERT INTO tmp_cache_keys_" in result
         # Should contain join logic somewhere
         assert "tmp_" in result
 
@@ -260,7 +262,7 @@ class TestExtendQueryWithPartitionKeys:
         partition_keys = {1, 2}
         result = extend_query_with_partition_keys(query, partition_keys, "region_id", method="TMP_TABLE_IN", p0_alias="u", analyze_tmp_table=False)
 
-        assert "ANALYZE tmp_partition_keys" not in result
+        assert "ANALYZE" not in result
         assert "CREATE INDEX" not in result
 
     def test_analyze_tmp_table_true(self):
@@ -269,7 +271,7 @@ class TestExtendQueryWithPartitionKeys:
         partition_keys = {1, 2}
         result = extend_query_with_partition_keys(query, partition_keys, "region_id", method="TMP_TABLE_IN", p0_alias="u", analyze_tmp_table=True)
 
-        assert "ANALYZE tmp_partition_keys" in result
+        assert "ANALYZE tmp_cache_keys_" in result
         assert "CREATE INDEX" in result
 
     def test_float_partition_keys(self):
@@ -357,7 +359,7 @@ class TestExtendQueryWithPartitionKeys:
         result = extend_query_with_partition_keys(query, partition_keys, "region_id", method="TMP_TABLE_JOIN")
 
         # When p0_alias is None for TMP_TABLE_JOIN, it should join on all tables
-        assert "CREATE TEMPORARY TABLE tmp_partition_keys" in result
+        assert "CREATE TEMPORARY TABLE tmp_cache_keys_" in result
 
     def test_tmp_table_in_no_existing_where(self):
         """Test TMP_TABLE_IN method when query has no WHERE clause."""
@@ -365,8 +367,8 @@ class TestExtendQueryWithPartitionKeys:
         partition_keys = {1, 2}
         result = extend_query_with_partition_keys(query, partition_keys, "region_id", method="TMP_TABLE_IN", p0_alias="u")
 
-        assert "WHERE u.region_id IN (SELECT partition_key FROM tmp_partition_keys)" in result
-        assert "CREATE TEMPORARY TABLE tmp_partition_keys" in result
+        assert "u.region_id IN (SELECT partition_key FROM tmp_cache_keys_" in result
+        assert "CREATE TEMPORARY TABLE tmp_cache_keys_" in result
 
     def test_values_method_with_existing_where(self):
         """Test VALUES method when query already has WHERE clause."""
@@ -870,3 +872,63 @@ class TestApplyCacheLazy:
         assert enhanced_query.count("zipcode_mv") == 1  # Only the original one
         assert stats["enhanced"] == 1
         assert stats["p0_rewritten"] == 0  # P0 was not rewritten since table already present
+
+
+class TestApplyCacheDeprecatedKwargs:
+    """apply_cache() must accept deprecated star_join_* keyword arguments
+    with DeprecationWarning, matching the shim in get_partition_keys/generate_all_hashes."""
+
+    def test_apply_cache_accepts_star_join_table_kwarg(self):
+        """apply_cache() should accept star_join_table= with a deprecation warning."""
+        mock_handler = Mock()
+        mock_handler.get_intersected.return_value = (None, 0)
+        mock_handler.filter_existing_keys.return_value = set()
+
+        # This should NOT raise TypeError for 'star_join_table'
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            try:
+                apply_cache(
+                    query="SELECT * FROM trips AS t WHERE t.fare > 10",
+                    cache_handler=mock_handler,
+                    partition_key="city_id",
+                    star_join_table="trips",
+                )
+            except TypeError as e:
+                if "star_join_table" in str(e) or "unexpected keyword" in str(e):
+                    pytest.fail(
+                        f"apply_cache() does not accept deprecated star_join_table kwarg: {e}"
+                    )
+                # Other TypeErrors (from mock internals) are acceptable
+            else:
+                # Check deprecation warning was emitted
+                dep_warnings = [x for x in w if issubclass(x.category, DeprecationWarning)]
+                assert any("star_join_table" in str(x.message) for x in dep_warnings), (
+                    "Expected DeprecationWarning for star_join_table"
+                )
+
+    def test_apply_cache_accepts_auto_detect_star_join_kwarg(self):
+        """apply_cache() should accept auto_detect_star_join= with a deprecation warning."""
+        mock_handler = Mock()
+        mock_handler.get_intersected.return_value = (None, 0)
+        mock_handler.filter_existing_keys.return_value = set()
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            try:
+                apply_cache(
+                    query="SELECT * FROM trips AS t WHERE t.fare > 10",
+                    cache_handler=mock_handler,
+                    partition_key="city_id",
+                    auto_detect_star_join=False,
+                )
+            except TypeError as e:
+                if "auto_detect_star_join" in str(e) or "unexpected keyword" in str(e):
+                    pytest.fail(
+                        f"apply_cache() does not accept deprecated auto_detect_star_join kwarg: {e}"
+                    )
+            else:
+                dep_warnings = [x for x in w if issubclass(x.category, DeprecationWarning)]
+                assert any("auto_detect_star_join" in str(x.message) for x in dep_warnings), (
+                    "Expected DeprecationWarning for auto_detect_star_join"
+                )

@@ -182,18 +182,16 @@ class TestDuckDBBitCacheHandler:
         bitsize_params = get_params_from_call(bitsize_calls[0])
         assert bitsize_params == ("zipcode",), f"Bitsize query should use partition_key param, got {bitsize_params}"
 
-        # Verify INSERT into cache table uses set_bit() to build the bitstring
+        # Verify INSERT into cache table uses a BITSTRING literal
         cache_insert_calls = [c for c in calls if "INSERT INTO" in get_sql_from_call(c) and CACHE_TABLE in get_sql_from_call(c)]
         assert len(cache_insert_calls) >= 1, f"Should INSERT INTO {CACHE_TABLE}"
         insert_sql = get_sql_from_call(cache_insert_calls[0])
-        # The SQL should contain set_bit calls for each integer value
-        assert "set_bit" in insert_sql, "INSERT SQL should use set_bit() to construct BITSTRING"
+        # The SQL should contain a BITSTRING literal (built as Python string, not nested set_bit)
+        assert "::BITSTRING" in insert_sql, "INSERT SQL should use a BITSTRING literal"
         # Verify the key "hash123" is passed as a parameter
         insert_params = get_params_from_call(cache_insert_calls[0])
         assert insert_params is not None
         assert "hash123" in insert_params, f"Cache INSERT params should contain key 'hash123', got {insert_params}"
-        # Verify bitsize (10000) is a parameter (used in REPEAT('0', ?) for base bitstring)
-        assert 10000 in insert_params, f"Cache INSERT params should contain bitsize 10000, got {insert_params}"
         # Verify count (4) is a parameter for partition_keys_count
         assert 4 in insert_params, f"Cache INSERT params should contain count 4, got {insert_params}"
 

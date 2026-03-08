@@ -8,6 +8,7 @@ queries table updates, and the unified "geometry" datatype.
 
 from abc import abstractmethod
 from logging import getLogger
+from typing import Literal
 
 from psycopg import sql
 from psycopg.errors import IntegrityError
@@ -91,6 +92,26 @@ class PostGISSpatialAbstractCacheHandler(PostgreSQLAbstractCacheHandler):
                 (key, partition_key),
             )
             self.db.commit()
+
+    @property
+    def spatial_filter_type(self) -> Literal["geometry", "h3_cell"]:
+        """The type of spatial filter this handler produces.
+
+        - "geometry": Returns geometry (WKB/SQL) for ST_Intersects/ST_DWithin filtering (default).
+        - "h3_cell": Returns H3 cell IDs for h3_lat_lng_to_cell membership filtering.
+
+        Subclasses override to change routing in apply_cache.py.
+        """
+        return "geometry"
+
+    @property
+    def spatial_filter_includes_buffer(self) -> bool:
+        """Whether get_spatial_filter_lazy() output already includes the buffer_distance.
+
+        When True, callers should use ST_Intersects instead of ST_DWithin to avoid
+        double-buffering. Subclasses override as needed.
+        """
+        return False
 
     @abstractmethod
     def _ensure_partition_table(self, partition_key: str, datatype: str, **kwargs) -> bool:

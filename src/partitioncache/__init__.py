@@ -10,6 +10,8 @@ from datetime import datetime
 from partitioncache.apply_cache import (
     apply_cache,
     apply_cache_lazy,
+    extend_query_with_h3_cell_filter,
+    extend_query_with_h3_cell_filter_lazy,
     extend_query_with_partition_keys,
     extend_query_with_partition_keys_lazy,
     extend_query_with_spatial_filter,
@@ -19,6 +21,7 @@ from partitioncache.apply_cache import (
 )
 from partitioncache.cache_handler import get_cache_handler
 from partitioncache.cache_handler.helper import PartitionCacheHelper, create_partitioncache_helper
+from partitioncache.query_processor import generate_all_query_hash_pairs
 
 try:
     from partitioncache.cache_handler.rocks_db_bit import RocksDBBitCacheHandler
@@ -61,7 +64,6 @@ def list_cache_types() -> dict[str, list[str]]:
     """
     # List of known handler names and their classes
     from partitioncache.cache_handler.postgis_bbox import PostGISBBoxCacheHandler
-    from partitioncache.cache_handler.postgis_h3 import PostGISH3CacheHandler
     from partitioncache.cache_handler.postgresql_array import PostgreSQLArrayCacheHandler
     from partitioncache.cache_handler.postgresql_bit import PostgreSQLBitCacheHandler
     from partitioncache.cache_handler.postgresql_roaringbit import PostgreSQLRoaringBitCacheHandler
@@ -80,7 +82,6 @@ def list_cache_types() -> dict[str, list[str]]:
         "postgresql_array": PostgreSQLArrayCacheHandler,
         "postgresql_bit": PostgreSQLBitCacheHandler,
         "postgresql_roaringbit": PostgreSQLRoaringBitCacheHandler,
-        "postgis_h3": PostGISH3CacheHandler,
         "postgis_bbox": PostGISBBoxCacheHandler,
     }
 
@@ -101,11 +102,14 @@ __all__ = [
     "extend_query_with_partition_keys_lazy",
     "extend_query_with_spatial_filter",
     "extend_query_with_spatial_filter_lazy",
+    "extend_query_with_h3_cell_filter",
+    "extend_query_with_h3_cell_filter_lazy",
     "apply_cache_lazy",
     "apply_cache",
     "push_to_original_query_queue",
     "push_to_query_fragment_queue",
     "get_queue_lengths",
+    "generate_all_query_hash_pairs",
     "PartitionCacheHelper",
     "DataType",
     "DataSet",

@@ -145,8 +145,8 @@ class TestOrderByLimitCleaning:
         for i, cleaned in enumerate(cleaned_queries[1:], 1):
             assert cleaned == base_query, f"Query {i+1} cleaning result differs from base query"
 
-    def test_preserve_important_clauses(self):
-        """Test that important clauses (WHERE, GROUP BY, HAVING) are preserved."""
+    def test_preserve_where_remove_group_by_having(self):
+        """Test that WHERE is preserved while GROUP BY, HAVING, ORDER BY, LIMIT are removed."""
         query = """
         SELECT city_id, COUNT(*) as user_count
         FROM users
@@ -158,16 +158,15 @@ class TestOrderByLimitCleaning:
         """
         result = clean_query(query)
 
-        # Should remove ORDER BY and LIMIT
+        # Should remove ORDER BY, LIMIT, GROUP BY, and HAVING
         assert "ORDER BY" not in result
         assert "LIMIT" not in result
+        assert "GROUP BY" not in result
+        assert "HAVING" not in result
 
-        # Should preserve WHERE, GROUP BY, HAVING
+        # Should preserve WHERE
         assert "WHERE" in result
-        assert "GROUP BY" in result
-        assert "HAVING" in result
         assert "active = TRUE" in result
-        assert "COUNT(*) > 10" in result
 
     def test_comments_and_formatting(self):
         """Test that comments are still removed along with ORDER BY/LIMIT."""

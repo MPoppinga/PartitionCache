@@ -78,7 +78,6 @@ DIRECT_PROCESSOR_BACKENDS = {
     "postgresql_array": ("array", "PG_ARRAY_CACHE_TABLE_PREFIX"),
     "postgresql_bit": ("bit", "PG_BIT_CACHE_TABLE_PREFIX"),
     "postgresql_roaringbit": ("roaringbit", "PG_ROARINGBIT_CACHE_TABLE_PREFIX"),
-    "postgis_h3": ("h3", "PG_H3_CACHE_TABLE_PREFIX"),
     "postgis_bbox": ("bbox", "PG_BBOX_CACHE_TABLE_PREFIX"),
 }
 

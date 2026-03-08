@@ -1,0 +1,108 @@
+name: "SSB Benchmark"
+fact_table: "lineorder"
+p0_alias: "lo"
+
+env_file: "examples/ssb_benchmark/.env"
+query_dir: "examples/ssb_benchmark/queries"
+
+data_setup:
+  script: "examples/ssb_benchmark/generate_ssb_data.py"
+  docker_compose: null
+  example_command: "python examples/ssb_benchmark/generate_ssb_data.py --scale-factor 0.01 --db-backend duckdb"
+  required_tables: ["lineorder", "customer", "supplier", "part", "date_dim"]
+
+executors:
+  duckdb:
+    enabled: true
+    default_path_template: "examples/ssb_benchmark/ssb_sf{scale_factor}.duckdb"
+  postgresql:
+    enabled: true
+
+partition_keys:
+  lo_custkey: { datatype: integer }
+  lo_suppkey: { datatype: integer }
+  lo_partkey: { datatype: integer }
+  lo_orderdate: { datatype: integer }
+
+query_partition_keys:
+  q1_1: [lo_orderdate]
+  q1_2: [lo_orderdate]
+  q1_3: [lo_orderdate]
+  q2_1: [lo_suppkey, lo_partkey]
+  q2_2: [lo_suppkey, lo_partkey]
+  q2_3: [lo_suppkey, lo_partkey]
+  q3_1: [lo_custkey, lo_suppkey, lo_orderdate]
+  q3_2: [lo_custkey, lo_suppkey, lo_orderdate]
+  q3_3: [lo_custkey, lo_suppkey, lo_orderdate]
+  q3_4: [lo_custkey, lo_suppkey, lo_orderdate]
+  q4_1: [lo_custkey, lo_suppkey, lo_partkey, lo_orderdate]
+  q4_2: [lo_custkey, lo_suppkey, lo_partkey, lo_orderdate]
+  q4_3: [lo_custkey, lo_suppkey, lo_partkey, lo_orderdate]
+  q5_1: [lo_custkey, lo_suppkey, lo_orderdate]
+  q5_2: [lo_custkey, lo_suppkey, lo_orderdate]
+  q5_3: [lo_custkey, lo_suppkey, lo_orderdate]
+  q6_1: [lo_partkey, lo_suppkey, lo_orderdate]
+  q6_2: [lo_partkey, lo_suppkey, lo_orderdate]
+  q6_3: [lo_partkey, lo_suppkey, lo_orderdate]
+  q7_1: [lo_custkey]
+  q7_2: [lo_suppkey]
+  q7_3: [lo_partkey]
+  q8_1: [lo_custkey, lo_orderdate]
+  q8_2: [lo_custkey, lo_partkey]
+  q8_3: [lo_suppkey, lo_orderdate]
+
+query_flights:
+  1: [q1_1, q1_2, q1_3]
+  2: [q2_1, q2_2, q2_3]
+  3: [q3_1, q3_2, q3_3, q3_4]
+  4: [q4_1, q4_2, q4_3]
+  5: [q5_1, q5_2, q5_3]
+  6: [q6_1, q6_2, q6_3]
+  7: [q7_1, q7_2, q7_3]
+  8: [q8_1, q8_2, q8_3]
+
+hierarchy_labels:
+  q5_1: "Region (broadest)"
+  q5_2: "Nation"
+  q5_3: "City (narrowest)"
+  q6_1: "Manufacturer (broadest)"
+  q6_2: "Category"
+  q6_3: "Brand (narrowest)"
+
+spatial_queries: []
+
+query_processing:
+  keep_all_attributes: true
+  follow_graph: false
+  strip_select: true
+  auto_detect_partition_join: false
+  skip_partition_key_joins: true
+  use_adapted_queries: true
+  adapted_subdirectory: "adapted"
+
+fragment_filter:
+  require_in_from: [lineorder]
+  exclude_from_from: []
+
+cache:
+  table_prefix: "ssb_cache"
+  bitsize_strategy: auto
+  min_bitsize: 200000
+
+backends:
+  duckdb: [duckdb_bit]
+  postgresql: [postgresql_array, postgresql_bit, postgresql_roaringbit]
+
+fact_stats:
+  strategy: count_distinct
+  table: "lineorder"
+
+modes:
+  cross_dimension:
+    phase1_flights: [3]
+    phase2_flights: [4]
+  hierarchy:
+    flights: [5, 6]
+  cold_warm:
+    flight: 3
+  representative_queries: [q1_1, q3_1, q5_1]
