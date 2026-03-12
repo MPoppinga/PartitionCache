@@ -318,6 +318,16 @@ class EnvironmentConfigManager:
         config["resolution"] = int(os.getenv("PG_H3_RESOLUTION", "9"))
         config["srid"] = int(os.getenv("PG_H3_SRID", "4326"))
 
+        # H3 cell lookup configuration (for spatial filtering at query time)
+        config["h3_cell_mode"] = os.getenv("H3_CELL_MODE", "inline")
+        h3_cell_table = os.getenv("H3_CELL_TABLE")
+        if h3_cell_table:
+            config["h3_cell_table"] = h3_cell_table
+        config["h3_cell_column"] = os.getenv("H3_CELL_COLUMN", "h3_cell_id")
+        h3_cell_id_column = os.getenv("H3_CELL_ID_COLUMN")
+        if h3_cell_id_column:
+            config["h3_cell_id_column"] = h3_cell_id_column
+
         return config
 
     @staticmethod

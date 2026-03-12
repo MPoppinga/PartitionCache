@@ -5,15 +5,16 @@ the thin RocksDictH3GroupedCacheHandler spatial subclass.
 Tests cover:
 - _build_spatial_grouped_query generates correct multi-column SELECT
 - _grouped_intersection connected-component algorithm
+- _grouped_kring_intersection k-ring expansion + cross-fragment intersection
 - RocksDictCacheHandler polymorphic set_cache/get_intersected for grouped data
-- RocksDictH3GroupedCacheHandler spatial filter (mocked PostgreSQL)
+- RocksDictH3GroupedCacheHandler H3 cell filter (mocked PostgreSQL)
 """
 
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from partitioncache.cache_handler.rocks_dict import _grouped_intersection
+from partitioncache.cache_handler.rocks_dict import _grouped_intersection, _grouped_kring_intersection
 from partitioncache.query_processor import (
     _build_spatial_grouped_query,
     generate_partial_queries,
@@ -248,6 +249,136 @@ class TestGroupedIntersection:
 
 
 # =============================================================================
+# Tests for _grouped_kring_intersection algorithm
+# =============================================================================
+
+
+class TestGroupedKringIntersection:
+    """Test the k-ring expansion + cross-fragment intersection algorithm."""
+
+    @pytest.fixture(autouse=True)
+    def _check_h3(self):
+        """Skip if h3 library is not installed."""
+        pytest.importorskip("h3")
+
+    def test_basic_two_fragments_overlapping_kring(self):
+        """Two fragments with cells that overlap after k-ring expansion."""
+        import h3
+
+        # Get two cells that are within k=2 of each other
+        center_hex = h3.latlng_to_cell(48.0, 11.0, 9)
+        neighbors = [h3.str_to_int(c) for c in h3.grid_disk(center_hex, 1)]
+        cell_a = h3.str_to_int(center_hex)
+        cell_b = neighbors[1]  # Adjacent cell
+
+        groups = [
+            [frozenset({cell_a})],
+            [frozenset({cell_b})],
+        ]
+        result = _grouped_kring_intersection(groups, k=1)
+        # Both cells expanded by k=1 should overlap
+        assert len(result) > 0
+        # Both original cells should be in the result (they're within k=1 of each other)
+        assert cell_a in result
+        assert cell_b in result
+
+    def test_no_overlap_with_k_zero(self):
+        """With k=0, non-overlapping cells should return empty (same as connected-component)."""
+        import h3
+
+        cell_a = h3.str_to_int(h3.latlng_to_cell(48.0, 11.0, 9))
+        cell_b = h3.str_to_int(h3.latlng_to_cell(48.1, 11.1, 9))  # Far enough apart
+
+        groups = [
+            [frozenset({cell_a})],
+            [frozenset({cell_b})],
+        ]
+        result = _grouped_kring_intersection(groups, k=0)
+        # k=0 means no expansion, cells are different → empty intersection
+        assert result == set()
+
+    def test_multi_city_only_correct_survives(self):
+        """Multi-city scenario: only the city with matches in ALL fragments survives."""
+        import h3
+
+        # NYC-ish cells (convert hex strings to int, matching what geom_to_h3_cell returns)
+        nyc_cell_a = h3.str_to_int(h3.latlng_to_cell(40.7, -74.0, 9))
+        nyc_cell_b = h3.str_to_int(h3.latlng_to_cell(40.71, -74.0, 9))
+
+        # LA-ish cells (far from NYC)
+        la_cell = h3.str_to_int(h3.latlng_to_cell(34.0, -118.2, 9))
+
+        # Fragment 0 has matches in both NYC and LA
+        # Fragment 1 has matches only in NYC
+        groups = [
+            [frozenset({nyc_cell_a}), frozenset({la_cell})],
+            [frozenset({nyc_cell_b})],
+        ]
+        result = _grouped_kring_intersection(groups, k=2)
+
+        # NYC cells should survive (within k=2 of each other)
+        nyc_a_disk = {h3.str_to_int(c) for c in h3.grid_disk(h3.int_to_str(nyc_cell_a), 2)}
+        nyc_b_disk = {h3.str_to_int(c) for c in h3.grid_disk(h3.int_to_str(nyc_cell_b), 2)}
+        nyc_overlap = nyc_a_disk & nyc_b_disk
+        assert len(nyc_overlap & result) > 0, "NYC area should survive intersection"
+
+        # LA cell should NOT survive (too far from any Fragment 1 match)
+        la_disk = {h3.str_to_int(c) for c in h3.grid_disk(h3.int_to_str(la_cell), 2)}
+        assert len(la_disk & result) == 0 or la_cell not in result, "LA should not survive — no Fragment 1 match nearby"
+
+    def test_k_computation_from_buffer_distance(self):
+        """Verify k computation from buffer distance and resolution."""
+        import math
+
+        import h3
+
+        resolution = 9
+        edge_length = h3.average_hexagon_edge_length(resolution, unit="m")
+
+        # 150m buffer → k=1 (since edge ~174m)
+        k_150 = math.ceil(150.0 / edge_length)
+        assert k_150 == 1
+
+        # 300m buffer → k=2
+        k_300 = math.ceil(300.0 / edge_length)
+        assert k_300 == 2
+
+        # 500m buffer → k=3
+        k_500 = math.ceil(500.0 / edge_length)
+        assert k_500 == 3
+
+    def test_single_fragment_returns_expanded_cells(self):
+        """Single fragment: return all cells expanded by k-ring."""
+        import h3
+
+        cell_hex = h3.latlng_to_cell(48.0, 11.0, 9)
+        cell = h3.str_to_int(cell_hex)
+        groups = [[frozenset({cell})]]
+        result = _grouped_kring_intersection(groups, k=1)
+
+        # Should be the full grid_disk of k=1 (as integers)
+        expected = {h3.str_to_int(c) for c in h3.grid_disk(cell_hex, 1)}
+        assert result == expected
+
+    def test_empty_fragments(self):
+        """Empty input should return empty set."""
+        assert _grouped_kring_intersection([], k=1) == set()
+
+    def test_empty_groups_in_fragment(self):
+        """Fragment with no groups: nothing can expand."""
+        import h3
+
+        cell = h3.str_to_int(h3.latlng_to_cell(48.0, 11.0, 9))
+        groups = [
+            [frozenset({cell})],
+            [],
+        ]
+        result = _grouped_kring_intersection(groups, k=1)
+        # Second fragment expands to empty set → intersection is empty
+        assert result == set()
+
+
+# =============================================================================
 # Tests for RocksDictCacheHandler with grouped data
 # =============================================================================
 
@@ -369,7 +500,7 @@ class TestRocksDictH3GroupedHandler:
         assert repr(handler) == "rocksdict_h3_grouped"
 
     def test_spatial_filter_type(self, handler):
-        assert handler.spatial_filter_type == "geometry"
+        assert handler.spatial_filter_type == "h3_cell_ids"
 
     def test_spatial_filter_includes_buffer(self, handler):
         assert handler.spatial_filter_includes_buffer is True
@@ -387,30 +518,118 @@ class TestRocksDictH3GroupedHandler:
         result = handler.geom_to_h3_cell(b"\x00\x01\x02")
         assert result is None
 
-    def test_get_spatial_filter(self, handler):
-        """get_spatial_filter reconstructs geometry from intersected cells."""
-        # Store grouped data
-        handler.set_cache("h1", [frozenset({100, 200})], "spatial_h3")
-        handler.set_cache("h2", [frozenset({200, 300})], "spatial_h3")
-
-        # Mock PostgreSQL to return WKB geometry
-        handler._mock_cursor.fetchone.return_value = (b"\x01\x02\x03\x04",)
-
-        result = handler.get_spatial_filter({"h1", "h2"}, "spatial_h3", buffer_distance=500.0)
-        assert result is not None
-        wkb, srid = result
-        assert wkb == b"\x01\x02\x03\x04"
-        assert srid == 4326
-
-    def test_get_spatial_filter_no_hits(self, handler):
-        """get_spatial_filter returns None when no cache hits."""
-        result = handler.get_spatial_filter({"nonexistent"}, "spatial_h3", buffer_distance=500.0)
+    def test_get_h3_cell_filter_no_hits(self, handler):
+        """get_h3_cell_filter returns None when no cache hits."""
+        result = handler.get_h3_cell_filter({"nonexistent"}, "spatial_h3", buffer_distance=500.0)
         assert result is None
 
-    def test_get_spatial_filter_no_overlap(self, handler):
-        """get_spatial_filter returns None when groups don't overlap."""
-        handler.set_cache("h1", [frozenset({100})], "spatial_h3")
-        handler.set_cache("h2", [frozenset({200})], "spatial_h3")
+    def test_h3_cell_mode_default(self, handler):
+        """Default h3_cell_mode should be 'inline'."""
+        assert handler.h3_cell_mode == "inline"
 
-        result = handler.get_spatial_filter({"h1", "h2"}, "spatial_h3", buffer_distance=500.0)
+    def test_h3_cell_config_attributes(self, tmp_path):
+        """H3 cell config attributes should be stored on the handler."""
+        with patch("partitioncache.cache_handler.rocksdict_h3_grouped.psycopg") as mock_psycopg:
+            mock_conn = MagicMock()
+            mock_cursor = MagicMock()
+            mock_psycopg.connect.return_value = mock_conn
+            mock_conn.cursor.return_value = mock_cursor
+
+            from partitioncache.cache_handler.rocksdict_h3_grouped import RocksDictH3GroupedCacheHandler
+
+            db_path = str(tmp_path / "test_h3_config.rocksdb")
+            h = RocksDictH3GroupedCacheHandler(
+                db_path=db_path,
+                db_name="test",
+                db_host="localhost",
+                db_user="test",
+                db_password="test",
+                db_port=5432,
+                h3_cell_mode="mv",
+                h3_cell_table="pois_h3_cells",
+                h3_cell_column="h3_cell_id",
+                h3_cell_id_column="id",
+            )
+            assert h.h3_cell_mode == "mv"
+            assert h.h3_cell_table == "pois_h3_cells"
+            assert h.h3_cell_column == "h3_cell_id"
+            assert h.h3_cell_id_column == "id"
+            h.db.close()
+
+
+class TestRocksDictH3GroupedHandlerKring:
+    """Test get_h3_cell_filter with actual H3 k-ring expansion."""
+
+    @pytest.fixture(autouse=True)
+    def _check_h3(self):
+        """Skip if h3 library is not installed."""
+        pytest.importorskip("h3")
+
+    @pytest.fixture
+    def handler(self, tmp_path):
+        """Create handler with mocked PostgreSQL connection."""
+        with patch("partitioncache.cache_handler.rocksdict_h3_grouped.psycopg") as mock_psycopg:
+            mock_conn = MagicMock()
+            mock_cursor = MagicMock()
+            mock_psycopg.connect.return_value = mock_conn
+            mock_conn.cursor.return_value = mock_cursor
+
+            from partitioncache.cache_handler.rocksdict_h3_grouped import RocksDictH3GroupedCacheHandler
+
+            db_path = str(tmp_path / "test_h3_kring.rocksdb")
+            h = RocksDictH3GroupedCacheHandler(
+                db_path=db_path,
+                db_name="test",
+                db_host="localhost",
+                db_user="test",
+                db_password="test",
+                db_port=5432,
+                resolution=9,
+                srid=4326,
+            )
+            h.register_partition_key("spatial_h3", "geometry")
+            yield h
+            h.db.close()
+
+    def test_get_h3_cell_filter_single_fragment(self, handler):
+        """Single fragment with k-ring expansion."""
+        import h3
+
+        cell = h3.str_to_int(h3.latlng_to_cell(48.0, 11.0, 9))
+        handler.set_cache("h1", [frozenset({cell})], "spatial_h3")
+
+        result = handler.get_h3_cell_filter({"h1"}, "spatial_h3", buffer_distance=200.0)
+        assert result is not None
+        # Should include the original cell and its k-ring neighbors
+        assert cell in result
+        assert len(result) > 1  # k=2 for 200m at res 9
+
+    def test_get_h3_cell_filter_two_fragments_overlapping(self, handler):
+        """Two fragments with overlapping k-rings."""
+        import h3
+
+        center_hex = h3.latlng_to_cell(48.0, 11.0, 9)
+        neighbors = [h3.str_to_int(c) for c in h3.grid_disk(center_hex, 1)]
+        cell_a = h3.str_to_int(center_hex)
+        cell_b = neighbors[1]
+
+        handler.set_cache("h1", [frozenset({cell_a})], "spatial_h3")
+        handler.set_cache("h2", [frozenset({cell_b})], "spatial_h3")
+
+        result = handler.get_h3_cell_filter({"h1", "h2"}, "spatial_h3", buffer_distance=200.0)
+        assert result is not None
+        assert len(result) > 0
+
+    def test_get_h3_cell_filter_zero_buffer(self, handler):
+        """Zero buffer distance means k=0 (no expansion)."""
+        import h3
+
+        cell_a = h3.str_to_int(h3.latlng_to_cell(48.0, 11.0, 9))
+        cell_b = h3.str_to_int(h3.latlng_to_cell(48.1, 11.1, 9))
+
+        handler.set_cache("h1", [frozenset({cell_a})], "spatial_h3")
+        handler.set_cache("h2", [frozenset({cell_b})], "spatial_h3")
+
+        result = handler.get_h3_cell_filter({"h1", "h2"}, "spatial_h3", buffer_distance=0.0)
+        # Different cells with k=0 → empty intersection
         assert result is None

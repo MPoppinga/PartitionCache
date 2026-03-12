@@ -964,6 +964,126 @@ def extend_query_with_h3_cell_filter(
     return prep_sql + parsed_query.sql()
 
 
+def extend_query_with_h3_cell_lookup(
+    query: str,
+    cell_ids: set[int],
+    cell_mode: str = "inline",
+    h3_cell_table: str | None = None,
+    h3_cell_column: str = "h3_cell_id",
+    h3_cell_id_column: str | None = None,
+    p0_alias: str | None = None,
+    geometry_column: str | None = None,
+    srid: int = 4326,
+    resolution: int = 9,
+    filter_all_tables: bool = True,
+) -> str:
+    """
+    Filter query via H3 cell ID lookup. Supports MV, direct column, and inline modes.
+
+    For cross-join queries (e.g., ``FROM pois p1, pois p2``), filtering only p0 leaves
+    the planner without cardinality info for other tables, often causing bad join order
+    choices. When ``filter_all_tables=True`` (default), all table aliases referencing
+    the same base table as p0 are filtered, giving the planner accurate cardinality
+    estimates for all sides of the join.
+
+    Args:
+        query: The original SQL query.
+        cell_ids: Set of H3 cell IDs to filter against.
+        cell_mode: Lookup mode — "mv" (materialized view JOIN), "column" (direct column
+            on fact table), or "inline" (h3_lat_lng_to_cell per row, no pre-computation).
+        h3_cell_table: Table/view containing pre-computed H3 cell IDs (required for "mv").
+        h3_cell_column: H3 cell column name in the lookup table or fact table.
+        h3_cell_id_column: Entity ID column in the MV, matching the fact table PK (required for "mv").
+        p0_alias: Table alias to apply filter to. If None, auto-detected.
+        geometry_column: Geometry column name (required for "inline" mode).
+        srid: SRID of the geometry data.
+        resolution: H3 resolution level.
+        filter_all_tables: If True (default), apply H3 cell filter to ALL table aliases
+            that reference the same base table as p0. Critical for cross-join performance.
+
+    Returns:
+        The extended SQL query with H3 cell filtering.
+    """
+    if not cell_ids:
+        return query
+
+    if cell_mode == "inline":
+        if geometry_column is None:
+            raise ValueError("geometry_column required for inline H3 cell mode")
+        return extend_query_with_h3_cell_filter(
+            query=query,
+            cell_ids=cell_ids,
+            geometry_column=geometry_column,
+            srid=srid,
+            resolution=resolution,
+            p0_alias=p0_alias,
+        )
+
+    parsed_query = sqlglot.parse_one(query)
+
+    if p0_alias is None:
+        first_table = parsed_query.find(exp.Table)
+        if first_table is None:
+            raise ValueError("No table found in query")
+        p0_alias = first_table.alias_or_name
+
+    # Determine which table aliases to filter
+    aliases_to_filter = [p0_alias]
+    if filter_all_tables:
+        # Find the base table name for p0
+        p0_base_table = None
+        for table in parsed_query.find_all(exp.Table):
+            if table.alias_or_name == p0_alias:
+                p0_base_table = table.name
+                break
+
+        if p0_base_table:
+            # Find all other aliases referencing the same base table
+            for table in parsed_query.find_all(exp.Table):
+                alias = table.alias_or_name
+                if alias != p0_alias and table.name == p0_base_table:
+                    aliases_to_filter.append(alias)
+            if len(aliases_to_filter) > 1:
+                logger.info(f"H3 cell filter: filtering {len(aliases_to_filter)} table aliases: {aliases_to_filter}")
+
+    tmp_table = f"_pcache_h3_cells_{random.randint(100000, 999999)}"
+
+    # Build VALUES clause for cell IDs
+    values_list = ", ".join(f"({cell_id}::bigint)" for cell_id in sorted(cell_ids))
+
+    prep_sql = (
+        f"DROP TABLE IF EXISTS {tmp_table}; "
+        f"CREATE TEMPORARY TABLE {tmp_table} AS SELECT cell FROM (VALUES {values_list}) AS v(cell); "
+        f"CREATE INDEX ON {tmp_table} USING btree (cell); "
+        f"ANALYZE {tmp_table}; "
+    )
+
+    if cell_mode == "mv":
+        if h3_cell_table is None:
+            raise ValueError("h3_cell_table required for mv H3 cell mode")
+        if h3_cell_id_column is None:
+            raise ValueError("h3_cell_id_column required for mv H3 cell mode")
+
+    # Add H3 cell filter for each alias
+    for alias in aliases_to_filter:
+        if cell_mode == "mv":
+            spatial_condition = (
+                f"{alias}.{h3_cell_id_column} IN ("
+                f"SELECT {h3_cell_id_column} FROM {h3_cell_table} "
+                f"WHERE {h3_cell_column} IN (SELECT cell FROM {tmp_table})"
+                f")"
+            )
+        elif cell_mode == "column":
+            spatial_condition = f"{alias}.{h3_cell_column} IN (SELECT cell FROM {tmp_table})"
+        else:
+            raise ValueError(f"Unsupported H3 cell mode: {cell_mode}. Use 'mv', 'column', or 'inline'.")
+
+        spatial_expr = sqlglot.parse_one(spatial_condition)
+        _add_where_condition(parsed_query, spatial_expr)
+
+    return prep_sql + parsed_query.sql()
+
+
 def apply_cache_lazy(
     query: str,
     cache_handler: AbstractCacheHandler_Lazy,
@@ -1073,46 +1193,73 @@ def apply_cache_lazy(
             if buffer_distance == 0.0:
                 raise ValueError("buffer_distance is required when geometry_column is set and query has no distance constraints")
 
-        if not hasattr(cache_handler, "get_spatial_filter_lazy"):
-            raise ValueError("Cache handler does not support spatial filtering (missing get_spatial_filter_lazy method)")
-
-        spatial_filter_sql = cache_handler.get_spatial_filter_lazy(  # type: ignore[attr-defined]
-            keys=existing_hashes,
-            partition_key=partition_key,
-            buffer_distance=buffer_distance,
-        )
-
-        if not spatial_filter_sql:
-            return query, stats
-
         srid = getattr(cache_handler, "srid", 4326)
         spatial_filter_type = getattr(cache_handler, "spatial_filter_type", "geometry")
 
-        if spatial_filter_type == "h3_cell":
-            resolution = getattr(cache_handler, "resolution", 9)
-            enhanced_query = extend_query_with_h3_cell_filter_lazy(
+        if spatial_filter_type == "h3_cell_ids":
+            # Pure H3 cell IDs path — k-ring expansion in Python, no PostGIS at query time
+            if not hasattr(cache_handler, "get_h3_cell_filter"):
+                raise ValueError("Cache handler does not support H3 cell filtering (missing get_h3_cell_filter method)")
+
+            cell_ids = cache_handler.get_h3_cell_filter(  # type: ignore[attr-defined]
+                keys=existing_hashes,
+                partition_key=partition_key,
+                buffer_distance=buffer_distance,
+            )
+            if not cell_ids:
+                return query, stats
+
+            enhanced_query = extend_query_with_h3_cell_lookup(
                 query=query,
-                cell_sql=spatial_filter_sql,
+                cell_ids=cell_ids,
+                cell_mode=getattr(cache_handler, "h3_cell_mode", "inline"),
+                h3_cell_table=getattr(cache_handler, "h3_cell_table", None),
+                h3_cell_column=getattr(cache_handler, "h3_cell_column", "h3_cell_id"),
+                h3_cell_id_column=getattr(cache_handler, "h3_cell_id_column", None),
+                p0_alias=p0_alias,
                 geometry_column=geometry_column,
                 srid=srid,
-                resolution=resolution,
-                p0_alias=p0_alias,
+                resolution=getattr(cache_handler, "resolution", 9),
             )
         else:
-            use_intersects = getattr(cache_handler, "spatial_filter_includes_buffer", False)
-            enhanced_query = extend_query_with_spatial_filter_lazy(
-                query=query,
-                spatial_filter_sql=spatial_filter_sql,
-                geometry_column=geometry_column,
+            # Existing paths: geometry or h3_cell (inline)
+            if not hasattr(cache_handler, "get_spatial_filter_lazy"):
+                raise ValueError("Cache handler does not support spatial filtering (missing get_spatial_filter_lazy method)")
+
+            spatial_filter_sql = cache_handler.get_spatial_filter_lazy(  # type: ignore[attr-defined]
+                keys=existing_hashes,
+                partition_key=partition_key,
                 buffer_distance=buffer_distance,
-                srid=srid,
-                p0_alias=p0_alias,
-                auto_detect_partition_join=auto_detect_partition_join,
-                partition_join_table=partition_join_table,
-                use_intersects=use_intersects,
-                spatial_method=spatial_method,
-                subdivide_max_vertices=subdivide_max_vertices,
             )
+
+            if not spatial_filter_sql:
+                return query, stats
+
+            if spatial_filter_type == "h3_cell":
+                resolution = getattr(cache_handler, "resolution", 9)
+                enhanced_query = extend_query_with_h3_cell_filter_lazy(
+                    query=query,
+                    cell_sql=spatial_filter_sql,
+                    geometry_column=geometry_column,
+                    srid=srid,
+                    resolution=resolution,
+                    p0_alias=p0_alias,
+                )
+            else:
+                use_intersects = getattr(cache_handler, "spatial_filter_includes_buffer", False)
+                enhanced_query = extend_query_with_spatial_filter_lazy(
+                    query=query,
+                    spatial_filter_sql=spatial_filter_sql,
+                    geometry_column=geometry_column,
+                    buffer_distance=buffer_distance,
+                    srid=srid,
+                    p0_alias=p0_alias,
+                    auto_detect_partition_join=auto_detect_partition_join,
+                    partition_join_table=partition_join_table,
+                    use_intersects=use_intersects,
+                    spatial_method=spatial_method,
+                    subdivide_max_vertices=subdivide_max_vertices,
+                )
 
         stats["enhanced"] = 1
         return enhanced_query, stats
@@ -1288,14 +1435,11 @@ def apply_cache(
     is_spatial = geometry_column is not None
 
     if is_spatial:
-        # Spatial path: generate hashes with spatial params, get WKB filter, apply via ST_DWithin
+        # Spatial path: generate hashes with spatial params, apply spatial filter
         if buffer_distance is None:
             buffer_distance = compute_buffer_distance(query)
             if buffer_distance == 0.0:
                 raise ValueError("buffer_distance is required when geometry_column is set and query has no distance constraints")
-
-        if not hasattr(cache_handler, "get_spatial_filter"):
-            raise ValueError("Cache handler does not support spatial filtering (missing get_spatial_filter method)")
 
         # Step 1: Generate hashes with spatial params
         cache_entry_hashes = generate_all_hashes(
@@ -1318,53 +1462,84 @@ def apply_cache(
         generated_variants = len(cache_entry_hashes)
         stats: dict[str, int] = {"generated_variants": generated_variants, "cache_hits": 0, "enhanced": 0, "p0_rewritten": 0}
 
-        # Step 2: Get pre-computed spatial filter from cache handler
-        spatial_result = cache_handler.get_spatial_filter(  # type: ignore[attr-defined]
-            keys=set(cache_entry_hashes),
-            partition_key=partition_key,
-            buffer_distance=buffer_distance,
-        )
-
-        if not spatial_result:
-            logger.info(f"No spatial cache hits found for query. Generated {generated_variants} subqueries")
-            return query, stats
-
-        # Count cache hits (similar to lazy path logic)
+        # Count cache hits
         used_hashes = len(cache_handler.filter_existing_keys(set(cache_entry_hashes), partition_key))  # type: ignore[attr-defined]
         stats["cache_hits"] = used_hashes
 
-        # Step 3: Apply spatial filter to query — route by spatial_filter_type
+        if used_hashes == 0:
+            logger.info(f"No spatial cache hits found for query. Generated {generated_variants} subqueries")
+            return query, stats
+
+        # Step 2: Route by spatial_filter_type
         srid = getattr(cache_handler, "srid", 4326)
         spatial_filter_type = getattr(cache_handler, "spatial_filter_type", "geometry")
 
-        if spatial_filter_type == "h3_cell":
-            # H3 path: spatial_result is set[int] (cell IDs)
-            resolution = getattr(cache_handler, "resolution", 9)
-            enhanced_query = extend_query_with_h3_cell_filter(
+        if spatial_filter_type == "h3_cell_ids":
+            # Pure H3 cell IDs path — k-ring expansion in Python, no PostGIS at query time
+            if not hasattr(cache_handler, "get_h3_cell_filter"):
+                raise ValueError("Cache handler does not support H3 cell filtering (missing get_h3_cell_filter method)")
+
+            cell_ids = cache_handler.get_h3_cell_filter(  # type: ignore[attr-defined]
+                keys=set(cache_entry_hashes),
+                partition_key=partition_key,
+                buffer_distance=buffer_distance,
+            )
+            if not cell_ids:
+                return query, stats
+
+            enhanced_query = extend_query_with_h3_cell_lookup(
                 query=query,
-                cell_ids=spatial_result,
+                cell_ids=cell_ids,
+                cell_mode=getattr(cache_handler, "h3_cell_mode", "inline"),
+                h3_cell_table=getattr(cache_handler, "h3_cell_table", None),
+                h3_cell_column=getattr(cache_handler, "h3_cell_column", "h3_cell_id"),
+                h3_cell_id_column=getattr(cache_handler, "h3_cell_id_column", None),
+                p0_alias=p0_alias,
                 geometry_column=geometry_column,
                 srid=srid,
-                resolution=resolution,
-                p0_alias=p0_alias,
+                resolution=getattr(cache_handler, "resolution", 9),
             )
         else:
-            # Geometry path: spatial_result is (WKB bytes, SRID)
-            spatial_filter_wkb, spatial_srid = spatial_result
-            use_intersects = getattr(cache_handler, "spatial_filter_includes_buffer", False)
-            enhanced_query = extend_query_with_spatial_filter(
-                query=query,
-                spatial_filter_wkb=spatial_filter_wkb,
-                geometry_column=geometry_column,
+            # Existing paths: geometry or h3_cell (inline)
+            if not hasattr(cache_handler, "get_spatial_filter"):
+                raise ValueError("Cache handler does not support spatial filtering (missing get_spatial_filter method)")
+
+            spatial_result = cache_handler.get_spatial_filter(  # type: ignore[attr-defined]
+                keys=set(cache_entry_hashes),
+                partition_key=partition_key,
                 buffer_distance=buffer_distance,
-                srid=spatial_srid,
-                p0_alias=p0_alias,
-                auto_detect_partition_join=auto_detect_partition_join,
-                partition_join_table=partition_join_table,
-                use_intersects=use_intersects,
-                spatial_method=spatial_method,
-                subdivide_max_vertices=subdivide_max_vertices,
             )
+            if not spatial_result:
+                return query, stats
+
+            if spatial_filter_type == "h3_cell":
+                # H3 path: spatial_result is set[int] (cell IDs)
+                resolution = getattr(cache_handler, "resolution", 9)
+                enhanced_query = extend_query_with_h3_cell_filter(
+                    query=query,
+                    cell_ids=spatial_result,
+                    geometry_column=geometry_column,
+                    srid=srid,
+                    resolution=resolution,
+                    p0_alias=p0_alias,
+                )
+            else:
+                # Geometry path: spatial_result is (WKB bytes, SRID)
+                spatial_filter_wkb, spatial_srid = spatial_result
+                use_intersects = getattr(cache_handler, "spatial_filter_includes_buffer", False)
+                enhanced_query = extend_query_with_spatial_filter(
+                    query=query,
+                    spatial_filter_wkb=spatial_filter_wkb,
+                    geometry_column=geometry_column,
+                    buffer_distance=buffer_distance,
+                    srid=spatial_srid,
+                    p0_alias=p0_alias,
+                    auto_detect_partition_join=auto_detect_partition_join,
+                    partition_join_table=partition_join_table,
+                    use_intersects=use_intersects,
+                    spatial_method=spatial_method,
+                    subdivide_max_vertices=subdivide_max_vertices,
+                )
 
         stats["enhanced"] = 1
         logger.info(f"Successfully enhanced query with spatial cache. Generated {generated_variants} subqueries, {used_hashes} cache hits")
