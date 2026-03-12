@@ -21,6 +21,7 @@ from partitioncache.apply_cache import (
     apply_cache_lazy,
     extend_query_with_h3_cell_filter,
     extend_query_with_h3_cell_filter_lazy,
+    extend_query_with_h3_cell_lookup,
     extend_query_with_spatial_filter,
     extend_query_with_spatial_filter_lazy,
 )
@@ -1587,6 +1588,8 @@ class TestApplyCacheSpatialMode:
 
         handler = MagicMock(spec=AbstractCacheHandler)
         del handler.get_spatial_filter
+        # Ensure cache hits are found so code reaches the get_spatial_filter check
+        handler.filter_existing_keys.return_value = ["hash1"]
 
         with pytest.raises(ValueError, match="does not support spatial filtering"):
             apply_cache(
@@ -2349,3 +2352,318 @@ class TestSpatialFilterTypeProperty:
         handler = MagicMock(spec=PostGISSpatialAbstractCacheHandler)
         handler.spatial_filter_type = PostGISSpatialAbstractCacheHandler.spatial_filter_type.fget(handler)  # type: ignore[union-attr]
         assert handler.spatial_filter_type == "geometry"
+
+
+# =============================================================================
+# Tests for extend_query_with_h3_cell_lookup
+# =============================================================================
+
+
+class TestExtendQueryWithH3CellLookup:
+    """Test extend_query_with_h3_cell_lookup with mv, column, and inline modes."""
+
+    QUERY = "SELECT * FROM poi AS p1 WHERE p1.type = 'restaurant'"
+    CELL_IDS = {617700169518678015, 617700169518678016, 617700169518678017}
+
+    def test_inline_mode_delegates_to_h3_cell_filter(self):
+        """Inline mode should delegate to extend_query_with_h3_cell_filter."""
+        result = extend_query_with_h3_cell_lookup(
+            query=self.QUERY,
+            cell_ids=self.CELL_IDS,
+            cell_mode="inline",
+            geometry_column="geom",
+            srid=4326,
+            resolution=9,
+            p0_alias="p1",
+        )
+        result_upper = result.upper()
+        assert "H3_LAT_LNG_TO_CELL" in result_upper
+        assert "_PCACHE_H3_CELLS_" in result_upper
+        assert "BTREE" in result_upper
+
+    def test_mv_mode_generates_join_lookup(self):
+        """MV mode should generate IN subquery with MV table."""
+        result = extend_query_with_h3_cell_lookup(
+            query=self.QUERY,
+            cell_ids=self.CELL_IDS,
+            cell_mode="mv",
+            h3_cell_table="poi_h3_cells",
+            h3_cell_column="h3_cell_id",
+            h3_cell_id_column="id",
+            p0_alias="p1",
+        )
+        result_upper = result.upper()
+        # Should have temp table setup
+        assert "_PCACHE_H3_CELLS_" in result_upper
+        assert "CREATE TEMPORARY TABLE" in result_upper
+        assert "BTREE" in result_upper
+        # Should have IN subquery referencing MV
+        assert "POI_H3_CELLS" in result_upper
+        assert "H3_CELL_ID" in result_upper
+        assert "P1.ID IN" in result_upper
+        # Should NOT have h3_lat_lng_to_cell (no per-row computation)
+        assert "H3_LAT_LNG_TO_CELL" not in result_upper
+
+    def test_column_mode_generates_direct_lookup(self):
+        """Column mode should generate direct column IN clause."""
+        result = extend_query_with_h3_cell_lookup(
+            query=self.QUERY,
+            cell_ids=self.CELL_IDS,
+            cell_mode="column",
+            h3_cell_column="h3_cell_9",
+            p0_alias="p1",
+        )
+        result_upper = result.upper()
+        # Should have temp table setup
+        assert "_PCACHE_H3_CELLS_" in result_upper
+        assert "CREATE TEMPORARY TABLE" in result_upper
+        # Should have direct column lookup
+        assert "P1.H3_CELL_9 IN" in result_upper
+        # Should NOT have h3_lat_lng_to_cell
+        assert "H3_LAT_LNG_TO_CELL" not in result_upper
+        # Should NOT reference any external table (direct column on fact table)
+        assert "POI_H3_CELLS" not in result_upper
+
+    def test_mv_mode_requires_table(self):
+        """MV mode without h3_cell_table should raise ValueError."""
+        with pytest.raises(ValueError, match="h3_cell_table required"):
+            extend_query_with_h3_cell_lookup(
+                query=self.QUERY,
+                cell_ids=self.CELL_IDS,
+                cell_mode="mv",
+                h3_cell_table=None,
+                h3_cell_id_column="id",
+                p0_alias="p1",
+            )
+
+    def test_mv_mode_requires_id_column(self):
+        """MV mode without h3_cell_id_column should raise ValueError."""
+        with pytest.raises(ValueError, match="h3_cell_id_column required"):
+            extend_query_with_h3_cell_lookup(
+                query=self.QUERY,
+                cell_ids=self.CELL_IDS,
+                cell_mode="mv",
+                h3_cell_table="poi_h3_cells",
+                h3_cell_id_column=None,
+                p0_alias="p1",
+            )
+
+    def test_inline_mode_requires_geometry_column(self):
+        """Inline mode without geometry_column should raise ValueError."""
+        with pytest.raises(ValueError, match="geometry_column required"):
+            extend_query_with_h3_cell_lookup(
+                query=self.QUERY,
+                cell_ids=self.CELL_IDS,
+                cell_mode="inline",
+                geometry_column=None,
+                p0_alias="p1",
+            )
+
+    def test_invalid_mode_raises(self):
+        """Invalid cell_mode should raise ValueError."""
+        with pytest.raises(ValueError, match="Unsupported H3 cell mode"):
+            extend_query_with_h3_cell_lookup(
+                query=self.QUERY,
+                cell_ids=self.CELL_IDS,
+                cell_mode="invalid",
+                p0_alias="p1",
+            )
+
+    def test_empty_cell_ids_returns_original(self):
+        """Empty cell_ids should return the original query."""
+        result = extend_query_with_h3_cell_lookup(
+            query=self.QUERY,
+            cell_ids=set(),
+            cell_mode="column",
+            p0_alias="p1",
+        )
+        assert result == self.QUERY
+
+    def test_auto_detect_alias(self):
+        """When p0_alias is None, should auto-detect from query."""
+        result = extend_query_with_h3_cell_lookup(
+            query=self.QUERY,
+            cell_ids=self.CELL_IDS,
+            cell_mode="column",
+            h3_cell_column="h3_cell_9",
+            p0_alias=None,
+        )
+        # Should still work (auto-detect "p1" from query)
+        assert "P1.H3_CELL_9 IN" in result.upper()
+
+    def test_mv_mode_with_metric_srid(self):
+        """MV mode should work regardless of SRID (no per-row computation)."""
+        result = extend_query_with_h3_cell_lookup(
+            query=self.QUERY,
+            cell_ids=self.CELL_IDS,
+            cell_mode="mv",
+            h3_cell_table="poi_h3_cells",
+            h3_cell_column="h3_cell_id",
+            h3_cell_id_column="id",
+            p0_alias="p1",
+            srid=25832,
+        )
+        # MV mode shouldn't care about SRID — it's a pre-computed lookup
+        assert "POI_H3_CELLS" in result.upper()
+        assert "ST_TRANSFORM" not in result.upper()
+
+    def test_column_mode_filters_all_same_base_tables(self):
+        """Column mode with filter_all_tables should filter all aliases of the same base table."""
+        cross_join_query = "SELECT * FROM poi AS p1, poi AS p2 WHERE ST_DWithin(p1.geom, p2.geom, 300)"
+        result = extend_query_with_h3_cell_lookup(
+            query=cross_join_query,
+            cell_ids=self.CELL_IDS,
+            cell_mode="column",
+            h3_cell_column="h3_cell_9",
+            p0_alias="p1",
+            filter_all_tables=True,
+        )
+        result_upper = result.upper()
+        # Both p1 and p2 should be filtered
+        assert "P1.H3_CELL_9 IN" in result_upper
+        assert "P2.H3_CELL_9 IN" in result_upper
+
+    def test_mv_mode_filters_all_same_base_tables(self):
+        """MV mode with filter_all_tables should filter all aliases of the same base table."""
+        cross_join_query = "SELECT * FROM poi AS p1, poi AS p2 WHERE ST_DWithin(p1.geom, p2.geom, 300)"
+        result = extend_query_with_h3_cell_lookup(
+            query=cross_join_query,
+            cell_ids=self.CELL_IDS,
+            cell_mode="mv",
+            h3_cell_table="poi_h3_cells",
+            h3_cell_column="h3_cell_id",
+            h3_cell_id_column="id",
+            p0_alias="p1",
+            filter_all_tables=True,
+        )
+        result_upper = result.upper()
+        # Both p1 and p2 should be filtered via MV
+        assert "P1.ID IN" in result_upper
+        assert "P2.ID IN" in result_upper
+
+    def test_filter_all_tables_skips_different_base_tables(self):
+        """filter_all_tables should not filter tables with different base names."""
+        mixed_query = "SELECT * FROM poi AS p1, categories AS c1 WHERE p1.cat_id = c1.id"
+        result = extend_query_with_h3_cell_lookup(
+            query=mixed_query,
+            cell_ids=self.CELL_IDS,
+            cell_mode="column",
+            h3_cell_column="h3_cell_9",
+            p0_alias="p1",
+            filter_all_tables=True,
+        )
+        result_upper = result.upper()
+        # p1 should be filtered
+        assert "P1.H3_CELL_9 IN" in result_upper
+        # c1 should NOT be filtered (different base table)
+        assert "C1.H3_CELL_9 IN" not in result_upper
+
+    def test_filter_all_tables_disabled(self):
+        """When filter_all_tables=False, only p0 should be filtered."""
+        cross_join_query = "SELECT * FROM poi AS p1, poi AS p2 WHERE ST_DWithin(p1.geom, p2.geom, 300)"
+        result = extend_query_with_h3_cell_lookup(
+            query=cross_join_query,
+            cell_ids=self.CELL_IDS,
+            cell_mode="column",
+            h3_cell_column="h3_cell_9",
+            p0_alias="p1",
+            filter_all_tables=False,
+        )
+        result_upper = result.upper()
+        assert "P1.H3_CELL_9 IN" in result_upper
+        assert "P2.H3_CELL_9 IN" not in result_upper
+
+    def test_single_table_query_unchanged_behavior(self):
+        """Single-table queries should work the same regardless of filter_all_tables."""
+        result = extend_query_with_h3_cell_lookup(
+            query=self.QUERY,
+            cell_ids=self.CELL_IDS,
+            cell_mode="column",
+            h3_cell_column="h3_cell_9",
+            p0_alias="p1",
+            filter_all_tables=True,
+        )
+        result_upper = result.upper()
+        assert "P1.H3_CELL_9 IN" in result_upper
+        # Only one filter condition (no other aliases of same table)
+        assert result_upper.count("H3_CELL_9 IN") == 1
+
+
+class TestApplyCacheH3CellIdsRouting:
+    """Test that apply_cache and apply_cache_lazy correctly route h3_cell_ids type."""
+
+    QUERY = "SELECT * FROM pois AS p1, pois AS p2 WHERE ST_DWithin(p1.geom, p2.geom, 300) AND p1.type = 'cafe'"
+
+    def _make_h3_cell_ids_handler(self):
+        """Create a mock handler with h3_cell_ids spatial filter type."""
+        handler = MagicMock()
+        handler.spatial_filter_type = "h3_cell_ids"
+        handler.spatial_filter_includes_buffer = True
+        handler.srid = 4326
+        handler.resolution = 9
+        handler.h3_cell_mode = "column"
+        handler.h3_cell_table = None
+        handler.h3_cell_column = "h3_cell_9"
+        handler.h3_cell_id_column = None
+        handler.get_h3_cell_filter.return_value = {100, 200, 300}
+        handler.filter_existing_keys.return_value = ["hash1", "hash2"]
+        return handler
+
+    @patch.object(_apply_cache_module, "generate_all_hashes")
+    def test_apply_cache_routes_h3_cell_ids(self, mock_gen_hashes):
+        """apply_cache() should route h3_cell_ids to get_h3_cell_filter + extend_query_with_h3_cell_lookup."""
+        mock_gen_hashes.return_value = ["hash1", "hash2"]
+        handler = self._make_h3_cell_ids_handler()
+
+        result_query, stats = apply_cache(
+            query=self.QUERY,
+            cache_handler=handler,
+            partition_key="spatial_h3",
+            geometry_column="geom",
+            buffer_distance=300.0,
+        )
+
+        # Should have called get_h3_cell_filter, NOT get_spatial_filter
+        handler.get_h3_cell_filter.assert_called_once()
+        handler.get_spatial_filter.assert_not_called()
+        assert stats["enhanced"] == 1
+        # The query should contain H3 cell lookup elements
+        assert "_PCACHE_H3_CELLS_" in result_query.upper()
+
+    @patch.object(_apply_cache_module, "generate_all_hashes")
+    def test_apply_cache_lazy_routes_h3_cell_ids(self, mock_gen_hashes):
+        """apply_cache_lazy() should route h3_cell_ids to get_h3_cell_filter + extend_query_with_h3_cell_lookup."""
+        mock_gen_hashes.return_value = ["hash1", "hash2"]
+        handler = self._make_h3_cell_ids_handler()
+
+        result_query, stats = apply_cache_lazy(
+            query=self.QUERY,
+            cache_handler=handler,
+            partition_key="spatial_h3",
+            geometry_column="geom",
+            buffer_distance=300.0,
+        )
+
+        # Should have called get_h3_cell_filter, NOT get_spatial_filter_lazy
+        handler.get_h3_cell_filter.assert_called_once()
+        handler.get_spatial_filter_lazy.assert_not_called()
+        assert stats["enhanced"] == 1
+        assert "_PCACHE_H3_CELLS_" in result_query.upper()
+
+    @patch.object(_apply_cache_module, "generate_all_hashes")
+    def test_apply_cache_h3_cell_ids_no_results(self, mock_gen_hashes):
+        """apply_cache() with h3_cell_ids returns original query when no cell IDs."""
+        mock_gen_hashes.return_value = ["hash1"]
+        handler = self._make_h3_cell_ids_handler()
+        handler.get_h3_cell_filter.return_value = None
+
+        result_query, stats = apply_cache(
+            query=self.QUERY,
+            cache_handler=handler,
+            partition_key="spatial_h3",
+            geometry_column="geom",
+            buffer_distance=300.0,
+        )
+
+        assert result_query == self.QUERY
+        assert stats["enhanced"] == 0

@@ -2,8 +2,9 @@
 RocksDict H3 Grouped Spatial Cache Handler.
 
 Thin subclass of RocksDictCacheHandler that adds:
-- PostgreSQL connection for H3 cell conversion and geometry reconstruction
-- get_spatial_filter() for apply_cache() integration
+- PostgreSQL connection for H3 cell conversion during cache population
+- get_h3_cell_filter() for pure H3 cell-based spatial filtering (no PostGIS at query time)
+- K-ring expansion for approximate spatial buffering
 - spatial_filter_type / spatial_filter_includes_buffer properties
 
 All storage and intersection logic lives in RocksDictCacheHandler, which
@@ -13,12 +14,13 @@ connected-component intersection.
 
 from __future__ import annotations
 
+import math
 from logging import getLogger
 
 import psycopg
 from psycopg import sql
 
-from partitioncache.cache_handler.rocks_dict import RocksDictCacheHandler
+from partitioncache.cache_handler.rocks_dict import RocksDictCacheHandler, _grouped_kring_intersection
 
 logger = getLogger("PartitionCache")
 
@@ -29,9 +31,12 @@ class RocksDictH3GroupedCacheHandler(RocksDictCacheHandler):
 
     Adds PostgreSQL connection for:
     - Converting geometry (WKB) to H3 cell IDs during cache population
-    - Reconstructing geometry from surviving H3 cells for spatial filtering
 
-    Requires: PostgreSQL + PostGIS + h3-pg extension.
+    Spatial filtering uses pure H3 cell IDs with k-ring expansion (Python h3 library).
+    No PostGIS required at query/filter time.
+
+    Requires: PostgreSQL + h3-pg extension (for cache population).
+    Requires: Python h3 library (for k-ring expansion at filter time).
     """
 
     _instance = None
@@ -48,12 +53,20 @@ class RocksDictH3GroupedCacheHandler(RocksDictCacheHandler):
         db_port: str | int,
         resolution: int = 9,
         srid: int = 4326,
+        h3_cell_mode: str = "inline",
+        h3_cell_table: str | None = None,
+        h3_cell_column: str = "h3_cell_id",
+        h3_cell_id_column: str | None = None,
         read_only: bool = False,
     ) -> None:
         super().__init__(db_path, read_only=read_only)
 
         self.resolution = resolution
         self.srid = srid
+        self.h3_cell_mode = h3_cell_mode
+        self.h3_cell_table = h3_cell_table
+        self.h3_cell_column = h3_cell_column
+        self.h3_cell_id_column = h3_cell_id_column
 
         self.pg_conn = psycopg.connect(
             dbname=db_name,
@@ -70,12 +83,12 @@ class RocksDictH3GroupedCacheHandler(RocksDictCacheHandler):
 
     @property
     def spatial_filter_type(self) -> str:
-        """Returns geometry — spatial filter is a buffered polygon."""
-        return "geometry"
+        """Returns h3_cell_ids — spatial filter is a set of H3 cell IDs."""
+        return "h3_cell_ids"
 
     @property
     def spatial_filter_includes_buffer(self) -> bool:
-        """Buffer is baked into the reconstructed geometry."""
+        """Buffer is baked into the k-ring expansion."""
         return True
 
     def geom_to_h3_cell(self, geom_value: bytes | memoryview | str) -> int | None:
@@ -111,66 +124,65 @@ class RocksDictH3GroupedCacheHandler(RocksDictCacheHandler):
             logger.warning(f"H3 cell conversion failed: {e}")
             return None
 
-    def get_spatial_filter(
+    def get_h3_cell_filter(
         self,
         keys: set[str],
         partition_key: str = "partition_key",
         buffer_distance: float = 0.0,
-    ) -> tuple[bytes, int] | None:
+    ) -> set[int] | None:
         """
-        Reconstruct geometry from surviving H3 cells after grouped intersection.
+        Get H3 cell IDs for spatial filtering via k-ring expansion.
 
-        1. get_intersected() returns surviving cell IDs (connected-component)
-        2. Convert cells to polygon boundaries via h3_cell_to_boundary
-        3. Collect, transform to target SRID, buffer
+        1. Load grouped match sets for each key from cache
+        2. Compute k from buffer_distance and resolution
+        3. Expand each group's cells with grid_disk(cell, k)
+        4. Per-fragment merge, cross-fragment intersection
+        5. Return surviving cell IDs
+
+        Args:
+            keys: Cache keys (fragment hashes) to intersect.
+            partition_key: Partition key namespace.
+            buffer_distance: Buffer distance in meters for k-ring expansion.
 
         Returns:
-            Tuple of (WKB bytes, SRID) or None if no cache hits.
+            Set of H3 cell IDs, or None if no cache hits.
         """
         try:
-            result, count = self.get_intersected(keys, partition_key)
-            if result is None or not result:
+            # Load grouped match sets for each key — no h3 import needed yet
+            fragment_groups: list[list[frozenset[int]]] = []
+            for key in keys:
+                value = self.get(key, partition_key=partition_key)
+                if value is not None and isinstance(value, list):
+                    fragment_groups.append(value)
+
+            if not fragment_groups:
                 return None
 
-            cell_list = list(result)
+            # Now we need h3 for k-ring expansion
+            try:
+                import h3 as h3_lib
+            except ImportError as e:
+                raise ImportError("h3 library required for H3 cell filtering: pip install h3") from e
 
-            # Build geometry reconstruction SQL
-            if self.srid != 4326:
-                geom_sql = sql.SQL(
-                    "SELECT ST_AsBinary(ST_Buffer("
-                    "  ST_Transform("
-                    "    ST_Collect(ST_SetSRID(h3_cell_to_boundary(cell::h3index)::geometry, 4326)),"
-                    "    {target_srid}"
-                    "  ),"
-                    "  {buf}"
-                    ")) FROM unnest(%s::bigint[]) AS cell"
-                ).format(
-                    target_srid=sql.Literal(self.srid),
-                    buf=sql.Literal(buffer_distance),
-                )
-            elif buffer_distance > 0:
-                geom_sql = sql.SQL(
-                    "SELECT ST_AsBinary(ST_Buffer("
-                    "  ST_Collect(ST_SetSRID(h3_cell_to_boundary(cell::h3index)::geometry, 4326)),"
-                    "  {buf}"
-                    ")) FROM unnest(%s::bigint[]) AS cell"
-                ).format(buf=sql.Literal(buffer_distance))
+            # Compute k from buffer_distance
+            if buffer_distance > 0:
+                edge_length = h3_lib.average_hexagon_edge_length(self.resolution, unit="m")
+                k = math.ceil(buffer_distance / edge_length)
             else:
-                geom_sql = sql.SQL(
-                    "SELECT ST_AsBinary("
-                    "  ST_Collect(ST_SetSRID(h3_cell_to_boundary(cell::h3index)::geometry, 4326))"
-                    ") FROM unnest(%s::bigint[]) AS cell"
-                )
+                k = 0
 
-            self.pg_cursor.execute(geom_sql, (cell_list,))
-            row = self.pg_cursor.fetchone()
-            if row is None or row[0] is None:
+            # K-ring expansion + cross-fragment intersection
+            result = _grouped_kring_intersection(fragment_groups, k)
+
+            if not result:
                 return None
 
-            return bytes(row[0]), self.srid
+            return result
 
+        except ImportError:
+            raise
         except Exception as e:
-            logger.error(f"Failed to get spatial filter geometry: {e}")
+            logger.error(f"Failed to get H3 cell filter: {e}")
             return None
 
     def close(self) -> None:

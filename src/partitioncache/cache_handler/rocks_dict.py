@@ -87,6 +87,57 @@ def _grouped_intersection(fragment_groups: list[list[frozenset[int]]]) -> set[in
     return surviving
 
 
+def _grouped_kring_intersection(
+    fragment_groups: list[list[frozenset[int]]],
+    k: int,
+) -> set[int]:
+    """
+    Expand groups with k-ring, then intersect per-fragment sets.
+
+    For each fragment:
+      1. Expand every cell in every group with grid_disk(cell, k)
+      2. Merge all expanded cells into one set (this fragment's "influence area")
+    Then intersect all fragments' influence areas.
+
+    Result: H3 cells that are within k cells of a match in EVERY fragment.
+
+    Args:
+        fragment_groups: Per-fragment list of match groups (frozenset of H3 cell IDs).
+        k: K-ring radius (number of hexagon hops for grid_disk expansion).
+
+    Returns:
+        Set of H3 cell IDs that survive cross-fragment intersection after k-ring expansion.
+    """
+    try:
+        import h3 as h3_lib
+    except ImportError as e:
+        raise ImportError("h3 library required for k-ring intersection: pip install h3") from e
+
+    if not fragment_groups:
+        return set()
+
+    per_fragment_cells: list[set[int]] = []
+    for groups in fragment_groups:
+        expanded: set[int] = set()
+        for group in groups:
+            for cell in group:
+                # h3 v4 uses hex strings; stored cells are int (bigint from PostgreSQL)
+                cell_hex = h3_lib.int_to_str(cell) if isinstance(cell, int) else cell
+                for neighbor in h3_lib.grid_disk(cell_hex, k):
+                    expanded.add(h3_lib.str_to_int(neighbor) if isinstance(neighbor, str) else neighbor)
+        per_fragment_cells.append(expanded)
+
+    if not per_fragment_cells:
+        return set()
+
+    # Cross-fragment intersection
+    result = per_fragment_cells[0]
+    for fragment_cells in per_fragment_cells[1:]:
+        result = result & fragment_cells
+
+    return result
+
+
 class RocksDictCacheHandler(RocksDictAbstractCacheHandler):
     """
     Handles access to a RocksDB cache using RocksDict with native serialization.
