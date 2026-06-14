@@ -231,6 +231,8 @@ class TestExtendQueryWithPartitionKeys:
 
         assert "CREATE TEMPORARY TABLE tmp_cache_keys_" in result
         assert "partition_key INT PRIMARY KEY" in result
+        # Temp table must be dropped at transaction end, not leaked for the whole session
+        assert "ON COMMIT DROP" in result
         assert "INSERT INTO tmp_cache_keys_" in result
         assert "VALUES(1),(2),(3)" in result or "VALUES(1,2,3)" in result
         assert "u.region_id IN (SELECT partition_key FROM tmp_cache_keys_" in result
@@ -458,6 +460,8 @@ class TestExtendQueryWithPartitionKeysLazy:
         result = extend_query_with_partition_keys_lazy(query, lazy_subquery, "zipcode", method="TMP_TABLE_IN", p0_alias="u")
 
         assert "CREATE TEMPORARY TABLE tmp_cache_keys_" in result  # More flexible match
+        # Lazy CREATE TABLE AS form must also self-drop at transaction end
+        assert "ON COMMIT DROP AS" in result
         assert "WHERE u.zipcode IN (SELECT zipcode FROM tmp_cache_keys_" in result
 
     def test_tmp_table_in_method_with_existing_where(self):

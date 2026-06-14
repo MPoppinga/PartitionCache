@@ -157,6 +157,23 @@ print(optimized)
 # SELECT * FROM users WHERE age > 25 AND user_id IN (1, 5, 10, 15, 20)
 ```
 
+> **Executing temp-table methods (`TMP_TABLE_IN` / `TMP_TABLE_JOIN`).** These methods return a
+> **multi-statement script**: `CREATE TEMPORARY TABLE ... ON COMMIT DROP; INSERT ...; ANALYZE ...; SELECT ...`.
+> The temp table uses `ON COMMIT DROP`, so the **entire script must run in a single transaction** — otherwise
+> the table is dropped right after `CREATE` (and never reclaimed if you split statements across separate
+> autocommit transactions). Because the final `SELECT` is the *last* statement, a plain `fetchall()` after
+> `cursor.execute(script)` reads the first statement (`CREATE TABLE`, no rows); walk `cursor.nextset()` to the
+> last result set instead. The library's `PostgresDBHandler.execute` does this for you (see
+> `partitioncache.db_handler.postgres.fetch_final_result_set`). Minimal pattern with a raw psycopg cursor:
+>
+> ```python
+> from partitioncache.db_handler.postgres import fetch_final_result_set
+>
+> with conn.cursor() as cur:           # one execute() == one transaction
+>     cur.execute(optimized)           # the multi-statement script
+>     rows = fetch_final_result_set(cur)  # rows of the final SELECT; temp table auto-dropped on commit
+> ```
+
 #### `apply_cache_lazy(query: str, cache_handler: AbstractCacheHandler_Lazy, partition_key: str, method: str = "IN_SUBQUERY", ..., geometry_column: str | None = None, buffer_distance: float | None = None, **kwargs)`
 
 **Recommended** - High-performance cache application with lazy evaluation. Supports spatial mode.
