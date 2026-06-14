@@ -365,7 +365,10 @@ def _create_tmp_table_setup(partition_keys: set[int] | set[str] | set[float] | s
     partition_keys_str = "),(".join(_format_partition_key_for_sql(pk) for pk in partition_keys)
     partition_key_type = _get_partition_key_sql_type(partition_keys)
 
-    setup_sql = f"""CREATE TEMPORARY TABLE {table_name} (partition_key {partition_key_type} PRIMARY KEY);
+    # ON COMMIT DROP: the temp table is dropped at the end of the surrounding transaction instead of
+    # persisting for the whole session. The full setup+query script must therefore run in ONE transaction
+    # (see execute_with_temp_tables / PostgresDBHandler.execute and docs/api_reference.md).
+    setup_sql = f"""CREATE TEMPORARY TABLE {table_name} (partition_key {partition_key_type} PRIMARY KEY) ON COMMIT DROP;
                     INSERT INTO {table_name} (partition_key) (VALUES({partition_keys_str}));
                     """
 
@@ -474,7 +477,8 @@ def _create_tmp_table_setup_from_subquery(lazy_subquery: str, partition_key: str
     """Create the SQL for temporary table setup from a lazy subquery."""
 
     table_name = f"tmp_cache_keys_{random.randint(100000, 999999)}"
-    setup_sql = f"CREATE TEMPORARY TABLE {table_name} AS ({lazy_subquery});\n"
+    # ON COMMIT DROP: dropped at transaction end (script must run in one transaction).
+    setup_sql = f"CREATE TEMPORARY TABLE {table_name} ON COMMIT DROP AS ({lazy_subquery});\n"
 
     if analyze_tmp_table:
         setup_sql += f"CREATE INDEX {table_name}_idx ON {table_name} ({partition_key});\n"
@@ -648,7 +652,7 @@ def extend_query_with_spatial_filter_lazy(
 
         prep_sql = (
             f"DROP TABLE IF EXISTS {sf_table}; "
-            f"CREATE TEMPORARY TABLE {sf_table} AS "
+            f"CREATE TEMPORARY TABLE {sf_table} ON COMMIT DROP AS "
             f"SELECT ST_Subdivide((ST_Dump({dump_expr})).geom, {subdivide_max_vertices}) AS geom; "
             f"CREATE INDEX ON {sf_table} USING GIST (geom); "
             f"ANALYZE {sf_table}; "
@@ -692,7 +696,7 @@ def extend_query_with_spatial_filter_lazy(
 
         prep_sql = (
             f"DROP TABLE IF EXISTS {sf_table}; "
-            f"CREATE TEMPORARY TABLE {sf_table} AS "
+            f"CREATE TEMPORARY TABLE {sf_table} ON COMMIT DROP AS "
             f"SELECT (ST_Dump({dump_expr})).geom AS geom; "
             f"CREATE INDEX ON {sf_table} USING GIST (geom); "
             f"ANALYZE {sf_table}; "
@@ -870,7 +874,7 @@ def extend_query_with_spatial_filter(
 
         prep_sql = (
             f"DROP TABLE IF EXISTS {sf_table}; "
-            f"CREATE TEMPORARY TABLE {sf_table} AS "
+            f"CREATE TEMPORARY TABLE {sf_table} ON COMMIT DROP AS "
             f"SELECT ST_Subdivide((ST_Dump({dump_expr})).geom, {subdivide_max_vertices}) AS geom; "
             f"CREATE INDEX ON {sf_table} USING GIST (geom); "
             f"ANALYZE {sf_table}; "
@@ -986,7 +990,7 @@ def extend_query_with_h3_cell_filter_lazy(
 
     prep_sql = (
         f"DROP TABLE IF EXISTS {tmp_table}; "
-        f"CREATE TEMPORARY TABLE {tmp_table} AS {cell_sql}; "
+        f"CREATE TEMPORARY TABLE {tmp_table} ON COMMIT DROP AS {cell_sql}; "
         f"CREATE INDEX ON {tmp_table} USING btree (cell); "
         f"ANALYZE {tmp_table}; "
     )
@@ -1047,7 +1051,7 @@ def extend_query_with_h3_cell_filter(
 
     prep_sql = (
         f"DROP TABLE IF EXISTS {tmp_table}; "
-        f"CREATE TEMPORARY TABLE {tmp_table} AS SELECT cell FROM (VALUES {values_list}) AS v(cell); "
+        f"CREATE TEMPORARY TABLE {tmp_table} ON COMMIT DROP AS SELECT cell FROM (VALUES {values_list}) AS v(cell); "
         f"CREATE INDEX ON {tmp_table} USING btree (cell); "
         f"ANALYZE {tmp_table}; "
     )
@@ -1149,7 +1153,7 @@ def extend_query_with_h3_cell_lookup(
 
     prep_sql = (
         f"DROP TABLE IF EXISTS {tmp_table}; "
-        f"CREATE TEMPORARY TABLE {tmp_table} AS SELECT cell FROM (VALUES {values_list}) AS v(cell); "
+        f"CREATE TEMPORARY TABLE {tmp_table} ON COMMIT DROP AS SELECT cell FROM (VALUES {values_list}) AS v(cell); "
         f"CREATE INDEX ON {tmp_table} USING btree (cell); "
         f"ANALYZE {tmp_table}; "
     )
