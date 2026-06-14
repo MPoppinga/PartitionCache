@@ -52,6 +52,9 @@ query_partition_keys:
   q10_1: [trip_id]
   q10_2: [trip_id]
   q10_3: [trip_id]
+  q11_1: [trip_id]
+  q11_2: [trip_id]
+  q11_3: [trip_id]
 
 query_flights:
   1: [q1_1, q1_2, q1_3]
@@ -64,6 +67,7 @@ query_flights:
   8: [q8_1, q8_2, q8_3]
   9: [q9_1, q9_2, q9_3]
   10: [q10_1, q10_2, q10_3]
+  11: [q11_1, q11_2, q11_3]
 
 hierarchy_labels:
   q5_1: "Park (broadest, ~4-8%)"
@@ -81,6 +85,10 @@ query_processing:
   strip_select: true
   auto_detect_partition_join: false
   skip_partition_key_joins: true
+  population:
+    max_conditions_removed: 1
+  lookup:
+    max_conditions_removed: 2
 
 fragment_filter:
   require_in_from: [taxi_trips]
