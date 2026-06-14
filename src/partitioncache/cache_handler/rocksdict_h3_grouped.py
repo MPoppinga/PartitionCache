@@ -78,6 +78,30 @@ class RocksDictH3GroupedCacheHandler(RocksDictCacheHandler):
         )
         self.pg_cursor = self.pg_conn.cursor()
 
+    @classmethod
+    def get_instance(cls, db_path: str, read_only: bool = False, **kwargs):  # type: ignore[override]
+        """Singleton factory that forwards the PostgreSQL/H3 config to ``__init__``.
+
+        The base ``RocksDictAbstractCacheHandler.get_instance`` only forwards ``db_path`` and
+        ``read_only`` and constructs ``cls(db_path, read_only=read_only)``. This handler additionally
+        requires ``db_host``/``db_name``/``db_user``/``db_password``/``db_port`` (and optional
+        ``resolution``/``srid``/``h3_cell_*`` settings) for the PostgreSQL connection used during H3
+        conversion, so the base factory raised ``unexpected keyword argument 'db_host'``. Override to
+        forward the full keyword config while preserving the singleton/refcount semantics.
+        """
+        if cls._instance is None or cls._current_path != db_path:
+            if cls._instance is not None:
+                try:
+                    cls._instance.db.close()
+                except Exception:
+                    pass
+                cls._instance = None
+                cls._refcount = 0
+            cls._instance = cls(db_path, read_only=read_only, **kwargs)
+            cls._current_path = db_path
+        cls._refcount += 1
+        return cls._instance
+
     def __repr__(self) -> str:
         return "rocksdict_h3_grouped"
 

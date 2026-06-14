@@ -633,3 +633,74 @@ class TestRocksDictH3GroupedHandlerKring:
         result = handler.get_h3_cell_filter({"h1", "h2"}, "spatial_h3", buffer_distance=0.0)
         # Different cells with k=0 → empty intersection
         assert result is None
+
+
+class TestH3GroupedGetInstance:
+    """Regression: get_instance must forward the PostgreSQL/H3 config to __init__.
+
+    The base RocksDictAbstractCacheHandler.get_instance only forwards db_path/read_only and
+    constructed cls(db_path, read_only=read_only), which raised
+    'RocksDictAbstractCacheHandler.get_instance() got an unexpected keyword argument db_host'
+    when called with the full h3-grouped config (db_host, db_name, ...).
+    """
+
+    def _reset_singleton(self):
+        from partitioncache.cache_handler.rocksdict_h3_grouped import RocksDictH3GroupedCacheHandler as H
+
+        H._instance = None
+        H._refcount = 0
+        H._current_path = None
+
+    def test_get_instance_forwards_pg_config(self, tmp_path):
+        from partitioncache.cache_handler.rocksdict_h3_grouped import RocksDictH3GroupedCacheHandler as H
+
+        self._reset_singleton()
+        config = {
+            "db_path": str(tmp_path / "h3.rocksdb"),
+            "db_host": "localhost",
+            "db_port": 5432,
+            "db_user": "u",
+            "db_password": "p",
+            "db_name": "d",
+            "resolution": 9,
+            "srid": 4326,
+        }
+        try:
+            with (
+                patch("partitioncache.cache_handler.rocksdict_abstract.Rdict"),
+                patch("partitioncache.cache_handler.rocksdict_h3_grouped.psycopg.connect", return_value=MagicMock()) as mock_connect,
+            ):
+                handler = H.get_instance(**config)
+                assert handler is not None
+                assert handler.resolution == 9
+                assert handler.srid == 4326
+                # PG connection params were forwarded to psycopg.connect
+                mock_connect.assert_called_once()
+                _, kwargs = mock_connect.call_args
+                assert kwargs["host"] == "localhost"
+                assert kwargs["dbname"] == "d"
+        finally:
+            self._reset_singleton()
+
+    def test_get_instance_is_singleton_per_path(self, tmp_path):
+        from partitioncache.cache_handler.rocksdict_h3_grouped import RocksDictH3GroupedCacheHandler as H
+
+        self._reset_singleton()
+        config = {
+            "db_path": str(tmp_path / "h3.rocksdb"),
+            "db_host": "localhost",
+            "db_port": 5432,
+            "db_user": "u",
+            "db_password": "p",
+            "db_name": "d",
+        }
+        try:
+            with (
+                patch("partitioncache.cache_handler.rocksdict_abstract.Rdict"),
+                patch("partitioncache.cache_handler.rocksdict_h3_grouped.psycopg.connect", return_value=MagicMock()),
+            ):
+                h1 = H.get_instance(**config)
+                h2 = H.get_instance(**config)
+                assert h1 is h2  # same path → same singleton instance
+        finally:
+            self._reset_singleton()
