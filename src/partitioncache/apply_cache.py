@@ -35,6 +35,8 @@ def get_partition_keys(
     remove_constraints_add: list[str] | None = None,
     skip_partition_key_joins: bool = False,
     geometry_column: str | None = None,
+    max_conditions_removed: int | None = None,
+    protected_patterns: list[str] | None = None,
     **kwargs: Any,
 ) -> tuple[set[int] | set[str] | set[float] | set[datetime] | None, int, int]:
     """
@@ -52,6 +54,7 @@ def get_partition_keys(
         add_constraints: Dict mapping table names to constraints to add (e.g., {"table": "col = val"})
         remove_constraints_all: List of attribute names to remove from all query variants
         remove_constraints_add: List of attribute names to remove, creating additional variants
+        protected_patterns: Conditions matching these patterns are never removed during variant generation.
 
     Returns:
        tuple containing:
@@ -84,6 +87,8 @@ def get_partition_keys(
         remove_constraints_add=remove_constraints_add,
         skip_partition_key_joins=skip_partition_key_joins,
         geometry_column=geometry_column,
+        max_conditions_removed=max_conditions_removed,
+        protected_patterns=protected_patterns,
     )
 
     logger.info(f"Found {len(cache_entry_hashes)} subqueries in query")
@@ -110,6 +115,8 @@ def get_partition_keys_lazy(
     remove_constraints_add: list[str] | None = None,
     skip_partition_key_joins: bool = False,
     geometry_column: str | None = None,
+    max_conditions_removed: int | None = None,
+    protected_patterns: list[str] | None = None,
     **kwargs: Any,
 ) -> tuple[str | None, int, int]:
     """
@@ -128,6 +135,7 @@ def get_partition_keys_lazy(
         add_constraints: Dict mapping table names to constraints to add (e.g., {"table": "col = val"})
         remove_constraints_all: List of attribute names to remove from all query variants
         remove_constraints_add: List of attribute names to remove, creating additional variants
+        protected_patterns: Conditions matching these patterns are never removed during variant generation.
 
     Returns:
         tuple[str, int, int]: A tuple containing:
@@ -162,6 +170,8 @@ def get_partition_keys_lazy(
         remove_constraints_add=remove_constraints_add,
         skip_partition_key_joins=skip_partition_key_joins,
         geometry_column=geometry_column,
+        max_conditions_removed=max_conditions_removed,
+        protected_patterns=protected_patterns,
     )
 
     if not isinstance(cache_handler, AbstractCacheHandler_Lazy):
@@ -360,8 +370,8 @@ def _create_tmp_table_setup(partition_keys: set[int] | set[str] | set[float] | s
                     """
 
     if analyze_tmp_table:
-        # Use standard B-tree index (HASH indexes are PostgreSQL-specific and not supported by DuckDB)
-        setup_sql += f"CREATE INDEX {table_name}_idx ON {table_name} (partition_key);ANALYZE {table_name};"
+        # PRIMARY KEY above already creates a B-tree index; ANALYZE updates statistics for the planner
+        setup_sql += f"ANALYZE {table_name};"
 
     return setup_sql, table_name
 
@@ -574,7 +584,7 @@ def extend_query_with_spatial_filter_lazy(
     auto_detect_partition_join: bool = True,
     partition_join_table: str | None = None,
     use_intersects: bool = False,
-    spatial_method: Literal["SUBDIVIDE_INLINE", "SUBDIVIDE_TMP_TABLE"] = "SUBDIVIDE_TMP_TABLE",
+    spatial_method: Literal["SUBDIVIDE_INLINE", "SUBDIVIDE_TMP_TABLE", "DUMP_TMP_TABLE", "DUMP_CTE"] = "SUBDIVIDE_TMP_TABLE",
     subdivide_max_vertices: int = 256,
 ) -> str:
     """
@@ -606,8 +616,11 @@ def extend_query_with_spatial_filter_lazy(
         spatial_method: Method for applying the spatial filter:
             - "SUBDIVIDE_TMP_TABLE": Create a temp table with ST_Subdivide + GiST index (default, optimal).
             - "SUBDIVIDE_INLINE": Inline ST_Subdivide in an EXISTS subquery (simpler, no temp table).
+            - "DUMP_TMP_TABLE": ST_Dump into temp table + GiST index (no subdivide, preserves original pieces).
+            - "DUMP_CTE": ST_Dump in CTE MATERIALIZED (no temp table, no index, simplest approach).
         subdivide_max_vertices: Maximum vertices per subdivided piece (default 256). Lower values
             create more, smaller pieces with tighter bounding boxes for better GiST selectivity.
+            Only used by SUBDIVIDE_* methods.
 
     Returns:
         The extended SQL query with spatial filter.
@@ -668,6 +681,89 @@ def extend_query_with_spatial_filter_lazy(
         _add_where_condition(parsed_query, spatial_expr)
         return prep_sql + parsed_query.sql()
 
+    elif spatial_method == "DUMP_TMP_TABLE":
+        # ST_Dump into temp table + GiST index. No ST_Subdivide — preserves original geometry pieces.
+        sf_table = f"_pcache_sf_{random.randint(100000, 999999)}"
+
+        if srid == 4326:
+            dump_expr = f"ST_Transform({geom_expr}, 4326)"
+        else:
+            dump_expr = geom_expr
+
+        prep_sql = (
+            f"DROP TABLE IF EXISTS {sf_table}; "
+            f"CREATE TEMPORARY TABLE {sf_table} AS "
+            f"SELECT (ST_Dump({dump_expr})).geom AS geom; "
+            f"CREATE INDEX ON {sf_table} USING GIST (geom); "
+            f"ANALYZE {sf_table}; "
+        )
+
+        if use_intersects:
+            if srid == 4326:
+                spatial_condition = (
+                    f"EXISTS (SELECT 1 FROM {sf_table} sf "
+                    f"WHERE ST_Intersects(ST_Transform({p0_alias}.{geometry_column}, 4326)::geography, sf.geom::geography))"
+                )
+            else:
+                spatial_condition = (
+                    f"EXISTS (SELECT 1 FROM {sf_table} sf "
+                    f"WHERE ST_Intersects({p0_alias}.{geometry_column}, sf.geom))"
+                )
+        elif srid == 4326:
+            spatial_condition = (
+                f"EXISTS (SELECT 1 FROM {sf_table} sf "
+                f"WHERE ST_DWithin(ST_Transform({p0_alias}.{geometry_column}, 4326)::geography, sf.geom::geography, {buffer_distance}))"
+            )
+        else:
+            spatial_condition = (
+                f"EXISTS (SELECT 1 FROM {sf_table} sf "
+                f"WHERE ST_DWithin({p0_alias}.{geometry_column}, sf.geom, {buffer_distance}))"
+            )
+
+        parsed_query = sqlglot.parse_one(query)
+        spatial_expr = sqlglot.parse_one(spatial_condition)
+        _add_where_condition(parsed_query, spatial_expr)
+        return prep_sql + parsed_query.sql()
+
+    elif spatial_method == "DUMP_CTE":
+        # ST_Dump in CTE MATERIALIZED — no temp table, no GiST index.
+        # PostgreSQL materializes the CTE and uses it as a scan source.
+        cte_name = f"_pcache_sf_{random.randint(100000, 999999)}"
+
+        if srid == 4326:
+            dump_expr = f"ST_Transform({geom_expr}, 4326)"
+        else:
+            dump_expr = geom_expr
+
+        cte_sql = f"WITH {cte_name} AS MATERIALIZED (SELECT (ST_Dump({dump_expr})).geom AS geom) "
+
+        if use_intersects:
+            if srid == 4326:
+                spatial_condition = (
+                    f"EXISTS (SELECT 1 FROM {cte_name} sf "
+                    f"WHERE ST_Intersects(ST_Transform({p0_alias}.{geometry_column}, 4326)::geography, sf.geom::geography))"
+                )
+            else:
+                spatial_condition = (
+                    f"EXISTS (SELECT 1 FROM {cte_name} sf "
+                    f"WHERE ST_Intersects({p0_alias}.{geometry_column}, sf.geom))"
+                )
+        elif srid == 4326:
+            spatial_condition = (
+                f"EXISTS (SELECT 1 FROM {cte_name} sf "
+                f"WHERE ST_DWithin(ST_Transform({p0_alias}.{geometry_column}, 4326)::geography, sf.geom::geography, {buffer_distance}))"
+            )
+        else:
+            spatial_condition = (
+                f"EXISTS (SELECT 1 FROM {cte_name} sf "
+                f"WHERE ST_DWithin({p0_alias}.{geometry_column}, sf.geom, {buffer_distance}))"
+            )
+
+        parsed_query = sqlglot.parse_one(query)
+        spatial_expr = sqlglot.parse_one(spatial_condition)
+        _add_where_condition(parsed_query, spatial_expr)
+        return cte_sql + parsed_query.sql()
+
     else:  # SUBDIVIDE_INLINE
         # Use ST_Subdivide directly (handles multi-geometries internally).
         # Cannot chain ST_Dump + ST_Subdivide as nested SRFs in FROM clause.
@@ -714,7 +810,7 @@ def extend_query_with_spatial_filter(
     auto_detect_partition_join: bool = True,
     partition_join_table: str | None = None,
     use_intersects: bool = False,
-    spatial_method: Literal["SUBDIVIDE_INLINE", "SUBDIVIDE_TMP_TABLE"] = "SUBDIVIDE_TMP_TABLE",
+    spatial_method: Literal["SUBDIVIDE_INLINE", "SUBDIVIDE_TMP_TABLE", "DUMP_TMP_TABLE", "DUMP_CTE"] = "SUBDIVIDE_TMP_TABLE",
     subdivide_max_vertices: int = 256,
 ) -> str:
     """
@@ -1105,8 +1201,10 @@ def apply_cache_lazy(
     skip_partition_key_joins: bool = False,
     geometry_column: str | None = None,
     buffer_distance: float | None = None,
-    spatial_method: Literal["SUBDIVIDE_INLINE", "SUBDIVIDE_TMP_TABLE"] = "SUBDIVIDE_TMP_TABLE",
+    spatial_method: Literal["SUBDIVIDE_INLINE", "SUBDIVIDE_TMP_TABLE", "DUMP_TMP_TABLE", "DUMP_CTE"] = "SUBDIVIDE_TMP_TABLE",
     subdivide_max_vertices: int = 256,
+    max_conditions_removed: int | None = None,
+    protected_patterns: list[str] | None = None,
     **kwargs: Any,
 ) -> tuple[str, dict[str, int]]:
     """
@@ -1131,6 +1229,7 @@ def apply_cache_lazy(
         add_constraints: Dict mapping table names to constraints to add (e.g., {"table": "col = val"})
         remove_constraints_all: List of attribute names to remove from all query variants
         remove_constraints_add: List of attribute names to remove, creating additional variants
+        protected_patterns: Conditions matching these patterns are never removed during variant generation.
         geometry_column: If set, enables spatial cache mode. Uses this geometry column for fragment
             SELECT clauses and spatial filter application. Requires a spatial cache handler with
             get_spatial_filter_lazy() method.
@@ -1176,6 +1275,8 @@ def apply_cache_lazy(
             remove_constraints_add=remove_constraints_add,
             skip_partition_key_joins=True,
             geometry_column=geometry_column,
+            max_conditions_removed=max_conditions_removed,
+            protected_patterns=protected_patterns,
         )
 
         generated_variants = len(hashes)
@@ -1280,6 +1381,8 @@ def apply_cache_lazy(
         remove_constraints_all=remove_constraints_all,
         remove_constraints_add=remove_constraints_add,
         skip_partition_key_joins=skip_partition_key_joins,
+        max_conditions_removed=max_conditions_removed,
+        protected_patterns=protected_patterns,
     )
 
     # Step 2: Optionally rewrite with p0 table
@@ -1345,7 +1448,7 @@ def apply_cache(
     skip_partition_key_joins: bool = False,
     geometry_column: str | None = None,
     buffer_distance: float | None = None,
-    spatial_method: Literal["SUBDIVIDE_INLINE", "SUBDIVIDE_TMP_TABLE"] = "SUBDIVIDE_TMP_TABLE",
+    spatial_method: Literal["SUBDIVIDE_INLINE", "SUBDIVIDE_TMP_TABLE", "DUMP_TMP_TABLE", "DUMP_CTE"] = "SUBDIVIDE_TMP_TABLE",
     subdivide_max_vertices: int = 256,
     **kwargs: Any,
 ) -> tuple[str, dict[str, int]]:

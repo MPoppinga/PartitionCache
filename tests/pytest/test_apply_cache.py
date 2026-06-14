@@ -272,7 +272,8 @@ class TestExtendQueryWithPartitionKeys:
         result = extend_query_with_partition_keys(query, partition_keys, "region_id", method="TMP_TABLE_IN", p0_alias="u", analyze_tmp_table=True)
 
         assert "ANALYZE tmp_cache_keys_" in result
-        assert "CREATE INDEX" in result
+        # PRIMARY KEY on the temp table already provides a B-tree index; no separate CREATE INDEX needed
+        assert "CREATE INDEX" not in result
 
     def test_float_partition_keys(self):
         """Test with float partition keys."""
