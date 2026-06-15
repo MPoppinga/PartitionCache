@@ -281,7 +281,12 @@ class TestWindowFunctionFragmentGeneration:
         WHERE t1.zipcode = t2.region_id AND t1.zipcode = 1001
         """
         pairs = generate_all_query_hash_pairs(query, "zipcode")
-        assert len(pairs) == 8, f"Should generate exactly 8 fragments for 2-table join, got {len(pairs)}"
+        # t1.zipcode = t2.region_id is an attachment join: test_businesses never
+        # references the partition key, so business-only fragments and injected
+        # zipcode equijoins are no longer generated (previously 8 fragments, of
+        # which 4 were invalid SQL). Remaining: {t1}, {t1,t2}, each with and
+        # without the zipcode literal.
+        assert len(pairs) == 4, f"Should generate exactly 4 fragments for 2-table join, got {len(pairs)}"
 
     def test_multiple_window_functions(self):
         """Multiple window functions should not prevent fragment generation."""

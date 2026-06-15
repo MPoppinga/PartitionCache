@@ -296,19 +296,51 @@ def generate_tuples(
     return result
 
 
-def remove_single_conditions(
+def remove_k_conditions(
     conditions: dict[str, list[str]],
+    max_removed: int = 1,
+    protected_patterns: list[str] | None = None,
 ) -> list[dict[str, list[str]]]:
+    """Generate variants by removing up to max_removed conditions per table.
+
+    For each table key with n > 1 conditions, generates C(n, k) variants
+    for k = 1..min(max_removed, n-1), each with k conditions removed.
+    Always includes the original (all conditions) as the first element.
+
+    Args:
+        conditions: Dict mapping table alias to list of conditions.
+        max_removed: Maximum number of conditions to remove per table.
+        protected_patterns: If set, conditions containing any of these
+            substrings (case-insensitive) are protected from removal.
+            Only unprotected conditions are candidates for removal.
+
+    Returns:
+        List of condition dicts, starting with the original.
     """
-    If in one condition more than one attribute is used, remove one of the attributes (yielding all possible outcomes)
-    Returns all new conditions together with the original conditions
-    """
+    from itertools import combinations
+
+    def _is_protected(condition: str) -> bool:
+        if protected_patterns is None:
+            return False
+        cond_lower = condition.lower()
+        return any(pat.lower() in cond_lower for pat in protected_patterns)
+
     ret = [conditions]
-    for key in conditions.keys():
-        if len(conditions[key]) > 1:
-            for i in range(len(conditions[key])):
-                new_conditions = conditions.copy()
-                new_conditions[key] = [conditions[key][i]]
+    for key in conditions:
+        conds = conditions[key]
+        # Split into protected and removable conditions
+        protected = [c for c in conds if _is_protected(c)]
+        removable = [c for c in conds if not _is_protected(c)]
+        n_removable = len(removable)
+        if n_removable < 1:
+            continue
+        # Must keep at least 1 condition total (protected count toward this)
+        min_keep = max(0, 1 - len(protected))
+        max_k = min(max_removed, n_removable - min_keep)
+        for k in range(1, max_k + 1):
+            for kept_removable in combinations(removable, n_removable - k):
+                new_conditions = {k2: list(v) for k2, v in conditions.items()}
+                new_conditions[key] = protected + list(kept_removable)
                 ret.append(new_conditions)
     return ret
 
@@ -332,6 +364,83 @@ def extract_conjunctive_conditions(sql: str) -> list[str]:
         extract_conditions_from_expression(where_clause.this)
 
     return conditions
+
+
+def _is_partition_key_fk_join(condition: str, partition_key: str, table_aliases: list[str]) -> bool:
+    """Check whether a condition is an attachment join on the partition key.
+
+    An attachment join is a plain column-to-column equality between two different
+    outer table aliases where exactly one side is the partition key column, e.g.
+    ``lo.lo_custkey = c.c_custkey``. Such joins connect a dimension table to a
+    partition-key-bearing fact table and must be treated as join-graph edges,
+    not as partition key conditions.
+
+    Args:
+        condition: A single conjunctive condition (SQL text).
+        partition_key: The partition key column name.
+        table_aliases: Aliases of the outer FROM clause.
+
+    Returns:
+        True if the condition is an attachment join, False otherwise (including
+        on parse errors, non-equality conditions, or unknown aliases).
+    """
+    try:
+        parsed = sqlglot.parse_one(condition)
+        if isinstance(parsed, exp.Paren):
+            parsed = parsed.this
+        if not isinstance(parsed, exp.EQ):
+            return False
+        left, right = parsed.left, parsed.right
+        if not (isinstance(left, exp.Column) and isinstance(right, exp.Column)):
+            return False
+        if not (left.table and right.table):
+            return False
+        if left.table not in table_aliases or right.table not in table_aliases:
+            return False
+        if left.table == right.table:
+            return False
+        return (left.name == partition_key) != (right.name == partition_key)
+    except Exception:
+        return False
+
+
+def _detect_pk_bearing_aliases(
+    table_aliases: list[str],
+    partition_key: str,
+    condition_groups: list[dict],
+    alias_to_table_map: dict[str, str],
+    partition_key_source_table: str | None,
+) -> set[str]:
+    """Detect aliases that reference the partition key column in any condition.
+
+    An alias is partition-key-bearing if the token ``alias.partition_key`` appears
+    in any extracted condition, or if it belongs to the declared
+    ``partition_key_source_table``. Aliases that never reference the partition key
+    (dimension tables attached via FK joins) are not pk-bearing.
+
+    Args:
+        table_aliases: Aliases of the outer FROM clause.
+        partition_key: The partition key column name.
+        condition_groups: Extracted condition dicts (values are lists of condition
+            strings, keys are aliases or alias tuples).
+        alias_to_table_map: Mapping from alias to table name.
+        partition_key_source_table: Operator-declared source table name or alias.
+
+    Returns:
+        Set of pk-bearing aliases.
+    """
+    all_conditions = [cond for group in condition_groups for conds in group.values() for cond in conds]
+    pk_bearing = set()
+    for alias in table_aliases:
+        token = re.compile(rf"\b{re.escape(alias)}\.{re.escape(partition_key)}\b")
+        if any(token.search(cond) for cond in all_conditions):
+            pk_bearing.add(alias)
+    if partition_key_source_table:
+        if partition_key_source_table in table_aliases:
+            pk_bearing.add(partition_key_source_table)
+        else:
+            pk_bearing.update(a for a in table_aliases if alias_to_table_map.get(a) == partition_key_source_table)
+    return pk_bearing
 
 
 def extract_and_group_query_conditions(
@@ -402,8 +511,10 @@ def extract_and_group_query_conditions(
             if left_alias in table_aliases and right_alias in table_aliases:
                 partition_key_joins[(min(left_alias, right_alias), max(left_alias, right_alias))].append(condition)
             continue  # Skip adding to other conditions
-        elif condition.count(partition_key) >= 1 and (
-            sqlglot.parse_one(condition).find(exp.In) or any(op in condition for op in ["BETWEEN", ">", "<", "=", "!=", "<>"])
+        elif (
+            condition.count(partition_key) >= 1
+            and (sqlglot.parse_one(condition).find(exp.In) or any(op in condition for op in ["BETWEEN", ">", "<", "=", "!=", "<>"]))
+            and not _is_partition_key_fk_join(condition, partition_key, table_aliases)
         ):
             # Partition key condition (IN, BETWEEN, comparison, etc.) — store with alias intact
             pk_alias_match = re.match(r'(?:NOT\s+)?(\w+)\.', condition)
@@ -752,6 +863,8 @@ def generate_partial_queries(
     geometry_column: str | None = None,
     pre_clean_select_clause: str | None = None,
     partition_key_source_table: str | None = None,
+    max_conditions_removed: int | None = None,
+    protected_patterns: list[str] | None = None,
 ) -> list[str]:
     """
     This function takes a query and returns the list of all possible partial queries.
@@ -837,9 +950,30 @@ def generate_partial_queries(
         partition_join_table,
     )
 
+    # Dimension-table attachment: when the query joins a dimension table via an
+    # attachment join (alias.partition_key = other_alias.other_column), restrict
+    # fragment generation to combinations containing a pk-bearing alias, inject
+    # pk-equijoins only between pk-bearing aliases, and SELECT from a pk-bearing
+    # alias. Gated on the attachment-join pattern so all other workloads produce
+    # byte-identical fragments.
+    has_attachment_join = any(
+        _is_partition_key_fk_join(cond, partition_key, table_aliases) for conds in distance_conditions.values() for cond in conds
+    )
+    pk_bearing_aliases: set[str] = set()
+    if has_attachment_join:
+        pk_bearing_aliases = _detect_pk_bearing_aliases(
+            table_aliases,
+            partition_key,
+            [attribute_conditions, distance_conditions, other_functions, or_conditions, partition_key_conditions, partition_key_joins],
+            alias_to_table_map,
+            partition_key_source_table,
+        )
+    restrict_to_pk_bearing = has_attachment_join and pk_bearing_aliases != set(table_aliases) and not detected_partition_join_alias
+
     # Emit warnings for tables not using partition key if requested
     # Skip warning in spatial mode — partition_key is a namespace, not a column
-    if warn_no_partition_key and not geometry_column:
+    # Skip warning for single-table queries — partition key is in SELECT, not WHERE
+    if warn_no_partition_key and not geometry_column and len(table_aliases) > 1:
         for alias in table_aliases:
             if alias == detected_partition_join_alias:
                 continue  # Partition-join tables are expected to use partition key
@@ -963,6 +1097,11 @@ def generate_partial_queries(
                 if any(alias in source_aliases for alias in combo)
             ]
 
+    # Attachment-join queries: drop combinations without any pk-bearing alias —
+    # a fragment consisting only of dimension tables cannot produce partition keys.
+    if restrict_to_pk_bearing:
+        all_query_combinations = [combo for combo in all_query_combinations if any(alias in pk_bearing_aliases for alias in combo)]
+
     # Make sure Table conditions are sorted
     for key in attribute_conditions.keys():
         attribute_conditions[key].sort()
@@ -972,8 +1111,10 @@ def generate_partial_queries(
     for combination in all_query_combinations:
         if keep_all_attributes:
             table_conditions_vaiants = [attribute_conditions]
+        elif max_conditions_removed is not None:
+            table_conditions_vaiants = remove_k_conditions(attribute_conditions, max_removed=max_conditions_removed, protected_patterns=protected_patterns)
         else:
-            table_conditions_vaiants = remove_single_conditions(attribute_conditions)  # create variants with less attributes
+            table_conditions_vaiants = remove_k_conditions(attribute_conditions, protected_patterns=protected_patterns)  # default k=1
 
         # If multiple variants of table conditions are available, create a partial query for each variant
         for var_attribute_conditions in table_conditions_vaiants:
@@ -1025,11 +1166,17 @@ def generate_partial_queries(
             for rdist in relvant_conditions_for_combination:
                 query_where.append(rdist)
 
-            # Add join conditions for given partition_key (skip for spatial queries)
+            # Add join conditions for given partition_key (skip for spatial queries).
+            # For attachment-join queries only pk-bearing aliases carry the partition
+            # key column — dimension tables connect via their original FK joins.
             if not skip_partition_key_joins:
-                for i in range(1, len(new_table_list)):
-                    for j in range(i + 1, len(new_table_list) + 1):
-                        query_where.append(f"{new_table_list[i - 1]}.{partition_key} = {new_table_list[j - 1]}.{partition_key}")
+                if restrict_to_pk_bearing:
+                    join_aliases = [f"t{idx + 1}" for idx, key in enumerate(table_conditions_keys) if key in pk_bearing_aliases]
+                else:
+                    join_aliases = new_table_list
+                for i in range(1, len(join_aliases)):
+                    for j in range(i + 1, len(join_aliases) + 1):
+                        query_where.append(f"{join_aliases[i - 1]}.{partition_key} = {join_aliases[j - 1]}.{partition_key}")
 
             # Build table list with correct table names from alias_to_table_map
             new_table_list_with_alias = []
@@ -1053,6 +1200,13 @@ def generate_partial_queries(
                         if alias_to_table_map.get(orig_alias, orig_alias) == partition_key_source_table:
                             pk_source_alias = new_alias
                             break
+            if pk_source_alias is None and restrict_to_pk_bearing:
+                # Attachment-join queries: SELECT from the first pk-bearing alias of
+                # the fragment (deterministic via table_conditions_keys order).
+                for key in table_conditions_keys:
+                    if key in pk_bearing_aliases:
+                        pk_source_alias = original_to_new_alias_mapping[key]
+                        break
 
             # Re-add partition-join table if one was detected
             if detected_partition_join_alias:
@@ -1186,7 +1340,14 @@ def generate_partial_queries(
                     for comb in itertools.combinations(all_pk_conditions, i):
                         query_where_comb = query_where.copy()
                         for orig_alias, subquery in comb:
-                            remapped = re.sub(rf'\b{re.escape(orig_alias)}\.', f'{new_table_list[0]}.', subquery)
+                            if restrict_to_pk_bearing:
+                                # Attach the pk condition to its own alias (or the
+                                # fragment's pk-bearing SELECT alias), never to a
+                                # dimension alias that lacks the pk column.
+                                remap_target = original_to_new_alias_mapping.get(orig_alias) or pk_source_alias or new_table_list[0]
+                            else:
+                                remap_target = new_table_list[0]
+                            remapped = re.sub(rf'\b{re.escape(orig_alias)}\.', f'{remap_target}.', subquery)
                             query_where_comb.append(remapped)
                         if geometry_column and len(new_table_list) > 1:
                             # Spatial multi-alias: separate geometry columns per alias for grouped match sets
@@ -1768,6 +1929,8 @@ def generate_all_query_hash_pairs(
     skip_partition_key_joins: bool = False,
     geometry_column: str | None = None,
     partition_key_source_table: str | None = None,
+    max_conditions_removed: int | None = None,
+    protected_patterns: list[str] | None = None,
     **kwargs: Any,
 ) -> list[tuple[str, str]]:
     """
@@ -1795,6 +1958,10 @@ def generate_all_query_hash_pairs(
             alias (e.g., "p1") for self-join disambiguation. When None and geometry_column is set,
             auto-detected from the first FROM table. When None and skip_partition_key_joins=True,
             auto-detected from the original SELECT clause.
+        protected_patterns: If set, conditions containing any of these substrings
+            (case-insensitive) are protected from removal during variant generation.
+            Only unprotected conditions are candidates for removal. Useful for ensuring
+            cheap relational filters are always present in every fragment.
 
     Returns:
         List of tuples containing (query_text, query_hash) pairs
@@ -1865,6 +2032,8 @@ def generate_all_query_hash_pairs(
             geometry_column=geometry_column,
             pre_clean_select_clause=pre_clean_select_clause,
             partition_key_source_table=partition_key_source_table,
+            max_conditions_removed=max_conditions_removed,
+            protected_patterns=protected_patterns,
         )
     )
     query_set.update(query_set_diff_combinations)
@@ -1890,6 +2059,8 @@ def generate_all_query_hash_pairs(
                 geometry_column=geometry_column,
                 pre_clean_select_clause=pre_clean_select_clause,
                 partition_key_source_table=partition_key_source_table,
+                max_conditions_removed=max_conditions_removed,
+                protected_patterns=protected_patterns,
             )
         )
     )
@@ -2174,6 +2345,8 @@ def generate_all_hashes(
     skip_partition_key_joins: bool = False,
     geometry_column: str | None = None,
     partition_key_source_table: str | None = None,
+    max_conditions_removed: int | None = None,
+    protected_patterns: list[str] | None = None,
     **kwargs: Any,
 ) -> list[str]:
     """
@@ -2207,6 +2380,8 @@ def generate_all_hashes(
         skip_partition_key_joins=skip_partition_key_joins,
         geometry_column=geometry_column,
         partition_key_source_table=partition_key_source_table,
+        max_conditions_removed=max_conditions_removed,
+        protected_patterns=protected_patterns,
     )
     return [x[1] for x in qh_pairs]
 
