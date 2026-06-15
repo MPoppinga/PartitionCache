@@ -181,6 +181,7 @@ def query_fragment_processor(args, constraint_args):
                 remove_constraints_add=remove_constraints_add,
                 skip_partition_key_joins=is_spatial,
                 geometry_column=geometry_column,
+                max_conditions_removed=args.max_conditions_removed,
             )
             logger.debug(f"Generated {len(query_hash_pairs)} fragments from original query")
 
