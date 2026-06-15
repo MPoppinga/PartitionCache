@@ -403,6 +403,14 @@ def add_variant_generation_args(parser: argparse.ArgumentParser) -> None:
         default=os.getenv("PARTITION_CACHE_REMOVE_CONSTRAINTS_ADD", None),
         help='JSON list of attribute names to remove, creating additional variants, e.g. \'["col1", "col2"]\' (default: None or PARTITION_CACHE_REMOVE_CONSTRAINTS_ADD)',
     )
+    variant_group.add_argument(
+        "--max-conditions-removed",
+        type=int,
+        default=int(os.getenv("PARTITION_CACHE_MAX_CONDITIONS_REMOVED", "0")) or None,
+        help="Maximum number of conditions to remove per table when generating attribute variants. "
+        "Default: 1 (remove one condition at a time). Higher values generate more variants via C(n,k) combinations. "
+        "(default: 1 or PARTITION_CACHE_MAX_CONDITIONS_REMOVED)",
+    )
 
 
 def resolve_cache_backend(args: argparse.Namespace) -> str:

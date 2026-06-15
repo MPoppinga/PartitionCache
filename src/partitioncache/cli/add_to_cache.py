@@ -132,6 +132,7 @@ def main():
                 remove_constraints_add=remove_constraints_add,
                 skip_partition_key_joins=is_spatial,
                 geometry_column=geometry_column,
+                max_conditions_removed=args.max_conditions_removed,
             )
             success = partitioncache.push_to_query_fragment_queue(query_hash_pairs, args.partition_key, args.partition_datatype, queue_provider, cache_backend=queue_cache_backend)
         else: # Compute fragments and add to fragment queue
@@ -195,6 +196,7 @@ def main():
                     remove_constraints_add=remove_constraints_add,
                     skip_partition_key_joins=is_spatial,
                     geometry_column=geometry_column,
+                    max_conditions_removed=args.max_conditions_removed,
                 )
 
             else:
