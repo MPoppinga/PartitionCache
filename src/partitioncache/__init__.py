@@ -33,7 +33,7 @@ except ImportError:
     RocksDBCacheHandler = None  # type: ignore[misc, assignment]
     RocksDBBitCacheHandler = None  # type: ignore[misc, assignment]
     ROCKSDB_AVAILABLE = False
-from partitioncache.queue import get_queue_lengths, push_to_original_query_queue, push_to_query_fragment_queue
+from partitioncache.queue import get_queue_lengths, push_to_original_query_queue, push_to_query_fragment_queue, push_to_query_variant_queue
 
 # Type aliases for better API clarity
 DataType = int | str | float | datetime
@@ -110,6 +110,7 @@ __all__ = [
     "apply_cache",
     "push_to_original_query_queue",
     "push_to_query_fragment_queue",
+    "push_to_query_variant_queue",
     "get_queue_lengths",
     "generate_all_query_hash_pairs",
     "PartitionCacheHelper",

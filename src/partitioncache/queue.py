@@ -85,6 +85,12 @@ def push_to_query_fragment_queue(
         return False
 
 
+# Preferred public name for the second-tier queue: it holds decomposed query *variants*
+# (historically called "fragments"). ``push_to_query_variant_queue`` and the original
+# ``push_to_query_fragment_queue`` are the same callable; both remain available.
+push_to_query_variant_queue = push_to_query_fragment_queue
+
+
 def pop_from_original_query_queue(queue_provider: str | None = None) -> tuple[str, str, str] | None:
     """
     Pop an original query from the original query queue.
