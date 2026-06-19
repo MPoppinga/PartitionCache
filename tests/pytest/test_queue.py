@@ -30,6 +30,7 @@ from partitioncache.queue import (
     pop_from_query_fragment_queue,
     push_to_original_query_queue,
     push_to_query_fragment_queue,
+    push_to_query_variant_queue,
 )
 
 
@@ -159,6 +160,29 @@ class TestQueryFragmentQueue:
         result = push_to_query_fragment_queue(query_hash_pairs, "test_partition_key")
         assert result is True
         # Wrapper forwards: (query_hash_pairs, partition_key, partition_datatype="integer", cache_backend=None)
+        mock_handler.push_to_query_fragment_queue.assert_called_once_with(query_hash_pairs, "test_partition_key", "integer", None)
+
+    def test_push_to_query_variant_queue_is_alias(self):
+        """push_to_query_variant_queue is the preferred name and the same callable as the fragment alias.
+
+        Both must also be exported from the top-level partitioncache package.
+        """
+        import partitioncache
+
+        assert push_to_query_variant_queue is push_to_query_fragment_queue
+        assert partitioncache.push_to_query_variant_queue is partitioncache.push_to_query_fragment_queue
+        assert "push_to_query_variant_queue" in partitioncache.__all__
+
+    @patch("partitioncache.queue._get_queue_handler")
+    def test_push_to_query_variant_queue_forwards(self, mock_get_handler):
+        """Calling the variant-named alias forwards to the handler identically."""
+        mock_handler = Mock()
+        mock_handler.push_to_query_fragment_queue.return_value = True
+        mock_get_handler.return_value = mock_handler
+
+        query_hash_pairs = [("SELECT * FROM table WHERE id=1", "hash1")]
+        result = push_to_query_variant_queue(query_hash_pairs, "test_partition_key")
+        assert result is True
         mock_handler.push_to_query_fragment_queue.assert_called_once_with(query_hash_pairs, "test_partition_key", "integer", None)
 
     @patch("partitioncache.queue._get_queue_handler")
