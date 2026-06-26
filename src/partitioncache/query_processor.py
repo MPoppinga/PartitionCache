@@ -1215,10 +1215,22 @@ def generate_partial_queries(
                 partition_join_table_name = alias_to_table_map.get(detected_partition_join_alias, detected_partition_join_alias)
                 # Use p1 as default alias for partition-join table (for backward compatibility)
                 # but check for conflicts and use alternative if needed
+                # Every original table is either remapped to a t<N> variant alias or is the
+                # partition-join table itself (re-added here). So the original input aliases
+                # never survive into the fragment, and only the output aliases (t1..tN) can
+                # actually collide with the hub alias. Checking the *input* aliases would
+                # divert correct queries to a fallback alias and make the fragment hash
+                # depend on irrelevant alias choices in the source query.
                 partition_join_new_alias = "p1"
-                if partition_join_new_alias in new_table_list or partition_join_new_alias in table_aliases:
-                    # If p1 conflicts, use a unique alias
-                    partition_join_new_alias = f"partition_join_{abs(hash(partition_join_table_name)) % 10000}"
+                if partition_join_new_alias in new_table_list:
+                    # Defensive only — p1 never collides with t-prefixed variant aliases.
+                    # Fallback must be deterministic across processes: Python's built-in
+                    # hash() is salted per-process (PYTHONHASHSEED) and would yield
+                    # non-reproducible cache hashes, so we scan for the next free p<N>.
+                    n = 2
+                    while f"p{n}" in new_table_list:
+                        n += 1
+                    partition_join_new_alias = f"p{n}"
                 partition_join_table_spec = f"{partition_join_table_name} AS {partition_join_new_alias}"
                 # Add partition-join alias mapping
                 original_to_new_alias_mapping[detected_partition_join_alias] = partition_join_new_alias

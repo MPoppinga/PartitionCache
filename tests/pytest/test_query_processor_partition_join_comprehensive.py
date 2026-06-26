@@ -396,10 +396,13 @@ class TestEdgeCasesAndErrorHandling:
         # Both tables are p0_* candidates, one picked as partition-join → only 1 variant
         assert len(variants) == 1, "Should generate exactly 1 variant"
 
-        # Only one table should be used as partition-join
-        # When user alias is "p1", system uses fallback alias "partition_join_*"
-        partition_join_count = sum(1 for v in variants if " AS p1" in v or " AS partition_join_" in v)
-        assert partition_join_count == 1, "Should have exactly 1 variant with partition-join table re-added"
+        # Only one table should be used as partition-join. The user query aliases its
+        # tables p1/p2, but those are remapped away (variant tables become t<N>), so the
+        # re-added partition-join table always gets the canonical alias p1 — never a
+        # per-process random "partition_join_*" token.
+        partition_join_count = sum(1 for v in variants if " AS p1" in v)
+        assert partition_join_count == 1, "Should have exactly 1 variant with partition-join table re-added as p1"
+        assert all("partition_join_" not in v for v in variants), "Hub alias must be canonical p1, not hash()-based"
 
     def test_complex_partition_key_conditions(self):
         """Test complex partition key conditions - demonstrates attribute vs partition key condition distinction."""
@@ -578,6 +581,77 @@ class TestRegressionTests:
             table_count = variant.count(" AS t")
             expected_partition_joins = table_count  # Each table should join to partition-join table
             assert len(partition_joins) == expected_partition_joins, f"Expected {expected_partition_joins} partition-joins, got {len(partition_joins)}"
+
+
+class TestPartitionJoinAliasDeterminism:
+    """Regression tests: the re-added partition-join (hub) alias must be deterministic.
+
+    The hub alias must be the canonical ``p1`` regardless of which aliases the source
+    query happened to use, and must NOT depend on Python's built-in ``hash()`` (which is
+    salted per-process via PYTHONHASHSEED). Otherwise the same logical query hashes
+    differently across runs, so a cache populated by one process (e.g. ``pcache-add``)
+    can never be hit by a separate retrieval process.
+    """
+
+    # Source query whose own aliases (p1/p2) used to spuriously divert the hub to a
+    # per-process-random "partition_join_<n>" fallback alias.
+    COLLISION_QUERY = "SELECT * FROM p0_table1 p1, p0_table2 p2 WHERE p1.partition_id = p2.partition_id"
+
+    def _hashes_under_seed(self, seed: str) -> list[tuple[str, str]]:
+        """Run hash-pair generation in a fresh subprocess with a fixed PYTHONHASHSEED."""
+        import json
+        import os
+        import subprocess
+        import sys
+
+        snippet = (
+            "import json\n"
+            "from partitioncache.query_processor import generate_all_query_hash_pairs\n"
+            f"pairs = generate_all_query_hash_pairs({self.COLLISION_QUERY!r}, 'partition_id', "
+            "auto_detect_partition_join=True, warn_no_partition_key=False)\n"
+            "print(json.dumps(pairs))\n"
+        )
+        env = dict(os.environ, PYTHONHASHSEED=seed)
+        out = subprocess.check_output([sys.executable, "-c", snippet], env=env, text=True)
+        return [tuple(p) for p in json.loads(out)]
+
+    def test_hub_alias_is_canonical_p1(self):
+        """The re-added hub must use canonical p1, never a hash()-based token."""
+        variants = generate_partial_queries(
+            self.COLLISION_QUERY, "partition_id", auto_detect_partition_join=True, warn_no_partition_key=False
+        )
+        assert len(variants) == 1
+        assert " AS p1" in variants[0], f"Hub must be aliased p1; got: {variants[0]}"
+        assert "partition_join_" not in variants[0], f"Hub alias must be canonical, not hash()-based; got: {variants[0]}"
+
+    def test_hashes_stable_across_python_hash_seeds(self):
+        """Same logical query → identical fragment hashes regardless of PYTHONHASHSEED."""
+        seed0 = self._hashes_under_seed("0")
+        seed1 = self._hashes_under_seed("1")
+        assert seed0 == seed1, (
+            "Fragment hashes must be stable across processes (PYTHONHASHSEED). "
+            f"seed=0 -> {seed0}, seed=1 -> {seed1}"
+        )
+
+    def test_hashes_invariant_under_source_alias_renaming(self):
+        """Fragment hashes must not depend on which aliases the source query uses.
+
+        The hub table, a non-hub table, and a neutral query all describe the same logical
+        star-join and must therefore produce identical fragment hashes — even when the
+        source query reuses the canonical ``p1`` alias itself.
+        """
+        queries = [
+            "SELECT * FROM p0_pocket p1, items t WHERE t.pocket_key = p1.pocket_key AND t.color = 'red'",  # hub aliased p1
+            "SELECT * FROM p0_pocket h, items p1 WHERE p1.pocket_key = h.pocket_key AND p1.color = 'red'",  # non-hub aliased p1
+            "SELECT * FROM p0_pocket h, items t WHERE t.pocket_key = h.pocket_key AND t.color = 'red'",  # neutral aliases
+        ]
+        hash_sets = []
+        for q in queries:
+            pairs = generate_all_query_hash_pairs(q, "pocket_key", auto_detect_partition_join=True, warn_no_partition_key=False)
+            hash_sets.append(sorted(h for _, h in pairs))
+        assert hash_sets[0] == hash_sets[1] == hash_sets[2], (
+            f"Fragment hashes must be invariant under source-alias renaming; got {hash_sets}"
+        )
 
 
 if __name__ == "__main__":
