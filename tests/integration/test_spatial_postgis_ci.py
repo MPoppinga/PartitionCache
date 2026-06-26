@@ -243,18 +243,23 @@ def _run_query(conn, sql_query: str) -> list:
 
 
 def _run_multi_statement(conn, sql_text: str) -> list:
-    """Execute potentially multi-statement SQL (e.g. TMP_TABLE_IN with CREATE + SELECT).
+    """Execute potentially multi-statement SQL (e.g. TMP_TABLE_IN / spatial filter with CREATE + SELECT).
 
-    Returns results from the last SELECT statement.
+    Returns results from the last result-producing statement.
+
+    The whole script MUST run in a single ``cur.execute`` call. The spatial filter and TMP_TABLE_IN
+    builders emit ``CREATE TEMPORARY TABLE ... ON COMMIT DROP; CREATE INDEX ...; SELECT ...``. PostgreSQL's
+    simple-query protocol runs all statements of one ``execute`` as a single implicit transaction, so the
+    ``ON COMMIT DROP`` table survives until the final SELECT. Splitting on ``;`` and running each statement
+    separately under ``autocommit=True`` would commit (and drop) the temp table right after CREATE, so the
+    following CREATE INDEX would fail with ``relation "..." does not exist``. This mirrors
+    ``PostgresDBHandler.execute`` / ``fetch_final_result_set`` in production.
     """
-    statements = [s.strip() for s in sql_text.split(";") if s.strip()]
-    results: list = []
+    from partitioncache.db_handler.postgres import fetch_final_result_set
+
     with conn.cursor() as cur:
-        for stmt in statements:
-            cur.execute(stmt)
-            if stmt.upper().lstrip().startswith("SELECT"):
-                results = cur.fetchall()
-    return results
+        cur.execute(sql_text)
+        return fetch_final_result_set(cur)
 
 
 # --------------------------------------------------------------------------- #
