@@ -1,0 +1,106 @@
+name: "OSM POI Benchmark"
+fact_table: "pois"
+p0_alias: "p1"
+
+env_file: "examples/openstreetmap_poi/.env"
+query_dir: "examples/openstreetmap_poi/testqueries_examples"
+
+# Query files are organized as {partition_key}/{query_file}.sql
+# e.g., zipcode_q1 -> zipcode/q1.sql
+query_subdirectory_pattern: "{partition_key}/{query_file}"
+
+data_setup:
+  script: "examples/openstreetmap_poi/process_osm_data.py"
+  docker_compose: "examples/openstreetmap_poi/docker-compose.yml"
+  example_command: "python examples/openstreetmap_poi/process_osm_data.py"
+  required_tables: ["pois"]
+
+executors:
+  duckdb:
+    enabled: false
+  postgresql:
+    enabled: true
+
+partition_keys:
+  zipcode: { datatype: integer }
+  landkreis: { datatype: text }
+  spatial_h3:
+    datatype: geometry
+    geometry_column: geom
+    spatial_backend: rocksdict_h3_grouped
+    srid: 25832
+    h3_resolution: 9
+  spatial_bbox:
+    datatype: geometry
+    geometry_column: geom
+    spatial_backend: postgis_bbox
+    srid: 25832
+    bbox_cell_size: 500
+
+query_partition_keys:
+  zipcode_q1: [zipcode]
+  zipcode_q2: [zipcode]
+  zipcode_q3: [zipcode]
+  landkreis_q1: [landkreis]
+  landkreis_q2: [landkreis]
+  landkreis_q3: [landkreis]
+  spatial_q1: [spatial_h3]
+  spatial_q2: [spatial_h3]
+  spatial_q3: [spatial_h3]
+  spatial_q4: [spatial_h3]
+  spatial_q5: [spatial_h3]
+  spatial_q6: [spatial_h3]
+  spatial_q7: [spatial_h3]
+  spatial_q8: [spatial_h3]
+  spatial_q9: [spatial_h3]
+  spatial_q10: [spatial_h3]
+  spatial_benchmark_qa1: [spatial_h3]
+  spatial_benchmark_qa2: [spatial_h3]
+  spatial_benchmark_qb1: [spatial_h3]
+  spatial_benchmark_qb2: [spatial_h3]
+  spatial_benchmark_qb3: [spatial_h3]
+  spatial_benchmark_qc1: [spatial_h3]
+  spatial_benchmark_qd1: [spatial_h3]
+
+query_flights:
+  1: [zipcode_q1, zipcode_q2, zipcode_q3]
+  2: [landkreis_q1, landkreis_q2, landkreis_q3]
+  3: [spatial_q1, spatial_q2, spatial_q3, spatial_q4, spatial_q5, spatial_q6, spatial_q7, spatial_q8, spatial_q9, spatial_q10]
+  4: [spatial_benchmark_qa1, spatial_benchmark_qa2, spatial_benchmark_qb1, spatial_benchmark_qb2, spatial_benchmark_qb3, spatial_benchmark_qc1, spatial_benchmark_qd1]
+
+hierarchy_labels: {}
+
+spatial_queries: [spatial_q1, spatial_q2, spatial_q3, spatial_q4, spatial_q5, spatial_q6, spatial_q7, spatial_q8, spatial_q9, spatial_q10, spatial_benchmark_qa1, spatial_benchmark_qa2, spatial_benchmark_qb1, spatial_benchmark_qb2, spatial_benchmark_qb3, spatial_benchmark_qc1, spatial_benchmark_qd1]
+
+query_processing:
+  keep_all_attributes: true
+  follow_graph: true
+  strip_select: true
+  auto_detect_partition_join: true
+  skip_partition_key_joins: false
+
+fragment_filter:
+  require_in_from: []
+  exclude_from_from: []
+
+cache:
+  table_prefix: "osm_poi_cache"
+  bitsize_strategy: fixed
+  fixed_bitsize: 1000000
+
+backends:
+  postgresql: [postgresql_array, postgresql_bit]
+
+fact_stats:
+  strategy: count_distinct
+  table: "pois"
+
+modes:
+  cross_dimension:
+    phase1_flights: [3]
+    phase2_flights: [4]
+  hierarchy:
+    flights: []
+  cold_warm:
+    flight: 1
+  representative_queries: [zipcode_q1, landkreis_q1]

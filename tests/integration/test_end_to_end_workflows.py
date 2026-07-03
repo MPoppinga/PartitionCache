@@ -235,17 +235,16 @@ class TestEndToEndWorkflows:
                 print(f"Enhanced query: {enhanced_query[:100]}...")
                 print(f"Stats: {stats}")
 
-                # Execute enhanced query (may be multiple statements)
-                with db_session.cursor() as cur:
-                    # Split multi-statement queries and execute them
-                    statements = [stmt.strip() for stmt in enhanced_query.split(";") if stmt.strip()]
-                    enhanced_results = []
+                # Execute enhanced query (may be multiple statements). The whole script must run in a
+                # single execute() call: TMP_TABLE_IN emits `CREATE TEMPORARY TABLE ... ON COMMIT DROP;
+                # ...; SELECT`, and PostgreSQL runs all statements of one execute() as a single implicit
+                # transaction so the temp table survives until the final SELECT. Splitting on ";" under
+                # autocommit would drop it right after CREATE. See PostgresDBHandler.fetch_final_result_set.
+                from partitioncache.db_handler.postgres import fetch_final_result_set
 
-                    for stmt in statements:
-                        cur.execute(stmt)
-                        # Only fetch results from SELECT statements
-                        if stmt.upper().strip().startswith("SELECT"):
-                            enhanced_results = cur.fetchall()
+                with db_session.cursor() as cur:
+                    cur.execute(enhanced_query)
+                    enhanced_results = fetch_final_result_set(cur)
 
                 # Results should match or be subset of baseline
                 assert len(enhanced_results) <= len(baseline_results), "Enhanced query returned more results than baseline"
@@ -590,18 +589,15 @@ class TestEndToEndWorkflows:
                     min_component_size=1,
                 )
 
+                # Enhanced query may be multi-statement (TMP_TABLE_IN emits CREATE TEMPORARY TABLE ...
+                # ON COMMIT DROP; ...; SELECT). Run the whole script in a single execute() so it runs as
+                # one implicit transaction and the temp table survives until the final SELECT; splitting on
+                # ";" under autocommit would drop it right after CREATE. See fetch_final_result_set.
+                from partitioncache.db_handler.postgres import fetch_final_result_set
+
                 with db_session.cursor() as cur:
-                    # Enhanced query might be a multi-statement query (with temp tables)
-                    # Split and execute each statement separately
-                    statements = [stmt.strip() for stmt in enhanced_query.split(";") if stmt.strip()]
-                    for stmt in statements:
-                        cur.execute(stmt)
-                        # Only fetch results if this statement returns data
-                        try:
-                            cur.fetchall()
-                        except Exception:
-                            # Statement doesn't return data (e.g., CREATE TABLE, etc.)
-                            pass
+                    cur.execute(enhanced_query)
+                    fetch_final_result_set(cur)
                 enhanced_time = time.time() - start_time
 
             performance_results.append(

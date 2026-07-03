@@ -37,15 +37,15 @@ def main():
     query_group.add_argument(
         "--no-recompose",
         action="store_true",
-        help="Do not recompose the query before adding to cache, the query is added as is to the cache or fragment queue"
+        help="Do not recompose the query before adding to cache, the query is added as is to the cache or variant queue"
     )
 
 
     # Execution mode configuration
     mode_group = parser.add_argument_group("execution mode")
-    mode_group.add_argument("--queue", action="store_true", help="Add query to fragment queue instead of executing directly")
-    mode_group.add_argument("--queue-original", action="store_true", help="Add query to original query queue instead of fragment queue")
-    mode_group.add_argument("--direct", action="store_true", help="Calculate fragments directly instead of using the incoming queue")
+    mode_group.add_argument("--queue", action="store_true", help="Add query variants to the variant queue instead of executing directly")
+    mode_group.add_argument("--queue-original", action="store_true", help="Add query to original query queue instead of the variant queue")
+    mode_group.add_argument("--direct", action="store_true", help="Calculate query variants directly instead of using the incoming queue")
 
     # Add common argument groups
     add_cache_args(parser, require_partition_key=True)
@@ -102,7 +102,7 @@ def main():
         # Resolve cache backend to store with queue item (important for spatial routing)
         queue_cache_backend = resolve_cache_backend(args) if is_spatial else None
 
-        if not args.no_recompose:  # Add to query fragment queue for async processing
+        if not args.no_recompose:  # Recompose into query variants and add to the variant queue for async processing
             # Resolve geometry column for spatial datatypes
             geometry_column = None
             if is_spatial:
@@ -112,7 +112,8 @@ def main():
                     try:
                         cache_handler = partitioncache.get_cache_handler(resolve_cache_backend(args), singleton=True)
                         geometry_column = getattr(cache_handler, "geometry_column", "geom")
-                    except Exception:
+                    except Exception as e:
+                        logger.debug("Could not resolve geometry column from cache handler, using default 'geom': %s", e)
                         geometry_column = "geom"
 
             query_hash_pairs = generate_all_query_hash_pairs(
@@ -121,9 +122,9 @@ def main():
                 min_component_size=args.min_component_size,
                 follow_graph=args.follow_graph,
                 keep_all_attributes=True,
-                auto_detect_star_join=not args.no_auto_detect_star_join,
+                auto_detect_partition_join=not args.no_auto_detect_partition_join,
                 max_component_size=args.max_component_size,
-                star_join_table=args.star_join_table,
+                partition_join_table=args.partition_join_table,
                 warn_no_partition_key=not args.no_warn_partition_key,
                 bucket_steps=args.bucket_steps,
                 add_constraints=add_constraints,
@@ -131,16 +132,17 @@ def main():
                 remove_constraints_add=remove_constraints_add,
                 skip_partition_key_joins=is_spatial,
                 geometry_column=geometry_column,
+                max_conditions_removed=args.max_conditions_removed,
             )
             success = partitioncache.push_to_query_fragment_queue(query_hash_pairs, args.partition_key, args.partition_datatype, queue_provider, cache_backend=queue_cache_backend)
-        else: # Compute fragments and add to fragment queue
+        else:  # Push the cleaned query as a single variant (no recomposition)
             query = clean_query(query)
             query_hash_pairs = [(query, hash_query(query))]
             success = partitioncache.push_to_query_fragment_queue(query_hash_pairs, args.partition_key, args.partition_datatype, queue_provider, cache_backend=queue_cache_backend)
         if success:
-            logger.info("Query successfully added to query fragment queue")
+            logger.info("Query successfully added to query variant queue")
         else:
-            logger.error("Failed to add query to query fragment queue")
+            logger.error("Failed to add query to query variant queue")
             exit(1)
 
     elif args.direct:  # Execute directly
@@ -184,9 +186,9 @@ def main():
                     min_component_size=args.min_component_size,
                     follow_graph=args.follow_graph,
                     keep_all_attributes=True,
-                    auto_detect_star_join=not args.no_auto_detect_star_join,
+                    auto_detect_partition_join=not args.no_auto_detect_partition_join,
                     max_component_size=args.max_component_size,
-                    star_join_table=args.star_join_table,
+                    partition_join_table=args.partition_join_table,
                     warn_no_partition_key=not args.no_warn_partition_key,
                     bucket_steps=args.bucket_steps,
                     add_constraints=add_constraints,
@@ -194,6 +196,7 @@ def main():
                     remove_constraints_add=remove_constraints_add,
                     skip_partition_key_joins=is_spatial,
                     geometry_column=geometry_column,
+                    max_conditions_removed=args.max_conditions_removed,
                 )
 
             else:
@@ -203,27 +206,27 @@ def main():
             logger.debug(f"Found {len(query_hash_pairs)} subqueries to process")
 
             if is_spatial:
-                # Spatial mode: use lazy insertion (the handler wraps fragments with H3/BBox SQL)
+                # Spatial mode: use lazy insertion (the handler wraps variant queries with H3/BBox SQL)
                 if not hasattr(cache_handler, "set_cache_lazy"):
                     logger.error(f"Spatial datatype '{args.partition_datatype}' requires a handler with set_cache_lazy support")
                     exit(1)
 
-                for query, hash_value in query_hash_pairs:
+                for fragment_query, hash_value in query_hash_pairs:
                     if cache.exists(hash_value):
                         logger.debug(f"Query {hash_value} already in cache")
-                        cache.set_query(hash_value, query)
+                        cache.set_query(hash_value, fragment_query)
                         continue
 
-                    success = cache_handler.set_cache_lazy(hash_value, query, args.partition_key)
+                    success = cache_handler.set_cache_lazy(hash_value, fragment_query, args.partition_key)
                     if success:
-                        cache.set_query(hash_value, query)
+                        cache.set_query(hash_value, fragment_query)
                         logger.debug(f"Lazily stored spatial query {hash_value}")
                     else:
                         logger.warning(f"Failed to lazily store spatial query {hash_value}")
 
                 cache.close()
             else:
-                # Standard mode: execute fragments via db_handler and store results
+                # Standard mode: execute variant queries via db_handler and store results
                 db_connection_params = get_database_connection_params(args)
 
                 if args.db_backend == "postgresql":
@@ -236,17 +239,17 @@ def main():
                     raise ValueError(f"Unsupported database backend: {args.db_backend}")
 
                 # Process each query-hash pair
-                for query, hash_value in query_hash_pairs:
+                for fragment_query, hash_value in query_hash_pairs:
                     if cache.exists(hash_value):
                         logger.debug(f"Query {hash_value} already in cache")
-                        cache.set_query(hash_value, query)
+                        cache.set_query(hash_value, fragment_query)
                         continue
 
                     # Execute query and store results
-                    result = set(db_handler.execute(query))
+                    result = set(db_handler.execute(fragment_query))
                     if result:
                         cache.set_cache(hash_value, result)
-                        cache.set_query(hash_value, query)
+                        cache.set_query(hash_value, fragment_query)
                         logger.debug(f"Stored query {hash_value} with {len(result)} results")
                     else:
                         logger.warning(f"Query {hash_value} returned no results")

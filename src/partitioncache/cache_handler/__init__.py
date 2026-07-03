@@ -99,14 +99,14 @@ def get_cache_handler(cache_type: str, singleton: bool = False) -> AbstractCache
             return DuckDBBitCacheHandler.get_instance(**config)  # type: ignore[no-any-return]
         else:
             return DuckDBBitCacheHandler(**config)  # type: ignore[no-any-return]
-    elif cache_type == "postgis_h3":
-        from partitioncache.cache_handler.postgis_h3 import PostGISH3CacheHandler
+    elif cache_type == "rocksdict_h3_grouped":
+        from partitioncache.cache_handler.rocksdict_h3_grouped import RocksDictH3GroupedCacheHandler
 
-        config = EnvironmentConfigManager.get_postgis_h3_config()
+        config = EnvironmentConfigManager.get_rocksdict_h3_grouped_config()
         if singleton:
-            return PostGISH3CacheHandler.get_instance(**config)  # type: ignore[no-any-return]
+            return RocksDictH3GroupedCacheHandler.get_instance(**config)  # type: ignore[no-any-return]
         else:
-            return PostGISH3CacheHandler(**config)  # type: ignore[no-any-return]
+            return RocksDictH3GroupedCacheHandler(**config)  # type: ignore[no-any-return]
     elif cache_type == "postgis_bbox":
         from partitioncache.cache_handler.postgis_bbox import PostGISBBoxCacheHandler
 

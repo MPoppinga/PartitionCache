@@ -11,6 +11,34 @@ from partitioncache.db_handler.abstract import AbstractDBHandler
 logger = getLogger("PartitionCache")
 
 
+def fetch_final_result_set(cursor: psycopg.Cursor) -> list:
+    """Return the rows of the last result-producing statement of an executed (multi-)statement script.
+
+    The temp-table integration methods (``TMP_TABLE_IN`` / ``TMP_TABLE_JOIN``) and the spatial filters emit
+    multi-statement scripts of the form
+    ``CREATE TEMPORARY TABLE ... ON COMMIT DROP; INSERT/ANALYZE ...; SELECT ...``.
+    After ``cursor.execute(script)`` psycopg positions the cursor on the FIRST statement's result, so a plain
+    ``fetchall()`` would read the ``CREATE TABLE`` (which produces no rows). This walks ``nextset()`` to the
+    final result-producing statement and returns its rows. Works for single-statement queries too (one set).
+
+    The whole script must be executed in a single ``cursor.execute`` call so that it runs in ONE transaction;
+    ``ON COMMIT DROP`` then drops the temp table only after the final ``SELECT`` has produced its rows.
+
+    Args:
+        cursor: A psycopg cursor on which ``execute`` has already been called.
+
+    Returns:
+        The rows of the last result set, or an empty list if no statement produced rows.
+    """
+    rows: list = []
+    while True:
+        if cursor.description is not None:
+            rows = cursor.fetchall()
+        if not cursor.nextset():
+            break
+    return rows
+
+
 class PostgresDBHandler(AbstractDBHandler):
     def __init__(self, host: str, port: int, user: str, password: str, dbname: str, timeout: str = "0") -> None:
         # PostgreSQL statement_timeout expects milliseconds when specified as a number without unit
@@ -29,10 +57,16 @@ class PostgresDBHandler(AbstractDBHandler):
             logger.error(f"POSTGRES EXECUTE ERROR: {type(e).__name__}: {e}")
             raise
 
-        # return first column of all rows if not empty
-        if self.cur.rowcount == 0:
-            return []
-        return [row[0] for row in self.cur.fetchall() if row[0]]
+        # Walk to the final result-producing statement: integration scripts (TMP_TABLE_IN/JOIN, spatial)
+        # emit `CREATE TEMPORARY TABLE ... ON COMMIT DROP; ...; SELECT`, where the rows are in the LAST
+        # result set, not the first. Returns first column of all rows if not empty.
+        rows = fetch_final_result_set(self.cur)
+        result = [row[0] for row in rows if row[0]]
+        # Commit so the surrounding transaction ends: this fires ON COMMIT DROP for any temp table created
+        # by the script (otherwise the table would linger for the whole session). Rows are already fetched.
+        # Mirrors the commit in the MySQL/SQLite handlers.
+        self.conn.commit()
+        return result
 
     def close(self) -> None:
         self.conn.close()

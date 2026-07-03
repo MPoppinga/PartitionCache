@@ -1,0 +1,107 @@
+name: "TPC-H Benchmark"
+fact_table: "lineitem"
+p0_alias: "l"
+
+env_file: "examples/tpch_benchmark/.env"
+query_dir: "examples/tpch_benchmark/queries"
+
+data_setup:
+  script: "examples/tpch_benchmark/generate_tpch_data.py"
+  docker_compose: null
+  example_command: "python examples/tpch_benchmark/generate_tpch_data.py --scale-factor 0.01 --db-backend duckdb"
+  required_tables: ["lineitem", "orders", "customer", "supplier", "part", "partsupp", "nation", "region"]
+
+executors:
+  duckdb:
+    enabled: true
+    default_path_template: "examples/tpch_benchmark/tpch_sf{scale_factor}.duckdb"
+  postgresql:
+    enabled: true
+
+partition_keys:
+  l_orderkey: { datatype: integer }
+  l_partkey: { datatype: integer }
+  l_suppkey: { datatype: integer }
+
+query_partition_keys:
+  q1_1: [l_orderkey]
+  q1_2: [l_orderkey]
+  q1_3: [l_orderkey]
+  q2_1: [l_partkey, l_suppkey]
+  q2_2: [l_partkey, l_suppkey]
+  q2_3: [l_partkey, l_suppkey]
+  q3_1: [l_orderkey, l_suppkey]
+  q3_2: [l_orderkey, l_suppkey]
+  q3_3: [l_orderkey, l_suppkey]
+  q3_4: [l_orderkey, l_suppkey]
+  q4_1: [l_orderkey, l_partkey, l_suppkey]
+  q4_2: [l_orderkey, l_partkey, l_suppkey]
+  q4_3: [l_orderkey, l_partkey, l_suppkey]
+  q5_1: [l_orderkey, l_suppkey]
+  q5_2: [l_orderkey, l_suppkey]
+  q5_3: [l_orderkey, l_suppkey]
+  q6_1: [l_orderkey, l_partkey, l_suppkey]
+  q6_2: [l_orderkey, l_partkey, l_suppkey]
+  q6_3: [l_orderkey, l_partkey, l_suppkey]
+  q7_1: [l_orderkey]
+  q7_2: [l_suppkey]
+  q7_3: [l_partkey]
+  q8_1: [l_orderkey, l_partkey]
+  q8_2: [l_orderkey, l_suppkey]
+  q8_3: [l_partkey, l_suppkey]
+
+query_flights:
+  1: [q1_1, q1_2, q1_3]
+  2: [q2_1, q2_2, q2_3]
+  3: [q3_1, q3_2, q3_3, q3_4]
+  4: [q4_1, q4_2, q4_3]
+  5: [q5_1, q5_2, q5_3]
+  6: [q6_1, q6_2, q6_3]
+  7: [q7_1, q7_2, q7_3]
+  8: [q8_1, q8_2, q8_3]
+
+hierarchy_labels:
+  q5_1: "Region (broadest)"
+  q5_2: "Nation"
+  q5_3: "Nation + acctbal (narrowest)"
+  q6_1: "Manufacturer (broadest)"
+  q6_2: "Brand"
+  q6_3: "Brand + Type (narrowest)"
+
+spatial_queries: []
+
+query_processing:
+  keep_all_attributes: true
+  follow_graph: false
+  strip_select: true
+  auto_detect_partition_join: false
+  skip_partition_key_joins: true
+  use_adapted_queries: true
+  adapted_subdirectory: "adapted"
+
+fragment_filter:
+  require_in_from: [lineitem]
+  exclude_from_from: []
+
+cache:
+  table_prefix: "tpch_cache"
+  bitsize_strategy: auto
+  min_bitsize: 200000
+
+backends:
+  duckdb: [duckdb_bit]
+  postgresql: [postgresql_array, postgresql_bit, postgresql_roaringbit]
+
+fact_stats:
+  strategy: count_distinct
+  table: "lineitem"
+
+modes:
+  cross_dimension:
+    phase1_flights: [3]
+    phase2_flights: [4]
+  hierarchy:
+    flights: [5, 6]
+  cold_warm:
+    flight: 3
+  representative_queries: [q1_1, q3_1, q5_1]

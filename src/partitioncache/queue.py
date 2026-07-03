@@ -28,7 +28,7 @@ def push_to_original_query_queue(
     query: str, partition_key: str = "partition_key", partition_datatype: str | None = None, queue_provider: str | None = None
 ) -> bool:
     """
-    Push an original query to the original query queue to be processed into fragments.
+    Push an original query to the original query queue to be decomposed and recomposed into query variants.
 
     Requires the following environment variables to be set, based on the QUERY_QUEUE_PROVIDER:
 
@@ -66,23 +66,32 @@ def push_to_query_fragment_queue(
     query_hash_pairs: list[tuple[str, str]], partition_key: str = "partition_key", partition_datatype: str = "integer", queue_provider: str | None = None, cache_backend: str | None = None
 ) -> bool:
     """
-    Push query fragments (as query-hash pairs) directly to the query fragment queue.
+    Push query variants (as (query, hash) pairs) directly to the query variant queue.
+
+    The second-tier queue holds recomposed query variants (historically called "fragments");
+    its persisted name remains ``query_fragment_queue`` for backward compatibility.
 
     Args:
-        query_hash_pairs (list[tuple[str, str]]): List of (query, hash) tuples to push to query fragment queue.
-        partition_key (str): The partition key for these query fragments (default: "partition_key").
+        query_hash_pairs (list[tuple[str, str]]): List of (variant_query, hash) tuples to push to the variant queue.
+        partition_key (str): The partition key for these query variants (default: "partition_key").
         partition_datatype (str): The datatype of the partition key (default: "integer").
         queue_provider (str): The queue provider to use (default: None, which uses the environment variable QUERY_QUEUE_PROVIDER).
         cache_backend (str): The cache backend to use for processing (default: None, uses processor config).
     Returns:
-        bool: True if all fragments were pushed successfully, False otherwise.
+        bool: True if all variants were pushed successfully, False otherwise.
     """
     try:
         handler = _get_queue_handler(queue_provider)
         return handler.push_to_query_fragment_queue(query_hash_pairs, partition_key, partition_datatype, cache_backend)  # type: ignore[no-any-return]
     except Exception as e:
-        logger.error(f"Failed to push fragments to query fragment queue: {e}")
+        logger.error(f"Failed to push query variants to the variant queue: {e}")
         return False
+
+
+# Preferred public name for the second-tier queue: it holds decomposed query *variants*
+# (historically called "fragments"). ``push_to_query_variant_queue`` and the original
+# ``push_to_query_fragment_queue`` are the same callable; both remain available.
+push_to_query_variant_queue = push_to_query_fragment_queue
 
 
 def pop_from_original_query_queue(queue_provider: str | None = None) -> tuple[str, str, str] | None:
@@ -127,10 +136,10 @@ def pop_from_original_query_queue_blocking(timeout: int = 60, queue_provider: st
 
 def pop_from_query_fragment_queue(queue_provider: str | None = None) -> tuple[str, str, str, str, str | None] | None:
     """
-    Pop a query fragment from the query fragment queue.
+    Pop a query variant from the query variant queue (persisted as ``query_fragment_queue``).
 
     Returns:
-        Tuple[str, str, str, str, str | None] or None: (query, hash, partition_key, partition_datatype, cache_backend) tuple if available, None if queue is empty or error occurred.
+        Tuple[str, str, str, str, str | None] or None: (variant_query, hash, partition_key, partition_datatype, cache_backend) tuple if available, None if queue is empty or error occurred.
     """
     try:
         handler = _get_queue_handler(queue_provider)
@@ -142,7 +151,7 @@ def pop_from_query_fragment_queue(queue_provider: str | None = None) -> tuple[st
 
 def pop_from_query_fragment_queue_blocking(timeout: int = 60, queue_provider: str | None = None) -> tuple[str, str, str, str, str | None] | None:
     """
-    Pop a query fragment from the query fragment queue with blocking wait.
+    Pop a query variant from the query variant queue with blocking wait.
     Uses provider-specific blocking mechanisms when available.
 
     Args:

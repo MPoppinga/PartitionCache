@@ -26,7 +26,6 @@ class TestBackendEnvMapping:
             ("postgresql_array", "array"),
             ("postgresql_bit", "bit"),
             ("postgresql_roaringbit", "roaringbit"),
-            ("postgis_h3", "h3"),
             ("postgis_bbox", "bbox"),
         ],
     )
@@ -40,7 +39,6 @@ class TestBackendEnvMapping:
             ("postgresql_array", "PG_ARRAY_CACHE_TABLE_PREFIX", "array_cache"),
             ("postgresql_bit", "PG_BIT_CACHE_TABLE_PREFIX", "bit_cache"),
             ("postgresql_roaringbit", "PG_ROARINGBIT_CACHE_TABLE_PREFIX", "roaring_cache"),
-            ("postgis_h3", "PG_H3_CACHE_TABLE_PREFIX", "h3_cache"),
             ("postgis_bbox", "PG_BBOX_CACHE_TABLE_PREFIX", "bbox_cache"),
         ],
     )
@@ -103,7 +101,6 @@ class TestEnvironmentValidation:
         ("cache_backend", "prefix_env", "prefix_value"),
         [
             ("postgresql_array", "PG_ARRAY_CACHE_TABLE_PREFIX", "partitioncache"),
-            ("postgis_h3", "PG_H3_CACHE_TABLE_PREFIX", "partitioncache_h3"),
             ("postgis_bbox", "PG_BBOX_CACHE_TABLE_PREFIX", "partitioncache_bbox"),
         ],
     )

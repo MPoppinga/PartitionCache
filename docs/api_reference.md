@@ -87,7 +87,7 @@ if 'float' in backends['postgresql_array']:
 
 ### Query Processing
 
-#### `get_partition_keys(query: str, cache_handler: AbstractCacheHandler, partition_key: str, min_component_size=2, canonicalize_queries=False, auto_detect_star_join: bool = True, star_join_table: str | None = None, bucket_steps: float = 1.0, add_constraints: dict[str, str] | None = None, remove_constraints_all: list[str] | None = None, remove_constraints_add: list[str] | None = None)`
+#### `get_partition_keys(query: str, cache_handler: AbstractCacheHandler, partition_key: str, min_component_size=2, canonicalize_queries=False, auto_detect_partition_join: bool = True, partition_join_table: str | None = None, bucket_steps: float = 1.0, add_constraints: dict[str, str] | None = None, remove_constraints_all: list[str] | None = None, remove_constraints_add: list[str] | None = None)`
 
 Retrieves cached partition keys for a query with comprehensive statistics.
 
@@ -97,8 +97,8 @@ Retrieves cached partition keys for a query with comprehensive statistics.
 - `partition_key` (str): Partition column name
 - `min_component_size` (int): The minimum number of tables in the partial queries.
 - `canonicalize_queries` (bool): If True, the query is canonicalized before hashing.
-- `auto_detect_star_join` (bool): Whether to auto-detect star-join tables (default: True)
-- `star_join_table` (str | None): Explicitly specified star-join table alias or name
+- `auto_detect_partition_join` (bool): Whether to auto-detect partition-join tables (default: True)
+- `partition_join_table` (str | None): Explicitly specified partition-join table alias or name
 - `bucket_steps` (float): Step size for normalizing distance conditions (default: 1.0)
 - `add_constraints` (dict[str, str] | None): Dict mapping table names to constraints to add
 - `remove_constraints_all` (list[str] | None): List of attribute names to remove from all query variants
@@ -157,7 +157,24 @@ print(optimized)
 # SELECT * FROM users WHERE age > 25 AND user_id IN (1, 5, 10, 15, 20)
 ```
 
-#### `apply_cache_lazy(query, cache_handler, partition_key, ..., geometry_column=None, buffer_distance=None)`
+> **Executing temp-table methods (`TMP_TABLE_IN` / `TMP_TABLE_JOIN`).** These methods return a
+> **multi-statement script**: `CREATE TEMPORARY TABLE ... ON COMMIT DROP; INSERT ...; ANALYZE ...; SELECT ...`.
+> The temp table uses `ON COMMIT DROP`, so the **entire script must run in a single transaction** — otherwise
+> the table is dropped right after `CREATE` (and never reclaimed if you split statements across separate
+> autocommit transactions). Because the final `SELECT` is the *last* statement, a plain `fetchall()` after
+> `cursor.execute(script)` reads the first statement (`CREATE TABLE`, no rows); walk `cursor.nextset()` to the
+> last result set instead. The library's `PostgresDBHandler.execute` does this for you (see
+> `partitioncache.db_handler.postgres.fetch_final_result_set`). Minimal pattern with a raw psycopg cursor:
+>
+> ```python
+> from partitioncache.db_handler.postgres import fetch_final_result_set
+>
+> with conn.cursor() as cur:           # one execute() == one transaction
+>     cur.execute(optimized)           # the multi-statement script
+>     rows = fetch_final_result_set(cur)  # rows of the final SELECT; temp table auto-dropped on commit
+> ```
+
+#### `apply_cache_lazy(query: str, cache_handler: AbstractCacheHandler_Lazy, partition_key: str, method: str = "IN_SUBQUERY", ..., geometry_column: str | None = None, buffer_distance: float | None = None, **kwargs)`
 
 **Recommended** - High-performance cache application with lazy evaluation. Supports spatial mode.
 
@@ -173,8 +190,8 @@ print(optimized)
 - `analyze_tmp_table` (bool, optional): Enable temp table analysis (default: True)
 - `use_p0_table` (bool, optional): Rewrite the query to use a p0 table/star-schema (default: False)
 - `p0_table_name` (str | None, optional): Name of the p0 table. Defaults to `{partition_key}_mv`
-- `auto_detect_star_join` (bool, optional): Whether to auto-detect star-join tables (default: True)
-- `star_join_table` (str | None, optional): Explicitly specified star-join table alias or name
+- `auto_detect_partition_join` (bool, optional): Whether to auto-detect partition-join tables (default: True)
+- `partition_join_table` (str | None, optional): Explicitly specified partition-join table alias or name
 - `bucket_steps` (float, optional): Step size for normalizing distance conditions (default: 1.0)
 - `add_constraints` (dict[str, str] | None, optional): Dict mapping table names to constraints to add
 - `remove_constraints_all` (list[str] | None, optional): List of attribute names to remove from all query variants

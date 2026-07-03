@@ -126,7 +126,7 @@ status_log_interval = 10  # Log status every 10 seconds when idle
 
 
 def query_fragment_processor(args, constraint_args):
-    """Thread function that processes original queries into fragments and pushes to query fragment queue.
+    """Thread function that decomposes and recomposes original queries into query variants and pushes them to the variant queue.
 
     Args:
         args: Command line arguments
@@ -150,28 +150,30 @@ def query_fragment_processor(args, constraint_args):
                 continue  # Timeout occurred, check exit event and try again
 
             query, partition_key, partition_datatype = query_result
-            logger.debug(f"Processing original query into fragments for partition_key: {partition_key} (datatype: {partition_datatype})")
+            logger.debug(f"Processing original query into query variants for partition_key: {partition_key} (datatype: {partition_datatype})")
 
             # Detect spatial mode and resolve geometry column from handler
             is_spatial = partition_datatype == "geometry"
+            resolved_backend = resolve_cache_backend(args) if is_spatial else None
             geometry_column = None
             if is_spatial:
                 try:
-                    spatial_cache_handler = get_cache_handler(resolve_cache_backend(args), singleton=True)
+                    spatial_cache_handler = get_cache_handler(resolved_backend, singleton=True)
                     geometry_column = getattr(spatial_cache_handler, "geometry_column", "geom")
-                except Exception:
+                except Exception as e:
+                    logger.debug("Could not resolve geometry column from cache handler, using default 'geom': %s", e)
                     geometry_column = "geom"
 
-            # Process the query into fragments using the partition_key from queue
+            # Process the query into query variants using the partition_key from queue
             query_hash_pairs = generate_all_query_hash_pairs(
                 query,
                 partition_key,
                 min_component_size=args.min_component_size,
                 follow_graph=args.follow_graph,
                 keep_all_attributes=True,
-                auto_detect_star_join=not args.no_auto_detect_star_join,
+                auto_detect_partition_join=not args.no_auto_detect_partition_join,
                 max_component_size=args.max_component_size,
-                star_join_table=args.star_join_table,
+                partition_join_table=args.partition_join_table,
                 warn_no_partition_key=not args.no_warn_partition_key,
                 bucket_steps=args.bucket_steps,
                 add_constraints=add_constraints,
@@ -179,17 +181,18 @@ def query_fragment_processor(args, constraint_args):
                 remove_constraints_add=remove_constraints_add,
                 skip_partition_key_joins=is_spatial,
                 geometry_column=geometry_column,
+                max_conditions_removed=args.max_conditions_removed,
             )
-            logger.debug(f"Generated {len(query_hash_pairs)} fragments from original query")
+            logger.debug(f"Generated {len(query_hash_pairs)} query variants from original query")
 
-            # Push fragments to query fragment queue using the partition_key and datatype from queue
+            # Push variants to the variant queue using the partition_key and datatype from queue
             # For spatial queries, resolve and pass cache_backend so the processor knows which handler to use
-            queue_cache_backend = resolve_cache_backend(args) if is_spatial else None
+            queue_cache_backend = resolved_backend
             success = push_to_query_fragment_queue(query_hash_pairs, partition_key, partition_datatype, cache_backend=queue_cache_backend)
             if success:
-                logger.debug(f"Pushed {len(query_hash_pairs)} fragments to query fragment queue")
+                logger.debug(f"Pushed {len(query_hash_pairs)} query variants to the variant queue")
             else:
-                logger.error("Error pushing fragments to query fragment queue")
+                logger.error("Error pushing query variants to the variant queue")
 
         except Exception as e:
             logger.error(f"Error in query fragment processor: {e}")
@@ -487,7 +490,7 @@ def get_timeout_for_state(can_consume, exit_event_set, error_count=0):
 
 
 def fragment_executor():
-    """Thread pool function that processes fragments from the fragment queue."""
+    """Thread pool function that executes query variants from the variant queue."""
     global pool, last_status_log_time
 
     # Initialize cache handler for the main process
@@ -612,7 +615,7 @@ def fragment_executor():
                         break
 
                     query, hash_value, partition_key, partition_datatype, item_cache_backend = fragment_result
-                    logger.debug(f"Found fragment in fragment queue: {hash_value}")
+                    logger.debug(f"Found query variant in variant queue: {hash_value}")
 
                     # Check if already in cache (unless force-recalculate)
                     if not args.force_recalculate and main_cache_handler.exists(hash_value, partition_key, check_query=False):
@@ -702,10 +705,10 @@ def main():
     # Cache optimization configuration
     optimization_group = parser.add_argument_group("cache optimization options")
     optimization_group.add_argument(
-        "--enable-cache-optimization", action="store_true", default=True, help="Enable cache-aware optimization for fragment queries"
+        "--enable-cache-optimization", action="store_true", default=True, help="Enable cache-aware optimization for variant queries"
     )
     optimization_group.add_argument(
-        "--disable-cache-optimization", action="store_true", default=False, help="Disable cache-aware optimization for fragment queries"
+        "--disable-cache-optimization", action="store_true", default=False, help="Disable cache-aware optimization for variant queries"
     )
     optimization_group.add_argument(
         "--cache-optimization-method",
@@ -836,8 +839,8 @@ def main():
                 query_accelerator = None
 
     logger.info("Starting two-threaded queue monitoring system:")
-    logger.info("- Thread 1: Process original queries into fragments")
-    logger.info("- Thread 2: Execute fragments from query fragment queue with enhanced consumption control")
+    logger.info("- Thread 1: Decompose/recompose original queries into query variants")
+    logger.info("- Thread 2: Execute query variants from the variant queue with enhanced consumption control")
     logger.info("- Partition keys are read from the queue instead of command line arguments")
     logger.info(f"- Configuration: max_processes={args.max_processes}")
     logger.info(f"- Queue provider: {provider}, Cache backend: {args.cache_backend}")

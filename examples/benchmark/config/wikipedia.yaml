@@ -1,0 +1,85 @@
+name: "Wikipedia LLM Benchmark"
+fact_table: "wikipedia_articles"
+p0_alias: "a"
+
+env_file: "examples/wikipedia_benchmark/.env"
+query_dir: "examples/wikipedia_benchmark/queries"
+
+data_setup:
+  script: "examples/wikipedia_benchmark/generate_wikipedia_data.py"
+  docker_compose: "examples/wikipedia_benchmark/docker-compose.yml"
+  example_command: "python examples/wikipedia_benchmark/generate_wikipedia_data.py --mock"
+  required_tables: ["wikipedia_articles"]
+
+executors:
+  duckdb:
+    enabled: false
+  postgresql:
+    enabled: true
+
+partition_keys:
+  article_id: { datatype: integer }
+
+query_partition_keys:
+  q1_1: [article_id]
+  q1_2: [article_id]
+  q1_3: [article_id]
+  q2_1: [article_id]
+  q2_2: [article_id]
+  q2_3: [article_id]
+  q3_1: [article_id]
+  q3_2: [article_id]
+  q3_3: [article_id]
+  q4_1: [article_id]
+  q4_2: [article_id]
+  q4_3: [article_id]
+  q5_1: [article_id]
+  q5_2: [article_id]
+  q5_3: [article_id]
+
+query_flights:
+  1: [q1_1, q1_2, q1_3]
+  2: [q2_1, q2_2, q2_3]
+  3: [q3_1, q3_2, q3_3]
+  4: [q4_1, q4_2, q4_3]
+  5: [q5_1, q5_2, q5_3]
+
+hierarchy_labels: {}
+
+spatial_queries: []
+
+query_processing:
+  keep_all_attributes: false
+  follow_graph: false
+  strip_select: true
+  auto_detect_partition_join: false
+  skip_partition_key_joins: true
+  use_adapted_queries: true
+  adapted_subdirectory: "adapted"
+
+fragment_filter:
+  require_in_from: [wikipedia_articles]
+  exclude_from_from: []
+
+cache:
+  table_prefix: "wikipedia_cache"
+  bitsize_strategy: data_driven
+
+backends:
+  postgresql: [postgresql_array, postgresql_bit]
+
+fact_stats:
+  strategy: count_with_max
+  table: "wikipedia_articles"
+  count_column: "*"
+  max_column: "article_id"
+
+modes:
+  cross_dimension:
+    phase1_flights: [1, 2, 3]
+    phase2_flights: [5]
+  hierarchy:
+    flights: []
+  cold_warm:
+    flight: 1
+  representative_queries: [q1_1, q2_1, q4_1]

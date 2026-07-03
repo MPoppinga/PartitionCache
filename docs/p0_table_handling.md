@@ -1,12 +1,12 @@
-# Star-Join Table Handling in PartitionCache
+# Partition-Join Table Handling in PartitionCache
 
 ## Overview
 
-Star-join tables ("p0 tables") are special tables used solely for partition key joins in star-schema query patterns. These tables serve as the central hub connecting other tables through the partition key, without contributing any filtering conditions. PartitionCache automatically detects and optimizes these tables by excluding them from variant generation and then re-adding them to each variant, significantly reducing the total number of generated variants while maintaining query correctness.
+Partition-join tables ("p0 tables") are special tables used solely for partition key joins in star-schema query patterns. These tables serve as the central hub connecting other tables through the partition key, without contributing any filtering conditions. PartitionCache automatically detects and optimizes these tables by excluding them from variant generation and then re-adding them to each variant, significantly reducing the total number of generated variants while maintaining query correctness.
 
-## How Star-Join Detection Works
+## How Partition-Join Detection Works
 
-The system uses a three-tier detection approach to identify star-join tables:
+The system uses a three-tier detection approach to identify partition-join tables:
 
 ### 1. Smart Detection (Default: Enabled)
 - **Pattern**: Tables that join to ALL other tables AND have ONLY partition key conditions
@@ -15,15 +15,15 @@ The system uses a three-tier detection approach to identify star-join tables:
 
 ### 2. Naming Convention
 - **Pattern**: Tables with names starting with 'p0' (case-insensitive) AND no attribute conditions
-- **Purpose**: Legacy support and explicit star-join designation
+- **Purpose**: Legacy support and explicit partition-join designation
 - **Example**: `p0_city`, `p0_partition`, `p0_region`
 
 ### 3. Explicit Specification
-- **Pattern**: Tables specified via `star_join_table` parameter (matches by alias or table name)
+- **Pattern**: Tables specified via `partition_join_table` parameter (matches by alias or table name)
 - **Purpose**: Override automatic detection for specific use cases
-- **Example**: `star_join_table='region_map'` or `star_join_table='rm'` to mark region_map table
+- **Example**: `partition_join_table='region_map'` or `partition_join_table='rm'` to mark region_map table
 
-**Note**: Only ONE star-join table is used per query. If multiple are detected, the first (alphabetically) is used.
+**Note**: Only ONE partition-join table is used per query. If multiple are detected, the first (alphabetically) is used.
 
 Example of a P0 table that WILL be excluded:
 ```sql
@@ -45,25 +45,25 @@ WHERE u.city_id = p0.city_id
 
 ### Step-by-Step Process
 
-The star-join optimization process:
+The partition-join optimization process:
 
 1. **Parse Query**: Extract tables, conditions, and join relationships
-2. **Detect Star-Join**: Identify star-join table using the three-tier approach
-3. **Build Graph**: Create connected component graph of non-star-join tables
-4. **Generate Base Variants**: Create combinations of non-star-join tables
-5. **Re-add Star-Join**: Add the star-join table to EVERY variant
-6. **Optimize Joins**: Ensure all tables join to star-join table on partition key
+2. **Detect Partition-Join**: Identify partition-join table using the three-tier approach
+3. **Build Graph**: Create connected component graph of non-partition-join tables
+4. **Generate Base Variants**: Create combinations of non-partition-join tables
+5. **Re-add Partition-Join**: Add the partition-join table to EVERY variant
+6. **Optimize Joins**: Ensure all tables join to partition-join table on partition key
 
 ### Why This Works
 
-The optimization is based on the mathematical property that star-join tables don't affect the selectivity of queries when they only provide partition key equality:
+The optimization is based on the mathematical property that partition-join tables don't affect the selectivity of queries when they only provide partition key equality:
 
 ```
-Original: A ⋈ B ⋈ C ⋈ StarJoin (on partition key)
-Equivalent: (A ⋈ B ⋈ C) ⋈ StarJoin (on partition key)
+Original: A ⋈ B ⋈ C ⋈ PartitionJoin (on partition key)
+Equivalent: (A ⋈ B ⋈ C) ⋈ PartitionJoin (on partition key)
 ```
 
-Since the star-join table must be included for correctness but doesn't affect which rows match, we can:
+Since the partition-join table must be included for correctness but doesn't affect which rows match, we can:
 1. Generate variants without it (reducing combinations)
 2. Add it back to every variant (maintaining correctness)
 
@@ -131,8 +131,8 @@ pcache-add \
   --min-component-size 2 \        # Minimum tables in variants
   --max-component-size 4 \        # Maximum tables in variants
   --follow-graph \                # Use connected component graph
-  --no-auto-detect-star-join \    # Disable smart detection
-  --star-join-table rm \          # Explicit star-join table (only one)
+  --no-auto-detect-partition-join \    # Disable smart detection
+  --partition-join-table rm \          # Explicit partition-join table (only one)
   --no-warn-partition-key          # Disable partition key warnings
 ```
 
@@ -141,13 +141,13 @@ pcache-add \
 - `PARTITION_CACHE_MIN_COMPONENT_SIZE`: Minimum tables in variants (default: 1)
 - `PARTITION_CACHE_MAX_COMPONENT_SIZE`: Maximum tables in variants (default: no limit)
 - `PARTITION_CACHE_FOLLOW_GRAPH`: Generate only connected subgraphs (default: true)
-- `PARTITION_CACHE_NO_AUTO_DETECT_STAR_JOIN`: Disable smart detection (default: false)
-- `PARTITION_CACHE_STAR_JOIN_TABLE`: Single star-join table alias or name
+- `PARTITION_CACHE_NO_AUTO_DETECT_PARTITION_JOIN`: Disable smart detection (default: false). Also accepts legacy `PARTITION_CACHE_NO_AUTO_DETECT_STAR_JOIN`.
+- `PARTITION_CACHE_PARTITION_JOIN_TABLE`: Single partition-join table alias or name. Also accepts legacy `PARTITION_CACHE_STAR_JOIN_TABLE`.
 - `PARTITION_CACHE_NO_WARN_PARTITION_KEY`: Disable partition key warnings (default: false)
 
 ### API Parameters
 
-The star-join parameters are available in all major PartitionCache API functions:
+The partition-join parameters are available in all major PartitionCache API functions:
 
 #### `apply_cache_lazy()` - Recommended API
 ```python
@@ -158,9 +158,9 @@ enhanced_query, stats = partitioncache.apply_cache_lazy(
     cache_handler=cache.underlying_handler,
     partition_key="city_id",
     method="TMP_TABLE_IN",
-    auto_detect_star_join=True,      # Enable smart star-join detection (default)
-    star_join_table="p0",            # Explicitly mark table by alias
-    min_component_size=2,            # Min tables per variant (including star-join)
+    auto_detect_partition_join=True,      # Enable smart partition-join detection (default)
+    partition_join_table="p0",            # Explicitly mark table by alias
+    min_component_size=2,            # Min tables per variant (including partition-join)
     # ... other parameters
 )
 ```
@@ -173,8 +173,8 @@ partition_keys, subqueries, hits = partitioncache.get_partition_keys(
     query="SELECT * FROM users u, orders o, p0_city p0 WHERE ...",
     cache_handler=cache.underlying_handler,
     partition_key="city_id",
-    auto_detect_star_join=True,      # Enable smart star-join detection (default)
-    star_join_table="p0_city",       # Explicitly mark table by name
+    auto_detect_partition_join=True,      # Enable smart partition-join detection (default)
+    partition_join_table="p0_city",       # Explicitly mark table by name
     min_component_size=2,            # Min tables per variant
     # ... other parameters
 )
@@ -189,19 +189,19 @@ optimized_query = partitioncache.extend_query_with_partition_keys(
     partition_keys={1, 5, 10, 15, 20},
     partition_key="city_id",
     method="IN",
-    p0_alias="p0",                   # Use detected star-join table alias
+    p0_alias="p0",                   # Use detected partition-join table alias
 )
 ```
 
-All functions support the same star-join parameters:
-- `auto_detect_star_join: bool = True` - Enable smart star-join detection
-- `star_join_table: str | None = None` - Explicitly mark ONE table as star-join (by alias or name)
+All functions support the same partition-join parameters:
+- `auto_detect_partition_join: bool = True` - Enable smart partition-join detection
+- `partition_join_table: str | None = None` - Explicitly mark ONE table as partition-join (by alias or name)
 
-## When to Use Star-Join Optimization
+## When to Use Partition-Join Optimization
 
 ### Good Use Cases
 
-1. **Pure Join Tables**: When star-join tables only connect partitions without filtering
+1. **Pure Join Tables**: When partition-join tables only connect partitions without filtering
 2. **Star Schemas**: Central mapping table connecting dimension tables
 3. **Performance Optimization**: Reduce variant count for large queries
 4. **Region/Partition Mappings**: Tables that map entities to partitions
@@ -229,9 +229,9 @@ When P0 tables are excluded, the system ensures partition key equality by:
 
 Excluding P0 tables can significantly reduce the number of variants:
 - Query with N tables and 1 P0 table: 2^N base variants → 2^(N-1) base variants
-- Each base variant has the star-join table re-added, maintaining correctness
+- Each base variant has the partition-join table re-added, maintaining correctness
 - Benefit: Better query organization and potential for optimization
-- Star-join tables clearly identified for query optimization
+- Partition-join tables clearly identified for query optimization
 
 ### Connected Component Graph
 
@@ -243,15 +243,15 @@ The `follow_graph=True` option uses a connected component graph to generate only
 
 ## Limitations
 
-1. Only ONE star-join table is allowed per query
-2. Only pure-join star-join tables are excluded (those without non-partition-key conditions)
+1. Only ONE partition-join table is allowed per query
+2. Only pure-join partition-join tables are excluded (those without non-partition-key conditions)
 3. Smart detection automatically applies when enabled (default)
 
 ## Best Practices
 
 1. Name pure-join tables with 'p0_' prefix for automatic detection
-2. Use `star_join_table` parameter to explicitly specify ONE star-join table
+2. Use `partition_join_table` parameter to explicitly specify ONE partition-join table
 3. Enable `warn_no_partition_key` to identify potential issues (default)
-4. Review logs for smart-detected star-join tables
-5. Test that query semantics are preserved with star-join optimization
+4. Review logs for smart-detected partition-join tables
+5. Test that query semantics are preserved with partition-join optimization
 6. Use `follow_graph=True` (default) for complex queries with independent table groups
