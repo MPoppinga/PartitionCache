@@ -160,11 +160,11 @@ class RocksDictH3GroupedCacheHandler(RocksDictCacheHandler):
         1. Load grouped match sets for each key from cache
         2. Compute k from buffer_distance and resolution
         3. Expand each group's cells with grid_disk(cell, k)
-        4. Per-fragment merge, cross-fragment intersection
+        4. Per-variant merge, cross-variant intersection
         5. Return surviving cell IDs
 
         Args:
-            keys: Cache keys (fragment hashes) to intersect.
+            keys: Cache keys (variant hashes) to intersect.
             partition_key: Partition key namespace.
             buffer_distance: Buffer distance in meters for k-ring expansion.
 
@@ -195,7 +195,7 @@ class RocksDictH3GroupedCacheHandler(RocksDictCacheHandler):
             else:
                 k = 0
 
-            # K-ring expansion + cross-fragment intersection
+            # K-ring expansion + cross-variant intersection
             result = _grouped_kring_intersection(fragment_groups, k)
 
             if not result:

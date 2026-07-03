@@ -1234,7 +1234,7 @@ def apply_cache_lazy(
         remove_constraints_all: List of attribute names to remove from all query variants
         remove_constraints_add: List of attribute names to remove, creating additional variants
         protected_patterns: Conditions matching these patterns are never removed during variant generation.
-        geometry_column: If set, enables spatial cache mode. Uses this geometry column for fragment
+        geometry_column: If set, enables spatial cache mode. Uses this geometry column for variant
             SELECT clauses and spatial filter application. Requires a spatial cache handler with
             get_spatial_filter_lazy() method.
         buffer_distance: Buffer distance in meters for spatial filter. If None and geometry_column
@@ -1488,8 +1488,8 @@ def apply_cache(
         add_constraints: Dict mapping table names to constraints to add (e.g., {"table": "col = val"})
         remove_constraints_all: List of attribute names to remove from all query variants
         remove_constraints_add: List of attribute names to remove, creating additional variants
-        skip_partition_key_joins (bool): If True, skip partition key joins in fragment generation.
-        geometry_column: If set, enables spatial cache mode. Uses this geometry column for fragment
+        skip_partition_key_joins (bool): If True, skip partition key joins in variant generation.
+        geometry_column: If set, enables spatial cache mode. Uses this geometry column for variant
             SELECT clauses and spatial filter application. Requires a spatial cache handler with
             get_spatial_filter() method.
         buffer_distance: Buffer distance in meters for spatial filter. If None and geometry_column

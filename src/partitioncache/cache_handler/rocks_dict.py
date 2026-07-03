@@ -9,11 +9,11 @@ logger = getLogger("PartitionCache")
 
 def _grouped_intersection(fragment_groups: list[list[frozenset[int]]]) -> set[int]:
     """
-    Intersect grouped match sets across fragments using connected components.
+    Intersect grouped match sets across cached query variants using connected components.
 
-    Each fragment has a list of match groups (frozenset of H3 cell IDs).
-    Two groups from different fragments are "connected" if they share any cell.
-    Returns the union of cells from connected components spanning ALL fragments.
+    Each variant has a list of match groups (frozenset of H3 cell IDs).
+    Two groups from different variants are "connected" if they share any cell.
+    Returns the union of cells from connected components spanning ALL variants.
 
     Uses union-find for efficiency.
     """
@@ -21,14 +21,14 @@ def _grouped_intersection(fragment_groups: list[list[frozenset[int]]]) -> set[in
     if num_fragments == 0:
         return set()
 
-    # Single fragment: return union of all cells
+    # Single variant: return union of all cells
     if num_fragments == 1:
         result: set[int] = set()
         for group in fragment_groups[0]:
             result.update(group)
         return result
 
-    # Assign unique ID to each group: (fragment_idx, cells)
+    # Assign unique ID to each group: (variant index, cells)
     all_groups: list[tuple[int, frozenset[int]]] = []
     for frag_idx, groups in enumerate(fragment_groups):
         for group in groups:
@@ -69,7 +69,7 @@ def _grouped_intersection(fragment_groups: list[list[frozenset[int]]]) -> set[in
         for i in range(1, len(group_indices)):
             union(group_indices[0], group_indices[i])
 
-    # Collect components: root -> (fragment indices, cells)
+    # Collect components: root -> (variant indices, cells)
     components: dict[int, tuple[set[int], set[int]]] = {}
     for group_idx, (frag_idx, cells) in enumerate(all_groups):
         root = find(group_idx)
@@ -78,7 +78,7 @@ def _grouped_intersection(fragment_groups: list[list[frozenset[int]]]) -> set[in
         components[root][0].add(frag_idx)
         components[root][1].update(cells)
 
-    # Keep components spanning all fragments
+    # Keep components spanning all variants
     surviving: set[int] = set()
     for frag_indices, cells in components.values():
         if len(frag_indices) == num_fragments:
@@ -92,21 +92,21 @@ def _grouped_kring_intersection(
     k: int,
 ) -> set[int]:
     """
-    Expand groups with k-ring, then intersect per-fragment sets.
+    Expand groups with k-ring, then intersect per-variant sets.
 
-    For each fragment:
+    For each cached variant:
       1. Expand every cell in every group with grid_disk(cell, k)
-      2. Merge all expanded cells into one set (this fragment's "influence area")
-    Then intersect all fragments' influence areas.
+      2. Merge all expanded cells into one set (this variant's "influence area")
+    Then intersect all variants' influence areas.
 
-    Result: H3 cells that are within k cells of a match in EVERY fragment.
+    Result: H3 cells that are within k cells of a match in EVERY variant.
 
     Args:
-        fragment_groups: Per-fragment list of match groups (frozenset of H3 cell IDs).
+        fragment_groups: Per-variant list of match groups (frozenset of H3 cell IDs).
         k: K-ring radius (number of hexagon hops for grid_disk expansion).
 
     Returns:
-        Set of H3 cell IDs that survive cross-fragment intersection after k-ring expansion.
+        Set of H3 cell IDs that survive cross-variant intersection after k-ring expansion.
     """
     try:
         import h3 as h3_lib
@@ -130,7 +130,7 @@ def _grouped_kring_intersection(
     if not per_fragment_cells:
         return set()
 
-    # Cross-fragment intersection
+    # Cross-variant intersection
     result = per_fragment_cells[0]
     for fragment_cells in per_fragment_cells[1:]:
         result = result & fragment_cells
