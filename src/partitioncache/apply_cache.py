@@ -496,6 +496,7 @@ def extend_query_with_partition_keys_lazy(
     analyze_tmp_table: bool = True,
     auto_detect_partition_join: bool = True,
     partition_join_table: str | None = None,
+    sql_dialect: str = "postgres",
 ) -> str:
     """
     Extend a given SQL query with the cache functionality using a lazy SQL subquery.
@@ -513,6 +514,7 @@ def extend_query_with_partition_keys_lazy(
         analyze_tmp_table (bool): Whether to create index and analyze. (only for temporary table methods)
         auto_detect_partition_join: Whether to auto-detect partition-join tables.
         partition_join_table: Explicitly specified partition-join table alias or name.
+        sql_dialect: sqlglot dialect used to parse and render the query. Defaults to PostgreSQL.
 
     Returns:
         str: The extended SQL query as string.
@@ -524,20 +526,21 @@ def extend_query_with_partition_keys_lazy(
         # No alias provided, try to find it (TMP_TABLE_JOIN does join on all tables)
         p0_alias = find_p0_alias(query, partition_key, auto_detect_partition_join, partition_join_table)
 
-    parsed_query = sqlglot.parse_one(query)
+    parsed_query = sqlglot.parse_one(query, read=sql_dialect)
 
     if method == "IN_SUBQUERY":
-        # Direct integration: original_query AND p0_alias.partition_key IN (lazy_subquery)
-        partition_expr = sqlglot.parse_one(f"{p0_alias}.{partition_key} IN ({lazy_subquery})")
+        partition_expr = sqlglot.parse_one(f"{p0_alias}.{partition_key} IN ({lazy_subquery})", read=sql_dialect)
         _add_where_condition(parsed_query, partition_expr)
-        return parsed_query.sql()
+        return parsed_query.sql(dialect=sql_dialect)
 
     elif method == "TMP_TABLE_IN":
         # Create temporary table from lazy subquery, then use IN with SELECT
         tmp_table_setup, table_name = _create_tmp_table_setup_from_subquery(lazy_subquery, partition_key, analyze_tmp_table)
-        partition_expr = sqlglot.parse_one(f"{p0_alias}.{partition_key} IN (SELECT {partition_key} FROM {table_name})")
+        partition_expr = sqlglot.parse_one(
+            f"{p0_alias}.{partition_key} IN (SELECT {partition_key} FROM {table_name})", read=sql_dialect
+        )
         _add_where_condition(parsed_query, partition_expr)
-        return tmp_table_setup + parsed_query.sql()
+        return tmp_table_setup + parsed_query.sql(dialect=sql_dialect)
 
     elif method == "TMP_TABLE_JOIN":
         # Create temporary table from lazy subquery, then JOIN
@@ -560,7 +563,7 @@ def extend_query_with_partition_keys_lazy(
 
             # Create the new join expression using sqlglot
             join_expr = (
-                from_clause.this.sql()  # Original table
+                from_clause.this.sql(dialect=sql_dialect)  # Original table
                 + " "  # Space between tables
                 + exp.Join(
                     this=exp.Identifier(this=f"{table_name} AS tmp_{table_alias}"),
@@ -569,13 +572,13 @@ def extend_query_with_partition_keys_lazy(
                         expression=exp.Identifier(this=f"{table_alias}.{partition_key}"),
                     ),
                     kind="INNER",
-                ).sql()  # New join expression
+                ).sql(dialect=sql_dialect)  # New join expression
             )
 
             # Replace the old join expression with the new one
             from_clause.this.replace(join_expr)
 
-        return tmp_table_setup + parsed_query.sql()
+        return tmp_table_setup + parsed_query.sql(dialect=sql_dialect)
 
 
 def extend_query_with_spatial_filter_lazy(
@@ -1209,6 +1212,7 @@ def apply_cache_lazy(
     subdivide_max_vertices: int = 256,
     max_conditions_removed: int | None = None,
     protected_patterns: list[str] | None = None,
+    sql_dialect: str = "postgres",
     **kwargs: Any,
 ) -> tuple[str, dict[str, int]]:
     """
@@ -1234,6 +1238,7 @@ def apply_cache_lazy(
         remove_constraints_all: List of attribute names to remove from all query variants
         remove_constraints_add: List of attribute names to remove, creating additional variants
         protected_patterns: Conditions matching these patterns are never removed during variant generation.
+        sql_dialect: sqlglot dialect used to parse and render non-spatial queries. Defaults to PostgreSQL.
         geometry_column: If set, enables spatial cache mode. Uses this geometry column for variant
             SELECT clauses and spatial filter application. Requires a spatial cache handler with
             get_spatial_filter_lazy() method.
@@ -1425,6 +1430,7 @@ def apply_cache_lazy(
         analyze_tmp_table=analyze_tmp_table,
         auto_detect_partition_join=auto_detect_partition_join,
         partition_join_table=partition_join_table,
+        sql_dialect=sql_dialect,
     )
 
     stats["enhanced"] = 1
