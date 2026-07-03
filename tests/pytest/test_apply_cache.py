@@ -576,6 +576,70 @@ class TestExtendQueryWithPartitionKeysLazy:
         assert "p1.zipcode IN (SELECT zipcode FROM tmp_cache_keys_" in result
         assert "p1.active = TRUE" in result or "p1.active = true" in result  # Original query condition preserved
 
+    def test_in_subquery_preserves_postgresql_array_constructor(self):
+        """PostgreSQL ARRAY[...] syntax in lazy subqueries must not be rewritten."""
+        query = "SELECT * FROM poi AS p1 WHERE p1.active = true"
+        lazy_subquery = """(
+        WITH bit_result AS (
+            SELECT BIT_AND(partition_keys) AS bit_result
+            FROM (
+                SELECT partition_keys
+                FROM cache_zipcode
+                WHERE query_hash = ANY(ARRAY['hash1', 'hash2'])
+            ) AS selected
+        )
+        SELECT 1 AS zipcode FROM bit_result
+        )"""
+
+        result = extend_query_with_partition_keys_lazy(
+            query,
+            lazy_subquery,
+            "zipcode",
+            method="IN_SUBQUERY",
+            p0_alias="p1",
+        )
+
+        assert "ANY(ARRAY['hash1', 'hash2'])" in result
+        assert "ANY(ARRAY('hash1', 'hash2'))" not in result
+
+    def test_in_subquery_preserves_postgresql_like_any_arrays_in_query(self):
+        """PostgreSQL arrays containing LIKE patterns must survive query extension."""
+        query = """
+        SELECT d.document_id
+        FROM document_catalog AS d
+        WHERE d.property_value ILIKE ANY (ARRAY['%alpha_%', '%/beta%'])
+          AND d.source_code LIKE ANY (ARRAY['%X1%', '%Y2%'])
+        """
+        lazy_subquery = "SELECT shard_id FROM cached_shards"
+
+        result = extend_query_with_partition_keys_lazy(
+            query,
+            lazy_subquery,
+            "shard_id",
+            method="IN_SUBQUERY",
+            p0_alias="d",
+        )
+
+        assert "ILIKE ANY(ARRAY['%alpha_%', '%/beta%'])" in result
+        assert "LIKE ANY(ARRAY['%X1%', '%Y2%'])" in result
+        assert "ANY(ARRAY(" not in result
+
+    def test_in_subquery_accepts_explicit_duckdb_dialect(self):
+        """Callers can select DuckDB parsing and rendering explicitly."""
+        query = "SELECT d.document_id FROM document_catalog AS d WHERE d.labels && ['alpha', 'beta']"
+
+        result = extend_query_with_partition_keys_lazy(
+            query,
+            "SELECT shard_id FROM cached_shards",
+            "shard_id",
+            method="IN_SUBQUERY",
+            p0_alias="d",
+            sql_dialect="duckdb",
+        )
+
+        assert "d.labels && ['alpha', 'beta']" in result
+        assert "d.shard_id IN (SELECT shard_id FROM cached_shards)" in result
+
     def test_invalid_method_raises_error(self):
         """Test that invalid method raises appropriate error."""
         query = "SELECT * FROM users AS u"
