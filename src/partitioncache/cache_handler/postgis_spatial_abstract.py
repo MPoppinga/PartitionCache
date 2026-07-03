@@ -124,7 +124,7 @@ class PostGISSpatialAbstractCacheHandler(PostgreSQLAbstractCacheHandler):
 
     @abstractmethod
     def set_cache_lazy(self, key: str, query: str, partition_key: str = "partition_key") -> bool:
-        """Store cache entries by wrapping a fragment query with backend-specific SQL."""
+        """Store cache entries by wrapping a variant query with backend-specific SQL."""
         ...
 
     @abstractmethod

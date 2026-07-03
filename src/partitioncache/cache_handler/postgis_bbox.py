@@ -149,11 +149,11 @@ class PostGISBBoxCacheHandler(PostGISSpatialAbstractCacheHandler):
 
     def set_cache_lazy(self, key: str, query: str, partition_key: str = "partition_key") -> bool:
         """
-        Store geometry collection by wrapping the fragment query with ST_Collect aggregation.
+        Store geometry collection by wrapping the variant query with ST_Collect aggregation.
 
-        The fragment query should return rows with a geometry column (or multiple geometry
-        columns named geom_1, geom_2, ... for multi-alias spatial fragments). Multi-column
-        fragments are flattened via CROSS JOIN LATERAL VALUES before collection.
+        The variant query should return rows with a geometry column (or multiple geometry
+        columns named geom_1, geom_2, ... for multi-alias spatial variants). Multi-column
+        variants are flattened via CROSS JOIN LATERAL VALUES before collection.
         """
         try:
             if "DELETE " in query.upper() or "DROP " in query.upper():
@@ -168,13 +168,13 @@ class PostGISBBoxCacheHandler(PostGISSpatialAbstractCacheHandler):
             table_name = f"{self.tableprefix}_cache_{partition_key}"
             geom_col = self.geometry_column
 
-            # Detect multi-column geometry format (geom_1, geom_2, ...) from grouped fragments
+            # Detect multi-column geometry format (geom_1, geom_2, ...) from grouped variants
             import re
 
             geom_col_indices = sorted({int(m) for m in re.findall(rf'\b{re.escape(geom_col)}_(\d+)\b', query)})
 
             if geom_col_indices:
-                # Multi-column fragment: flatten via LATERAL VALUES into single geometry column
+                # Multi-column variant: flatten via LATERAL VALUES into single geometry column
                 values_list = ", ".join(f"(sub.{geom_col}_{i})" for i in geom_col_indices)
                 lazy_insert_query = sql.SQL(
                     """
@@ -198,7 +198,7 @@ class PostGISBBoxCacheHandler(PostGISSpatialAbstractCacheHandler):
                     query=sql.SQL(query),  # type: ignore[arg-type]
                 )
             else:
-                # Single-column fragment: collect directly
+                # Single-column variant: collect directly
                 lazy_insert_query = sql.SQL(
                     """
                     INSERT INTO {table} (query_hash, partition_keys, partition_keys_count)
@@ -325,7 +325,7 @@ class PostGISBBoxCacheHandler(PostGISSpatialAbstractCacheHandler):
 
         Each stored geometry collection is buffered by ``buffer_distance`` before
         intersection. This produces the "co-occurrence zone" — the area within
-        ``buffer_distance`` of ALL fragment types simultaneously.
+        ``buffer_distance`` of ALL cached variants simultaneously.
 
         For a single key: ``ST_Buffer(partition_keys, buf)``
         For multiple keys: ``ST_Intersection(ST_Buffer(A, buf), ST_Buffer(B, buf))``

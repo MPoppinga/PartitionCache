@@ -37,15 +37,15 @@ def main():
     query_group.add_argument(
         "--no-recompose",
         action="store_true",
-        help="Do not recompose the query before adding to cache, the query is added as is to the cache or fragment queue"
+        help="Do not recompose the query before adding to cache, the query is added as is to the cache or variant queue"
     )
 
 
     # Execution mode configuration
     mode_group = parser.add_argument_group("execution mode")
-    mode_group.add_argument("--queue", action="store_true", help="Add query to fragment queue instead of executing directly")
-    mode_group.add_argument("--queue-original", action="store_true", help="Add query to original query queue instead of fragment queue")
-    mode_group.add_argument("--direct", action="store_true", help="Calculate fragments directly instead of using the incoming queue")
+    mode_group.add_argument("--queue", action="store_true", help="Add query variants to the variant queue instead of executing directly")
+    mode_group.add_argument("--queue-original", action="store_true", help="Add query to original query queue instead of the variant queue")
+    mode_group.add_argument("--direct", action="store_true", help="Calculate query variants directly instead of using the incoming queue")
 
     # Add common argument groups
     add_cache_args(parser, require_partition_key=True)
@@ -102,7 +102,7 @@ def main():
         # Resolve cache backend to store with queue item (important for spatial routing)
         queue_cache_backend = resolve_cache_backend(args) if is_spatial else None
 
-        if not args.no_recompose:  # Add to query fragment queue for async processing
+        if not args.no_recompose:  # Recompose into query variants and add to the variant queue for async processing
             # Resolve geometry column for spatial datatypes
             geometry_column = None
             if is_spatial:
@@ -135,14 +135,14 @@ def main():
                 max_conditions_removed=args.max_conditions_removed,
             )
             success = partitioncache.push_to_query_fragment_queue(query_hash_pairs, args.partition_key, args.partition_datatype, queue_provider, cache_backend=queue_cache_backend)
-        else: # Compute fragments and add to fragment queue
+        else:  # Push the cleaned query as a single variant (no recomposition)
             query = clean_query(query)
             query_hash_pairs = [(query, hash_query(query))]
             success = partitioncache.push_to_query_fragment_queue(query_hash_pairs, args.partition_key, args.partition_datatype, queue_provider, cache_backend=queue_cache_backend)
         if success:
-            logger.info("Query successfully added to query fragment queue")
+            logger.info("Query successfully added to query variant queue")
         else:
-            logger.error("Failed to add query to query fragment queue")
+            logger.error("Failed to add query to query variant queue")
             exit(1)
 
     elif args.direct:  # Execute directly
@@ -206,7 +206,7 @@ def main():
             logger.debug(f"Found {len(query_hash_pairs)} subqueries to process")
 
             if is_spatial:
-                # Spatial mode: use lazy insertion (the handler wraps fragments with H3/BBox SQL)
+                # Spatial mode: use lazy insertion (the handler wraps variant queries with H3/BBox SQL)
                 if not hasattr(cache_handler, "set_cache_lazy"):
                     logger.error(f"Spatial datatype '{args.partition_datatype}' requires a handler with set_cache_lazy support")
                     exit(1)
@@ -226,7 +226,7 @@ def main():
 
                 cache.close()
             else:
-                # Standard mode: execute fragments via db_handler and store results
+                # Standard mode: execute variant queries via db_handler and store results
                 db_connection_params = get_database_connection_params(args)
 
                 if args.db_backend == "postgresql":

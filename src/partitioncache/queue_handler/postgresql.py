@@ -312,17 +312,18 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
 
     def push_to_query_fragment_queue(self, query_hash_pairs: list[tuple[str, str]], partition_key: str, partition_datatype: str | None = None, cache_backend: str | None = None) -> bool:
         """
-        Push query fragments to the fragment queue (implements AbstractQueueHandler interface).
+        Push query variants to the variant queue (implements AbstractQueueHandler interface;
+        the queue table keeps its historical ``query_fragment_queue`` name).
         Uses batch non-blocking upsert for optimal performance and proper concurrency handling.
 
         Args:
-            query_hash_pairs (List[Tuple[str, str]]): List of (query, hash) tuples to push.
-            partition_key (str): The partition key for these query fragments.
+            query_hash_pairs (List[Tuple[str, str]]): List of (variant_query, hash) tuples to push.
+            partition_key (str): The partition key for these query variants.
             partition_datatype (str): The datatype of the partition key (default: None).
             cache_backend (str): The cache backend to use for processing (default: None, uses processor config).
 
         Returns:
-            bool: True if all fragments were pushed successfully, False otherwise.
+            bool: True if all variants were pushed successfully, False otherwise.
         """
         if not query_hash_pairs:
             return True
@@ -370,11 +371,11 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
                     )
 
                 conn.commit()
-                logger.debug(f"Pushed {len(query_hash_pairs)} query fragments using fallback method")
+                logger.debug(f"Pushed {len(query_hash_pairs)} query variants using fallback method")
                 return True
 
         except Exception as e:
-            logger.error(f"Failed to push query fragments to PostgreSQL queue handler: {e}")
+            logger.error(f"Failed to push query variants to PostgreSQL queue handler: {e}")
             return False
         finally:
             # Ensure fresh connection is properly closed
@@ -446,18 +447,18 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
         self, query_hash_pairs: list[tuple[str, str]], partition_key: str, priority: int = 1, partition_datatype: str | None = None, cache_backend: str | None = None
     ) -> bool:
         """
-        Push query fragments with specified priority.
+        Push query variants with specified priority.
         Uses non-blocking upsert to avoid concurrency issues with locked rows.
-        If a fragment already exists and is not being processed, increment its priority.
+        If a variant already exists and is not being processed, increment its priority.
 
         Args:
-            query_hash_pairs (List[Tuple[str, str]]): List of (query, hash) tuples to push.
-            partition_key (str): The partition key for these query fragments.
-            priority (int): Initial priority for the query fragments (default: 1).
+            query_hash_pairs (List[Tuple[str, str]]): List of (variant_query, hash) tuples to push.
+            partition_key (str): The partition key for these query variants.
+            priority (int): Initial priority for the query variants (default: 1).
             partition_datatype (str): The datatype of the partition key (default: "integer").
 
         Returns:
-            bool: True if all fragments were pushed/updated successfully, False otherwise.
+            bool: True if all variants were pushed/updated successfully, False otherwise.
         """
         if not query_hash_pairs:
             return True
@@ -509,7 +510,7 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
                 return True
 
         except Exception as e:
-            logger.error(f"Failed to push query fragments to PostgreSQL queue handler: {e}")
+            logger.error(f"Failed to push query variants to PostgreSQL queue handler: {e}")
             return False
         finally:
             # Ensure fresh connection is properly closed
@@ -657,7 +658,7 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
 
     def pop_from_query_fragment_queue(self) -> tuple[str, str, str, str, str | None] | None:
         """
-        Pop a query fragment from the query fragment queue.
+        Pop a query variant from the variant queue (persisted as ``query_fragment_queue``).
         Uses PostgreSQL's SELECT FOR UPDATE SKIP LOCKED for atomic operations.
 
         Returns:
@@ -705,7 +706,7 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
 
     def pop_from_query_fragment_queue_blocking(self, timeout: int = 60) -> tuple[str, str, str, str, str | None] | None:
         """
-        Pop a query fragment from the query fragment queue with blocking wait.
+        Pop a query variant from the variant queue with blocking wait.
         Uses PostgreSQL LISTEN/NOTIFY for efficient blocking with timeout fallback.
 
         Args:

@@ -1726,7 +1726,7 @@ valid environment variables. Use --env to load configuration from a custom file.
 
     queue_clear_parser = queue_subparsers.add_parser("clear", help="Clear queue entries")
     queue_clear_parser.add_argument("--original", action="store_true", help="Clear only original query queue")
-    queue_clear_parser.add_argument("--fragment", action="store_true", help="Clear only fragment query queue")
+    queue_clear_parser.add_argument("--fragment", action="store_true", help="Clear only the query variant queue (query_fragment_queue)")
 
     # Maintenance commands
     maintenance_parser = subparsers.add_parser("maintenance", help="Maintenance operations")

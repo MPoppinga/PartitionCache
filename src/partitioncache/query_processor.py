@@ -54,7 +54,7 @@ def normalize_joins_to_cross_join(query: str) -> str:
     Convert explicit JOIN ON syntax to comma-separated FROM with conditions in WHERE.
 
     This normalization ensures that queries using JOIN ON syntax produce the same
-    cache fragments as equivalent queries using comma joins with WHERE conditions.
+    query variants as equivalent queries using comma joins with WHERE conditions.
 
     Example:
         SELECT t.id FROM trips t JOIN pois p ON ST_DWithin(t.geom, p.geom, 500) WHERE t.fare > 10
@@ -815,8 +815,8 @@ def _build_spatial_grouped_query(
     """
     Build a query selecting geometry from every alias as separate columns.
 
-    For single-alias fragments, returns a standard SELECT DISTINCT with one geometry column.
-    For multi-alias fragments, selects each alias's geometry as a separate column
+    For single-alias variants, returns a standard SELECT DISTINCT with one geometry column.
+    For multi-alias variants, selects each alias's geometry as a separate column
     (geom_1, geom_2, ...) so the caller can convert each to an H3 cell independently
     and store them as grouped match sets (frozenset of cell IDs per row).
 
@@ -824,7 +824,7 @@ def _build_spatial_grouped_query(
     internally in their ``set_cache_lazy()`` method.
 
     Args:
-        table_aliases: List of table aliases in the fragment (e.g., ['t1', 't2'])
+        table_aliases: List of table aliases in the variant (e.g., ['t1', 't2'])
         table_list_with_alias: List of "table AS alias" strings (e.g., ['pois AS t1', 'pois AS t2'])
         where_conditions: List of WHERE clause conditions
         geometry_column: Geometry column name (e.g., 'geom')
@@ -894,14 +894,14 @@ def generate_partial_queries(
             SELECT with *. When provided, this is used to preserve the original SELECT clause in partial queries
             when strip_select=False.
         partition_key_source_table: str | None: Table name that contains the partition key column.
-            When set, only fragments that include this table are generated, and the SELECT clause
+            When set, only fragment variants that include this table are generated, and the SELECT clause
             references the correct alias for this table. Required when skip_partition_key_joins=True
             and not all tables have the partition key column (e.g., fact + dimension table queries).
             Can be a table name (e.g., "pois") or a specific alias (e.g., "p1"). When an alias
-            is provided, only fragments containing that exact alias are generated — this is
+            is provided, only variants containing that exact alias are generated — this is
             essential for self-join queries where multiple aliases map to the same table but
-            fragments must consistently select from the same alias (e.g., spatial queries where
-            each fragment must store geometry cells for the same fact alias).
+            variants must consistently select from the same alias (e.g., spatial queries where
+            each variant must store geometry cells for the same fact alias).
 
     Returns:
         List[str]: List of all possible partial queries
@@ -952,10 +952,10 @@ def generate_partial_queries(
 
     # Dimension-table attachment: when the query joins a dimension table via an
     # attachment join (alias.partition_key = other_alias.other_column), restrict
-    # fragment generation to combinations containing a pk-bearing alias, inject
+    # variant generation to combinations containing a pk-bearing alias, inject
     # pk-equijoins only between pk-bearing aliases, and SELECT from a pk-bearing
     # alias. Gated on the attachment-join pattern so all other workloads produce
-    # byte-identical fragments.
+    # byte-identical variants.
     has_attachment_join = any(
         _is_partition_key_fk_join(cond, partition_key, table_aliases) for conds in distance_conditions.values() for cond in conds
     )
@@ -1075,7 +1075,7 @@ def generate_partial_queries(
 
     # Filter out combinations that don't include the partition key source table/alias.
     # Skip this when a partition-join table is detected — the partition-join mechanism
-    # already handles SELECT correctly and re-adds the fact table to all fragments.
+    # already handles SELECT correctly and re-adds the fact table to all variants.
     #
     # partition_key_source_table can be either:
     # - A table NAME (e.g., "pois") — filters to combinations containing any alias of that table
@@ -1098,7 +1098,7 @@ def generate_partial_queries(
             ]
 
     # Attachment-join queries: drop combinations without any pk-bearing alias —
-    # a fragment consisting only of dimension tables cannot produce partition keys.
+    # a variant consisting only of dimension tables cannot produce partition keys.
     if restrict_to_pk_bearing:
         all_query_combinations = [combo for combo in all_query_combinations if any(alias in pk_bearing_aliases for alias in combo)]
 
@@ -1202,7 +1202,7 @@ def generate_partial_queries(
                             break
             if pk_source_alias is None and restrict_to_pk_bearing:
                 # Attachment-join queries: SELECT from the first pk-bearing alias of
-                # the fragment (deterministic via table_conditions_keys order).
+                # the variant (deterministic via table_conditions_keys order).
                 for key in table_conditions_keys:
                     if key in pk_bearing_aliases:
                         pk_source_alias = original_to_new_alias_mapping[key]
@@ -1217,9 +1217,9 @@ def generate_partial_queries(
                 # but check for conflicts and use alternative if needed
                 # Every original table is either remapped to a t<N> variant alias or is the
                 # partition-join table itself (re-added here). So the original input aliases
-                # never survive into the fragment, and only the output aliases (t1..tN) can
+                # never survive into the variant, and only the output aliases (t1..tN) can
                 # actually collide with the hub alias. Checking the *input* aliases would
-                # divert correct queries to a fallback alias and make the fragment hash
+                # divert correct queries to a fallback alias and make the variant hash
                 # depend on irrelevant alias choices in the source query.
                 partition_join_new_alias = "p1"
                 if partition_join_new_alias in new_table_list:
@@ -1354,7 +1354,7 @@ def generate_partial_queries(
                         for orig_alias, subquery in comb:
                             if restrict_to_pk_bearing:
                                 # Attach the pk condition to its own alias (or the
-                                # fragment's pk-bearing SELECT alias), never to a
+                                # variant's pk-bearing SELECT alias), never to a
                                 # dimension alias that lacks the pk column.
                                 remap_target = original_to_new_alias_mapping.get(orig_alias) or pk_source_alias or new_table_list[0]
                             else:
@@ -1389,7 +1389,7 @@ def generate_partial_queries(
                 sub = sub.strip()
                 ret.append(sub)
 
-    # Process each query with sqlglot, skipping non-SQL fragments
+    # Process each query with sqlglot, skipping unparseable variants
     result = []
     for q in ret:
         try:
@@ -1398,7 +1398,7 @@ def generate_partial_queries(
             sql_result = simplified.sql()
             result.append(sql_result)
         except Exception:
-            # If parsing fails, skip this fragment
+            # If parsing fails, skip this variant
             logger.error(f"Failed to parse query: {q}")
             continue
 
@@ -1965,7 +1965,7 @@ def generate_all_query_hash_pairs(
         remove_constraints_all: List of attribute names to remove from all query variants
         remove_constraints_add: List of attribute names to remove, creating additional variants
         partition_key_source_table: Table name or alias that contains the partition key column.
-            When set, only fragments that include this table/alias are generated, and the SELECT
+            When set, only fragment variants that include this table/alias are generated, and the SELECT
             clause references the correct alias. Can be a table name (e.g., "pois") or a specific
             alias (e.g., "p1") for self-join disambiguation. When None and geometry_column is set,
             auto-detected from the first FROM table. When None and skip_partition_key_joins=True,
@@ -1973,7 +1973,7 @@ def generate_all_query_hash_pairs(
         protected_patterns: If set, conditions containing any of these substrings
             (case-insensitive) are protected from removal during variant generation.
             Only unprotected conditions are candidates for removal. Useful for ensuring
-            cheap relational filters are always present in every fragment.
+            cheap relational filters are always present in every variant.
 
     Returns:
         List of tuples containing (query_text, query_hash) pairs
@@ -2080,7 +2080,7 @@ def generate_all_query_hash_pairs(
     # Apply constraint modifications to all generated queries
     query_set = _apply_constraint_modifications(
         query_set, add_constraints=add_constraints, remove_constraints_all=remove_constraints_all, remove_constraints_add=remove_constraints_add
-    ) # TODO This would sometime create a difefrent ordering nessesary as the reassignment of aliase in the fragmentcreation could be different
+    )  # TODO This would sometimes require a different ordering as the reassignment of aliases in the variant creation could be different
 
     # If we have constraint modifications, also apply them to normalized distance variants
     if add_constraints or remove_constraints_add:
