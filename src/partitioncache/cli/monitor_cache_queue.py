@@ -450,8 +450,14 @@ def run_and_store_query(query: str, query_hash: str, partition_key: str, partiti
     except Exception as e:
         logger.error(f"WORKER THREAD EXCEPTION: Error processing query {query_hash}: {str(e)}", exc_info=True)
         if cache_handler and "current transaction is aborted" in str(e):
+            # The connection attribute is `db`. `_connection` exists on no handler, so this
+            # recovery never actually ran: the connection stayed aborted and every later
+            # statement on it failed too, including the set_query_status("failed") above --
+            # which is why a failed fragment could leave no trace in the queries table.
+            connection = getattr(cache_handler, "db", None)
             try:
-                cache_handler._connection.rollback()
+                if connection is not None:
+                    connection.rollback()
             except Exception as rollback_error:
                 logger.warning(f"Failed to rollback transaction for {query_hash}: {rollback_error}")
 
