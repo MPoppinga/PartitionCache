@@ -46,6 +46,13 @@ DECLARE
     v_queries_table TEXT;
     v_cache_backend TEXT;
 BEGIN
+    -- Serialise this prefix's DDL across workers. Several processors bootstrapping the
+    -- same prefix at once took ACCESS EXCLUSIVE on the metadata and cache tables in
+    -- opposite orders and deadlocked; the victim's fragment was marked failed and never
+    -- retried. Transaction-scoped, so it releases with the caller's commit; re-entrant,
+    -- so bootstrap calling the trigger creator is fine. Same key as the Python handler
+    -- (hashtext, not a client-side hash) so both paths serialise against each other.
+    PERFORM pg_advisory_xact_lock(hashtext(p_table_prefix));
     v_metadata_table := partitioncache_get_metadata_table_name(p_table_prefix);
     v_queries_table := partitioncache_get_queries_table_name(p_table_prefix);
     
@@ -111,6 +118,13 @@ DECLARE
     v_partition_exists BOOLEAN;
     v_index_name TEXT;
 BEGIN
+    -- Serialise this prefix's DDL across workers. Several processors bootstrapping the
+    -- same prefix at once took ACCESS EXCLUSIVE on the metadata and cache tables in
+    -- opposite orders and deadlocked; the victim's fragment was marked failed and never
+    -- retried. Transaction-scoped, so it releases with the caller's commit; re-entrant,
+    -- so bootstrap calling the trigger creator is fine. Same key as the Python handler
+    -- (hashtext, not a client-side hash) so both paths serialise against each other.
+    PERFORM pg_advisory_xact_lock(hashtext(p_table_prefix));
     v_metadata_table := partitioncache_get_metadata_table_name(p_table_prefix);
     v_cache_table := partitioncache_get_cache_table_name(p_table_prefix, p_partition_key);
     
@@ -259,6 +273,13 @@ DECLARE
     v_trigger_name TEXT;
     v_metadata_table TEXT;
 BEGIN
+    -- Serialise this prefix's DDL across workers. Several processors bootstrapping the
+    -- same prefix at once took ACCESS EXCLUSIVE on the metadata and cache tables in
+    -- opposite orders and deadlocked; the victim's fragment was marked failed and never
+    -- retried. Transaction-scoped, so it releases with the caller's commit; re-entrant,
+    -- so bootstrap calling the trigger creator is fine. Same key as the Python handler
+    -- (hashtext, not a client-side hash) so both paths serialise against each other.
+    PERFORM pg_advisory_xact_lock(hashtext(p_table_prefix));
     v_trigger_function_name := p_table_prefix || '_bitsize_trigger_func';
     v_trigger_name := p_table_prefix || '_bitsize_trigger';
     v_metadata_table := p_table_prefix || '_partition_metadata';
