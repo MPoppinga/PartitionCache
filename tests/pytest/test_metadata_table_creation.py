@@ -174,14 +174,15 @@ class TestMetadataTableCreation:
 
         # Init flow for PostgreSQLRoaringBitCacheHandler (overrides _recreate_metadata_table):
         #   super().__init__() -> _recreate_metadata_table():
-        #     1. _load_sql_functions() - loads SQL file content
-        #     2. CREATE TABLE partition_metadata (integer-only constraint)
-        #     3. CREATE TABLE queries
+        #     1. pg_advisory_xact_lock(hashtext(prefix)) - serialise this prefix's DDL
+        #     2. _load_sql_functions() - loads SQL file content
+        #     3. CREATE TABLE partition_metadata (integer-only constraint)
+        #     4. CREATE TABLE queries
         #   Then in __init__():
-        #     4. CREATE EXTENSION IF NOT EXISTS roaringbitmap
-        # Total: exactly 4 execute calls
-        assert mock_cursor.execute.call_count == 4, (
-            f"Expected exactly 4 execute calls (SQL functions + metadata table + queries table + roaringbitmap extension), "
+        #     5. CREATE EXTENSION IF NOT EXISTS roaringbitmap
+        # Total: exactly 5 execute calls
+        assert mock_cursor.execute.call_count == 5, (
+            f"Expected exactly 5 execute calls (advisory lock + SQL functions + metadata table + queries table + roaringbitmap extension), "
             f"got {mock_cursor.execute.call_count}"
         )
 
@@ -189,19 +190,24 @@ class TestMetadataTableCreation:
         execute_calls = [call[0][0] for call in mock_cursor.execute.call_args_list]
 
         # Verify call order:
-        # Call 1: CREATE TABLE partition_metadata
-        assert "partition_metadata" in str(execute_calls[1]), (
-            f"Second execute call should create partition_metadata table, got: {str(execute_calls[1])}"
+        # Call 0: the per-prefix DDL lock, which must precede anything taking a relation lock
+        assert "pg_advisory_xact_lock" in str(execute_calls[0]), (
+            f"First execute call should take the per-prefix DDL lock, got: {str(execute_calls[0])}"
         )
 
-        # Call 2: CREATE TABLE queries
-        assert "queries" in str(execute_calls[2]), (
-            f"Third execute call should create queries table, got: {str(execute_calls[2])}"
+        # Call 2: CREATE TABLE partition_metadata
+        assert "partition_metadata" in str(execute_calls[2]), (
+            f"Third execute call should create partition_metadata table, got: {str(execute_calls[2])}"
         )
 
-        # Call 3: CREATE EXTENSION roaringbitmap
-        assert "roaringbitmap" in str(execute_calls[3]), (
-            f"Fourth execute call should create roaringbitmap extension, got: {str(execute_calls[3])}"
+        # Call 3: CREATE TABLE queries
+        assert "queries" in str(execute_calls[3]), (
+            f"Fourth execute call should create queries table, got: {str(execute_calls[3])}"
+        )
+
+        # Call 4: CREATE EXTENSION roaringbitmap
+        assert "roaringbitmap" in str(execute_calls[4]), (
+            f"Fifth execute call should create roaringbitmap extension, got: {str(execute_calls[4])}"
         )
 
         # Look for the specific roaringbit metadata table creation, not the general SQL function
