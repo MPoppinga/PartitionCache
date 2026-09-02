@@ -1,7 +1,8 @@
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, PropertyMock, patch
 
 import pytest
 from psycopg import sql
+from psycopg.pq import TransactionStatus
 
 from partitioncache.cache_handler.abstract import AbstractCacheHandler_Lazy
 from partitioncache.cache_handler.postgresql_bit import PostgreSQLBitCacheHandler
@@ -240,3 +241,30 @@ def test_delete(cache_handler):
             break
     assert found
     cache_handler.db.commit.assert_called()
+
+
+def test_read_ends_the_transaction_it_opened(cache_handler):
+    """A read that finds the connection idle must not leave it idle in transaction.
+
+    Holding an AccessShareLock past the read is what stalls a concurrent ALTER TABLE.
+    """
+    info = Mock()
+    type(info).transaction_status = PropertyMock(side_effect=[TransactionStatus.IDLE, TransactionStatus.INTRANS])
+    cache_handler.db.info = info
+    cache_handler.cursor.fetchone.return_value = ("integer",)
+    cache_handler.db.rollback.reset_mock()
+
+    assert cache_handler._get_partition_datatype("some_partition") == "integer"
+    cache_handler.db.rollback.assert_called_once()
+
+
+def test_read_leaves_a_callers_transaction_alone(cache_handler):
+    """A read nested inside a write must not end that transaction -- it would discard the write."""
+    info = Mock()
+    type(info).transaction_status = PropertyMock(return_value=TransactionStatus.INTRANS)
+    cache_handler.db.info = info
+    cache_handler.cursor.fetchone.return_value = ("integer",)
+    cache_handler.db.rollback.reset_mock()
+
+    assert cache_handler._get_partition_datatype("another_partition") == "integer"
+    cache_handler.db.rollback.assert_not_called()
