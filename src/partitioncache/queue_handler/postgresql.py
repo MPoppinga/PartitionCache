@@ -228,6 +228,13 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
 
             if len(existing_functions) == 2:
                 logger.debug("Non-blocking queue functions already exist")
+                # END THE TRANSACTION THE CHECK OPENED. This connection is persistent and
+                # not in autocommit, so returning here left it `idle in transaction` for
+                # the lifetime of the process -- observed at 3.6 hours during a 09c run,
+                # holding a snapshot and catalog locks the whole time. The common case is
+                # exactly this one: the functions are usually already there, so the only
+                # path that committed was the rare one that deployed them.
+                conn.rollback()
                 return
 
             logger.info("Deploying non-blocking queue functions...")
@@ -238,6 +245,7 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
             sql_file = Path(__file__).parent / "postgresql_queue_helper.sql"
             if not sql_file.exists():
                 logger.warning(f"Non-blocking queue functions SQL file not found: {sql_file}")
+                conn.rollback()
                 return
 
             with open(sql_file) as f:
@@ -284,6 +292,9 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
             except Exception as func_error:
                 # Fallback to traditional approach if function doesn't exist
                 logger.debug(f"Non-blocking function not available, using fallback: {func_error}")
+                # A failed PostgreSQL statement aborts the whole transaction. The
+                # fallback must start a fresh transaction before issuing INSERT.
+                conn.rollback()
                 cursor.execute(
                     sql.SQL("""
                     INSERT INTO {} (query, partition_key, partition_datatype, priority, updated_at, created_at)
@@ -341,13 +352,21 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
                 partition_keys = [partition_key] * len(query_hash_pairs)
                 partition_datatypes = [partition_datatype] * len(query_hash_pairs)
                 priorities = [1] * len(query_hash_pairs)  # Default priority
-                cache_backends = [cache_backend] * len(query_hash_pairs)
-
-                # Use base batch function directly with table parameter
-                cursor.execute(
-                    "SELECT * FROM non_blocking_fragment_queue_batch_upsert(%s, %s, %s, %s, %s, %s, %s)",
-                    (hashes, partition_keys, partition_datatypes, queries, priorities, self.fragment_queue_table, cache_backends),
-                )
+                # ``None`` means that the processor configuration chooses the
+                # backend. Keep the six-argument call in that case so clients remain
+                # compatible with processors that predate per-item backends.
+                batch_params = (hashes, partition_keys, partition_datatypes, queries, priorities, self.fragment_queue_table)
+                if cache_backend is None:
+                    cursor.execute(
+                        "SELECT * FROM non_blocking_fragment_queue_batch_upsert(%s, %s, %s, %s, %s, %s)",
+                        batch_params,
+                    )
+                else:
+                    cache_backends = [cache_backend] * len(query_hash_pairs)
+                    cursor.execute(
+                        "SELECT * FROM non_blocking_fragment_queue_batch_upsert(%s, %s, %s, %s, %s, %s, %s)",
+                        batch_params + (cache_backends,),
+                    )
                 results = cursor.fetchall()
                 conn.commit()
 
@@ -358,6 +377,7 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
             except Exception as func_error:
                 # Fallback to individual inserts if batch function doesn't exist
                 logger.debug(f"Batch function not available, using individual fallback: {func_error}")
+                conn.rollback()
                 for query, hash_value in query_hash_pairs:
                     cursor.execute(
                         sql.SQL("""
@@ -417,6 +437,7 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
             except Exception as func_error:
                 # Fallback to traditional approach if function doesn't exist
                 logger.debug(f"Non-blocking function not available, using fallback: {func_error}")
+                conn.rollback()
                 cursor.execute(
                     sql.SQL("""
                     INSERT INTO {} (query, partition_key, partition_datatype, priority, updated_at)
@@ -476,13 +497,18 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
                 partition_keys = [partition_key] * len(query_hash_pairs)
                 partition_datatypes = [partition_datatype] * len(query_hash_pairs)
                 priorities = [priority] * len(query_hash_pairs)
-                cache_backends = [cache_backend] * len(query_hash_pairs)
-
-                # Use base batch function directly with table parameter
-                cursor.execute(
-                    "SELECT * FROM non_blocking_fragment_queue_batch_upsert(%s, %s, %s, %s, %s, %s, %s)",
-                    (hashes, partition_keys, partition_datatypes, queries, priorities, self.fragment_queue_table, cache_backends),
-                )
+                batch_params = (hashes, partition_keys, partition_datatypes, queries, priorities, self.fragment_queue_table)
+                if cache_backend is None:
+                    cursor.execute(
+                        "SELECT * FROM non_blocking_fragment_queue_batch_upsert(%s, %s, %s, %s, %s, %s)",
+                        batch_params,
+                    )
+                else:
+                    cache_backends = [cache_backend] * len(query_hash_pairs)
+                    cursor.execute(
+                        "SELECT * FROM non_blocking_fragment_queue_batch_upsert(%s, %s, %s, %s, %s, %s, %s)",
+                        batch_params + (cache_backends,),
+                    )
                 results = cursor.fetchall()
                 conn.commit()
 
@@ -492,6 +518,7 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
             except Exception as func_error:
                 # Fallback to traditional approach if function doesn't exist
                 logger.debug(f"Non-blocking function not available, using fallback: {func_error}")
+                conn.rollback()
                 for query, hash_value in query_hash_pairs:
                     cursor.execute(
                         sql.SQL("""
