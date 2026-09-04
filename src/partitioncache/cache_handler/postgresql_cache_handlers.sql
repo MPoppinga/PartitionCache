@@ -46,15 +46,28 @@ DECLARE
     v_queries_table TEXT;
     v_cache_backend TEXT;
 BEGIN
-    -- Serialise this prefix's DDL across workers. Several processors bootstrapping the
-    -- same prefix at once took ACCESS EXCLUSIVE on the metadata and cache tables in
-    -- opposite orders and deadlocked; the victim's fragment was marked failed and never
-    -- retried. Transaction-scoped, so it releases with the caller's commit; re-entrant,
-    -- so bootstrap calling the trigger creator is fine. Same key as the Python handler
-    -- (hashtext, not a client-side hash) so both paths serialise against each other.
-    PERFORM pg_advisory_xact_lock(hashtext(p_table_prefix));
     v_metadata_table := partitioncache_get_metadata_table_name(p_table_prefix);
     v_queries_table := partitioncache_get_queries_table_name(p_table_prefix);
+
+    -- Both already exist: nothing to create, so take no lock and let this processor run
+    -- beside the others.
+    IF to_regclass(quote_ident(v_metadata_table)) IS NOT NULL
+       AND to_regclass(quote_ident(v_queries_table)) IS NOT NULL THEN
+        RETURN;
+    END IF;
+
+    -- Serialise this prefix's DDL across workers, but ONLY when there is DDL to do.
+    -- Concurrent bootstraps of the same prefix took ACCESS EXCLUSIVE on the metadata and
+    -- cache tables in opposite orders and deadlocked; the victim's fragment was marked
+    -- failed and never retried. The lock fixes that. Taking it unconditionally does not:
+    -- it is transaction-scoped and the caller's transaction is an entire fragment job, so
+    -- every processor queued behind the first one. Measured 2026-09-04 with five
+    -- processors: four in `Lock: advisory` for eleven minutes, one in `IO: DataFileRead`,
+    -- then all five killed by the 1800 s statement timeout with nothing materialised.
+    -- The early return above is therefore the hot path and this is the bootstrap path.
+    -- Same key as the Python handler (hashtext, not a client-side hash) so both serialise
+    -- against each other; re-entrant, so bootstrap calling the trigger creator is fine.
+    PERFORM pg_advisory_xact_lock(hashtext(p_table_prefix));
     
     -- Determine cache backend type from table prefix
     IF p_table_prefix LIKE '%_roaringbit%' THEN
@@ -116,17 +129,46 @@ DECLARE
     v_metadata_table TEXT;
     v_cache_table TEXT;
     v_partition_exists BOOLEAN;
+    v_bitsize_sufficient BOOLEAN;
     v_index_name TEXT;
 BEGIN
-    -- Serialise this prefix's DDL across workers. Several processors bootstrapping the
-    -- same prefix at once took ACCESS EXCLUSIVE on the metadata and cache tables in
-    -- opposite orders and deadlocked; the victim's fragment was marked failed and never
-    -- retried. Transaction-scoped, so it releases with the caller's commit; re-entrant,
-    -- so bootstrap calling the trigger creator is fine. Same key as the Python handler
-    -- (hashtext, not a client-side hash) so both paths serialise against each other.
-    PERFORM pg_advisory_xact_lock(hashtext(p_table_prefix));
     v_metadata_table := partitioncache_get_metadata_table_name(p_table_prefix);
     v_cache_table := partitioncache_get_cache_table_name(p_table_prefix, p_partition_key);
+
+    -- Already exists: nothing to create. Nested rather than one AND -- the row probe below
+    -- reads v_metadata_table, and it is the outer test that guarantees the table is there.
+    -- A bit partition whose stored bitsize is too small still needs the slow path, because
+    -- growing it is DDL like any other.
+    IF to_regclass(quote_ident(v_metadata_table)) IS NOT NULL
+       AND to_regclass(quote_ident(v_cache_table)) IS NOT NULL THEN
+        EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I WHERE partition_key = %L)',
+                       v_metadata_table, p_partition_key)
+        INTO v_partition_exists;
+        IF v_partition_exists THEN
+            IF p_cache_backend <> 'bit' OR p_bitsize IS NULL THEN
+                RETURN true;
+            END IF;
+            EXECUTE format('SELECT bitsize >= %L FROM %I WHERE partition_key = %L',
+                           p_bitsize, v_metadata_table, p_partition_key)
+            INTO v_bitsize_sufficient;
+            IF v_bitsize_sufficient THEN
+                RETURN true;
+            END IF;
+        END IF;
+    END IF;
+
+    -- Serialise this prefix's DDL across workers, but ONLY when there is DDL to do.
+    -- Concurrent bootstraps of the same prefix took ACCESS EXCLUSIVE on the metadata and
+    -- cache tables in opposite orders and deadlocked; the victim's fragment was marked
+    -- failed and never retried. The lock fixes that. Taking it unconditionally does not:
+    -- it is transaction-scoped and the caller's transaction is an entire fragment job, so
+    -- every processor queued behind the first one. Measured 2026-09-04 with five
+    -- processors: four in `Lock: advisory` for eleven minutes, one in `IO: DataFileRead`,
+    -- then all five killed by the 1800 s statement timeout with nothing materialised.
+    -- The early return above is therefore the hot path and this is the bootstrap path.
+    -- Same key as the Python handler (hashtext, not a client-side hash) so both serialise
+    -- against each other; re-entrant, so bootstrap calling the trigger creator is fine.
+    PERFORM pg_advisory_xact_lock(hashtext(p_table_prefix));
     
     -- Check if partition already exists
     EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I WHERE partition_key = %L)', v_metadata_table, p_partition_key)
@@ -273,16 +315,27 @@ DECLARE
     v_trigger_name TEXT;
     v_metadata_table TEXT;
 BEGIN
-    -- Serialise this prefix's DDL across workers. Several processors bootstrapping the
-    -- same prefix at once took ACCESS EXCLUSIVE on the metadata and cache tables in
-    -- opposite orders and deadlocked; the victim's fragment was marked failed and never
-    -- retried. Transaction-scoped, so it releases with the caller's commit; re-entrant,
-    -- so bootstrap calling the trigger creator is fine. Same key as the Python handler
-    -- (hashtext, not a client-side hash) so both paths serialise against each other.
-    PERFORM pg_advisory_xact_lock(hashtext(p_table_prefix));
     v_trigger_function_name := p_table_prefix || '_bitsize_trigger_func';
     v_trigger_name := p_table_prefix || '_bitsize_trigger';
     v_metadata_table := p_table_prefix || '_partition_metadata';
+
+    -- Already exists: nothing to create, and no lock either.
+    IF EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = v_trigger_name AND NOT tgisinternal) THEN
+        RETURN;
+    END IF;
+
+    -- Serialise this prefix's DDL across workers, but ONLY when there is DDL to do.
+    -- Concurrent bootstraps of the same prefix took ACCESS EXCLUSIVE on the metadata and
+    -- cache tables in opposite orders and deadlocked; the victim's fragment was marked
+    -- failed and never retried. The lock fixes that. Taking it unconditionally does not:
+    -- it is transaction-scoped and the caller's transaction is an entire fragment job, so
+    -- every processor queued behind the first one. Measured 2026-09-04 with five
+    -- processors: four in `Lock: advisory` for eleven minutes, one in `IO: DataFileRead`,
+    -- then all five killed by the 1800 s statement timeout with nothing materialised.
+    -- The early return above is therefore the hot path and this is the bootstrap path.
+    -- Same key as the Python handler (hashtext, not a client-side hash) so both serialise
+    -- against each other; re-entrant, so bootstrap calling the trigger creator is fine.
+    PERFORM pg_advisory_xact_lock(hashtext(p_table_prefix));
     
     -- Create trigger function
     EXECUTE format('
