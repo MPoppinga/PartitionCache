@@ -1,3 +1,4 @@
+import math
 """
 PostGIS Bounding Box Cache Handler.
 
@@ -332,11 +333,18 @@ class PostGISBBoxCacheHandler(PostGISSpatialAbstractCacheHandler):
         """
         table_name = f"{self.tableprefix}_cache_{partition_key}"
         keys_list = list(keys)
-        buf = buffer_distance
+        # ST_Buffer approximates a circle by a polygon whose vertices lie ON the circle, so
+        # its edges lie inside it by up to r * (1 - cos(pi / (2 * quad_segs))) -- 1.9 percent
+        # of the radius at the default 8 segments, 3.8 m at 200 m. Pairs that close to the
+        # distance limit fell outside the buffered region (Experiment 13, 2026-09-18). Scale
+        # the radius by 1 / cos(pi / (2 * quad_segs)) so the polygon circumscribes the true
+        # circle: the buffered region then contains every point within buffer_distance.
+        _QUAD_SEGS = 8  # 16 blew a backend to 8.85 GB on a 1,000 m star (OOM, 2026-09-18); 8 with the circumscription is still sound
+        buf = buffer_distance / math.cos(math.pi / (2 * _QUAD_SEGS))
 
         if len(keys_list) == 1:
             return sql.SQL(
-                "ST_Buffer((SELECT partition_keys FROM {table} WHERE query_hash = {key}), {buf})"
+                "ST_Buffer((SELECT partition_keys FROM {table} WHERE query_hash = {key}), {buf}, 'quad_segs=8')"
             ).format(
                 table=sql.Identifier(table_name),
                 key=sql.Literal(keys_list[0]),
@@ -344,7 +352,7 @@ class PostGISBBoxCacheHandler(PostGISSpatialAbstractCacheHandler):
             )
 
         result = sql.SQL(
-            "ST_Buffer((SELECT partition_keys FROM {table} WHERE query_hash = {key}), {buf})"
+            "ST_Buffer((SELECT partition_keys FROM {table} WHERE query_hash = {key}), {buf}, 'quad_segs=8')"
         ).format(
             table=sql.Identifier(table_name),
             key=sql.Literal(keys_list[0]),
@@ -353,7 +361,7 @@ class PostGISBBoxCacheHandler(PostGISSpatialAbstractCacheHandler):
 
         for i in range(1, len(keys_list)):
             inner = sql.SQL(
-                "ST_Buffer((SELECT partition_keys FROM {table} WHERE query_hash = {key}), {buf})"
+                "ST_Buffer((SELECT partition_keys FROM {table} WHERE query_hash = {key}), {buf}, 'quad_segs=8')"
             ).format(
                 table=sql.Identifier(table_name),
                 key=sql.Literal(keys_list[i]),

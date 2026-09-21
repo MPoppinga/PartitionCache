@@ -49,12 +49,51 @@ def handle_deprecated_kwargs(kwargs: dict[str, Any], func_name: str) -> dict[str
     return result
 
 
+def query_contains_top_level_outer_join(query: str) -> bool:
+    """Return True if the query has a LEFT/RIGHT/FULL JOIN at the outermost SELECT scope.
+
+    Outer joins cannot be safely decomposed into partition-cache variants. The
+    comma-join rewrite used during normalization (see ``normalize_joins_to_cross_join``)
+    has inner-join semantics: it drops rows of the preserved side that have no join
+    partner. The partition-key set produced by such a rewritten variant would therefore
+    be a *subset* of the original query's set, violating the relaxation invariant that
+    every variant must match at least all partition keys of the original query. Applying
+    such a cache entry could exclude valid partitions (false negatives). Callers must
+    exclude these queries from variant generation and execute them unchanged.
+
+    Only the outermost SELECT scope is inspected. Outer joins nested inside subqueries,
+    ``EXISTS`` or ``IN`` clauses are preserved verbatim by normalization and are safe.
+
+    Args:
+        query: SQL query string to inspect.
+
+    Returns:
+        True if a top-level LEFT/RIGHT/FULL join is present, False otherwise (including
+        when the query cannot be parsed).
+    """
+    try:
+        parsed = sqlglot.parse_one(query)
+    except Exception:
+        return False
+
+    select = parsed if isinstance(parsed, exp.Select) else parsed.find(exp.Select)
+    if not select:
+        return False
+
+    for join in select.find_all(exp.Join):
+        if join.find_ancestor(exp.Subquery) or join.find_ancestor(exp.Exists) or join.find_ancestor(exp.In):
+            continue
+        if join.args.get("side"):
+            return True
+    return False
+
+
 def normalize_joins_to_cross_join(query: str) -> str:
     """
-    Convert explicit JOIN ON syntax to comma-separated FROM with conditions in WHERE.
+    Convert explicit inner JOIN ON syntax to comma-separated FROM with conditions in WHERE.
 
-    This normalization ensures that queries using JOIN ON syntax produce the same
-    query variants as equivalent queries using comma joins with WHERE conditions.
+    This normalization ensures that queries using inner ``JOIN ON`` syntax produce the
+    same query variants as equivalent queries using comma joins with WHERE conditions.
 
     Example:
         SELECT t.id FROM trips t JOIN pois p ON ST_DWithin(t.geom, p.geom, 500) WHERE t.fare > 10
@@ -65,12 +104,15 @@ def normalize_joins_to_cross_join(query: str) -> str:
         query: SQL query string to normalize
 
     Note:
-        Outer JOINs (LEFT, RIGHT, FULL) are converted to comma joins, which changes
-        semantics: NULL-preserving behavior of outer joins is lost. A warning is
-        logged when this conversion occurs.
+        Outer JOINs (LEFT, RIGHT, FULL) are **not** converted, because the comma-join
+        rewrite has inner-join semantics and would drop preserved-side rows without a
+        join partner (see ``query_contains_top_level_outer_join``). When a top-level
+        outer join is present the query is returned unchanged; such queries are excluded
+        from variant generation upstream and executed as-is.
 
     Returns:
-        Normalized query with JOINs converted to comma joins
+        Normalized query with inner JOINs converted to comma joins, or the query
+        unchanged if it contains a top-level outer join.
     """
     try:
         parsed = sqlglot.parse_one(query)
@@ -79,6 +121,10 @@ def normalize_joins_to_cross_join(query: str) -> str:
 
     select = parsed if isinstance(parsed, exp.Select) else parsed.find(exp.Select)
     if not select:
+        return query
+
+    # Outer joins are not safe to flatten into comma joins; leave the query untouched.
+    if query_contains_top_level_outer_join(query):
         return query
 
     # Only collect JOINs at the current SELECT scope — skip JOINs inside subqueries/CTEs/EXISTS
@@ -93,12 +139,6 @@ def normalize_joins_to_cross_join(query: str) -> str:
     # Only process joins that have ON conditions (explicit joins)
     join_conditions = []
     for join in joins:
-        if join.args.get("side"):
-            logger.warning(
-                "normalize_joins_to_cross_join: converting %s JOIN to comma join; "
-                "outer join semantics (NULL preservation) will be lost",
-                join.args.get("side"),
-            )
         on_clause = join.args.get("on")
         if on_clause:
             # The on arg is the condition expression directly
@@ -959,16 +999,30 @@ def generate_partial_queries(
     has_attachment_join = any(
         _is_partition_key_fk_join(cond, partition_key, table_aliases) for conds in distance_conditions.values() for cond in conds
     )
-    pk_bearing_aliases: set[str] = set()
-    if has_attachment_join:
-        pk_bearing_aliases = _detect_pk_bearing_aliases(
-            table_aliases,
-            partition_key,
-            [attribute_conditions, distance_conditions, other_functions, or_conditions, partition_key_conditions, partition_key_joins],
-            alias_to_table_map,
-            partition_key_source_table,
-        )
-    restrict_to_pk_bearing = has_attachment_join and pk_bearing_aliases != set(table_aliases) and not detected_partition_join_alias
+    # The pk-bearing restriction used to be gated on the attachment-join pattern (a pk
+    # equijoin), so a dimension attached by any OTHER predicate -- a spatial join such as
+    # ST_DWithin(t.pickup_geom, p.geom, 200) -- was not covered, and the generator emitted
+    # fragments whose only relation lacks the partition key:
+    #     SELECT DISTINCT t1.trip_id FROM osm_pois AS t1 WHERE t1.poi_type = 'museum'
+    # Such a fragment cannot be populated. The rule now: whenever the pk-bearing aliases are
+    # known (from alias.partition_key in a condition, or from the declared
+    # partition_key_source_table) and are a strict subset of the aliases, every fragment
+    # keeps a pk-bearing relation -- with the join predicate that attaches the dimension --
+    # and selects the key from it. Queries in which no alias is known to bear the key, or
+    # all are, are untouched and keep producing byte-identical variants.
+    pk_bearing_aliases: set[str] = _detect_pk_bearing_aliases(
+        table_aliases,
+        partition_key,
+        [attribute_conditions, distance_conditions, other_functions, or_conditions, partition_key_conditions, partition_key_joins],
+        alias_to_table_map,
+        partition_key_source_table,
+    )
+    restrict_to_pk_bearing = (
+        bool(pk_bearing_aliases)
+        and pk_bearing_aliases != set(table_aliases)
+        and not detected_partition_join_alias
+        and (has_attachment_join or partition_key_source_table is not None)
+    )
 
     # Emit warnings for tables not using partition key if requested
     # Skip warning in spatial mode — partition_key is a namespace, not a column
@@ -1987,6 +2041,21 @@ def generate_all_query_hash_pairs(
     if "auto_detect_partition_join" in deprecated:
         auto_detect_partition_join = deprecated["auto_detect_partition_join"]
 
+    # Outer joins (LEFT/RIGHT/FULL) at the top-level scope cannot be safely decomposed
+    # into cache variants: the comma-join rewrite used during normalization has inner-join
+    # semantics and would drop preserved-side rows without a join partner. The resulting
+    # cached partition-key set would be a subset of the original query's set, so applying
+    # such a cache entry could exclude valid partitions (false negatives). These queries
+    # are excluded from variant generation and must be executed unchanged.
+    if query_contains_top_level_outer_join(query):
+        logger.warning(
+            "generate_all_query_hash_pairs: query contains a top-level outer join "
+            "(LEFT/RIGHT/FULL JOIN); PartitionCache does not generate cache variants for it "
+            "because the inner-join rewrite could exclude valid partitions. Returning no "
+            "variants; execute the query unchanged."
+        )
+        return []
+
     query_set: set[str] = set()
 
     # If strip_select=False, extract the original SELECT clause BEFORE clean_query()
@@ -2112,13 +2181,127 @@ def hash_query(query: str) -> str:
 
 
 
+def _numeric_literal_value(node: exp.Expression | None) -> float | None:
+    """Return the float value of a numeric literal node, or None."""
+    if node is None:
+        return None
+    if isinstance(node, exp.Neg):
+        inner = _numeric_literal_value(node.this)
+        return None if inner is None else -inner
+    if isinstance(node, exp.Literal) and node.is_number:
+        try:
+            return float(node.this)
+        except (ValueError, TypeError):
+            return None
+    return None
+
+
+def _literal_offset(node: exp.Expression | None) -> float | None:
+    """Return the literal offset of a ``column +/- literal`` bound, or None.
+
+    ``a.ts + 3600`` -> 3600.0, ``a.ts - 3600`` -> 3600.0, ``a.ts`` -> None.
+    """
+    if not isinstance(node, exp.Add | exp.Sub):
+        return None
+    for side in (node.this, node.expression):
+        value = _numeric_literal_value(side)
+        if value is not None:
+            return abs(value)
+    return None
+
+
+def _range_window_from_predicate(pred: exp.Expression) -> float | None:
+    """Extract the window width from a bounded range predicate over two aliases.
+
+    Recognised shapes (``W`` is a numeric literal):
+      * ``b.t BETWEEN a.t AND a.t + W``   (also ``a.t - W AND a.t + W``)
+      * ``ABS(a.t - b.t) <= W``           (any expression containing a subtraction)
+      * ``a.t - b.t <= W``                (also ``<``, and the mirrored ``W >= a.t - b.t``)
+      * ``b.t <= a.t + W``                (bound given as a column plus a literal offset)
+
+    Returns None when the predicate is unbounded or carries no literal bound.
+    """
+    if isinstance(pred, exp.Between):
+        offsets = [o for o in (_literal_offset(pred.args.get("low")), _literal_offset(pred.args.get("high"))) if o is not None]
+        return max(offsets) if offsets else None
+
+    if isinstance(pred, exp.LTE | exp.LT):
+        bounded, bound = pred.this, pred.expression
+    elif isinstance(pred, exp.GTE | exp.GT):
+        # Mirrored form: W >= a.t - b.t
+        bounded, bound = pred.expression, pred.this
+    else:
+        return None
+
+    value = _numeric_literal_value(bound)
+    if value is not None:
+        # ABS(a.t - b.t) <= W / a.t - b.t <= W: the width is the literal itself.
+        return abs(value) if bounded.find(exp.Sub) is not None else None
+
+    # b.t <= a.t + W: the width is the literal offset on the bound side.
+    return _literal_offset(bound)
+
+
+def _extract_range_window_constraints(query: str, seen_pairs: set[tuple[str, str]]) -> list[tuple[str, str, float]]:
+    """Extract (alias1, alias2, width) from bounded range predicates linking two aliases.
+
+    This is the non-spatial counterpart to the ST_DWithin pass. Its motivating case is the
+    correlation window of a detection rule (``e2.ts BETWEEN e1.ts AND e1.ts + 3600``), which
+    plays the same role in time that a distance constraint plays in space. The arithmetic is
+    unit-agnostic, so any bounded difference between two aliases is recognised.
+
+    Kept as a separate pass rather than by relaxing :func:`is_distance_function`, whose regex is
+    shared by every existing workload and would risk regressions if widened.
+
+    Args:
+        query: SQL query string to parse.
+        seen_pairs: Alias pairs already claimed by an earlier pass; these are skipped.
+
+    Returns:
+        List of (alias1, alias2, width) tuples.
+    """
+    try:
+        conditions = extract_conjunctive_conditions(query)
+    except Exception:
+        return []
+
+    results: list[tuple[str, str, float]] = []
+    for condition in conditions:
+        try:
+            cond_parsed = sqlglot.parse_one(f"SELECT 1 WHERE {condition}")
+        except sqlglot.ParseError:
+            continue
+
+        where = cond_parsed.find(exp.Where)
+        if where is None or where.this is None:
+            continue
+        pred = where.this
+
+        aliases = {col.table for col in pred.find_all(exp.Column) if col.table}
+        if len(aliases) != 2:
+            continue
+
+        a1, a2 = sorted(aliases)
+        if (a1, a2) in seen_pairs:
+            continue
+
+        width = _range_window_from_predicate(pred)
+        if width is not None and width > 0:
+            results.append((a1, a2, width))
+            seen_pairs.add((a1, a2))
+
+    return results
+
+
 def extract_distance_constraints(query: str) -> list[tuple[str, str, float]]:
     """Extract (alias1, alias2, distance) from all distance constraints in the query.
 
-    Handles two kinds of distance constraints:
+    Handles three kinds of distance constraints:
       1. ST_DWithin(a.geom, b.geom, distance) function calls
       2. Comparison-based distance expressions detected by is_distance_function(),
          e.g. SQRT(POWER(p1.x - p2.x, 2)) < 0.008 or DIST(t1.g, t2.g) BETWEEN 1.6 AND 3.6
+      3. Bounded range windows between two aliases, e.g. the correlation window
+         e2.ts BETWEEN e1.ts AND e1.ts + 3600 or ABS(e1.ts - e2.ts) <= 3600
 
     Args:
         query: SQL query string to parse.
@@ -2232,6 +2415,9 @@ def extract_distance_constraints(query: str) -> list[tuple[str, str, float]]:
         if distance is not None:
             results.append((a1, a2, distance))
             seen_pairs.add((a1, a2))
+
+    # --- Pass 3: Bounded range windows (e.g. correlation time windows) ---
+    results.extend(_extract_range_window_constraints(query, seen_pairs))
 
     return sorted(results)
 
