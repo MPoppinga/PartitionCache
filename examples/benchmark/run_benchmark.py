@@ -138,20 +138,22 @@ class PostgreSQLExecutor:
     def execute(self, query: str) -> tuple[list, float]:
         """Execute query and return (rows, elapsed_seconds).
 
-        Handles multi-statement queries (e.g. from TMP_TABLE_IN/JOIN methods)
-        by splitting on semicolons, executing setup statements first, then
-        fetching results from the final SELECT.
+        Multi-statement integration scripts (TMP_TABLE_IN/JOIN, spatial filters) emit
+        `CREATE TEMPORARY TABLE ... ON COMMIT DROP; ...; SELECT`. These MUST run in a single
+        transaction so the temp table is dropped only after the final SELECT — hence one
+        execute() call (one implicit transaction under autocommit), then walk the result sets
+        to the final SELECT instead of splitting on ';' and running each statement separately
+        (which would drop the temp table right after CREATE).
         """
         with self.conn.cursor() as cur:
             start = time.perf_counter()
-            statements = [s.strip() for s in query.split(";") if s.strip()]
-            if len(statements) > 1:
-                for stmt in statements[:-1]:
-                    cur.execute(stmt)
-                cur.execute(statements[-1])
-            else:
-                cur.execute(query)
-            rows = cur.fetchall()
+            cur.execute(query)
+            rows: list = []
+            while True:
+                if cur.description is not None:
+                    rows = cur.fetchall()
+                if not cur.nextset():
+                    break
             elapsed = time.perf_counter() - start
         return rows, elapsed
 
@@ -312,6 +314,11 @@ class CacheManager:
 # =============================================================================
 
 
+# Set by --no-dilation. When True, temporal partition keys skip bucket dilation, which makes
+# the resulting candidate set unsound; used to measure the false negatives dilation prevents.
+DILATION_DISABLED = False
+
+
 def load_query(config: BenchmarkConfig, query_name: str) -> str:
     """Load a SQL query from file, resolving the path based on config."""
     project_root = Path(__file__).parent.parent.parent
@@ -333,25 +340,6 @@ def load_query(config: BenchmarkConfig, query_name: str) -> str:
     with open(path) as f:
         return f.read().strip()
 
-
-def load_adapted_query(config: BenchmarkConfig, query_name: str) -> str | None:
-    """Load an adapted query for cache population (SSB/TPC-H pattern).
-
-    Returns None if adapted queries are not configured or the file doesn't exist.
-    """
-    qp = config.query_processing
-    if not qp.get("use_adapted_queries", False):
-        return None
-
-    project_root = Path(__file__).parent.parent.parent
-    query_dir = project_root / config.query_dir
-    subdir = qp.get("adapted_subdirectory", "adapted")
-    path = query_dir / subdir / f"{query_name}.sql"
-
-    if not path.exists():
-        return None
-    with open(path) as f:
-        return f.read().strip()
 
 
 # =============================================================================
@@ -642,33 +630,116 @@ def _populate_rocksdict_h3_grouped(executor, handler, fragment: str, hash_val: s
         h3_handler.set_null(hash_val, partition_key)
 
 
+def _count_function_calls(sql: str) -> int:
+    """Estimate the number of function calls in a SQL fragment (heuristic for cost sorting)."""
+    return sql.count("(") - sql.count("IN (") - sql.count("IN(")
+
+
+def _get_population_settings(qp: dict) -> dict:
+    """Get query processing settings for cache population.
+
+    Reads from the 'population' sub-section of query_processing config,
+    falling back to top-level settings for backward compatibility.
+    """
+    pop = qp.get("population", {})
+    return {
+        "keep_all_attributes": pop.get("keep_all_attributes", qp.get("keep_all_attributes", False)),
+        "max_conditions_removed": pop.get("max_conditions_removed", qp.get("max_conditions_removed")),
+        "protected_patterns": pop.get("protected_patterns", qp.get("protected_patterns")),
+    }
+
+
+def _skip_pk_joins_for(pk_config: dict, qp: dict) -> bool:
+    """Whether partition-key joins must be dropped for this particular partition key.
+
+    This is a per-key decision, not a per-workload one:
+
+    * Spatial and temporal keys need it True. The generator would otherwise inject an
+      equality between aliases on the partition column (t1.bucket_1h = t2.bucket_1h) that
+      the original query never contained, making the fragment stricter than the query and
+      losing real matches.
+    * Entity keys need it False. For them that same equality (e2.src_user_id = e1.src_user_id)
+      is a genuine query condition -- the group-by of the correlation rule. Dropping it turns
+      the fragment into a cross product over all entities: expensive to populate and far too
+      unselective to be worth caching.
+    """
+    if pk_config.get("temporal_bucket_width") or pk_config.get("datatype") == "geometry":
+        return True
+    return bool(qp.get("skip_partition_key_joins", False))
+
+
+def _apply_temporal_settings(kwargs: dict, pk_config: dict) -> None:
+    """Enable temporal dilation for a bucketed partition key.
+
+    The bucket width turns the query's correlation window into a bucket count, so a pair of
+    correlated events landing in adjacent buckets survives the fragment intersection.
+    """
+    width = pk_config.get("temporal_bucket_width")
+    if not width:
+        return
+    kwargs["temporal_bucket_width"] = float(width)
+    if DILATION_DISABLED:
+        kwargs["dilation_buckets"] = 0
+
+
+def _get_lookup_settings(qp: dict) -> dict:
+    """Get query processing settings for cache lookup.
+
+    Reads from the 'lookup' sub-section of query_processing config,
+    falling back to top-level settings for backward compatibility.
+    Lookup always uses keep_all_attributes=False to maximize cache hit rates.
+    """
+    lookup = qp.get("lookup", {})
+    return {
+        "keep_all_attributes": lookup.get("keep_all_attributes", False),
+        "max_conditions_removed": lookup.get("max_conditions_removed", qp.get("max_conditions_removed")),
+        "protected_patterns": lookup.get("protected_patterns", qp.get("protected_patterns")),
+    }
+
+
 def populate_cache_for_query(executor, cache_manager: CacheManager, query: str, partition_keys: list[str], config: BenchmarkConfig) -> dict:
     """Populate cache for a query across all its partition keys.
+
+    When enable_population_optimization is set in config, fragments are sorted
+    by estimated cost (cheaper first) and each fragment's execution is narrowed
+    using already-cached sub-fragments via extend_query_with_partition_keys.
 
     Returns dict with per-partition-key stats including population_time.
     """
     stats = {}
     qp = config.query_processing
     fragment_filter = create_fragment_filter(config)
+    enable_optimization = qp.get("enable_population_optimization", False)
+    optimization_method = qp.get("population_optimization_method", "IN_SUBQUERY")
 
     for pk in partition_keys:
-        pk_stats = {"fragments_generated": 0, "fragments_executed": 0, "partition_keys_cached": 0}
+        pk_stats = {"fragments_generated": 0, "fragments_executed": 0, "partition_keys_cached": 0, "optimized_fragments": 0}
         handler = cache_manager.get_handler(pk)
         pk_config = config.partition_keys.get(pk, {})
 
         pk_start = time.perf_counter()
 
-        # Build kwargs for generate_all_query_hash_pairs
+        # Build kwargs for generate_all_query_hash_pairs using population settings
+        pop_settings = _get_population_settings(qp)
         gen_kwargs: dict = {
+            "partition_key_source_table": config.fact_table,
             "query": query,
             "partition_key": pk,
             "min_component_size": 1,
-            "keep_all_attributes": qp.get("keep_all_attributes", False),
+            "keep_all_attributes": pop_settings["keep_all_attributes"],
             "strip_select": qp.get("strip_select", True),
             "auto_detect_partition_join": qp.get("auto_detect_partition_join", False),
-            "skip_partition_key_joins": qp.get("skip_partition_key_joins", True),
+            "skip_partition_key_joins": _skip_pk_joins_for(pk_config, qp),
             "follow_graph": qp.get("follow_graph", False),
+            "warn_no_partition_key": False,
         }
+        if qp.get("bucket_steps") is not None:
+            # Must match the lookup side exactly; a different value changes the hashes.
+            gen_kwargs["bucket_steps"] = qp["bucket_steps"]
+        if pop_settings["max_conditions_removed"] is not None:
+            gen_kwargs["max_conditions_removed"] = pop_settings["max_conditions_removed"]
+        if pop_settings.get("protected_patterns"):
+            gen_kwargs["protected_patterns"] = pop_settings["protected_patterns"]
 
         # Spatial partition keys: must skip partition key joins and add geometry column
         if pk_config.get("datatype") == "geometry":
@@ -682,6 +753,10 @@ def populate_cache_for_query(executor, cache_manager: CacheManager, query: str, 
             pairs = [(q, h) for q, h in pairs if fragment_filter(q)]
 
         pk_stats["fragments_generated"] = len(pairs)
+
+        # Sort fragments by estimated cost (cheaper first) when optimization is enabled
+        if enable_optimization and not pk_config.get("datatype") == "geometry":
+            pairs = sorted(pairs, key=lambda p: _count_function_calls(p[0]))
 
         # Spatial partition keys use lazy insertion (server-side H3 conversion)
         is_spatial_pk = pk_config.get("datatype") == "geometry"
@@ -709,7 +784,31 @@ def populate_cache_for_query(executor, cache_manager: CacheManager, query: str, 
                     if success:
                         pk_stats["fragments_executed"] += 1
                 else:
-                    result_set = executor.execute_fragment(fragment)
+                    exec_fragment = fragment
+                    # Optimization: narrow fragment using already-cached sub-fragments
+                    if enable_optimization:
+                        try:
+                            cached_keys, _n_gen, n_hits = partitioncache.get_partition_keys(
+                                partition_key_source_table=config.fact_table,
+                                query=fragment,
+                                cache_handler=handler.underlying_handler,
+                                partition_key=pk,
+                                min_component_size=1,
+                                auto_detect_partition_join=False,
+                            )
+                            if n_hits > 0 and cached_keys:
+                                # Map IN_SUBQUERY to IN for non-lazy extend (IN_SUBQUERY is lazy-only)
+                                extend_method = "IN" if optimization_method == "IN_SUBQUERY" else optimization_method
+                                extended = partitioncache.extend_query_with_partition_keys(
+                                    fragment, cached_keys, partition_key=pk, method=extend_method,
+                                )
+                                if extended is not None:
+                                    exec_fragment = extended
+                                    pk_stats["optimized_fragments"] += 1
+                        except Exception:
+                            pass  # Fall back to unoptimized execution
+
+                    result_set = executor.execute_fragment(exec_fragment)
                     pk_stats["fragments_executed"] += 1
                     pk_stats["partition_keys_cached"] = max(pk_stats["partition_keys_cached"], len(result_set))
 
@@ -735,14 +834,9 @@ def apply_cache_to_query(
     config: BenchmarkConfig,
     fact_stats: dict | None = None,
     method: str = "TMP_TABLE_IN",
-    cache_query: str | None = None,
     spatial_method: str = "SUBDIVIDE_TMP_TABLE",
 ) -> tuple[str, dict, float]:
     """Apply cached restrictions for all partition keys to the query.
-
-    Args:
-        cache_query: Query to use for cache hash matching (adapted query for SSB/TPC-H).
-                     If None, uses the original query.
 
     Returns (enhanced_query, per_pk_stats, cache_apply_time).
     """
@@ -754,28 +848,35 @@ def apply_cache_to_query(
     setup_statements: list[str] = []
     select_query = query
     pk_stats = {}
-    lookup_query = cache_query if cache_query else query
 
     for pk in partition_keys:
         handler = cache_manager.get_handler(pk)
         pk_config = config.partition_keys.get(pk, {})
 
+        lookup_settings = _get_lookup_settings(qp)
         get_kwargs: dict = {
-            "query": lookup_query,
+            "partition_key_source_table": config.fact_table,
+            "query": query,
             "cache_handler": handler.underlying_handler,
             "partition_key": pk,
             "min_component_size": 1,
             "auto_detect_partition_join": qp.get("auto_detect_partition_join", False),
         }
-        if qp.get("skip_partition_key_joins"):
-            get_kwargs["skip_partition_key_joins"] = True
+        get_kwargs["skip_partition_key_joins"] = _skip_pk_joins_for(pk_config, qp)
         if not qp.get("follow_graph", True):
             get_kwargs["follow_graph"] = False
+        if lookup_settings["max_conditions_removed"] is not None:
+            get_kwargs["max_conditions_removed"] = lookup_settings["max_conditions_removed"]
+        if lookup_settings.get("protected_patterns"):
+            get_kwargs["protected_patterns"] = lookup_settings["protected_patterns"]
 
         # Spatial partition keys: must skip partition key joins and add geometry column
         if pk_config.get("datatype") == "geometry":
             get_kwargs["geometry_column"] = pk_config.get("geometry_column", "geom")
             get_kwargs["skip_partition_key_joins"] = True
+        _apply_temporal_settings(get_kwargs, pk_config)
+        if qp.get("bucket_steps") is not None:
+            get_kwargs["bucket_steps"] = qp["bucket_steps"]
 
         cached_keys, num_generated, num_hits = partitioncache.get_partition_keys(**get_kwargs)
 
@@ -802,10 +903,17 @@ def apply_cache_to_query(
             # instead of extend_query_with_partition_keys which would inject p1.<partition_key> IN (...)
             try:
                 geometry_col = pk_config.get("geometry_column", "geom")
-                # Extract max ST_DWithin distance as fallback buffer_distance for queries
-                # where compute_buffer_distance returns 0 (e.g., single-table with fixed point)
-                buffer_dist = _extract_max_st_dwithin_distance(select_query)
+                # The buffer must cover the path distance from the anchor alias to any joined
+                # alias -- the weighted diameter of the query's distance graph -- not the
+                # largest single ST_DWithin: a chain p1-p2-p3-p4 at 300 m per hop puts p4 up to
+                # 900 m from p1, and the largest edge alone lost 1,856 of 37,155 pairs on that
+                # query (Experiment 13, 2026-09-18). compute_buffer_distance gives the diameter;
+                # the single-distance scan remains the fallback for point-radius queries.
+                from partitioncache.query_processor import compute_buffer_distance
+                buffer_dist = max(compute_buffer_distance(select_query),
+                                  _extract_max_st_dwithin_distance(select_query))
                 result, spatial_stats = partitioncache.apply_cache(
+                    partition_key_source_table=config.fact_table,
                     query=select_query,
                     cache_handler=handler.underlying_handler,
                     partition_key=pk,
@@ -868,14 +976,9 @@ def apply_cache_to_query_lazy(
     partition_keys: list[str],
     config: BenchmarkConfig,
     method: str = "IN_SUBQUERY",
-    cache_query: str | None = None,
     spatial_method: str = "SUBDIVIDE_TMP_TABLE",
 ) -> tuple[str, dict, float]:
     """Apply cached restrictions using the lazy API (database-side intersection).
-
-    Args:
-        cache_query: Query to use for cache hash matching (adapted query for SSB/TPC-H).
-                     If None, uses the original query.
 
     Returns (enhanced_query, per_pk_stats, cache_apply_time).
     """
@@ -884,17 +987,13 @@ def apply_cache_to_query_lazy(
     enhanced = query
     pk_stats = {}
 
-    # When using adapted queries, lazy API can't be used directly because
-    # apply_cache_lazy() uses the same query for hash generation and extension.
-    # Fall back to non-lazy path with adapted query for hash matching.
-    if cache_query and cache_query != query:
-        return apply_cache_to_query(cache_manager, query, partition_keys, config, method=method, cache_query=cache_query, spatial_method=spatial_method)
-
     for pk in partition_keys:
         handler = cache_manager.get_handler(pk)
         pk_config = config.partition_keys.get(pk, {})
 
         lazy_kwargs: dict = {
+
+            "partition_key_source_table": config.fact_table,
             "query": enhanced,
             "cache_handler": handler.underlying_handler,
             "partition_key": pk,
@@ -903,13 +1002,20 @@ def apply_cache_to_query_lazy(
             "auto_detect_partition_join": qp.get("auto_detect_partition_join", False),
             "p0_alias": config.p0_alias,
         }
-        if qp.get("skip_partition_key_joins"):
-            lazy_kwargs["skip_partition_key_joins"] = True
+        lookup_settings = _get_lookup_settings(qp)
+        lazy_kwargs["skip_partition_key_joins"] = _skip_pk_joins_for(pk_config, qp)
         if not qp.get("follow_graph", True):
             lazy_kwargs["follow_graph"] = False
+        if lookup_settings["max_conditions_removed"] is not None:
+            lazy_kwargs["max_conditions_removed"] = lookup_settings["max_conditions_removed"]
+        if lookup_settings.get("protected_patterns"):
+            lazy_kwargs["protected_patterns"] = lookup_settings["protected_patterns"]
         if pk_config.get("datatype") == "geometry":
             lazy_kwargs["geometry_column"] = pk_config.get("geometry_column", "geom")
             lazy_kwargs["skip_partition_key_joins"] = True
+        _apply_temporal_settings(lazy_kwargs, pk_config)
+        if qp.get("bucket_steps") is not None:
+            lazy_kwargs["bucket_steps"] = qp["bucket_steps"]
 
         lazy_kwargs["spatial_method"] = spatial_method
         enhanced, stats = partitioncache.apply_cache_lazy(**lazy_kwargs)
@@ -938,9 +1044,6 @@ def run_single_query(
 ) -> dict:
     """Run a single query through the full benchmark pipeline."""
     original_query = load_query(config, query_name)
-    adapted_query = load_adapted_query(config, query_name)
-    # Use adapted query for cache operations if available (SSB/TPC-H multi-table originals)
-    cache_query = adapted_query if adapted_query else original_query
     pks = config.query_partition_keys[query_name]
 
     result: dict = {
@@ -970,9 +1073,9 @@ def run_single_query(
         except Exception as e:
             print(f"  Warning: EXPLAIN ANALYZE failed for baseline: {e}")
 
-    # 2. Populate cache (using adapted query if available)
+    # 2. Populate cache
     cache_start = time.perf_counter()
-    cache_stats = populate_cache_for_query(executor, cache_manager, cache_query, pks, config)
+    cache_stats = populate_cache_for_query(executor, cache_manager, original_query, pks, config)
     cache_pop_time = time.perf_counter() - cache_start
     result["cache_population_time"] = cache_pop_time
     result["cache_stats"] = cache_stats
@@ -985,16 +1088,20 @@ def run_single_query(
             if pk_config.get("datatype") == "geometry" and hasattr(executor, "explain_analyze"):
                 # Collect all hashes that were populated for this PK
                 qp = config.query_processing
+                pop_settings = _get_population_settings(qp)
                 gen_kwargs: dict = {
-                    "query": cache_query,
+                    "partition_key_source_table": config.fact_table,
+                    "query": original_query,
                     "partition_key": pk,
                     "min_component_size": 1,
-                    "keep_all_attributes": qp.get("keep_all_attributes", False),
+                    "keep_all_attributes": pop_settings["keep_all_attributes"],
                     "strip_select": qp.get("strip_select", True),
                     "auto_detect_partition_join": qp.get("auto_detect_partition_join", False),
                     "skip_partition_key_joins": True,
                     "follow_graph": qp.get("follow_graph", False),
                 }
+                if pop_settings["max_conditions_removed"] is not None:
+                    gen_kwargs["max_conditions_removed"] = pop_settings["max_conditions_removed"]
                 if pk_config.get("geometry_column"):
                     gen_kwargs["geometry_column"] = pk_config["geometry_column"]
 
@@ -1007,12 +1114,11 @@ def run_single_query(
             result["spatial_cache_stats"] = spatial_cache_stats
 
     # 3. Apply cache and run enhanced query (with repeat)
-    # Cache application also uses adapted query for hash matching, but extends the original query
     if api == "lazy":
-        enhanced_query, pk_stats, cache_apply_time = apply_cache_to_query_lazy(cache_manager, original_query, pks, config, method=method, cache_query=cache_query, spatial_method=spatial_method)
+        enhanced_query, pk_stats, cache_apply_time = apply_cache_to_query_lazy(cache_manager, original_query, pks, config, method=method, spatial_method=spatial_method)
     else:
         enhanced_query, pk_stats, cache_apply_time = apply_cache_to_query(
-            cache_manager, original_query, pks, config, fact_stats=fact_stats, method=method, cache_query=cache_query, spatial_method=spatial_method
+            cache_manager, original_query, pks, config, fact_stats=fact_stats, method=method, spatial_method=spatial_method
         )
     result["apply_stats"] = pk_stats
     result["cache_apply_time"] = cache_apply_time
@@ -1045,6 +1151,7 @@ def run_single_query(
     # 4. Compute metrics
     result["speedup"] = result["baseline_time"] / result["cached_time"] if result["cached_time"] > 0 else float("inf")
     result["result_match"] = len(baseline_rows) == len(cached_rows)
+    result["rows_lost"] = len(baseline_rows) - len(cached_rows)
 
     return result
 
@@ -1054,21 +1161,57 @@ def run_single_query(
 # =============================================================================
 
 
+def _effective_method_for_api(method: str, api_mode: str) -> str:
+    """Map a requested method to one valid for the given API path.
+
+    IN / VALUES are eager-only; IN_SUBQUERY is lazy-only. TMP_TABLE_* work on both.
+    """
+    if api_mode == "lazy" and method in ("IN", "VALUES"):
+        return "IN_SUBQUERY"
+    if api_mode == "non-lazy" and method == "IN_SUBQUERY":
+        return "IN"
+    return method
+
+
+def _run_query_list(executor, cache_manager, query_names, config, repeat, fact_stats, method, api, explain, spatial_method):
+    """Run a list of queries under one or both API paths and print per-path summaries.
+
+    When ``api == "both"`` each query is run under non-lazy AND lazy back-to-back, so both
+    see a comparable buffer state (a fair eager-vs-lazy A/B). Each result is labelled with its
+    actual API path (``result["api"]``) and a separate summary is printed per path.
+    """
+    api_modes = ["non-lazy", "lazy"] if api == "both" else [api]
+
+    results = []
+    for query_name in query_names:
+        for api_mode in api_modes:
+            label = f"{query_name} [{api_mode}]" if len(api_modes) > 1 else query_name
+            print(f"\n--- {label} ---")
+            eff_method = _effective_method_for_api(method, api_mode)
+            result = run_single_query(
+                executor, cache_manager, query_name, config, repeat=repeat, fact_stats=fact_stats,
+                method=eff_method, api=api_mode, explain=explain, spatial_method=spatial_method,
+            )
+            results.append(result)
+            print_query_result(result)
+
+    if len(api_modes) > 1:
+        for api_mode in api_modes:
+            subset = [r for r in results if r.get("api") == api_mode]
+            print(f"\n### Summary — api={api_mode} (method={_effective_method_for_api(method, api_mode)})")
+            print_summary(subset)
+    else:
+        print_summary(results)
+    return results
+
+
 def run_all_queries(executor, cache_manager, config, repeat=1, fact_stats=None, method="TMP_TABLE_IN", api="non-lazy", explain=False, spatial_method="SUBDIVIDE_TMP_TABLE"):
     """Run all benchmark queries."""
     print(f"\n{'=' * 80}")
     print(f"{config.name}: All Queries ({len(config.all_queries)} queries, method={method}, api={api})")
     print("=" * 80)
 
-    results = []
-    for query_name in config.all_queries:
-        print(f"\n--- {query_name} ---")
-        result = run_single_query(executor, cache_manager, query_name, config, repeat=repeat, fact_stats=fact_stats, method=method, api=api, explain=explain, spatial_method=spatial_method)
-        results.append(result)
-        print_query_result(result)
-
-    print_summary(results)
-    return results
+    return _run_query_list(executor, cache_manager, config.all_queries, config, repeat, fact_stats, method, api, explain, spatial_method)
 
 
 def run_flight(executor, cache_manager, config, flight_num, repeat=1, fact_stats=None, method="TMP_TABLE_IN", api="non-lazy", explain=False, spatial_method="SUBDIVIDE_TMP_TABLE"):
@@ -1083,15 +1226,7 @@ def run_flight(executor, cache_manager, config, flight_num, repeat=1, fact_stats
     print(f"{config.name}: Flight Q{flight_num} (method={method}, api={api})")
     print(f"{'=' * 80}")
 
-    results = []
-    for query_name in queries:
-        print(f"\n--- {query_name} ---")
-        result = run_single_query(executor, cache_manager, query_name, config, repeat=repeat, fact_stats=fact_stats, method=method, api=api, explain=explain, spatial_method=spatial_method)
-        results.append(result)
-        print_query_result(result)
-
-    print_summary(results)
-    return results
+    return _run_query_list(executor, cache_manager, queries, config, repeat, fact_stats, method, api, explain, spatial_method)
 
 
 def _run_cross_dimension_phase(executor, cache_manager, config, flights, phase_label, results, repeat, fact_stats, method, api):
@@ -1107,15 +1242,21 @@ def _run_cross_dimension_phase(executor, cache_manager, config, flights, phase_l
 
             # Check for pre-existing cache hits BEFORE populating
             pre_hits = {}
+            lookup_settings = _get_lookup_settings(qp)
             for pk in pks:
                 handler = cache_manager.get_handler(pk)
                 get_kwargs: dict = {
+                    "partition_key_source_table": config.fact_table,
                     "query": original_query,
                     "cache_handler": handler.underlying_handler,
                     "partition_key": pk,
                     "min_component_size": 1,
                     "auto_detect_partition_join": qp.get("auto_detect_partition_join", False),
                 }
+                if lookup_settings["max_conditions_removed"] is not None:
+                    get_kwargs["max_conditions_removed"] = lookup_settings["max_conditions_removed"]
+                if lookup_settings.get("protected_patterns"):
+                    get_kwargs["protected_patterns"] = lookup_settings["protected_patterns"]
                 _, num_gen, num_hits = partitioncache.get_partition_keys(**get_kwargs)
                 pre_hits[pk] = {"variants": num_gen, "hits_before": num_hits}
 
@@ -1309,15 +1450,21 @@ def run_hierarchy(executor, cache_manager, config, repeat=1, fact_stats=None, me
 
             # Check for pre-existing cache hits BEFORE populating
             pre_hits = {}
+            lookup_settings = _get_lookup_settings(qp)
             for pk in pks:
                 handler = cache_manager.get_handler(pk)
                 get_kwargs: dict = {
+                    "partition_key_source_table": config.fact_table,
                     "query": original_query,
                     "cache_handler": handler.underlying_handler,
                     "partition_key": pk,
                     "min_component_size": 1,
                     "auto_detect_partition_join": qp.get("auto_detect_partition_join", False),
                 }
+                if lookup_settings["max_conditions_removed"] is not None:
+                    get_kwargs["max_conditions_removed"] = lookup_settings["max_conditions_removed"]
+                if lookup_settings.get("protected_patterns"):
+                    get_kwargs["protected_patterns"] = lookup_settings["protected_patterns"]
                 _, num_gen, num_hits = partitioncache.get_partition_keys(**get_kwargs)
                 pre_hits[pk] = {"variants": num_gen, "hits_before": num_hits}
 
@@ -2120,6 +2267,11 @@ Examples:
     )
     parser.add_argument("--config", type=str, required=True, help="Path to YAML config file")
     parser.add_argument(
+        "--no-dilation",
+        action="store_true",
+        help="Disable temporal bucket dilation (unsound; used to measure the false negatives dilation prevents)",
+    )
+    parser.add_argument(
         "--mode",
         nargs="+",
         default=["all"],
@@ -2155,6 +2307,11 @@ Examples:
     parser.add_argument("--output", type=str, default=None, help="Save results to JSON file")
 
     args = parser.parse_args()
+
+    global DILATION_DISABLED
+    DILATION_DISABLED = args.no_dilation
+    if DILATION_DISABLED:
+        print("WARNING: temporal dilation disabled -- cached candidate sets are unsound and may lose rows")
 
     # Resolve config path: try as-is first, then relative to script directory
     script_dir = Path(__file__).parent

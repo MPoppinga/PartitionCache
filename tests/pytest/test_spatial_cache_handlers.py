@@ -35,6 +35,13 @@ from partitioncache.query_processor import (
     generate_partial_queries,
 )
 
+
+def _circumscribed(r: float) -> str:
+    """The buffer radius the bbox handler emits since the 2026-09-18 repair: scaled by
+    1/cos(pi/(2*8)) so the 8-segment polygon circumscribes the true circle."""
+    import math as _m
+    return repr(r / _m.cos(_m.pi / 16))
+
 # Get the actual module object (not the function) since partitioncache.__init__
 # shadows the module attribute with `from partitioncache.apply_cache import apply_cache`
 _apply_cache_module = sys.modules["partitioncache.apply_cache"]
@@ -1107,7 +1114,7 @@ class TestPostGISBBoxSqlGeneration:
         result = handler._get_buffered_intersected_sql({"hash1"}, "spatial_bbox", 500.0)
         result_str = result.as_string()
         assert "ST_Buffer" in result_str
-        assert "500.0" in result_str
+        assert _circumscribed(500.0) in result_str  # radius circumscribes the circle since the 2026-09-18 repair
         assert "ST_Envelope" not in result_str
         assert "partition_keys" in result_str
 
@@ -1123,7 +1130,7 @@ class TestPostGISBBoxSqlGeneration:
         result_str = result.as_string()
         assert "ST_Intersection" in result_str
         assert "ST_Buffer" in result_str
-        assert "500.0" in result_str
+        assert _circumscribed(500.0) in result_str  # radius circumscribes the circle since the 2026-09-18 repair
         assert "ST_Envelope" not in result_str
         # Should have two ST_Buffer calls (one per key)
         assert result_str.count("ST_Buffer") == 2
@@ -1139,7 +1146,7 @@ class TestPostGISBBoxSqlGeneration:
         result = handler._get_buffered_intersected_sql({"hash1"}, "spatial_bbox", 500.0)
         result_str = result.as_string()
         # Should use exactly 500.0, not 500.0 + cell_size
-        assert "500.0" in result_str
+        assert _circumscribed(500.0) in result_str  # radius circumscribes the circle since the 2026-09-18 repair
         # cell_size default is 0.01, so 500.01 should NOT appear
         assert "500.01" not in result_str
 
