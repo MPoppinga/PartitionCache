@@ -1,0 +1,26 @@
+# Plain PostgreSQL — no PostGIS, no h3-pg. The security-log benchmark is the
+# lightest-weight workload in the suite in terms of database dependencies.
+services:
+  db:
+    image: postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: security_log_db
+      POSTGRES_USER: seclog_user
+      POSTGRES_PASSWORD: seclog_password
+    ports:
+      - "127.0.0.1:5436:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    shm_size: 2g
+    command:
+      - "postgres"
+      - "-c"
+      - "shared_buffers=2GB"
+      - "-c"
+      - "work_mem=256MB"
+      - "-c"
+      - "max_parallel_workers_per_gather=4"
+
+volumes:
+  pgdata:
