@@ -1,0 +1,87 @@
+# LDBC SNB Business Intelligence -- social-graph queries.
+#
+# q11 (friend triangles) and q18 (friend recommendation) never touch Message, so they
+# cannot share a fact_table / p0_alias with the message-anchored config and live here
+# instead. Both attach to the partition key through k1.person1id = <person>.id.
+name: "LDBC SNB BI (social graph)"
+fact_table: "person_knows_person"
+p0_alias: "k1"
+
+env_file: "examples/ldbc_snb_bi/.env"
+query_dir: "examples/ldbc_snb_bi/queries"
+
+data_setup:
+  script: "examples/ldbc_snb_bi/generate_ldbc_data.py"
+  docker_compose: null
+  example_command: "python examples/ldbc_snb_bi/generate_ldbc_data.py --data-dir /path/to/ldbc-data"
+  required_tables: ["person_knows_person", "person", "city", "country", "tag",
+                    "person_hasinterest_tag"]
+
+executors:
+  duckdb:
+    enabled: false
+    default_path_template: "examples/ldbc_snb_bi/ldbc_sf{scale_factor}.duckdb"
+  postgresql:
+    enabled: true
+
+partition_keys:
+  person1id: { datatype: integer }
+
+query_partition_keys:
+  q11_1: [person1id]
+  q11_2: [person1id]
+  q11_3: [person1id]
+  q11_4: [person1id]
+  q11_5: [person1id]
+  q11_6: [person1id]
+  q18_1: [person1id]
+  q18_2: [person1id]
+  q18_3: [person1id]
+  q18_4: [person1id]
+  q18_5: [person1id]
+  q18_6: [person1id]
+
+query_flights:
+  11: [q11_1, q11_2, q11_3, q11_4, q11_5, q11_6]
+  18: [q18_1, q18_2, q18_3, q18_4, q18_5, q18_6]
+
+hierarchy_labels: {}
+spatial_queries: []
+
+query_processing:
+  keep_all_attributes: false
+  follow_graph: true
+  strip_select: true
+  auto_detect_partition_join: true
+  skip_partition_key_joins: false
+  population:
+    max_conditions_removed: 1
+  lookup:
+    max_conditions_removed: 2
+
+fragment_filter:
+  require_in_from: []
+  exclude_from_from: []
+
+cache:
+  table_prefix: "ldbc_social_cache"
+  bitsize_strategy: auto
+  min_bitsize: 200000
+
+backends:
+  duckdb: [duckdb_bit]
+  postgresql: [postgresql_array]
+
+fact_stats:
+  strategy: count_distinct
+  table: "person_knows_person"
+
+modes:
+  cross_dimension:
+    phase1_flights: [11]
+    phase2_flights: [18]
+  hierarchy:
+    flights: []
+  cold_warm:
+    flight: 11
+  representative_queries: [q11_1, q18_1]

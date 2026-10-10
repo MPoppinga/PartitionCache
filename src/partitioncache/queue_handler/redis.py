@@ -61,7 +61,7 @@ class RedisQueueHandler(AbstractQueueHandler):
 
     def push_to_original_query_queue(self, query: str, partition_key: str, partition_datatype: str | None = None) -> bool:
         """
-        Push an original query to the original query queue to be processed into fragments.
+        Push an original query to the original query queue to be decomposed and recomposed into query variants.
 
         Args:
             query (str): The original query to be pushed to the original query queue.
@@ -86,16 +86,17 @@ class RedisQueueHandler(AbstractQueueHandler):
 
     def push_to_query_fragment_queue(self, query_hash_pairs: list[tuple[str, str]], partition_key: str, partition_datatype: str | None = None, cache_backend: str | None = None) -> bool:
         """
-        Push query fragments (as query-hash pairs) directly to the query fragment queue.
+        Push query variants (as (query, hash) pairs) directly to the query variant queue
+        (persisted as the historical ``query_fragment`` key).
 
         Args:
-            query_hash_pairs (List[Tuple[str, str]]): List of (query, hash) tuples to push to fragment queue.
-            partition_key (str): The partition key for these query fragments.
+            query_hash_pairs (List[Tuple[str, str]]): List of (variant_query, hash) tuples to push to the variant queue.
+            partition_key (str): The partition key for these query variants.
             partition_datatype (str): The datatype of the partition key (default: None).
             cache_backend (str): The cache backend to use for processing (default: None, uses processor config).
 
         Returns:
-            bool: True if all fragments were pushed successfully, False otherwise.
+            bool: True if all variants were pushed successfully, False otherwise.
         """
         try:
             r = self._get_redis_connection()
@@ -108,10 +109,10 @@ class RedisQueueHandler(AbstractQueueHandler):
                 pipeline.rpush(queue_key, fragment_data)
 
             pipeline.execute()
-            logger.debug(f"Pushed {len(query_hash_pairs)} fragments to Redis query fragment queue using pipeline: {queue_key}")
+            logger.debug(f"Pushed {len(query_hash_pairs)} query variants to Redis variant queue using pipeline: {queue_key}")
             return True
         except Exception as e:
-            logger.error(f"Failed to push fragments to Redis query fragment queue: {e}")
+            logger.error(f"Failed to push query variants to Redis variant queue: {e}")
             return False
 
     def pop_from_original_query_queue(self) -> tuple[str, str, str] | None:
@@ -136,7 +137,7 @@ class RedisQueueHandler(AbstractQueueHandler):
 
     def pop_from_query_fragment_queue(self) -> tuple[str, str, str, str, str | None] | None:
         """
-        Pop a query fragment from the query fragment queue.
+        Pop a query variant from the variant queue (persisted as the ``query_fragment`` key).
         Uses a short timeout for non-blocking behavior.
 
         Returns:
@@ -178,7 +179,7 @@ class RedisQueueHandler(AbstractQueueHandler):
 
     def pop_from_query_fragment_queue_blocking(self, timeout: int = 60) -> tuple[str, str, str, str, str | None] | None:
         """
-        Pop a query fragment from the query fragment queue with configurable blocking timeout.
+        Pop a query variant from the variant queue with configurable blocking timeout.
 
         Args:
             timeout (int): Maximum time to wait in seconds (default: 30)

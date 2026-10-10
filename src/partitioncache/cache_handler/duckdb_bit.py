@@ -325,30 +325,55 @@ class DuckDBBitCacheHandler(AbstractCacheHandler_Lazy):
         """
         Build DuckDB BITSTRING expression for the given integer keys.
 
+        For small key sets (<= 500), uses direct nested set_bit() calls.
+        For larger sets, chunks the keys and combines with bitwise OR to
+        stay within DuckDB's expression depth limit (default 1000).
+
         Args:
             int_keys: List of integer keys
             bitsize: Size of the bitstring
 
         Returns:
-            SQL expression for creating the bitstring
+            SQL expression for creating the bitstring (bitsize embedded, no ? placeholder)
         """
-        bitstring_expr = "REPEAT('0', ?)::BITSTRING"
+        chunk_size = 500
 
-        # Set bits for each integer value using DuckDB's set_bit function
-        for k in int_keys:
-            bitstring_expr = f"set_bit({bitstring_expr}, {k}, 1)"
+        if len(int_keys) <= chunk_size:
+            # Small set: direct nested set_bit calls
+            expr = f"REPEAT('0', {bitsize})::BITSTRING"
+            for k in int_keys:
+                expr = f"set_bit({expr}, {k}, 1)"
+            return expr
 
-        return bitstring_expr
+        # Large set: chunk keys and combine with bitwise OR
+        chunks = [int_keys[i : i + chunk_size] for i in range(0, len(int_keys), chunk_size)]
+        chunk_exprs = []
+        for chunk in chunks:
+            sub = f"REPEAT('0', {bitsize})::BITSTRING"
+            for k in chunk:
+                sub = f"set_bit({sub}, {k}, 1)"
+            chunk_exprs.append(sub)
 
-    def _store_cache_entry(self, table_name: str, key: str, bitstring_expr: str, bitsize: int, count: int) -> None:
+        # Combine with | (OR) using balanced binary tree to minimize nesting depth
+        while len(chunk_exprs) > 1:
+            new_exprs = []
+            for i in range(0, len(chunk_exprs), 2):
+                if i + 1 < len(chunk_exprs):
+                    new_exprs.append(f"({chunk_exprs[i]} | {chunk_exprs[i + 1]})")
+                else:
+                    new_exprs.append(chunk_exprs[i])
+            chunk_exprs = new_exprs
+
+        return chunk_exprs[0]
+
+    def _store_cache_entry(self, table_name: str, key: str, bitstring_expr: str, count: int) -> None:
         """
         Store or update cache entry in the table.
 
         Args:
             table_name: Name of the cache table
             key: Cache key
-            bitstring_expr: SQL expression for bitstring
-            bitsize: Size of the bitstring
+            bitstring_expr: SQL expression for bitstring (bitsize embedded)
             count: Number of partition keys
         """
         try:
@@ -357,7 +382,7 @@ class DuckDBBitCacheHandler(AbstractCacheHandler_Lazy):
                 INSERT INTO {table_name} (query_hash, partition_keys, partition_keys_count)
                 VALUES (?, {bitstring_expr}, ?)
             """,
-                (key, bitsize, count),
+                (key, count),
             )
         except duckdb.ConstraintException:
             # If insert fails due to primary key constraint, do update
@@ -367,7 +392,50 @@ class DuckDBBitCacheHandler(AbstractCacheHandler_Lazy):
                 SET partition_keys = {bitstring_expr}, partition_keys_count = ?
                 WHERE query_hash = ?
             """,
-                (bitsize, count, key),
+                (count, key),
+            )
+
+    def _store_cache_entry_batched(self, table_name: str, key: str, int_keys: list[int], bitsize: int, count: int) -> None:
+        """
+        Store cache entry using INSERT + batch UPDATE for large bitsizes.
+
+        For large bitsizes (>500K), nested set_bit expressions are very slow because
+        each intermediate set_bit copies the entire bitstring. This method inserts a
+        zero bitstring first, then updates it in small batches.
+
+        Args:
+            table_name: Name of the cache table
+            key: Cache key
+            int_keys: List of integer keys to set
+            bitsize: Size of the bitstring
+            count: Number of partition keys
+        """
+        zero_expr = f"REPEAT('0', {bitsize})::BITSTRING"
+
+        # Insert or reset to zero bitstring
+        try:
+            self.conn.execute(
+                f"""INSERT INTO {table_name} (query_hash, partition_keys, partition_keys_count)
+                VALUES (?, {zero_expr}, ?)""",
+                (key, count),
+            )
+        except duckdb.ConstraintException:
+            self.conn.execute(
+                f"""UPDATE {table_name} SET partition_keys = {zero_expr}, partition_keys_count = ?
+                WHERE query_hash = ?""",
+                (count, key),
+            )
+
+        # Update in small batches, reading stored bitstring each time
+        batch_size = 50
+        for i in range(0, len(int_keys), batch_size):
+            batch = int_keys[i : i + batch_size]
+            expr = "partition_keys"
+            for k in batch:
+                expr = f"set_bit({expr}, {k}, 1)"
+            self.conn.execute(
+                f"UPDATE {table_name} SET partition_keys = {expr} WHERE query_hash = ?",
+                (key,),
             )
 
     def set_cache(self, key: str, partition_key_identifiers: set[int] | set[str] | set[float] | set[datetime], partition_key: str = "partition_key") -> bool:
@@ -398,12 +466,15 @@ class DuckDBBitCacheHandler(AbstractCacheHandler_Lazy):
             if actual_bitsize is None:
                 return False
 
-            # Build bitstring expression
-            bitstring_expr = self._build_bitstring_expression(int_keys, actual_bitsize)
-
             # Store cache entry
             table_name = self._get_safe_table_name(partition_key)
-            self._store_cache_entry(table_name, key, bitstring_expr, actual_bitsize, len(int_keys))
+
+            # For large bitsizes, use batched INSERT+UPDATE to avoid huge intermediate objects
+            if actual_bitsize > 500000:
+                self._store_cache_entry_batched(table_name, key, int_keys, actual_bitsize, len(int_keys))
+            else:
+                bitstring_expr = self._build_bitstring_expression(int_keys, actual_bitsize)
+                self._store_cache_entry(table_name, key, bitstring_expr, len(int_keys))
 
             # Also store in queries table for existence checks
             try:
