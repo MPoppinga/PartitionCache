@@ -79,6 +79,7 @@ PartitionCache follows a modular architecture with distinct layers:
 ## Documentation Index
 
 ### Core Documentation
+- **[Architecture & Design Decisions](architecture_and_design_decisions.md)** - Consolidated reference of all components and design decisions with machine-checkable code anchors
 - **[API Reference](api_reference.md)** - Detailed Python API documentation
 - **[CLI Reference](cli_reference.md)** - Command-line tools documentation
 - **[Architecture Diagrams](architecture_diagrams.md)** - Visual system representations
