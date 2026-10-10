@@ -249,6 +249,87 @@ class PostgreSQLArrayCacheHandler(PostgreSQLAbstractCacheHandler):
             logger.error(f"Failed to get lazy intersection in partition {partition_key}: {e}")
             return None, 0
 
+    def get_intersected_dilated_sql(self, keys: set[str], partition_key: str, dilation: int) -> sql.Composed:
+        """Return SQL intersecting cached sets after dilating each of them by ``dilation`` buckets.
+
+        Each cached set is expanded independently before the intersection, mirroring the
+        buffer-then-intersect order used by the spatial handlers. Dilating the intersection
+        instead would be unsound.
+        """
+        table_name = f"{self.tableprefix}_cache_{partition_key}"
+        keys_list = sorted(keys)
+
+        dilated_ctes = [
+            sql.SQL(
+                "{alias} AS (SELECT DISTINCT u.v + g.d AS v "
+                "FROM (SELECT unnest(partition_keys) AS v FROM {table} WHERE query_hash = {key}) AS u, "
+                "generate_series({lo}, {hi}) AS g(d))"
+            ).format(
+                alias=sql.Identifier(f"d{i}"),
+                table=sql.Identifier(table_name),
+                key=sql.Literal(key),
+                lo=sql.Literal(-dilation),
+                hi=sql.Literal(dilation),
+            )
+            for i, key in enumerate(keys_list)
+        ]
+
+        intersected = sql.SQL(" INTERSECT ").join(
+            sql.SQL("SELECT v FROM {}").format(sql.Identifier(f"d{i}")) for i in range(len(keys_list))
+        )
+        return sql.SQL("WITH {ctes} {body}").format(ctes=sql.SQL(", ").join(dilated_ctes), body=intersected)
+
+    def get_intersected_dilated_lazy(self, keys: set[str], partition_key: str = "partition_key", dilation: int = 0) -> tuple[str | None, int]:
+        """Lazy intersection with each cached set dilated by ``dilation`` buckets first.
+
+        Only integer partition keys can be dilated; bucket arithmetic is meaningless for text
+        or timestamp keys. Returns (None, 0) for those, so callers fall back cleanly.
+        """
+        try:
+            if dilation < 0:
+                raise ValueError(f"dilation must be non-negative, got {dilation}")
+
+            datatype = self._get_partition_datatype(partition_key)
+            if datatype is None:
+                return None, 0
+            if datatype != "integer":
+                logger.error(f"Temporal dilation requires an integer partition key, got '{datatype}' for '{partition_key}'")
+                return None, 0
+
+            filtered_keys = self.filter_existing_keys(keys, partition_key)
+            if not filtered_keys:
+                return None, 0
+
+            if dilation == 0:
+                return self.get_intersected_lazy(filtered_keys, partition_key)
+
+            query = sql.SQL("SELECT v AS {partition_col} FROM ({inner}) AS dilated_intersection").format(
+                partition_col=sql.Identifier(partition_key),
+                inner=self.get_intersected_dilated_sql(filtered_keys, partition_key, dilation),
+            )
+            return query.as_string(), len(filtered_keys)
+        except Exception as e:
+            logger.error(f"Failed to get dilated lazy intersection in partition {partition_key}: {e}")
+            return None, 0
+
+    def get_intersected_dilated(
+        self, keys: set[str], partition_key: str = "partition_key", dilation: int = 0
+    ) -> tuple[set[int] | None, int]:
+        """Materialised counterpart of :meth:`get_intersected_dilated_lazy`."""
+        try:
+            if dilation == 0:
+                result, count = self.get_intersected(keys, partition_key)
+                return result, count  # type: ignore[return-value]
+
+            lazy_sql, count = self.get_intersected_dilated_lazy(keys, partition_key, dilation)
+            if lazy_sql is None:
+                return None, 0
+            self.cursor.execute(lazy_sql)
+            return {row[0] for row in self.cursor.fetchall()}, count
+        except Exception as e:
+            logger.error(f"Failed to get dilated intersection in partition {partition_key}: {e}")
+            return None, 0
+
     def set_cache_lazy(self, key: str, query: str, partition_key: str = "partition_key") -> bool:
         """
         Store partition key identifiers in cache by executing the provided query directly.
