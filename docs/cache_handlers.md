@@ -86,6 +86,7 @@ PartitionCache supports multiple cache backends with different performance chara
 - **Requirements**: PostgreSQL + PostGIS + h3-pg extension (cell conversion at population time), Python `h3` library (k-ring expansion at filter time)
 - **Best for**: Hexagonal spatial partitioning, uniform spatial distribution
 - **Spatial filtering**: Connected-component intersection of cell groups with k-ring buffer expansion
+- **Population**: `set_cache_lazy()` runs the spatial variant on PostgreSQL and maps every geometry column to an H3 cell in the same statement; each result row becomes one cell group. Used by `pcache-add --direct` and `pcache-monitor`. The pg_cron queue processor cannot populate this backend because its cache lives in RocksDict.
 - **Scalability**: Good (single-instance)
 
 #### PostGIS BBox Handler

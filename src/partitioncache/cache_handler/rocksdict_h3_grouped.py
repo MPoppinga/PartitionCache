@@ -91,12 +91,11 @@ class RocksDictH3GroupedCacheHandler(RocksDictCacheHandler):
         """
         if cls._instance is None or cls._current_path != db_path:
             if cls._instance is not None:
-                try:
-                    cls._instance.db.close()
-                except Exception:
-                    pass
-                cls._instance = None
+                # Close the whole handler, not only RocksDict: the PostgreSQL connection
+                # would otherwise leak every time the singleton switches paths.
                 cls._refcount = 0
+                cls._instance.close()
+                cls._instance = None
             cls._instance = cls(db_path, read_only=read_only, **kwargs)
             cls._current_path = db_path
         cls._refcount += 1
@@ -115,6 +114,18 @@ class RocksDictH3GroupedCacheHandler(RocksDictCacheHandler):
         """Buffer is baked into the k-ring expansion."""
         return True
 
+    def _h3_cell_sql(self, geometry: sql.Composable) -> sql.Composed:
+        """SQL expression mapping a geometry value to the H3 cell of its centroid (as bigint).
+
+        ``h3_lat_lng_to_cell()`` expects WGS84, so other SRIDs are transformed first.
+        """
+        centroid = sql.SQL("ST_Centroid({geom}::geometry)").format(geom=geometry)
+        if self.srid != 4326:
+            centroid = sql.SQL("ST_Transform({centroid}, 4326)").format(centroid=centroid)
+        return sql.SQL("h3_lat_lng_to_cell({centroid}::point, {res})::bigint").format(
+            centroid=centroid, res=sql.Literal(self.resolution)
+        )
+
     def geom_to_h3_cell(self, geom_value: bytes | memoryview | str) -> int | None:
         """Convert a geometry value to an H3 cell ID via PostgreSQL.
 
@@ -122,24 +133,9 @@ class RocksDictH3GroupedCacheHandler(RocksDictCacheHandler):
         raw WKB bytes, or memoryview. Uses ``::geometry`` cast which handles all formats.
         """
         try:
-            if self.srid != 4326:
-                h3_sql = sql.SQL(
-                    "SELECT h3_lat_lng_to_cell("
-                    "  ST_Transform(ST_Centroid(%s::geometry), 4326)::point,"
-                    "  {res}"
-                    ")::bigint"
-                ).format(res=sql.Literal(self.resolution))
-            else:
-                h3_sql = sql.SQL(
-                    "SELECT h3_lat_lng_to_cell("
-                    "  ST_Centroid(%s::geometry)::point,"
-                    "  {res}"
-                    ")::bigint"
-                ).format(res=sql.Literal(self.resolution))
-
             # Pass value as-is: psycopg3 returns hex EWKB strings,
             # PostgreSQL's ::geometry cast handles hex, binary, and EWKB
-            self.pg_cursor.execute(h3_sql, (geom_value,))
+            self.pg_cursor.execute(sql.SQL("SELECT {cell}").format(cell=self._h3_cell_sql(sql.Placeholder())), (geom_value,))
             result = self.pg_cursor.fetchone()
             if result and result[0] is not None:
                 return int(result[0])
@@ -147,6 +143,74 @@ class RocksDictH3GroupedCacheHandler(RocksDictCacheHandler):
         except Exception as e:
             logger.warning(f"H3 cell conversion failed: {e}")
             return None
+
+    def set_cache_lazy(self, key: str, query: str, partition_key: str = "partition_key") -> bool:
+        """Populate the cache by running a spatial variant query on PostgreSQL.
+
+        Every column of every result row is treated as a geometry and mapped to an H3 cell
+        in the same statement, so geometries never travel through Python. Each row becomes
+        one match group (the cells of all its aliases); duplicate groups are dropped.
+        An empty result is stored as a null entry.
+        """
+        if "DELETE " in query.upper() or "DROP " in query.upper():
+            logger.error("Query contains DELETE or DROP")
+            return False
+
+        try:
+            # Column names are unknown and may repeat (t1.geom, t2.geom), so read the
+            # column count first and rename them positionally in the wrapping query.
+            self.pg_cursor.execute(sql.SQL("SELECT * FROM ({query}) AS sub LIMIT 0").format(query=sql.SQL(query)))  # type: ignore[arg-type]
+            column_count = len(self.pg_cursor.description or [])
+            if column_count == 0:
+                logger.error(f"Spatial variant query for {key} returns no columns")
+                return False
+
+            columns = [sql.Identifier(f"c{i}") for i in range(column_count)]
+            cells = sql.SQL(", ").join(self._h3_cell_sql(sql.SQL("sub.{col}").format(col=col)) for col in columns)
+            self.pg_cursor.execute(
+                sql.SQL("SELECT ARRAY[{cells}] FROM ({query}) AS sub({columns})").format(
+                    cells=cells,
+                    query=sql.SQL(query),  # type: ignore[arg-type]
+                    columns=sql.SQL(", ").join(columns),
+                )
+            )
+            rows = self.pg_cursor.fetchall()
+        except Exception as e:
+            logger.error(f"Failed to run spatial variant query for {key}: {e}")
+            return False
+
+        match_groups: list[frozenset[int]] = []
+        seen: set[frozenset[int]] = set()
+        for (row_cells,) in rows:
+            group = frozenset(int(cell) for cell in row_cells if cell is not None)
+            if group and group not in seen:
+                seen.add(group)
+                match_groups.append(group)
+
+        if not match_groups:
+            return self.set_null(key, partition_key)
+        return self.set_cache(key, match_groups, partition_key)
+
+    def set_entry_lazy(
+        self,
+        key: str,
+        query: str,
+        query_text: str,
+        partition_key: str = "partition_key",
+        force_update: bool = False,
+    ) -> bool:
+        """Store a lazily populated cache entry together with its query text.
+
+        Same contract as ``AbstractCacheHandler_Lazy.set_entry_lazy``. This handler is not an
+        ``AbstractCacheHandler_Lazy`` because it has no SQL-side intersection to offer.
+        """
+        try:
+            if not force_update and self.exists(key, partition_key, check_query=True):
+                return self.set_query(key, query_text, partition_key)
+            return self.set_cache_lazy(key, query, partition_key) and self.set_query(key, query_text, partition_key)
+        except Exception as e:
+            logger.error(f"Failed to set cache entry lazily for key {key}: {e}")
+            return False
 
     def get_h3_cell_filter(
         self,
