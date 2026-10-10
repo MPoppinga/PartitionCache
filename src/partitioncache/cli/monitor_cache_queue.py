@@ -276,7 +276,8 @@ def apply_cache_optimization(query: str, query_hash: str, partition_key: str, pa
             stats["total_hashes"] = total_hashes
             stats["cache_hits"] = hits
 
-            if hits >= args.min_cache_hits and partition_keys:
+            # An empty set is a valid result (the query has no rows); extend_query_with_partition_keys handles it
+            if hits >= args.min_cache_hits and partition_keys is not None:
                 method = args.cache_optimization_method
                 stats["method_used"] = method
 

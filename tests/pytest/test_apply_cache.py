@@ -9,6 +9,7 @@ from unittest.mock import Mock
 import pytest
 
 from partitioncache.apply_cache import (
+    EMPTY_INTERSECTION_COMMENT,
     apply_cache,
     apply_cache_lazy,
     extend_query_with_partition_keys,
@@ -156,11 +157,24 @@ class TestRewriteQueryWithP0Table:
 class TestExtendQueryWithPartitionKeys:
     """Test the extend_query_with_partition_keys function."""
 
-    def test_empty_partition_keys_returns_original(self):
-        """Test that empty partition keys returns original query."""
-        query = "SELECT * FROM users WHERE id = 1"
-        result = extend_query_with_partition_keys(query, set(), "partition_key")
-        assert result == query
+    @pytest.mark.parametrize("method", ["IN", "VALUES", "TMP_TABLE_IN", "TMP_TABLE_JOIN"])
+    def test_empty_partition_keys_restricts_to_no_rows(self, method):
+        """An empty intersection proves the query has no result: every method adds a commented FALSE."""
+        query = "SELECT * FROM users AS u WHERE u.id = 1"
+        result = extend_query_with_partition_keys(query, set(), "region_id", method=method, p0_alias="u")
+        assert result == f"SELECT * FROM users AS u WHERE u.id = 1 AND FALSE /* {EMPTY_INTERSECTION_COMMENT} */"
+        assert "CREATE TEMPORARY TABLE" not in result
+
+    def test_empty_partition_keys_without_where_clause(self):
+        """The FALSE condition creates a WHERE clause when the query has none."""
+        result = extend_query_with_partition_keys("SELECT COUNT(*) FROM users", set(), "region_id")
+        assert result == f"SELECT COUNT(*) FROM users WHERE FALSE /* {EMPTY_INTERSECTION_COMMENT} */"
+
+    def test_empty_partition_keys_targets_outer_query(self):
+        """The FALSE condition goes to the outer WHERE, not into a subquery."""
+        query = "SELECT * FROM users AS u WHERE u.id IN (SELECT o.user_id FROM orders AS o WHERE o.total > 5)"
+        result = extend_query_with_partition_keys(query, set(), "region_id")
+        assert result.endswith(f"o.total > 5) AND FALSE /* {EMPTY_INTERSECTION_COMMENT} */")
 
     def test_in_method_with_integers(self):
         """Test IN method with integer partition keys."""
@@ -1001,3 +1015,26 @@ class TestApplyCacheDeprecatedKwargs:
                 assert any("auto_detect_star_join" in str(x.message) for x in dep_warnings), (
                     "Expected DeprecationWarning for auto_detect_star_join"
                 )
+
+
+class TestApplyCacheEmptyIntersection:
+    """apply_cache() must tell "no cache hits" (None) apart from "valid hits, empty intersection" (set())."""
+
+    QUERY = "SELECT * FROM trips AS t WHERE t.fare > 10"
+
+    def _handler(self, intersected):
+        handler = Mock()
+        handler.get_intersected.return_value = intersected
+        return handler
+
+    def test_no_cache_hits_returns_query_unchanged(self):
+        enhanced, stats = apply_cache(self.QUERY, self._handler((None, 0)), partition_key="city_id", p0_alias="t")
+        assert enhanced == self.QUERY
+        assert stats["enhanced"] == 0
+
+    @pytest.mark.parametrize("method", ["IN", "VALUES", "TMP_TABLE_IN", "TMP_TABLE_JOIN"])
+    def test_empty_intersection_restricts_query_to_no_rows(self, method):
+        enhanced, stats = apply_cache(self.QUERY, self._handler((set(), 2)), partition_key="city_id", method=method, p0_alias="t")
+        assert enhanced == f"SELECT * FROM trips AS t WHERE t.fare > 10 AND FALSE /* {EMPTY_INTERSECTION_COMMENT} */"
+        assert stats["enhanced"] == 1
+        assert stats["cache_hits"] == 2
