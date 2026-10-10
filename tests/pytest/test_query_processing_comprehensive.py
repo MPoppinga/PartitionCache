@@ -265,7 +265,13 @@ class TestNestedCorrelatedExists:
 # 9. Multiple JOIN types normalized
 # ======================================================================
 class TestMixedJoinTypes:
-    """LEFT JOIN, RIGHT JOIN, INNER JOIN all normalized to comma joins."""
+    """Inner joins are normalized to comma joins; outer joins are excluded from caching.
+
+    Rewriting LEFT/RIGHT/FULL joins to comma joins has inner-join semantics and would
+    drop preserved-side rows, so any query containing a top-level outer join is excluded
+    from variant generation and left unchanged (see reviewer feedback on outer-join
+    relaxation).
+    """
 
     LEFT_JOIN = (
         "SELECT t.trip_id FROM trips AS t "
@@ -280,26 +286,24 @@ class TestMixedJoinTypes:
         "WHERE t.fare > 10 AND p1.type = 'museum'"
     )
 
-    def test_left_join_normalized(self):
+    def test_left_join_not_normalized(self):
+        """A top-level LEFT JOIN is preserved, not flattened into the WHERE clause."""
         result = normalize_joins_to_cross_join(self.LEFT_JOIN)
-        from_part = result.upper().split("WHERE")[0]
-        assert "LEFT" not in from_part
-        assert "JOIN" not in from_part
-        assert "ST_DWITHIN" in result.upper()
+        assert "LEFT JOIN" in result.upper()
 
-    def test_left_join_fragments(self):
-        pairs = generate_all_query_hash_pairs(self.LEFT_JOIN, "city_id")
-        assert len(pairs) > 0
+    def test_left_join_produces_no_fragments(self):
+        """Outer-join queries must not generate cache variants (would risk false negatives)."""
+        pairs = generate_all_query_hash_pairs(self.LEFT_JOIN, "city_id", warn_no_partition_key=False)
+        assert pairs == []
 
-    def test_multiple_join_types_normalized(self):
+    def test_mixed_inner_and_outer_join_not_normalized(self):
+        """A query mixing INNER and LEFT joins is rejected wholesale (outer join present)."""
         result = normalize_joins_to_cross_join(self.MULTIPLE_JOINS)
-        from_part = result.upper().split("WHERE")[0]
-        assert "INNER" not in from_part
-        assert "LEFT" not in from_part
+        assert "LEFT JOIN" in result.upper()
 
-    def test_multiple_joins_produce_fragments(self):
+    def test_mixed_joins_produce_no_fragments(self):
         pairs = generate_all_query_hash_pairs(self.MULTIPLE_JOINS, "city_id", warn_no_partition_key=False)
-        assert len(pairs) > 0
+        assert pairs == []
 
 
 # ======================================================================
