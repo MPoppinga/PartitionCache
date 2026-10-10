@@ -430,6 +430,29 @@ def _add_where_condition(parsed_query: exp.Expression, condition_expr: exp.Expre
         existing_where.args["this"] = exp.and_(existing_where.args["this"], condition_expr)
 
 
+EMPTY_INTERSECTION_COMMENT = "PartitionCache: cache intersection is empty, query cannot return rows"
+
+
+def _add_empty_intersection_condition(query: str, sql_dialect: str = "postgres") -> str:
+    """Restrict a query to no rows because the cache proved that no partition can match.
+
+    Every cache entry is a superset of the partitions that can contribute to the query, so an empty
+    intersection of valid entries means the query has no result. The empty set itself cannot be
+    expressed with the regular methods (``IN ()`` is invalid SQL, ``VALUES`` needs at least one row,
+    and an empty temporary table has no known key type), so a commented ``FALSE`` condition is added
+    to the outermost WHERE instead. The query shape is kept, so aggregates still return their
+    empty-input result (e.g. ``COUNT(*) = 0``).
+    """
+    parsed_query = sqlglot.parse_one(query, read=sql_dialect)
+    condition = exp.false()
+    condition.add_comments([EMPTY_INTERSECTION_COMMENT])
+    if isinstance(parsed_query, exp.Select):
+        parsed_query.where(condition, copy=False)
+    else:
+        _add_where_condition(parsed_query, condition)
+    return parsed_query.sql(dialect=sql_dialect)
+
+
 def _temp_table_ddl(table_name: str, sql_dialect: str) -> tuple[str, str]:
     """Return (prefix, suffix) for a CREATE TEMPORARY TABLE in the given dialect.
 
@@ -502,10 +525,12 @@ def extend_query_with_partition_keys(
         partition_join_table: Explicitly specified partition-join table alias or name.
 
     Returns:
-        str: The extended SQL query as string.
+        str: The extended SQL query as string. An empty ``partition_keys`` set is a valid cache result
+        (the intersection proved that no partition matches); the query is then restricted with a
+        commented ``AND FALSE`` regardless of ``method``.
     """
     if not partition_keys:
-        return query
+        return _add_empty_intersection_condition(query, sql_dialect)
 
     if p0_alias is None and method != "TMP_TABLE_JOIN":
         # No alias provided, try to find it (TMP_TABLE_JOIN does join on all tables)
@@ -1804,9 +1829,16 @@ def apply_cache(
     stats = {"generated_variants": generated_variants, "cache_hits": used_hashes, "enhanced": 0, "p0_rewritten": p0_rewritten}
 
     # If no cache hits, return working query (potentially p0-rewritten)
-    if not partition_keys:
+    if partition_keys is None:
         logger.info(f"No cache hits found for query. Generated {generated_variants} subqueries, {used_hashes} cache hits")
         return working_query, stats
+
+    # Cache hits whose intersection is empty prove the query has no result; restrict it to no rows
+    # instead of discarding the hits and running it unfiltered.
+    if not partition_keys:
+        stats["enhanced"] = 1
+        logger.info(f"Cache intersection of {used_hashes} cache hits is empty, restricting query to no rows")
+        return _add_empty_intersection_condition(working_query), stats
 
     # Step 3: Apply the partition keys to the working query
     # Determine the correct alias for cache restrictions
