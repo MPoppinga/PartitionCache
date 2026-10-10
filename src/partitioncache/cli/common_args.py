@@ -124,7 +124,7 @@ def add_spatial_args(parser: argparse.ArgumentParser, include_buffer_distance: b
         spatial_group.add_argument(
             "--buffer-distance",
             type=float,
-            default=float(os.getenv("PARTITION_CACHE_BUFFER_DISTANCE")) if os.getenv("PARTITION_CACHE_BUFFER_DISTANCE") else None,
+            default=float(os.environ["PARTITION_CACHE_BUFFER_DISTANCE"]) if os.getenv("PARTITION_CACHE_BUFFER_DISTANCE") else None,
             help="Buffer distance in meters for spatial cache application. "
             "If not set, auto-derived from ST_DWithin distances in the query.",
         )

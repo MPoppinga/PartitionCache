@@ -39,9 +39,9 @@ class RocksDictH3GroupedCacheHandler(RocksDictCacheHandler):
     Requires: Python h3 library (for k-ring expansion at filter time).
     """
 
-    _instance = None
+    _instance: RocksDictH3GroupedCacheHandler | None = None
     _refcount = 0
-    _current_path = None
+    _current_path: str | None = None
 
     def __init__(
         self,
@@ -184,7 +184,7 @@ class RocksDictH3GroupedCacheHandler(RocksDictCacheHandler):
 
             # Now we need h3 for k-ring expansion
             try:
-                import h3 as h3_lib
+                import h3 as h3_lib  # type: ignore[import-untyped]
             except ImportError as e:
                 raise ImportError("h3 library required for H3 cell filtering: pip install h3") from e
 

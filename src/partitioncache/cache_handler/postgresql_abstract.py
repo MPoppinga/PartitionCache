@@ -1,8 +1,10 @@
 import threading
 from abc import abstractmethod
+from collections.abc import Callable
 from contextlib import contextmanager
 from functools import wraps
 from logging import getLogger
+from typing import ParamSpec, TypeVar
 
 import psycopg
 from psycopg import sql
@@ -12,14 +14,17 @@ from partitioncache.cache_handler.abstract import AbstractCacheHandler_Lazy
 
 logger = getLogger("PartitionCache")
 
+P = ParamSpec("P")
+R = TypeVar("R")
 
-def _ends_read_transaction(fn):
+
+def _ends_read_transaction(fn: Callable[P, R]) -> Callable[P, R]:  # noqa: UP047 -- PEP 695 syntax needs Python 3.12, package supports 3.10
     """Mark a read-only handler method so it leaves the connection idle. See _read_txn."""
 
     @wraps(fn)
-    def wrapper(self, *args, **kwargs):
-        with self._read_txn():
-            return fn(self, *args, **kwargs)
+    def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+        with args[0]._read_txn():  # type: ignore[attr-defined]
+            return fn(*args, **kwargs)
 
     return wrapper
 

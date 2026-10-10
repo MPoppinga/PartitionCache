@@ -156,7 +156,7 @@ def query_fragment_processor(args, constraint_args):
             is_spatial = partition_datatype == "geometry"
             resolved_backend = resolve_cache_backend(args) if is_spatial else None
             geometry_column = None
-            if is_spatial:
+            if resolved_backend is not None:
                 try:
                     spatial_cache_handler = get_cache_handler(resolved_backend, singleton=True)
                     geometry_column = getattr(spatial_cache_handler, "geometry_column", "geom")
