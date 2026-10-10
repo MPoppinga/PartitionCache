@@ -156,7 +156,7 @@ partitioncache.push_to_query_variant_queue(query_hash_pairs, "user_id", "integer
 # Add spatial query variants with explicit cache backend
 partitioncache.push_to_query_variant_queue(
     query_hash_pairs, "spatial_key", "geometry",
-    cache_backend="postgis_h3"
+    cache_backend="postgis_bbox"
 )
 ```
 
@@ -182,7 +182,7 @@ result = partitioncache.pop_from_query_fragment_queue()
 if result:
     query, hash_val, partition_key, partition_datatype, cache_backend = result
     print(f"Executing query {hash_val} for partition: {partition_key}")
-    # cache_backend is None for non-spatial queries, or e.g. "postgis_h3" for spatial
+    # cache_backend is None for non-spatial queries, or e.g. "postgis_bbox" for spatial
 ```
 
 #### `get_queue_lengths(queue_provider: str | None = None)`

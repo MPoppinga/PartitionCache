@@ -24,12 +24,12 @@ Different cache handlers support different datatypes:
 | rocksdb_set | ✓ | ✗ | ✓ | ✗ | ✗ |
 | rocksdb_bit | ✓ | ✗ | ✗ | ✗ | ✗ |
 | rocksdict | ✓ | ✓ | ✓ | ✓ | ✗ |
-| postgis_h3 | ✗ | ✗ | ✗ | ✗ | ✓ |
+| rocksdict_h3_grouped | ✗ | ✗ | ✗ | ✗ | ✓ |
 | postgis_bbox | ✗ | ✗ | ✗ | ✗ | ✓ |
 
 **Note**: Bit-based handlers (postgresql_bit, postgresql_roaringbit, redis_bit, rocksdb_bit) only support integers due to their underlying storage mechanism.
 
-**Note**: Spatial handlers (postgis_h3, postgis_bbox) exclusively use the `geometry` datatype and require PostGIS. The H3 handler additionally requires the h3-pg extension.
+**Note**: Spatial handlers (postgis_bbox, rocksdict_h3_grouped) exclusively use the `geometry` datatype and require PostGIS. The H3 handler additionally requires the h3-pg extension and the Python `h3` library.
 
 ## CLI Tool Usage
 
@@ -77,7 +77,7 @@ pcache-add \
     --query "SELECT DISTINCT t1.geom FROM poi AS t1 WHERE t1.type = 'restaurant'" \
     --partition-key "spatial" \
     --partition-datatype "geometry" \
-    --cache-backend "postgis_h3" \
+    --cache-backend "postgis_bbox" \
     --geometry-column "geom" \
     --direct
 ```
