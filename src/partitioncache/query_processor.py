@@ -2221,13 +2221,128 @@ def hash_query(query: str) -> str:
     return hashlib.sha1(query.encode()).hexdigest()
 
 
+
+def _numeric_literal_value(node: exp.Expression | None) -> float | None:
+    """Return the float value of a numeric literal node, or None."""
+    if node is None:
+        return None
+    if isinstance(node, exp.Neg):
+        inner = _numeric_literal_value(node.this)
+        return None if inner is None else -inner
+    if isinstance(node, exp.Literal) and node.is_number:
+        try:
+            return float(node.this)
+        except (ValueError, TypeError):
+            return None
+    return None
+
+
+def _literal_offset(node: exp.Expression | None) -> float | None:
+    """Return the literal offset of a ``column +/- literal`` bound, or None.
+
+    ``a.ts + 3600`` -> 3600.0, ``a.ts - 3600`` -> 3600.0, ``a.ts`` -> None.
+    """
+    if not isinstance(node, exp.Add | exp.Sub):
+        return None
+    for side in (node.this, node.expression):
+        value = _numeric_literal_value(side)
+        if value is not None:
+            return abs(value)
+    return None
+
+
+def _range_window_from_predicate(pred: exp.Expression) -> float | None:
+    """Extract the window width from a bounded range predicate over two aliases.
+
+    Recognised shapes (``W`` is a numeric literal):
+      * ``b.t BETWEEN a.t AND a.t + W``   (also ``a.t - W AND a.t + W``)
+      * ``ABS(a.t - b.t) <= W``           (any expression containing a subtraction)
+      * ``a.t - b.t <= W``                (also ``<``, and the mirrored ``W >= a.t - b.t``)
+      * ``b.t <= a.t + W``                (bound given as a column plus a literal offset)
+
+    Returns None when the predicate is unbounded or carries no literal bound.
+    """
+    if isinstance(pred, exp.Between):
+        offsets = [o for o in (_literal_offset(pred.args.get("low")), _literal_offset(pred.args.get("high"))) if o is not None]
+        return max(offsets) if offsets else None
+
+    if isinstance(pred, exp.LTE | exp.LT):
+        bounded, bound = pred.this, pred.expression
+    elif isinstance(pred, exp.GTE | exp.GT):
+        # Mirrored form: W >= a.t - b.t
+        bounded, bound = pred.expression, pred.this
+    else:
+        return None
+
+    value = _numeric_literal_value(bound)
+    if value is not None:
+        # ABS(a.t - b.t) <= W / a.t - b.t <= W: the width is the literal itself.
+        return abs(value) if bounded.find(exp.Sub) is not None else None
+
+    # b.t <= a.t + W: the width is the literal offset on the bound side.
+    return _literal_offset(bound)
+
+
+def _extract_range_window_constraints(query: str, seen_pairs: set[tuple[str, str]]) -> list[tuple[str, str, float]]:
+    """Extract (alias1, alias2, width) from bounded range predicates linking two aliases.
+
+    This is the non-spatial counterpart to the ST_DWithin pass. Its motivating case is the
+    correlation window of a detection rule (``e2.ts BETWEEN e1.ts AND e1.ts + 3600``), which
+    plays the same role in time that a distance constraint plays in space. The arithmetic is
+    unit-agnostic, so any bounded difference between two aliases is recognised.
+
+    Kept as a separate pass rather than by relaxing :func:`is_distance_function`, whose regex is
+    shared by every existing workload and would risk regressions if widened.
+
+    Args:
+        query: SQL query string to parse.
+        seen_pairs: Alias pairs already claimed by an earlier pass; these are skipped.
+
+    Returns:
+        List of (alias1, alias2, width) tuples.
+    """
+    try:
+        conditions = extract_conjunctive_conditions(query)
+    except Exception:
+        return []
+
+    results: list[tuple[str, str, float]] = []
+    for condition in conditions:
+        try:
+            cond_parsed = sqlglot.parse_one(f"SELECT 1 WHERE {condition}")
+        except sqlglot.ParseError:
+            continue
+
+        where = cond_parsed.find(exp.Where)
+        if where is None or where.this is None:
+            continue
+        pred = where.this
+
+        aliases = {col.table for col in pred.find_all(exp.Column) if col.table}
+        if len(aliases) != 2:
+            continue
+
+        a1, a2 = sorted(aliases)
+        if (a1, a2) in seen_pairs:
+            continue
+
+        width = _range_window_from_predicate(pred)
+        if width is not None and width > 0:
+            results.append((a1, a2, width))
+            seen_pairs.add((a1, a2))
+
+    return results
+
+
 def extract_distance_constraints(query: str) -> list[tuple[str, str, float]]:
     """Extract (alias1, alias2, distance) from all distance constraints in the query.
 
-    Handles two kinds of distance constraints:
+    Handles three kinds of distance constraints:
       1. ST_DWithin(a.geom, b.geom, distance) function calls
       2. Comparison-based distance expressions detected by is_distance_function(),
          e.g. SQRT(POWER(p1.x - p2.x, 2)) < 0.008 or DIST(t1.g, t2.g) BETWEEN 1.6 AND 3.6
+      3. Bounded range windows between two aliases, e.g. the correlation window
+         e2.ts BETWEEN e1.ts AND e1.ts + 3600 or ABS(e1.ts - e2.ts) <= 3600
 
     Args:
         query: SQL query string to parse.
@@ -2341,6 +2456,9 @@ def extract_distance_constraints(query: str) -> list[tuple[str, str, float]]:
         if distance is not None:
             results.append((a1, a2, distance))
             seen_pairs.add((a1, a2))
+
+    # --- Pass 3: Bounded range windows (e.g. correlation time windows) ---
+    results.extend(_extract_range_window_constraints(query, seen_pairs))
 
     return sorted(results)
 

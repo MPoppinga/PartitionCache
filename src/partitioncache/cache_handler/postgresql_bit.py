@@ -413,6 +413,88 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
             .as_string()
         )
 
+    def get_intersected_dilated_sql_wk(self, keys, partition_key: str, dilation: int) -> str:
+        """Intersection SQL where each cached bit array is dilated by ``dilation`` bits first.
+
+        Dilation of a bit array is a shift-OR: a set bit at index ``b`` is spread to every
+        index within ``dilation`` of ``b``. PostgreSQL bit-string shifts preserve length and
+        pad with zeros, so buckets at the ends clip instead of wrapping around.
+
+        Each row is dilated *before* BIT_AND, mirroring the buffer-then-intersect order of the
+        spatial handlers. Dilating the intersection result instead would be unsound.
+        """
+        table_name = f"{self.tableprefix}_cache_{partition_key}"
+        keys_part = sql.SQL("ARRAY[{}]").format(sql.SQL(", ").join(sql.Literal(key) for key in keys))
+
+        shifted: list[sql.Composable] = [sql.SQL("partition_keys")]
+        for offset in range(1, dilation + 1):
+            shifted.append(sql.SQL("(partition_keys >> {})").format(sql.Literal(offset)))
+            shifted.append(sql.SQL("(partition_keys << {})").format(sql.Literal(offset)))
+        dilated_expr = sql.SQL(" | ").join(shifted)
+
+        return (
+            sql.SQL(
+                "SELECT BIT_AND(dilated) AS bit_result FROM "
+                "(SELECT {dilated_expr} AS dilated FROM {table} WHERE query_hash = ANY({keys})) AS selected"
+            )
+            .format(dilated_expr=dilated_expr, table=sql.Identifier(table_name), keys=keys_part)
+            .as_string()
+        )
+
+    def get_intersected_dilated_lazy(self, keys: set[str], partition_key: str = "partition_key", dilation: int = 0) -> tuple[str | None, int]:
+        """Lazy intersection with each cached bit array dilated by ``dilation`` buckets first."""
+        try:
+            if dilation < 0:
+                raise ValueError(f"dilation must be non-negative, got {dilation}")
+            if dilation == 0:
+                return self.get_intersected_lazy(keys, partition_key)
+
+            filtered_keys = self.filter_existing_keys(keys, partition_key)
+            if not filtered_keys:
+                return None, 0
+
+            intersect_sql_str = self.get_intersected_dilated_sql_wk(filtered_keys, partition_key, dilation)
+            r = (
+                sql.SQL("""(
+       WITH bit_result AS (
+            {0}
+        ),
+        numbered_bits AS (
+            SELECT
+                bit_result,
+                generate_series(0, bit_length(bit_result) - 1) AS bit_index
+            FROM bit_result
+        )
+        SELECT unnest(array_agg(bit_index)) AS {1}
+        FROM numbered_bits
+        WHERE get_bit(bit_result, bit_index) = 1)
+        """)
+                .format(sql.SQL(intersect_sql_str), sql.Identifier(partition_key))  # type: ignore[arg-type]
+                .as_string()
+            )
+            return r, len(filtered_keys)
+        except Exception as e:
+            logger.error(f"Failed to get dilated lazy intersection in partition {partition_key}: {e}")
+            return None, 0
+
+    def get_intersected_dilated(
+        self, keys: set[str], partition_key: str = "partition_key", dilation: int = 0
+    ) -> tuple[set[int] | None, int]:
+        """Materialised counterpart of :meth:`get_intersected_dilated_lazy`."""
+        try:
+            if dilation == 0:
+                result, count = self.get_intersected(keys, partition_key)
+                return result, count  # type: ignore[return-value]
+
+            lazy_sql, count = self.get_intersected_dilated_lazy(keys, partition_key, dilation)
+            if lazy_sql is None:
+                return None, 0
+            self.cursor.execute(lazy_sql)  # type: ignore[arg-type]
+            return {row[0] for row in self.cursor.fetchall()}, count
+        except Exception as e:
+            logger.error(f"Failed to get dilated intersection in partition {partition_key}: {e}")
+            return None, 0
+
     def get_intersected_lazy(self, keys: set[str], partition_key: str = "partition_key") -> tuple[str | None, int]:
         """Get lazy intersection for partition-specific table."""
         filtered_keys = self.filter_existing_keys(keys, partition_key)  # TODO: Check if this is needed, or if we can just use the keys directly
