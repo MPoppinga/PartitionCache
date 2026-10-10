@@ -39,31 +39,6 @@ class PostgreSQLArrayCacheHandler(PostgreSQLAbstractCacheHandler):
             if self.db.closed is False:
                 self.db.rollback()
 
-    def _load_sql_functions(self) -> None:
-        """Load SQL functions from the cache handlers SQL file."""
-        try:
-            from pathlib import Path
-
-            # Get the SQL file path for cache handlers
-            sql_cache_file = Path(__file__).parent / "postgresql_cache_handlers.sql"
-
-            if not sql_cache_file.exists():
-                logger.warning(f"SQL cache handlers file not found at {sql_cache_file}")
-                return
-
-            # Read and execute the SQL file
-            sql_cache_content = sql_cache_file.read_text()
-            self.cursor.execute(sql_cache_content)  # type: ignore[arg-type]
-            logger.debug("Successfully loaded SQL functions from cache handlers file")
-        except Exception as e:
-            logger.debug(f"Failed to load SQL functions (this is OK if they're already loaded): {e}")
-            # Continuing on an aborted transaction makes every later statement fail with
-            # "current transaction is aborted", which hides the real error behind it.
-            try:
-                self.db.rollback()
-            except Exception:
-                logger.debug("rollback after SQL function load failed", exc_info=True)
-
     def _create_partition_table(self, partition_key: str, datatype: str) -> None:
         """Create a cache table for a specific partition key using SQL bootstrap function."""
         try:

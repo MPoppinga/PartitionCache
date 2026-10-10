@@ -4,6 +4,7 @@ from collections.abc import Callable
 from contextlib import contextmanager
 from functools import wraps
 from logging import getLogger
+from pathlib import Path
 from typing import ParamSpec, TypeVar
 
 import psycopg
@@ -126,6 +127,39 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
             logger.debug("DDL lock taken inside an open transaction; lock order is not guaranteed")
         self.cursor.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (self.tableprefix,))
         yield
+
+    def _load_sql_functions(self) -> None:
+        """Load the SQL functions from postgresql_cache_handlers.sql.
+
+        Usually called inside _serialized_ddl, where the advisory lock belongs to the open
+        transaction. A plain rollback after a failed load would end that transaction and
+        release the lock, so the DDL that follows would run unserialized. Inside a
+        transaction the load therefore runs under a savepoint and only the load is undone.
+        """
+        sql_cache_file = Path(__file__).parent / "postgresql_cache_handlers.sql"
+        if not sql_cache_file.exists():
+            logger.warning(f"SQL cache handlers file not found at {sql_cache_file}")
+            return
+
+        in_transaction = self.db.info.transaction_status == TransactionStatus.INTRANS
+        try:
+            if in_transaction:
+                self.cursor.execute("SAVEPOINT partitioncache_load_sql")
+            self.cursor.execute(sql_cache_file.read_text())  # type: ignore[arg-type]
+            if in_transaction:
+                self.cursor.execute("RELEASE SAVEPOINT partitioncache_load_sql")
+            logger.debug("Successfully loaded SQL functions from cache handlers file")
+        except Exception as e:
+            logger.warning(f"Failed to load SQL functions (this is OK if they're already loaded): {e}")
+            # Continuing on an aborted transaction makes every later statement fail with
+            # "current transaction is aborted", which hides the real error behind it.
+            try:
+                if in_transaction:
+                    self.cursor.execute("ROLLBACK TO SAVEPOINT partitioncache_load_sql")
+                else:
+                    self.db.rollback()
+            except Exception:
+                logger.debug("rollback after SQL function load failed", exc_info=True)
 
     @contextmanager
     def _read_txn(self):

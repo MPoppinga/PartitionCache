@@ -135,33 +135,6 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
         )
         self.db.commit()
 
-    def _load_sql_functions(self) -> None:
-        """Load SQL functions from the cache handlers SQL file."""
-        try:
-            from pathlib import Path
-
-            # Get the SQL file path for cache handlers
-            sql_cache_file = Path(__file__).parent / "postgresql_cache_handlers.sql"
-
-            if not sql_cache_file.exists():
-                logger.warning(f"SQL cache handlers file not found at {sql_cache_file}")
-                return
-
-            # Read and execute the SQL file
-            sql_cache_content = sql_cache_file.read_text()
-            logger.info(f"LOADING SQL: Executing SQL functions file ({len(sql_cache_content)} chars)")
-            self.cursor.execute(sql_cache_content)  # type: ignore[arg-type]
-            logger.info("LOADING SQL: SQL functions executed successfully")
-        except Exception as e:
-            logger.warning(f"Failed to load SQL functions (this is OK if they're already loaded): {e}")
-            # Continuing on an aborted transaction makes every later statement fail with
-            # "current transaction is aborted", including the set_query_status that would
-            # have recorded the failure -- so the fragment vanishes instead of counting.
-            try:
-                self.db.rollback()
-            except Exception:
-                logger.debug("rollback after SQL function load failed", exc_info=True)
-
     def _create_bitsize_trigger(self) -> None:
         """Create trigger function and trigger for handling bitsize changes."""
         try:
