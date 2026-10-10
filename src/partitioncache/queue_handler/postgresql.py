@@ -381,12 +381,13 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
                 for query, hash_value in query_hash_pairs:
                     cursor.execute(
                         sql.SQL("""
-                        INSERT INTO {} (query, hash, partition_key, partition_datatype, cache_backend, priority, updated_at, created_at)
+                        INSERT INTO {table} (query, hash, partition_key, partition_datatype, cache_backend, priority, updated_at, created_at)
                         VALUES (%s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                         ON CONFLICT (hash, partition_key) DO UPDATE SET
-                            priority = {}.priority + 1,
+                            priority = {table}.priority + 1,
+                            cache_backend = COALESCE(EXCLUDED.cache_backend, {table}.cache_backend),
                             updated_at = CURRENT_TIMESTAMP
-                    """).format(sql.Identifier(self.fragment_queue_table), sql.Identifier(self.fragment_queue_table)),
+                    """).format(table=sql.Identifier(self.fragment_queue_table)),
                         (query, hash_value, partition_key, partition_datatype, cache_backend, 1),
                     )
 
@@ -522,13 +523,14 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
                 for query, hash_value in query_hash_pairs:
                     cursor.execute(
                         sql.SQL("""
-                        INSERT INTO {} (query, hash, partition_key, partition_datatype, cache_backend, priority, updated_at, created_at)
+                        INSERT INTO {table} (query, hash, partition_key, partition_datatype, cache_backend, priority, updated_at, created_at)
                         VALUES (%s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                         ON CONFLICT (hash, partition_key)
                         DO UPDATE SET
-                            priority = {}.priority + %s,
+                            priority = {table}.priority + %s,
+                            cache_backend = COALESCE(EXCLUDED.cache_backend, {table}.cache_backend),
                             updated_at = CURRENT_TIMESTAMP
-                    """).format(sql.Identifier(self.fragment_queue_table), sql.Identifier(self.fragment_queue_table)),
+                    """).format(table=sql.Identifier(self.fragment_queue_table)),
                         (query, hash_value, partition_key, partition_datatype, cache_backend, priority, priority),
                     )
 

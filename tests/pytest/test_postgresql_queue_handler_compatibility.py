@@ -75,3 +75,22 @@ def test_original_queue_fallback_rolls_back_failed_helper_transaction():
 
     connection.rollback.assert_called_once_with()
     assert cursor.execute.call_count == 2
+
+
+@pytest.mark.parametrize("with_priority", [False, True])
+def test_fragment_fallback_updates_cache_backend_on_conflict(with_priority):
+    """A requeued item with an explicit backend must not keep the backend it was queued with."""
+    handler, _, cursor = _handler_with_connection()
+    cursor.execute.side_effect = [RuntimeError("helper unavailable"), None]
+
+    if with_priority:
+        handler.push_to_query_fragment_queue_with_priority(
+            [("SELECT 1", "hash-1")], "geom", 3, "geometry", cache_backend="postgis_bbox"
+        )
+    else:
+        handler.push_to_query_fragment_queue(
+            [("SELECT 1", "hash-1")], "geom", "geometry", cache_backend="postgis_bbox"
+        )
+
+    fallback_statement = cursor.execute.call_args.args[0].as_string(None)
+    assert 'cache_backend = COALESCE(EXCLUDED.cache_backend, "test_query_fragment_queue".cache_backend)' in fallback_statement
