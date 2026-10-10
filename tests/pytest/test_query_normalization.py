@@ -11,7 +11,10 @@ from sqlglot import exp
 from partitioncache.query_processor import (
     clean_query,
     extract_and_group_query_conditions,
+    generate_all_hashes,
     generate_all_query_hash_pairs,
+    normalize_joins_to_cross_join,
+    query_contains_top_level_outer_join,
 )
 
 
@@ -80,16 +83,22 @@ class TestJoinNormalization:
         assert "taxi_trips" in result
         assert "payments" in result
 
-    def test_left_join_preserved(self):
-        """LEFT JOINs should also be converted (for cache purposes, we treat all as inner)."""
+    def test_left_join_not_converted(self):
+        """LEFT JOINs must NOT be rewritten to comma joins.
+
+        The comma-join rewrite has inner-join semantics and would drop preserved-side
+        rows without a join partner, which could exclude valid partitions (false
+        negatives). Outer joins are therefore left intact by normalization.
+        """
         query = """
         SELECT t.trip_id
         FROM taxi_trips t
         LEFT JOIN pois p ON ST_DWithin(t.geom, p.geom, 500)
         WHERE t.fare > 10
         """
-        result = clean_query(query)
-        # The join condition should be in WHERE
+        result = normalize_joins_to_cross_join(query)
+        # The outer join is preserved, not flattened into the WHERE clause
+        assert "LEFT JOIN" in result.upper()
         assert "taxi_trips" in result
         assert "pois" in result
 
@@ -404,3 +413,68 @@ class TestStripSelectPreservation:
         assert not has_trip_id, (
             f"strip_select=True should NOT preserve trip_id in SELECT: {select_clauses}"
         )
+
+
+class TestOuterJoinExclusion:
+    """Outer joins (LEFT/RIGHT/FULL) must be excluded from variant generation.
+
+    Rewriting them into comma-joins has inner-join semantics and drops preserved-side
+    rows without a join partner. The resulting cached partition-key set would be a subset
+    of the original query's set, so applying such a cache entry could exclude valid
+    partitions (false negatives). Such queries must produce no variants and be executed
+    unchanged.
+    """
+
+    def test_detector_true_for_top_level_outer_joins(self):
+        assert query_contains_top_level_outer_join("SELECT a.x FROM a LEFT JOIN b ON a.id = b.id")
+        assert query_contains_top_level_outer_join("SELECT a.x FROM a RIGHT JOIN b ON a.id = b.id")
+        assert query_contains_top_level_outer_join("SELECT a.x FROM a FULL JOIN b ON a.id = b.id")
+        assert query_contains_top_level_outer_join("SELECT a.x FROM a LEFT OUTER JOIN b ON a.id = b.id")
+
+    def test_detector_false_for_inner_and_comma_joins(self):
+        assert not query_contains_top_level_outer_join("SELECT a.x FROM a JOIN b ON a.id = b.id")
+        assert not query_contains_top_level_outer_join("SELECT a.x FROM a INNER JOIN b ON a.id = b.id")
+        assert not query_contains_top_level_outer_join("SELECT a.x FROM a, b WHERE a.id = b.id")
+        assert not query_contains_top_level_outer_join("SELECT a.x FROM a WHERE a.x > 5")
+
+    def test_detector_false_for_outer_join_inside_subquery(self):
+        """An outer join nested in EXISTS/IN is preserved verbatim and is safe."""
+        exists_q = (
+            "SELECT a.x FROM a WHERE EXISTS "
+            "(SELECT 1 FROM b LEFT JOIN c ON b.id = c.id WHERE b.a_id = a.id)"
+        )
+        in_q = (
+            "SELECT a.x FROM a WHERE a.id IN "
+            "(SELECT b.a_id FROM b LEFT JOIN c ON b.id = c.id)"
+        )
+        assert not query_contains_top_level_outer_join(exists_q)
+        assert not query_contains_top_level_outer_join(in_q)
+
+    def test_detector_false_on_unparseable(self):
+        assert not query_contains_top_level_outer_join("this is not sql")
+
+    def test_generate_all_query_hash_pairs_empty_for_outer_join(self):
+        query = (
+            "SELECT o.region FROM orders o "
+            "LEFT JOIN shipments s ON o.id = s.order_id "
+            "WHERE o.region > 5"
+        )
+        assert generate_all_query_hash_pairs(query, "region", warn_no_partition_key=False) == []
+
+    def test_generate_all_hashes_empty_for_outer_join(self):
+        query = (
+            "SELECT o.region FROM orders o "
+            "LEFT JOIN shipments s ON o.id = s.order_id "
+            "WHERE o.region > 5"
+        )
+        assert generate_all_hashes(query, "region", warn_no_partition_key=False) == []
+
+    def test_inner_join_still_generates_variants(self):
+        """Regression: inner joins must still decompose into cache variants."""
+        query = (
+            "SELECT o.region FROM orders o "
+            "JOIN shipments s ON o.id = s.order_id "
+            "WHERE o.region > 5"
+        )
+        pairs = generate_all_query_hash_pairs(query, "region", warn_no_partition_key=False)
+        assert len(pairs) > 0

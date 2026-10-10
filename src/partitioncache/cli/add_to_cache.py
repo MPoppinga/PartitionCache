@@ -22,7 +22,7 @@ from partitioncache.cli.common_args import (
     resolve_cache_backend,
 )
 from partitioncache.db_handler import get_db_handler
-from partitioncache.query_processor import clean_query, generate_all_query_hash_pairs, hash_query
+from partitioncache.query_processor import clean_query, generate_all_query_hash_pairs, hash_query, query_contains_top_level_outer_join
 
 logger = getLogger("PartitionCache")
 
@@ -135,6 +135,13 @@ def main():
                 max_conditions_removed=args.max_conditions_removed,
             )
             success = partitioncache.push_to_query_fragment_queue(query_hash_pairs, args.partition_key, args.partition_datatype, queue_provider, cache_backend=queue_cache_backend)
+        elif query_contains_top_level_outer_join(query):  # Outer joins cannot be cached safely
+            logger.warning(
+                "Query contains a top-level outer join (LEFT/RIGHT/FULL); PartitionCache cannot "
+                "cache it safely (inner-join rewrite could exclude valid partitions). Skipping — "
+                "execute the query unchanged."
+            )
+            success = True
         else:  # Push the cleaned query as a single variant (no recomposition)
             query = clean_query(query)
             query_hash_pairs = [(query, hash_query(query))]
@@ -199,6 +206,13 @@ def main():
                     max_conditions_removed=args.max_conditions_removed,
                 )
 
+            elif query_contains_top_level_outer_join(query):
+                logger.warning(
+                    "Query contains a top-level outer join (LEFT/RIGHT/FULL); PartitionCache cannot "
+                    "cache it safely (inner-join rewrite could exclude valid partitions). Skipping — "
+                    "execute the query unchanged."
+                )
+                query_hash_pairs = []
             else:
                 query = clean_query(query)
                 query_hash_pairs = [(query, hash_query(query))]
