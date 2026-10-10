@@ -85,6 +85,16 @@ def main():
     else:
         query = args.query
 
+    # Every mode would end with zero cache entries, and the queue modes would still report
+    # the query as queued. Say so once and stop instead.
+    if query_contains_top_level_outer_join(query):
+        logger.warning(
+            "Query contains a top-level outer join (LEFT/RIGHT/FULL). PartitionCache does not cache "
+            "such queries: the inner-join rewrite could exclude valid partitions. Nothing was queued "
+            "or stored; run the query without cache restrictions."
+        )
+        return
+
     # Determine queue provider
     queue_provider = getattr(args, 'queue_provider', None) or os.getenv("QUERY_QUEUE_PROVIDER", "postgresql")
 
@@ -135,13 +145,6 @@ def main():
                 max_conditions_removed=args.max_conditions_removed,
             )
             success = partitioncache.push_to_query_fragment_queue(query_hash_pairs, args.partition_key, args.partition_datatype, queue_provider, cache_backend=queue_cache_backend)
-        elif query_contains_top_level_outer_join(query):  # Outer joins cannot be cached safely
-            logger.warning(
-                "Query contains a top-level outer join (LEFT/RIGHT/FULL); PartitionCache cannot "
-                "cache it safely (inner-join rewrite could exclude valid partitions). Skipping — "
-                "execute the query unchanged."
-            )
-            success = True
         else:  # Push the cleaned query as a single variant (no recomposition)
             query = clean_query(query)
             query_hash_pairs = [(query, hash_query(query))]
@@ -206,13 +209,6 @@ def main():
                     max_conditions_removed=args.max_conditions_removed,
                 )
 
-            elif query_contains_top_level_outer_join(query):
-                logger.warning(
-                    "Query contains a top-level outer join (LEFT/RIGHT/FULL); PartitionCache cannot "
-                    "cache it safely (inner-join rewrite could exclude valid partitions). Skipping — "
-                    "execute the query unchanged."
-                )
-                query_hash_pairs = []
             else:
                 query = clean_query(query)
                 query_hash_pairs = [(query, hash_query(query))]
