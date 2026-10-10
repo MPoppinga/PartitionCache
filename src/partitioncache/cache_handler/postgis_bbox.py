@@ -1,4 +1,3 @@
-import math
 """
 PostGIS Bounding Box Cache Handler.
 
@@ -8,6 +7,7 @@ Supports spatial filtering via geometric ST_Intersection of buffered multipolygo
 Requires: PostgreSQL + PostGIS extension.
 """
 
+import math
 import warnings
 from logging import getLogger
 
