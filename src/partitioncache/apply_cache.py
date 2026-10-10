@@ -74,7 +74,7 @@ def get_partition_keys(
 
     # Generate all hashes for the given query (Only consider subqueries with two ore more components that are connected, allow modifying attributes)
     cache_entry_hashes = generate_all_hashes(
-            partition_key_source_table=partition_key_source_table,
+        partition_key_source_table=partition_key_source_table,
         query=query,
         partition_key=partition_key,
         min_component_size=min_component_size,
@@ -159,7 +159,7 @@ def get_partition_keys_lazy(
         auto_detect_partition_join = deprecated["auto_detect_partition_join"]
 
     hashes = generate_all_hashes(
-            partition_key_source_table=partition_key_source_table,
+        partition_key_source_table=partition_key_source_table,
         query=query,
         partition_key=partition_key,
         min_component_size=min_component_size,
