@@ -1038,3 +1038,69 @@ class TestApplyCacheEmptyIntersection:
         assert enhanced == f"SELECT * FROM trips AS t WHERE t.fare > 10 AND FALSE /* {EMPTY_INTERSECTION_COMMENT} */"
         assert stats["enhanced"] == 1
         assert stats["cache_hits"] == 2
+
+
+class TestTempTableSqlDialect:
+    """CREATE TEMPORARY TABLE DDL must match the target dialect.
+
+    PostgreSQL supports ON COMMIT DROP; DuckDB rejects it with
+    "Only ON COMMIT PRESERVE ROWS is supported", which made every TMP_TABLE_* method
+    fail there -- including the default one.
+    """
+
+    QUERY = "SELECT * FROM message AS m WHERE m.length > 5"
+    KEYS = {1, 2, 3}
+
+    @pytest.mark.parametrize("method", ["TMP_TABLE_IN", "TMP_TABLE_JOIN"])
+    def test_postgres_emits_on_commit_drop(self, method):
+        sql = extend_query_with_partition_keys(
+            self.QUERY, self.KEYS, "creatorpersonid", method=method, p0_alias="m", sql_dialect="postgres"
+        )
+        assert "ON COMMIT DROP" in sql
+        # PostgreSQL relies on ON COMMIT DROP plus a randomised name; no extra DROP statement
+        # may be emitted, because the whole script runs as one transaction and callers step
+        # through the result sets positionally.
+        assert "DROP TABLE IF EXISTS" not in sql
+
+    @pytest.mark.parametrize("method", ["TMP_TABLE_IN", "TMP_TABLE_JOIN"])
+    def test_duckdb_omits_on_commit_drop(self, method):
+        sql = extend_query_with_partition_keys(
+            self.QUERY, self.KEYS, "creatorpersonid", method=method, p0_alias="m", sql_dialect="duckdb"
+        )
+        assert "ON COMMIT DROP" not in sql
+        # session-scoped there, so the table is dropped explicitly beforehand
+        assert "DROP TABLE IF EXISTS" in sql
+
+    def test_postgres_is_the_default(self):
+        sql = extend_query_with_partition_keys(
+            self.QUERY, self.KEYS, "creatorpersonid", method="TMP_TABLE_IN", p0_alias="m"
+        )
+        assert "ON COMMIT DROP" in sql
+
+    @pytest.mark.parametrize("method", ["TMP_TABLE_IN", "TMP_TABLE_JOIN"])
+    def test_duckdb_actually_executes(self, method):
+        """The regression this guards: DuckDB rejecting the generated DDL outright."""
+        duckdb = pytest.importorskip("duckdb")
+        con = duckdb.connect(":memory:")
+        con.execute("CREATE TABLE message (creatorpersonid INT, length INT)")
+        con.execute("INSERT INTO message VALUES (1, 10), (2, 10), (9, 10)")
+        sql = extend_query_with_partition_keys(
+            "SELECT count(*) FROM message AS m WHERE m.length > 5",
+            self.KEYS, "creatorpersonid", method=method, p0_alias="m", sql_dialect="duckdb",
+        )
+        result = None
+        for statement in (s for s in sql.split(";") if s.strip()):
+            result = con.execute(statement)
+        assert result.fetchall() == [(2,)]
+
+    def test_lazy_subquery_setup_is_dialect_aware(self):
+        pg = extend_query_with_partition_keys_lazy(
+            self.QUERY, "SELECT 1 AS creatorpersonid", "creatorpersonid",
+            method="TMP_TABLE_IN", p0_alias="m", sql_dialect="postgres",
+        )
+        duck = extend_query_with_partition_keys_lazy(
+            self.QUERY, "SELECT 1 AS creatorpersonid", "creatorpersonid",
+            method="TMP_TABLE_IN", p0_alias="m", sql_dialect="duckdb",
+        )
+        assert "ON COMMIT DROP" in pg and "DROP TABLE IF EXISTS" not in pg
+        assert "ON COMMIT DROP" not in duck and "DROP TABLE IF EXISTS" in duck
