@@ -54,8 +54,13 @@ query_processing:
   strip_select: true
   auto_detect_partition_join: false
   skip_partition_key_joins: true
-  use_adapted_queries: true
-  adapted_subdirectory: "adapted"
+  enable_population_optimization: true
+  population_optimization_method: "IN_SUBQUERY"
+  protected_patterns: ["categories"]  # Keep category filter in all fragments
+  population:
+    max_conditions_removed: 1
+  lookup:
+    max_conditions_removed: 2
 
 fragment_filter:
   require_in_from: [wikipedia_articles]

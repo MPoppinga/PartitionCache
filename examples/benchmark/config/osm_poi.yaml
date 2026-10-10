@@ -78,6 +78,12 @@ query_processing:
   strip_select: true
   auto_detect_partition_join: true
   skip_partition_key_joins: false
+  population:
+    max_conditions_removed: 1
+    keep_all_attributes: false
+  lookup:
+    max_conditions_removed: 2
+    keep_all_attributes: false
 
 fragment_filter:
   require_in_from: []

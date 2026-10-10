@@ -31,7 +31,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from dotenv import load_dotenv
 
 import partitioncache
-from partitioncache.query_processor import generate_all_query_hash_pairs
+from partitioncache.query_processor import compute_buffer_distance, generate_all_query_hash_pairs
 
 load_dotenv("examples/openstreetmap_poi/.env", override=True)
 
@@ -226,15 +226,22 @@ def populate_bbox(handler, conn, query: str) -> dict:
     return stats
 
 
-def apply_bbox_lazy(handler, conn, query: str) -> tuple[str, dict]:
-    buffer_dist = _extract_max_st_dwithin(query)
+def apply_bbox_lazy(
+    handler,
+    conn,
+    query: str,
+    spatial_method: str = "SUBDIVIDE_TMP_TABLE",
+    subdivide_max_vertices: int = 256,
+) -> tuple[str, dict]:
+    buffer_dist = compute_buffer_distance(query)
     kwargs = {
         "query": query,
         "cache_handler": handler,
         "partition_key": PARTITION_KEY_BBOX,
         "method": "TMP_TABLE_IN",
         "geometry_column": GEOMETRY_COLUMN,
-        "spatial_method": "SUBDIVIDE_TMP_TABLE",
+        "spatial_method": spatial_method,
+        "subdivide_max_vertices": subdivide_max_vertices,
         "p0_alias": "p1",
         "skip_partition_key_joins": True,
         "follow_graph": True,
@@ -318,7 +325,7 @@ def populate_h3(handler, conn, query: str, partition_key: str) -> dict:
 
 
 def apply_h3_lazy(handler, conn, query: str, partition_key: str) -> tuple[str, dict]:
-    buffer_dist = _extract_max_st_dwithin(query)
+    buffer_dist = compute_buffer_distance(query)
     kwargs = {
         "query": query,
         "cache_handler": handler,
@@ -333,16 +340,6 @@ def apply_h3_lazy(handler, conn, query: str, partition_key: str) -> tuple[str, d
     if buffer_dist > 0:
         kwargs["buffer_distance"] = buffer_dist
     return partitioncache.apply_cache_lazy(**kwargs)
-
-
-def _extract_max_st_dwithin(query: str) -> float:
-    distances = []
-    for m in re.finditer(r"ST_DWithin\s*\([^)]*,\s*(\d+(?:\.\d+)?)\s*\)", query, re.IGNORECASE):
-        try:
-            distances.append(float(m.group(1)))
-        except ValueError:
-            pass
-    return max(distances) if distances else 0.0
 
 
 # =============================================================================
@@ -402,42 +399,62 @@ def run_benchmark():
             all_results.append(result)
             continue
 
-        # --- BBox ---
-        print("\n  [BBox] Populating + Applying...")
+        # --- BBox configurations ---
+        # Populate once, then test multiple spatial_method / subdivide_max_vertices combos
+        bbox_configs = [
+            ("bbox_tmp256", "SUBDIVIDE_TMP_TABLE", 256),
+            ("bbox_tmp32", "SUBDIVIDE_TMP_TABLE", 32),
+            ("bbox_tmp8", "SUBDIVIDE_TMP_TABLE", 8),
+            ("bbox_inl256", "SUBDIVIDE_INLINE", 256),
+            ("bbox_inl32", "SUBDIVIDE_INLINE", 32),
+            ("bbox_inl8", "SUBDIVIDE_INLINE", 8),
+            ("bbox_dump_tmp", "DUMP_TMP_TABLE", 0),
+            ("bbox_dump_cte", "DUMP_CTE", 0),
+        ]
         try:
             pop_stats = populate_bbox(bbox_handler, conn, query)
             result["bbox_fragments"] = pop_stats["fragments"]
-
-            enhanced, cache_stats = apply_bbox_lazy(bbox_handler, conn, query)
-            result["bbox_cache_stats"] = cache_stats
-
-            if cache_stats.get("enhanced"):
-                rows_e, med_t, min_t, max_t = execute_query_n(conn, enhanced)
-                result["bbox_rows"] = len(rows_e)
-                result["bbox_time"] = med_t
-                result["bbox_min"] = min_t
-                result["bbox_max"] = max_t
-                result["bbox_match"] = len(rows_e) == result["baseline_rows"]
-                result["bbox_speedup"] = result["baseline_time"] / med_t if med_t > 0 else float("inf")
-
-                plan_lines, plan_info = explain_analyze(conn, enhanced)
-                result["bbox_plan"] = plan_info
-                result["bbox_plan_lines"] = plan_lines
-                result["bbox_enhanced_sql"] = enhanced
-
-                status = "MATCH" if result["bbox_match"] else f"MISMATCH ({len(rows_e)} vs {result['baseline_rows']})"
-                print(f"    Rows: {len(rows_e):,}  Time: {med_t:.3f}s  Speedup: {result['bbox_speedup']:.1f}x  {status}")
-                print(f"    Scan: {plan_info['scan_type']}  GiST: {plan_info['gist_used']}  "
-                      f"ExecTime: {plan_info['exec_time_ms']:.1f}ms  "
-                      f"Buffers: {plan_info['shared_hit']}/{plan_info['shared_read']}")
-            else:
-                print(f"    No cache hits")
-                result["bbox_rows"] = None
         except Exception as e:
-            print(f"    BBox FAILED: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"    BBox populate FAILED: {e}")
             result["bbox_error"] = str(e)
+            pop_stats = None
+
+        if pop_stats:
+            for cfg_name, spat_method, max_verts in bbox_configs:
+                print(f"\n  [{cfg_name}] ({spat_method}, max_vertices={max_verts})...")
+                try:
+                    enhanced, cache_stats = apply_bbox_lazy(
+                        bbox_handler, conn, query,
+                        spatial_method=spat_method,
+                        subdivide_max_vertices=max_verts,
+                    )
+                    result[f"{cfg_name}_cache_stats"] = cache_stats
+
+                    if cache_stats.get("enhanced"):
+                        rows_e, med_t, min_t, max_t = execute_query_n(conn, enhanced)
+                        result[f"{cfg_name}_rows"] = len(rows_e)
+                        result[f"{cfg_name}_time"] = med_t
+                        result[f"{cfg_name}_min"] = min_t
+                        result[f"{cfg_name}_max"] = max_t
+                        result[f"{cfg_name}_match"] = len(rows_e) == result["baseline_rows"]
+                        result[f"{cfg_name}_speedup"] = result["baseline_time"] / med_t if med_t > 0 else float("inf")
+
+                        plan_lines, plan_info = explain_analyze(conn, enhanced)
+                        result[f"{cfg_name}_plan"] = plan_info
+                        result[f"{cfg_name}_plan_lines"] = plan_lines
+                        result[f"{cfg_name}_enhanced_sql"] = enhanced
+
+                        status = "MATCH" if result[f"{cfg_name}_match"] else f"MISMATCH ({len(rows_e)} vs {result['baseline_rows']})"
+                        print(f"    Rows: {len(rows_e):,}  Time: {med_t:.3f}s  Speedup: {result[f'{cfg_name}_speedup']:.1f}x  {status}")
+                        print(f"    Scan: {plan_info['scan_type']}  GiST: {plan_info['gist_used']}  "
+                              f"ExecTime: {plan_info['exec_time_ms']:.1f}ms  "
+                              f"Buffers: {plan_info['shared_hit']}/{plan_info['shared_read']}")
+                    else:
+                        print("    No cache hits")
+                        result[f"{cfg_name}_rows"] = None
+                except Exception as e:
+                    print(f"    {cfg_name} FAILED: {e}")
+                    result[f"{cfg_name}_error"] = str(e)
 
         # --- H3 Inline ---
         print("\n  [H3 Inline] Populating + Applying...")
@@ -470,7 +487,7 @@ def run_benchmark():
                       f"ExecTime: {plan_info['exec_time_ms']:.1f}ms  "
                       f"Buffers: {plan_info['shared_hit']}/{plan_info['shared_read']}")
             else:
-                print(f"    No cache hits")
+                print("    No cache hits")
                 result["h3_inline_rows"] = None
         except Exception as e:
             print(f"    H3 Inline FAILED: {e}")
@@ -509,7 +526,7 @@ def run_benchmark():
                       f"ExecTime: {plan_info['exec_time_ms']:.1f}ms  "
                       f"Buffers: {plan_info['shared_hit']}/{plan_info['shared_read']}")
             else:
-                print(f"    No cache hits")
+                print("    No cache hits")
                 result["h3_mv_rows"] = None
         except Exception as e:
             print(f"    H3 MV FAILED: {e}")
@@ -548,7 +565,7 @@ def run_benchmark():
                       f"ExecTime: {plan_info['exec_time_ms']:.1f}ms  "
                       f"Buffers: {plan_info['shared_hit']}/{plan_info['shared_read']}")
             else:
-                print(f"    No cache hits")
+                print("    No cache hits")
                 result["h3_col_rows"] = None
         except Exception as e:
             print(f"    H3 Column FAILED: {e}")
@@ -559,62 +576,59 @@ def run_benchmark():
         all_results.append(result)
 
     # ==========================================================================
-    # Summary Table
+    # Summary Table — All methods
     # ==========================================================================
-    print(f"\n{'='*160}")
+    bbox_cfg_names = ["bbox_tmp256", "bbox_tmp32", "bbox_tmp8", "bbox_inl256", "bbox_inl32", "bbox_inl8", "bbox_dump_tmp", "bbox_dump_cte"]
+    h3_methods = [("h3_inline", "H3Inl"), ("h3_mv", "H3MV"), ("h3_col", "H3Col")]
+    all_methods = [(c, c) for c in bbox_cfg_names] + h3_methods
+
+    print(f"\n{'='*180}")
     print("PERFORMANCE SUMMARY")
-    print(f"{'='*160}")
-    print(f"{'Query':<15} {'Baseline':>10} {'BBox':>10} {'BBox':>7} {'H3 Inl':>10} {'H3 Inl':>7} {'H3 MV':>10} {'H3 MV':>7} {'H3 Col':>10} {'H3 Col':>7} {'BBox':>6} {'H3Inl':>6} {'H3MV':>6} {'H3Col':>6}")
-    print(f"{'':<15} {'time(s)':>10} {'time(s)':>10} {'speed':>7} {'time(s)':>10} {'speed':>7} {'time(s)':>10} {'speed':>7} {'time(s)':>10} {'speed':>7} {'scan':>6} {'scan':>6} {'scan':>6} {'scan':>6}")
-    print("-" * 160)
+    print(f"{'='*180}")
+    header = f"{'Query':<15} {'Baseline':>10}"
+    for _, label in all_methods:
+        header += f" {label:>12} {'speed':>7}"
+    print(header)
+    print("-" * 180)
 
     for r in all_results:
         base_t = f"{r['baseline_time']:.3f}" if "baseline_time" in r else "ERR"
-        bbox_t = f"{r['bbox_time']:.3f}" if r.get("bbox_time") else "N/A"
-        bbox_s = f"{r['bbox_speedup']:.1f}x" if r.get("bbox_speedup") else "N/A"
-        h3i_t = f"{r['h3_inline_time']:.3f}" if r.get("h3_inline_time") else "N/A"
-        h3i_s = f"{r['h3_inline_speedup']:.1f}x" if r.get("h3_inline_speedup") else "N/A"
-        h3m_t = f"{r['h3_mv_time']:.3f}" if r.get("h3_mv_time") else "N/A"
-        h3m_s = f"{r['h3_mv_speedup']:.1f}x" if r.get("h3_mv_speedup") else "N/A"
-        h3c_t = f"{r['h3_col_time']:.3f}" if r.get("h3_col_time") else "N/A"
-        h3c_s = f"{r['h3_col_speedup']:.1f}x" if r.get("h3_col_speedup") else "N/A"
-        bbox_scan = r.get("bbox_plan", {}).get("scan_type", "N/A")
-        h3i_scan = r.get("h3_inline_plan", {}).get("scan_type", "N/A")
-        h3m_scan = r.get("h3_mv_plan", {}).get("scan_type", "N/A")
-        h3c_scan = r.get("h3_col_plan", {}).get("scan_type", "N/A")
-        print(f"{r['query']:<15} {base_t:>10} {bbox_t:>10} {bbox_s:>7} {h3i_t:>10} {h3i_s:>7} {h3m_t:>10} {h3m_s:>7} {h3c_t:>10} {h3c_s:>7} {bbox_scan:>6} {h3i_scan:>6} {h3m_scan:>6} {h3c_scan:>6}")
+        line = f"{r['query']:<15} {base_t:>10}"
+        for key, _ in all_methods:
+            t = f"{r[f'{key}_time']:.3f}" if r.get(f"{key}_time") else "N/A"
+            s = f"{r[f'{key}_speedup']:.1f}x" if r.get(f"{key}_speedup") else "N/A"
+            line += f" {t:>12} {s:>7}"
+        print(line)
 
     # Correctness Table
-    print(f"\n{'='*120}")
-    print("CORRECTNESS (H3 results are supersets — more rows is expected)")
-    print(f"{'='*120}")
-    print(f"{'Query':<15} {'Base rows':>10} {'BBox rows':>10} {'BBox':>6} {'H3Inl rows':>10} {'H3Inl +':>8} {'H3MV rows':>10} {'H3MV +':>8} {'H3Col rows':>10} {'H3Col +':>8}")
-    print("-" * 120)
+    print(f"\n{'='*160}")
+    print("CORRECTNESS")
+    print(f"{'='*160}")
+    header = f"{'Query':<15} {'Base rows':>10}"
+    for _, label in all_methods:
+        header += f" {label:>10} {'ok':>5}"
+    print(header)
+    print("-" * 160)
 
     for r in all_results:
         base_r = str(r.get("baseline_rows", "ERR"))
-        bbox_r = str(r.get("bbox_rows", "N/A"))
-        bbox_ok = "OK" if r.get("bbox_match") else ("MISS" if r.get("bbox_match") is False else "N/A")
-        h3i_r = str(r.get("h3_inline_rows", "N/A"))
-        h3i_extra = f"+{r['h3_inline_superset_size']}" if r.get("h3_inline_superset_size", 0) > 0 else "0"
-        h3m_r = str(r.get("h3_mv_rows", "N/A"))
-        h3m_extra = f"+{r['h3_mv_superset_size']}" if r.get("h3_mv_superset_size", 0) > 0 else "0"
-        h3c_r = str(r.get("h3_col_rows", "N/A"))
-        h3c_extra = f"+{r['h3_col_superset_size']}" if r.get("h3_col_superset_size", 0) > 0 else "0"
-        if r.get("h3_inline_rows") is None:
-            h3i_extra = "N/A"
-        if r.get("h3_mv_rows") is None:
-            h3m_extra = "N/A"
-        if r.get("h3_col_rows") is None:
-            h3c_extra = "N/A"
-        print(f"{r['query']:<15} {base_r:>10} {bbox_r:>10} {bbox_ok:>6} {h3i_r:>10} {h3i_extra:>8} {h3m_r:>10} {h3m_extra:>8} {h3c_r:>10} {h3c_extra:>8}")
+        line = f"{r['query']:<15} {base_r:>10}"
+        for key, _ in all_methods:
+            rows = r.get(f"{key}_rows")
+            if rows is None:
+                line += f" {'N/A':>10} {'N/A':>5}"
+            else:
+                match = r.get(f"{key}_match", False)
+                line += f" {str(rows):>10} {'OK' if match else 'MISS':>5}"
+        print(line)
 
     # EXPLAIN ANALYZE details
     print(f"\n{'='*100}")
     print("EXPLAIN ANALYZE DETAILS")
     print(f"{'='*100}")
     for r in all_results:
-        for method, label in [("baseline", "Baseline"), ("bbox", "BBox"), ("h3_inline", "H3 Inline"), ("h3_mv", "H3 MV"), ("h3_col", "H3 Column")]:
+        explain_methods = [("baseline", "Baseline")] + list(all_methods)
+        for method, label in explain_methods:
             plan_key = f"{method}_plan"
             lines_key = f"{method}_plan_lines"
             if plan_key in r and lines_key in r:

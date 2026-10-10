@@ -71,16 +71,18 @@ hierarchy_labels:
 spatial_queries: []
 
 query_processing:
-  keep_all_attributes: true
-  follow_graph: false
+  keep_all_attributes: false
+  follow_graph: true
   strip_select: true
-  auto_detect_partition_join: false
-  skip_partition_key_joins: true
-  use_adapted_queries: true
-  adapted_subdirectory: "adapted"
+  auto_detect_partition_join: true
+  skip_partition_key_joins: false
+  population:
+    max_conditions_removed: 1
+  lookup:
+    max_conditions_removed: 2
 
 fragment_filter:
-  require_in_from: [lineitem]
+  require_in_from: []
   exclude_from_from: []
 
 cache:

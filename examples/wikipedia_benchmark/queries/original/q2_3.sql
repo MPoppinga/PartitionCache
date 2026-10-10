@@ -1,8 +1,9 @@
--- Flight 2: Date range + content length + LLM
--- Q2_3: Northern European events with environmental angle (2 LLM questions)
+-- Flight 2: Science category + high edits + recent + LLM
+-- Q2_3: Environmental science and climate topics (2 LLM questions)
 SELECT a.article_id
 FROM wikipedia_articles a
-WHERE a.creation_year BETWEEN 2010 AND 2015
-  AND a.content_length > 5000
-  AND wiki_llm_classify(a.content, 'Is this article primarily about a place, event, or tradition in Scandinavia, the Baltics, or the British Isles?')
-  AND wiki_llm_classify(a.content, 'Does the article discuss environmental issues, climate, or natural landscapes?')
+WHERE EXISTS (SELECT 1 FROM unnest(a.categories) c WHERE c ILIKE '%scienc%')
+  AND a.edit_count > 50
+  AND a.creation_year >= 2005
+  AND wiki_llm_classify(a.content, 'Does this article discuss environmental issues, climate change, or ecology?')
+  AND wiki_llm_classify(a.content, 'Does the article mention specific data, measurements, or statistics about environmental impact?')

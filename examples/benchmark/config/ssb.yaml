@@ -50,6 +50,14 @@ query_partition_keys:
   q8_1: [lo_custkey, lo_orderdate]
   q8_2: [lo_custkey, lo_partkey]
   q8_3: [lo_suppkey, lo_orderdate]
+  # Expensive variants: sha256/ILIKE predicates force sequential lineorder scan
+  # Cache reuse with q3/q5 flights via shared dimension fragment keys
+  qx1_1: [lo_custkey, lo_suppkey, lo_orderdate]
+  qx1_2: [lo_custkey, lo_suppkey, lo_orderdate]
+  qx1_3: [lo_custkey, lo_partkey, lo_orderdate]
+  qx2_1: [lo_suppkey, lo_partkey, lo_orderdate]
+  qx2_2: [lo_custkey, lo_suppkey, lo_partkey, lo_orderdate]
+  qx2_3: [lo_custkey, lo_suppkey, lo_orderdate]
 
 query_flights:
   1: [q1_1, q1_2, q1_3]
@@ -60,6 +68,7 @@ query_flights:
   6: [q6_1, q6_2, q6_3]
   7: [q7_1, q7_2, q7_3]
   8: [q8_1, q8_2, q8_3]
+  9: [qx1_1, qx1_2, qx1_3, qx2_1, qx2_2, qx2_3]
 
 hierarchy_labels:
   q5_1: "Region (broadest)"
@@ -72,16 +81,18 @@ hierarchy_labels:
 spatial_queries: []
 
 query_processing:
-  keep_all_attributes: true
-  follow_graph: false
+  keep_all_attributes: false
+  follow_graph: true
   strip_select: true
-  auto_detect_partition_join: false
-  skip_partition_key_joins: true
-  use_adapted_queries: true
-  adapted_subdirectory: "adapted"
+  auto_detect_partition_join: true
+  skip_partition_key_joins: false
+  population:
+    max_conditions_removed: 1
+  lookup:
+    max_conditions_removed: 2
 
 fragment_filter:
-  require_in_from: [lineorder]
+  require_in_from: []
   exclude_from_from: []
 
 cache:
@@ -105,4 +116,4 @@ modes:
     flights: [5, 6]
   cold_warm:
     flight: 3
-  representative_queries: [q1_1, q3_1, q5_1]
+  representative_queries: [q1_1, q3_1, q5_1, qx1_1]
