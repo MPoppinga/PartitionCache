@@ -153,13 +153,21 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
             logger.warning(f"Failed to load SQL functions (this is OK if they're already loaded): {e}")
             # Continuing on an aborted transaction makes every later statement fail with
             # "current transaction is aborted", which hides the real error behind it.
-            try:
-                if in_transaction:
+            if in_transaction:
+                try:
                     self.cursor.execute("ROLLBACK TO SAVEPOINT partitioncache_load_sql")
-                else:
+                except Exception:
+                    logger.debug("rollback to savepoint after SQL function load failed", exc_info=True)
+            if not in_transaction or self.db.info.transaction_status == TransactionStatus.INERROR:
+                # The savepoint is gone when another thread committed on this shared connection
+                # in between; that commit already released the advisory lock. Never return with
+                # an aborted transaction, or every later statement on the connection fails.
+                if in_transaction:
+                    logger.warning("Savepoint for the SQL function load was lost; resetting the transaction")
+                try:
                     self.db.rollback()
-            except Exception:
-                logger.debug("rollback after SQL function load failed", exc_info=True)
+                except Exception:
+                    logger.debug("rollback after SQL function load failed", exc_info=True)
 
     @contextmanager
     def _read_txn(self):

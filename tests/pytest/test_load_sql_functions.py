@@ -69,3 +69,22 @@ def test_failed_load_outside_transaction_rolls_back():
 
     assert len(_statements(handler)) == 1  # no savepoint without a transaction to protect
     handler.db.rollback.assert_called_once_with()
+
+
+@pytest.mark.parametrize("handler_cls", HANDLER_CLASSES)
+def test_lost_savepoint_resets_the_aborted_transaction(handler_cls):
+    """Another thread committed on the shared connection between SAVEPOINT and RELEASE."""
+    handler = _handler(handler_cls, TransactionStatus.INTRANS, fail_load=False)
+
+    def execute(statement, *args):
+        if isinstance(statement, str) and statement.startswith(("RELEASE", "ROLLBACK TO")):
+            handler.db.info.transaction_status = TransactionStatus.INERROR
+            raise RuntimeError('savepoint "partitioncache_load_sql" does not exist')
+
+    handler.cursor.execute.side_effect = execute
+
+    handler._load_sql_functions()
+
+    assert _statements(handler)[-1] == "ROLLBACK TO SAVEPOINT partitioncache_load_sql"
+    # Returning with an aborted transaction would make every later write on the connection fail
+    handler.db.rollback.assert_called_once_with()
