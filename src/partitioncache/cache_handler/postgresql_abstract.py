@@ -125,16 +125,21 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
         """
         if self.db.info.transaction_status != TransactionStatus.IDLE:
             logger.debug("DDL lock taken inside an open transaction; lock order is not guaranteed")
-        self.cursor.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (self.tableprefix,))
+        self._take_ddl_lock()
         yield
+
+    def _take_ddl_lock(self) -> None:
+        """Take this prefix's transaction-scoped DDL advisory lock (see _serialized_ddl)."""
+        self.cursor.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (self.tableprefix,))
 
     def _load_sql_functions(self) -> None:
         """Load the SQL functions from postgresql_cache_handlers.sql.
 
-        Usually called inside _serialized_ddl, where the advisory lock belongs to the open
-        transaction. A plain rollback after a failed load would end that transaction and
-        release the lock, so the DDL that follows would run unserialized. Inside a
-        transaction the load therefore runs under a savepoint and only the load is undone.
+        Usually called as the first statement inside _serialized_ddl, where the advisory
+        lock belongs to the open transaction. A failed load aborts that transaction, and the
+        rollback that clears it also releases the lock, so the lock is taken again before
+        the DDL that follows. No savepoint is used: handlers may share one connection
+        across threads, and another thread's commit destroys a savepoint in between.
         """
         sql_cache_file = Path(__file__).parent / "postgresql_cache_handlers.sql"
         if not sql_cache_file.exists():
@@ -143,31 +148,18 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
 
         in_transaction = self.db.info.transaction_status == TransactionStatus.INTRANS
         try:
-            if in_transaction:
-                self.cursor.execute("SAVEPOINT partitioncache_load_sql")
             self.cursor.execute(sql_cache_file.read_text())  # type: ignore[arg-type]
-            if in_transaction:
-                self.cursor.execute("RELEASE SAVEPOINT partitioncache_load_sql")
             logger.debug("Successfully loaded SQL functions from cache handlers file")
         except Exception as e:
             logger.warning(f"Failed to load SQL functions (this is OK if they're already loaded): {e}")
             # Continuing on an aborted transaction makes every later statement fail with
             # "current transaction is aborted", which hides the real error behind it.
-            if in_transaction:
-                try:
-                    self.cursor.execute("ROLLBACK TO SAVEPOINT partitioncache_load_sql")
-                except Exception:
-                    logger.debug("rollback to savepoint after SQL function load failed", exc_info=True)
-            if not in_transaction or self.db.info.transaction_status == TransactionStatus.INERROR:
-                # The savepoint is gone when another thread committed on this shared connection
-                # in between; that commit already released the advisory lock. Never return with
-                # an aborted transaction, or every later statement on the connection fails.
+            try:
+                self.db.rollback()
                 if in_transaction:
-                    logger.warning("Savepoint for the SQL function load was lost; resetting the transaction")
-                try:
-                    self.db.rollback()
-                except Exception:
-                    logger.debug("rollback after SQL function load failed", exc_info=True)
+                    self._take_ddl_lock()  # the rollback released the caller's DDL lock
+            except Exception:
+                logger.debug("rollback after SQL function load failed", exc_info=True)
 
     @contextmanager
     def _read_txn(self):

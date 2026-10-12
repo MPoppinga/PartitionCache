@@ -1,8 +1,8 @@
 """Tests for PostgreSQLAbstractCacheHandler._load_sql_functions.
 
 The loader usually runs inside _serialized_ddl, whose advisory lock lives as long as the
-transaction. A failed load must not end that transaction, or the DDL after it runs
-without the lock.
+transaction. A failed load must leave the connection usable and the lock held, without
+any extra statements on the success path (handlers may share a connection across threads).
 """
 
 from unittest.mock import MagicMock
@@ -14,6 +14,7 @@ from partitioncache.cache_handler.postgresql_array import PostgreSQLArrayCacheHa
 from partitioncache.cache_handler.postgresql_bit import PostgreSQLBitCacheHandler
 from partitioncache.cache_handler.postgresql_roaringbit import PostgreSQLRoaringBitCacheHandler
 
+LOCK_SQL = "SELECT pg_advisory_xact_lock(hashtext(%s))"
 HANDLER_CLASSES = [PostgreSQLArrayCacheHandler, PostgreSQLBitCacheHandler, PostgreSQLRoaringBitCacheHandler]
 
 
@@ -24,8 +25,7 @@ def _handler(handler_cls, transaction_status, fail_load):
     handler.cursor = MagicMock()
 
     def execute(statement, *args):
-        is_control = isinstance(statement, str) and statement.split()[0] in ("SAVEPOINT", "RELEASE", "ROLLBACK")
-        if fail_load and not is_control:
+        if fail_load and statement != LOCK_SQL:
             raise RuntimeError("function load failed")
 
     handler.cursor.execute.side_effect = execute
@@ -37,28 +37,26 @@ def _statements(handler):
 
 
 @pytest.mark.parametrize("handler_cls", HANDLER_CLASSES)
-def test_failed_load_inside_transaction_rolls_back_to_savepoint_only(handler_cls):
+def test_failed_load_inside_transaction_retakes_the_ddl_lock(handler_cls):
     handler = _handler(handler_cls, TransactionStatus.INTRANS, fail_load=True)
+    handler.tableprefix = "pc"
 
     handler._load_sql_functions()
 
-    statements = _statements(handler)
-    assert statements[0] == "SAVEPOINT partitioncache_load_sql"
-    assert statements[-1] == "ROLLBACK TO SAVEPOINT partitioncache_load_sql"
-    # A full rollback would release the advisory lock held by the transaction
-    handler.db.rollback.assert_not_called()
+    handler.db.rollback.assert_called_once_with()
+    # The rollback released the caller's advisory lock; the DDL after the load needs it again
+    assert handler.cursor.execute.call_args_list[-1].args == (LOCK_SQL, ("pc",))
+    assert len(_statements(handler)) == 2
 
 
 @pytest.mark.parametrize("handler_cls", HANDLER_CLASSES)
-def test_successful_load_inside_transaction_releases_savepoint(handler_cls):
+def test_successful_load_inside_transaction_runs_only_the_file(handler_cls):
     handler = _handler(handler_cls, TransactionStatus.INTRANS, fail_load=False)
 
     handler._load_sql_functions()
 
-    statements = _statements(handler)
-    assert statements[0] == "SAVEPOINT partitioncache_load_sql"
-    assert statements[-1] == "RELEASE SAVEPOINT partitioncache_load_sql"
-    assert len(statements) == 3
+    # No savepoint: another thread's commit on a shared connection would destroy it
+    assert len(_statements(handler)) == 1
     handler.db.rollback.assert_not_called()
 
 
@@ -67,24 +65,16 @@ def test_failed_load_outside_transaction_rolls_back():
 
     handler._load_sql_functions()
 
-    assert len(_statements(handler)) == 1  # no savepoint without a transaction to protect
+    assert len(_statements(handler)) == 1  # no lock to retake outside a transaction
     handler.db.rollback.assert_called_once_with()
 
 
 @pytest.mark.parametrize("handler_cls", HANDLER_CLASSES)
-def test_lost_savepoint_resets_the_aborted_transaction(handler_cls):
-    """Another thread committed on the shared connection between SAVEPOINT and RELEASE."""
-    handler = _handler(handler_cls, TransactionStatus.INTRANS, fail_load=False)
+def test_serialized_ddl_and_retake_use_the_same_lock(handler_cls):
+    handler = _handler(handler_cls, TransactionStatus.IDLE, fail_load=False)
+    handler.tableprefix = "pc"
 
-    def execute(statement, *args):
-        if isinstance(statement, str) and statement.startswith(("RELEASE", "ROLLBACK TO")):
-            handler.db.info.transaction_status = TransactionStatus.INERROR
-            raise RuntimeError('savepoint "partitioncache_load_sql" does not exist')
+    with handler._serialized_ddl():
+        pass
 
-    handler.cursor.execute.side_effect = execute
-
-    handler._load_sql_functions()
-
-    assert _statements(handler)[-1] == "ROLLBACK TO SAVEPOINT partitioncache_load_sql"
-    # Returning with an aborted transaction would make every later write on the connection fail
-    handler.db.rollback.assert_called_once_with()
+    assert handler.cursor.execute.call_args_list[-1].args == (LOCK_SQL, ("pc",))
