@@ -444,6 +444,30 @@ def _is_partition_key_fk_join(condition: str, partition_key: str, table_aliases:
         return False
 
 
+def _is_inequality_condition(condition: str) -> bool:
+    """Check whether a condition is a plain inequality such as ``p1.id <> p2.id``.
+
+    Such conditions only keep two aliases from binding the same row and restrict
+    almost nothing. They stay in every fragment that contains both aliases but
+    must not connect the aliases in the join graph; otherwise pairwise ``<>``
+    makes the graph complete and adds fragments that are cross products.
+
+    Args:
+        condition: A single conjunctive condition (SQL text).
+
+    Returns:
+        True for a top-level ``<>`` / ``!=`` comparison, False otherwise (including
+        on parse errors).
+    """
+    try:
+        parsed = sqlglot.parse_one(condition)
+        if isinstance(parsed, exp.Paren):
+            parsed = parsed.this
+        return isinstance(parsed, exp.NEQ)
+    except Exception:
+        return False
+
+
 def _detect_pk_bearing_aliases(
     table_aliases: list[str],
     partition_key: str,
@@ -1133,9 +1157,13 @@ def generate_partial_queries(
     else:
         distance_conditions_filtered = distance_conditions
 
+    # Pairs related only by inequalities (p1.id <> p2.id) are not graph edges; their
+    # conditions are still added to every fragment that contains both aliases.
+    join_graph_edges = [pair for pair, conds in distance_conditions_filtered.items() if not all(_is_inequality_condition(c) for c in conds)]
+
     # Get all possible combinations of tables (grouped by number of tables in the tuple)
     query_combinations = generate_tuples(
-        list(distance_conditions_filtered.keys()),
+        join_graph_edges,
         aliases_for_variants,
         min_component_size,
         follow_graph,
