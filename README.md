@@ -93,6 +93,31 @@ print(f"Cache hits: {stats['cache_hits']}/{stats['generated_variants']}")
 
 ```
 
+### Programmatic Cache Population
+
+Populate the cache using PartitionCache's query decomposition and hash generation directly from Python:
+
+```python
+import psycopg
+import partitioncache
+
+cache = partitioncache.create_cache_helper("postgresql_array", "city_id", "integer")
+conn = psycopg.connect("postgresql://user:pass@localhost/mydb")
+
+query = "SELECT DISTINCT city_id FROM restaurants WHERE rating > 4.0 AND cuisine = 'italian'"
+
+# Decompose query into fragments, execute each, and store results
+for fragment_query, query_hash in partitioncache.generate_all_query_hash_pairs(query, partition_key="city_id"):
+    if not cache.exists(query_hash):
+        result = {row[0] for row in conn.execute(fragment_query).fetchall()}
+        cache.set_entry(query_hash, result, fragment_query)
+
+# Future queries are now automatically optimized
+enhanced_query, stats = partitioncache.apply_cache_lazy(
+    query=query, cache_handler=cache.underlying_handler, partition_key="city_id"
+)
+```
+
 ## Cache Backend Selection
 
 | Backend | Datatypes | Use Case |

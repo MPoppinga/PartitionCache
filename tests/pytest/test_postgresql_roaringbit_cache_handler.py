@@ -2,9 +2,23 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from bitarray import bitarray
+from psycopg import sql as psycopg_sql
 from pyroaring import BitMap
 
 from partitioncache.cache_handler.postgresql_roaringbit import PostgreSQLRoaringBitCacheHandler
+
+
+def _get_sql_calls(mock_cursor):
+    """Extract only psycopg sql.SQL/Composed calls (not raw string SQL file loads).
+
+    Returns a list of (sql_string, call) tuples for calls using psycopg sql objects.
+    """
+    results = []
+    for call in mock_cursor.execute.call_args_list:
+        arg = call[0][0]
+        if isinstance(arg, psycopg_sql.SQL | psycopg_sql.Composed):
+            results.append((str(arg), call))
+    return results
 
 
 class TestPostgreSQLRoaringBitCacheHandler:
@@ -61,20 +75,24 @@ class TestPostgreSQLRoaringBitCacheHandler:
 
         assert result is True
 
-        # Verify the INSERT was called
-        assert mock_cursor.execute.call_count >= 1
+        # Filter to only psycopg sql.SQL/Composed calls (excludes raw SQL file loads)
+        sql_calls = _get_sql_calls(mock_cursor)
 
-        # Check that a roaring bitmap was created and serialized
-        insert_call = None
-        for call in mock_cursor.execute.call_args_list:
-            if "INSERT INTO" in str(call[0][0]):
-                insert_call = call
-                break
+        # Verify that an INSERT into the correct cache table was called with rb_build
+        insert_cache_calls = [(s, c) for s, c in sql_calls if "INSERT INTO" in s and "rb_build" in s]
+        assert len(insert_cache_calls) == 1, "Expected exactly one INSERT with rb_build for the cache table"
+        insert_sql_str, insert_cache_call = insert_cache_calls[0]
+        assert "test_roaringbit_cache_cache_test_partition" in insert_sql_str, (
+            f"INSERT should target test_roaringbit_cache_cache_test_partition, got: {insert_sql_str}"
+        )
+        # Verify the key is passed as the first parameter
+        assert insert_cache_call[0][1][0] == "test_key", (
+            f"First parameter should be 'test_key', got: {insert_cache_call[0][1][0]}"
+        )
 
-        assert insert_call is not None
-        # Check that test_key is in the parameters (second element of the call)
-        if len(insert_call) > 1 and len(insert_call[1]) > 0:
-            assert "test_key" in str(insert_call[1][0])
+        # Verify that an INSERT into the queries table was also called
+        insert_queries_calls = [(s, c) for s, c in sql_calls if "INSERT INTO" in s and "queries" in s]
+        assert len(insert_queries_calls) == 1, "Expected exactly one INSERT for the queries table"
 
     def test_set_cache_with_string_integers(self, cache_handler, mock_cursor):
         """Test setting a set of string integers."""
@@ -219,8 +237,25 @@ class TestPostgreSQLRoaringBitCacheHandler:
 
         cache_handler.register_partition_key("new_partition", "integer")
 
-        # Should have called table creation and metadata insertion
-        assert mock_cursor.execute.call_count >= 3
+        # register_partition_key delegates to _ensure_partition_table, which calls:
+        # 1. _load_sql_functions (raw SQL file content, not a psycopg sql object)
+        # 2. SELECT partitioncache_ensure_metadata_tables(...)
+        # 3. SELECT partitioncache_bootstrap_partition(...)
+        sql_calls = _get_sql_calls(mock_cursor)
+
+        # Verify ensure_metadata_tables was called
+        ensure_metadata_calls = [(s, c) for s, c in sql_calls if "partitioncache_ensure_metadata_tables" in s]
+        assert len(ensure_metadata_calls) == 1, (
+            f"Expected one ensure_metadata_tables call, got {len(ensure_metadata_calls)}"
+        )
+
+        # Verify bootstrap_partition was called with correct parameters
+        bootstrap_calls = [(s, c) for s, c in sql_calls if "partitioncache_bootstrap_partition" in s]
+        assert len(bootstrap_calls) == 1, "Expected one bootstrap_partition call"
+        bootstrap_params = bootstrap_calls[0][1][0][1]
+        assert bootstrap_params[1] == "new_partition", f"Bootstrap should reference 'new_partition', got: {bootstrap_params[1]}"
+        assert bootstrap_params[2] == "integer", f"Bootstrap datatype should be 'integer', got: {bootstrap_params[2]}"
+        assert bootstrap_params[3] == "roaringbit", f"Bootstrap handler type should be 'roaringbit', got: {bootstrap_params[3]}"
 
     def test_register_partition_key_invalid_datatype(self, cache_handler):
         """Test registering with invalid datatype raises error."""
@@ -260,19 +295,29 @@ class TestPostgreSQLRoaringBitCacheHandler:
 
     def test_create_partition_table(self, cache_handler, mock_cursor):
         """Test partition table creation."""
+        # Mock extension check returns True
+        mock_cursor.fetchone.return_value = (1,)
+
         cache_handler._create_partition_table("test_partition")
 
-        # Should have called CREATE TABLE and INSERT
-        assert mock_cursor.execute.call_count >= 2
+        sql_calls = [str(call[0][0]) for call in mock_cursor.execute.call_args_list]
 
-        # Check that roaringbitmap type is used
-        create_table_call = None
-        for call in mock_cursor.execute.call_args_list:
-            if "CREATE TABLE" in str(call[0][0]) and "roaringbitmap" in str(call[0][0]):
-                create_table_call = call
-                break
+        # Verify extension check was performed
+        extension_checks = [s for s in sql_calls if "pg_extension" in s and "roaringbitmap" in s]
+        assert len(extension_checks) == 1, "Should check for roaringbitmap extension"
 
-        assert create_table_call is not None
+        # Verify CREATE TABLE with roaringbitmap type and correct table name
+        create_table_calls = [s for s in sql_calls if "CREATE TABLE" in s]
+        assert len(create_table_calls) == 1, f"Expected exactly one CREATE TABLE call, got {len(create_table_calls)}"
+        create_sql = create_table_calls[0]
+        assert "roaringbitmap" in create_sql, "CREATE TABLE should use roaringbitmap type"
+        assert "test_roaringbit_cache_cache_test_partition" in create_sql, (
+            f"CREATE TABLE should target test_roaringbit_cache_cache_test_partition, got: {create_sql}"
+        )
+
+        # Verify metadata INSERT into partition_metadata table
+        metadata_inserts = [s for s in sql_calls if "INSERT INTO" in s and "partition_metadata" in s]
+        assert len(metadata_inserts) == 1, "Should insert into partition_metadata table"
 
     def test_ensure_partition_table_new_partition(self, cache_handler, mock_cursor):
         """Test ensuring partition table for new partition."""
@@ -281,8 +326,19 @@ class TestPostgreSQLRoaringBitCacheHandler:
 
         cache_handler._ensure_partition_table("new_partition", "integer")
 
-        # Should have created the table (metadata check + extension check + create table)
-        assert mock_cursor.execute.call_count >= 3
+        # Filter to only psycopg sql.SQL/Composed calls (excludes raw SQL file loads)
+        sql_calls = _get_sql_calls(mock_cursor)
+
+        # Verify ensure_metadata_tables was called
+        ensure_metadata_calls = [(s, c) for s, c in sql_calls if "partitioncache_ensure_metadata_tables" in s]
+        assert len(ensure_metadata_calls) == 1, "Should call partitioncache_ensure_metadata_tables"
+
+        # Verify bootstrap_partition was called with correct parameters
+        bootstrap_calls = [(s, c) for s, c in sql_calls if "partitioncache_bootstrap_partition" in s]
+        assert len(bootstrap_calls) == 1, "Should call partitioncache_bootstrap_partition"
+        bootstrap_params = bootstrap_calls[0][1][0][1]
+        assert bootstrap_params[1] == "new_partition", f"Should reference 'new_partition', got: {bootstrap_params[1]}"
+        assert bootstrap_params[2] == "integer", f"Datatype should be 'integer', got: {bootstrap_params[2]}"
 
     def test_ensure_partition_table_existing_partition(self, cache_handler, mock_cursor):
         """Test ensuring partition table for existing partition."""
@@ -294,15 +350,18 @@ class TestPostgreSQLRoaringBitCacheHandler:
 
         cache_handler._ensure_partition_table("existing_partition", "integer")
 
-        # Should call SQL bootstrap functions
-        assert mock_cursor.execute.call_count >= 1
+        # Filter to only psycopg sql.SQL/Composed calls (excludes raw SQL file loads)
+        sql_calls = _get_sql_calls(mock_cursor)
 
-        # Find the bootstrap function call
-        bootstrap_call_found = False
-        for call in mock_cursor.execute.call_args_list:
-            call_sql = str(call[0][0])
-            if "partitioncache_bootstrap_partition" in call_sql:
-                bootstrap_call_found = True
-                break
+        # Verify ensure_metadata_tables was called
+        ensure_metadata_calls = [(s, c) for s, c in sql_calls if "partitioncache_ensure_metadata_tables" in s]
+        assert len(ensure_metadata_calls) == 1, "Should call partitioncache_ensure_metadata_tables"
 
-        assert bootstrap_call_found, "Should have called bootstrap function"
+        # Verify bootstrap_partition was called with correct parameters
+        bootstrap_calls = [(s, c) for s, c in sql_calls if "partitioncache_bootstrap_partition" in s]
+        assert len(bootstrap_calls) == 1, "Should call partitioncache_bootstrap_partition"
+        bootstrap_params = bootstrap_calls[0][1][0][1]
+        assert bootstrap_params[0] == "test_roaringbit_cache", f"Should use prefix 'test_roaringbit_cache', got: {bootstrap_params[0]}"
+        assert bootstrap_params[1] == "existing_partition", f"Should reference 'existing_partition', got: {bootstrap_params[1]}"
+        assert bootstrap_params[2] == "integer", f"Datatype should be 'integer', got: {bootstrap_params[2]}"
+        assert bootstrap_params[3] == "roaringbit", f"Handler type should be 'roaringbit', got: {bootstrap_params[3]}"

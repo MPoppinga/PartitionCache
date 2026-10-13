@@ -126,7 +126,7 @@ status_log_interval = 10  # Log status every 10 seconds when idle
 
 
 def query_fragment_processor(args, constraint_args):
-    """Thread function that processes original queries into fragments and pushes to query fragment queue.
+    """Thread function that decomposes and recomposes original queries into query variants and pushes them to the variant queue.
 
     Args:
         args: Command line arguments
@@ -150,28 +150,30 @@ def query_fragment_processor(args, constraint_args):
                 continue  # Timeout occurred, check exit event and try again
 
             query, partition_key, partition_datatype = query_result
-            logger.debug(f"Processing original query into fragments for partition_key: {partition_key} (datatype: {partition_datatype})")
+            logger.debug(f"Processing original query into query variants for partition_key: {partition_key} (datatype: {partition_datatype})")
 
             # Detect spatial mode and resolve geometry column from handler
             is_spatial = partition_datatype == "geometry"
+            resolved_backend = resolve_cache_backend(args) if is_spatial else None
             geometry_column = None
-            if is_spatial:
+            if resolved_backend is not None:
                 try:
-                    spatial_cache_handler = get_cache_handler(resolve_cache_backend(args), singleton=True)
+                    spatial_cache_handler = get_cache_handler(resolved_backend, singleton=True)
                     geometry_column = getattr(spatial_cache_handler, "geometry_column", "geom")
-                except Exception:
+                except Exception as e:
+                    logger.debug("Could not resolve geometry column from cache handler, using default 'geom': %s", e)
                     geometry_column = "geom"
 
-            # Process the query into fragments using the partition_key from queue
+            # Process the query into query variants using the partition_key from queue
             query_hash_pairs = generate_all_query_hash_pairs(
                 query,
                 partition_key,
                 min_component_size=args.min_component_size,
                 follow_graph=args.follow_graph,
                 keep_all_attributes=True,
-                auto_detect_star_join=not args.no_auto_detect_star_join,
+                auto_detect_partition_join=not args.no_auto_detect_partition_join,
                 max_component_size=args.max_component_size,
-                star_join_table=args.star_join_table,
+                partition_join_table=args.partition_join_table,
                 warn_no_partition_key=not args.no_warn_partition_key,
                 bucket_steps=args.bucket_steps,
                 add_constraints=add_constraints,
@@ -179,15 +181,18 @@ def query_fragment_processor(args, constraint_args):
                 remove_constraints_add=remove_constraints_add,
                 skip_partition_key_joins=is_spatial,
                 geometry_column=geometry_column,
+                max_conditions_removed=args.max_conditions_removed,
             )
-            logger.debug(f"Generated {len(query_hash_pairs)} fragments from original query")
+            logger.debug(f"Generated {len(query_hash_pairs)} query variants from original query")
 
-            # Push fragments to query fragment queue using the partition_key and datatype from queue
-            success = push_to_query_fragment_queue(query_hash_pairs, partition_key, partition_datatype)
+            # Push variants to the variant queue using the partition_key and datatype from queue
+            # For spatial queries, resolve and pass cache_backend so the processor knows which handler to use
+            queue_cache_backend = resolved_backend
+            success = push_to_query_fragment_queue(query_hash_pairs, partition_key, partition_datatype, cache_backend=queue_cache_backend)
             if success:
-                logger.debug(f"Pushed {len(query_hash_pairs)} fragments to query fragment queue")
+                logger.debug(f"Pushed {len(query_hash_pairs)} query variants to the variant queue")
             else:
-                logger.error("Error pushing fragments to query fragment queue")
+                logger.error("Error pushing query variants to the variant queue")
 
         except Exception as e:
             logger.error(f"Error in query fragment processor: {e}")
@@ -271,7 +276,8 @@ def apply_cache_optimization(query: str, query_hash: str, partition_key: str, pa
             stats["total_hashes"] = total_hashes
             stats["cache_hits"] = hits
 
-            if hits >= args.min_cache_hits and partition_keys:
+            # An empty set is a valid result (the query has no rows); extend_query_with_partition_keys handles it
+            if hits >= args.min_cache_hits and partition_keys is not None:
                 method = args.cache_optimization_method
                 stats["method_used"] = method
 
@@ -296,7 +302,7 @@ def apply_cache_optimization(query: str, query_hash: str, partition_key: str, pa
     return query, False, stats
 
 
-def run_and_store_query(query: str, query_hash: str, partition_key: str, partition_datatype: str | None = None):
+def run_and_store_query(query: str, query_hash: str, partition_key: str, partition_datatype: str | None = None, item_cache_backend: str | None = None):
     """Worker function to execute and store a query."""
     logger.info(f"WORKER THREAD START: Processing query {query_hash}")
 
@@ -307,7 +313,7 @@ def run_and_store_query(query: str, query_hash: str, partition_key: str, partiti
     success = False
 
     try:
-        cache_backend = resolve_cache_backend(args)
+        cache_backend = item_cache_backend or resolve_cache_backend(args)
         cache_handler = get_cache_handler(cache_backend, singleton=True)
         logger.info(f"Got cache handler for {query_hash}")
 
@@ -350,16 +356,17 @@ def run_and_store_query(query: str, query_hash: str, partition_key: str, partiti
             logger.info(f"EXECUTING LAZY INSERTION: Calling set_entry_lazy for {query_hash}")
             t = time.perf_counter()
             try:
-                if isinstance(cache_handler, AbstractCacheHandler_Lazy):
-                    lazy_success = cache_handler.set_entry_lazy(original_hash, query_to_execute, original_query, partition_key)
-                    execution_time = time.perf_counter() - t
-                    if lazy_success:
-                        logger.info(f"✅ LAZY INSERTION SUCCESS: Lazily stored {original_hash} in cache in {execution_time:.3f}s")
-                        log_query_time(query_hash, execution_time)
-                        success = True
-                    else:
-                        logger.warning(f"⚠️ LAZY INSERTION FAILED: Lazy insertion failed for {original_hash}, falling back to traditional method")
-                        log_query_time(f"{query_hash}_lazy_failed", execution_time)
+                # Not an isinstance check on AbstractCacheHandler_Lazy: rocksdict_h3_grouped
+                # populates lazily without offering lazy intersection (see hasattr above).
+                lazy_success = cache_handler.set_entry_lazy(original_hash, query_to_execute, original_query, partition_key)  # type: ignore[attr-defined]
+                execution_time = time.perf_counter() - t
+                if lazy_success:
+                    logger.info(f"✅ LAZY INSERTION SUCCESS: Lazily stored {original_hash} in cache in {execution_time:.3f}s")
+                    log_query_time(query_hash, execution_time)
+                    success = True
+                else:
+                    logger.warning(f"⚠️ LAZY INSERTION FAILED: Lazy insertion failed for {original_hash}, falling back to traditional method")
+                    log_query_time(f"{query_hash}_lazy_failed", execution_time)
             except psycopg.OperationalError as e:
                 execution_time = time.perf_counter() - t
                 if "statement timeout" in str(e) or "query_canceled" in str(e):
@@ -445,8 +452,14 @@ def run_and_store_query(query: str, query_hash: str, partition_key: str, partiti
     except Exception as e:
         logger.error(f"WORKER THREAD EXCEPTION: Error processing query {query_hash}: {str(e)}", exc_info=True)
         if cache_handler and "current transaction is aborted" in str(e):
+            # The connection attribute is `db`. `_connection` exists on no handler, so this
+            # recovery never actually ran: the connection stayed aborted and every later
+            # statement on it failed too, including the set_query_status("failed") above --
+            # which is why a failed fragment could leave no trace in the queries table.
+            connection = getattr(cache_handler, "db", None)
             try:
-                cache_handler._connection.rollback()
+                if connection is not None:
+                    connection.rollback()
             except Exception as rollback_error:
                 logger.warning(f"Failed to rollback transaction for {query_hash}: {rollback_error}")
 
@@ -485,7 +498,7 @@ def get_timeout_for_state(can_consume, exit_event_set, error_count=0):
 
 
 def fragment_executor():
-    """Thread pool function that processes fragments from the fragment queue."""
+    """Thread pool function that executes query variants from the variant queue."""
     global pool, last_status_log_time
 
     # Initialize cache handler for the main process
@@ -609,8 +622,8 @@ def fragment_executor():
                         # No more jobs available or timeout
                         break
 
-                    query, hash_value, partition_key, partition_datatype = fragment_result
-                    logger.debug(f"Found fragment in fragment queue: {hash_value}")
+                    query, hash_value, partition_key, partition_datatype, item_cache_backend = fragment_result
+                    logger.debug(f"Found query variant in variant queue: {hash_value}")
 
                     # Check if already in cache (unless force-recalculate)
                     if not args.force_recalculate and main_cache_handler.exists(hash_value, partition_key, check_query=False):
@@ -628,7 +641,7 @@ def fragment_executor():
 
                     # Submit the job
                     with status_lock:
-                        future = pool.submit(run_and_store_query, query, hash_value, partition_key, partition_datatype)
+                        future = pool.submit(run_and_store_query, query, hash_value, partition_key, partition_datatype, item_cache_backend)
                         active_futures[future] = hash_value
                         logger.info(f"Submitted to threadpool: {hash_value} (active: {len(active_futures)})")
 
@@ -700,10 +713,10 @@ def main():
     # Cache optimization configuration
     optimization_group = parser.add_argument_group("cache optimization options")
     optimization_group.add_argument(
-        "--enable-cache-optimization", action="store_true", default=True, help="Enable cache-aware optimization for fragment queries"
+        "--enable-cache-optimization", action="store_true", default=True, help="Enable cache-aware optimization for variant queries"
     )
     optimization_group.add_argument(
-        "--disable-cache-optimization", action="store_true", default=False, help="Disable cache-aware optimization for fragment queries"
+        "--disable-cache-optimization", action="store_true", default=False, help="Disable cache-aware optimization for variant queries"
     )
     optimization_group.add_argument(
         "--cache-optimization-method",
@@ -834,8 +847,8 @@ def main():
                 query_accelerator = None
 
     logger.info("Starting two-threaded queue monitoring system:")
-    logger.info("- Thread 1: Process original queries into fragments")
-    logger.info("- Thread 2: Execute fragments from query fragment queue with enhanced consumption control")
+    logger.info("- Thread 1: Decompose/recompose original queries into query variants")
+    logger.info("- Thread 2: Execute query variants from the variant queue with enhanced consumption control")
     logger.info("- Partition keys are read from the queue instead of command line arguments")
     logger.info(f"- Configuration: max_processes={args.max_processes}")
     logger.info(f"- Queue provider: {provider}, Cache backend: {args.cache_backend}")
