@@ -39,33 +39,15 @@ class PostgreSQLArrayCacheHandler(PostgreSQLAbstractCacheHandler):
             if self.db.closed is False:
                 self.db.rollback()
 
-    def _load_sql_functions(self) -> None:
-        """Load SQL functions from the cache handlers SQL file."""
-        try:
-            from pathlib import Path
-
-            # Get the SQL file path for cache handlers
-            sql_cache_file = Path(__file__).parent / "postgresql_cache_handlers.sql"
-
-            if not sql_cache_file.exists():
-                logger.warning(f"SQL cache handlers file not found at {sql_cache_file}")
-                return
-
-            # Read and execute the SQL file
-            sql_cache_content = sql_cache_file.read_text()
-            self.cursor.execute(sql_cache_content)  # type: ignore[arg-type]
-            logger.debug("Successfully loaded SQL functions from cache handlers file")
-        except Exception as e:
-            logger.debug(f"Failed to load SQL functions (this is OK if they're already loaded): {e}")
-
     def _create_partition_table(self, partition_key: str, datatype: str) -> None:
         """Create a cache table for a specific partition key using SQL bootstrap function."""
         try:
-            # Use SQL bootstrap function to create partition table and metadata entry
-            self.cursor.execute(
-                sql.SQL("SELECT partitioncache_bootstrap_partition(%s, %s, %s, %s)"),
-                (self.tableprefix, partition_key, datatype, "array")
-            )
+            with self._serialized_ddl():
+                # Use SQL bootstrap function to create partition table and metadata entry
+                self.cursor.execute(
+                    sql.SQL("SELECT partitioncache_bootstrap_partition(%s, %s, %s, %s)"),
+                    (self.tableprefix, partition_key, datatype, "array")
+                )
             self.db.commit()
         except Exception as e:
             logger.error(f"Failed to create partition table for {partition_key}: {e}")
@@ -79,25 +61,26 @@ class PostgreSQLArrayCacheHandler(PostgreSQLAbstractCacheHandler):
     def _ensure_partition_table(self, partition_key: str, datatype: str, **kwargs):
         """Ensure a partition table exists with the correct datatype using SQL bootstrap function."""
         try:
-            # Load SQL functions first to ensure they're available
-            self._load_sql_functions()
+            with self._serialized_ddl():
+                # Load SQL functions first to ensure they're available
+                self._load_sql_functions()
 
-            # Use SQL bootstrap function to ensure metadata tables exist
-            self.cursor.execute(
-                sql.SQL("SELECT partitioncache_ensure_metadata_tables(%s)"),
-                (self.tableprefix,)
-            )
+                # Use SQL bootstrap function to ensure metadata tables exist
+                self.cursor.execute(
+                    sql.SQL("SELECT partitioncache_ensure_metadata_tables(%s)"),
+                    (self.tableprefix,)
+                )
 
-            # Check if partition already exists and validate datatype
-            existing_datatype = self._get_partition_datatype(partition_key)
-            if existing_datatype is not None and existing_datatype != datatype:
-                raise ValueError(f"Partition key '{partition_key}' already exists with datatype '{existing_datatype}', cannot use datatype '{datatype}'")
+                # Check if partition already exists and validate datatype
+                existing_datatype = self._get_partition_datatype(partition_key)
+                if existing_datatype is not None and existing_datatype != datatype:
+                    raise ValueError(f"Partition key '{partition_key}' already exists with datatype '{existing_datatype}', cannot use datatype '{datatype}'")
 
-            # Use SQL bootstrap function to create partition table and metadata entry
-            self.cursor.execute(
-                sql.SQL("SELECT partitioncache_bootstrap_partition(%s, %s, %s, %s)"),
-                (self.tableprefix, partition_key, datatype, "array")
-            )
+                # Use SQL bootstrap function to create partition table and metadata entry
+                self.cursor.execute(
+                    sql.SQL("SELECT partitioncache_bootstrap_partition(%s, %s, %s, %s)"),
+                    (self.tableprefix, partition_key, datatype, "array")
+                )
 
             self.db.commit()
             return True

@@ -2,6 +2,7 @@ from unittest.mock import Mock, patch
 
 import psycopg
 import pytest
+from psycopg import sql
 
 from partitioncache.cache_handler.postgresql_array import PostgreSQLArrayCacheHandler
 
@@ -46,9 +47,27 @@ def cache_handler(mock_db, mock_cursor):
 
 def test_set_cache(cache_handler):
     cache_handler.cursor.fetchone.side_effect = [("integer",)]
-    cache_handler.set_cache("key1", {1, 2, 3})
+    result = cache_handler.set_cache("key1", {1, 2, 3})
+    assert result is True
     assert cache_handler.cursor.execute.called
     cache_handler.db.commit.assert_called()
+
+    # Verify INSERT SQL with ON CONFLICT was issued with correct key and values
+    insert_found = False
+    for call in cache_handler.cursor.execute.call_args_list:
+        call_str = str(call)
+        if "INSERT INTO" in call_str and "ON CONFLICT" in call_str and "DO UPDATE SET" in call_str:
+            insert_found = True
+            # Verify the key parameter is passed
+            args = call[0]  # positional args to execute()
+            if len(args) > 1 and isinstance(args[1], tuple):
+                params = args[1]
+                assert params[0] == "key1", f"Expected key 'key1', got {params[0]}"
+                # The values should be a list of the set elements
+                assert isinstance(params[1], list), f"Expected list for values, got {type(params[1])}"
+                assert set(params[1]) == {1, 2, 3}, f"Expected {{1, 2, 3}}, got {set(params[1])}"
+            break
+    assert insert_found, "Expected INSERT INTO ... ON CONFLICT SQL statement not found"
 
 
 def test_set_cache_empty(cache_handler):
@@ -90,9 +109,42 @@ def test_get_str_type(cache_handler):
 
 
 def test_set_null(cache_handler):
-    cache_handler.cursor.fetchone.side_effect = [(None,)]
-    cache_handler.set_null("null_key")
-    assert cache_handler.cursor.execute.called
+    """Test set_null stores NULL partition_keys for a key when partition datatype is known."""
+    # Mock _get_partition_datatype to return a known datatype
+    cache_handler._get_partition_datatype = Mock(return_value="integer")
+    result = cache_handler.set_null("null_key")
+    assert result is True
+    cache_handler.db.commit.assert_called()
+
+    # Verify INSERT SQL with NULL was issued
+    insert_found = False
+    for call_args in cache_handler.cursor.execute.call_args_list:
+        call_str = str(call_args)
+        if "INSERT INTO" in call_str and "ON CONFLICT" in call_str:
+            insert_found = True
+            # Verify the key and NULL value are passed as parameters
+            args = call_args[0]
+            if len(args) > 1 and isinstance(args[1], tuple):
+                params = args[1]
+                assert params[0] == "null_key", f"Expected key 'null_key', got {params[0]}"
+                assert params[1] is None, f"Expected None for partition_keys, got {params[1]}"
+            break
+    assert insert_found, "Expected INSERT INTO ... ON CONFLICT SQL for set_null"
+
+
+def test_set_null_unknown_datatype(cache_handler):
+    """Test set_null returns False when partition datatype cannot be determined.
+
+    PostgreSQLArrayCacheHandler supports 4 datatypes, so when no datatype
+    is registered for the partition, it cannot auto-determine which to use.
+    """
+    cache_handler._get_partition_datatype = Mock(return_value=None)
+    result = cache_handler.set_null("null_key")
+    assert result is False
+    # Verify no INSERT was attempted
+    for call_args in cache_handler.cursor.execute.call_args_list:
+        call_str = str(call_args)
+        assert "INSERT" not in call_str, "INSERT should not be called when datatype is unknown"
 
 
 def test_is_null(cache_handler):
@@ -164,6 +216,16 @@ def test_get_intersected_lazy(cache_handler):
     assert isinstance(query, str)
     assert count == 2
 
+    # Verify the lazy SQL structure: should wrap intersection in SELECT unnest(...)
+    assert "unnest" in query.lower(), f"Expected 'unnest' in lazy query, got: {query}"
+    assert "partition_key" in query.lower(), f"Expected partition column reference in lazy query, got: {query}"
+    # Should reference the cache table
+    assert "test_cache_cache_partition_key" in query, f"Expected table name in lazy query, got: {query}"
+    # Should contain intersection logic (aggregate or fallback)
+    assert "array_intersect_agg" in query or "&" in query or "intersect" in query.lower(), (
+        f"Expected intersection logic in lazy query, got: {query}"
+    )
+
 
 def test_get_all_keys(cache_handler):
     # Mock the metadata query to return integer datatype
@@ -179,14 +241,33 @@ def test_get_all_keys(cache_handler):
 def test_delete(cache_handler):
     # Set up partition datatype
     cache_handler.cursor.fetchone.side_effect = [("integer",)]
-    cache_handler.delete("key_to_delete")
-    found = False
-    for call in cache_handler.cursor.execute.call_args_list:
-        if "DELETE" in str(call) and "key_to_delete" in str(call):
-            found = True
-            break
-    assert found
+    result = cache_handler.delete("key_to_delete")
+    assert result is True
     cache_handler.db.commit.assert_called()
+
+    # Verify DELETE SQL was issued with correct key parameter
+    delete_calls = []
+    for call in cache_handler.cursor.execute.call_args_list:
+        call_str = str(call)
+        if "DELETE FROM" in call_str:
+            delete_calls.append(call)
+
+    # Should have two DELETE calls: one from cache table, one from queries table
+    assert len(delete_calls) == 2, f"Expected 2 DELETE calls, got {len(delete_calls)}"
+
+    # First DELETE: from partition-specific cache table
+    cache_delete_str = str(delete_calls[0])
+    assert "DELETE FROM" in cache_delete_str
+    assert "query_hash" in cache_delete_str
+    cache_delete_params = delete_calls[0][0][1]  # (sql, params) -> params
+    assert cache_delete_params == ("key_to_delete",), f"Expected ('key_to_delete',), got {cache_delete_params}"
+
+    # Second DELETE: from queries table
+    queries_delete_str = str(delete_calls[1])
+    assert "DELETE FROM" in queries_delete_str
+    queries_delete_params = delete_calls[1][0][1]  # (sql, params) -> params
+    assert "key_to_delete" in queries_delete_params, f"Expected 'key_to_delete' in params, got {queries_delete_params}"
+    assert "partition_key" in queries_delete_params, f"Expected 'partition_key' in params, got {queries_delete_params}"
 
 
 def test_get_intersected_sql_aggregates():
@@ -218,12 +299,24 @@ def test_get_intersected_sql_fallback_integer():
     # Call the actual method
     query = PostgreSQLArrayCacheHandler.get_intersected_sql(handler, {"key1", "key2"}, "p1", "integer")
 
-    # Check the query structure without calling as_string
+    # Verify the query is a psycopg sql.Composed object
+    assert isinstance(query, sql.Composed), f"Expected sql.Composed, got {type(query)}"
+
+    # Check the query structure for integer-specific intersection
     query_str = str(query)
-    assert "Identifier('k0', 'partition_keys')" in query_str
-    assert "SQL(' & ')" in query_str
-    assert "Identifier('k1', 'partition_keys')" in query_str
-    assert "test_cache_cache_p1" in query_str
+    # Should reference the correct table
+    assert "test_cache_cache_p1" in query_str, f"Expected table name in query, got: {query_str}"
+    # Should use intarray & operator for integer intersection
+    assert " & " in query_str, f"Expected '&' operator for integer intersection, got: {query_str}"
+    # Should reference partition_keys from aliased subqueries
+    assert "partition_keys" in query_str, f"Expected 'partition_keys' column reference, got: {query_str}"
+    # Should reference both keys via subquery aliases
+    assert "k0" in query_str and "k1" in query_str, f"Expected subquery aliases k0, k1 in query, got: {query_str}"
+    # Should contain SELECT ... FROM structure
+    assert "SELECT" in query_str, f"Expected SELECT in query, got: {query_str}"
+    assert "query_hash" in query_str, f"Expected query_hash filter in query, got: {query_str}"
+    # Should NOT use aggregate function
+    assert "array_intersect_agg" not in query_str, f"Should not use aggregate in fallback mode, got: {query_str}"
 
 
 def test_get_intersected_sql_fallback_text():
@@ -237,11 +330,24 @@ def test_get_intersected_sql_fallback_text():
     # Call the actual method
     query = PostgreSQLArrayCacheHandler.get_intersected_sql(handler, {"key1", "key2"}, "p1", "text")
 
-    # Verify the query structure
+    # Verify the query is a psycopg sql.Composed object
+    assert isinstance(query, sql.Composed), f"Expected sql.Composed, got {type(query)}"
+
+    # Check the query structure for text-specific intersection
     query_str = str(query)
-    assert "unnest(" in query_str
-    assert "intersect" in query_str
-    assert "test_cache_cache_p1" in query_str
+    # Should reference the correct table
+    assert "test_cache_cache_p1" in query_str, f"Expected table name in query, got: {query_str}"
+    # Text intersection uses unnest + intersect pattern (not intarray & operator)
+    assert "unnest" in query_str.lower(), f"Expected 'unnest' for text intersection, got: {query_str}"
+    assert "intersect" in query_str.lower(), f"Expected 'intersect' for text intersection, got: {query_str}"
+    # Should reference partition_keys
+    assert "partition_keys" in query_str, f"Expected 'partition_keys' column reference, got: {query_str}"
+    # Should NOT use intarray & operator (that's integer-only)
+    assert " & " not in query_str, f"Text intersection should not use '&' operator, got: {query_str}"
+    # Should NOT use aggregate function
+    assert "array_intersect_agg" not in query_str, f"Should not use aggregate in fallback mode, got: {query_str}"
+    # Should contain query_hash filter
+    assert "query_hash" in query_str, f"Expected query_hash filter in query, got: {query_str}"
 
 
 def test_init_creates_extensions_and_aggregates():
@@ -256,9 +362,16 @@ def test_init_creates_extensions_and_aggregates():
         handler.cursor = mock_cursor
         handler.db = mock_db
 
-        # Just check that the handler was created and has the required attributes
+        # Verify required attributes exist with correct types
         assert hasattr(handler, "array_intersect_agg_available")
+        assert isinstance(handler.array_intersect_agg_available, bool), (
+            f"Expected bool for array_intersect_agg_available, got {type(handler.array_intersect_agg_available)}"
+        )
         assert hasattr(handler, "USE_AGGREGATES")
+        assert isinstance(handler.USE_AGGREGATES, bool), f"Expected bool for USE_AGGREGATES, got {type(handler.USE_AGGREGATES)}"
+        assert handler.USE_AGGREGATES is True, "USE_AGGREGATES should be True by default"
+        # Verify tableprefix was set correctly
+        assert handler.tableprefix == "test_prefix", f"Expected tableprefix 'test_prefix', got {handler.tableprefix}"
 
 
 
@@ -310,12 +423,21 @@ def test_set_cache_large_numbers(cache_handler):
     large_set = {1000000, 2000000, 3000000}
     cache_handler.cursor.fetchone.side_effect = [(None,)]  # No existing partition
     cache_handler.set_cache("large_key", large_set)
-    found = False
+
+    # Verify INSERT SQL was issued with correct key and large number values
+    insert_found = False
     for call in cache_handler.cursor.execute.call_args_list:
-        if "INSERT" in str(call) and "large_key" in str(call):
-            found = True
-            break
-    assert found
+        call_str = str(call)
+        if "INSERT INTO" in call_str and "ON CONFLICT" in call_str:
+            args = call[0]
+            if len(args) > 1 and isinstance(args[1], tuple) and len(args[1]) >= 2:
+                key_param, values_param = args[1][0], args[1][1]
+                if key_param == "large_key":
+                    insert_found = True
+                    assert isinstance(values_param, list), f"Expected list for values, got {type(values_param)}"
+                    assert set(values_param) == large_set, f"Expected {large_set}, got {set(values_param)}"
+                    break
+    assert insert_found, "Expected INSERT INTO ... ON CONFLICT SQL with 'large_key' not found"
 
 
 def test_get_very_large_set(cache_handler):
@@ -353,26 +475,47 @@ def test_get_all_keys_empty(cache_handler):
 def test_delete_non_existent_key(cache_handler):
     # Set up partition datatype
     cache_handler.cursor.fetchone.side_effect = [("integer",)]
-    cache_handler.delete("non_existent_key")
-    found = False
-    for call in cache_handler.cursor.execute.call_args_list:
-        if "DELETE" in str(call) and "non_existent_key" in str(call):
-            found = True
-            break
-    assert found
+    result = cache_handler.delete("non_existent_key")
+    assert result is True
     cache_handler.db.commit.assert_called()
+
+    # Verify DELETE SQL was issued with correct key parameter
+    delete_calls = []
+    for call in cache_handler.cursor.execute.call_args_list:
+        call_str = str(call)
+        if "DELETE FROM" in call_str:
+            delete_calls.append(call)
+
+    # Should have two DELETE calls: one from cache table, one from queries table
+    assert len(delete_calls) == 2, f"Expected 2 DELETE calls, got {len(delete_calls)}"
+
+    # Verify the key is passed as a parameter in the first DELETE
+    cache_delete_params = delete_calls[0][0][1]
+    assert cache_delete_params == ("non_existent_key",), f"Expected ('non_existent_key',), got {cache_delete_params}"
 
 
 def test_set_cache_update_existing(cache_handler):
     cache_handler.cursor.fetchone.side_effect = [("integer",)]
-    cache_handler.set_cache("existing_key", {4, 5, 6})
-    found = False
-    for call in cache_handler.cursor.execute.call_args_list:
-        if "INSERT" in str(call) and "existing_key" in str(call) and "ON CONFLICT" in str(call):
-            found = True
-            break
-    assert found
+    result = cache_handler.set_cache("existing_key", {4, 5, 6})
+    assert result is True
     cache_handler.db.commit.assert_called()
+
+    # Verify INSERT with ON CONFLICT DO UPDATE SET clause (upsert pattern)
+    insert_found = False
+    for call in cache_handler.cursor.execute.call_args_list:
+        call_str = str(call)
+        if "INSERT INTO" in call_str and "ON CONFLICT" in call_str and "DO UPDATE SET" in call_str:
+            args = call[0]
+            if len(args) > 1 and isinstance(args[1], tuple) and len(args[1]) >= 2:
+                key_param, values_param = args[1][0], args[1][1]
+                if key_param == "existing_key":
+                    insert_found = True
+                    # Verify the ON CONFLICT clause includes EXCLUDED reference for upsert
+                    assert "EXCLUDED" in call_str, f"Expected EXCLUDED in ON CONFLICT clause, got: {call_str}"
+                    assert isinstance(values_param, list), f"Expected list for values, got {type(values_param)}"
+                    assert set(values_param) == {4, 5, 6}, f"Expected {{4, 5, 6}}, got {set(values_param)}"
+                    break
+    assert insert_found, "Expected INSERT INTO ... ON CONFLICT ... DO UPDATE SET SQL with 'existing_key' not found"
 
 
 def test_database_connection_error():
@@ -385,21 +528,41 @@ def test_very_long_key(cache_handler):
     long_key = "x" * 1000
     cache_handler.cursor.fetchone.side_effect = [(None,)]
     cache_handler.set_cache(long_key, {1, 2, 3})
-    found = False
+
+    # Verify INSERT SQL was issued with the full long key and correct values
+    insert_found = False
     for call in cache_handler.cursor.execute.call_args_list:
-        if "INSERT" in str(call) and long_key in str(call):
-            found = True
-            break
-    assert found
+        call_str = str(call)
+        if "INSERT INTO" in call_str and "ON CONFLICT" in call_str:
+            args = call[0]
+            if len(args) > 1 and isinstance(args[1], tuple) and len(args[1]) >= 2:
+                key_param, values_param = args[1][0], args[1][1]
+                if key_param == long_key:
+                    insert_found = True
+                    assert len(key_param) == 1000, f"Expected key length 1000, got {len(key_param)}"
+                    assert isinstance(values_param, list), f"Expected list for values, got {type(values_param)}"
+                    assert set(values_param) == {1, 2, 3}, f"Expected {{1, 2, 3}}, got {set(values_param)}"
+                    break
+    assert insert_found, "Expected INSERT INTO ... ON CONFLICT SQL with long key not found"
 
 
 def test_unicode_key(cache_handler):
     unicode_key = "测试键"
     cache_handler.cursor.fetchone.side_effect = [(None,)]
     cache_handler.set_cache(unicode_key, {1, 2, 3})
-    found = False
+
+    # Verify INSERT SQL was issued with the unicode key and correct values
+    insert_found = False
     for call in cache_handler.cursor.execute.call_args_list:
-        if "INSERT" in str(call) and unicode_key in str(call):
-            found = True
-            break
-    assert found
+        call_str = str(call)
+        if "INSERT INTO" in call_str and "ON CONFLICT" in call_str:
+            args = call[0]
+            if len(args) > 1 and isinstance(args[1], tuple) and len(args[1]) >= 2:
+                key_param, values_param = args[1][0], args[1][1]
+                if key_param == unicode_key:
+                    insert_found = True
+                    assert key_param == "测试键", f"Expected unicode key '测试键', got {key_param}"
+                    assert isinstance(values_param, list), f"Expected list for values, got {type(values_param)}"
+                    assert set(values_param) == {1, 2, 3}, f"Expected {{1, 2, 3}}, got {set(values_param)}"
+                    break
+    assert insert_found, "Expected INSERT INTO ... ON CONFLICT SQL with unicode key not found"

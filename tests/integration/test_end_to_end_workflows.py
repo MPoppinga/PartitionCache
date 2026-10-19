@@ -119,9 +119,19 @@ def e2e_cache_client(db_session):
     """
     from partitioncache.cache_handler import get_cache_handler
 
+    # Keep cache handler DB_* env aligned with the active db_session to avoid
+    # test-order-dependent mismatches when other tests mutate process env vars.
+    db_info = db_session.info
+    os.environ["DB_HOST"] = db_info.host or os.getenv("DB_HOST", "localhost")
+    os.environ["DB_PORT"] = str(db_info.port)
+    os.environ["DB_USER"] = db_info.user or os.getenv("DB_USER", "integration_user")
+    os.environ["DB_NAME"] = db_info.dbname or os.getenv("DB_NAME", "partitioncache_integration")
+
     # Only use postgresql_array for E2E workflow tests
     cache_backend = "postgresql_array"
     cache_handler = get_cache_handler(cache_backend)
+    cache_handler.register_partition_key("zipcode", "integer")
+    cache_handler.register_partition_key("region", "text")
 
     yield cache_handler
 
@@ -225,17 +235,16 @@ class TestEndToEndWorkflows:
                 print(f"Enhanced query: {enhanced_query[:100]}...")
                 print(f"Stats: {stats}")
 
-                # Execute enhanced query (may be multiple statements)
-                with db_session.cursor() as cur:
-                    # Split multi-statement queries and execute them
-                    statements = [stmt.strip() for stmt in enhanced_query.split(";") if stmt.strip()]
-                    enhanced_results = []
+                # Execute enhanced query (may be multiple statements). The whole script must run in a
+                # single execute() call: TMP_TABLE_IN emits `CREATE TEMPORARY TABLE ... ON COMMIT DROP;
+                # ...; SELECT`, and PostgreSQL runs all statements of one execute() as a single implicit
+                # transaction so the temp table survives until the final SELECT. Splitting on ";" under
+                # autocommit would drop it right after CREATE. See PostgresDBHandler.fetch_final_result_set.
+                from partitioncache.db_handler.postgres import fetch_final_result_set
 
-                    for stmt in statements:
-                        cur.execute(stmt)
-                        # Only fetch results from SELECT statements
-                        if stmt.upper().strip().startswith("SELECT"):
-                            enhanced_results = cur.fetchall()
+                with db_session.cursor() as cur:
+                    cur.execute(enhanced_query)
+                    enhanced_results = fetch_final_result_set(cur)
 
                 # Results should match or be subset of baseline
                 assert len(enhanced_results) <= len(baseline_results), "Enhanced query returned more results than baseline"
@@ -556,7 +565,7 @@ class TestEndToEndWorkflows:
             # Use test data partition values
             test_partition_values = {1001, 1002, 90210}
             for hash_key in hashes:
-                e2e_cache_client.set_cache(hash_key, test_partition_values, partition_key)
+                assert e2e_cache_client.set_cache(hash_key, test_partition_values, partition_key), f"Failed to cache hash {hash_key}"
 
             # Measure cache-enabled performance
             start_time = time.time()
@@ -580,18 +589,15 @@ class TestEndToEndWorkflows:
                     min_component_size=1,
                 )
 
+                # Enhanced query may be multi-statement (TMP_TABLE_IN emits CREATE TEMPORARY TABLE ...
+                # ON COMMIT DROP; ...; SELECT). Run the whole script in a single execute() so it runs as
+                # one implicit transaction and the temp table survives until the final SELECT; splitting on
+                # ";" under autocommit would drop it right after CREATE. See fetch_final_result_set.
+                from partitioncache.db_handler.postgres import fetch_final_result_set
+
                 with db_session.cursor() as cur:
-                    # Enhanced query might be a multi-statement query (with temp tables)
-                    # Split and execute each statement separately
-                    statements = [stmt.strip() for stmt in enhanced_query.split(";") if stmt.strip()]
-                    for stmt in statements:
-                        cur.execute(stmt)
-                        # Only fetch results if this statement returns data
-                        try:
-                            cur.fetchall()
-                        except Exception:
-                            # Statement doesn't return data (e.g., CREATE TABLE, etc.)
-                            pass
+                    cur.execute(enhanced_query)
+                    fetch_final_result_set(cur)
                 enhanced_time = time.time() - start_time
 
             performance_results.append(

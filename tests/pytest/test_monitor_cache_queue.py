@@ -46,9 +46,9 @@ def mock_args():
     # Add common variant generation args
     args.min_component_size = 1
     args.follow_graph = True
-    args.no_auto_detect_star_join = False
+    args.no_auto_detect_partition_join = False
     args.max_component_size = None
-    args.star_join_table = None
+    args.partition_join_table = None
     args.no_warn_partition_key = False
     args.bucket_steps = 1.0
     args.add_constraints = None
@@ -69,6 +69,7 @@ def mock_args():
     args.disable_optimized_polling = False
     args.force_recalculate = False
     args.log_query_times = None
+    args.disable_lazy_insertion = False
     return args
 
 
@@ -121,9 +122,9 @@ class TestQueryFragmentProcessor:
             min_component_size=mock_args.min_component_size,
             follow_graph=mock_args.follow_graph,
             keep_all_attributes=True,
-            auto_detect_star_join=not mock_args.no_auto_detect_star_join,
+            auto_detect_partition_join=not mock_args.no_auto_detect_partition_join,
             max_component_size=mock_args.max_component_size,
-            star_join_table=mock_args.star_join_table,
+            partition_join_table=mock_args.partition_join_table,
             warn_no_partition_key=not mock_args.no_warn_partition_key,
             bucket_steps=mock_args.bucket_steps,
             add_constraints=None,
@@ -131,8 +132,9 @@ class TestQueryFragmentProcessor:
             remove_constraints_add=None,
             skip_partition_key_joins=False,
             geometry_column=None,
+            max_conditions_removed=mock_args.max_conditions_removed,
         )
-        mock_push_fragments.assert_called_once_with([("SELECT DISTINCT t1.partition_key FROM test_table t1", "hash1")], "test_partition_key", "integer")
+        mock_push_fragments.assert_called_once_with([("SELECT DISTINCT t1.partition_key FROM test_table t1", "hash1")], "test_partition_key", "integer", cache_backend=None)
 
     @patch("partitioncache.cli.monitor_cache_queue.exit_event")
     @patch("partitioncache.cli.monitor_cache_queue.pop_from_original_query_queue_blocking")
@@ -267,6 +269,33 @@ class TestRunAndStoreQuery:
         assert result is True
         mock_cache.set_cache.assert_called_once_with("test_hash", {1, 2, 3}, "test_partition_key")
         mock_db.close.assert_called_once()
+
+    @patch("partitioncache.cli.monitor_cache_queue.get_cache_handler")
+    @patch("partitioncache.cli.monitor_cache_queue.get_db_handler")
+    def test_run_and_store_query_lazy_entry_without_lazy_intersection(self, mock_get_db, mock_get_cache, mock_args):
+        """Spatial handlers such as rocksdict_h3_grouped populate lazily but are no AbstractCacheHandler_Lazy."""
+        mock_args.force_recalculate = False
+        mock_args.disable_lazy_insertion = False
+        mock_cache = Mock(spec=["set_cache_lazy", "set_entry_lazy", "register_partition_key", "close"])
+        mock_cache.set_entry_lazy.return_value = True
+        mock_get_cache.return_value = mock_cache
+
+        import partitioncache.cli.monitor_cache_queue as mcq_module
+
+        original_args = getattr(mcq_module, "args", None)
+        mcq_module.args = mock_args
+
+        try:
+            result = run_and_store_query("SELECT geom FROM pois", "geo_hash", "spatial_h3", "geometry", item_cache_backend="rocksdict_h3_grouped")
+        finally:
+            if original_args is not None:
+                mcq_module.args = original_args
+            else:
+                delattr(mcq_module, "args")
+
+        assert result is True
+        mock_cache.set_entry_lazy.assert_called_once_with("geo_hash", "SELECT geom FROM pois", "SELECT geom FROM pois", "spatial_h3")
+        mock_get_db.assert_not_called()
 
     @patch("partitioncache.cli.monitor_cache_queue.get_cache_handler")
     @patch("partitioncache.cli.monitor_cache_queue.get_db_handler")
@@ -418,7 +447,8 @@ class TestRunAndStoreQuery:
         hash_part, time_part = lines[0].split(',')
         assert hash_part == "test_hash"
         execution_time = float(time_part)
-        assert execution_time >= 0
+        assert execution_time >= 0  # Timing value from mocked instant execution
+        assert execution_time < 1.0  # Mocked DB calls should complete in well under 1 second
 
 
 class TestPrintStatus:
@@ -508,8 +538,8 @@ class TestFragmentExecutorComponents:
                                     return call_count[0] > 3  # Exit after a few calls
                                 mock_exit_event.is_set.side_effect = mock_exit_side_effect
                                 # Return cached query once, then None to prevent infinite loop
-                                mock_pop.side_effect = [("SELECT * FROM test", "cached_hash", "test_partition_key", "integer"), None]
-                                mock_pop_blocking.side_effect = [("SELECT * FROM test", "cached_hash", "test_partition_key", "integer"), None]
+                                mock_pop.side_effect = [("SELECT * FROM test", "cached_hash", "test_partition_key", "integer", None), None]
+                                mock_pop_blocking.side_effect = [("SELECT * FROM test", "cached_hash", "test_partition_key", "integer", None), None]
                                 mock_get_lengths.return_value = {"original_query_queue": 0, "query_fragment_queue": 0}
                                 mock_time.return_value = 1000.0
 
@@ -615,9 +645,9 @@ class TestIntegration:
             min_component_size=mock_args.min_component_size,
             follow_graph=mock_args.follow_graph,
             keep_all_attributes=True,
-            auto_detect_star_join=not mock_args.no_auto_detect_star_join,
+            auto_detect_partition_join=not mock_args.no_auto_detect_partition_join,
             max_component_size=mock_args.max_component_size,
-            star_join_table=mock_args.star_join_table,
+            partition_join_table=mock_args.partition_join_table,
             warn_no_partition_key=not mock_args.no_warn_partition_key,
             bucket_steps=mock_args.bucket_steps,
             add_constraints=None,
@@ -625,9 +655,10 @@ class TestIntegration:
             remove_constraints_add=None,
             skip_partition_key_joins=False,
             geometry_column=None,
+            max_conditions_removed=mock_args.max_conditions_removed,
         )
         mock_push_to_outgoing.assert_called_once_with(
-            [("SELECT DISTINCT t1.partition_key FROM test_table t1 WHERE t1.id = 1", "hash1")], "test_partition_key", "integer"
+            [("SELECT DISTINCT t1.partition_key FROM test_table t1 WHERE t1.id = 1", "hash1")], "test_partition_key", "integer", cache_backend=None
         )
 
 

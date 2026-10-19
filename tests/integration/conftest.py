@@ -424,6 +424,24 @@ if _is_rocksdict_available():
     CACHE_BACKENDS.append("rocksdict")
     CACHE_BACKENDS.append("rocksdict_roaringbit")
 
+# Optional backend scoping for CI jobs.
+# When set, this should be a comma-separated list like:
+#   INTEGRATION_CACHE_BACKENDS=postgresql_array,redis_set
+requested_backends = os.getenv("INTEGRATION_CACHE_BACKENDS", "").strip()
+if requested_backends:
+    requested = [backend.strip() for backend in requested_backends.split(",") if backend.strip()]
+    available = set(CACHE_BACKENDS)
+    selected = [backend for backend in requested if backend in available]
+    missing = [backend for backend in requested if backend not in available]
+
+    if missing:
+        logger.warning(f"Requested integration backends not available in this environment: {missing}")
+    if selected:
+        CACHE_BACKENDS = selected
+        logger.info(f"Scoped integration backends to: {CACHE_BACKENDS}")
+    else:
+        logger.warning("INTEGRATION_CACHE_BACKENDS was set but no requested backends were available; using default backend matrix")
+
 
 @pytest.fixture(params=CACHE_BACKENDS)
 def cache_client(request, db_session):

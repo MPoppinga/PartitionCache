@@ -77,16 +77,17 @@ PartitionCache supports multiple cache backends with different performance chara
 - **Memory**: Disk-based with cache
 - **Scalability**: Good (single-instance)
 
-### PostGIS Spatial Backends
+### Spatial Backends
 
-#### PostGIS H3 Handler
-- **Type**: `postgis_h3`
-- **Storage**: BIGINT[] arrays of H3 hexagonal cell indices
+#### RocksDict H3 Grouped Handler
+- **Type**: `rocksdict_h3_grouped` (replaces the removed `postgis_h3` handler)
+- **Storage**: RocksDict, one list of H3 cell groups (`list[frozenset[int]]`) per query variant
 - **Datatypes**: `geometry`
-- **Requirements**: PostgreSQL + PostGIS + h3-pg extension
+- **Requirements**: PostgreSQL + PostGIS + h3-pg extension (cell conversion at population time), Python `h3` library (k-ring expansion at filter time)
 - **Best for**: Hexagonal spatial partitioning, uniform spatial distribution
-- **Spatial filtering**: K-ring buffer expansion via `h3_grid_disk()`
-- **Scalability**: Excellent (database-native)
+- **Spatial filtering**: Connected-component intersection of cell groups with k-ring buffer expansion
+- **Population**: `set_cache_lazy()` runs the spatial variant on PostgreSQL and maps every geometry column to an H3 cell in the same statement; each result row becomes one cell group. Used by `pcache-add --direct` and `pcache-monitor`. The pg_cron queue processor cannot populate this backend because its cache lives in RocksDict.
+- **Scalability**: Good (single-instance)
 
 #### PostGIS BBox Handler
 - **Type**: `postgis_bbox`
@@ -166,7 +167,7 @@ cache.set_cache("key2", {"a", "b"}, partition_key="test")
 | Distributed system | Any | integer, text | redis_set, redis_bit | Network-accessible |
 | Development/testing | Any | any | rocksdict | No server setup required |
 | Time-series data | Large | timestamp | postgresql_array | Native timestamp support |
-| Spatial data (hexagonal) | Large | geometry | postgis_h3 | H3 hexagonal cells, requires h3-pg |
+| Spatial data (hexagonal) | Large | geometry | rocksdict_h3_grouped | H3 hexagonal cells, requires h3-pg and the h3 library |
 | Spatial data (grid) | Large | geometry | postgis_bbox | Bounding box grid cells |
 
 ### Memory Efficiency Comparison

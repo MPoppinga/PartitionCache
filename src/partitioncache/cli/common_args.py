@@ -8,6 +8,7 @@ consistency across all CLI tools and reduce code duplication.
 import argparse
 import json
 import os
+import re
 import sys
 from logging import getLogger
 from pathlib import Path
@@ -16,6 +17,35 @@ from typing import Any
 import dotenv
 
 logger = getLogger("PartitionCache")
+
+_DURATION_PATTERN = re.compile(r"^(\d+)\s*([smhdSMHD]?)$")
+
+
+def parse_duration_to_seconds(value: str | int, arg_name: str = "duration") -> int:
+    """
+    Parse a duration value into seconds.
+
+    Accepted formats:
+    - Integer seconds: 30
+    - String seconds: "30" / "30s"
+    - Minutes: "5m"
+    - Hours: "2h"
+    - Days: "1d"
+    """
+    if isinstance(value, int):
+        if value < 0:
+            raise ValueError(f"{arg_name} must be >= 0")
+        return value
+
+    value_str = str(value).strip()
+    match = _DURATION_PATTERN.match(value_str)
+    if not match:
+        raise ValueError(f"Invalid {arg_name} '{value}'. Use formats like 30, 30s, 5m, 2h, 1d.")
+
+    amount = int(match.group(1))
+    unit = (match.group(2) or "s").lower()
+    factor = {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
+    return amount * factor
 
 
 def add_database_args(parser: argparse.ArgumentParser, include_sqlite: bool = True) -> None:
@@ -94,7 +124,7 @@ def add_spatial_args(parser: argparse.ArgumentParser, include_buffer_distance: b
         spatial_group.add_argument(
             "--buffer-distance",
             type=float,
-            default=float(os.getenv("PARTITION_CACHE_BUFFER_DISTANCE", "0")) or None,
+            default=float(os.environ["PARTITION_CACHE_BUFFER_DISTANCE"]) if os.getenv("PARTITION_CACHE_BUFFER_DISTANCE") else None,
             help="Buffer distance in meters for spatial cache application. "
             "If not set, auto-derived from ST_DWithin distances in the query.",
         )
@@ -326,16 +356,16 @@ def add_variant_generation_args(parser: argparse.ArgumentParser) -> None:
         help="Only generate variants from tables forming connected subgraphs via multi-table predicates like distance conditions or non-equijoin conditions (default: True or PARTITION_CACHE_FOLLOW_GRAPH)",
     )
     variant_group.add_argument(
-        "--no-auto-detect-star-join",
+        "--no-auto-detect-partition-join",
         action="store_true",
-        default=os.getenv("PARTITION_CACHE_NO_AUTO_DETECT_STAR_JOIN", "false").lower() in ("true", "1", "yes"),
-        help="Disable automatic star-join table detection based on query pattern (default: False or PARTITION_CACHE_NO_AUTO_DETECT_STAR_JOIN)",
+        default=os.getenv("PARTITION_CACHE_NO_AUTO_DETECT_PARTITION_JOIN", os.getenv("PARTITION_CACHE_NO_AUTO_DETECT_STAR_JOIN", "false")).lower() in ("true", "1", "yes"),
+        help="Disable automatic partition-join table detection based on query pattern (default: False or PARTITION_CACHE_NO_AUTO_DETECT_PARTITION_JOIN)",
     )
     variant_group.add_argument(
-        "--star-join-table",
+        "--partition-join-table",
         type=str,
-        default=os.getenv("PARTITION_CACHE_STAR_JOIN_TABLE", None),
-        help="Explicitly specify star-join table alias or name (only one star-join table per query, or set PARTITION_CACHE_STAR_JOIN_TABLE)",
+        default=os.getenv("PARTITION_CACHE_PARTITION_JOIN_TABLE", os.getenv("PARTITION_CACHE_STAR_JOIN_TABLE", None)),
+        help="Explicitly specify partition-join table alias or name (only one partition-join table per query, or set PARTITION_CACHE_PARTITION_JOIN_TABLE)",
     )
     variant_group.add_argument(
         "--max-component-size",
@@ -373,6 +403,14 @@ def add_variant_generation_args(parser: argparse.ArgumentParser) -> None:
         default=os.getenv("PARTITION_CACHE_REMOVE_CONSTRAINTS_ADD", None),
         help='JSON list of attribute names to remove, creating additional variants, e.g. \'["col1", "col2"]\' (default: None or PARTITION_CACHE_REMOVE_CONSTRAINTS_ADD)',
     )
+    variant_group.add_argument(
+        "--max-conditions-removed",
+        type=int,
+        default=int(os.getenv("PARTITION_CACHE_MAX_CONDITIONS_REMOVED", "0")) or None,
+        help="Maximum number of conditions to remove per table when generating attribute variants. "
+        "Default: 1 (remove one condition at a time). Higher values generate more variants via C(n,k) combinations. "
+        "(default: 1 or PARTITION_CACHE_MAX_CONDITIONS_REMOVED)",
+    )
 
 
 def resolve_cache_backend(args: argparse.Namespace) -> str:
@@ -392,7 +430,7 @@ def resolve_cache_backend(args: argparse.Namespace) -> str:
 
     if not cache_backend:
         print("Error: No cache backend specified. Use --cache-backend or set CACHE_BACKEND environment variable")
-        print("Available backends: postgresql_array, postgresql_bit, postgresql_roaringbit, redis_set, redis_bit, rocksdb_set, rocksdb_bit, rocksdict, postgis_h3, postgis_bbox")
+        print("Available backends: postgresql_array, postgresql_bit, postgresql_roaringbit, redis_set, redis_bit, rocksdb_set, rocksdb_bit, rocksdict, postgis_bbox, rocksdict_h3_grouped")
         sys.exit(1)
 
     return cache_backend
@@ -490,3 +528,95 @@ def setup_logging(verbose: bool = False) -> None:
     format_string = "%(asctime)s - %(name)s - %(levelname)s - %(message)s" if verbose else "%(levelname)s: %(message)s"
 
     logging.basicConfig(level=level, format=format_string, datefmt="%Y-%m-%d %H:%M:%S")
+
+
+# ---------------------------------------------------------------------------
+# Shared database connection and introspection helpers
+# ---------------------------------------------------------------------------
+
+
+def get_db_connection():
+    """Get database connection using environment variables."""
+    import psycopg
+
+    return psycopg.connect(
+        host=os.getenv("DB_HOST"),
+        port=int(os.getenv("DB_PORT", "5432")),
+        user=os.getenv("DB_USER"),
+        password=os.getenv("DB_PASSWORD"),
+        dbname=os.getenv("DB_NAME"),
+    )
+
+
+def get_pg_cron_connection():
+    """Get pg_cron database connection using environment variables."""
+    import psycopg
+
+    return psycopg.connect(
+        host=os.getenv("PG_CRON_HOST", os.getenv("DB_HOST")),
+        port=int(os.getenv("PG_CRON_PORT", os.getenv("DB_PORT", "5432"))),
+        user=os.getenv("PG_CRON_USER", os.getenv("DB_USER")),
+        password=os.getenv("PG_CRON_PASSWORD", os.getenv("DB_PASSWORD")),
+        dbname=os.getenv("PG_CRON_DATABASE", "postgres"),
+    )
+
+
+def get_cache_database_name() -> str:
+    """Get the cache database name from environment."""
+    return os.getenv("DB_NAME", "postgres")
+
+
+def get_cron_database_name() -> str:
+    """Get the cron database name from environment."""
+    return os.getenv("PG_CRON_DATABASE", "postgres")
+
+
+def table_exists(conn, table_name: str) -> bool:
+    """Check if a table exists in the database."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = %s)",
+            [table_name],
+        )
+        result = cur.fetchone()
+        return bool(result and result[0])
+
+
+def function_exists(conn, function_name: str) -> bool:
+    """Check if a function exists in the database."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT EXISTS (SELECT 1 FROM pg_proc WHERE proname = %s)", [function_name])
+        result = cur.fetchone()
+        return bool(result and result[0])
+
+
+def ensure_role_exists(conn, role_name: str, create_if_missing: bool = False) -> tuple[bool, str]:
+    """Check if a PostgreSQL role exists and optionally create it.
+
+    Args:
+        conn: Active psycopg connection (must have sufficient privileges for CREATE ROLE if *create_if_missing* is True).
+        role_name: Name of the role to check/create.
+        create_if_missing: When True, attempt ``CREATE ROLE <role_name> LOGIN`` if the role does not exist.
+
+    Returns:
+        Tuple of (success, message).  *success* is True when the role exists
+        (either pre-existing or newly created).
+    """
+    from psycopg import sql as psycopg_sql
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", [role_name])
+        if cur.fetchone() is not None:
+            return True, f"Role '{role_name}' already exists"
+
+    if not create_if_missing:
+        return False, f"Role '{role_name}' does not exist (use --create-role to create it)"
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(psycopg_sql.SQL("CREATE ROLE {} LOGIN").format(psycopg_sql.Identifier(role_name)))
+        conn.commit()
+        return True, f"Role '{role_name}' created successfully"
+    except Exception as e:
+        conn.rollback()
+        return False, f"Failed to create role '{role_name}': {e}"

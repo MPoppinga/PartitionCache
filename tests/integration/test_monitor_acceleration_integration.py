@@ -211,6 +211,8 @@ except Exception as e:
                     postgresql_connection_params=postgresql_params,
                     preload_tables=[test_data_setup]
                 )
+                if accelerator is None:
+                    raise DuckDBImportError("DuckDB accelerator initialization failed")
 
                 # Test query
                 test_query = f"SELECT partition_key FROM {test_data_setup} WHERE partition_key < 10"
@@ -244,7 +246,7 @@ except Exception as e:
             SELECT partition_key
             FROM {test_data_setup}
             WHERE category = 'type_a'
-            AND value > 500
+            AND partition_key < 40
             """
 
             # Test with acceleration
@@ -252,6 +254,8 @@ except Exception as e:
                 postgresql_connection_params=postgresql_params,
                 preload_tables=[test_data_setup]
             )
+            if accelerator is None:
+                raise DuckDBImportError("DuckDB accelerator initialization failed")
 
             accelerator.preload_tables()
 
@@ -300,6 +304,8 @@ except Exception as e:
                 postgresql_connection_params=postgresql_params,
                 preload_tables=["nonexistent_table", "another_missing_table"]
             )
+            if accelerator is None:
+                raise DuckDBImportError("DuckDB accelerator initialization failed")
 
             # Should still initialize despite missing tables
             assert accelerator._initialized
@@ -425,6 +431,8 @@ class TestMonitorAccelerationStressTest:
                 preload_tables=[large_dataset_setup],
                 duckdb_memory_limit="2GB"
             )
+            if accelerator is None:
+                raise DuckDBImportError("DuckDB accelerator initialization failed")
 
             accelerator.preload_tables()
 

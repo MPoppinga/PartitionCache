@@ -233,8 +233,31 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- Note: No backward compatibility wrapper needed since manual commands 
--- read config from cron database and call parameter-based function directly
+-- Function to clean up old eviction log entries.
+CREATE OR REPLACE FUNCTION partitioncache_cleanup_eviction_logs(
+    p_table_prefix TEXT,
+    p_retention_days INTEGER DEFAULT 30
+)
+RETURNS INTEGER AS $$
+DECLARE
+    v_log_table TEXT;
+    v_deleted_count INTEGER;
+BEGIN
+    v_log_table := p_table_prefix || '_eviction_log';
+
+    EXECUTE format(
+        'DELETE FROM %I WHERE created_at < NOW() - INTERVAL ''%s days''',
+        v_log_table,
+        p_retention_days
+    );
+
+    GET DIAGNOSTICS v_deleted_count = ROW_COUNT;
+    RETURN v_deleted_count;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Note: No backward compatibility wrapper needed since manual commands
+-- read config from cron database and call parameter-based function directly.
 
 -- Function to remove all eviction-related objects from cache database
 CREATE OR REPLACE FUNCTION partitioncache_remove_eviction_cache_objects(p_table_prefix TEXT)
