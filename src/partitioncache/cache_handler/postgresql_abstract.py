@@ -1,8 +1,11 @@
 import threading
 from abc import abstractmethod
+from collections.abc import Callable
 from contextlib import contextmanager
 from functools import wraps
 from logging import getLogger
+from pathlib import Path
+from typing import ParamSpec, TypeVar
 
 import psycopg
 from psycopg import sql
@@ -12,14 +15,17 @@ from partitioncache.cache_handler.abstract import AbstractCacheHandler_Lazy
 
 logger = getLogger("PartitionCache")
 
+P = ParamSpec("P")
+R = TypeVar("R")
 
-def _ends_read_transaction(fn):
+
+def _ends_read_transaction(fn: Callable[P, R]) -> Callable[P, R]:  # noqa: UP047 -- PEP 695 syntax needs Python 3.12, package supports 3.10
     """Mark a read-only handler method so it leaves the connection idle. See _read_txn."""
 
     @wraps(fn)
-    def wrapper(self, *args, **kwargs):
-        with self._read_txn():
-            return fn(self, *args, **kwargs)
+    def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+        with args[0]._read_txn():  # type: ignore[attr-defined]
+            return fn(*args, **kwargs)
 
     return wrapper
 
@@ -119,8 +125,41 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
         """
         if self.db.info.transaction_status != TransactionStatus.IDLE:
             logger.debug("DDL lock taken inside an open transaction; lock order is not guaranteed")
-        self.cursor.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (self.tableprefix,))
+        self._take_ddl_lock()
         yield
+
+    def _take_ddl_lock(self) -> None:
+        """Take this prefix's transaction-scoped DDL advisory lock (see _serialized_ddl)."""
+        self.cursor.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (self.tableprefix,))
+
+    def _load_sql_functions(self) -> None:
+        """Load the SQL functions from postgresql_cache_handlers.sql.
+
+        Usually called as the first statement inside _serialized_ddl, where the advisory
+        lock belongs to the open transaction. A failed load aborts that transaction, and the
+        rollback that clears it also releases the lock, so the lock is taken again before
+        the DDL that follows. No savepoint is used: handlers may share one connection
+        across threads, and another thread's commit destroys a savepoint in between.
+        """
+        sql_cache_file = Path(__file__).parent / "postgresql_cache_handlers.sql"
+        if not sql_cache_file.exists():
+            logger.warning(f"SQL cache handlers file not found at {sql_cache_file}")
+            return
+
+        in_transaction = self.db.info.transaction_status == TransactionStatus.INTRANS
+        try:
+            self.cursor.execute(sql_cache_file.read_text())  # type: ignore[arg-type]
+            logger.debug("Successfully loaded SQL functions from cache handlers file")
+        except Exception as e:
+            logger.warning(f"Failed to load SQL functions (this is OK if they're already loaded): {e}")
+            # Continuing on an aborted transaction makes every later statement fail with
+            # "current transaction is aborted", which hides the real error behind it.
+            try:
+                self.db.rollback()
+                if in_transaction:
+                    self._take_ddl_lock()  # the rollback released the caller's DDL lock
+            except Exception:
+                logger.debug("rollback after SQL function load failed", exc_info=True)
 
     @contextmanager
     def _read_txn(self):

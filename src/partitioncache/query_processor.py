@@ -444,6 +444,30 @@ def _is_partition_key_fk_join(condition: str, partition_key: str, table_aliases:
         return False
 
 
+def _is_inequality_condition(condition: str) -> bool:
+    """Check whether a condition is a plain inequality such as ``p1.id <> p2.id``.
+
+    Such conditions only keep two aliases from binding the same row and restrict
+    almost nothing. They stay in every fragment that contains both aliases but
+    must not connect the aliases in the join graph; otherwise pairwise ``<>``
+    makes the graph complete and adds fragments that are cross products.
+
+    Args:
+        condition: A single conjunctive condition (SQL text).
+
+    Returns:
+        True for a top-level ``<>`` / ``!=`` comparison, False otherwise (including
+        on parse errors).
+    """
+    try:
+        parsed = sqlglot.parse_one(condition)
+        if isinstance(parsed, exp.Paren):
+            parsed = parsed.this
+        return isinstance(parsed, exp.NEQ)
+    except Exception:
+        return False
+
+
 def _detect_pk_bearing_aliases(
     table_aliases: list[str],
     partition_key: str,
@@ -791,6 +815,29 @@ def detect_partition_join_from_query(
     )
 
 
+def _rename_aliases(text: str, mapping: dict[str, str], qualified_only: bool = False) -> str:
+    """
+    Rename table aliases in a single pass.
+
+    Renaming one alias after the other is wrong when an input alias already looks like
+    an output alias (e.g. ``{"a": "t1", "t1": "t2"}`` would turn ``a.x < t1.x`` into
+    ``t2.x < t2.x``). A single regex pass never renames a replacement again.
+
+    Args:
+        text: SQL fragment to rewrite.
+        mapping: Original alias -> new alias.
+        qualified_only: If True, only rename aliases followed by a dot (``alias.column``).
+
+    Returns:
+        The rewritten fragment.
+    """
+    if not mapping:
+        return text
+    names = "|".join(re.escape(name) for name in sorted(mapping, key=len, reverse=True))
+    end = r"(?=\.)" if qualified_only else r"\b"
+    return re.sub(rf"\b({names}){end}", lambda m: mapping[m.group(1)], text)
+
+
 def _build_select_clause(
     strip_select: bool,
     original_select_clause: str | None,
@@ -833,12 +880,8 @@ def _build_select_clause(
 
     # Preserve original SELECT clause with alias mapping
     try:
-        # Replace original aliases with new aliases in the SELECT clause
-        mapped_select_clause = original_select_clause
-        for original_alias, new_alias in original_to_new_alias_mapping.items():
-            # Replace table alias references (e.g., "cd.pdb_id" -> "t1.pdb_id")
-            pattern = rf"\b{re.escape(original_alias)}\."
-            mapped_select_clause = re.sub(pattern, f"{new_alias}.", mapped_select_clause)
+        # Replace original aliases with new aliases in the SELECT clause (e.g., "cd.pdb_id" -> "t1.pdb_id")
+        mapped_select_clause = _rename_aliases(original_select_clause, original_to_new_alias_mapping, qualified_only=True)
 
         return f"SELECT {mapped_select_clause}"
     except Exception as e:
@@ -1114,9 +1157,13 @@ def generate_partial_queries(
     else:
         distance_conditions_filtered = distance_conditions
 
+    # Pairs related only by inequalities (p1.id <> p2.id) are not graph edges; their
+    # conditions are still added to every fragment that contains both aliases.
+    join_graph_edges = [pair for pair, conds in distance_conditions_filtered.items() if not all(_is_inequality_condition(c) for c in conds)]
+
     # Get all possible combinations of tables (grouped by number of tables in the tuple)
     query_combinations = generate_tuples(
-        list(distance_conditions_filtered.keys()),
+        join_graph_edges,
         aliases_for_variants,
         min_component_size,
         follow_graph,
@@ -1205,16 +1252,14 @@ def generate_partial_queries(
 
             # Build the query
             query_where: list[str] = []
-            i = 0  # Index for new table aliases
+            new_alias_by_key = {key: f"t{idx}" for idx, key in enumerate(table_conditions_keys, start=1)}  # Enumerate table aliases
             for table_condition_key in table_conditions_keys:
-                i += 1
-                table_alias = f"t{i}"  # Enumerate table aliases
+                table_alias = new_alias_by_key[table_condition_key]
                 new_table_list.append(table_alias)
                 query_where.extend([re.sub(rf'\b{re.escape(table_condition_key)}\.', f'{table_alias}.', x) for x in var_attribute_conditions[table_condition_key]])
 
-                # set the correct table alias in the distance conditions
-                pattern = rf"\b{re.escape(table_condition_key)}\b"
-                relvant_conditions_for_combination = [re.sub(pattern, table_alias, cc) for cc in relvant_conditions_for_combination]
+            # set the correct table aliases in the distance conditions (in one pass, input aliases may be named t<N>)
+            relvant_conditions_for_combination = [_rename_aliases(cc, new_alias_by_key) for cc in relvant_conditions_for_combination]
 
             # Add distance conditions to the query
             for rdist in relvant_conditions_for_combination:
@@ -1303,17 +1348,13 @@ def generate_partial_queries(
                             if (a1 == detected_partition_join_alias and a2 == orig_alias) or \
                                (a2 == detected_partition_join_alias and a1 == orig_alias):
                                 for cond in conds:
-                                    mapped = cond
-                                    mapped = re.sub(rf'\b{re.escape(detected_partition_join_alias)}\b', partition_join_new_alias, mapped)
-                                    mapped = re.sub(rf'\b{re.escape(orig_alias)}\b', new_alias, mapped)
+                                    mapped = _rename_aliases(cond, {detected_partition_join_alias: partition_join_new_alias, orig_alias: new_alias})
                                     partition_join_joins.append(mapped)
                         # Also re-add other_functions between partition-join and variant tables
                         for keys, oconds in other_functions.items():
                             if detected_partition_join_alias in keys and orig_alias in keys:
                                 for cond in oconds:
-                                    mapped = cond
-                                    mapped = re.sub(rf'\b{re.escape(detected_partition_join_alias)}\b', partition_join_new_alias, mapped)
-                                    mapped = re.sub(rf'\b{re.escape(orig_alias)}\b', new_alias, mapped)
+                                    mapped = _rename_aliases(cond, {detected_partition_join_alias: partition_join_new_alias, orig_alias: new_alias})
                                     partition_join_joins.append(mapped)
                 else:
                     for table_alias in new_table_list:

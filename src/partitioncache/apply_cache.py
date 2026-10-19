@@ -120,7 +120,7 @@ def get_partition_keys(
 
     # Generate all hashes for the given query (Only consider subqueries with two ore more components that are connected, allow modifying attributes)
     cache_entry_hashes = generate_all_hashes(
-            partition_key_source_table=partition_key_source_table,
+        partition_key_source_table=partition_key_source_table,
         query=query,
         partition_key=partition_key,
         min_component_size=min_component_size,
@@ -217,7 +217,7 @@ def get_partition_keys_lazy(
         auto_detect_partition_join = deprecated["auto_detect_partition_join"]
 
     hashes = generate_all_hashes(
-            partition_key_source_table=partition_key_source_table,
+        partition_key_source_table=partition_key_source_table,
         query=query,
         partition_key=partition_key,
         min_component_size=min_component_size,
@@ -1388,10 +1388,8 @@ def apply_cache_lazy(
     if "auto_detect_partition_join" in deprecated:
         auto_detect_partition_join = deprecated["auto_detect_partition_join"]
 
-    # Determine if we're in spatial mode
-    is_spatial = geometry_column is not None
-
-    if is_spatial:
+    # Spatial mode is selected by passing a geometry column
+    if geometry_column is not None:
         # Spatial path: generate hashes once, use get_spatial_filter_lazy() directly.
         # Unlike the non-spatial path, we skip get_partition_keys_lazy() / get_intersected_lazy()
         # because spatial handlers need get_spatial_filter_lazy() (buffered geometric intersection),
@@ -1677,10 +1675,8 @@ def apply_cache(
     if "auto_detect_partition_join" in deprecated:
         auto_detect_partition_join = deprecated["auto_detect_partition_join"]
 
-    # Determine if we're in spatial mode
-    is_spatial = geometry_column is not None
-
-    if is_spatial:
+    # Spatial mode is selected by passing a geometry column
+    if geometry_column is not None:
         # Spatial path: generate hashes with spatial params, apply spatial filter
         if buffer_distance is None:
             buffer_distance = compute_buffer_distance(query)

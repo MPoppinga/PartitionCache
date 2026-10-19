@@ -272,6 +272,33 @@ class TestRunAndStoreQuery:
 
     @patch("partitioncache.cli.monitor_cache_queue.get_cache_handler")
     @patch("partitioncache.cli.monitor_cache_queue.get_db_handler")
+    def test_run_and_store_query_lazy_entry_without_lazy_intersection(self, mock_get_db, mock_get_cache, mock_args):
+        """Spatial handlers such as rocksdict_h3_grouped populate lazily but are no AbstractCacheHandler_Lazy."""
+        mock_args.force_recalculate = False
+        mock_args.disable_lazy_insertion = False
+        mock_cache = Mock(spec=["set_cache_lazy", "set_entry_lazy", "register_partition_key", "close"])
+        mock_cache.set_entry_lazy.return_value = True
+        mock_get_cache.return_value = mock_cache
+
+        import partitioncache.cli.monitor_cache_queue as mcq_module
+
+        original_args = getattr(mcq_module, "args", None)
+        mcq_module.args = mock_args
+
+        try:
+            result = run_and_store_query("SELECT geom FROM pois", "geo_hash", "spatial_h3", "geometry", item_cache_backend="rocksdict_h3_grouped")
+        finally:
+            if original_args is not None:
+                mcq_module.args = original_args
+            else:
+                delattr(mcq_module, "args")
+
+        assert result is True
+        mock_cache.set_entry_lazy.assert_called_once_with("geo_hash", "SELECT geom FROM pois", "SELECT geom FROM pois", "spatial_h3")
+        mock_get_db.assert_not_called()
+
+    @patch("partitioncache.cli.monitor_cache_queue.get_cache_handler")
+    @patch("partitioncache.cli.monitor_cache_queue.get_db_handler")
     def test_run_and_store_query_limit_reached(self, mock_get_db, mock_get_cache, mock_args):
         """Test query execution with limit reached."""
         mock_args.limit = 2

@@ -80,9 +80,9 @@ def _grouped_intersection(fragment_groups: list[list[frozenset[int]]]) -> set[in
 
     # Keep components spanning all variants
     surviving: set[int] = set()
-    for frag_indices, cells in components.values():
+    for frag_indices, component_cells in components.values():
         if len(frag_indices) == num_fragments:
-            surviving.update(cells)
+            surviving.update(component_cells)
 
     return surviving
 
@@ -109,7 +109,7 @@ def _grouped_kring_intersection(
         Set of H3 cell IDs that survive cross-variant intersection after k-ring expansion.
     """
     try:
-        import h3 as h3_lib
+        import h3 as h3_lib  # type: ignore[import-untyped]
     except ImportError as e:
         raise ImportError("h3 library required for k-ring intersection: pip install h3") from e
 
@@ -156,7 +156,9 @@ class RocksDictCacheHandler(RocksDictAbstractCacheHandler):
     def __repr__(self) -> str:
         return "rocksdict"
 
-    def get(self, key: str, partition_key: str = "partition_key") -> set[int] | set[str] | set[float] | set[datetime] | list[frozenset[int]] | None:
+    def get(  # type: ignore[override]
+        self, key: str, partition_key: str = "partition_key"
+    ) -> set[int] | set[str] | set[float] | set[datetime] | list[frozenset[int]] | None:
         """Get value from partition-specific cache namespace."""
         datatype = self._get_partition_datatype(partition_key)
         if datatype is None:
@@ -167,7 +169,7 @@ class RocksDictCacheHandler(RocksDictAbstractCacheHandler):
         if result is None or result == "NULL":
             return None
 
-        return result
+        return result  # type: ignore[no-any-return]
 
     def get_intersected(
         self, keys: set[str], partition_key: str = "partition_key"

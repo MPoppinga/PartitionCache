@@ -22,12 +22,14 @@ BEGIN
         RAISE no_data_found;
     END IF;
 
-    -- If SELECT succeeded, row exists and we have the lock - safe to UPDATE
+    -- If SELECT succeeded, row exists and we have the lock - safe to UPDATE.
+    -- An explicit backend on the new push wins; NULL keeps the one already queued.
     v_sql := format(
-        'UPDATE %I SET priority = priority + $1, updated_at = CURRENT_TIMESTAMP WHERE hash = $2 AND partition_key = $3',
+        'UPDATE %I SET priority = priority + $1, cache_backend = COALESCE($4, cache_backend), updated_at = CURRENT_TIMESTAMP ' ||
+        'WHERE hash = $2 AND partition_key = $3',
         p_queue_table
     );
-    EXECUTE v_sql USING p_priority, p_hash, p_partition_key;
+    EXECUTE v_sql USING p_priority, p_hash, p_partition_key, p_cache_backend;
 
     RETURN 'updated';
 
@@ -39,8 +41,9 @@ EXCEPTION
                 'INSERT INTO %I (hash, partition_key, partition_datatype, query, priority, cache_backend, updated_at, created_at) ' ||
                 'VALUES ($1, $2, $3, $4, $5, $6, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) ' ||
                 'ON CONFLICT (hash, partition_key) DO UPDATE SET ' ||
-                'priority = %I.priority + $5, updated_at = CURRENT_TIMESTAMP',
-                p_queue_table, p_queue_table
+                'priority = %I.priority + $5, cache_backend = COALESCE(EXCLUDED.cache_backend, %I.cache_backend), ' ||
+                'updated_at = CURRENT_TIMESTAMP',
+                p_queue_table, p_queue_table, p_queue_table
             );
             EXECUTE v_sql USING p_hash, p_partition_key, p_partition_datatype, p_query, p_priority, p_cache_backend;
             RETURN 'inserted';

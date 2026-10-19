@@ -156,7 +156,7 @@ def query_fragment_processor(args, constraint_args):
             is_spatial = partition_datatype == "geometry"
             resolved_backend = resolve_cache_backend(args) if is_spatial else None
             geometry_column = None
-            if is_spatial:
+            if resolved_backend is not None:
                 try:
                     spatial_cache_handler = get_cache_handler(resolved_backend, singleton=True)
                     geometry_column = getattr(spatial_cache_handler, "geometry_column", "geom")
@@ -356,16 +356,17 @@ def run_and_store_query(query: str, query_hash: str, partition_key: str, partiti
             logger.info(f"EXECUTING LAZY INSERTION: Calling set_entry_lazy for {query_hash}")
             t = time.perf_counter()
             try:
-                if isinstance(cache_handler, AbstractCacheHandler_Lazy):
-                    lazy_success = cache_handler.set_entry_lazy(original_hash, query_to_execute, original_query, partition_key)
-                    execution_time = time.perf_counter() - t
-                    if lazy_success:
-                        logger.info(f"✅ LAZY INSERTION SUCCESS: Lazily stored {original_hash} in cache in {execution_time:.3f}s")
-                        log_query_time(query_hash, execution_time)
-                        success = True
-                    else:
-                        logger.warning(f"⚠️ LAZY INSERTION FAILED: Lazy insertion failed for {original_hash}, falling back to traditional method")
-                        log_query_time(f"{query_hash}_lazy_failed", execution_time)
+                # Not an isinstance check on AbstractCacheHandler_Lazy: rocksdict_h3_grouped
+                # populates lazily without offering lazy intersection (see hasattr above).
+                lazy_success = cache_handler.set_entry_lazy(original_hash, query_to_execute, original_query, partition_key)  # type: ignore[attr-defined]
+                execution_time = time.perf_counter() - t
+                if lazy_success:
+                    logger.info(f"✅ LAZY INSERTION SUCCESS: Lazily stored {original_hash} in cache in {execution_time:.3f}s")
+                    log_query_time(query_hash, execution_time)
+                    success = True
+                else:
+                    logger.warning(f"⚠️ LAZY INSERTION FAILED: Lazy insertion failed for {original_hash}, falling back to traditional method")
+                    log_query_time(f"{query_hash}_lazy_failed", execution_time)
             except psycopg.OperationalError as e:
                 execution_time = time.perf_counter() - t
                 if "statement timeout" in str(e) or "query_canceled" in str(e):

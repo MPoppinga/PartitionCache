@@ -202,3 +202,62 @@ class TestRegexAliasRemap:
             # Aliases should be cleanly remapped (t1, t2, p1, etc.)
             # but never produce broken tokens like 'p00' from 'p' → 'p0' collision
             assert "p00" not in v, f"Alias collision produced 'p00': {v}"
+
+
+class TestInputAliasesLookLikeCanonicalAliases:
+    """Input aliases named like the canonical output aliases (t<N>, p<N>) must not collide.
+
+    Renaming one alias after the other turned ``a.price < t1.price`` into
+    ``t2.price < t2.price``: the fragment never matches, its cache entry is empty, and the
+    eager path then restricts the whole query to no rows.
+    """
+
+    @staticmethod
+    def _hashes(query: str, partition_key: str, **kwargs) -> list[str]:
+        from partitioncache.query_processor import generate_all_query_hash_pairs
+
+        pairs = generate_all_query_hash_pairs(query, partition_key, min_component_size=1, warn_no_partition_key=False, **kwargs)
+        return sorted(h for _, h in pairs)
+
+    def test_rename_aliases_is_single_pass(self):
+        from partitioncache.query_processor import _rename_aliases
+
+        assert _rename_aliases("a.price < t1.price", {"a": "t1", "t1": "t2"}) == "t1.price < t2.price"
+        assert _rename_aliases("t2.x = t1.x", {"t2": "t1", "t1": "t2"}) == "t1.x = t2.x"
+        assert _rename_aliases("t1.x + t10.x", {"t1": "t2", "t10": "t1"}) == "t2.x + t1.x"
+        assert _rename_aliases("a.x, a_b.x, a", {"a": "t1"}, qualified_only=True) == "t1.x, a_b.x, a"
+
+    def test_alias_t1_keeps_two_sided_condition(self):
+        from partitioncache.query_processor import generate_partial_queries
+
+        query = "SELECT * FROM pois AS a, pois AS t1 WHERE a.price < t1.price AND a.city_id = t1.city_id"
+        variants = generate_partial_queries(query, "city_id", min_component_size=1, warn_no_partition_key=False)
+
+        assert any("t1.price < t2.price" in v for v in variants), variants
+        assert not any("t2.price < t2.price" in v for v in variants), variants
+        neutral = "SELECT * FROM pois AS a, pois AS b WHERE a.price < b.price AND a.city_id = b.city_id"
+        assert self._hashes(query, "city_id") == self._hashes(neutral, "city_id")
+
+    def test_swapped_canonical_aliases(self):
+        query = "SELECT * FROM pois AS t2, pois AS t1 WHERE t2.price < t1.price AND t2.city_id = t1.city_id"
+        neutral = "SELECT * FROM pois AS a, pois AS b WHERE a.price < b.price AND a.city_id = b.city_id"
+        assert self._hashes(query, "city_id") == self._hashes(neutral, "city_id")
+
+    def test_spatial_partition_join_with_input_alias_p1(self):
+        from partitioncache.query_processor import generate_partial_queries
+
+        kwargs = {"auto_detect_partition_join": True, "skip_partition_key_joins": True, "warn_no_partition_key": False}
+        query = "SELECT * FROM p0_cell h, pois p1 WHERE ST_DWithin(h.geom, p1.geom, 100) AND p1.kind = 'x'"
+        neutral = "SELECT * FROM p0_cell h, pois b WHERE ST_DWithin(h.geom, b.geom, 100) AND b.kind = 'x'"
+
+        variants = generate_partial_queries(query, "cell_id", **kwargs)
+        assert variants == generate_partial_queries(neutral, "cell_id", **kwargs)
+        assert "ST_DWITHIN(p1.geom, t1.geom, 100)" in variants[0]
+
+    def test_preserved_select_clause_with_alias_t1(self):
+        from partitioncache.query_processor import generate_partial_queries
+
+        query = "SELECT a.name, t1.name FROM pois a, pois t1 WHERE a.city_id = t1.city_id AND a.price < t1.price"
+        variants = generate_partial_queries(query, "city_id", strip_select=False, warn_no_partition_key=False)
+
+        assert "SELECT t1.name, t2.name FROM pois AS t1, pois AS t2 WHERE t1.city_id = t2.city_id AND t1.price < t2.price" in variants

@@ -556,6 +556,81 @@ class TestRocksDictH3GroupedHandler:
             assert h.h3_cell_id_column == "id"
             h.db.close()
 
+    def test_set_cache_lazy_builds_one_group_per_row(self, handler):
+        """Each row becomes one match group of its non-NULL cells; duplicate groups are dropped."""
+        cursor = handler._mock_cursor
+        cursor.description = [("geom_1",), ("geom_2",)]
+        cursor.fetchall.return_value = [([1, 2],), ([2, 1],), ([3, None],), ([None, None],)]
+
+        assert handler.set_cache_lazy("h1", "SELECT t1.geom AS geom_1, t2.geom AS geom_2 FROM pois t1, pois t2", "spatial_h3")
+
+        assert handler.get("h1", "spatial_h3") == [frozenset({1, 2}), frozenset({3})]
+        # Columns are renamed positionally so repeated names (t1.geom, t2.geom) cannot clash
+        population_sql = cursor.execute.call_args.args[0].as_string(None)
+        assert 'AS sub("c0", "c1")' in population_sql
+        assert population_sql.count("h3_lat_lng_to_cell") == 2
+
+    def test_set_cache_lazy_empty_result_stores_null(self, handler):
+        cursor = handler._mock_cursor
+        cursor.description = [("geom",)]
+        cursor.fetchall.return_value = []
+
+        assert handler.set_cache_lazy("h_empty", "SELECT geom FROM pois WHERE false", "spatial_h3")
+
+        assert handler.is_null("h_empty", "spatial_h3")
+
+    def test_set_cache_lazy_rejects_destructive_query(self, handler):
+        assert handler.set_cache_lazy("h_bad", "DELETE FROM pois", "spatial_h3") is False
+        handler._mock_cursor.execute.assert_not_called()
+
+    def test_set_cache_lazy_reports_query_failure(self, handler):
+        handler._mock_cursor.execute.side_effect = RuntimeError("relation does not exist")
+
+        assert handler.set_cache_lazy("h_fail", "SELECT geom FROM missing", "spatial_h3") is False
+        assert not handler.exists("h_fail", "spatial_h3")
+
+    def test_set_entry_lazy_stores_cells_and_query(self, handler):
+        cursor = handler._mock_cursor
+        cursor.description = [("geom",)]
+        cursor.fetchall.return_value = [([7],)]
+
+        assert handler.set_entry_lazy("h2", "SELECT geom FROM pois", "SELECT * FROM pois", "spatial_h3")
+
+        assert handler.get("h2", "spatial_h3") == [frozenset({7})]
+        assert handler.get_query("h2", "spatial_h3") == "SELECT * FROM pois"
+
+    def test_set_cache_lazy_transforms_non_wgs84_srid(self, handler):
+        handler.srid = 25832
+        cursor = handler._mock_cursor
+        cursor.description = [("geom",)]
+        cursor.fetchall.return_value = []
+
+        handler.set_cache_lazy("h3", "SELECT geom FROM pois", "spatial_h3")
+
+        assert "ST_Transform(" in cursor.execute.call_args.args[0].as_string(None)
+
+    def test_singleton_path_switch_closes_postgres_connection(self, tmp_path):
+        with patch("partitioncache.cache_handler.rocksdict_h3_grouped.psycopg") as mock_psycopg:
+            first_conn, second_conn = MagicMock(), MagicMock()
+            mock_psycopg.connect.side_effect = [first_conn, second_conn]
+
+            from partitioncache.cache_handler.rocksdict_h3_grouped import RocksDictH3GroupedCacheHandler
+
+            pg_config = {"db_name": "test", "db_host": "localhost", "db_user": "test", "db_password": "test", "db_port": 5432}
+            try:
+                first = RocksDictH3GroupedCacheHandler.get_instance(str(tmp_path / "a.rocksdb"), **pg_config)
+                second = RocksDictH3GroupedCacheHandler.get_instance(str(tmp_path / "b.rocksdb"), **pg_config)
+
+                assert first is not second
+                first_conn.close.assert_called_once()
+                second_conn.close.assert_not_called()
+            finally:
+                RocksDictH3GroupedCacheHandler._refcount = 0
+                if RocksDictH3GroupedCacheHandler._instance is not None:
+                    RocksDictH3GroupedCacheHandler._instance.close()
+                RocksDictH3GroupedCacheHandler._instance = None
+                RocksDictH3GroupedCacheHandler._current_path = None
+
 
 class TestRocksDictH3GroupedHandlerKring:
     """Test get_h3_cell_filter with actual H3 k-ring expansion."""

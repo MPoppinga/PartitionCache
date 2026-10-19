@@ -198,14 +198,21 @@ def setup_h3_cells(
         column_name: Name for the H3 cell column (column mode only).
     """
     import psycopg
+    from psycopg import sql
+
+    if not 0 <= resolution <= 15:
+        raise ValueError(f"H3 resolution must be between 0 and 15, got {resolution}")
+
+    def qualified(name: str) -> sql.Identifier:
+        """Quote a possibly schema-qualified name (schema.table) as an identifier."""
+        return sql.Identifier(*name.split("."))
 
     # Build centroid expression with SRID handling
+    centroid_expr = sql.SQL("ST_Centroid({geom})").format(geom=sql.Identifier(geometry_column))
     if srid != 4326:
-        centroid_expr = f"ST_Transform(ST_Centroid({geometry_column}), 4326)::point"
-    else:
-        centroid_expr = f"ST_Centroid({geometry_column})::point"
+        centroid_expr = sql.SQL("ST_Transform({centroid}, 4326)").format(centroid=centroid_expr)
 
-    h3_cell_expr = f"h3_lat_lng_to_cell({centroid_expr}, {resolution})::bigint"
+    h3_cell_expr = sql.SQL("h3_lat_lng_to_cell({centroid}::point, {res})::bigint").format(centroid=centroid_expr, res=sql.Literal(resolution))
 
     # Get PostgreSQL connection config
     db_host = os.getenv("PG_H3_HOST") or os.getenv("DB_HOST")
@@ -232,22 +239,31 @@ def setup_h3_cells(
         if mode == "mv":
             view_name = mv_name or f"{table}_h3_cells"
             h3_col = column_name or "h3_cell_id"
+            view = qualified(view_name)
+            view_base = view_name.split(".")[-1]
 
             logger.info(f"Creating materialized view '{view_name}' from '{table}'...")
 
-            cursor.execute(f"DROP MATERIALIZED VIEW IF EXISTS {view_name}")  # type: ignore[arg-type]
-            create_sql = (
-                f"CREATE MATERIALIZED VIEW {view_name} AS "
-                f"SELECT {id_column}, {h3_cell_expr} AS {h3_col} "
-                f"FROM {table}"
+            cursor.execute(sql.SQL("DROP MATERIALIZED VIEW IF EXISTS {view}").format(view=view))
+            cursor.execute(
+                sql.SQL("CREATE MATERIALIZED VIEW {view} AS SELECT {id_col}, {cell} AS {h3_col} FROM {table}").format(
+                    view=view,
+                    id_col=sql.Identifier(id_column),
+                    cell=h3_cell_expr,
+                    h3_col=sql.Identifier(h3_col),
+                    table=qualified(table),
+                )
             )
-            cursor.execute(create_sql)  # type: ignore[arg-type]
 
             logger.info(f"Creating B-tree indexes on '{view_name}'...")
-            cursor.execute(f"CREATE INDEX idx_{view_name}_{h3_col} ON {view_name} USING btree ({h3_col})")  # type: ignore[arg-type]
-            cursor.execute(f"CREATE INDEX idx_{view_name}_{id_column} ON {view_name} USING btree ({id_column})")  # type: ignore[arg-type]
+            for indexed_col in (h3_col, id_column):
+                cursor.execute(
+                    sql.SQL("CREATE INDEX {index} ON {view} USING btree ({col})").format(
+                        index=sql.Identifier(f"idx_{view_base}_{indexed_col}"), view=view, col=sql.Identifier(indexed_col)
+                    )
+                )
 
-            cursor.execute(f"SELECT count(*) FROM {view_name}")  # type: ignore[arg-type]
+            cursor.execute(sql.SQL("SELECT count(*) FROM {view}").format(view=view))
             row_count = cursor.fetchone()
             count = row_count[0] if row_count else 0
             logger.info(f"Materialized view '{view_name}' created with {count} rows")
@@ -255,18 +271,24 @@ def setup_h3_cells(
 
         elif mode == "column":
             col_name = column_name or f"h3_cell_{resolution}"
+            source = qualified(table)
+            col = sql.Identifier(col_name)
 
             logger.info(f"Adding column '{col_name}' to table '{table}'...")
 
-            cursor.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col_name} bigint")  # type: ignore[arg-type]
+            cursor.execute(sql.SQL("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col} bigint").format(table=source, col=col))
 
             logger.info(f"Computing H3 cell IDs for all rows in '{table}'...")
-            cursor.execute(f"UPDATE {table} SET {col_name} = {h3_cell_expr}")  # type: ignore[arg-type]
+            cursor.execute(sql.SQL("UPDATE {table} SET {col} = {cell}").format(table=source, col=col, cell=h3_cell_expr))
 
             logger.info(f"Creating B-tree index on '{table}.{col_name}'...")
-            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_{col_name} ON {table} USING btree ({col_name})")  # type: ignore[arg-type]
+            cursor.execute(
+                sql.SQL("CREATE INDEX IF NOT EXISTS {index} ON {table} USING btree ({col})").format(
+                    index=sql.Identifier(f"idx_{table.split('.')[-1]}_{col_name}"), table=source, col=col
+                )
+            )
 
-            cursor.execute(f"SELECT count(*) FROM {table} WHERE {col_name} IS NOT NULL")  # type: ignore[arg-type]
+            cursor.execute(sql.SQL("SELECT count(*) FROM {table} WHERE {col} IS NOT NULL").format(table=source, col=col))
             row_count = cursor.fetchone()
             count = row_count[0] if row_count else 0
             logger.info(f"Column '{col_name}' populated for {count} rows in '{table}'")
