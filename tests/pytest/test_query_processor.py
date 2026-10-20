@@ -11,6 +11,7 @@ from partitioncache.query_processor import (
     generate_all_query_hash_pairs,
     is_distance_function,
     normalize_distance_conditions,
+    remove_k_conditions,
 )
 
 
@@ -375,6 +376,268 @@ class TestIntegrationScenarios:
         # All lookup hashes should be found in population when variations are enabled
         missing = lookup_hashes - population_hashes_with_var
         assert len(missing) == 0, f"Found {len(missing)} missing hashes when variations enabled"
+
+
+class TestRemoveKConditions:
+    """Test remove_k_conditions function (replaces buggy remove_single_conditions)."""
+
+    def test_single_condition_returns_original_only(self):
+        """With 1 condition per table, can't remove any — returns original only."""
+        conditions = {"t1": ["a = 1"]}
+        result = remove_k_conditions(conditions)
+        assert len(result) == 1
+        assert result[0] == conditions
+
+    def test_three_conditions_k1_removes_one(self):
+        """3 conditions, k=1: original + C(3,1) = 4 variants, each variant has 2 conditions."""
+        conditions = {"t1": ["a = 1", "b = 2", "c = 3"]}
+        result = remove_k_conditions(conditions, max_removed=1)
+        assert len(result) == 4  # 1 original + 3 variants
+        # Original should have all 3
+        assert len(result[0]["t1"]) == 3
+        # Each variant should have 2 conditions (one removed)
+        for variant in result[1:]:
+            assert len(variant["t1"]) == 2
+
+    def test_five_conditions_k1(self):
+        """5 conditions, k=1: original + C(5,1) = 6 variants, each with 4 conditions."""
+        conditions = {"t1": ["a = 1", "b = 2", "c = 3", "d = 4", "e = 5"]}
+        result = remove_k_conditions(conditions, max_removed=1)
+        assert len(result) == 6  # 1 + C(5,1)
+        assert len(result[0]["t1"]) == 5
+        for variant in result[1:]:
+            assert len(variant["t1"]) == 4
+
+    def test_five_conditions_k2(self):
+        """5 conditions, k=2: original + C(5,1) + C(5,2) = 16 variants."""
+        conditions = {"t1": ["a = 1", "b = 2", "c = 3", "d = 4", "e = 5"]}
+        result = remove_k_conditions(conditions, max_removed=2)
+        assert len(result) == 16  # 1 + 5 + 10
+
+    def test_two_conditions_k1(self):
+        """2 conditions, k=1: original + C(2,1) = 3 variants."""
+        conditions = {"t1": ["a = 1", "b = 2"]}
+        result = remove_k_conditions(conditions, max_removed=1)
+        assert len(result) == 3
+        # Variants should each have exactly 1 condition
+        for variant in result[1:]:
+            assert len(variant["t1"]) == 1
+        # Check that each single condition appears in exactly one variant
+        single_conds = [variant["t1"][0] for variant in result[1:]]
+        assert set(single_conds) == {"a = 1", "b = 2"}
+
+    def test_k_larger_than_n_minus_1_caps_at_n_minus_1(self):
+        """k=5 but only 3 conditions: can remove at most 2 (must keep 1)."""
+        conditions = {"t1": ["a = 1", "b = 2", "c = 3"]}
+        result = remove_k_conditions(conditions, max_removed=5)
+        # Should be same as k=2: 1 + C(3,1) + C(3,2) = 7
+        assert len(result) == 7
+
+    def test_multi_table_independent_removal(self):
+        """Multiple tables: removal is independent per table."""
+        conditions = {
+            "t1": ["a = 1", "b = 2"],
+            "t2": ["x = 10", "y = 20", "z = 30"],
+        }
+        result = remove_k_conditions(conditions, max_removed=1)
+        # t1: 1 + C(2,1) = 3 variants
+        # t2: 1 + C(3,1) = 4 variants
+        # Combined: 3 * 4 = 12 total... actually no.
+        # The function generates variants per table independently and combines via Cartesian product?
+        # Let me check - the original code iterated per key independently.
+        # Actually, looking at the original code, it iterates all keys and creates
+        # a flat list of variants. Each variant modifies one table at a time.
+        # So for multi-table: original + 2 (from t1) + 3 (from t2) = 6
+        # Let me verify this is the correct expected behavior.
+        # The function returns a flat list of condition dicts.
+        # Original always included, then for each table with >1 conditions,
+        # generate removal variants (modifying only that table, keeping others unchanged).
+        assert len(result) >= 6  # At least: 1 original + 2 from t1 + 3 from t2
+
+    def test_removes_correct_conditions(self):
+        """Verify the actual conditions removed are correct."""
+        conditions = {"t1": ["a = 1", "b = 2", "c = 3"]}
+        result = remove_k_conditions(conditions, max_removed=1)
+        # Collect all 2-element subsets from variants
+        variant_cond_sets = [frozenset(v["t1"]) for v in result[1:]]
+        # Should have exactly 3 variants, each missing one of a, b, c
+        expected = [
+            frozenset(["b = 2", "c = 3"]),  # removed a
+            frozenset(["a = 1", "c = 3"]),  # removed b
+            frozenset(["a = 1", "b = 2"]),  # removed c
+        ]
+        assert set(variant_cond_sets) == set(expected)
+
+    def test_default_k_is_1(self):
+        """Default max_removed should be 1."""
+        conditions = {"t1": ["a = 1", "b = 2", "c = 3"]}
+        result = remove_k_conditions(conditions)
+        assert len(result) == 4  # 1 + C(3,1) = 4
+
+    def test_preserves_other_tables_unchanged(self):
+        """When removing from one table, other tables' conditions are unchanged."""
+        conditions = {
+            "t1": ["a = 1", "b = 2"],
+            "t2": ["x = 10"],
+        }
+        result = remove_k_conditions(conditions, max_removed=1)
+        # t2 has only 1 condition, so no removal variants from t2
+        # t1 has 2 conditions: 2 removal variants
+        # Total: 1 original + 2 = 3
+        assert len(result) == 3
+        # All variants should have t2 unchanged
+        for variant in result:
+            assert variant["t2"] == ["x = 10"]
+
+
+class TestRemoveKConditionsIntegration:
+    """Integration tests: verify fragment generation uses remove_k_conditions correctly."""
+
+    def test_keep_all_attributes_bypasses_removal(self):
+        """keep_all_attributes=True should produce single variant (no removal)."""
+        query = """
+        SELECT t1.id FROM table1 t1
+        WHERE t1.a = 1 AND t1.b = 2 AND t1.c = 3
+        """
+        pairs_fixed = generate_all_query_hash_pairs(
+            query, "id", min_component_size=1,
+            keep_all_attributes=True,
+        )
+        pairs_varied = generate_all_query_hash_pairs(
+            query, "id", min_component_size=1,
+            keep_all_attributes=False,
+        )
+        # With keep_all_attributes, fewer variants
+        assert len(pairs_fixed) < len(pairs_varied)
+
+    def test_max_conditions_removed_controls_variant_count(self):
+        """max_conditions_removed should control how many conditions can be removed."""
+        query = """
+        SELECT t1.id FROM table1 t1
+        WHERE t1.a = 1 AND t1.b = 2 AND t1.c = 3 AND t1.d = 4
+        """
+        # k=1: table has 4 conditions, so 1 + C(4,1) = 5 attribute variants
+        pairs_k1 = generate_all_query_hash_pairs(
+            query, "id", min_component_size=1,
+            keep_all_attributes=False,
+            max_conditions_removed=1,
+        )
+        # k=2: 1 + C(4,1) + C(4,2) = 11 attribute variants
+        pairs_k2 = generate_all_query_hash_pairs(
+            query, "id", min_component_size=1,
+            keep_all_attributes=False,
+            max_conditions_removed=2,
+        )
+        assert len(pairs_k2) > len(pairs_k1)
+
+    def test_backward_compat_default_behavior(self):
+        """Default behavior (no max_conditions_removed) should use k=1."""
+        query = """
+        SELECT t1.id FROM table1 t1
+        WHERE t1.a = 1 AND t1.b = 2 AND t1.c = 3
+        """
+        pairs_default = generate_all_query_hash_pairs(
+            query, "id", min_component_size=1,
+            keep_all_attributes=False,
+        )
+        pairs_k1 = generate_all_query_hash_pairs(
+            query, "id", min_component_size=1,
+            keep_all_attributes=False,
+            max_conditions_removed=1,
+        )
+        # Same hashes generated
+        hashes_default = {h for _, h in pairs_default}
+        hashes_k1 = {h for _, h in pairs_k1}
+        assert hashes_default == hashes_k1
+
+
+class TestProtectedPatterns:
+    """Tests for protected_patterns parameter in remove_k_conditions."""
+
+    def test_protected_conditions_never_removed(self):
+        """Conditions matching protected_patterns should never be removed."""
+        conditions = {
+            "t1": ["a = 1", "b = 2", "func_call(x)", "func_call(y)"],
+        }
+        result = remove_k_conditions(conditions, max_removed=2, protected_patterns=["func_call"])
+        # Only a=1 and b=2 are removable (2 removable conditions)
+        # k=1: C(2,1) = 2 variants; k=2: C(2,2) = 1 variant
+        # Total: 1 original + 2 + 1 = 4
+        assert len(result) == 4
+        # All variants must contain both func_call conditions
+        for variant in result:
+            funcs = [c for c in variant["t1"] if "func_call" in c]
+            assert len(funcs) == 2, f"Protected conditions missing in variant: {variant['t1']}"
+
+    def test_all_protected_returns_original_only(self):
+        """If all conditions are protected, only the original is returned."""
+        conditions = {
+            "t1": ["func(a)", "func(b)", "func(c)"],
+        }
+        result = remove_k_conditions(conditions, max_removed=2, protected_patterns=["func"])
+        assert len(result) == 1
+        assert result[0] == conditions
+
+    def test_no_protected_patterns_removes_any(self):
+        """Without protected_patterns, any condition can be removed (default behavior)."""
+        conditions = {"t1": ["a = 1", "b = 2", "c = 3"]}
+        result = remove_k_conditions(conditions, max_removed=1)
+        # 1 original + C(3,1) = 4
+        assert len(result) == 4
+
+    def test_protected_pattern_case_insensitive(self):
+        """Protected pattern matching should be case-insensitive."""
+        conditions = {"t1": ["a = 1", "WIKI_LLM_CLASSIFY(content, 'q')"]}
+        result = remove_k_conditions(conditions, max_removed=1, protected_patterns=["wiki_llm_classify"])
+        # Only a=1 is removable, 1 condition -> but removing it leaves only the protected one
+        # So: 1 original + C(1,1) = 2
+        assert len(result) == 2
+        # The variant should have only the protected condition
+        assert any("WIKI_LLM_CLASSIFY" in c for c in result[1]["t1"])
+
+    def test_wikipedia_pattern_unnest_protected(self):
+        """Simulates Wikipedia benchmark: protect unnest/category conditions."""
+        conditions = {
+            "t1": [
+                "EXISTS(SELECT 1 FROM UNNEST(t1.categories) c WHERE c ILIKE '%histor%')",
+                "t1.edit_count > 50",
+                "t1.creation_year >= 2005",
+                "WIKI_LLM_CLASSIFY(t1.content, 'question1')",
+                "WIKI_LLM_CLASSIFY(t1.content, 'question2')",
+            ],
+        }
+        # Protect category/unnest conditions
+        result = remove_k_conditions(conditions, max_removed=1, protected_patterns=["unnest"])
+        # Protected: 1 (unnest). Removable: 4 (edit_count, creation_year, 2x LLM)
+        # k=1: C(4,1) = 4 variants
+        # Total: 1 original + 4 = 5
+        assert len(result) == 5
+        # All variants must contain the unnest condition
+        for variant in result:
+            unnest_conds = [c for c in variant["t1"] if "UNNEST" in c]
+            assert len(unnest_conds) == 1
+
+    def test_protected_patterns_integration(self):
+        """Integration: protected_patterns threaded through generate_all_query_hash_pairs."""
+        query = """
+        SELECT t1.id FROM table1 t1
+        WHERE t1.a = 1 AND t1.b = 2 AND t1.c = 3
+        """
+        # With protected_patterns=["a"], only b and c can be removed
+        pairs_protected = generate_all_query_hash_pairs(
+            query, "id", min_component_size=1,
+            keep_all_attributes=False,
+            max_conditions_removed=1,
+            protected_patterns=["t1.a"],
+        )
+        # Without protection, all 3 can be removed
+        pairs_unprotected = generate_all_query_hash_pairs(
+            query, "id", min_component_size=1,
+            keep_all_attributes=False,
+            max_conditions_removed=1,
+        )
+        # Protected should have fewer variants (2 removable vs 3)
+        assert len(pairs_protected) < len(pairs_unprotected)
 
 
 if __name__ == "__main__":

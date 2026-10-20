@@ -373,3 +373,37 @@ class TestCLITimeoutProtection:
                 info_calls = [call[0][0] for call in mock_logger.info.call_args_list]
                 cache_entries_logged = any("Total Cache Entries: 1" in call for call in info_calls)
                 assert cache_entries_logged, f"Cache entries not logged. Info calls: {info_calls}"
+
+
+class TestSetupH3Cells:
+    """setup h3-cells composes its DDL from CLI-supplied names, so they must be quoted."""
+
+    ENV = {"DB_HOST": "localhost", "DB_USER": "u", "DB_PASSWORD": "p", "DB_NAME": "d", "DB_PORT": "5432"}
+
+    def _run(self, **kwargs):
+        from partitioncache.cli.manage_cache import setup_h3_cells
+
+        with patch.dict("os.environ", self.ENV), patch("psycopg.connect") as mock_connect:
+            cursor = mock_connect.return_value.cursor.return_value
+            cursor.fetchone.return_value = (0,)
+            setup_h3_cells(**kwargs)
+        return [call.args[0].as_string(None) for call in cursor.execute.call_args_list]
+
+    def test_column_mode_quotes_identifiers(self):
+        statements = self._run(mode="column", table="pois; DROP TABLE users", geometry_column="geom", id_column="id")
+
+        # The hostile name only ever appears inside a quoted identifier
+        assert statements[0] == 'ALTER TABLE "pois; DROP TABLE users" ADD COLUMN IF NOT EXISTS "h3_cell_9" bigint'
+        assert statements[2] == 'CREATE INDEX IF NOT EXISTS "idx_pois; DROP TABLE users_h3_cell_9" ON "pois; DROP TABLE users" USING btree ("h3_cell_9")'
+
+    def test_mv_mode_supports_schema_qualified_table(self):
+        statements = self._run(mode="mv", table="osm.pois", geometry_column="geom", id_column="id", srid=25832)
+
+        create = next(s for s in statements if s.startswith("CREATE MATERIALIZED VIEW"))
+        assert 'FROM "osm"."pois"' in create
+        assert 'CREATE MATERIALIZED VIEW "osm"."pois_h3_cells"' in create
+        assert "ST_Transform(ST_Centroid(\"geom\"), 4326)" in create
+
+    def test_rejects_invalid_resolution(self):
+        with pytest.raises(ValueError, match="resolution"):
+            self._run(mode="column", table="pois", geometry_column="geom", id_column="id", resolution=16)

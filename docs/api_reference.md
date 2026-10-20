@@ -70,14 +70,17 @@ Lists all available cache backends and their datatype support.
 backends = partitioncache.list_cache_types()
 print(backends)
 # {
+#   'redis_set': ['integer', 'text'],
+#   'redis_bit': ['integer'],
+#   'redis_roaringbit': ['integer'],
+#   'rocksdict': ['float', 'geometry', 'integer', 'text', 'timestamp'],
+#   'rocksdict_roaringbit': ['integer'],
 #   'postgresql_array': ['float', 'integer', 'text', 'timestamp'],
 #   'postgresql_bit': ['integer'],
 #   'postgresql_roaringbit': ['integer'],
-#   'redis_bit': ['integer'],
-#   'redis_set': ['integer', 'text'],
-#   'rocksdb_bit': ['integer'],
-#   'rocksdb_set': ['integer', 'text'],
-#   'rocksdict': ['float', 'integer', 'text', 'timestamp']
+#   'postgis_bbox': ['geometry'],
+#   'rocksdb_set': ['integer', 'text'],  # only when RocksDB is installed
+#   'rocksdb_bit': ['integer']           # only when RocksDB is installed
 # }
 
 # Check if backend supports datatype
@@ -85,9 +88,11 @@ if 'float' in backends['postgresql_array']:
     print("PostgreSQL array supports float datatypes")
 ```
 
+**Note:** `get_cache_handler()` additionally accepts the backends `duckdb_bit` and `rocksdict_h3_grouped`, which are not listed by `list_cache_types()`.
+
 ### Query Processing
 
-#### `get_partition_keys(query: str, cache_handler: AbstractCacheHandler, partition_key: str, min_component_size=2, canonicalize_queries=False, auto_detect_star_join: bool = True, star_join_table: str | None = None, bucket_steps: float = 1.0, add_constraints: dict[str, str] | None = None, remove_constraints_all: list[str] | None = None, remove_constraints_add: list[str] | None = None)`
+#### `get_partition_keys(query: str, cache_handler: AbstractCacheHandler, partition_key: str, min_component_size=2, canonicalize_queries=False, follow_graph: bool = True, auto_detect_partition_join: bool = True, partition_join_table: str | None = None, bucket_steps: float = 1.0, add_constraints: dict[str, str] | None = None, remove_constraints_all: list[str] | None = None, remove_constraints_add: list[str] | None = None, skip_partition_key_joins: bool = False, geometry_column: str | None = None, max_conditions_removed: int | None = None, protected_patterns: list[str] | None = None)`
 
 Retrieves cached partition keys for a query with comprehensive statistics.
 
@@ -97,12 +102,17 @@ Retrieves cached partition keys for a query with comprehensive statistics.
 - `partition_key` (str): Partition column name
 - `min_component_size` (int): The minimum number of tables in the partial queries.
 - `canonicalize_queries` (bool): If True, the query is canonicalized before hashing.
-- `auto_detect_star_join` (bool): Whether to auto-detect star-join tables (default: True)
-- `star_join_table` (str | None): Explicitly specified star-join table alias or name
+- `follow_graph` (bool): If True, only connected partial queries are considered (default: True)
+- `auto_detect_partition_join` (bool): Whether to auto-detect partition-join tables (default: True)
+- `partition_join_table` (str | None): Explicitly specified partition-join table alias or name
 - `bucket_steps` (float): Step size for normalizing distance conditions (default: 1.0)
 - `add_constraints` (dict[str, str] | None): Dict mapping table names to constraints to add
 - `remove_constraints_all` (list[str] | None): List of attribute names to remove from all query variants
 - `remove_constraints_add` (list[str] | None): List of attribute names to remove, creating additional variants
+- `skip_partition_key_joins` (bool): Spatial mode — generate query variants without partition-key equijoins (default: False)
+- `geometry_column` (str | None): Geometry column for spatial variant generation
+- `max_conditions_removed` (int | None): Upper bound on the number of conditions removed when generating reduced variants
+- `protected_patterns` (list[str] | None): Condition substrings that must never be removed
 
 **Returns:**
 - `Tuple[Set, int, int]`: (partition_keys, subqueries_generated, cache_hits)
@@ -124,7 +134,14 @@ print(f"Found {len(partition_keys)} partition keys")
 print(f"Cache hits: {hits}/{subqueries} subqueries")
 ```
 
-#### `extend_query_with_partition_keys(query: str, partition_keys: set[int] | set[str] | set[float] | set[datetime], partition_key: str, method: Literal["IN", "VALUES", "TMP_TABLE_JOIN", "TMP_TABLE_IN"] = "IN", p0_alias: str | None = None, analyze_tmp_table: bool = True)`
+#### `get_partition_keys_lazy(query, cache_handler, partition_key, ...)`
+
+Same parameters as `get_partition_keys`, but instead of materializing the partition keys it returns a lazy SQL subquery that computes the intersection inside the database. Requires a lazy-capable backend (`AbstractCacheHandler_Lazy`). Used internally by `apply_cache_lazy()`.
+
+**Returns:**
+- `Tuple[str | None, int, int]`: (lazy_subquery, subqueries_generated, cache_hits)
+
+#### `extend_query_with_partition_keys(query: str, partition_keys: set[int] | set[str] | set[float] | set[datetime], partition_key: str, method: Literal["IN", "VALUES", "TMP_TABLE_JOIN", "TMP_TABLE_IN"] = "IN", p0_alias: str | None = None, analyze_tmp_table: bool = True, auto_detect_partition_join: bool = True, partition_join_table: str | None = None)`
 
 Optimizes a query by adding partition key restrictions.
 
@@ -135,6 +152,8 @@ Optimizes a query by adding partition key restrictions.
 - `method` (Literal["IN", "VALUES", "TMP_TABLE_JOIN", "TMP_TABLE_IN"]): Optimization method
 - `p0_alias` (str | None): The alias of the table to use for the partition key.
 - `analyze_tmp_table` (bool): Whether to create index and analyze. (only for temporary table methods)
+- `auto_detect_partition_join` (bool): Whether to auto-detect partition-join tables when resolving the target alias (default: True)
+- `partition_join_table` (str | None): Explicitly specified partition-join table alias or name
 
 **Returns:**
 - `str`: Optimized SQL query
@@ -157,7 +176,31 @@ print(optimized)
 # SELECT * FROM users WHERE age > 25 AND user_id IN (1, 5, 10, 15, 20)
 ```
 
-#### `apply_cache_lazy(query, cache_handler, partition_key, ..., geometry_column=None, buffer_distance=None)`
+> **Executing temp-table methods (`TMP_TABLE_IN` / `TMP_TABLE_JOIN`).** These methods return a
+> **multi-statement script**: `CREATE TEMPORARY TABLE ... ON COMMIT DROP; INSERT ...; ANALYZE ...; SELECT ...`.
+> The temp table uses `ON COMMIT DROP`, so the **entire script must run in a single transaction** — otherwise
+> the table is dropped right after `CREATE` (and never reclaimed if you split statements across separate
+> autocommit transactions). Because the final `SELECT` is the *last* statement, a plain `fetchall()` after
+> `cursor.execute(script)` reads the first statement (`CREATE TABLE`, no rows); walk `cursor.nextset()` to the
+> last result set instead. The library's `PostgresDBHandler.execute` does this for you (see
+> `partitioncache.db_handler.postgres.fetch_final_result_set`). Minimal pattern with a raw psycopg cursor:
+>
+> ```python
+> from partitioncache.db_handler.postgres import fetch_final_result_set
+>
+> with conn.cursor() as cur:           # one execute() == one transaction
+>     cur.execute(optimized)           # the multi-statement script
+>     rows = fetch_final_result_set(cur)  # rows of the final SELECT; temp table auto-dropped on commit
+> ```
+
+#### `extend_query_with_partition_keys_lazy(query: str, lazy_subquery: str, partition_key: str, method: Literal["IN_SUBQUERY", "TMP_TABLE_IN", "TMP_TABLE_JOIN"] = "IN_SUBQUERY", p0_alias: str | None = None, analyze_tmp_table: bool = True, auto_detect_partition_join: bool = True, partition_join_table: str | None = None, sql_dialect: str = "postgres")`
+
+Lazy counterpart to `extend_query_with_partition_keys`: integrates a lazy SQL subquery (as returned by `get_partition_keys_lazy()`) into the query instead of a materialized key set.
+
+**Returns:**
+- `str`: Extended SQL query
+
+#### `apply_cache_lazy(query: str, cache_handler: AbstractCacheHandler_Lazy, partition_key: str, method: str = "IN_SUBQUERY", ..., sql_dialect: str = "postgres", geometry_column: str | None = None, buffer_distance: float | None = None, **kwargs)`
 
 **Recommended** - High-performance cache application with lazy evaluation. Supports spatial mode.
 
@@ -171,16 +214,22 @@ print(optimized)
 - `canonicalize_queries` (bool, optional): Whether to canonicalize queries before hashing (default: False)
 - `follow_graph` (bool, optional): Whether to follow the query graph for generating variants (default: True)
 - `analyze_tmp_table` (bool, optional): Enable temp table analysis (default: True)
+- `sql_dialect` (str, optional): sqlglot dialect used to parse and render non-spatial queries (default: `"postgres"`; use `"duckdb"` for DuckDB queries)
 - `use_p0_table` (bool, optional): Rewrite the query to use a p0 table/star-schema (default: False)
 - `p0_table_name` (str | None, optional): Name of the p0 table. Defaults to `{partition_key}_mv`
-- `auto_detect_star_join` (bool, optional): Whether to auto-detect star-join tables (default: True)
-- `star_join_table` (str | None, optional): Explicitly specified star-join table alias or name
+- `auto_detect_partition_join` (bool, optional): Whether to auto-detect partition-join tables (default: True)
+- `partition_join_table` (str | None, optional): Explicitly specified partition-join table alias or name
 - `bucket_steps` (float, optional): Step size for normalizing distance conditions (default: 1.0)
 - `add_constraints` (dict[str, str] | None, optional): Dict mapping table names to constraints to add
 - `remove_constraints_all` (list[str] | None, optional): List of attribute names to remove from all query variants
 - `remove_constraints_add` (list[str] | None, optional): List of attribute names to remove, creating additional variants
-- `geometry_column` (str | None, optional): Enables spatial mode. Uses this geometry column for fragment SELECT clauses and spatial filter. Requires a spatial cache handler with `get_spatial_filter_lazy()` method.
+- `max_conditions_removed` (int | None, optional): Upper bound on the number of conditions removed when generating reduced variants (default: None)
+- `protected_patterns` (list[str] | None, optional): Condition substrings that must never be removed (default: None)
+- `skip_partition_key_joins` (bool, optional): Spatial mode — generate query variants without partition-key equijoins (default: False)
+- `geometry_column` (str | None, optional): Enables spatial mode. Uses this geometry column for variant SELECT clauses and spatial filter. Requires a spatial cache handler with `get_spatial_filter_lazy()` method.
 - `buffer_distance` (float | None, optional): Buffer distance in meters for spatial filter (required when `geometry_column` is set).
+- `spatial_method` (Literal["SUBDIVIDE_INLINE", "SUBDIVIDE_TMP_TABLE", "DUMP_TMP_TABLE", "DUMP_CTE"], optional): Strategy for applying the spatial filter (default: "SUBDIVIDE_TMP_TABLE")
+- `subdivide_max_vertices` (int, optional): Maximum vertices per subdivided filter geometry (default: 256)
 
 **Returns:**
 - `Tuple[str, Dict]`: (enhanced_query, statistics)
@@ -288,7 +337,7 @@ Extends a SQL query with a pre-computed spatial filter geometry (WKB bytes). Non
 **Returns:**
 - `str`: The extended SQL query with spatial filter.
 
-#### `extend_query_with_spatial_filter_lazy(query, spatial_filter_sql, geometry_column, buffer_distance, p0_alias=None)`
+#### `extend_query_with_spatial_filter_lazy(query, spatial_filter_sql, geometry_column, buffer_distance, srid=4326, p0_alias=None)`
 
 Extends a SQL query with a spatial filter using a lazy SQL subquery that produces geometry.
 
@@ -296,11 +345,32 @@ Extends a SQL query with a spatial filter using a lazy SQL subquery that produce
 - `query` (str): The original SQL query.
 - `spatial_filter_sql` (str): SQL subquery returning a geometry to filter against.
 - `geometry_column` (str): The geometry column name in the target table.
-- `buffer_distance` (float): Buffer distance in meters (uses geography cast).
+- `buffer_distance` (float): Buffer distance in meters (uses geography cast for SRID 4326; skipped for metric SRIDs).
+- `srid` (int, optional): SRID of the spatial filter geometry (default: 4326).
 - `p0_alias` (str | None, optional): Table alias to apply the filter to.
 
 **Returns:**
 - `str`: The extended SQL query with spatial filter.
+
+Both spatial extension functions additionally accept `use_intersects`, `spatial_method`, `subdivide_max_vertices`, `auto_detect_partition_join`, and `partition_join_table`.
+
+#### `extend_query_with_h3_cell_filter_lazy(query, cell_sql, geometry_column, srid, resolution, p0_alias=None)`
+
+Extends a query with an H3 cell membership filter from a SQL subquery producing cell IDs: creates an indexed temporary table from `cell_sql` and adds `h3_lat_lng_to_cell(<centroid>, resolution)::bigint IN (SELECT cell FROM <tmp>)`. Pure cell lookup — no geometry reconstruction.
+
+**Returns:**
+- `str`: Multi-statement script (same single-transaction rules as the other temp-table methods).
+
+#### `extend_query_with_h3_cell_filter(query, cell_ids, geometry_column, srid, resolution, p0_alias=None)`
+
+Non-lazy counterpart: builds the same filter from a pre-computed `set[int]` of H3 cell IDs (temporary table from a `VALUES` clause).
+
+#### `extend_query_with_h3_cell_lookup(query, cell_ids, cell_mode="inline", h3_cell_table=None, h3_cell_column="h3_cell_id", h3_cell_id_column=None, p0_alias=None, geometry_column=None, srid=4326, resolution=9, filter_all_tables=True)`
+
+Filters a query via H3 cell-ID lookup with three modes: `"inline"` (compute `h3_lat_lng_to_cell` on the fly from `geometry_column`), `"mv"` (join a materialized view named in `h3_cell_table`), or `"column"` (use a pre-computed cell-ID column named in `h3_cell_id_column`). With `filter_all_tables=True` (default), all aliases referencing the same base table are filtered, giving the planner accurate cardinality estimates for cross-join queries.
+
+**Returns:**
+- `str`: The extended SQL query.
 
 ### Queue Operations
 
@@ -328,6 +398,21 @@ success = partitioncache.push_to_original_query_queue(
 
 if success:
     print("Query added to processing queue")
+```
+
+#### `push_to_query_variant_queue(query_hash_pairs: list[tuple[str, str]], partition_key: str = "partition_key", partition_datatype: str = "integer", queue_provider: str | None = None, cache_backend: str | None = None)`
+
+Pushes pre-decomposed query variants — `(query, hash)` pairs as produced by `generate_all_query_hash_pairs()` — directly to the second-tier queue, bypassing decomposition. This is the preferred public name; `push_to_query_fragment_queue` is the historical name for the same callable and remains available.
+
+**Returns:**
+- `bool`: True if all pairs were pushed successfully
+
+**Example:**
+```python
+from partitioncache.query_processor import generate_all_query_hash_pairs
+
+pairs = generate_all_query_hash_pairs(query, partition_key="city_id")
+partitioncache.push_to_query_variant_queue(pairs, partition_key="city_id", partition_datatype="integer")
 ```
 
 #### `get_queue_lengths(queue_provider: str | None = None)`
@@ -362,6 +447,8 @@ for i in range(10):
 ### AbstractCacheHandler
 
 Base class for all cache backends implementing the core interface.
+
+The examples in this section operate on a **raw handler instance** (e.g. `cache = partitioncache.get_cache_handler("postgresql_array", singleton=True)` or `helper.underlying_handler`), whose methods take an explicit `partition_key` argument. The `PartitionCacheHelper` (see below) binds the partition key instead.
 
 #### Core Methods
 
@@ -402,7 +489,7 @@ cached_data = cache.get(query_hash, "city_id")
 cached_query = cache.get_query(query_hash, "city_id")
 ```
 
-##### `set_cache(key: str, value: set[int] | set[str] | set[float] | set[datetime], partition_key: str = "partition_key") -> bool`
+##### `set_cache(key: str, partition_key_identifiers: set[int] | set[str] | set[float] | set[datetime], partition_key: str = "partition_key") -> bool`
 
 Stores a set of partition keys in the cache (cache data only).
 
@@ -410,7 +497,7 @@ Stores a set of partition keys in the cache (cache data only).
 
 **Parameters:**
 - `key` (str): Cache key (usually query hash)
-- `value` (Set): Set of partition key values
+- `partition_key_identifiers` (Set): Set of partition key values
 - `partition_key` (str): Partition identifier
 
 **Returns:**
@@ -444,9 +531,9 @@ if cached_cities:
     print(f"Found {len(cached_cities)} cities in cache")
 ```
 
-##### `exists(key: str, partition_key: str = "partition_key") -> bool`
+##### `exists(key: str, partition_key: str = "partition_key", check_query: bool = False) -> bool`
 
-Checks if a cache entry exists.
+Checks if a cache entry exists. With `check_query=True`, query metadata is consulted first: a missing query record returns False; an `'ok'` status additionally checks the cache entry; an error status (`'timeout'`/`'failed'`) returns True without a cache check.
 
 **Returns:**
 - `bool`: True if key exists
@@ -505,7 +592,7 @@ print(f"Intersection: {intersection} (from {hits} cache hits)")
 
 ##### `get_intersected_lazy(keys: set[str], partition_key: str = "partition_key") -> tuple[str | None, int]`
 
-**Advanced** - Returns lazy SQL subquery for intersection operations.
+**Advanced** - Returns lazy SQL subquery for intersection operations. Defined on `AbstractCacheHandler_Lazy` (lazy-capable backends such as the PostgreSQL family and `duckdb_bit`), not on the base class.
 
 **Returns:**
 - `Tuple[str | None, int]`: (sql_subquery, cache_hits)
@@ -536,13 +623,24 @@ High-level wrapper providing additional convenience methods and validation.
 
 #### Methods
 
-All `AbstractCacheHandler` methods are available on the helper, but without the `partition_key` parameter since it uses the helper's default partition key.
+The helper wraps a subset of the handler interface. All methods operate on the helper's bound partition key — they take **no** `partition_key` parameter. Failures are logged and return neutral values (False/None/empty) instead of raising.
 
-**Recommended methods:**
-- `set_entry(key, partition_key_identifiers, query_text, force_update=False)` - **Preferred** method for storing cache entries with query metadata
+- `set_entry(key, partition_key_identifiers, query_text, force_update=False)` - **Preferred** write path (cache data + query metadata)
+- `set_cache(key, partition_key_identifiers)` - Store cache data only
 - `get(key)` - Retrieve cached partition keys
-- `get_query(key)` - Retrieve query metadata
 - `exists(key, check_query=False)` - Check if entry exists
+- `delete(key)` - Remove entry
+- `set_null(key)` / `is_null(key)` - Negative-cache markers
+- `set_query(key, querytext)` - Store query metadata only
+- `get_intersected(keys)` - Intersect several cached sets
+- `filter_existing_keys(keys, check_query=False)` - Subset of keys present in cache
+- `get_all_keys()` - All keys of the bound partition
+- `delete_partition()` - Drop the partition's data
+- `close()` - Close the underlying handler
+
+`LazyPartitionCacheHelper` (returned automatically by `create_cache_helper` for lazy-capable backends) additionally provides `get_intersected_lazy(keys)`.
+
+Handler-level operations without a helper counterpart — e.g. `get_query`, `get_all_queries`, `register_partition_key`, `get_partition_keys` (list all partitions) — are reached via `underlying_handler`:
 
 **Example:**
 ```python
@@ -558,29 +656,33 @@ cache.set_entry(query_hash, {1, 5, 10}, query)
 
 # Retrieve cache data and metadata
 user_ids = cache.get(query_hash)
-original_query = cache.get_query(query_hash)
+original_query = cache.underlying_handler.get_query(query_hash, cache.partition_key)
 ```
 
-##### `register_partition_key(partition_key, datatype, **kwargs)`
+##### Working with additional partition keys
 
-Explicitly register a new partition key with validation.
+`register_partition_key(partition_key, datatype, **kwargs)` lives on the **handler**, not the helper. To work with several partition keys, create one helper per key (they share the same singleton handler), or use the handler directly:
 
-**Example:**
 ```python
-# Register new partition types
-cache.register_partition_key("region_id", "integer")
-cache.register_partition_key("timestamp_bucket", "timestamp")
-cache.register_partition_key("price_range", "float")
+# One helper per partition key (recommended)
+city_cache = partitioncache.create_cache_helper("postgresql_array", "city_id", "integer")
+price_cache = partitioncache.create_cache_helper("postgresql_array", "price_range", "float")
 
-# Use with different partitions
-cache.set_cache("expensive_items", {99.99, 199.99}, partition_key="price_range")
+price_cache.set_cache("expensive_items", {99.99, 199.99})
+
+# Or register directly on the handler
+cache.underlying_handler.register_partition_key("region_id", "integer")
 ```
 
 ## Query Processing Utilities
 
+### `generate_all_query_hash_pairs(query: str, partition_key: str, min_component_size=1, follow_graph=True, keep_all_attributes=True, canonicalize_queries=False, ...)`
+
+The exported lower-level API: generates all query variants and returns them as `list[tuple[str, str]]` of `(variant_query, hash)` pairs — the format consumed by `push_to_query_variant_queue()`. Accepts the full variant-generation parameter set (`auto_detect_partition_join`, `partition_join_table`, `max_component_size`, `bucket_steps`, `add_constraints`, `remove_constraints_all`, `remove_constraints_add`, `max_conditions_removed`, `protected_patterns`, and the spatial parameters `skip_partition_key_joins`/`geometry_column`).
+
 ### `generate_all_hashes(query: str, partition_key: str, min_component_size=1, follow_graph=True, fix_attributes=True, canonicalize_queries=False)`
 
-Generates query variants and their hashes for cache lookup.
+Generates query variants and their hashes for cache lookup. Thin wrapper around `generate_all_query_hash_pairs` returning only the hashes.
 
 **Parameters:**
 - `query` (str): SQL query to process
@@ -664,19 +766,20 @@ os.environ['REDIS_PASSWORD'] = 'redis_password'
 
 ### Programmatic Configuration
 
+`get_cache_handler(cache_type, singleton=False)` accepts no connection kwargs — all connection settings are read from environment variables. Set them programmatically before creating the handler if needed:
+
 ```python
-# Direct handler creation with configuration
+import os
 from partitioncache.cache_handler import get_cache_handler
 
-cache_handler = get_cache_handler(
-    cache_type="postgresql_array",
-    db_name="custom_db",
-    db_host="custom-db-server",
-    db_user="custom_user",
-    db_password="custom_password",
-    db_port=5432,
-    db_tableprefix="custom_cache_"
-)
+os.environ["DB_HOST"] = "custom-db-server"
+os.environ["DB_NAME"] = "custom_db"
+os.environ["DB_USER"] = "custom_user"
+os.environ["DB_PASSWORD"] = "custom_password"
+os.environ["DB_PORT"] = "5432"
+os.environ["PG_ARRAY_CACHE_TABLE_PREFIX"] = "custom_cache_"
+
+cache_handler = get_cache_handler("postgresql_array", singleton=True)
 ```
 
 ## Advanced Usage Patterns
@@ -684,30 +787,29 @@ cache_handler = get_cache_handler(
 ### Multi-Partition Applications
 
 ```python
-# Setup multiple partition strategies
-cache = partitioncache.create_cache_helper("postgresql_array", "default", "integer")
+from datetime import datetime
 
-# Register different partition types
-cache.register_partition_key("city_id", "integer")
-cache.register_partition_key("region_name", "text")  
-cache.register_partition_key("time_bucket", "timestamp")
+# One helper per partition key; they share the same singleton handler
+city_cache = partitioncache.create_cache_helper("postgresql_array", "city_id", "integer")
+region_cache = partitioncache.create_cache_helper("postgresql_array", "region_name", "text")
+time_cache = partitioncache.create_cache_helper("postgresql_array", "time_bucket", "timestamp")
 
 # Store data across partitions (recommended: use set_entry with query text)
 from partitioncache.query_processor import hash_query
 
-# Best practice: store with query metadata
 spatial_query = "SELECT * FROM locations WHERE city_id IN (1,5,10)"
-cache.set_entry(hash_query(spatial_query), {1, 5, 10}, spatial_query, partition_key="city_id")
+city_cache.set_entry(hash_query(spatial_query), {1, 5, 10}, spatial_query)
 
-temporal_query = "SELECT * FROM events WHERE time_bucket IN ('2024-01','2024-02')"  
-cache.set_entry(hash_query(temporal_query), {"2024-01", "2024-02"}, temporal_query, partition_key="time_bucket")
+temporal_query = "SELECT * FROM events WHERE time_bucket >= '2024-01-01'"
+time_cache.set_entry(hash_query(temporal_query), {datetime(2024, 1, 1), datetime(2024, 2, 1)}, temporal_query)
 
 regional_query = "SELECT * FROM regions WHERE region_name IN ('north','south')"
-cache.set_entry(hash_query(regional_query), {"north", "south"}, regional_query, partition_key="region_name")
+region_cache.set_entry(hash_query(regional_query), {"north", "south"}, regional_query)
 
-# Query across partitions
-for partition_key, datatype in cache.get_partition_keys():
-    keys = cache.get_all_keys(partition_key)
+# Enumerate partitions via the underlying handler
+handler = city_cache.underlying_handler
+for partition_key, datatype in handler.get_partition_keys():
+    keys = handler.get_all_keys(partition_key)
     print(f"Partition {partition_key} ({datatype}): {len(keys)} cached queries")
 ```
 
@@ -722,13 +824,13 @@ def implement_hierarchical_cache():
     fallback_cache = partitioncache.create_cache_helper("postgresql_array", "region_id", "integer")
     
     def get_with_fallback(query_hash):
-        # Try primary cache first
-        result = primary_cache.get(query_hash, partition_key="city_id")
+        # Try primary cache first (each helper is bound to its partition key)
+        result = primary_cache.get(query_hash)
         if result:
             return result, "city_level"
             
         # Fallback to region level
-        result = fallback_cache.get(query_hash, partition_key="region_id")
+        result = fallback_cache.get(query_hash)
         if result:
             return result, "region_level"
             
@@ -768,7 +870,7 @@ def cached_query_lookup(query, cache, partition_key):
 ### Batch Operations
 
 ```python
-def batch_cache_population(queries_and_results, cache, partition_key):
+def batch_cache_population(queries_and_results, cache):
     """Efficiently populate cache with multiple queries."""
     
     success_count = 0
@@ -777,8 +879,8 @@ def batch_cache_population(queries_and_results, cache, partition_key):
         from partitioncache.query_processor import hash_query
         query_hash = hash_query(query)
         
-        # Store in cache
-        if cache.set_cache(query_hash, partition_keys, partition_key):
+        # Store in cache (helper is bound to its partition key)
+        if cache.set_cache(query_hash, partition_keys):
             success_count += 1
     
     print(f"Batch population: {success_count}/{len(queries_and_results)} successful")

@@ -104,30 +104,38 @@ class TestMetadataTableCreation:
 
         # Init flow for PostgreSQLBitCacheHandler (overrides _recreate_metadata_table):
         #   super().__init__() -> _recreate_metadata_table():
-        #     1. SELECT to_regclass(...) - check if table exists
-        #     2. _load_sql_functions() - loads SQL file content
-        #     3. CREATE TABLE partition_metadata (with bitsize column)
-        #     4. CREATE TABLE queries
-        #     5. _create_bitsize_trigger() - SELECT partitioncache_create_bitsize_trigger(...)
-        # Total: exactly 5 execute calls
-        assert mock_cursor.execute.call_count == 5, (
-            f"Expected exactly 5 execute calls (regclass check + SQL functions + metadata table + queries table + bitsize trigger), "
+        #     1. pg_advisory_xact_lock(hashtext(prefix)) - serialise this prefix's DDL
+        #     2. SELECT to_regclass(...) - check if table exists
+        #     3. _load_sql_functions() - loads SQL file content
+        #     4. CREATE TABLE partition_metadata (with bitsize column)
+        #     5. CREATE TABLE queries
+        #     6. _create_bitsize_trigger() - SELECT partitioncache_create_bitsize_trigger(...)
+        # Total: exactly 6 execute calls
+        assert mock_cursor.execute.call_count == 6, (
+            f"Expected exactly 6 execute calls (advisory lock + regclass check + SQL functions + metadata table + queries table + bitsize trigger), "
             f"got {mock_cursor.execute.call_count}"
         )
 
         # Verify SQL call content by order
         execute_calls = mock_cursor.execute.call_args_list
 
-        # Call 0: SELECT to_regclass(...) to check if table exists
-        first_call_sql = str(execute_calls[0])
-        assert "to_regclass" in first_call_sql, (
-            f"First call should check table existence via to_regclass, got: {first_call_sql}"
+        # Call 0: the advisory lock, which has to come before anything that takes a
+        # relation lock -- otherwise two workers acquire the two locks in opposite orders.
+        lock_call_sql = str(execute_calls[0])
+        assert "pg_advisory_xact_lock" in lock_call_sql, (
+            f"First call should take the per-prefix DDL lock, got: {lock_call_sql}"
         )
 
-        # Call 2: CREATE TABLE partition_metadata with bitsize
-        metadata_call_sql = str(execute_calls[2])
+        # Call 1: SELECT to_regclass(...) to check if table exists
+        first_call_sql = str(execute_calls[1])
+        assert "to_regclass" in first_call_sql, (
+            f"Second call should check table existence via to_regclass, got: {first_call_sql}"
+        )
+
+        # Call 3: CREATE TABLE partition_metadata with bitsize
+        metadata_call_sql = str(execute_calls[3])
         assert "partition_metadata" in metadata_call_sql, (
-            f"Third call should create partition_metadata table, got: {metadata_call_sql}"
+            f"Fourth call should create partition_metadata table, got: {metadata_call_sql}"
         )
         assert "bitsize" in metadata_call_sql.lower(), (
             f"Metadata table CREATE should include bitsize column, got: {metadata_call_sql}"
@@ -136,16 +144,16 @@ class TestMetadataTableCreation:
             f"Metadata table should have integer datatype constraint, got: {metadata_call_sql}"
         )
 
-        # Call 3: CREATE TABLE queries
-        queries_call_sql = str(execute_calls[3])
+        # Call 4: CREATE TABLE queries
+        queries_call_sql = str(execute_calls[4])
         assert "queries" in queries_call_sql, (
-            f"Fourth call should create queries table, got: {queries_call_sql}"
+            f"Fifth call should create queries table, got: {queries_call_sql}"
         )
 
-        # Call 4: SELECT partitioncache_create_bitsize_trigger
-        trigger_call_sql = str(execute_calls[4])
+        # Call 5: SELECT partitioncache_create_bitsize_trigger
+        trigger_call_sql = str(execute_calls[5])
         assert "partitioncache_create_bitsize_trigger" in trigger_call_sql, (
-            f"Fifth call should create bitsize trigger, got: {trigger_call_sql}"
+            f"Sixth call should create bitsize trigger, got: {trigger_call_sql}"
         )
 
         handler.close()
@@ -166,14 +174,15 @@ class TestMetadataTableCreation:
 
         # Init flow for PostgreSQLRoaringBitCacheHandler (overrides _recreate_metadata_table):
         #   super().__init__() -> _recreate_metadata_table():
-        #     1. _load_sql_functions() - loads SQL file content
-        #     2. CREATE TABLE partition_metadata (integer-only constraint)
-        #     3. CREATE TABLE queries
+        #     1. pg_advisory_xact_lock(hashtext(prefix)) - serialise this prefix's DDL
+        #     2. _load_sql_functions() - loads SQL file content
+        #     3. CREATE TABLE partition_metadata (integer-only constraint)
+        #     4. CREATE TABLE queries
         #   Then in __init__():
-        #     4. CREATE EXTENSION IF NOT EXISTS roaringbitmap
-        # Total: exactly 4 execute calls
-        assert mock_cursor.execute.call_count == 4, (
-            f"Expected exactly 4 execute calls (SQL functions + metadata table + queries table + roaringbitmap extension), "
+        #     5. CREATE EXTENSION IF NOT EXISTS roaringbitmap
+        # Total: exactly 5 execute calls
+        assert mock_cursor.execute.call_count == 5, (
+            f"Expected exactly 5 execute calls (advisory lock + SQL functions + metadata table + queries table + roaringbitmap extension), "
             f"got {mock_cursor.execute.call_count}"
         )
 
@@ -181,19 +190,24 @@ class TestMetadataTableCreation:
         execute_calls = [call[0][0] for call in mock_cursor.execute.call_args_list]
 
         # Verify call order:
-        # Call 1: CREATE TABLE partition_metadata
-        assert "partition_metadata" in str(execute_calls[1]), (
-            f"Second execute call should create partition_metadata table, got: {str(execute_calls[1])}"
+        # Call 0: the per-prefix DDL lock, which must precede anything taking a relation lock
+        assert "pg_advisory_xact_lock" in str(execute_calls[0]), (
+            f"First execute call should take the per-prefix DDL lock, got: {str(execute_calls[0])}"
         )
 
-        # Call 2: CREATE TABLE queries
-        assert "queries" in str(execute_calls[2]), (
-            f"Third execute call should create queries table, got: {str(execute_calls[2])}"
+        # Call 2: CREATE TABLE partition_metadata
+        assert "partition_metadata" in str(execute_calls[2]), (
+            f"Third execute call should create partition_metadata table, got: {str(execute_calls[2])}"
         )
 
-        # Call 3: CREATE EXTENSION roaringbitmap
-        assert "roaringbitmap" in str(execute_calls[3]), (
-            f"Fourth execute call should create roaringbitmap extension, got: {str(execute_calls[3])}"
+        # Call 3: CREATE TABLE queries
+        assert "queries" in str(execute_calls[3]), (
+            f"Fourth execute call should create queries table, got: {str(execute_calls[3])}"
+        )
+
+        # Call 4: CREATE EXTENSION roaringbitmap
+        assert "roaringbitmap" in str(execute_calls[4]), (
+            f"Fifth execute call should create roaringbitmap extension, got: {str(execute_calls[4])}"
         )
 
         # Look for the specific roaringbit metadata table creation, not the general SQL function

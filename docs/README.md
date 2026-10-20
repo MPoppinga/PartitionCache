@@ -79,6 +79,7 @@ PartitionCache follows a modular architecture with distinct layers:
 ## Documentation Index
 
 ### Core Documentation
+- **[Architecture & Design Decisions](architecture_and_design_decisions.md)** - Consolidated reference of all components and design decisions with machine-checkable code anchors
 - **[API Reference](api_reference.md)** - Detailed Python API documentation
 - **[CLI Reference](cli_reference.md)** - Command-line tools documentation
 - **[Architecture Diagrams](architecture_diagrams.md)** - Visual system representations
@@ -98,7 +99,7 @@ PartitionCache follows a modular architecture with distinct layers:
 ### Examples & Tutorials
 - **[Complete Workflow](complete_workflow_example.md)** - End-to-end tutorial
 - **[Cache Management CLI](manage_cache_cli.md)** - pcache-manage usage guide
-- **[P0 Table Handling](p0_table_handling.md)** - Star-join query optimization
+- **[P0 Table Handling](p0_table_handling.md)** - Partition-join query optimization
 - **[pg_cron Cross-Database Setup](pg_cron_cross_database_setup.md)** - Advanced PostgreSQL configuration
 
 ## Key Concepts

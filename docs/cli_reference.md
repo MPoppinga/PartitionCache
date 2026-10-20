@@ -281,7 +281,7 @@ Advanced options for controlling how query variants are generated for better cac
 - `--partition-datatype {integer,float,text,timestamp,geometry}` - Partition key datatype
   - **Default**: Inferred from query analysis
   - **When to specify**: For explicit type validation or when inference fails
-  - **Spatial**: Use `geometry` for spatial queries (requires `--cache-backend postgis_h3` or `postgis_bbox`)
+  - **Spatial**: Use `geometry` for spatial queries (requires `--cache-backend postgis_bbox` or `rocksdict_h3_grouped`)
 
 ### Spatial Configuration
 - `--geometry-column GEOMETRY_COLUMN` - Name of the geometry column for spatial queries
@@ -382,14 +382,14 @@ This generates multiple variants:
 - Variants with and without `size = 4` constraint
 - Variants with added `active = true` constraint
 
-**Spatial query (PostGIS H3 backend):**
+**Spatial query (PostGIS BBox backend):**
 ```bash
 pcache-add --queue \
   --query-file "spatial_query.sql" \
   --partition-key "spatial" \
   --partition-datatype geometry \
   --geometry-column geom \
-  --cache-backend postgis_h3
+  --cache-backend postgis_bbox
 ```
 
 **Spatial query (direct execution):**

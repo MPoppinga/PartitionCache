@@ -1,13 +1,33 @@
 import threading
 from abc import abstractmethod
+from collections.abc import Callable
+from contextlib import contextmanager
+from functools import wraps
 from logging import getLogger
+from pathlib import Path
+from typing import ParamSpec, TypeVar
 
 import psycopg
 from psycopg import sql
+from psycopg.pq import TransactionStatus
 
 from partitioncache.cache_handler.abstract import AbstractCacheHandler_Lazy
 
 logger = getLogger("PartitionCache")
+
+P = ParamSpec("P")
+R = TypeVar("R")
+
+
+def _ends_read_transaction(fn: Callable[P, R]) -> Callable[P, R]:  # noqa: UP047 -- PEP 695 syntax needs Python 3.12, package supports 3.10
+    """Mark a read-only handler method so it leaves the connection idle. See _read_txn."""
+
+    @wraps(fn)
+    def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+        with args[0]._read_txn():  # type: ignore[attr-defined]
+            return fn(*args, **kwargs)
+
+    return wrapper
 
 
 class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
@@ -88,16 +108,91 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
                 logger.error(f"Failed to rollback after metadata table creation error: {rollback_error}")
             raise
 
+    @contextmanager
+    def _serialized_ddl(self):
+        """Serialize this prefix's one-time DDL against other workers on the same prefix.
+
+        Handler setup runs CREATE TABLE, ALTER TABLE and CREATE OR REPLACE FUNCTION against
+        objects every worker shares. Four workers building handlers for one prefix while a
+        fifth is already writing deadlock on the metadata table and on pg_proc; PostgreSQL
+        breaks the cycle by killing one, which surfaces as a lost fragment.
+
+        The lock is transaction-scoped, so it releases at the unit's own commit and nothing
+        leaks on error. It has to be the FIRST statement of the transaction: a read taken
+        first would hold its own lock already and invert the order between two workers.
+        hashtext() is used rather than Python's hash(), which is salted per process and so
+        gives each worker a different lock id for the same prefix.
+        """
+        if self.db.info.transaction_status != TransactionStatus.IDLE:
+            logger.debug("DDL lock taken inside an open transaction; lock order is not guaranteed")
+        self._take_ddl_lock()
+        yield
+
+    def _take_ddl_lock(self) -> None:
+        """Take this prefix's transaction-scoped DDL advisory lock (see _serialized_ddl)."""
+        self.cursor.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (self.tableprefix,))
+
+    def _load_sql_functions(self) -> None:
+        """Load the SQL functions from postgresql_cache_handlers.sql.
+
+        Usually called as the first statement inside _serialized_ddl, where the advisory
+        lock belongs to the open transaction. A failed load aborts that transaction, and the
+        rollback that clears it also releases the lock, so the lock is taken again before
+        the DDL that follows. No savepoint is used: handlers may share one connection
+        across threads, and another thread's commit destroys a savepoint in between.
+        """
+        sql_cache_file = Path(__file__).parent / "postgresql_cache_handlers.sql"
+        if not sql_cache_file.exists():
+            logger.warning(f"SQL cache handlers file not found at {sql_cache_file}")
+            return
+
+        in_transaction = self.db.info.transaction_status == TransactionStatus.INTRANS
+        try:
+            self.cursor.execute(sql_cache_file.read_text())  # type: ignore[arg-type]
+            logger.debug("Successfully loaded SQL functions from cache handlers file")
+        except Exception as e:
+            logger.warning(f"Failed to load SQL functions (this is OK if they're already loaded): {e}")
+            # Continuing on an aborted transaction makes every later statement fail with
+            # "current transaction is aborted", which hides the real error behind it.
+            try:
+                self.db.rollback()
+                if in_transaction:
+                    self._take_ddl_lock()  # the rollback released the caller's DDL lock
+            except Exception:
+                logger.debug("rollback after SQL function load failed", exc_info=True)
+
+    @contextmanager
+    def _read_txn(self):
+        """End a transaction that a read opened.
+
+        These methods only SELECT and never commit, so without this the connection stays
+        `idle in transaction` holding an AccessShareLock on whatever it touched until the
+        handler is closed. That is enough to stall the processor: one worker's unfinished
+        read of _partition_metadata blocks another worker's ALTER TABLE on the same table,
+        and since there is no deadlock cycle PostgreSQL never breaks it.
+
+        Only a transaction opened inside the block is ended. If the caller was already in
+        one it owns the pending work, so ending it here could discard a write.
+        """
+        owns = self.db.info.transaction_status == TransactionStatus.IDLE
+        try:
+            yield
+        finally:
+            if owns and self.db.info.transaction_status != TransactionStatus.IDLE:
+                self.db.rollback()  # a read changed nothing, so discard rather than commit
+
     def _ensure_metadata_table_exists(self) -> None:
         """Ensure the metadata table exists, create it if it doesn't."""
         try:
             # Test if metadata table exists by trying to query it
-            self.cursor.execute(sql.SQL("SELECT 1 FROM {0} LIMIT 1").format(sql.Identifier(self.tableprefix + "_partition_metadata")))
+            with self._read_txn():
+                self.cursor.execute(sql.SQL("SELECT 1 FROM {0} LIMIT 1").format(sql.Identifier(self.tableprefix + "_partition_metadata")))
         except Exception:
             # Metadata table doesn't exist, create it
             logger.info(f"Creating metadata table: {self.tableprefix}_partition_metadata")
             self._recreate_metadata_table(self.get_supported_datatypes())
 
+    @_ends_read_transaction
     def _get_partition_datatype(self, partition_key: str) -> str | None:
         """Get the datatype for a partition key from metadata."""
         if partition_key in self._cached_datatype:
@@ -167,6 +262,7 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
                 logger.error(f"Failed to rollback transaction: {rollback_error}")
             return False
 
+    @_ends_read_transaction
     def get_query(self, key: str, partition_key: str = "partition_key") -> str | None:
         """Retrieve the query text associated with the given key."""
         try:
@@ -179,6 +275,7 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
             logger.debug(f"Failed to get query for key {key}: {e}")
             return None
 
+    @_ends_read_transaction
     def get_all_queries(self, partition_key: str) -> list[tuple[str, str]]:
         """Retrieve all query hash and text pairs for a specific partition."""
         try:
@@ -225,6 +322,7 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
                 logger.error(f"Failed to rollback transaction: {rollback_error}")
             return False
 
+    @_ends_read_transaction
     def is_null(self, key: str, partition_key: str = "partition_key") -> bool:
         """Check if key has null value in partition-specific table."""
         datatype = self._get_partition_datatype(partition_key)
@@ -279,6 +377,7 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
                 # Rollback failed - return False anyway
                 return False
 
+    @_ends_read_transaction
     def _check_cache_exists(self, key: str, partition_key: str) -> bool:
         """Helper method to check if a hash exists in the cache table."""
         table_name = f"{self.tableprefix}_cache_{partition_key}"
@@ -292,6 +391,7 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
         result = self.cursor.fetchone()
         return result is not None
 
+    @_ends_read_transaction
     def filter_existing_keys(self, keys: set, partition_key: str = "partition_key", check_query: bool = False) -> set:
         """Return the set of keys that exist in the partition-specific cache."""
         try:
@@ -341,6 +441,7 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
             logger.error(f"Failed to filter existing keys in partition {partition_key}: {e}")
             return set()
 
+    @_ends_read_transaction
     def get_all_keys(self, partition_key: str) -> list:
         """Get all keys for a specific partition key."""
         datatype = self._get_partition_datatype(partition_key)
@@ -451,6 +552,7 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
                 logger.error(f"Failed to rollback transaction: {rollback_error}")
             return 0
 
+    @_ends_read_transaction
     def get_partition_keys(self) -> list[tuple[str, str]]:
         """Get all partition keys and their datatypes."""
         try:
@@ -503,6 +605,7 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
                 logger.error(f"Failed to rollback transaction: {rollback_error}")
             return False
 
+    @_ends_read_transaction
     def get_query_status(self, key: str, partition_key: str = "partition_key") -> str | None:
         """Get the status of a query from the queries table."""
         try:

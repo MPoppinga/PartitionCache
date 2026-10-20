@@ -221,6 +221,10 @@ DECLARE
 BEGIN
     v_job_id := 'job_' || p_item_id;
     v_start_time := clock_timestamp();
+
+    -- Queue items carry the full handler name (postgresql_array, postgis_bbox), the processor
+    -- config the short form (array, bbox). The branches below compare against the short form.
+    p_cache_backend := regexp_replace(p_cache_backend, '^(postgresql|postgis)_', '');
     
     -- Set table names
     v_active_jobs_table := p_queue_prefix || '_active_jobs';

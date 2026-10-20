@@ -168,6 +168,139 @@ def setup_all_tables(cache_backend: str | None = None, queue_provider: str | Non
         raise
 
 
+def setup_h3_cells(
+    mode: str,
+    table: str,
+    geometry_column: str,
+    id_column: str,
+    resolution: int = 9,
+    srid: int = 4326,
+    mv_name: str | None = None,
+    column_name: str | None = None,
+) -> None:
+    """
+    Set up H3 cell pre-computation for spatial filtering.
+
+    Creates either a materialized view or a direct column with pre-computed
+    H3 cell IDs for B-tree-based spatial filtering at query time.
+
+    Uses PostgreSQL h3-pg extension + PostGIS for the one-time computation.
+    No PostGIS needed at runtime.
+
+    Args:
+        mode: "mv" for materialized view, "column" for direct column on fact table.
+        table: Source table name.
+        geometry_column: Geometry column in the source table.
+        id_column: Entity ID column in the source table.
+        resolution: H3 resolution (0-15, default 9 ~174m edge).
+        srid: SRID of the geometry data.
+        mv_name: Name for the materialized view (mv mode only).
+        column_name: Name for the H3 cell column (column mode only).
+    """
+    import psycopg
+    from psycopg import sql
+
+    if not 0 <= resolution <= 15:
+        raise ValueError(f"H3 resolution must be between 0 and 15, got {resolution}")
+
+    def qualified(name: str) -> sql.Identifier:
+        """Quote a possibly schema-qualified name (schema.table) as an identifier."""
+        return sql.Identifier(*name.split("."))
+
+    # Build centroid expression with SRID handling
+    centroid_expr = sql.SQL("ST_Centroid({geom})").format(geom=sql.Identifier(geometry_column))
+    if srid != 4326:
+        centroid_expr = sql.SQL("ST_Transform({centroid}, 4326)").format(centroid=centroid_expr)
+
+    h3_cell_expr = sql.SQL("h3_lat_lng_to_cell({centroid}::point, {res})::bigint").format(centroid=centroid_expr, res=sql.Literal(resolution))
+
+    # Get PostgreSQL connection config
+    db_host = os.getenv("PG_H3_HOST") or os.getenv("DB_HOST")
+    db_port = int(os.getenv("PG_H3_PORT") or os.getenv("DB_PORT") or "5432")
+    db_user = os.getenv("PG_H3_USER") or os.getenv("DB_USER")
+    db_password = os.getenv("PG_H3_PASSWORD") or os.getenv("DB_PASSWORD")
+    db_name = os.getenv("PG_H3_DB") or os.getenv("DB_NAME")
+
+    if not all([db_host, db_user, db_password, db_name]):
+        raise ValueError("PostgreSQL connection not configured. Set DB_HOST, DB_USER, DB_PASSWORD, DB_NAME environment variables.")
+
+    conn = psycopg.connect(
+        dbname=db_name,
+        host=db_host,
+        user=db_user,
+        password=db_password,
+        port=db_port,
+        autocommit=True,
+    )
+
+    try:
+        cursor = conn.cursor()
+
+        if mode == "mv":
+            view_name = mv_name or f"{table}_h3_cells"
+            h3_col = column_name or "h3_cell_id"
+            view = qualified(view_name)
+            view_base = view_name.split(".")[-1]
+
+            logger.info(f"Creating materialized view '{view_name}' from '{table}'...")
+
+            cursor.execute(sql.SQL("DROP MATERIALIZED VIEW IF EXISTS {view}").format(view=view))
+            cursor.execute(
+                sql.SQL("CREATE MATERIALIZED VIEW {view} AS SELECT {id_col}, {cell} AS {h3_col} FROM {table}").format(
+                    view=view,
+                    id_col=sql.Identifier(id_column),
+                    cell=h3_cell_expr,
+                    h3_col=sql.Identifier(h3_col),
+                    table=qualified(table),
+                )
+            )
+
+            logger.info(f"Creating B-tree indexes on '{view_name}'...")
+            for indexed_col in (h3_col, id_column):
+                cursor.execute(
+                    sql.SQL("CREATE INDEX {index} ON {view} USING btree ({col})").format(
+                        index=sql.Identifier(f"idx_{view_base}_{indexed_col}"), view=view, col=sql.Identifier(indexed_col)
+                    )
+                )
+
+            cursor.execute(sql.SQL("SELECT count(*) FROM {view}").format(view=view))
+            row_count = cursor.fetchone()
+            count = row_count[0] if row_count else 0
+            logger.info(f"Materialized view '{view_name}' created with {count} rows")
+            logger.info(f"Set environment: H3_CELL_MODE=mv H3_CELL_TABLE={view_name} H3_CELL_COLUMN={h3_col} H3_CELL_ID_COLUMN={id_column}")
+
+        elif mode == "column":
+            col_name = column_name or f"h3_cell_{resolution}"
+            source = qualified(table)
+            col = sql.Identifier(col_name)
+
+            logger.info(f"Adding column '{col_name}' to table '{table}'...")
+
+            cursor.execute(sql.SQL("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col} bigint").format(table=source, col=col))
+
+            logger.info(f"Computing H3 cell IDs for all rows in '{table}'...")
+            cursor.execute(sql.SQL("UPDATE {table} SET {col} = {cell}").format(table=source, col=col, cell=h3_cell_expr))
+
+            logger.info(f"Creating B-tree index on '{table}.{col_name}'...")
+            cursor.execute(
+                sql.SQL("CREATE INDEX IF NOT EXISTS {index} ON {table} USING btree ({col})").format(
+                    index=sql.Identifier(f"idx_{table.split('.')[-1]}_{col_name}"), table=source, col=col
+                )
+            )
+
+            cursor.execute(sql.SQL("SELECT count(*) FROM {table} WHERE {col} IS NOT NULL").format(table=source, col=col))
+            row_count = cursor.fetchone()
+            count = row_count[0] if row_count else 0
+            logger.info(f"Column '{col_name}' populated for {count} rows in '{table}'")
+            logger.info(f"Set environment: H3_CELL_MODE=column H3_CELL_COLUMN={col_name}")
+
+        else:
+            raise ValueError(f"Unsupported mode: {mode}. Use 'mv' or 'column'.")
+
+    finally:
+        conn.close()
+
+
 def validate_environment() -> bool:
     """
     Validate that the environment is properly configured for PartitionCache.
@@ -1545,6 +1678,17 @@ valid environment variables. Use --env to load configuration from a custom file.
     setup_cache = setup_subparsers.add_parser("cache", help="Set up cache metadata tables only")
     setup_cache.add_argument("--cache", type=str, help="Cache backend to setup (defaults to CACHE_BACKEND env var)")
 
+    # Setup h3-cells command
+    setup_h3 = setup_subparsers.add_parser("h3-cells", help="Pre-compute H3 cell IDs for spatial filtering")
+    setup_h3.add_argument("--mode", required=True, choices=["mv", "column"], help="'mv' for materialized view, 'column' for direct column on fact table")
+    setup_h3.add_argument("--table", required=True, help="Source table name")
+    setup_h3.add_argument("--geometry-column", default="geom", help="Geometry column name (default: geom)")
+    setup_h3.add_argument("--id-column", default="id", help="Entity ID column name (default: id)")
+    setup_h3.add_argument("--resolution", type=int, default=9, help="H3 resolution 0-15 (default: 9, ~174m edge)")
+    setup_h3.add_argument("--srid", type=int, default=4326, help="SRID of geometry data (default: 4326)")
+    setup_h3.add_argument("--mv-name", help="Materialized view name (default: {table}_h3_cells)")
+    setup_h3.add_argument("--column-name", help="H3 cell column name (default: h3_cell_{resolution})")
+
     # Status commands
     status_parser = subparsers.add_parser("status", help="Check PartitionCache status and configuration")
     status_subparsers = status_parser.add_subparsers(dest="status_command", help="Status operations")
@@ -1604,7 +1748,7 @@ valid environment variables. Use --env to load configuration from a custom file.
 
     queue_clear_parser = queue_subparsers.add_parser("clear", help="Clear queue entries")
     queue_clear_parser.add_argument("--original", action="store_true", help="Clear only original query queue")
-    queue_clear_parser.add_argument("--fragment", action="store_true", help="Clear only fragment query queue")
+    queue_clear_parser.add_argument("--fragment", action="store_true", help="Clear only the query variant queue (query_fragment_queue)")
 
     # Maintenance commands
     maintenance_parser = subparsers.add_parser("maintenance", help="Maintenance operations")
@@ -1657,6 +1801,17 @@ valid environment variables. Use --env to load configuration from a custom file.
                 setup_queue_tables(queue_provider=getattr(args, "queue", None))
             elif args.setup_command == "cache":
                 setup_cache_metadata_tables(cache_backend=getattr(args, "cache", None))
+            elif args.setup_command == "h3-cells":
+                setup_h3_cells(
+                    mode=args.mode,
+                    table=args.table,
+                    geometry_column=args.geometry_column,
+                    id_column=args.id_column,
+                    resolution=args.resolution,
+                    srid=args.srid,
+                    mv_name=getattr(args, "mv_name", None),
+                    column_name=getattr(args, "column_name", None),
+                )
 
         elif args.command == "status":
             if not args.status_command or args.status_command == "all":

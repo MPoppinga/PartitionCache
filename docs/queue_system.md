@@ -142,23 +142,25 @@ partitioncache.push_to_original_query_queue(
 )
 ```
 
-#### `push_to_query_fragment_queue(query_hash_pairs: list[tuple[str, str]], partition_key: str = "partition_key", partition_datatype: str = "integer", queue_provider: str | None = None, cache_backend: str | None = None)`
-Add processed query fragments to the query fragment queue:
+#### `push_to_query_variant_queue(query_hash_pairs: list[tuple[str, str]], partition_key: str = "partition_key", partition_datatype: str = "integer", queue_provider: str | None = None, cache_backend: str | None = None)`
+Add processed query variants (query-hash pairs) to the query variant queue:
 
 ```python
-# Add query fragments with partition key
+# Add query variants with partition key
 query_hash_pairs = [
     ("SELECT * FROM users WHERE age > 25 AND user_id = 1", "hash123"),
     ("SELECT * FROM users WHERE age > 25 AND user_id = 2", "hash456")
 ]
-partitioncache.push_to_query_fragment_queue(query_hash_pairs, "user_id", "integer")
+partitioncache.push_to_query_variant_queue(query_hash_pairs, "user_id", "integer")
 
-# Add spatial query fragments with explicit cache backend
-partitioncache.push_to_query_fragment_queue(
+# Add spatial query variants with explicit cache backend
+partitioncache.push_to_query_variant_queue(
     query_hash_pairs, "spatial_key", "geometry",
-    cache_backend="postgis_h3"
+    cache_backend="postgis_bbox"
 )
 ```
+
+> `push_to_query_fragment_queue` is a backward-compatible alias of `push_to_query_variant_queue` (same callable). New code should use `push_to_query_variant_queue`.
 
 #### `pop_from_original_query_queue(queue_provider: str | None = None)`
 Retrieve original queries for processing:
@@ -180,7 +182,7 @@ result = partitioncache.pop_from_query_fragment_queue()
 if result:
     query, hash_val, partition_key, partition_datatype, cache_backend = result
     print(f"Executing query {hash_val} for partition: {partition_key}")
-    # cache_backend is None for non-spatial queries, or e.g. "postgis_h3" for spatial
+    # cache_backend is None for non-spatial queries, or e.g. "postgis_bbox" for spatial
 ```
 
 #### `get_queue_lengths(queue_provider: str | None = None)`

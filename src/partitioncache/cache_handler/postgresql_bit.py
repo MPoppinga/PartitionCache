@@ -6,7 +6,7 @@ from bitarray import bitarray
 from psycopg import sql
 from psycopg.errors import IntegrityError
 
-from partitioncache.cache_handler.postgresql_abstract import PostgreSQLAbstractCacheHandler
+from partitioncache.cache_handler.postgresql_abstract import PostgreSQLAbstractCacheHandler, _ends_read_transaction
 
 logger = getLogger("PartitionCache")
 
@@ -34,50 +34,82 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
         Extends the base metadata table functionality.
         """
         try:
-            # Check if the metadata table already exists
-            self.cursor.execute(sql.SQL("SELECT to_regclass('{0}')").format(sql.Identifier(self.tableprefix + "_partition_metadata")))
-            result = self.cursor.fetchone()
-            # Handle both real database results and mock objects
-            try:
-                if result and result[0]:
+            with self._serialized_ddl():
+                # Check if the metadata table already exists
+                self.cursor.execute(sql.SQL("SELECT to_regclass('{0}')").format(sql.Identifier(self.tableprefix + "_partition_metadata")))
+                result = self.cursor.fetchone()
+                # Handle both real database results and mock objects
+                table_exists = False
+                try:
+                    if result and result[0]:
+                        table_exists = True
+                except (TypeError, AttributeError):
+                    # If result is a Mock or doesn't support subscripting, continue with table creation
+                    pass
+
+                if table_exists:
+                    # Table exists — ensure it has the bitsize column (may have been created by postgresql_array handler)
+                    self.cursor.execute(
+                        sql.SQL("""SELECT column_name FROM information_schema.columns
+                            WHERE table_name = %s AND column_name = 'bitsize'"""),
+                        (self.tableprefix + "_partition_metadata",),
+                    )
+                    has_bitsize = self.cursor.fetchone() is not None
+                    if not has_bitsize:
+                        logger.info(f"BIT METADATA: Adding missing bitsize column to {self.tableprefix}_partition_metadata")
+                        self.cursor.execute(
+                            sql.SQL("ALTER TABLE {0} ADD COLUMN bitsize INTEGER").format(
+                                sql.Identifier(self.tableprefix + "_partition_metadata")
+                            )
+                        )
+                        self.db.commit()
+
+                    # Nothing to do if the trigger is already there: re-running the function
+                    # loader and the trigger DDL on every handler construction is what makes
+                    # concurrent workers collide on pg_proc and on the metadata table.
+                    self.cursor.execute(
+                        "SELECT 1 FROM pg_trigger WHERE NOT tgisinternal AND tgname = %s",
+                        (self.tableprefix + "_bitsize_trigger",),
+                    )
+                    if self.cursor.fetchone() is None:
+                        self._load_sql_functions()
+                        self._create_bitsize_trigger()
+                    self.db.commit()
                     return
-            except (TypeError, AttributeError):
-                # If result is a Mock or doesn't support subscripting, continue with table creation
-                pass
 
-            logger.warning(f"! Setting up {self.tableprefix} cache handler: Loading SQL functions")
-            # Load SQL functions first
-            self._load_sql_functions()
+                logger.warning(f"! Setting up {self.tableprefix} cache handler: Loading SQL functions")
+                # Load SQL functions first
+                self._load_sql_functions()
 
-            # Create metadata table with bitsize column for bit arrays
-            self.cursor.execute(
-                sql.SQL("""CREATE TABLE IF NOT EXISTS {0} (
-                    partition_key TEXT PRIMARY KEY,
-                    datatype TEXT NOT NULL CHECK (datatype = 'integer'),
-                    bitsize INTEGER NOT NULL,
-                    created_at TIMESTAMP DEFAULT now()
-                );""").format(sql.Identifier(self.tableprefix + "_partition_metadata"))
-            )
-            logger.info("BIT METADATA: Bit metadata table created successfully")
+                # Create metadata table with bitsize column for bit arrays
+                self.cursor.execute(
+                    sql.SQL("""CREATE TABLE IF NOT EXISTS {0} (
+                        partition_key TEXT PRIMARY KEY,
+                        datatype TEXT NOT NULL CHECK (datatype = 'integer'),
+                        bitsize INTEGER NOT NULL,
+                        created_at TIMESTAMP DEFAULT now()
+                    );""").format(sql.Identifier(self.tableprefix + "_partition_metadata"))
+                )
+                logger.info("BIT METADATA: Bit metadata table created successfully")
 
-            # Create queries table (same as base implementation)
-            self.cursor.execute(
-                sql.SQL("""CREATE TABLE IF NOT EXISTS {0} (
-                    query_hash TEXT NOT NULL,
-                    query TEXT NOT NULL,
-                    partition_key TEXT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'ok' CHECK (status IN ('ok', 'timeout', 'failed')),
-                    last_seen TIMESTAMP NOT NULL DEFAULT now(),
-                    PRIMARY KEY (query_hash, partition_key)
-                );""").format(sql.Identifier(self.tableprefix + "_queries"))
-            )
-            logger.info("BIT METADATA: Queries table created successfully")
+                # Create queries table (same as base implementation)
+                self.cursor.execute(
+                    sql.SQL("""CREATE TABLE IF NOT EXISTS {0} (
+                        query_hash TEXT NOT NULL,
+                        query TEXT NOT NULL,
+                        partition_key TEXT NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'ok' CHECK (status IN ('ok', 'timeout', 'failed')),
+                        last_seen TIMESTAMP NOT NULL DEFAULT now(),
+                        PRIMARY KEY (query_hash, partition_key)
+                    );""").format(sql.Identifier(self.tableprefix + "_queries"))
+                )
+                logger.info("BIT METADATA: Queries table created successfully")
 
-            # Create trigger function for handling bitsize changes (now that SQL functions are loaded)
-            self._create_bitsize_trigger()
-            logger.info("BIT METADATA: Bitsize trigger created successfully")
+                # Create trigger function for handling bitsize changes (now that SQL functions are loaded)
+                self._create_bitsize_trigger()
+                logger.info("BIT METADATA: Bitsize trigger created successfully")
 
-            self.db.commit()
+                self.db.commit()
         except Exception as e:
             logger.error(f"Failed to recreate bit metadata table: {e}")
             try:
@@ -86,6 +118,7 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
                 logger.error(f"Failed to rollback after metadata table creation error: {rollback_error}")
             raise
 
+    @_ends_read_transaction
     def _get_partition_bitsize(self, partition_key: str) -> int | None:
         """Get the bitsize for a partition key from metadata."""
         self.cursor.execute(
@@ -101,26 +134,6 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
             (bitsize, partition_key),
         )
         self.db.commit()
-
-    def _load_sql_functions(self) -> None:
-        """Load SQL functions from the cache handlers SQL file."""
-        try:
-            from pathlib import Path
-
-            # Get the SQL file path for cache handlers
-            sql_cache_file = Path(__file__).parent / "postgresql_cache_handlers.sql"
-
-            if not sql_cache_file.exists():
-                logger.warning(f"SQL cache handlers file not found at {sql_cache_file}")
-                return
-
-            # Read and execute the SQL file
-            sql_cache_content = sql_cache_file.read_text()
-            logger.info(f"LOADING SQL: Executing SQL functions file ({len(sql_cache_content)} chars)")
-            self.cursor.execute(sql_cache_content)  # type: ignore[arg-type]
-            logger.info("LOADING SQL: SQL functions executed successfully")
-        except Exception as e:
-            logger.warning(f"Failed to load SQL functions (this is OK if they're already loaded): {e}")
 
     def _create_bitsize_trigger(self) -> None:
         """Create trigger function and trigger for handling bitsize changes."""
@@ -175,13 +188,14 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
             if existing_bitsize is not None and existing_bitsize >= bitsize:
                 return True, existing_bitsize
 
-            # Use advisory lock to prevent race conditions in schema creation
-            # Generate consistent lock ID from partition key
-            lock_id = hash(f"{self.tableprefix}_{partition_key}") % (2**31 - 1)
-            logger.info(f"ACQUIRING ADVISORY LOCK: {lock_id} for partition {partition_key}")
+            # One lock per PREFIX, matching _serialized_ddl, so partition creation and
+            # handler setup serialise against each other -- they touch the same metadata
+            # table and the same functions. hashtext() rather than Python's hash(), which
+            # is salted per process and handed every worker a different lock id.
+            logger.info(f"ACQUIRING ADVISORY LOCK on {self.tableprefix} for partition {partition_key}")
 
             # Try to acquire lock with timeout
-            self.cursor.execute("SELECT pg_try_advisory_xact_lock(%s)", (lock_id,))
+            self.cursor.execute("SELECT pg_try_advisory_xact_lock(hashtext(%s))", (self.tableprefix,))
             result = self.cursor.fetchone()
             lock_acquired = result[0] if result else False
 
@@ -200,8 +214,8 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
                         break  # Exit loop and try to acquire lock to expand
 
                 # If still not created, try to acquire lock blocking
-                logger.info(f"FALLBACK TO BLOCKING LOCK: {lock_id} for partition {partition_key}")
-                self.cursor.execute("SELECT pg_advisory_xact_lock(%s)", (lock_id,))
+                logger.info(f"FALLBACK TO BLOCKING LOCK on {self.tableprefix} for partition {partition_key}")
+                self.cursor.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (self.tableprefix,))
 
             # Double-check if partition was created while waiting for lock
             existing_bitsize = self._get_partition_bitsize(partition_key)

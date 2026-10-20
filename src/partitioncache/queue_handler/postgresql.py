@@ -228,6 +228,13 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
 
             if len(existing_functions) == 2:
                 logger.debug("Non-blocking queue functions already exist")
+                # END THE TRANSACTION THE CHECK OPENED. This connection is persistent and
+                # not in autocommit, so returning here left it `idle in transaction` for
+                # the lifetime of the process -- observed at 3.6 hours during a 09c run,
+                # holding a snapshot and catalog locks the whole time. The common case is
+                # exactly this one: the functions are usually already there, so the only
+                # path that committed was the rare one that deployed them.
+                conn.rollback()
                 return
 
             logger.info("Deploying non-blocking queue functions...")
@@ -238,6 +245,7 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
             sql_file = Path(__file__).parent / "postgresql_queue_helper.sql"
             if not sql_file.exists():
                 logger.warning(f"Non-blocking queue functions SQL file not found: {sql_file}")
+                conn.rollback()
                 return
 
             with open(sql_file) as f:
@@ -284,6 +292,9 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
             except Exception as func_error:
                 # Fallback to traditional approach if function doesn't exist
                 logger.debug(f"Non-blocking function not available, using fallback: {func_error}")
+                # A failed PostgreSQL statement aborts the whole transaction. The
+                # fallback must start a fresh transaction before issuing INSERT.
+                conn.rollback()
                 cursor.execute(
                     sql.SQL("""
                     INSERT INTO {} (query, partition_key, partition_datatype, priority, updated_at, created_at)
@@ -312,17 +323,18 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
 
     def push_to_query_fragment_queue(self, query_hash_pairs: list[tuple[str, str]], partition_key: str, partition_datatype: str | None = None, cache_backend: str | None = None) -> bool:
         """
-        Push query fragments to the fragment queue (implements AbstractQueueHandler interface).
+        Push query variants to the variant queue (implements AbstractQueueHandler interface;
+        the queue table keeps its historical ``query_fragment_queue`` name).
         Uses batch non-blocking upsert for optimal performance and proper concurrency handling.
 
         Args:
-            query_hash_pairs (List[Tuple[str, str]]): List of (query, hash) tuples to push.
-            partition_key (str): The partition key for these query fragments.
+            query_hash_pairs (List[Tuple[str, str]]): List of (variant_query, hash) tuples to push.
+            partition_key (str): The partition key for these query variants.
             partition_datatype (str): The datatype of the partition key (default: None).
             cache_backend (str): The cache backend to use for processing (default: None, uses processor config).
 
         Returns:
-            bool: True if all fragments were pushed successfully, False otherwise.
+            bool: True if all variants were pushed successfully, False otherwise.
         """
         if not query_hash_pairs:
             return True
@@ -340,13 +352,21 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
                 partition_keys = [partition_key] * len(query_hash_pairs)
                 partition_datatypes = [partition_datatype] * len(query_hash_pairs)
                 priorities = [1] * len(query_hash_pairs)  # Default priority
-                cache_backends = [cache_backend] * len(query_hash_pairs)
-
-                # Use base batch function directly with table parameter
-                cursor.execute(
-                    "SELECT * FROM non_blocking_fragment_queue_batch_upsert(%s, %s, %s, %s, %s, %s, %s)",
-                    (hashes, partition_keys, partition_datatypes, queries, priorities, self.fragment_queue_table, cache_backends),
-                )
+                # ``None`` means that the processor configuration chooses the
+                # backend. Keep the six-argument call in that case so clients remain
+                # compatible with processors that predate per-item backends.
+                batch_params = (hashes, partition_keys, partition_datatypes, queries, priorities, self.fragment_queue_table)
+                if cache_backend is None:
+                    cursor.execute(
+                        "SELECT * FROM non_blocking_fragment_queue_batch_upsert(%s, %s, %s, %s, %s, %s)",
+                        batch_params,
+                    )
+                else:
+                    cache_backends = [cache_backend] * len(query_hash_pairs)
+                    cursor.execute(
+                        "SELECT * FROM non_blocking_fragment_queue_batch_upsert(%s, %s, %s, %s, %s, %s, %s)",
+                        batch_params + (cache_backends,),
+                    )
                 results = cursor.fetchall()
                 conn.commit()
 
@@ -357,24 +377,26 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
             except Exception as func_error:
                 # Fallback to individual inserts if batch function doesn't exist
                 logger.debug(f"Batch function not available, using individual fallback: {func_error}")
+                conn.rollback()
                 for query, hash_value in query_hash_pairs:
                     cursor.execute(
                         sql.SQL("""
-                        INSERT INTO {} (query, hash, partition_key, partition_datatype, cache_backend, priority, updated_at, created_at)
+                        INSERT INTO {table} (query, hash, partition_key, partition_datatype, cache_backend, priority, updated_at, created_at)
                         VALUES (%s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                         ON CONFLICT (hash, partition_key) DO UPDATE SET
-                            priority = {}.priority + 1,
+                            priority = {table}.priority + 1,
+                            cache_backend = COALESCE(EXCLUDED.cache_backend, {table}.cache_backend),
                             updated_at = CURRENT_TIMESTAMP
-                    """).format(sql.Identifier(self.fragment_queue_table), sql.Identifier(self.fragment_queue_table)),
+                    """).format(table=sql.Identifier(self.fragment_queue_table)),
                         (query, hash_value, partition_key, partition_datatype, cache_backend, 1),
                     )
 
                 conn.commit()
-                logger.debug(f"Pushed {len(query_hash_pairs)} query fragments using fallback method")
+                logger.debug(f"Pushed {len(query_hash_pairs)} query variants using fallback method")
                 return True
 
         except Exception as e:
-            logger.error(f"Failed to push query fragments to PostgreSQL queue handler: {e}")
+            logger.error(f"Failed to push query variants to PostgreSQL queue handler: {e}")
             return False
         finally:
             # Ensure fresh connection is properly closed
@@ -416,6 +438,7 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
             except Exception as func_error:
                 # Fallback to traditional approach if function doesn't exist
                 logger.debug(f"Non-blocking function not available, using fallback: {func_error}")
+                conn.rollback()
                 cursor.execute(
                     sql.SQL("""
                     INSERT INTO {} (query, partition_key, partition_datatype, priority, updated_at)
@@ -446,18 +469,18 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
         self, query_hash_pairs: list[tuple[str, str]], partition_key: str, priority: int = 1, partition_datatype: str | None = None, cache_backend: str | None = None
     ) -> bool:
         """
-        Push query fragments with specified priority.
+        Push query variants with specified priority.
         Uses non-blocking upsert to avoid concurrency issues with locked rows.
-        If a fragment already exists and is not being processed, increment its priority.
+        If a variant already exists and is not being processed, increment its priority.
 
         Args:
-            query_hash_pairs (List[Tuple[str, str]]): List of (query, hash) tuples to push.
-            partition_key (str): The partition key for these query fragments.
-            priority (int): Initial priority for the query fragments (default: 1).
+            query_hash_pairs (List[Tuple[str, str]]): List of (variant_query, hash) tuples to push.
+            partition_key (str): The partition key for these query variants.
+            priority (int): Initial priority for the query variants (default: 1).
             partition_datatype (str): The datatype of the partition key (default: "integer").
 
         Returns:
-            bool: True if all fragments were pushed/updated successfully, False otherwise.
+            bool: True if all variants were pushed/updated successfully, False otherwise.
         """
         if not query_hash_pairs:
             return True
@@ -475,13 +498,18 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
                 partition_keys = [partition_key] * len(query_hash_pairs)
                 partition_datatypes = [partition_datatype] * len(query_hash_pairs)
                 priorities = [priority] * len(query_hash_pairs)
-                cache_backends = [cache_backend] * len(query_hash_pairs)
-
-                # Use base batch function directly with table parameter
-                cursor.execute(
-                    "SELECT * FROM non_blocking_fragment_queue_batch_upsert(%s, %s, %s, %s, %s, %s, %s)",
-                    (hashes, partition_keys, partition_datatypes, queries, priorities, self.fragment_queue_table, cache_backends),
-                )
+                batch_params = (hashes, partition_keys, partition_datatypes, queries, priorities, self.fragment_queue_table)
+                if cache_backend is None:
+                    cursor.execute(
+                        "SELECT * FROM non_blocking_fragment_queue_batch_upsert(%s, %s, %s, %s, %s, %s)",
+                        batch_params,
+                    )
+                else:
+                    cache_backends = [cache_backend] * len(query_hash_pairs)
+                    cursor.execute(
+                        "SELECT * FROM non_blocking_fragment_queue_batch_upsert(%s, %s, %s, %s, %s, %s, %s)",
+                        batch_params + (cache_backends,),
+                    )
                 results = cursor.fetchall()
                 conn.commit()
 
@@ -491,16 +519,18 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
             except Exception as func_error:
                 # Fallback to traditional approach if function doesn't exist
                 logger.debug(f"Non-blocking function not available, using fallback: {func_error}")
+                conn.rollback()
                 for query, hash_value in query_hash_pairs:
                     cursor.execute(
                         sql.SQL("""
-                        INSERT INTO {} (query, hash, partition_key, partition_datatype, cache_backend, priority, updated_at, created_at)
+                        INSERT INTO {table} (query, hash, partition_key, partition_datatype, cache_backend, priority, updated_at, created_at)
                         VALUES (%s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                         ON CONFLICT (hash, partition_key)
                         DO UPDATE SET
-                            priority = {}.priority + %s,
+                            priority = {table}.priority + %s,
+                            cache_backend = COALESCE(EXCLUDED.cache_backend, {table}.cache_backend),
                             updated_at = CURRENT_TIMESTAMP
-                    """).format(sql.Identifier(self.fragment_queue_table), sql.Identifier(self.fragment_queue_table)),
+                    """).format(table=sql.Identifier(self.fragment_queue_table)),
                         (query, hash_value, partition_key, partition_datatype, cache_backend, priority, priority),
                     )
 
@@ -509,7 +539,7 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
                 return True
 
         except Exception as e:
-            logger.error(f"Failed to push query fragments to PostgreSQL queue handler: {e}")
+            logger.error(f"Failed to push query variants to PostgreSQL queue handler: {e}")
             return False
         finally:
             # Ensure fresh connection is properly closed
@@ -657,7 +687,7 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
 
     def pop_from_query_fragment_queue(self) -> tuple[str, str, str, str, str | None] | None:
         """
-        Pop a query fragment from the query fragment queue.
+        Pop a query variant from the variant queue (persisted as ``query_fragment_queue``).
         Uses PostgreSQL's SELECT FOR UPDATE SKIP LOCKED for atomic operations.
 
         Returns:
@@ -705,7 +735,7 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
 
     def pop_from_query_fragment_queue_blocking(self, timeout: int = 60) -> tuple[str, str, str, str, str | None] | None:
         """
-        Pop a query fragment from the query fragment queue with blocking wait.
+        Pop a query variant from the variant queue with blocking wait.
         Uses PostgreSQL LISTEN/NOTIFY for efficient blocking with timeout fallback.
 
         Args:

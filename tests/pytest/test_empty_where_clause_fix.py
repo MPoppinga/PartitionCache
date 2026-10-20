@@ -121,8 +121,8 @@ class TestEmptyWhereClauseFix:
                 remainder = query_fragment[where_index + 7:].strip()
                 assert remainder, f"WHERE clause is empty in fragment: {query_fragment}"
 
-    def test_star_join_scenario_no_conditions(self):
-        """Test star-join scenario without attribute conditions."""
+    def test_partition_join_scenario_no_conditions(self):
+        """Test partition-join scenario without attribute conditions."""
         query = """
         SELECT DISTINCT t1.region_id
         FROM regions AS t1
@@ -137,7 +137,7 @@ class TestEmptyWhereClauseFix:
             min_component_size=1,
             follow_graph=True,
             keep_all_attributes=True,
-            auto_detect_star_join=True
+            auto_detect_partition_join=True
         )
 
         # Check all generated fragments

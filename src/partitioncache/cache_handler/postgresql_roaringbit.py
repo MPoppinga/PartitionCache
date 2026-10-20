@@ -35,65 +35,47 @@ class PostgreSQLRoaringBitCacheHandler(PostgreSQLAbstractCacheHandler):
         table_name = f"{self.tableprefix}_cache_{partition_key}"
 
         try:
-            # Check if roaringbitmap extension is available
-            self.cursor.execute("SELECT 1 FROM pg_extension WHERE extname = 'roaringbitmap';")
-            if not self.cursor.fetchone():
-                # Try to create the extension first
-                try:
-                    self.cursor.execute("CREATE EXTENSION IF NOT EXISTS roaringbitmap;")
-                    self.db.commit()
-                    logger.info("Successfully created roaringbitmap extension")
-                except Exception as ext_error:
-                    logger.error(f"roaringbitmap extension not found and cannot be created: {ext_error}")
-                    raise RuntimeError("roaringbitmap extension required but not available") from ext_error
+            with self._serialized_ddl():
+                # Check if roaringbitmap extension is available
+                self.cursor.execute("SELECT 1 FROM pg_extension WHERE extname = 'roaringbitmap';")
+                if not self.cursor.fetchone():
+                    # Try to create the extension first
+                    try:
+                        self.cursor.execute("CREATE EXTENSION IF NOT EXISTS roaringbitmap;")
+                        self.db.commit()
+                        logger.info("Successfully created roaringbitmap extension")
+                    except Exception as ext_error:
+                        logger.error(f"roaringbitmap extension not found and cannot be created: {ext_error}")
+                        raise RuntimeError("roaringbitmap extension required but not available") from ext_error
 
-            # Create the cache table for roaring bitmaps with improved error handling
-            self.cursor.execute(
-                sql.SQL("""CREATE TABLE IF NOT EXISTS {0} (
-                    query_hash TEXT PRIMARY KEY,
-                    partition_keys roaringbitmap,
-                    partition_keys_count integer GENERATED ALWAYS AS (
-                        CASE
-                            WHEN partition_keys IS NULL THEN NULL
-                            ELSE rb_cardinality(partition_keys)
-                        END
-                    ) STORED
-                );""").format(sql.Identifier(table_name))
-            )
+                # Create the cache table for roaring bitmaps with improved error handling
+                self.cursor.execute(
+                    sql.SQL("""CREATE TABLE IF NOT EXISTS {0} (
+                        query_hash TEXT PRIMARY KEY,
+                        partition_keys roaringbitmap,
+                        partition_keys_count integer GENERATED ALWAYS AS (
+                            CASE
+                                WHEN partition_keys IS NULL THEN NULL
+                                ELSE rb_cardinality(partition_keys)
+                            END
+                        ) STORED
+                    );""").format(sql.Identifier(table_name))
+                )
 
-            # Insert metadata
-            self.cursor.execute(
-                sql.SQL("INSERT INTO {0} (partition_key, datatype) VALUES (%s, %s) ON CONFLICT (partition_key) DO NOTHING").format(
-                    sql.Identifier(self.tableprefix + "_partition_metadata")
-                ),
-                (partition_key, "integer"),
-            )
+                # Insert metadata
+                self.cursor.execute(
+                    sql.SQL("INSERT INTO {0} (partition_key, datatype) VALUES (%s, %s) ON CONFLICT (partition_key) DO NOTHING").format(
+                        sql.Identifier(self.tableprefix + "_partition_metadata")
+                    ),
+                    (partition_key, "integer"),
+                )
 
-            self.db.commit()
+                self.db.commit()
 
         except Exception as e:
             logger.error(f"Failed to create roaringbitmap table {table_name}: {e}")
             self.db.rollback()
             raise
-
-    def _load_sql_functions(self) -> None:
-        """Load SQL functions from the cache handlers SQL file."""
-        try:
-            from pathlib import Path
-
-            # Get the SQL file path for cache handlers
-            sql_cache_file = Path(__file__).parent / "postgresql_cache_handlers.sql"
-
-            if not sql_cache_file.exists():
-                logger.warning(f"SQL cache handlers file not found at {sql_cache_file}")
-                return
-
-            # Read and execute the SQL file
-            sql_cache_content = sql_cache_file.read_text()
-            self.cursor.execute(sql_cache_content)  # type: ignore[arg-type]
-            logger.debug("Successfully loaded SQL functions from cache handlers file")
-        except Exception as e:
-            logger.debug(f"Failed to load SQL functions (this is OK if they're already loaded): {e}")
 
     def _recreate_metadata_table(self, supported_datatypes: set[str]) -> None:
         """
@@ -101,31 +83,32 @@ class PostgreSQLRoaringBitCacheHandler(PostgreSQLAbstractCacheHandler):
         Extends the base metadata table functionality.
         """
         try:
-            # Load SQL functions first
-            self._load_sql_functions()
+            with self._serialized_ddl():
+                # Load SQL functions first
+                self._load_sql_functions()
 
-            # Create metadata table for roaringbit arrays (no bitsize column needed)
-            self.cursor.execute(
-                sql.SQL("""CREATE TABLE IF NOT EXISTS {0} (
-                    partition_key TEXT PRIMARY KEY,
-                    datatype TEXT NOT NULL CHECK (datatype = 'integer'),
-                    created_at TIMESTAMP DEFAULT now()
-                );""").format(sql.Identifier(self.tableprefix + "_partition_metadata"))
-            )
+                # Create metadata table for roaringbit arrays (no bitsize column needed)
+                self.cursor.execute(
+                    sql.SQL("""CREATE TABLE IF NOT EXISTS {0} (
+                        partition_key TEXT PRIMARY KEY,
+                        datatype TEXT NOT NULL CHECK (datatype = 'integer'),
+                        created_at TIMESTAMP DEFAULT now()
+                    );""").format(sql.Identifier(self.tableprefix + "_partition_metadata"))
+                )
 
-            # Create queries table (same as base implementation)
-            self.cursor.execute(
-                sql.SQL("""CREATE TABLE IF NOT EXISTS {0} (
-                    query_hash TEXT NOT NULL,
-                    query TEXT NOT NULL,
-                    partition_key TEXT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'ok' CHECK (status IN ('ok', 'timeout', 'failed')),
-                    last_seen TIMESTAMP NOT NULL DEFAULT now(),
-                    PRIMARY KEY (query_hash, partition_key)
-                );""").format(sql.Identifier(self.tableprefix + "_queries"))
-            )
+                # Create queries table (same as base implementation)
+                self.cursor.execute(
+                    sql.SQL("""CREATE TABLE IF NOT EXISTS {0} (
+                        query_hash TEXT NOT NULL,
+                        query TEXT NOT NULL,
+                        partition_key TEXT NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'ok' CHECK (status IN ('ok', 'timeout', 'failed')),
+                        last_seen TIMESTAMP NOT NULL DEFAULT now(),
+                        PRIMARY KEY (query_hash, partition_key)
+                    );""").format(sql.Identifier(self.tableprefix + "_queries"))
+                )
 
-            self.db.commit()
+                self.db.commit()
         except Exception as e:
             logger.error(f"Failed to recreate roaringbit metadata table: {e}")
             try:
@@ -137,23 +120,24 @@ class PostgreSQLRoaringBitCacheHandler(PostgreSQLAbstractCacheHandler):
     def _ensure_partition_table(self, partition_key: str, datatype: str, **kwargs) -> bool:
         """Ensure a partition table exists using SQL bootstrap function."""
         try:
-            # Load SQL functions first to ensure they're available
-            self._load_sql_functions()
+            with self._serialized_ddl():
+                # Load SQL functions first to ensure they're available
+                self._load_sql_functions()
 
-            # Use SQL bootstrap function to ensure metadata tables exist
-            self.cursor.execute(
-                sql.SQL("SELECT partitioncache_ensure_metadata_tables(%s)"),
-                (self.tableprefix,)
-            )
+                # Use SQL bootstrap function to ensure metadata tables exist
+                self.cursor.execute(
+                    sql.SQL("SELECT partitioncache_ensure_metadata_tables(%s)"),
+                    (self.tableprefix,)
+                )
 
-            # Use SQL bootstrap function to create partition table and metadata entry
-            self.cursor.execute(
-                sql.SQL("SELECT partitioncache_bootstrap_partition(%s, %s, %s, %s)"),
-                (self.tableprefix, partition_key, datatype, "roaringbit")
-            )
+                # Use SQL bootstrap function to create partition table and metadata entry
+                self.cursor.execute(
+                    sql.SQL("SELECT partitioncache_bootstrap_partition(%s, %s, %s, %s)"),
+                    (self.tableprefix, partition_key, datatype, "roaringbit")
+                )
 
-            self.db.commit()
-            return True
+                self.db.commit()
+                return True
         except Exception as e:
             logger.error(f"Failed to ensure roaringbit partition table for {partition_key}: {e}")
             self.db.rollback()

@@ -42,6 +42,13 @@ rocksdb = [
     "rocksdb",  # Seperate because it is not available on all platforms
 ]
 
+benchmark = [
+    "pyyaml",
+    "duckdb",
+    "psycopg",
+    "python-dotenv",
+]
+
 [project.urls]
 homepage = "https://github.com/MPoppinga/PartitionCache"
 repository = "https://github.com/MPoppinga/PartitionCache"
