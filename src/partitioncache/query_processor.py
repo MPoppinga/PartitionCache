@@ -19,6 +19,8 @@ import sqlglot.optimizer.canonicalize
 import sqlglot.optimizer.normalize
 import sqlglot.optimizer.simplify
 
+import partitioncache.sqlglot_compat  # noqa: F401 -- keeps ST_Point/ST_MakePoint as parsed before sqlglot 26
+
 logger = logging.getLogger("PartitionCache")
 
 # Mapping of deprecated parameter names to their new names
@@ -610,7 +612,8 @@ def extract_and_group_query_conditions(
         all_alias: set = set(re.findall(r"[a-zA-Z_]\w*(?=\.)", condition)) & set(table_aliases)
         parsed = sqlglot.parse_one(condition)
         table_identifiers = tuple(sorted({col.table for col in parsed.find_all(exp.Column) if col.table}))
-        if parsed.find(exp.Func):
+        # AND/OR are exp.Func subclasses since sqlglot 30; only real function calls count here
+        if any(not isinstance(func, exp.Connector) for func in parsed.find_all(exp.Func)):
             if len(all_alias) == 2:
                 all_alias_list = sorted(all_alias)
                 distance_conditions[(all_alias_list[0], all_alias_list[1])].append(condition)
@@ -1796,7 +1799,7 @@ def _add_constraints_to_query(query: str, add_constraints: dict[str, str]) -> st
         return query
 
 
-def _remove_orphaned_tables(parsed: exp.Expression) -> exp.Expression:
+def _remove_orphaned_tables(parsed: exp.Expr) -> exp.Expr:
     """Remove tables from FROM that have no remaining WHERE conditions connecting them.
 
     When a condition (e.g., ST_DWithin) linking a dimension table to the main table is removed,
