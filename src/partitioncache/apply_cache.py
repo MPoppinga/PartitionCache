@@ -420,7 +420,7 @@ def _get_partition_key_sql_type(partition_keys: set[int] | set[str] | set[float]
     return "TEXT"
 
 
-def _add_where_condition(parsed_query: exp.Expression, condition_expr: exp.Expression) -> None:
+def _add_where_condition(parsed_query: exp.Expr, condition_expr: exp.Expr) -> None:
     """Add a WHERE condition to a parsed query, creating WHERE clause if needed."""
     existing_where: exp.Where | None = parsed_query.find(exp.Where)
     if existing_where is None:
