@@ -4,6 +4,8 @@ data
 sm_filter*
 
 *.sqlite
+*.duckdb
+*.duckdb.wal
 *.png
 .env
 *.txt
@@ -170,3 +172,11 @@ cython_debug/
 .idea/
 .vscode/
 
+
+# Benchmark output, local caches and tool state
+examples/**/*results*.json
+examples/**/*_cache_rocksdict*/
+*_cache_rocksdict*.pre*/
+claudedocs/*.json
+claudedocs/archive/
+.serena/
