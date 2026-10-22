@@ -3,6 +3,7 @@
 
 import json
 import logging
+import sys
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
@@ -10,6 +11,9 @@ import pytest
 from partitioncache.apply_cache import apply_cache, apply_cache_lazy
 from partitioncache.cache_handler.abstract import AbstractCacheHandler, AbstractCacheHandler_Lazy
 from partitioncache.db_handler.postgres import PostgresDBHandler
+
+# The package re-exports the function apply_cache, which shadows the submodule for string-based patch() on Python 3.10
+_apply_cache_module = sys.modules["partitioncache.apply_cache"]
 
 QUERY = "SELECT * FROM trips AS t WHERE t.fare > 10"
 
@@ -51,7 +55,7 @@ class TestCostGate:
 
     def test_cheap_query_skips_cache_before_variant_generation(self, apply):
         estimator = Mock(return_value=42.4)
-        with patch("partitioncache.apply_cache.generate_all_hashes") as gen:
+        with patch.object(_apply_cache_module, "generate_all_hashes") as gen:
             (enhanced, stats), handler = apply(cost_estimator=estimator, min_query_cost=1000)
         gen.assert_not_called()
         assert handler.method_calls == []
@@ -99,7 +103,7 @@ class TestCostGate:
     @pytest.mark.parametrize("wrapper", [apply_cache, apply_cache_lazy])
     def test_spatial_path_is_gated_too(self, wrapper):
         handler = Mock()
-        with patch("partitioncache.apply_cache.generate_all_hashes") as gen:
+        with patch.object(_apply_cache_module, "generate_all_hashes") as gen:
             enhanced, stats = wrapper(
                 "SELECT * FROM poi AS p1 WHERE p1.type = 'cafe'",
                 handler,
