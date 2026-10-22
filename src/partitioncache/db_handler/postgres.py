@@ -68,6 +68,20 @@ class PostgresDBHandler(AbstractDBHandler):
         self.conn.commit()
         return result
 
+    def estimate_cost(self, query: str) -> float | None:
+        """Return the planner's total cost of ``query`` from ``EXPLAIN (FORMAT JSON)``; the query is not executed."""
+        try:
+            self.cur.execute(f"EXPLAIN (FORMAT JSON) {query}")
+            row = self.cur.fetchone()
+        except Exception:
+            # Leave the connection usable: a failed statement aborts the surrounding transaction
+            self.conn.rollback()
+            raise
+        self.conn.commit()
+        if not row or not row[0]:
+            return None
+        return float(row[0][0]["Plan"]["Total Cost"])
+
     def close(self) -> None:
         self.conn.close()
         self.cur.close()
