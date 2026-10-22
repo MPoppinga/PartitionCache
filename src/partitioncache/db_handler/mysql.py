@@ -2,6 +2,7 @@
 Handles the connection to a MySQL/MariaDB database
 """
 
+import json
 from logging import getLogger
 from typing import Any
 
@@ -57,6 +58,21 @@ class MySQLDBHandler(AbstractDBHandler):
             logger.error(f"Error executing query: {query}")
             logger.error(e)
             return []
+
+    def estimate_cost(self, query: str) -> float | None:
+        """Return ``query_block.cost_info.query_cost`` from ``EXPLAIN FORMAT=JSON``; the query is not executed.
+
+        MariaDB's JSON plan has no ``cost_info``, so it returns None there.
+        """
+        self.cur.execute(f"EXPLAIN FORMAT=JSON {query}")
+        row = self.cur.fetchone()
+        self.cur.reset()
+        if not row or not row[0]:
+            return None
+        raw: Any = row[0]
+        plan: dict[str, Any] = json.loads(raw) if isinstance(raw, str | bytes | bytearray) else raw
+        cost = plan.get("query_block", {}).get("cost_info", {}).get("query_cost")
+        return float(cost) if cost is not None else None
 
     def close(self) -> None:
         try:
