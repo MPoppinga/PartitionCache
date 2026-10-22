@@ -164,6 +164,15 @@ class PostgreSQLExecutor:
             rows = cur.fetchall()
         return {row[0] for row in rows}
 
+    def estimate_cost(self, query: str) -> float | None:
+        """Return the planner's total cost estimate for a single-statement query (plain EXPLAIN, not executed)."""
+        with self.conn.cursor() as cur:
+            cur.execute(f"EXPLAIN (FORMAT JSON) {query}")
+            row = cur.fetchone()
+        if not row or not row[0]:
+            return None
+        return float(row[0][0]["Plan"]["Total Cost"])
+
     def explain_analyze(self, query: str) -> tuple[list[str], float]:
         """Run EXPLAIN ANALYZE and return (plan_lines, actual_time_ms).
 
@@ -477,6 +486,7 @@ def parse_explain_plan(plan_lines: list[str]) -> dict:
         seq_scan_detected: bool
         scan_type: str (summary of primary scan method)
         estimated_rows: float (from planner)
+        estimated_cost: float (planner total cost of the root node)
         actual_rows: float (from execution)
         execution_time_ms: float
         plan_text: str (full plan)
@@ -502,8 +512,12 @@ def parse_explain_plan(plan_lines: list[str]) -> dict:
 
     # Extract estimated vs actual rows from root node (first line with rows= pattern)
     estimated_rows = 0.0
+    estimated_cost = 0.0
     actual_rows = 0.0
     for line in plan_lines:
+        m = re.search(r"cost=[\d.]+\.\.([\d.]+)", line)
+        if m and estimated_cost == 0:
+            estimated_cost = float(m.group(1))
         m = re.search(r"rows=(\d+)\s+width=", line)
         if m and estimated_rows == 0:
             estimated_rows = float(m.group(1))
@@ -523,6 +537,7 @@ def parse_explain_plan(plan_lines: list[str]) -> dict:
         "seq_scan_detected": seq_scan_detected,
         "scan_type": scan_type,
         "estimated_rows": estimated_rows,
+        "estimated_cost": estimated_cost,
         "actual_rows": actual_rows,
         "execution_time_ms": execution_time_ms,
         "plan_text": plan_text,
@@ -534,7 +549,7 @@ def print_explain_summary(label: str, plan_info: dict):
     gist = "Yes" if plan_info["gist_index_used"] else "No"
     seq = "Yes" if plan_info["seq_scan_detected"] else "No"
     print(f"  [{label}] Scan: {plan_info['scan_type']}, GiST: {gist}, SeqScan: {seq}, "
-          f"Est. rows: {plan_info['estimated_rows']:.0f}, "
+          f"Est. cost: {plan_info['estimated_cost']:.0f}, Est. rows: {plan_info['estimated_rows']:.0f}, "
           f"Actual rows: {plan_info['actual_rows']:.0f}, "
           f"Exec: {plan_info['execution_time_ms']:.1f}ms")
 
@@ -1064,6 +1079,13 @@ def run_single_query(
     result["baseline_time"] = statistics.mean(baseline_times)
     if repeat > 1:
         result["baseline_stddev"] = statistics.stdev(baseline_times)
+
+    # 1a. Planner cost of the baseline (PostgreSQL only; plain EXPLAIN, cheap) -- calibration data for min_query_cost
+    if hasattr(executor, "estimate_cost"):
+        try:
+            result["baseline_cost"] = executor.estimate_cost(original_query)
+        except Exception as e:
+            print(f"  Warning: EXPLAIN failed for baseline cost: {e}")
 
     # 1b. EXPLAIN ANALYZE on baseline (if requested and PostgreSQL)
     if explain and hasattr(executor, "explain_analyze"):
@@ -2142,6 +2164,8 @@ def print_query_result(result: dict):
     baseline_str = f"{result['baseline_time']:.4f}s"
     if "baseline_stddev" in result:
         baseline_str += f" (stddev: {result['baseline_stddev']:.4f}s)"
+    if result.get("baseline_cost") is not None:
+        baseline_str += f", planner cost {result['baseline_cost']:.0f}"
     print(f"  Baseline: {result['baseline_rows']} rows in {baseline_str}")
     print(f"  Cache population: {result['cache_population_time']:.4f}s")
     if "cache_apply_time" in result:
