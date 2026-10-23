@@ -7,6 +7,7 @@ It utilizes the given cache to extend the SQL query with the set of possible par
 """
 
 import random
+import secrets
 from datetime import datetime
 from logging import getLogger
 from typing import Any, Literal
@@ -359,6 +360,43 @@ def _get_partition_key_sql_type(partition_keys: set[int] | set[str] | set[float]
     return "TEXT"
 
 
+def _key_list_sentinel() -> str:
+    """Return a unique identifier that stands in for a partition-key list during the sqlglot rewrite.
+
+    The token is a plain lowercase identifier, so sqlglot renders it verbatim (no quoting, no
+    rewriting) in every dialect, and the random suffix makes a collision with the user's query
+    text practically impossible. `_splice_key_list` still asserts that it occurs exactly once.
+    """
+    return f"__pcache_keys_{secrets.token_hex(8)}__"
+
+
+def _format_spliced_partition_key(pk: int | str | float | datetime) -> str:
+    """Format one key for a spliced (unparsed) list.
+
+    Same output as `_format_partition_key_for_sql`, except that a single quote inside a string key
+    is doubled. The former parse-based path rejected such keys with a sqlglot TokenError; a spliced
+    list must escape them itself so the literal stays well-formed.
+    """
+    if isinstance(pk, str):
+        return _format_partition_key_for_sql(pk.replace("'", "''"))
+    return _format_partition_key_for_sql(pk)
+
+
+def _splice_key_list(rendered_sql: str, sentinel: str, key_list: str) -> str:
+    """Replace the single occurrence of `sentinel` in `rendered_sql` with the formatted key list.
+
+    Formerly the key list itself was parsed with sqlglot (`parse_one(f"... IN ({keys})")`), which
+    is linear in the number of keys but with a large constant: a 100k-key list took seconds. The
+    list is now formatted by `_format_partition_key_for_sql` and joined with the separators
+    sqlglot would have produced (", " inside IN, "), (" inside VALUES), so the output is
+    byte-identical to the parsed form.
+    """
+    occurrences = rendered_sql.count(sentinel)
+    if occurrences != 1:
+        raise AssertionError(f"partition-key placeholder {sentinel!r} occurs {occurrences} times in the rendered query, expected exactly once")
+    return rendered_sql.replace(sentinel, key_list, 1)
+
+
 def _add_where_condition(parsed_query: exp.Expr, condition_expr: exp.Expr) -> None:
     """Add a WHERE condition to a parsed query, creating WHERE clause if needed."""
     existing_where: exp.Where | None = parsed_query.find(exp.Where)
@@ -478,16 +516,20 @@ def extend_query_with_partition_keys(
     parsed_query = sqlglot.parse_one(query)
 
     if method == "IN":
-        partition_keys_str = ",".join(_format_partition_key_for_sql(pk) for pk in partition_keys)
-        partition_expr = sqlglot.parse_one(f"{p0_alias}.{partition_key} IN ({partition_keys_str})")
+        # The key list is not parsed: a placeholder identifier goes through sqlglot and the
+        # formatted list is spliced into the rendered SQL afterwards (see _splice_key_list).
+        sentinel = _key_list_sentinel()
+        partition_expr = sqlglot.parse_one(f"{p0_alias}.{partition_key} IN ({sentinel})")
         _add_where_condition(parsed_query, partition_expr)
-        return parsed_query.sql()
+        key_list = ", ".join(_format_spliced_partition_key(pk) for pk in partition_keys)
+        return _splice_key_list(parsed_query.sql(), sentinel, key_list)
 
     elif method == "VALUES":
-        partition_keys_str = "),(".join(_format_partition_key_for_sql(pk) for pk in partition_keys)
-        partition_expr = sqlglot.parse_one(f"{p0_alias}.{partition_key} IN (VALUES({partition_keys_str}))")
+        sentinel = _key_list_sentinel()
+        partition_expr = sqlglot.parse_one(f"{p0_alias}.{partition_key} IN (VALUES({sentinel}))")
         _add_where_condition(parsed_query, partition_expr)
-        return parsed_query.sql()
+        key_list = "), (".join(_format_spliced_partition_key(pk) for pk in partition_keys)
+        return _splice_key_list(parsed_query.sql(), sentinel, key_list)
 
     elif method == "TMP_TABLE_JOIN":
         tmp_table_setup, table_name = _create_tmp_table_setup(partition_keys, analyze_tmp_table, sql_dialect)
