@@ -202,13 +202,9 @@ def clean_query(query: str) -> str:
         str: Cleaned and normalized query suitable for cache variant generation
     """
 
-    # Remove single-line comments before whitespace normalization,
-    # otherwise collapsing newlines makes `--.*` wipe out everything
-    # from the first comment to the end of the (now single-line) string.
-    query = re.sub(r"--.*", "", query)
-
-    query = re.sub(r"\s+", " ", query)
-    query = re.sub(r"\s*=\s*", "=", query)
+    # Comments and whitespace are left to the sqlglot tokenizer: text-level replacements
+    # would also rewrite string literals ('a  b' vs 'a b', 'x = y' vs 'x=y') and give
+    # non-equivalent queries the same hash.
 
     # Remove trailing semicolons (they're not part of the SQL statement)
     query = query.rstrip().rstrip(";")
@@ -254,14 +250,15 @@ def clean_query(query: str) -> str:
     if outermost_select:
         outermost_select.set("expressions", [exp.Star()])
 
-    query = parsed.sql()
+    # Quoted identifiers are not supported downstream, so drop the quotes on the AST,
+    # where string literals are left untouched.
+    for identifier in parsed.find_all(exp.Identifier):
+        identifier.set("quoted", False)
+
+    query = parsed.sql(comments=False)
 
     # Removing tailing semicolon
     query = re.sub(r";\s*$", "", query)
-
-    # Remove all double quotes(postgresql) and backticks(mysql) from the normalized query
-    query = query.replace('"', "")  # TODO currently double quotes are not supported in identifiers in PartitionCache
-    query = query.replace("`", "")  # TODO currently backticks are not supported in identifiers in PartitionCache
 
     return query
 
@@ -1720,7 +1717,8 @@ def normalize_distance_conditions(original_query: str, bucket_steps: float = 1.0
             new_condition = f"{left_part} > {valuef:g}"
         query = query.replace(distance_condition, new_condition)
 
-    return " ".join(query.split())
+    # Collapse the whitespace left by the replacements, but not inside string literals
+    return re.sub(r"('(?:[^']|'')*')|\s+", lambda m: m.group(1) or " ", query).strip()
 
 
 def _add_constraints_to_query(query: str, add_constraints: dict[str, str]) -> str:
