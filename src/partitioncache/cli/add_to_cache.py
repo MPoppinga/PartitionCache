@@ -22,7 +22,13 @@ from partitioncache.cli.common_args import (
     resolve_cache_backend,
 )
 from partitioncache.db_handler import get_db_handler
-from partitioncache.query_processor import clean_query, generate_all_query_hash_pairs, hash_query, query_contains_top_level_outer_join
+from partitioncache.query_processor import (
+    clean_query,
+    generate_all_query_hash_pairs,
+    hash_query,
+    order_variants_for_population,
+    query_contains_top_level_outer_join,
+)
 
 logger = getLogger("PartitionCache")
 
@@ -144,6 +150,8 @@ def main():
                 geometry_column=geometry_column,
                 max_conditions_removed=args.max_conditions_removed,
             )
+            # Smallest variants first, so the monitor's cache optimization can restrict the larger ones with them
+            query_hash_pairs = order_variants_for_population(query_hash_pairs)
             success = partitioncache.push_to_query_fragment_queue(query_hash_pairs, args.partition_key, args.partition_datatype, queue_provider, cache_backend=queue_cache_backend)
         else:  # Push the cleaned query as a single variant (no recomposition)
             query = clean_query(query)

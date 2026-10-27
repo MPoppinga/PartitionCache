@@ -58,6 +58,7 @@ def mock_args():
     args.enable_cache_optimization = False
     args.disable_cache_optimization = True
     args.min_cache_hits = 1
+    args.max_restriction_keys = None
     args.cache_optimization_method = "IN"
     args.prefer_lazy_optimization = True
     # Add DuckDB acceleration args
@@ -830,3 +831,88 @@ class TestCacheOptimization:
         assert stats["total_hashes"] == 0
         assert stats["cache_hits"] == 0
         assert stats["method_used"] is None
+
+    @pytest.fixture
+    def standard_args(self, mock_args):
+        mock_args.enable_cache_optimization = True
+        mock_args.disable_cache_optimization = False
+        mock_args.prefer_lazy_optimization = False
+        mock_args.cache_optimization_method = "IN"
+        return mock_args
+
+    @patch("partitioncache.cli.monitor_cache_queue.extend_query_with_partition_keys")
+    @patch("partitioncache.cli.monitor_cache_queue.get_partition_keys")
+    def test_key_limit_skips_large_intersection(self, mock_get_keys, mock_extend, standard_args):
+        standard_args.max_restriction_keys = 3
+        mock_get_keys.return_value = ({1, 2, 3, 4}, 6, 2)
+
+        optimized_query, was_optimized, stats = apply_cache_optimization("SELECT 1", "h", "pk", "integer", Mock(), standard_args)
+
+        assert optimized_query == "SELECT 1"
+        assert was_optimized is False
+        assert stats["cache_hits"] == 2
+        assert stats["method_used"] is None
+        mock_extend.assert_not_called()
+
+    @patch("partitioncache.cli.monitor_cache_queue.extend_query_with_partition_keys")
+    @patch("partitioncache.cli.monitor_cache_queue.get_partition_keys")
+    def test_key_limit_allows_small_intersection(self, mock_get_keys, mock_extend, standard_args):
+        standard_args.max_restriction_keys = 3
+        mock_get_keys.return_value = ({1, 2, 3}, 6, 2)
+        mock_extend.return_value = "SELECT 1 AND pk IN (1, 2, 3)"
+
+        optimized_query, was_optimized, _ = apply_cache_optimization("SELECT 1", "h", "pk", "integer", Mock(), standard_args)
+
+        assert was_optimized is True
+        assert optimized_query == "SELECT 1 AND pk IN (1, 2, 3)"
+
+    @patch("partitioncache.cli.monitor_cache_queue.extend_query_with_partition_keys")
+    @patch("partitioncache.cli.monitor_cache_queue.get_partition_keys_lazy")
+    @patch("partitioncache.cli.monitor_cache_queue.get_partition_keys")
+    def test_key_limit_uses_standard_path_for_lazy_handlers(self, mock_get_keys, mock_get_lazy, mock_extend, standard_args):
+        """The lazy path never sees the key count, so a key limit switches to the materializing path."""
+        from partitioncache.cache_handler.abstract import AbstractCacheHandler_Lazy
+
+        standard_args.prefer_lazy_optimization = True
+        standard_args.cache_optimization_method = "IN_SUBQUERY"
+        standard_args.max_restriction_keys = 10
+        mock_get_keys.return_value = ({1, 2}, 6, 2)
+        mock_extend.return_value = "restricted"
+
+        _, was_optimized, stats = apply_cache_optimization("SELECT 1", "h", "pk", "integer", Mock(spec=AbstractCacheHandler_Lazy), standard_args)
+
+        assert was_optimized is True
+        mock_get_lazy.assert_not_called()
+        # IN_SUBQUERY exists only for the lazy path
+        assert stats["method_used"] == "IN"
+        assert mock_extend.call_args.kwargs["method"] == "IN"
+
+
+class TestVariantOrder:
+    """The monitor queues the variants of a query smallest first."""
+
+    @patch("partitioncache.cli.monitor_cache_queue.exit_event")
+    @patch("partitioncache.cli.monitor_cache_queue.pop_from_original_query_queue_blocking")
+    @patch("partitioncache.cli.monitor_cache_queue.pop_from_original_query_queue")
+    @patch("partitioncache.cli.monitor_cache_queue.generate_all_query_hash_pairs")
+    @patch("partitioncache.cli.monitor_cache_queue.push_to_query_fragment_queue")
+    def test_variants_pushed_smallest_first(self, mock_push, mock_generate, mock_pop, mock_pop_blocking, mock_exit_event, mock_args, mock_env):
+        import partitioncache.cli.monitor_cache_queue as mcq_module
+
+        mock_exit_event.is_set.side_effect = [False, True]
+        mock_pop_blocking.return_value = ("SELECT * FROM a", "pk", "integer")
+        large = ("SELECT DISTINCT t1.pk FROM a AS t1, b AS t2 WHERE t1.pk = t2.pk AND t2.x = 1", "large")
+        small = ("SELECT DISTINCT t1.pk FROM a AS t1 WHERE t1.x = 1", "small")
+        mock_generate.return_value = [large, small]
+
+        original_args = getattr(mcq_module, "args", None)
+        mcq_module.args = mock_args
+        try:
+            query_fragment_processor(mock_args, (None, None, None))
+        finally:
+            if original_args is not None:
+                mcq_module.args = original_args
+            else:
+                delattr(mcq_module, "args")
+
+        assert mock_push.call_args.args[0] == [small, large]

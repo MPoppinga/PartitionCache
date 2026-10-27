@@ -2220,6 +2220,43 @@ def generate_all_query_hash_pairs(
         return [(q, hash_query(q)) for q in query_set]
 
 
+def order_variants_for_population(query_hash_pairs: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """Order query variants so that smaller variants are populated first.
+
+    ``generate_all_query_hash_pairs`` returns variants in set order, which is arbitrary.
+    The relaxations of a variant join fewer tables or keep fewer conditions, so sorting by
+    (table count, condition count) means they are usually cached by the time the variant
+    itself runs, and cache-aware population can restrict it to their intersected keys.
+    The sort is stable; variants that cannot be parsed keep their relative order at the end.
+
+    Args:
+        query_hash_pairs: (variant_query, hash) pairs as returned by ``generate_all_query_hash_pairs``.
+
+    Returns:
+        The same pairs, smallest variants first.
+    """
+
+    def size(pair: tuple[str, str]) -> tuple[float, float]:
+        try:
+            select = sqlglot.parse_one(pair[0])
+        except sqlglot.ParseError:
+            return (float("inf"), float("inf"))
+        if not isinstance(select, exp.Select):
+            return (float("inf"), float("inf"))
+        # Only the outer FROM counts; tables of IN/EXISTS subqueries belong to their condition
+        tables = sum(1 for table in select.find_all(exp.Table) if table.parent_select is select)
+        where = select.args.get("where")
+        if where is None:
+            conditions = 0
+        elif isinstance(where.this, exp.And):
+            conditions = len(list(where.this.flatten()))
+        else:
+            conditions = 1
+        return (tables, conditions)
+
+    return sorted(query_hash_pairs, key=size)
+
+
 def hash_query(query: str) -> str:
     return hashlib.sha1(query.encode()).hexdigest()
 
