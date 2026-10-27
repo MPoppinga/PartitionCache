@@ -191,7 +191,9 @@ def find_p0_alias(query: str, partition_key: str, auto_detect_partition_join: bo
     Find the appropriate table alias for cache restrictions.
 
     Uses the query processor's partition-join detection logic.
-    If no partition-join table is detected, falls back to the first table in the query.
+    If no partition-join table is detected, falls back to the first table in the query,
+    unless the partition key column is qualified only with other aliases; then the first
+    such alias (SELECT list first) is used.
 
     Args:
         query: SQL query to analyze
@@ -223,8 +225,16 @@ def find_p0_alias(query: str, partition_key: str, auto_detect_partition_join: bo
         # If partition-join detection fails (e.g., no FROM clause), fall through to default
         pass
 
-    # Fallback to first table
-    return first_table.alias_or_name
+    # Fallback to the first table, unless only other tables carry the partition key: generated
+    # variants without partition_key_source_table can list a dimension before the fact table
+    first_alias = first_table.alias_or_name
+    select = parsed_query if isinstance(parsed_query, exp.Select) else parsed_query.find(exp.Select)
+    if select is not None:
+        key_columns = [*(col for e in select.expressions for col in e.find_all(exp.Column)), *select.find_all(exp.Column)]
+        key_aliases: list[str] = [col.table for col in key_columns if col.name == partition_key and col.table and col.parent_select is select]
+        if key_aliases and first_alias not in key_aliases:
+            return key_aliases[0]
+    return first_alias
 
 
 def rewrite_query_with_p0_table( # TODO: Check duplication with query_processor
