@@ -2257,6 +2257,82 @@ def order_variants_for_population(query_hash_pairs: list[tuple[str, str]]) -> li
     return sorted(query_hash_pairs, key=size)
 
 
+VariantSignature = tuple[frozenset[str], frozenset[str], str]
+
+
+def variant_signature(query: str, partition_key: str) -> VariantSignature | None:
+    """Describe a query variant by its tables, its conditions and the table that provides the partition key.
+
+    Aliases are replaced by table names, so the signature does not depend on how a variant numbers its
+    aliases. Variant A is a relaxation of variant B when ``is_relaxation_of(sig_a, sig_b)``: B joins the
+    tables of A and keeps all conditions of A, so B's partition keys are a subset of A's.
+
+    Returns None for anything the subset test cannot judge soundly: a table used twice (ambiguous
+    alias mapping), explicit JOIN syntax (ON conditions are not in WHERE), unqualified columns,
+    grouping/limits/set operations, or a partition key that is not selected from exactly one table.
+
+    Args:
+        query: A query variant as produced by ``generate_all_query_hash_pairs``.
+        partition_key: The partition key column the variant selects.
+
+    Returns:
+        (table names, conditions with aliases replaced by table names, partition key table) or None.
+    """
+    try:
+        select = sqlglot.parse_one(query)
+    except sqlglot.ParseError:
+        return None
+    if not isinstance(select, exp.Select) or any(select.args.get(arg) for arg in ("group", "having", "limit", "offset", "with", "qualify")):
+        return None
+    if any(join.args.get("on") or join.args.get("using") or join.side or join.kind for join in select.args.get("joins") or []):
+        return None
+
+    tables = [table for table in select.find_all(exp.Table) if table.parent_select is select]
+    names = [table.name for table in tables]
+    if len(set(names)) != len(names):
+        return None
+    alias_to_table = {table.alias_or_name: table.name for table in tables}
+
+    key_columns = [col for expression in select.expressions for col in expression.find_all(exp.Column) if col.name == partition_key]
+    if len(key_columns) != 1 or key_columns[0].table not in alias_to_table:
+        return None
+    key_table = alias_to_table[key_columns[0].table]
+
+    where = select.args.get("where")
+    if where is None:
+        conditions = []
+    elif isinstance(where.this, exp.And):
+        conditions = list(where.this.flatten())
+    else:
+        conditions = [where.this]
+
+    normalized = set()
+    for condition in conditions:
+        condition = condition.copy()
+        # Aliases introduced inside the condition (IN/EXISTS subqueries) must not shadow outer ones
+        inner_aliases = {table.alias_or_name for table in condition.find_all(exp.Table)}
+        if inner_aliases & (alias_to_table.keys() | set(names)):
+            return None
+        for col in condition.find_all(exp.Column):
+            if not col.table:
+                return None
+            if col.table in alias_to_table:
+                col.set("table", exp.to_identifier(alias_to_table[col.table]))
+            elif col.table not in inner_aliases:
+                return None
+        normalized.add(condition.sql())
+    return frozenset(names), frozenset(normalized), key_table
+
+
+def is_relaxation_of(candidate: VariantSignature, variant: VariantSignature) -> bool:
+    """True if the variant joins all tables and keeps all conditions of the candidate, with the same key table.
+
+    Then every partition key of the variant is also one of the candidate, so the candidate's cached
+    keys can restrict the variant.
+    """
+    return candidate[2] == variant[2] and candidate[0] <= variant[0] and candidate[1] <= variant[1]
+
+
 def hash_query(query: str) -> str:
     return hashlib.sha1(query.encode()).hexdigest()
 

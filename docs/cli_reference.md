@@ -298,6 +298,8 @@ Advanced options for controlling how query variants are generated for better cac
 - Executes query immediately and stores results in cache
 - **Best for**: Development, testing, small queries
 - **Warning**: Can be slow for complex queries with many fragments
+- `--restrict-variants`: executes the variants smallest first and restricts each to the intersection of the keys of its already populated relaxations, kept in memory (no cache lookup per variant). An empty intersection is stored as an empty result without executing the variant. See `populate_query_variants` in the [API reference](api_reference.md).
+- `--max-restriction-keys N`: only restrict when the intersection has at most N keys (implies `--restrict-variants`); a restriction to most of the keys filters little and costs a long key list
 
 #### Queue Processing
 ```bash

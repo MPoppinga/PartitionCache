@@ -22,6 +22,7 @@ from partitioncache.cli.common_args import (
     resolve_cache_backend,
 )
 from partitioncache.db_handler import get_db_handler
+from partitioncache.population import populate_query_variants
 from partitioncache.query_processor import (
     clean_query,
     generate_all_query_hash_pairs,
@@ -52,6 +53,17 @@ def main():
     mode_group.add_argument("--queue", action="store_true", help="Add query variants to the variant queue instead of executing directly")
     mode_group.add_argument("--queue-original", action="store_true", help="Add query to original query queue instead of the variant queue")
     mode_group.add_argument("--direct", action="store_true", help="Calculate query variants directly instead of using the incoming queue")
+    mode_group.add_argument(
+        "--restrict-variants",
+        action="store_true",
+        help="With --direct: execute variants smallest first and restrict each to the keys of its already populated relaxations",
+    )
+    mode_group.add_argument(
+        "--max-restriction-keys",
+        type=int,
+        default=None,
+        help="With --direct: only restrict a variant when the intersection has at most this many keys (implies --restrict-variants)",
+    )
 
     # Add common argument groups
     add_cache_args(parser, require_partition_key=True)
@@ -256,21 +268,27 @@ def main():
                 else:
                     raise ValueError(f"Unsupported database backend: {args.db_backend}")
 
-                # Process each query-hash pair
-                for fragment_query, hash_value in query_hash_pairs:
-                    if cache.exists(hash_value):
-                        logger.debug(f"Query {hash_value} already in cache")
-                        cache.set_query(hash_value, fragment_query)
-                        continue
+                if args.restrict_variants or args.max_restriction_keys is not None:
+                    stats = populate_query_variants(
+                        query_hash_pairs, args.partition_key, cache_handler, db_handler, max_restriction_keys=args.max_restriction_keys
+                    )
+                    logger.info(f"Populated query variants: {stats}")
+                else:
+                    # Process each query-hash pair
+                    for fragment_query, hash_value in query_hash_pairs:
+                        if cache.exists(hash_value):
+                            logger.debug(f"Query {hash_value} already in cache")
+                            cache.set_query(hash_value, fragment_query)
+                            continue
 
-                    # Execute query and store results
-                    result = set(db_handler.execute(fragment_query))
-                    if result:
-                        cache.set_cache(hash_value, result)
-                        cache.set_query(hash_value, fragment_query)
-                        logger.debug(f"Stored query {hash_value} with {len(result)} results")
-                    else:
-                        logger.warning(f"Query {hash_value} returned no results")
+                        # Execute query and store results
+                        result = set(db_handler.execute(fragment_query))
+                        if result:
+                            cache.set_cache(hash_value, result)
+                            cache.set_query(hash_value, fragment_query)
+                            logger.debug(f"Stored query {hash_value} with {len(result)} results")
+                        else:
+                            logger.warning(f"Query {hash_value} returned no results")
 
                 db_handler.close()
                 cache.close()
