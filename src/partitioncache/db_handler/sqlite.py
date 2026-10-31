@@ -31,8 +31,9 @@ class SQLiteDBHandler(AbstractDBHandler):
 
     def close(self) -> None:
         try:
-            self.conn.close()
+            # Cursor first: closing it after the connection raised ProgrammingError
             self.cur.close()
+            self.conn.close()
         except sqlite3.Error as e:
             logger.error(f"Error closing SQLite connection: {e}")
             raise

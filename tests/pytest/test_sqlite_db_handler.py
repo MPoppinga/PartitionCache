@@ -15,9 +15,7 @@ def handler(tmp_path):
     conn.close()
     h = SQLiteDBHandler(path)
     yield h
-    # SQLiteDBHandler.close() closes the connection before the cursor and raises
-    h.cur.close()
-    h.conn.close()
+    h.close()
 
 
 def test_key_zero_kept_and_null_dropped(handler):
