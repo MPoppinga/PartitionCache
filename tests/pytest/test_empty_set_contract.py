@@ -6,8 +6,9 @@ An empty set is a valid result: the query has no rows, and cache application tur
 and it must never be confused with "not cached" or the set_null marker (both read back as None).
 
 Redis handlers need a server (PARTITIONCACHE_TEST_REDIS_HOST/PORT, default localhost:6379) and are
-skipped without one; RocksDB handlers need python-rocksdb. PostgreSQL handlers are covered by the
-integration tests.
+skipped without one; RocksDB handlers need python-rocksdb. PostgreSQL handlers run only when
+PARTITIONCACHE_TEST_PG_HOST/PORT/USER/PASSWORD/DB name a scratch database (roaringbit also needs the
+roaringbitmap extension); they are covered by the integration tests as well.
 """
 
 import functools
@@ -70,6 +71,35 @@ def _rocksdb(cls_name, module, **kwargs):
     return factory
 
 
+def _postgresql(cls_name, module, **kwargs):
+    def factory(tmp_path):
+        host = os.getenv("PARTITIONCACHE_TEST_PG_HOST")
+        if not host:
+            pytest.skip("PARTITIONCACHE_TEST_PG_HOST not set")
+        cls = getattr(__import__(f"partitioncache.cache_handler.{module}", fromlist=[cls_name]), cls_name)
+        try:
+            handler = cls(
+                db_name=os.getenv("PARTITIONCACHE_TEST_PG_DB", "postgres"),
+                db_host=host,
+                db_user=os.getenv("PARTITIONCACHE_TEST_PG_USER", "postgres"),
+                db_password=os.getenv("PARTITIONCACHE_TEST_PG_PASSWORD", ""),
+                db_port=int(os.getenv("PARTITIONCACHE_TEST_PG_PORT", "5432")),
+                db_tableprefix=f"contract_{uuid.uuid4().hex[:8]}",
+                **kwargs,
+            )
+        except Exception as e:
+            pytest.skip(f"{cls_name} not available: {e}")
+        if module == "postgresql_roaringbit":
+            handler.db.rollback()  # the constructor's CREATE EXTENSION may have failed
+            handler.cursor.execute("SELECT 1 FROM pg_extension WHERE extname = 'roaringbitmap'")
+            if handler.cursor.fetchone() is None:
+                handler.close()
+                pytest.skip("roaringbitmap extension not installed")
+        return handler
+
+    return factory
+
+
 # name -> (factory, needs a registered partition key to store an empty set)
 HANDLERS = {
     "rocksdict": (_rocksdict, True),
@@ -80,6 +110,9 @@ HANDLERS = {
     "redis_roaringbit": (_redis("RedisRoaringBitCacheHandler", "redis_roaringbit"), False),
     "rocksdb_set": (_rocksdb("RocksDBCacheHandler", "rocks_db_set"), True),
     "rocksdb_bit": (_rocksdb("RocksDBBitCacheHandler", "rocks_db_bit", bitsize=8), False),
+    "postgresql_array": (_postgresql("PostgreSQLArrayCacheHandler", "postgresql_array"), True),
+    "postgresql_bit": (_postgresql("PostgreSQLBitCacheHandler", "postgresql_bit", bitsize=64), False),
+    "postgresql_roaringbit": (_postgresql("PostgreSQLRoaringBitCacheHandler", "postgresql_roaringbit"), False),
 }
 
 
