@@ -70,10 +70,21 @@ def test_set_cache(cache_handler):
     assert insert_found, "Expected INSERT INTO ... ON CONFLICT SQL statement not found"
 
 
-def test_set_cache_empty(cache_handler):
+def test_set_cache_empty_stores_an_empty_array(cache_handler):
+    """An empty result is stored ('{}'), not dropped: it means the query has no rows."""
     cache_handler.cursor.execute.reset_mock()
-    cache_handler.set_cache("empty_key", set())
-    assert not cache_handler.cursor.execute.called
+    cache_handler.cursor.fetchone.side_effect = [("integer",)]
+    assert cache_handler.set_cache("empty_key", set()) is True
+    inserts = [c for c in cache_handler.cursor.execute.call_args_list if "INSERT INTO" in str(c[0][0]) and "query_hash, partition_keys" in str(c[0][0])]
+    assert len(inserts) == 1
+    assert inserts[0][0][1] == ("empty_key", "{}")
+
+
+def test_set_cache_empty_needs_a_registered_partition_key(cache_handler):
+    cache_handler.cursor.execute.reset_mock()
+    cache_handler.cursor.fetchone.side_effect = [None]
+    assert cache_handler.set_cache("empty_key", set(), "unregistered") is False
+    assert not any("INSERT INTO" in str(c[0][0]) for c in cache_handler.cursor.execute.call_args_list)
 
 
 def test_set_cache_str_type(cache_handler):

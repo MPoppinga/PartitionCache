@@ -156,10 +156,10 @@ class PostgreSQLRoaringBitCacheHandler(PostgreSQLAbstractCacheHandler):
             key: The cache key
             partition_key_identifiers: Can be a set of integers, a BitMap, a bitarray, or a list of integers
             partition_key: The partition key (column) identifier
-        """
-        if not partition_key_identifiers:
-            return True
 
+        An empty input is stored as an empty bitmap, which ``get`` returns as an empty BitMap: the query
+        has no rows. NULL stays reserved for the ``set_null`` marker.
+        """
         try:
             # Ensure partition table exists
             self._ensure_partition_table(partition_key, "integer")
@@ -182,7 +182,7 @@ class PostgreSQLRoaringBitCacheHandler(PostgreSQLAbstractCacheHandler):
             table_name = f"{self.tableprefix}_cache_{partition_key}"
             self.cursor.execute(
                 sql.SQL(
-                    "INSERT INTO {0} (query_hash, partition_keys) VALUES (%s, rb_build(%s)) ON CONFLICT (query_hash) DO UPDATE SET partition_keys = EXCLUDED.partition_keys"
+                    "INSERT INTO {0} (query_hash, partition_keys) VALUES (%s, rb_build(%s::INTEGER[])) ON CONFLICT (query_hash) DO UPDATE SET partition_keys = EXCLUDED.partition_keys"
                 ).format(sql.Identifier(table_name)),
                 (key, value_list),
             )

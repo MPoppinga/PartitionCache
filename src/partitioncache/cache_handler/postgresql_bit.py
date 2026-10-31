@@ -253,11 +253,9 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
     def set_cache(self, key: str, partition_key_identifiers: set[int] | set[str] | set[float] | set[datetime], partition_key: str = "partition_key") -> bool:
         """
         Set the partition key identifiers of the given hash in the cache for a specific partition key.
-        Only integer values are supported for bit arrays.
+        Only integer values are supported for bit arrays. An empty set is stored as an all-zero bit
+        array, which ``get`` returns as ``set()``: the query has no rows.
         """
-        if not partition_key_identifiers:
-            return True
-
         try:
             # Convert all keys to integers first
             int_keys = []
@@ -270,7 +268,7 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
                     raise ValueError(f"Only integer values are supported for bit arrays: {k} : {partition_key_identifiers}")
 
             # Determine required bitsize based on data
-            max_value = max(int_keys)
+            max_value = max(int_keys, default=-1)
             required_bitsize = max(max_value + 1, self.default_bitsize)  # Ensure at least default size
 
             # Atomically ensure partition table exists and get actual bitsize
