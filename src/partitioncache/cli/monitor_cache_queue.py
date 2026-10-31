@@ -444,6 +444,13 @@ def run_and_store_query(query: str, query_hash: str, partition_key: str, partiti
                     logger.error(f"QUERY EXECUTION ERROR: Failed to execute query for {query_hash} after {execution_time:.2f}s: {type(e).__name__}: {e}")
                     log_query_time(f"{query_hash}_error", execution_time)
                     cache_handler.set_query_status(query_hash, partition_key, "failed")
+            except Exception as e:
+                # Errors of the other DB backends (sqlite3, mysql.connector): nothing is cached, the
+                # query is marked failed, so a failure never passes as an empty result
+                execution_time = time.perf_counter() - execution_start
+                logger.error(f"QUERY EXECUTION ERROR: Failed to execute query for {query_hash} after {execution_time:.2f}s: {type(e).__name__}: {e}")
+                log_query_time(f"{query_hash}_error", execution_time)
+                cache_handler.set_query_status(query_hash, partition_key, "failed")
             finally:
                 if db_handler:
                     db_handler.close()

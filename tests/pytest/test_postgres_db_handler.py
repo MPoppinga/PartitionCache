@@ -69,3 +69,23 @@ class TestFetchFinalResultSet:
             ]
         )
         assert fetch_final_result_set(cur) == [(99,)]
+
+
+class TestExecuteKeepsFalsyKeys:
+    """execute drops only NULL: key 0 is a partition like any other."""
+
+    def test_key_zero_and_empty_string_kept(self):
+        from unittest.mock import MagicMock
+
+        from partitioncache.db_handler.postgres import PostgresDBHandler
+
+        handler = PostgresDBHandler.__new__(PostgresDBHandler)
+        handler.conn = MagicMock()
+        handler.cur = MagicMock()
+        handler.cur.execute = MagicMock()
+        fake = FakeCursor([(["pk"], [(0,), (5,), (None,), ("",)])])
+        handler.cur.description = fake.description
+        handler.cur.fetchall = fake.fetchall
+        handler.cur.nextset = fake.nextset
+
+        assert handler.execute("SELECT pk FROM t") == [0, 5, ""]

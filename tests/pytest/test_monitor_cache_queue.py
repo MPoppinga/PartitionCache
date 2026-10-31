@@ -368,6 +368,37 @@ class TestRunAndStoreQuery:
 
     @patch("partitioncache.cli.monitor_cache_queue.get_cache_handler")
     @patch("partitioncache.cli.monitor_cache_queue.get_db_handler")
+    def test_non_psycopg_execution_error_marks_failed_and_caches_nothing(self, mock_get_db, mock_get_cache, mock_args):
+        """A sqlite3/mysql error is a failure, never an empty result."""
+        import sqlite3
+
+        import partitioncache.cli.monitor_cache_queue as mcq_module
+
+        mock_cache = Mock()
+        del mock_cache.set_cache_lazy
+        del mock_cache.set_entry_lazy
+        mock_get_cache.return_value = mock_cache
+        mock_db = Mock()
+        mock_db.execute.side_effect = sqlite3.OperationalError("no such table: t")
+        mock_get_db.return_value = mock_db
+
+        original_args = getattr(mcq_module, "args", None)
+        mcq_module.args = mock_args
+        try:
+            result = run_and_store_query("SELECT * FROM t", "test_hash", "test_partition_key", "integer")
+        finally:
+            if original_args is not None:
+                mcq_module.args = original_args
+            else:
+                delattr(mcq_module, "args")
+
+        assert result is False
+        mock_cache.set_cache.assert_not_called()
+        mock_cache.set_query_status.assert_called_once_with("test_hash", "test_partition_key", "failed")
+        mock_db.close.assert_called_once()
+
+    @patch("partitioncache.cli.monitor_cache_queue.get_cache_handler")
+    @patch("partitioncache.cli.monitor_cache_queue.get_db_handler")
     def test_run_and_store_query_error(self, mock_get_db, mock_get_cache, mock_args):
         """Test query execution with general error."""
         mock_get_cache.side_effect = Exception("Cache error")

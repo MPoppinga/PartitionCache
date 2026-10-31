@@ -61,7 +61,9 @@ class PostgresDBHandler(AbstractDBHandler):
         # emit `CREATE TEMPORARY TABLE ... ON COMMIT DROP; ...; SELECT`, where the rows are in the LAST
         # result set, not the first. Returns first column of all rows if not empty.
         rows = fetch_final_result_set(self.cur)
-        result = [row[0] for row in rows if row[0]]
+        # Only NULL is dropped: a truthiness test also dropped key 0 (and '' / 0.0), so its partition was
+        # missing from the cached set and cache restrictions excluded it
+        result = [row[0] for row in rows if row[0] is not None]
         # Commit so the surrounding transaction ends: this fires ON COMMIT DROP for any temp table created
         # by the script (otherwise the table would linger for the whole session). Rows are already fetched.
         # Mirrors the commit in the MySQL/SQLite handlers.
