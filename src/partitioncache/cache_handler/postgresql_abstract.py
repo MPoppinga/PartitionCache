@@ -289,6 +289,30 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
             logger.debug(f"Failed to get all queries for partition {partition_key}: {e}")
             return []
 
+    def _select_keys_as_array_literal(self, query: str, partition_key: str) -> str:
+        """Run a variant query as a plain SELECT and return its partition keys as one array literal.
+
+        Lazy insertion used to be one ``INSERT ... SELECT``, but PostgreSQL never plans parallel workers
+        for a statement that writes, so the variant query ran single-threaded. As a separate SELECT it can
+        run in parallel; the result travels as one array value in its text form ('{1,2,3}'), which the
+        caller's INSERT casts back to the column type, so no per-key conversion happens in Python.
+
+        NULL keys belong to no partition and are dropped, as on the non-lazy path. ARRAY(subquery) is
+        '{}' for zero rows and never NULL, so an empty result cannot be mistaken for the NULL marker
+        of ``set_null``; a missing value raises instead of passing as empty.
+        """
+        self.cursor.execute(
+            sql.SQL("SELECT ARRAY(SELECT {col} FROM ({query}) AS query_result WHERE {col} IS NOT NULL)::text").format(
+                col=sql.Identifier(partition_key),
+                query=sql.SQL(query),  # type: ignore[arg-type]
+            )
+        )
+        row = self.cursor.fetchone()
+        if row is None or row[0] is None:
+            raise RuntimeError("Lazy insertion query returned no key array")
+        keys_literal: str = row[0]
+        return keys_literal
+
     def set_null(self, key: str, partition_key: str = "partition_key") -> bool:
         """Set null value in partition-specific table."""
         try:

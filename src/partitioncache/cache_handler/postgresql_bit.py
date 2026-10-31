@@ -4,7 +4,6 @@ from logging import getLogger
 
 from bitarray import bitarray
 from psycopg import sql
-from psycopg.errors import IntegrityError
 
 from partitioncache.cache_handler.postgresql_abstract import PostgreSQLAbstractCacheHandler, _ends_read_transaction
 
@@ -477,11 +476,13 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
 
             table_name = f"{self.tableprefix}_cache_{partition_key}"
 
-            # Build lazy insertion query that creates a bit array from query results
+            # SELECT and INSERT are separate statements so the variant query can run in parallel;
+            # the INSERT builds the bit array from the returned keys
+            keys_literal = self._select_keys_as_array_literal(query, partition_key)
             lazy_insert_query = sql.SQL(
                 """
                 WITH query_result AS (
-                    {query}
+                    SELECT unnest(%s::INTEGER[]) AS {partition_col}
                 ),
                 bit_positions AS (
                     SELECT {partition_col}::INTEGER AS position
@@ -509,32 +510,23 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
                     partition_keys = EXCLUDED.partition_keys
                 """
             ).format(
-                query=sql.SQL(query),  # type: ignore[arg-type]
                 partition_col=sql.Identifier(partition_key),
                 bitsize=sql.Literal(bitsize),
                 table_name=sql.Identifier(table_name),
                 key=sql.Literal(key)
             )
 
-            self.cursor.execute(lazy_insert_query)
+            self.cursor.execute(lazy_insert_query, (keys_literal,))
 
-            # Also store in queries table for existence checks
-            try:
-                self.cursor.execute(
-                    sql.SQL("INSERT INTO {table} (query_hash, partition_key, query) VALUES (%s, %s, %s)").format(
-                        table=sql.Identifier(self.tableprefix + "_queries")
-                    ),
-                    (key, partition_key, "")
-                )
-            except IntegrityError:
-                # Update if insert fails
-                self.cursor.execute(
-                    sql.SQL("UPDATE {table} SET last_seen = now() WHERE query_hash = %s AND partition_key = %s").format(
-                        table=sql.Identifier(self.tableprefix + "_queries")
-                    ),
-                    (key, partition_key)
-                )
-
+            # Also store in queries table for existence checks. An upsert instead of INSERT plus UPDATE on
+            # IntegrityError: after the failed INSERT the transaction is aborted and the UPDATE raised too.
+            self.cursor.execute(
+                sql.SQL(
+                    "INSERT INTO {table} (query_hash, partition_key, query) VALUES (%s, %s, %s) "
+                    "ON CONFLICT (query_hash, partition_key) DO UPDATE SET last_seen = now()"
+                ).format(table=sql.Identifier(self.tableprefix + "_queries")),
+                (key, partition_key, ""),
+            )
             self.db.commit()
             return True
 

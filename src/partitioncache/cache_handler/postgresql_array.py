@@ -3,7 +3,6 @@ from datetime import datetime
 from logging import getLogger
 
 from psycopg import sql
-from psycopg.errors import IntegrityError
 
 from partitioncache.cache_handler.postgresql_abstract import PostgreSQLAbstractCacheHandler
 
@@ -250,43 +249,30 @@ class PostgreSQLArrayCacheHandler(PostgreSQLAbstractCacheHandler):
 
             table_name = f"{self.tableprefix}_cache_{partition_key}"
 
-            # Build lazy insertion query
-            lazy_insert_query = sql.SQL(
-                """
-                INSERT INTO {table_name} (query_hash, partition_keys)
-                SELECT {key}, ARRAY(SELECT {partition_col} FROM ({query}) AS query_result)
-                ON CONFLICT (query_hash) DO UPDATE SET
-                    partition_keys = EXCLUDED.partition_keys
-                """
-            ).format(
-                table_name=sql.Identifier(table_name),
-                key=sql.Literal(key),
-                partition_col=sql.Identifier(partition_key),
-                query=sql.SQL(query)  # type: ignore[arg-type]
+            # SELECT and INSERT are separate statements so the variant query can run in parallel
+            keys_literal = self._select_keys_as_array_literal(query, partition_key)
+            self.cursor.execute(
+                sql.SQL(
+                    """
+                    INSERT INTO {table_name} (query_hash, partition_keys)
+                    VALUES (%s, %s)
+                    ON CONFLICT (query_hash) DO UPDATE SET
+                        partition_keys = EXCLUDED.partition_keys
+                    """
+                ).format(table_name=sql.Identifier(table_name)),
+                (key, keys_literal),
             )
 
-            self.cursor.execute(lazy_insert_query)
+            # Also store in queries table for existence checks. An upsert instead of INSERT plus UPDATE on
+            # IntegrityError: after the failed INSERT the transaction is aborted and the UPDATE raised too.
+            self.cursor.execute(
+                sql.SQL(
+                    "INSERT INTO {table} (query_hash, partition_key, query) VALUES (%s, %s, %s) "
+                    "ON CONFLICT (query_hash, partition_key) DO UPDATE SET last_seen = now()"
+                ).format(table=sql.Identifier(self.tableprefix + "_queries")),
+                (key, partition_key, ""),
+            )
             self.db.commit()
-
-            # Also store in queries table for existence checks
-            queries_table = f"{self.tableprefix}_queries"
-            try:
-                self.cursor.execute(
-                    sql.SQL("INSERT INTO {table} (query_hash, partition_key, query) VALUES (%s, %s, %s)").format(
-                        table=sql.Identifier(queries_table)
-                    ),
-                    (key, partition_key, "")
-                )
-                self.db.commit()
-            except IntegrityError:
-                # Update if insert fails
-                self.cursor.execute(
-                    sql.SQL("UPDATE {table} SET last_seen = now() WHERE query_hash = %s AND partition_key = %s").format(
-                        table=sql.Identifier(queries_table)
-                    ),
-                    (key, partition_key)
-                )
-                self.db.commit()
 
             return True
 
