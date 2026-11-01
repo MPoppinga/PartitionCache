@@ -28,6 +28,7 @@ class PopulationStats:
     empty_without_execution: int = 0
     already_cached: int = 0
     failed: int = 0
+    store_failed: int = 0
 
 
 def populate_query_variants(
@@ -67,6 +68,7 @@ def populate_query_variants(
         signature = signatures.get(variant_hash)
         if cache_handler.exists(variant_hash, partition_key):
             stats.already_cached += 1
+            cache_handler.set_query(variant_hash, variant, partition_key)  # keep the query text current
             if signature is not None:
                 cached = cache_handler.get(variant_hash, partition_key)
                 if cached is not None:
@@ -82,7 +84,9 @@ def populate_query_variants(
                 relaxation_keys.sort(key=len)
                 intersection = relaxation_keys[0].intersection(*relaxation_keys[1:])
                 if not intersection:
-                    cache_handler.set_entry(variant_hash, set(), variant, partition_key, force_update=True)
+                    if not cache_handler.set_entry(variant_hash, set(), variant, partition_key, force_update=True):
+                        logger.warning(f"Failed to store the empty result of variant {variant_hash}")
+                        stats.store_failed += 1
                     populated[variant_hash] = set()
                     stats.empty_without_execution += 1
                     continue
@@ -101,7 +105,9 @@ def populate_query_variants(
             if connection is not None:
                 connection.rollback()
             continue
-        cache_handler.set_entry(variant_hash, result, variant, partition_key, force_update=True)
+        if not cache_handler.set_entry(variant_hash, result, variant, partition_key, force_update=True):
+            logger.warning(f"Failed to store the result of variant {variant_hash}")
+            stats.store_failed += 1
         stats.executed += 1
         if signature is not None:
             populated[variant_hash] = result

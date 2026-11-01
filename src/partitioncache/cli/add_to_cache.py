@@ -75,6 +75,10 @@ def main():
     add_verbosity_args(parser)
 
     args = parser.parse_args()
+    if args.max_restriction_keys is not None and args.max_restriction_keys < 0:
+        parser.error("--max-restriction-keys must not be negative")
+    if (args.restrict_variants or args.max_restriction_keys is not None) and not args.direct:
+        parser.error("--restrict-variants and --max-restriction-keys require --direct")
 
     # Configure logging based on verbosity
     configure_logging(args)

@@ -34,9 +34,38 @@ class TestVariantSignature:
         b = "SELECT DISTINCT t2.pk FROM d AS t1, f AS t2 WHERE t1.k = t2.k AND t2.k IN (SELECT s.k FROM s WHERE s.v = t2.v)"
         assert is_relaxation_of(variant_signature(a, "pk"), variant_signature(b, "pk"))
 
+    def test_schemas_distinguish_tables(self):
+        """s1.lo and s2.lo are different tables, also when their conditions look alike."""
+        a = "SELECT DISTINCT a.pk FROM s1.lo AS a WHERE a.y = 2"
+        b = "SELECT DISTINCT b.pk FROM s2.lo AS b WHERE b.x = 1 AND b.y = 2"
+        assert not is_relaxation_of(variant_signature(a, "pk"), variant_signature(b, "pk"))
+        assert is_relaxation_of(variant_signature(a, "pk"), variant_signature(a.replace("a.y = 2", "a.y = 2 AND a.x = 1"), "pk"))
+
+    def test_generated_variants_keep_schemas_apart(self):
+        query = "SELECT a.pk FROM s1.lo a, s2.lo b WHERE a.pk = b.pk AND a.y = 2 AND b.y = 2 AND b.x = 1"
+        pairs = generate_all_query_hash_pairs(query, "pk", min_component_size=1, warn_no_partition_key=False)
+        signatures = [variant_signature(v, "pk") for v, _ in pairs]
+        for sig in signatures:
+            assert sig is not None and all(name.startswith(("s1.", "s2.")) for name in sig[0])
+        for a in signatures:
+            for b in signatures:
+                if a is not b and is_relaxation_of(a, b):
+                    assert a[0] <= b[0]
+
     @pytest.mark.parametrize(
         "query",
         [
+            "SELECT DISTINCT t1.pk FROM f AS t1, (SELECT * FROM d WHERE FALSE) AS s",
+            "SELECT DISTINCT t1.pk FROM f AS t1, UNNEST(ARRAY[1]) AS u",
+            "SELECT DISTINCT t1.pk FROM f AS t1, LATERAL (SELECT 1) AS s",
+            "SELECT DISTINCT t1.pk FROM f AS t1 NATURAL JOIN d AS t2",
+            "SELECT DISTINCT t1.pk FROM f AS t1 TABLESAMPLE SYSTEM (10)",
+            "SELECT DISTINCT ON (t1.pk) t1.pk FROM f AS t1",
+            "SELECT MAX(t1.pk) FROM f AS t1",
+            "SELECT DISTINCT t1.pk + 1 FROM f AS t1",
+            "SELECT DISTINCT t1.pk, t1.k FROM f AS t1",
+            "SELECT DISTINCT t1.pk FROM f AS t1 WHERE random() < 0.5",
+            "SELECT DISTINCT t1.pk FROM f AS t1 WHERE t1.ts < now()",
             "SELECT DISTINCT t1.pk FROM f AS t1 JOIN d AS t2 ON t1.k = t2.k",
             "SELECT DISTINCT t1.pk FROM f AS t1 LEFT JOIN d AS t2 ON t1.k = t2.k",
             "SELECT DISTINCT t1.pk FROM f AS t1, f AS t2 WHERE t1.k = t2.k",
@@ -78,6 +107,10 @@ class FakeCache:
 
     def get(self, key, partition_key="partition_key"):
         return self.entries.get(key)
+
+    def set_query(self, key, query_text, partition_key="partition_key"):
+        self.queries[key] = query_text
+        return True
 
     def set_entry(self, key, partition_key_identifiers, query_text, partition_key="partition_key", force_update=False):
         self.entries[key] = set(partition_key_identifiers)
@@ -165,16 +198,40 @@ class TestPopulateQueryVariants:
         assert cache.entries == full.entries
 
     def test_failed_variant_does_not_stop_population(self, star_db):
-        class RaisingDB(CountingDB):
-            # SQLiteDBHandler logs errors and returns []; populate_query_variants needs them raised
-            def execute(self, query):
-                if "missing_table" in query:
-                    raise RuntimeError("no such table: missing_table")
-                return super().execute(query)
-
+        # The real SQLiteDBHandler error path: it raises, so the failure is not mistaken for "no rows"
         pairs = _pairs() + [("SELECT DISTINCT t1.pk FROM missing_table AS t1", "broken")]
         cache = FakeCache()
-        stats = populate_query_variants(pairs, "pk", cache, RaisingDB(star_db))
+        stats = populate_query_variants(pairs, "pk", cache, CountingDB(star_db))
         assert stats.failed == 1
         assert "broken" not in cache.entries
         assert len(cache.entries) == len(pairs) - 1
+
+    def test_failed_relaxation_does_not_empty_the_variants_it_would_restrict(self, star_db):
+        """A relaxation whose query fails is neither cached nor used; the larger variants keep their true results."""
+        reference = FakeCache()
+        populate_query_variants(_pairs(), "pk", reference, CountingDB(star_db), restrict=False)
+        pairs = _pairs()
+        smallest = min(pairs, key=lambda p: len(p[0]))
+        broken = [("SELECT DISTINCT t1.pk FROM missing_table AS t1", h) if h == smallest[1] else (v, h) for v, h in pairs]
+
+        cache = FakeCache()
+        stats = populate_query_variants(broken, "pk", cache, CountingDB(star_db))
+
+        assert stats.failed == 1
+        assert smallest[1] not in cache.entries
+        assert cache.entries == {h: keys for h, keys in reference.entries.items() if h != smallest[1]}
+
+    def test_store_failures_are_counted(self, star_db):
+        class FailingCache(FakeCache):
+            def set_entry(self, *args, **kwargs):
+                return False
+
+        stats = populate_query_variants(_pairs(), "pk", FailingCache(), CountingDB(star_db))
+        assert stats.store_failed == stats.executed + stats.empty_without_execution > 0
+
+
+def test_order_is_reproducible_for_variants_of_the_same_size():
+    from partitioncache.query_processor import order_variants_for_population
+
+    pairs = [("SELECT DISTINCT t1.pk FROM a AS t1 WHERE t1.x = 1", "h2"), ("SELECT DISTINCT t1.pk FROM b AS t1 WHERE t1.x = 1", "h1")]
+    assert order_variants_for_population(pairs) == order_variants_for_population(list(reversed(pairs)))

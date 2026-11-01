@@ -2254,22 +2254,50 @@ def order_variants_for_population(query_hash_pairs: list[tuple[str, str]]) -> li
             conditions = 1
         return (tables, conditions)
 
-    return sorted(query_hash_pairs, key=size)
+    # The hash as last key makes the order reproducible; the input comes in set order
+    return sorted(query_hash_pairs, key=lambda pair: (*size(pair), pair[1]))
 
 
 VariantSignature = tuple[frozenset[str], frozenset[str], str]
+
+# Results that can differ between two executions make conditions incomparable across variants
+_VOLATILE_EXPRESSIONS = (exp.Rand, exp.CurrentTimestamp, exp.CurrentDate, exp.CurrentTime, exp.CurrentDatetime, exp.Uuid)
+_VOLATILE_FUNCTION_NAMES = {
+    "random", "rand", "now", "clock_timestamp", "statement_timestamp", "transaction_timestamp", "timeofday",
+    "localtime", "localtimestamp", "nextval", "currval", "setval", "setseed", "gen_random_uuid", "uuid_generate_v4",
+}
+_PLAIN_TABLE_ARGS = {"this", "db", "catalog", "alias"}
+
+
+def _plain_table(source: exp.Expr | None) -> exp.Table | None:
+    """The source if it is a bare table reference (optionally schema-qualified and aliased), else None."""
+    if not isinstance(source, exp.Table):
+        return None
+    if any(value for key, value in source.args.items() if key not in _PLAIN_TABLE_ARGS):
+        return None  # TABLESAMPLE, pivots, hints, ...
+    alias = source.args.get("alias")
+    if alias is not None and alias.args.get("columns"):
+        return None  # column aliases rename columns
+    return source
+
+
+def _is_volatile(expression: exp.Expr) -> bool:
+    if any(True for _ in expression.find_all(*_VOLATILE_EXPRESSIONS)):
+        return True
+    return any(func.name.lower() in _VOLATILE_FUNCTION_NAMES for func in expression.find_all(exp.Anonymous))
 
 
 def variant_signature(query: str, partition_key: str) -> VariantSignature | None:
     """Describe a query variant by its tables, its conditions and the table that provides the partition key.
 
-    Aliases are replaced by table names, so the signature does not depend on how a variant numbers its
-    aliases. Variant A is a relaxation of variant B when ``is_relaxation_of(sig_a, sig_b)``: B joins the
-    tables of A and keeps all conditions of A, so B's partition keys are a subset of A's.
+    Aliases are replaced by table names (with schema and catalog), so the signature does not depend on how a
+    variant numbers its aliases. Variant A is a relaxation of variant B when ``is_relaxation_of(sig_a, sig_b)``:
+    B joins the tables of A and keeps all conditions of A, so B's partition keys are a subset of A's.
 
-    Returns None for anything the subset test cannot judge soundly: a table used twice (ambiguous
-    alias mapping), explicit JOIN syntax (ON conditions are not in WHERE), unqualified columns,
-    grouping/limits/set operations, or a partition key that is not selected from exactly one table.
+    Only the shape the variant generator produces is judged: ``SELECT [DISTINCT] alias.key FROM t1 AS a, t2 AS b
+    WHERE cond AND cond ...`` with bare tables. Anything else returns None: a table used twice, explicit or
+    NATURAL joins, subqueries/UNNEST/LATERAL in FROM, TABLESAMPLE, DISTINCT ON, a select list other than the
+    bare key column, grouping/limits/set operations, unqualified columns, and volatile functions.
 
     Args:
         query: A query variant as produced by ``generate_all_query_hash_pairs``.
@@ -2282,21 +2310,33 @@ def variant_signature(query: str, partition_key: str) -> VariantSignature | None
         select = sqlglot.parse_one(query)
     except sqlglot.ParseError:
         return None
-    if not isinstance(select, exp.Select) or any(select.args.get(arg) for arg in ("group", "having", "limit", "offset", "with", "qualify")):
+    if not isinstance(select, exp.Select) or any(select.args.get(arg) for arg in ("group", "having", "limit", "offset", "with", "qualify", "kind", "into")):
         return None
-    if any(join.args.get("on") or join.args.get("using") or join.side or join.kind for join in select.args.get("joins") or []):
+    distinct = select.args.get("distinct")
+    if distinct is not None and distinct.args.get("on") is not None:
         return None
 
-    tables = [table for table in select.find_all(exp.Table) if table.parent_select is select]
-    names = [table.name for table in tables]
+    from_clause = select.args.get("from_")
+    sources = [from_clause.this if from_clause is not None else None]
+    for join in select.args.get("joins") or []:
+        if join.args.get("on") or join.args.get("using") or join.side or join.kind or join.args.get("method"):
+            return None
+        sources.append(join.this)
+    plain_tables = [_plain_table(source) for source in sources]
+    tables = [table for table in plain_tables if table is not None]
+    if len(tables) != len(plain_tables):
+        return None
+    names = [exp.table_name(table) for table in tables]
     if len(set(names)) != len(names):
         return None
-    alias_to_table = {table.alias_or_name: table.name for table in tables}
+    alias_to_table = {table.alias_or_name: exp.table_name(table) for table in tables}
 
-    key_columns = [col for expression in select.expressions for col in expression.find_all(exp.Column) if col.name == partition_key]
-    if len(key_columns) != 1 or key_columns[0].table not in alias_to_table:
+    if len(select.expressions) != 1:
         return None
-    key_table = alias_to_table[key_columns[0].table]
+    key_column = select.expressions[0]
+    if not isinstance(key_column, exp.Column) or key_column.name != partition_key or key_column.table not in alias_to_table:
+        return None
+    key_table = alias_to_table[key_column.table]
 
     where = select.args.get("where")
     if where is None:
@@ -2308,13 +2348,16 @@ def variant_signature(query: str, partition_key: str) -> VariantSignature | None
 
     normalized = set()
     for condition in conditions:
+        if _is_volatile(condition):
+            return None
         condition = condition.copy()
         # Aliases introduced inside the condition (IN/EXISTS subqueries) must not shadow outer ones
-        inner_aliases = {table.alias_or_name for table in condition.find_all(exp.Table)}
-        if inner_aliases & (alias_to_table.keys() | set(names)):
+        inner_tables = list(condition.find_all(exp.Table))
+        inner_aliases = {table.alias_or_name for table in inner_tables}
+        if (inner_aliases | {exp.table_name(table) for table in inner_tables}) & (alias_to_table.keys() | set(names)):
             return None
         for col in condition.find_all(exp.Column):
-            if not col.table:
+            if not col.table or col.args.get("db") or col.args.get("catalog"):
                 return None
             if col.table in alias_to_table:
                 col.set("table", exp.to_identifier(alias_to_table[col.table]))

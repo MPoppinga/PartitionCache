@@ -143,3 +143,14 @@ def test_rewrite_of_100k_int_keys_is_fast(method):
     elapsed = time.perf_counter() - t0
     assert new.count(",") >= 99_999
     assert elapsed < 2.0, f"{method}: rewrite of 100k keys took {elapsed:.2f} s"
+
+
+def test_backslash_keys_are_escaped_for_mysql():
+    """MySQL treats a backslash as an escape character; a key ending in one must not swallow the next key."""
+    keys = {"a\\", "b"}
+    new = extend_query_with_partition_keys(QUERY_WITH_WHERE, keys, "pocket_key", method="IN", p0_alias="p", sql_dialect="mysql")
+    parsed = sqlglot.parse_one(new, read="mysql")
+    literals = {lit.this for lit in parsed.find(exp.In).find_all(exp.Literal) if lit.is_string}
+    assert literals == keys
+    values = extend_query_with_partition_keys(QUERY_WITH_WHERE, keys, "pocket_key", method="VALUES", p0_alias="p", sql_dialect="mysql")
+    assert "('a\\\\')" in values

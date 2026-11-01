@@ -370,16 +370,16 @@ def _key_list_sentinel() -> str:
     return f"__pcache_keys_{secrets.token_hex(8)}__"
 
 
-def _format_spliced_partition_key(pk: int | str | float | datetime) -> str:
+def _format_spliced_partition_key(pk: int | str | float | datetime, sql_dialect: str = "postgres") -> str:
     """Format one key for a spliced (unparsed) list.
 
-    Same output as `_format_partition_key_for_sql`, except that a single quote inside a string key
-    is doubled. The former parse-based path rejected such keys with a sqlglot TokenError; a spliced
-    list must escape them itself so the literal stays well-formed.
+    Integers as numbers, everything else as a string literal rendered by sqlglot for ``sql_dialect``, so
+    quotes and backslashes are escaped the way that dialect expects (MySQL treats a backslash as an
+    escape character). The former parse-based path rejected such keys with a sqlglot TokenError.
     """
-    if isinstance(pk, str):
-        return _format_partition_key_for_sql(pk.replace("'", "''"))
-    return _format_partition_key_for_sql(pk)
+    if isinstance(pk, int):
+        return str(pk)
+    return exp.Literal.string(str(pk)).sql(dialect=sql_dialect)
 
 
 def _splice_key_list(rendered_sql: str, sentinel: str, key_list: str) -> str:
@@ -521,14 +521,14 @@ def extend_query_with_partition_keys(
         sentinel = _key_list_sentinel()
         partition_expr = sqlglot.parse_one(f"{p0_alias}.{partition_key} IN ({sentinel})")
         _add_where_condition(parsed_query, partition_expr)
-        key_list = ", ".join(_format_spliced_partition_key(pk) for pk in partition_keys)
+        key_list = ", ".join(_format_spliced_partition_key(pk, sql_dialect) for pk in partition_keys)
         return _splice_key_list(parsed_query.sql(), sentinel, key_list)
 
     elif method == "VALUES":
         sentinel = _key_list_sentinel()
         partition_expr = sqlglot.parse_one(f"{p0_alias}.{partition_key} IN (VALUES({sentinel}))")
         _add_where_condition(parsed_query, partition_expr)
-        key_list = "), (".join(_format_spliced_partition_key(pk) for pk in partition_keys)
+        key_list = "), (".join(_format_spliced_partition_key(pk, sql_dialect) for pk in partition_keys)
         return _splice_key_list(parsed_query.sql(), sentinel, key_list)
 
     elif method == "TMP_TABLE_JOIN":
