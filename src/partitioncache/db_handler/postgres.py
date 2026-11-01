@@ -72,13 +72,14 @@ class PostgresDBHandler(AbstractDBHandler):
         """Return the planner's total cost of ``query`` from ``EXPLAIN (FORMAT JSON)``; the query is not executed.
 
         The EXPLAIN runs in a transaction that is always rolled back, or in a savepoint when the caller has a
-        transaction open, so the caller's transaction is neither committed nor aborted. It is sent as a
-        prepared statement, which PostgreSQL accepts for a single statement only: text that contains several
-        statements raises instead of running the others.
+        transaction open, so the caller's transaction is neither committed nor aborted. A binary cursor sends
+        it as an unnamed extended-protocol statement, which PostgreSQL accepts for a single statement only:
+        text that contains several statements raises instead of running the others. No named prepared
+        statement is created, so the caller's prepared statements survive the rollback.
         """
-        with self.conn.transaction(force_rollback=True):
-            self.cur.execute(f"EXPLAIN (FORMAT JSON) {query}", prepare=True)
-            row = self.cur.fetchone()
+        with self.conn.transaction(force_rollback=True), self.conn.cursor(binary=True) as cur:
+            cur.execute(f"EXPLAIN (FORMAT JSON) {query}")
+            row = cur.fetchone()
         if not row or not row[0]:
             return None
         return float(row[0][0]["Plan"]["Total Cost"])

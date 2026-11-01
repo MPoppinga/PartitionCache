@@ -61,3 +61,25 @@ def test_open_transaction_is_not_committed(handler):
     handler.conn.execute("CREATE TEMP TABLE pc_cost_gate_on_commit (a int) ON COMMIT DROP")
     handler.estimate_cost("SELECT 1")
     assert handler.conn.execute("SELECT to_regclass('pc_cost_gate_on_commit') IS NOT NULL").fetchone()[0]
+
+
+def test_callers_prepared_statements_survive(handler):
+    handler.conn.execute("PREPARE pc_cost_gate_callerq AS SELECT 42")
+    handler.estimate_cost("SELECT 1")
+    assert handler.conn.execute("EXECUTE pc_cost_gate_callerq").fetchone()[0] == 42
+
+
+def test_several_statements_are_rejected_without_prepared_statements():
+    """With prepare_threshold=None (e.g. behind pgbouncer) psycopg never prepares; the check still holds."""
+    try:
+        conn = psycopg.connect(**CONN, prepare_threshold=None)
+    except psycopg.OperationalError as e:
+        pytest.skip(f"PostgreSQL not available: {e}")
+    handler = PostgresDBHandler.__new__(PostgresDBHandler)
+    handler.conn, handler.cur = conn, conn.cursor()
+    try:
+        with pytest.raises(psycopg.Error):
+            handler.estimate_cost("SELECT 1; CREATE TABLE pc_cost_gate_probe (a int)")
+        assert not _table_exists(handler, "pc_cost_gate_probe")
+    finally:
+        conn.close()

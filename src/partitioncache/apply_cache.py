@@ -7,9 +7,11 @@ It utilizes the given cache to extend the SQL query with the set of possible par
 """
 
 import math
+import numbers
 import random
 from collections.abc import Callable
 from datetime import datetime
+from decimal import Decimal
 from logging import getLogger
 from typing import Any, Literal
 
@@ -1254,14 +1256,15 @@ def _check_cost_gate(query: str, cost_estimator: Callable[[str], float | None] |
     if cost_estimator is None:
         raise ValueError("min_query_cost requires a cost_estimator (e.g. PostgresDBHandler.estimate_cost)")
     try:
-        cost = cost_estimator(query)
+        cost: Any = cost_estimator(query)  # custom estimators may return Decimal, numpy numbers or junk
     except Exception as e:
         logger.warning(f"Query cost estimation failed, applying the cache anyway: {e}")
         return False, {"cost_gated": 0}
-    if isinstance(cost, bool) or not isinstance(cost, int | float) or not math.isfinite(cost):
+    if isinstance(cost, bool) or not isinstance(cost, numbers.Real | Decimal) or not math.isfinite(cost):
         if cost is not None:
             logger.warning(f"Query cost estimator returned {cost!r}, not a finite number; applying the cache anyway")
         return False, {"cost_gated": 0}
+    cost = float(cost)
     gated = cost < min_query_cost
     if gated:
         logger.info(f"Planner cost {cost:.0f} is below min_query_cost {min_query_cost:.0f}; cache not applied")

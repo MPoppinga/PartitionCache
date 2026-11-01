@@ -128,6 +128,13 @@ class TestCostGate:
 
 
 class TestEstimatorResultValidation:
+    def test_decimal_cost_is_used(self, apply):
+        from decimal import Decimal
+
+        (enhanced, stats), _ = apply(cost_estimator=Mock(return_value=Decimal("42.4")), min_query_cost=1000)
+        assert enhanced == QUERY
+        assert stats["cost_gated"] == 1 and stats["query_cost"] == 42
+
     @pytest.mark.parametrize("value", [float("nan"), float("inf"), "87.5", True])
     def test_non_finite_or_non_numeric_cost_applies_the_cache(self, apply, value):
         (enhanced, stats), _ = apply(cost_estimator=Mock(return_value=value), min_query_cost=1000)
@@ -144,21 +151,22 @@ class TestPostgresEstimateCost:
         return handler
 
     def test_returns_total_cost_without_executing(self):
-        cur = MagicMock()
+        handler = self._handler(MagicMock())
+        cur = handler.conn.cursor.return_value.__enter__.return_value
         cur.fetchone.return_value = ([{"Plan": {"Node Type": "Seq Scan", "Total Cost": 1234.56}}],)
-        handler = self._handler(cur)
 
         assert handler.estimate_cost(QUERY) == 1234.56
-        # A prepared statement accepts a single statement only; the transaction is always rolled back
-        cur.execute.assert_called_once_with(f"EXPLAIN (FORMAT JSON) {QUERY}", prepare=True)
+        # A binary cursor sends an unnamed extended-protocol statement (single statement only, nothing left
+        # in psycopg's prepared-statement cache); the transaction is always rolled back
+        handler.conn.cursor.assert_called_once_with(binary=True)
+        cur.execute.assert_called_once_with(f"EXPLAIN (FORMAT JSON) {QUERY}")
         handler.conn.transaction.assert_called_once_with(force_rollback=True)
         handler.conn.commit.assert_not_called()
         handler.conn.rollback.assert_not_called()
 
     def test_failure_reraises_without_touching_the_callers_transaction(self):
-        cur = MagicMock()
-        cur.execute.side_effect = RuntimeError("syntax error")
-        handler = self._handler(cur)
+        handler = self._handler(MagicMock())
+        handler.conn.cursor.return_value.__enter__.return_value.execute.side_effect = RuntimeError("syntax error")
 
         with pytest.raises(RuntimeError):
             handler.estimate_cost("SELEC 1")
