@@ -207,15 +207,19 @@ DECLARE
     v_log_table TEXT;
     v_config_table TEXT;
     v_bitsize INTEGER;
-    -- array/bit/roaringbit: the variant runs as this plain SELECT and returns its keys as one array literal
+    -- array/bit/roaringbit: the variant runs as this plain SELECT and returns its keys as a typed array,
+    -- which reaches the INSERT as parameter $1 (one variable per array column type)
     v_select_query TEXT;
-    v_keys TEXT;
+    v_int_keys INTEGER[];
+    v_numeric_keys NUMERIC[];
+    v_text_keys TEXT[];
+    v_timestamp_keys TIMESTAMP[];
     v_min_key BIGINT;
     v_max_key BIGINT;
     v_grown_bitsize INTEGER;
-    -- Bit array from the key literal (%L) and the bitsize (%s, twice)
+    -- Bit array from the key array ($1) and the bitsize (%s, twice)
     v_bit_template TEXT := 'WITH bit_positions AS (
-            SELECT position FROM unnest(%L::INTEGER[]) AS u(position)
+            SELECT position FROM unnest($1) AS u(position) WHERE position >= 0
         ),
         bit_array AS (
             SELECT generate_series(0, %s - 1) AS bit_index
@@ -351,9 +355,9 @@ BEGIN
             -- Note: Bitsize validation/expansion will be handled by the bootstrap function's GREATEST logic
             
             -- The INSERT is built after the SELECT has run (see the execution block)
-            v_select_query := format('SELECT ARRAY(SELECT %s FROM (%s) AS query_result WHERE %s IS NOT NULL)::text', p_partition_key, p_query, p_partition_key);
+            v_select_query := format('SELECT ARRAY(SELECT %s FROM (%s) AS query_result WHERE %s IS NOT NULL)', p_partition_key, p_query, p_partition_key);
         ELSIF p_cache_backend IN ('roaringbit', 'array') THEN
-            v_select_query := format('SELECT ARRAY(SELECT %s FROM (%s) AS query_result WHERE %s IS NOT NULL)::text', p_partition_key, p_query, p_partition_key);
+            v_select_query := format('SELECT ARRAY(SELECT %s FROM (%s) AS query_result WHERE %s IS NOT NULL)', p_partition_key, p_query, p_partition_key);
         ELSIF p_cache_backend = 'h3' THEN
             -- Read spatial config from config table
             v_config_table := p_queue_prefix || '_processor_config';
@@ -424,22 +428,21 @@ BEGIN
             RAISE EXCEPTION 'Query contains DELETE or DROP';
         END IF;
 
-        -- Execute main query with bitsize expansion handling
+        -- Execute main query
         BEGIN
             IF v_select_query IS NOT NULL THEN
                 -- SELECT and INSERT are separate statements: PostgreSQL never runs a statement that writes
                 -- with parallel workers, so the variant inside an INSERT ... SELECT ran single-threaded.
-                -- ARRAY(subquery) is '{}' for zero rows, never NULL, so an empty result is stored as an
-                -- empty array / all-zero bits / empty bitmap and stays distinct from the NULL marker.
-                EXECUTE v_select_query INTO v_keys;
-                IF v_keys IS NULL THEN
-                    RAISE EXCEPTION 'Variant query returned no key array';
-                END IF;
+                -- The keys stay a typed array on the server. ARRAY(subquery) is '{}' for zero rows, never
+                -- NULL, so an empty result is stored as an empty array / all-zero bits / empty bitmap and
+                -- stays distinct from the NULL marker.
                 IF p_cache_backend = 'bit' THEN
+                    EXECUTE v_select_query INTO v_int_keys;
+                    IF v_int_keys IS NULL THEN RAISE EXCEPTION 'Variant query returned no key array'; END IF;
                     -- Keys a bit array cannot hold are not dropped: a negative key fails the job, a key
                     -- beyond the bitsize grows the partition's bit arrays to max key + 1 + buffer, where
                     -- the buffer is the setting partitioncache.bitsize_buffer (ALTER DATABASE ... SET), default 0
-                    EXECUTE 'SELECT min(k), max(k) FROM unnest($1::INTEGER[]) AS k' INTO v_min_key, v_max_key USING v_keys;
+                    SELECT min(k), max(k) INTO v_min_key, v_max_key FROM unnest(v_int_keys) AS k;
                     IF v_min_key < 0 THEN
                         RAISE EXCEPTION 'Partition key % is negative; bit arrays cannot store it', v_min_key;
                     END IF;
@@ -450,57 +453,37 @@ BEGIN
                         RAISE WARNING 'Partition key % exceeds bitsize % of partition %: bit arrays grown to %', v_max_key, v_bitsize, p_partition_key, v_grown_bitsize;
                         v_bitsize := v_grown_bitsize;
                     END IF;
-                    v_insert_query := format('INSERT INTO %I (query_hash, partition_keys) SELECT %L, (%s) ON CONFLICT (query_hash) DO UPDATE SET partition_keys = EXCLUDED.partition_keys', v_cache_table, p_query_hash, format(v_bit_template, v_keys, v_bitsize, v_bitsize));
+                    EXECUTE format('INSERT INTO %I (query_hash, partition_keys) SELECT %L, (%s) ON CONFLICT (query_hash) DO UPDATE SET partition_keys = EXCLUDED.partition_keys', v_cache_table, p_query_hash, format(v_bit_template, v_bitsize, v_bitsize))
+                        USING v_int_keys;
                 ELSIF p_cache_backend = 'roaringbit' THEN
-                    v_insert_query := format('INSERT INTO %I (query_hash, partition_keys) VALUES (%L, rb_build(%L::INTEGER[])) ON CONFLICT (query_hash) DO UPDATE SET partition_keys = EXCLUDED.partition_keys', v_cache_table, p_query_hash, v_keys);
+                    EXECUTE v_select_query INTO v_int_keys;
+                    IF v_int_keys IS NULL THEN RAISE EXCEPTION 'Variant query returned no key array'; END IF;
+                    EXECUTE format('INSERT INTO %I (query_hash, partition_keys) VALUES (%L, rb_build($1)) ON CONFLICT (query_hash) DO UPDATE SET partition_keys = EXCLUDED.partition_keys', v_cache_table, p_query_hash)
+                        USING v_int_keys;
                 ELSE
-                    v_insert_query := format('INSERT INTO %I (query_hash, partition_keys) VALUES (%L, %L) ON CONFLICT (query_hash) DO UPDATE SET partition_keys = EXCLUDED.partition_keys', v_cache_table, p_query_hash, v_keys);
-                END IF;
-            END IF;
-            EXECUTE v_insert_query;
-            GET DIAGNOSTICS v_rows_affected = ROW_COUNT;
-        EXCEPTION WHEN OTHERS THEN
-            -- Check if error is due to bitsize limitation for bit backend
-            IF p_cache_backend = 'bit' AND v_keys IS NOT NULL AND (SQLERRM LIKE '%bit string length%' OR SQLERRM LIKE '%invalid input%') THEN
-                -- Calculate required bitsize from actual query data
-                DECLARE v_data_max_value INTEGER;
-                DECLARE v_new_bitsize INTEGER;
-                BEGIN
-                    EXECUTE 'SELECT COALESCE(MAX(k), -1) FROM unnest($1::INTEGER[]) AS k' INTO v_data_max_value USING v_keys;
-                    
-                    IF v_data_max_value >= 0 THEN
-                        v_new_bitsize := v_data_max_value + 1;
-                        
-                        -- Update bitsize if needed
-                        IF v_new_bitsize > v_bitsize THEN
-                            -- Update metadata with new bitsize (trigger should handle table alteration)
-                            EXECUTE format('UPDATE %I SET bitsize = %L WHERE partition_key = %L', v_metadata_table, v_new_bitsize, p_partition_key);
-                            
-                            -- Update local variable to new bitsize
-                            v_bitsize := v_new_bitsize;
-                            
-                            -- Rebuild the bit array with the new bitsize from the keys already fetched
-                            v_insert_query := format('INSERT INTO %I (query_hash, partition_keys) SELECT %L, (%s) ON CONFLICT (query_hash) DO UPDATE SET partition_keys = EXCLUDED.partition_keys', v_cache_table, p_query_hash, format(v_bit_template, v_keys, v_bitsize, v_bitsize));
-
-                            -- Retry with expanded bitsize
-                            EXECUTE v_insert_query;
-                            GET DIAGNOSTICS v_rows_affected = ROW_COUNT;
-                        ELSE
-                            -- Re-raise original error if not a bitsize issue
-                            RAISE;
-                        END IF;
+                    v_insert_query := format('INSERT INTO %I (query_hash, partition_keys) VALUES (%L, $1) ON CONFLICT (query_hash) DO UPDATE SET partition_keys = EXCLUDED.partition_keys', v_cache_table, p_query_hash);
+                    IF v_datatype = 'integer' THEN
+                        EXECUTE v_select_query INTO v_int_keys;
+                        IF v_int_keys IS NULL THEN RAISE EXCEPTION 'Variant query returned no key array'; END IF;
+                        EXECUTE v_insert_query USING v_int_keys;
+                    ELSIF v_datatype = 'float' THEN
+                        EXECUTE v_select_query INTO v_numeric_keys;
+                        IF v_numeric_keys IS NULL THEN RAISE EXCEPTION 'Variant query returned no key array'; END IF;
+                        EXECUTE v_insert_query USING v_numeric_keys;
+                    ELSIF v_datatype = 'timestamp' THEN
+                        EXECUTE v_select_query INTO v_timestamp_keys;
+                        IF v_timestamp_keys IS NULL THEN RAISE EXCEPTION 'Variant query returned no key array'; END IF;
+                        EXECUTE v_insert_query USING v_timestamp_keys;
                     ELSE
-                        -- Re-raise original error if no data to analyze
-                        RAISE;
+                        EXECUTE v_select_query INTO v_text_keys;
+                        IF v_text_keys IS NULL THEN RAISE EXCEPTION 'Variant query returned no key array'; END IF;
+                        EXECUTE v_insert_query USING v_text_keys;
                     END IF;
-                EXCEPTION WHEN OTHERS THEN
-                    -- Re-raise original error if expansion fails
-                    RAISE;
-                END;
+                END IF;
             ELSE
-                -- Re-raise non-bitsize errors
-                RAISE;
+                EXECUTE v_insert_query;
             END IF;
+            GET DIAGNOSTICS v_rows_affected = ROW_COUNT;
         END;
         
         -- Check result limit if configured

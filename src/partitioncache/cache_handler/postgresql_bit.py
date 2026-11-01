@@ -487,7 +487,7 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
         """Store a variant's keys as a bit array on the server; keys that do not fit raise instead of being dropped."""
         bitsize = int(bitsize)
         bit_value = (
-            "(WITH bit_positions AS (SELECT position FROM unnest(%L::INTEGER[]) AS u(position)),"
+            "(WITH bit_positions AS (SELECT position FROM unnest($2) AS u(position)),"
             f" bit_array AS (SELECT generate_series(0, {bitsize} - 1) AS bit_index),"
             " bit_string AS ("
             " SELECT string_agg(CASE WHEN bit_array.bit_index IN (SELECT position FROM bit_positions) THEN '1' ELSE '0' END,"
@@ -495,13 +495,13 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
             f" SELECT bit_value::BIT({bitsize}) FROM bit_string)"
         )
         check = (
-            "SELECT min(k), max(k) FROM unnest(v_keys::INTEGER[]) AS k INTO v_min, v_max; "
+            "SELECT min(k), max(k) FROM unnest(v_keys) AS k INTO v_min, v_max; "
             "IF v_min < 0 THEN RAISE EXCEPTION 'Partition key % is negative; bit arrays cannot store it', v_min "
             f"USING ERRCODE = '{NEGATIVE_KEY_SQLSTATE}'; END IF; "
             f"IF v_max >= {bitsize} THEN RAISE EXCEPTION 'Partition key % exceeds bitsize {bitsize}', v_max "
             f"USING ERRCODE = '{BITSIZE_EXCEEDED_SQLSTATE}', DETAIL = v_max::text; END IF;"
         )
-        self._store_keys_lazily(table_name, key, query, partition_key, bit_value, check)
+        self._store_keys_lazily(table_name, key, query, partition_key, "INTEGER[]", bit_value, check)
 
     def set_cache_lazy(self, key: str, query: str, partition_key: str = "partition_key") -> bool:
         """
