@@ -214,9 +214,13 @@ DECLARE
     v_numeric_keys NUMERIC[];
     v_text_keys TEXT[];
     v_timestamp_keys TIMESTAMP[];
-    -- Bit array from the key array ($1) and the bitsize (%s, twice)
+    v_min_key BIGINT;
+    v_max_key BIGINT;
+    v_grown_bitsize INTEGER;
+    v_bitsize_buffer INTEGER;
+    -- Bit array from the key array ($1) and the bitsize (%s, twice); keys must lie in 0 .. bitsize - 1
     v_bit_template TEXT := 'WITH bit_positions AS (
-            SELECT position FROM unnest($1) AS u(position) WHERE position >= 0
+            SELECT position FROM unnest($1) AS u(position)
         ),
         bit_array AS (
             SELECT generate_series(0, %s - 1) AS bit_index
@@ -425,7 +429,7 @@ BEGIN
             RAISE EXCEPTION 'Query contains DELETE or DROP';
         END IF;
 
-        -- Execute main query with bitsize expansion handling
+        -- Execute main query
         BEGIN
             IF v_select_query IS NOT NULL THEN
                 -- SELECT and INSERT are separate statements: PostgreSQL never runs a statement that writes
@@ -436,6 +440,32 @@ BEGIN
                 IF p_cache_backend = 'bit' THEN
                     EXECUTE v_select_query INTO v_int_keys;
                     IF v_int_keys IS NULL THEN RAISE EXCEPTION 'Variant query returned no key array'; END IF;
+                    -- Keys a bit array cannot hold are not dropped: a negative key fails the job, a key
+                    -- beyond the bitsize grows the partition's bit arrays to max key + 1 + buffer, where
+                    -- the buffer is the setting partitioncache.bitsize_buffer (ALTER DATABASE ... SET), default 0
+                    SELECT min(k), max(k) INTO v_min_key, v_max_key FROM unnest(v_int_keys) AS k;
+                    IF v_min_key < 0 THEN
+                        RAISE EXCEPTION 'Partition key % is negative; bit arrays cannot store it', v_min_key;
+                    END IF;
+                    IF v_max_key >= v_bitsize THEN
+                        v_bitsize_buffer := COALESCE(NULLIF(current_setting('partitioncache.bitsize_buffer', true), '')::INTEGER, 0);
+                        IF v_bitsize_buffer < 0 THEN
+                            RAISE EXCEPTION 'partitioncache.bitsize_buffer must not be negative (is %)', v_bitsize_buffer;
+                        END IF;
+                        PERFORM partitioncache_bootstrap_partition(p_table_prefix, p_partition_key, v_datatype, p_cache_backend, (v_max_key + 1 + v_bitsize_buffer)::INTEGER);
+                    END IF;
+                    -- The bitsize was read before the variant ran; another job may have grown the bit arrays
+                    -- since. Lock the cache table first: a job that grows it holds it until commit, so the
+                    -- bitsize read afterwards matches the column type (INSERT takes this lock anyway).
+                    EXECUTE format('LOCK TABLE %I IN ROW EXCLUSIVE MODE', v_cache_table);
+                    EXECUTE format('SELECT bitsize FROM %I WHERE partition_key = %L', v_metadata_table, p_partition_key) INTO v_grown_bitsize;
+                    IF v_max_key >= v_grown_bitsize THEN
+                        RAISE EXCEPTION 'Partition key % exceeds bitsize % of partition %', v_max_key, v_grown_bitsize, p_partition_key;
+                    END IF;
+                    IF v_max_key >= v_bitsize THEN
+                        RAISE WARNING 'Partition key % exceeds bitsize % of partition %: bit arrays grown to %', v_max_key, v_bitsize, p_partition_key, v_grown_bitsize;
+                    END IF;
+                    v_bitsize := v_grown_bitsize;
                     EXECUTE format('INSERT INTO %I (query_hash, partition_keys) SELECT %L, (%s) ON CONFLICT (query_hash) DO UPDATE SET partition_keys = EXCLUDED.partition_keys', v_cache_table, p_query_hash, format(v_bit_template, v_bitsize, v_bitsize))
                         USING v_int_keys;
                 ELSIF p_cache_backend = 'roaringbit' THEN
@@ -467,48 +497,6 @@ BEGIN
                 EXECUTE v_insert_query;
             END IF;
             GET DIAGNOSTICS v_rows_affected = ROW_COUNT;
-        EXCEPTION WHEN OTHERS THEN
-            -- Check if error is due to bitsize limitation for bit backend
-            IF p_cache_backend = 'bit' AND v_int_keys IS NOT NULL AND (SQLERRM LIKE '%bit string length%' OR SQLERRM LIKE '%invalid input%') THEN
-                -- Calculate required bitsize from actual query data
-                DECLARE v_data_max_value INTEGER;
-                DECLARE v_new_bitsize INTEGER;
-                BEGIN
-                    EXECUTE 'SELECT COALESCE(MAX(k), -1) FROM unnest($1) AS k' INTO v_data_max_value USING v_int_keys;
-                    
-                    IF v_data_max_value >= 0 THEN
-                        v_new_bitsize := v_data_max_value + 1;
-                        
-                        -- Update bitsize if needed
-                        IF v_new_bitsize > v_bitsize THEN
-                            -- Update metadata with new bitsize (trigger should handle table alteration)
-                            EXECUTE format('UPDATE %I SET bitsize = %L WHERE partition_key = %L', v_metadata_table, v_new_bitsize, p_partition_key);
-                            
-                            -- Update local variable to new bitsize
-                            v_bitsize := v_new_bitsize;
-                            
-                            -- Rebuild the bit array with the new bitsize from the keys already fetched
-                            v_insert_query := format('INSERT INTO %I (query_hash, partition_keys) SELECT %L, (%s) ON CONFLICT (query_hash) DO UPDATE SET partition_keys = EXCLUDED.partition_keys', v_cache_table, p_query_hash, format(v_bit_template, v_bitsize, v_bitsize));
-
-                            -- Retry with expanded bitsize
-                            EXECUTE v_insert_query USING v_int_keys;
-                            GET DIAGNOSTICS v_rows_affected = ROW_COUNT;
-                        ELSE
-                            -- Re-raise original error if not a bitsize issue
-                            RAISE;
-                        END IF;
-                    ELSE
-                        -- Re-raise original error if no data to analyze
-                        RAISE;
-                    END IF;
-                EXCEPTION WHEN OTHERS THEN
-                    -- Re-raise original error if expansion fails
-                    RAISE;
-                END;
-            ELSE
-                -- Re-raise non-bitsize errors
-                RAISE;
-            END IF;
         END;
         
         -- Check result limit if configured

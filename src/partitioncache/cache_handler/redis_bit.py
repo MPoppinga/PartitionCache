@@ -131,13 +131,19 @@ class RedisBitCacheHandler(RedisAbstractCacheHandler):
         val.setall(0)
         try:
             for k in partition_key_identifiers:
-                if isinstance(k, int):
-                    val[k] = 1
-                elif isinstance(k, str):
-                    val[int(k)] = 1
-                else:
-                    raise ValueError("Only integer values are supported")
-        except (IndexError, ValueError):
+                if isinstance(k, str):
+                    try:
+                        k = int(k)
+                    except ValueError:
+                        raise TypeError(k) from None
+                if not isinstance(k, int):
+                    raise TypeError(k)
+                if k < 0:  # bitarray[-1] would silently set the last bit
+                    raise IndexError(k)
+                val[k] = 1
+        except TypeError as e:
+            raise ValueError(f"Only integer values are supported for bit arrays: {e.args[0]!r}") from None
+        except IndexError:
             raise ValueError(f"Partition key identifiers {partition_key_identifiers} is out of range for bitarray of size {bitsize}") from None
         try:
             cache_key = self._get_cache_key(key, partition_key)

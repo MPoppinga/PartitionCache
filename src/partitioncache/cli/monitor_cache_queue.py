@@ -348,7 +348,7 @@ def run_and_store_query(query: str, query_hash: str, partition_key: str, partiti
                 existing_bitsize = cache_handler._get_partition_bitsize(partition_key)  # type: ignore[attr-defined]
                 if args.bitsize is not None:
                     kwargs["bitsize"] = args.bitsize
-                    if existing_bitsize is not None and existing_bitsize != args.bitsize:
+                    if existing_bitsize is not None and existing_bitsize < args.bitsize:  # never shrink: stored bit arrays would lose keys
                         logger.info(f"Updating bitsize from {existing_bitsize} to {args.bitsize} for partition '{partition_key}'")
                         cache_handler._set_partition_bitsize(partition_key, args.bitsize)  # type: ignore[attr-defined]
                 elif existing_bitsize is not None:

@@ -290,7 +290,9 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
             logger.debug(f"Failed to get all queries for partition {partition_key}: {e}")
             return []
 
-    def _store_keys_lazily(self, table_name: str, key: str, query: str, partition_key: str, array_type: str = "INTEGER[]", value_expr: str = "$2") -> None:
+    def _store_keys_lazily(
+        self, table_name: str, key: str, query: str, partition_key: str, array_type: str = "INTEGER[]", value_expr: str = "$2", check: str = ""
+    ) -> None:
         """Run a variant query and store its partition keys without moving them through Python.
 
         A single INSERT ... SELECT keeps the keys in the database, but PostgreSQL never plans parallel
@@ -303,6 +305,9 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
         belong to no partition and are dropped, as on the non-lazy path. ARRAY(subquery) is '{}' for zero
         rows and never NULL, so an empty result cannot be mistaken for the NULL marker of set_null; a
         missing value raises instead.
+
+        check is PL/pgSQL run between the two statements, with the keys in v_keys and the variables
+        v_min / v_max (bigint) available, e.g. to reject keys a bit array cannot hold.
         """
         select = sql.SQL("SELECT ARRAY(SELECT {col} FROM ({query}) AS query_result WHERE {col} IS NOT NULL)").format(
             col=sql.Identifier(partition_key),
@@ -320,9 +325,10 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
         while any(f"${tag}$" in literal for literal in (select_literal, insert_literal, key_literal)):
             tag = "pc" + secrets.token_hex(6)
         block = (
-            f"DO ${tag}$ DECLARE v_keys {array_type}; BEGIN "
+            f"DO ${tag}$ DECLARE v_keys {array_type}; v_min bigint; v_max bigint; BEGIN "
             f"EXECUTE {select_literal} INTO v_keys; "
             "IF v_keys IS NULL THEN RAISE EXCEPTION 'Lazy insertion query returned no key array'; END IF; "
+            f"{check} "
             f"EXECUTE {insert_literal} USING {key_literal}, v_keys; "
             f"END ${tag}$"
         )
