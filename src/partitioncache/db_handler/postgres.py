@@ -69,15 +69,16 @@ class PostgresDBHandler(AbstractDBHandler):
         return result
 
     def estimate_cost(self, query: str) -> float | None:
-        """Return the planner's total cost of ``query`` from ``EXPLAIN (FORMAT JSON)``; the query is not executed."""
-        try:
-            self.cur.execute(f"EXPLAIN (FORMAT JSON) {query}")
+        """Return the planner's total cost of ``query`` from ``EXPLAIN (FORMAT JSON)``; the query is not executed.
+
+        The EXPLAIN runs in a transaction that is always rolled back, or in a savepoint when the caller has a
+        transaction open, so the caller's transaction is neither committed nor aborted. It is sent as a
+        prepared statement, which PostgreSQL accepts for a single statement only: text that contains several
+        statements raises instead of running the others.
+        """
+        with self.conn.transaction(force_rollback=True):
+            self.cur.execute(f"EXPLAIN (FORMAT JSON) {query}", prepare=True)
             row = self.cur.fetchone()
-        except Exception:
-            # Leave the connection usable: a failed statement aborts the surrounding transaction
-            self.conn.rollback()
-            raise
-        self.conn.commit()
         if not row or not row[0]:
             return None
         return float(row[0][0]["Plan"]["Total Cost"])

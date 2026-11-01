@@ -325,7 +325,9 @@ if stats.get("cost_gated"):
 - `estimate_cost` is implemented for PostgreSQL (`EXPLAIN (FORMAT JSON)`, `Plan.Total Cost`) and MySQL (`EXPLAIN FORMAT=JSON`, `query_block.cost_info.query_cost`). DuckDB, SQLite and MariaDB return `None` — they expose no scalar cost — and the cache is applied as usual. Any callable with the same signature works as `cost_estimator`.
 - Cost units are planner units, not milliseconds, and depend on `seq_page_cost`/`random_page_cost`; the threshold has to be calibrated per installation and workload, e.g. by comparing `estimate_cost` of representative queries with their measured runtime with and without the cache.
 - The gate only catches queries that are cheap *according to the planner*. Planner over-estimates (a query estimated expensive that finishes in milliseconds) pass the gate and get the cache as before; large cached key sets and bad plans for the enhanced query are not covered.
-- A failing estimator is logged and the cache is applied; `min_query_cost` without `cost_estimator` raises `ValueError`.
+- A failing estimator, or one that returns something other than a finite number, is logged and the cache is applied; `min_query_cost` without `cost_estimator` raises `ValueError`.
+- Every query that is not gated pays one extra `EXPLAIN` round trip on the data connection.
+- `PostgresDBHandler.estimate_cost` runs the `EXPLAIN` in a transaction (or savepoint) that is always rolled back, so it does not commit or abort a transaction the caller has open, and it rejects text that contains more than one statement. MySQL returns `None` for plans without a top-level cost, such as `UNION`.
 
 #### `apply_cache(query, cache_handler, partition_key, ..., geometry_column=None, buffer_distance=None)`
 

@@ -127,6 +127,15 @@ class TestCostGate:
         assert stats["query_cost"] == 500
 
 
+class TestEstimatorResultValidation:
+    @pytest.mark.parametrize("value", [float("nan"), float("inf"), "87.5", True])
+    def test_non_finite_or_non_numeric_cost_applies_the_cache(self, apply, value):
+        (enhanced, stats), _ = apply(cost_estimator=Mock(return_value=value), min_query_cost=1000)
+        assert enhanced != QUERY
+        assert stats["cost_gated"] == 0
+        assert "query_cost" not in stats
+
+
 class TestPostgresEstimateCost:
     def _handler(self, cursor):
         handler = PostgresDBHandler.__new__(PostgresDBHandler)
@@ -140,18 +149,21 @@ class TestPostgresEstimateCost:
         handler = self._handler(cur)
 
         assert handler.estimate_cost(QUERY) == 1234.56
-        cur.execute.assert_called_once_with(f"EXPLAIN (FORMAT JSON) {QUERY}")
-        handler.conn.commit.assert_called_once()
+        # A prepared statement accepts a single statement only; the transaction is always rolled back
+        cur.execute.assert_called_once_with(f"EXPLAIN (FORMAT JSON) {QUERY}", prepare=True)
+        handler.conn.transaction.assert_called_once_with(force_rollback=True)
+        handler.conn.commit.assert_not_called()
+        handler.conn.rollback.assert_not_called()
 
-    def test_failure_rolls_back_and_reraises(self):
+    def test_failure_reraises_without_touching_the_callers_transaction(self):
         cur = MagicMock()
         cur.execute.side_effect = RuntimeError("syntax error")
         handler = self._handler(cur)
 
         with pytest.raises(RuntimeError):
             handler.estimate_cost("SELEC 1")
-        handler.conn.rollback.assert_called_once()
         handler.conn.commit.assert_not_called()
+        handler.conn.rollback.assert_not_called()
 
 
 class TestMySQLEstimateCost:

@@ -6,6 +6,7 @@ It utilizes the given cache to extend the SQL query with the set of possible par
 
 """
 
+import math
 import random
 from collections.abc import Callable
 from datetime import datetime
@@ -1257,7 +1258,9 @@ def _check_cost_gate(query: str, cost_estimator: Callable[[str], float | None] |
     except Exception as e:
         logger.warning(f"Query cost estimation failed, applying the cache anyway: {e}")
         return False, {"cost_gated": 0}
-    if cost is None:
+    if isinstance(cost, bool) or not isinstance(cost, int | float) or not math.isfinite(cost):
+        if cost is not None:
+            logger.warning(f"Query cost estimator returned {cost!r}, not a finite number; applying the cache anyway")
         return False, {"cost_gated": 0}
     gated = cost < min_query_cost
     if gated:

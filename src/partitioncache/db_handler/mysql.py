@@ -62,7 +62,8 @@ class MySQLDBHandler(AbstractDBHandler):
     def estimate_cost(self, query: str) -> float | None:
         """Return ``query_block.cost_info.query_cost`` from ``EXPLAIN FORMAT=JSON``; the query is not executed.
 
-        MariaDB's JSON plan has no ``cost_info``, so it returns None there.
+        MariaDB's JSON plan has no ``cost_info``, and MySQL puts no cost at the top level of some plans (e.g.
+        UNION, where it is under ``query_block.union_result``); it returns None there.
         """
         self.cur.execute(f"EXPLAIN FORMAT=JSON {query}")
         row = self.cur.fetchone()
@@ -72,7 +73,10 @@ class MySQLDBHandler(AbstractDBHandler):
         raw: Any = row[0]
         plan: dict[str, Any] = json.loads(raw) if isinstance(raw, str | bytes | bytearray) else raw
         cost = plan.get("query_block", {}).get("cost_info", {}).get("query_cost")
-        return float(cost) if cost is not None else None
+        if cost is None:
+            logger.debug("EXPLAIN FORMAT=JSON has no query_block.cost_info.query_cost; no cost estimate")
+            return None
+        return float(cost)
 
     def close(self) -> None:
         try:
