@@ -378,7 +378,7 @@ Two pairs of functions implement the read path at different abstraction levels.
 
 **Lookup functions.** `src/partitioncache/apply_cache.py::get_partition_keys` generates all variant hashes via `generate_all_hashes` and passes them to `cache_handler.get_intersected(...)`. It returns a three-tuple: the intersected partition-key set (or `None` when nothing matched), the total number of generated variant hashes, and the number of hashes that actually hit the cache. Its counterpart `src/partitioncache/apply_cache.py::get_partition_keys_lazy` performs the same hash generation but calls `get_intersected_lazy`, returning a SQL subquery string instead of a materialized set; it raises `ValueError` ("Cache handler does not support lazy intersection") if the handler is not an `AbstractCacheHandler_Lazy` subclass. Both accept the full variant-generation parameter set (`min_component_size=2`, `canonicalize_queries=False`, `follow_graph=True`, `bucket_steps=1.0`, constraint addition/removal lists, etc.), so lookup uses exactly the same variant space as population.
 
-**Single-call wrappers.** `src/partitioncache/apply_cache.py::apply_cache` (eager) and `src/partitioncache/apply_cache.py::apply_cache_lazy` (lazy) combine lookup, optional p0 rewrite (Section 5.3), and query extension into one call. Both return `tuple[str, dict[str, int]]`: the (possibly) enhanced query and a statistics dictionary with exactly four keys:
+**Single-call wrappers.** `src/partitioncache/apply_cache.py::apply_cache` (eager) and `src/partitioncache/apply_cache.py::apply_cache_lazy` (lazy) combine lookup, optional p0 rewrite (Section 5.3), and query extension into one call. Both return `tuple[str, dict[str, int]]`: the (possibly) enhanced query and a statistics dictionary with four keys, plus two more when the cost gate is configured:
 
 | Key | Meaning |
 |---|---|
@@ -386,8 +386,12 @@ Two pairs of functions implement the read path at different abstraction levels.
 | `cache_hits` | Number of those hashes found in the cache |
 | `enhanced` | `1` if a cache restriction was attached, `0` if the query is returned unchanged |
 | `p0_rewritten` | `1` if the p0 star-schema rewrite changed the query, `0` otherwise |
+| `cost_gated` | Only with `min_query_cost`: `1` if the cache was skipped because the planner cost was below the threshold |
+| `query_cost` | Only with `min_query_cost`: the rounded planner estimate of the original query, if the estimator returned one |
 
 If the lookup yields no usable result (empty intersection or empty lazy subquery), the wrappers return the working query unchanged with `enhanced = 0`; callers therefore never need a separate "cache miss" code path. Both wrappers also branch into a spatial mode when `geometry_column` is set (Section 5.5). The wrappers are exported as part of the public API in `src/partitioncache/__init__.py`.
+
+**Planner-cost gate.** For queries that the database already answers in milliseconds, the fixed overhead of cache application (variant generation in Python, cache lookup, temp-table setup) exceeds any possible saving. With `cost_estimator` and `min_query_cost`, both wrappers ask the planner for the cost of the original query before doing anything else (`src/partitioncache/apply_cache.py::_check_cost_gate`) and return it unchanged when the estimate is below the threshold. `src/partitioncache/db_handler/abstract.py::AbstractDBHandler.estimate_cost` returns `None` by default; the PostgreSQL and MySQL handlers read the root cost from their JSON `EXPLAIN` output. The gate is off by default and fails open — a missing or failing estimate applies the cache — because it is a performance heuristic, not a correctness check. Only the original query is costed: the enhanced query cannot be planned meaningfully before execution (the temp table of `TMP_TABLE_IN` does not exist yet, and the planner has no row estimate for the `unnest` of the lazy intersection). The gate therefore covers "query too cheap", but not large cached key sets or bad plans for the enhanced query.
 
 #### DD-07: Lazy in-database intersection as the primary read path
 - **Status:** implemented (core path)
