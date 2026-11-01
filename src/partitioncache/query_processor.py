@@ -53,12 +53,11 @@ def handle_deprecated_kwargs(kwargs: dict[str, Any], func_name: str) -> dict[str
     return result
 
 
-# The aliases the variant generator recognises in conditions (see the alias regex in the condition split)
-_PLAIN_IDENTIFIER_RE = re.compile(r"[A-Za-z_]\w*")
-
-
 def _has_alias_that_needs_quotes(query: str) -> bool:
-    """True if a table of the outermost FROM clause has an alias (or name) the variant generator does not recognise."""
+    """True if a table of the outermost FROM clause has an alias (or, without one, a name) that is not an identifier.
+
+    The variant generator recognises aliases as word characters not starting with a digit (str.isidentifier).
+    """
     try:
         parsed = sqlglot.parse_one(query)
     except Exception:
@@ -67,7 +66,7 @@ def _has_alias_that_needs_quotes(query: str) -> bool:
     if select is None:
         return False
     return any(
-        not _PLAIN_IDENTIFIER_RE.fullmatch(table.alias_or_name) for table in select.find_all(exp.Table) if table.parent_select is select
+        not table.alias_or_name.isidentifier() for table in select.find_all(exp.Table) if table.parent_select is select
     )
 
 
@@ -630,7 +629,7 @@ def extract_and_group_query_conditions(
 
         # Multi-reference, multi-alias, or zero-alias conditions need alias substitution
         # Filter against outer FROM aliases to exclude inner subquery table references
-        all_alias: set = set(re.findall(r"[a-zA-Z_]\w*(?=\.)", condition_refs)) & set(table_aliases)
+        all_alias: set = set(re.findall(r"[^\W\d]\w*(?=\.)", condition_refs)) & set(table_aliases)
         parsed = sqlglot.parse_one(condition)
         table_identifiers = tuple(sorted({col.table for col in parsed.find_all(exp.Column) if col.table}))
         # AND/OR are exp.Func subclasses since sqlglot 30; only real function calls count here
@@ -2145,11 +2144,11 @@ def generate_all_query_hash_pairs(
         )
         return []
 
-    # The alias handling only recognises plain ASCII-led identifiers: for an alias such as "1u" or "a$b" its
-    # conditions would be lost and the variants would reference aliases that are not in their FROM clause
+    # The alias handling only recognises identifiers: for an alias such as "1u" or "a$b" its conditions
+    # would be lost and the variants would reference aliases that are not in their FROM clause
     if _has_alias_that_needs_quotes(query):
         logger.warning(
-            "generate_all_query_hash_pairs: query uses a table alias that is not a plain identifier "
+            "generate_all_query_hash_pairs: query uses a table alias or name that is not a plain identifier "
             "(letters, digits and underscores, not starting with a digit); PartitionCache does not generate "
             "cache variants for it. Returning no variants; execute the query unchanged."
         )
@@ -2321,11 +2320,12 @@ VariantSignature = tuple[frozenset[str], frozenset[str], str]
 # not listed here (including user-defined ones) are assumed to be deterministic.
 _VOLATILE_EXPRESSIONS = (
     exp.Rand, exp.CurrentTimestamp, exp.CurrentDate, exp.CurrentTime, exp.CurrentDatetime, exp.Localtimestamp, exp.Uuid, exp.TableSample,
+    exp.CurrentUser, exp.SessionUser,
 )
 _VOLATILE_FUNCTION_NAMES = {
     "random", "rand", "random_normal", "now", "clock_timestamp", "statement_timestamp", "transaction_timestamp", "timeofday",
     "localtime", "localtimestamp", "nextval", "currval", "setval", "setseed", "gen_random_uuid", "uuid_generate_v4",
-    "txid_current", "txid_current_if_assigned", "pg_current_xact_id", "pg_backend_pid",
+    "txid_current", "txid_current_if_assigned", "pg_current_xact_id", "pg_backend_pid", "current_setting",
 }
 _VOLATILE_DATETIME_LITERALS = {"now", "today", "tomorrow", "yesterday"}
 _PLAIN_TABLE_ARGS = {"this", "db", "catalog", "alias"}
@@ -2354,8 +2354,10 @@ def _is_volatile(expression: exp.Expr) -> bool:
     """
     if any(True for _ in expression.find_all(*_VOLATILE_EXPRESSIONS)):
         return True
-    if any(func.name.lower() in _VOLATILE_FUNCTION_NAMES for func in expression.find_all(exp.Anonymous)):
-        return True
+    for func in expression.find_all(exp.Anonymous):
+        # age(x) is measured from the current date; age(x, y) is deterministic
+        if func.name.lower() in _VOLATILE_FUNCTION_NAMES or (func.name.lower() == "age" and len(func.expressions) == 1):
+            return True
     if any(lit.is_string and lit.this.strip().lower() in _VOLATILE_DATETIME_LITERALS for lit in expression.find_all(exp.Literal)):
         return True
     for sub in expression.find_all(exp.Select):
@@ -2387,6 +2389,9 @@ def variant_signature(query: str, partition_key: str, sql_dialect: str = "postgr
 
     Returns:
         (table names, conditions with aliases replaced by table names, partition key table) or None.
+
+    Raises:
+        ValueError: sql_dialect is not a dialect sqlglot knows (e.g. "postgresql" instead of "postgres").
     """
     try:
         select = normalize_identifiers(sqlglot.parse_one(query), dialect=sql_dialect)

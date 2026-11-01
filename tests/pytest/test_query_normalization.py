@@ -456,7 +456,7 @@ class TestOuterJoinExclusion:
     def test_detector_false_on_unparseable(self):
         assert not query_contains_top_level_outer_join("this is not sql")
 
-    @pytest.mark.parametrize("alias", ['"1u"', '"a$b"', '"my u"', "ü"])
+    @pytest.mark.parametrize("alias", ['"1u"', '"a$b"', '"my u"'])
     def test_generate_all_query_hash_pairs_empty_for_alias_that_is_not_plain(self, alias, caplog):
         """The alias handling would lose the alias's conditions and keep references to aliases outside FROM."""
         query = f"SELECT {alias}.pk FROM users AS {alias}, orders AS o WHERE {alias}.pk = o.pk AND {alias}.age > 30 AND o.total > 5"
@@ -464,11 +464,14 @@ class TestOuterJoinExclusion:
             assert generate_all_query_hash_pairs(query, "pk") == []
         assert "not a plain identifier" in caplog.text
 
-    @pytest.mark.parametrize("alias", ["u", '"u"', "_u", "u1"])
-    def test_plain_aliases_keep_their_conditions(self, alias):
-        query = f"SELECT {alias}.pk FROM users AS {alias}, orders AS o WHERE {alias}.pk = o.pk AND {alias}.age > 30 AND o.total > 5"
-        variants = {variant for variant, _ in generate_all_query_hash_pairs(query, "pk")}
-        assert "SELECT DISTINCT t1.pk FROM users AS t1 WHERE t1.age > 30" in variants
+    @pytest.mark.parametrize("alias", ['"u"', "_u", "u1", "ü", "é1", "Ölfeld"])
+    def test_identifier_aliases_give_the_same_variants_as_a_plain_alias(self, alias):
+        def variants(a):
+            query = f"SELECT {a}.pk FROM users AS {a}, orders AS o WHERE {a}.pk = o.pk AND {a}.age > o.total AND {a}.x = 1"
+            return sorted(generate_all_query_hash_pairs(query, "pk"))
+
+        assert variants(alias) == variants("u")
+        assert any("t1.total < t2.age" in variant for variant, _ in variants(alias))
 
     def test_generate_all_query_hash_pairs_empty_for_outer_join(self):
         query = (
