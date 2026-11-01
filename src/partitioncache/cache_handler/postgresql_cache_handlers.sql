@@ -324,13 +324,20 @@ BEGIN
 
     -- The trigger function widens the cache table's BIT column when the partition's bitsize grows.
     -- The USING cast zero-pads stored bit arrays on the right; without it the ALTER failed with
-    -- "bit string length N does not match type bit(M)" as soon as the table held a row.
+    -- "bit string length N does not match type bit(M)" as soon as the table held a row. A smaller
+    -- bitsize is refused: the cast would cut every stored bit array and silently drop keys.
     v_function_sql := format('
         CREATE OR REPLACE FUNCTION %I()
         RETURNS TRIGGER AS $trigger$
         DECLARE
             v_cache_table TEXT;
         BEGIN
+            -- partitioncache bitsize trigger v2: grows with USING, refuses to shrink
+            IF TG_OP = ''UPDATE'' AND NEW.bitsize < OLD.bitsize THEN
+                RAISE EXCEPTION ''Bitsize of partition %% cannot shrink from %% to %%: stored bit arrays would lose keys'',
+                    NEW.partition_key, OLD.bitsize, NEW.bitsize;
+            END IF;
+
             -- Only handle UPDATE operations where bitsize changes
             IF TG_OP = ''UPDATE'' AND OLD.bitsize != NEW.bitsize THEN
                 v_cache_table := ''%s_cache_'' || NEW.partition_key;
@@ -359,10 +366,10 @@ BEGIN
         $trigger$ LANGUAGE plpgsql;
     ', v_trigger_function_name, p_table_prefix);
 
-    -- Already exists: nothing to create, and no lock either. A trigger function from before the
-    -- USING fix is replaced in place (CREATE OR REPLACE FUNCTION takes no table lock).
+    -- Already exists: nothing to create, and no lock either. An older trigger function (without the
+    -- USING cast or the shrink check) is replaced in place (CREATE OR REPLACE FUNCTION takes no table lock).
     IF EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = v_trigger_name AND NOT tgisinternal) THEN
-        IF NOT EXISTS (SELECT 1 FROM pg_proc WHERE proname = v_trigger_function_name AND prosrc LIKE '%USING partition_keys::BIT%') THEN
+        IF NOT EXISTS (SELECT 1 FROM pg_proc WHERE proname = v_trigger_function_name AND prosrc LIKE '%partitioncache bitsize trigger v2%') THEN
             EXECUTE v_function_sql;
         END IF;
         RETURN;

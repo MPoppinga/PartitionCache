@@ -217,9 +217,10 @@ DECLARE
     v_min_key BIGINT;
     v_max_key BIGINT;
     v_grown_bitsize INTEGER;
-    -- Bit array from the key array ($1) and the bitsize (%s, twice)
+    v_bitsize_buffer INTEGER;
+    -- Bit array from the key array ($1) and the bitsize (%s, twice); keys must lie in 0 .. bitsize - 1
     v_bit_template TEXT := 'WITH bit_positions AS (
-            SELECT position FROM unnest($1) AS u(position) WHERE position >= 0
+            SELECT position FROM unnest($1) AS u(position)
         ),
         bit_array AS (
             SELECT generate_series(0, %s - 1) AS bit_index
@@ -447,12 +448,24 @@ BEGIN
                         RAISE EXCEPTION 'Partition key % is negative; bit arrays cannot store it', v_min_key;
                     END IF;
                     IF v_max_key >= v_bitsize THEN
-                        v_grown_bitsize := v_max_key + 1 + COALESCE(NULLIF(current_setting('partitioncache.bitsize_buffer', true), '')::INTEGER, 0);
-                        PERFORM partitioncache_bootstrap_partition(p_table_prefix, p_partition_key, v_datatype, p_cache_backend, v_grown_bitsize);
-                        EXECUTE format('SELECT bitsize FROM %I WHERE partition_key = %L', v_metadata_table, p_partition_key) INTO v_grown_bitsize;
-                        RAISE WARNING 'Partition key % exceeds bitsize % of partition %: bit arrays grown to %', v_max_key, v_bitsize, p_partition_key, v_grown_bitsize;
-                        v_bitsize := v_grown_bitsize;
+                        v_bitsize_buffer := COALESCE(NULLIF(current_setting('partitioncache.bitsize_buffer', true), '')::INTEGER, 0);
+                        IF v_bitsize_buffer < 0 THEN
+                            RAISE EXCEPTION 'partitioncache.bitsize_buffer must not be negative (is %)', v_bitsize_buffer;
+                        END IF;
+                        PERFORM partitioncache_bootstrap_partition(p_table_prefix, p_partition_key, v_datatype, p_cache_backend, (v_max_key + 1 + v_bitsize_buffer)::INTEGER);
                     END IF;
+                    -- The bitsize was read before the variant ran; another job may have grown the bit arrays
+                    -- since. Lock the cache table first: a job that grows it holds it until commit, so the
+                    -- bitsize read afterwards matches the column type (INSERT takes this lock anyway).
+                    EXECUTE format('LOCK TABLE %I IN ROW EXCLUSIVE MODE', v_cache_table);
+                    EXECUTE format('SELECT bitsize FROM %I WHERE partition_key = %L', v_metadata_table, p_partition_key) INTO v_grown_bitsize;
+                    IF v_max_key >= v_grown_bitsize THEN
+                        RAISE EXCEPTION 'Partition key % exceeds bitsize % of partition %', v_max_key, v_grown_bitsize, p_partition_key;
+                    END IF;
+                    IF v_max_key >= v_bitsize THEN
+                        RAISE WARNING 'Partition key % exceeds bitsize % of partition %: bit arrays grown to %', v_max_key, v_bitsize, p_partition_key, v_grown_bitsize;
+                    END IF;
+                    v_bitsize := v_grown_bitsize;
                     EXECUTE format('INSERT INTO %I (query_hash, partition_keys) SELECT %L, (%s) ON CONFLICT (query_hash) DO UPDATE SET partition_keys = EXCLUDED.partition_keys', v_cache_table, p_query_hash, format(v_bit_template, v_bitsize, v_bitsize))
                         USING v_int_keys;
                 ELSIF p_cache_backend = 'roaringbit' THEN

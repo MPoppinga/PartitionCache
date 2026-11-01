@@ -148,9 +148,12 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
         return result[0] if result else None
 
     def _set_partition_bitsize(self, partition_key: str, bitsize: int) -> None:
-        """Update the bitsize for a partition key in metadata."""
+        """Grow the bitsize for a partition key in metadata; a smaller bitsize keeps the current one.
+
+        Shrinking would cut the stored bit arrays and drop their keys, so the bitsize trigger refuses it.
+        """
         self.cursor.execute(
-            sql.SQL("UPDATE {0} SET bitsize = %s WHERE partition_key = %s").format(sql.Identifier(self.tableprefix + "_partition_metadata")),
+            sql.SQL("UPDATE {0} SET bitsize = GREATEST(bitsize, %s) WHERE partition_key = %s").format(sql.Identifier(self.tableprefix + "_partition_metadata")),
             (bitsize, partition_key),
         )
         self.db.commit()

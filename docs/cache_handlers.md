@@ -306,7 +306,7 @@ export PG_BIT_CACHE_BITSIZE_BUFFER=1000
 ```
 
 **Keys outside the bit array:**
-A key beyond the bitsize grows the partition's bit arrays to `max key + 1 + buffer`, eager and lazy alike, and logs a warning. Stored entries are zero-padded and keep their keys. Each growth rewrites the cache table, so a buffer avoids growing for every slightly larger key. The pg_cron processor grows the same way and reads its buffer from the setting `partitioncache.bitsize_buffer` of the database it runs in (`ALTER DATABASE <db> SET partitioncache.bitsize_buffer = 1000`). Negative keys cannot be stored in a bit array and fail the insert. `duckdb_bit`, `redis_bit` and `rocksdb_bit` do not grow: a key outside the bitsize fails the insert, it is never dropped.
+A key beyond the bitsize grows the partition's bit arrays to `max key + 1 + buffer`, eager and lazy alike, and logs a warning. Stored entries are zero-padded and keep their keys. Each growth rewrites the cache table, so a buffer avoids growing for every slightly larger key. The pg_cron processor grows the same way and reads its buffer from the setting `partitioncache.bitsize_buffer` of the database it runs in (`ALTER DATABASE <db> SET partitioncache.bitsize_buffer = 1000`). Negative keys cannot be stored in a bit array and fail the insert. The bitsize never shrinks: a smaller `--bitsize` or `PG_BIT_CACHE_BITSIZE` keeps the current one, and the bitsize trigger refuses to lower it, since that would cut the stored bit arrays. Growth alters the cache table (an `ACCESS EXCLUSIVE` lock until the transaction commits, which waits for open transactions on that table), and PostgreSQL limits `BIT(n)` to 83,886,080 bits, so choose the initial bitsize for the expected key range. `duckdb_bit`, `redis_bit` and `rocksdb_bit` do not grow: a key outside the bitsize fails the insert, it is never dropped.
 
 **Fixed-Length Bit Arrays:**
 All cache tables use fixed-length `BIT(n)` columns for consistent BIT_AND operations:
@@ -322,12 +322,12 @@ bitsize = cache._get_partition_bitsize("large_dataset")
 ```
 
 **Automatic Schema Updates:**
-Database triggers automatically update cache table schemas when bitsize changes:
+Database triggers automatically update cache table schemas when the bitsize grows:
 
 ```python
-# Changing bitsize triggers schema update
+# Growing the bitsize triggers a schema update; a smaller value keeps the current bitsize
 cache._set_partition_bitsize("large_dataset", 75000)
-# Automatically runs: ALTER TABLE cache_large_dataset ALTER COLUMN partition_keys TYPE BIT(75000)
+# Automatically runs: ALTER TABLE cache_large_dataset ALTER COLUMN partition_keys TYPE BIT(75000) USING partition_keys::BIT(75000)
 ```
 
 ### Variable Bit Sizes
