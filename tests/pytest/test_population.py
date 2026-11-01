@@ -39,9 +39,15 @@ class TestVariantSignature:
         b = "SELECT DISTINCT b.pk FROM lo AS b WHERE b.x = 1 AND b.y = 2"
         assert not is_relaxation_of(variant_signature(a, "pk"), variant_signature(b, "pk"))
 
-    def test_ordered_limit_subquery_is_accepted(self):
-        query = "SELECT DISTINCT t1.pk FROM f AS t1 WHERE t1.k IN (SELECT s.k FROM s ORDER BY s.k LIMIT 5)"
-        assert variant_signature(query, "pk") is not None
+    def test_unquoted_names_are_case_folded(self):
+        a = "SELECT DISTINCT a.PK FROM LO AS a WHERE a.y = 2"
+        b = "SELECT DISTINCT b.pk FROM lo AS b WHERE b.x = 1 AND b.Y = 2"
+        assert is_relaxation_of(variant_signature(a, "pk"), variant_signature(b, "pk"))
+
+    def test_sqlite_folds_quoted_names_too(self):
+        a = 'SELECT DISTINCT a.pk FROM "LO" AS a WHERE a.y = 2'
+        b = "SELECT DISTINCT b.pk FROM lo AS b WHERE b.x = 1 AND b.y = 2"
+        assert is_relaxation_of(variant_signature(a, "pk", "sqlite"), variant_signature(b, "pk", "sqlite"))
 
     def test_schemas_distinguish_tables(self):
         """s1.lo and s2.lo are different tables, also when their conditions look alike."""
@@ -82,6 +88,11 @@ class TestVariantSignature:
             "SELECT DISTINCT t1.pk FROM f AS t1 WHERE random_normal() > 0",
             "SELECT DISTINCT t1.pk FROM f AS t1 WHERE t1.k IN (SELECT s.k FROM s TABLESAMPLE BERNOULLI (10))",
             "SELECT DISTINCT t1.pk FROM f AS t1 WHERE t1.k IN (SELECT s.k FROM s LIMIT 5)",
+            "SELECT DISTINCT t1.pk FROM f AS t1 WHERE t1.k IN (SELECT s.k FROM s ORDER BY s.k LIMIT 5)",
+            "SELECT DISTINCT t1.pk FROM f AS t1 WHERE t1.k IN (SELECT s.k FROM s ORDER BY s.k OFFSET 5)",
+            "SELECT DISTINCT t1.pk FROM f AS t1 WHERE t1.k IN (SELECT DISTINCT ON (s.g) s.k FROM s ORDER BY s.g)",
+            "SELECT DISTINCT t1.pk FROM f AS t1 WHERE t1.ts < 'now'",
+            "SELECT DISTINCT t1.pk FROM f AS t1 WHERE t1.xid = txid_current()",
             "SELECT DISTINCT t1.pk FROM f AS t1 JOIN d AS t2 ON t1.k = t2.k",
             "SELECT DISTINCT t1.pk FROM f AS t1 LEFT JOIN d AS t2 ON t1.k = t2.k",
             "SELECT DISTINCT t1.pk FROM f AS t1, f AS t2 WHERE t1.k = t2.k",

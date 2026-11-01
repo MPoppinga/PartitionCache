@@ -63,7 +63,7 @@ def populate_query_variants(
     """
     stats = PopulationStats()
     ordered = order_variants_for_population(query_hash_pairs)
-    signatures = {variant_hash: variant_signature(variant, partition_key) for variant, variant_hash in ordered} if restrict else {}
+    signatures = {variant_hash: variant_signature(variant, partition_key, sql_dialect) for variant, variant_hash in ordered} if restrict else {}
     populated: dict[str, set[Any]] = {}
 
     for variant, variant_hash in ordered:
