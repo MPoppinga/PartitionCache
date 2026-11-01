@@ -298,6 +298,8 @@ Advanced options for controlling how query variants are generated for better cac
 - Executes query immediately and stores results in cache
 - **Best for**: Development, testing, small queries
 - **Warning**: Can be slow for complex queries with many fragments
+- `--restrict-variants`: executes the variants smallest first and restricts each to the intersection of the keys of its already populated relaxations, kept in memory (no cache lookup per variant). An empty intersection is stored as an empty result without executing the variant. See `populate_query_variants` in the [API reference](api_reference.md).
+- `--max-restriction-keys N`: only restrict when the intersection has at most N keys (implies `--restrict-variants`); a restriction to most of the keys filters little and costs a long key list
 
 #### Queue Processing
 ```bash
@@ -517,11 +519,12 @@ pcache-monitor [options]
 
 Cache-aware optimization leverages existing cache entries to restrict the search space of new queries before execution. When enabled, the monitor analyzes incoming fragment queries to identify potential cache matches, checks existing cache entries for overlapping conditions, applies restrictions to queries using cached partition keys, and preserves original queries in the cache while executing optimized versions. This approach significantly reduces database load by constraining queries to known partition key sets.
 
-- `--enable-cache-optimization` - Enable cache-aware optimization for fragment queries
-  - **Default**: Disabled
+- `--enable-cache-optimization` / `--disable-cache-optimization` - Enable or disable cache-aware optimization for fragment queries
+  - **Default**: Enabled
   - **Purpose**: Check existing cache entries to restrict search space before execution
   - **Benefit**: Reduces database load by applying IN/subquery restrictions
   - **Algorithm**: Generates subquery variants, checks cache for existing entries, applies restrictions if cache hits meet threshold
+  - **Variant order**: `pcache-monitor` and `pcache-add --queue` push the variants of a query smallest first (fewest tables, then fewest conditions), so the relaxations of a variant are usually cached before it runs. With several `--max-processes` workers a variant can still start before all of its relaxations finish.
 - `--force-recalculate` - Force recalculation of cache entries even if they already exist
   - **Default**: Disabled
   - **Purpose**: Refresh existing cache entries with updated data from the source database
@@ -539,6 +542,11 @@ Cache-aware optimization leverages existing cache entries to restrict the search
   - **Default**: 1
   - **Note**: Only applies to non-lazy methods (IN, VALUES)
   - **Purpose**: Avoid optimization overhead for minimal cache hits
+- `--max-restriction-keys N` - Only restrict a variant when the cached intersection has at most N keys
+  - **Default**: no limit
+  - **Purpose**: Skip restrictions that filter little; a restriction to most of the keys costs a long key list or temp table and saves almost nothing
+  - **Sizing**: a fraction of the number of distinct partition keys, e.g. a quarter
+  - **Note**: The lazy path never materializes the keys, so setting a limit uses the standard (materializing) path; `IN_SUBQUERY` is then applied as `IN`
 - `--prefer-lazy-optimization` / `--no-prefer-lazy-optimization` - Prefer lazy methods when available
   - **Default**: `--prefer-lazy-optimization` (enabled)
   - **Purpose**: Use more efficient lazy subqueries with PostgreSQL backends

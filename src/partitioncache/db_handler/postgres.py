@@ -61,12 +61,32 @@ class PostgresDBHandler(AbstractDBHandler):
         # emit `CREATE TEMPORARY TABLE ... ON COMMIT DROP; ...; SELECT`, where the rows are in the LAST
         # result set, not the first. Returns first column of all rows if not empty.
         rows = fetch_final_result_set(self.cur)
-        result = [row[0] for row in rows if row[0]]
+        # Only NULL is dropped: a truthiness test also dropped key 0 (and '' / 0.0), so its partition was
+        # missing from the cached set and cache restrictions excluded it
+        result = [row[0] for row in rows if row[0] is not None]
         # Commit so the surrounding transaction ends: this fires ON COMMIT DROP for any temp table created
         # by the script (otherwise the table would linger for the whole session). Rows are already fetched.
         # Mirrors the commit in the MySQL/SQLite handlers.
         self.conn.commit()
         return result
+
+    def estimate_cost(self, query: str) -> float | None:
+        """Return the planner's total cost of ``query`` from ``EXPLAIN (FORMAT JSON)``; the query is not executed.
+
+        The EXPLAIN runs in a transaction that is always rolled back, or in a savepoint when the caller has a
+        transaction open, so the caller's transaction is neither committed nor aborted. A binary cursor sends
+        it as an unnamed extended-protocol statement, which PostgreSQL accepts for a single statement only:
+        text that contains several statements raises instead of running the others. No named prepared
+        statement is created. psycopg itself still sends DEALLOCATE ALL on the rollback when it holds
+        automatically prepared statements on this connection (prepare_threshold), which also drops prepared
+        statements the caller created with PREPARE.
+        """
+        with self.conn.transaction(force_rollback=True), self.conn.cursor(binary=True) as cur:
+            cur.execute(f"EXPLAIN (FORMAT JSON) {query}")
+            row = cur.fetchone()
+        if not row or not row[0]:
+            return None
+        return float(row[0][0]["Plan"]["Total Cost"])
 
     def close(self) -> None:
         self.conn.close()

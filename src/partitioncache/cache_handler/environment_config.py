@@ -81,6 +81,9 @@ class EnvironmentConfigManager:
 
         config["db_tableprefix"] = table_prefix
         config["bitsize"] = int(bitsize)
+        bitsize_buffer = os.getenv("PG_BIT_CACHE_BITSIZE_BUFFER")
+        if bitsize_buffer:
+            config["bitsize_buffer"] = int(bitsize_buffer)
         return config
 
     @staticmethod

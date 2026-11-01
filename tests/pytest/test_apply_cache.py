@@ -47,6 +47,22 @@ class TestFindP0Alias:
         result = find_p0_alias(query, "partition_key")
         assert result == "u"
 
+    def test_partition_key_on_later_table(self):
+        """A generated variant can list a dimension first; the restriction belongs to the table with the key."""
+        query = (
+            "SELECT DISTINCT t2.lo_orderdate FROM date_dim AS t1, lineorder AS t2 "
+            "WHERE t1.d_datekey = t2.lo_orderdate AND t1.d_year = 1993"
+        )
+        assert find_p0_alias(query, "lo_orderdate") == "t2"
+
+    def test_first_table_kept_when_it_carries_the_key(self):
+        query = "SELECT DISTINCT t1.pk FROM a AS t1, b AS t2 WHERE t1.pk = t2.pk"
+        assert find_p0_alias(query, "pk") == "t1"
+
+    def test_subquery_columns_ignored(self):
+        query = "SELECT DISTINCT t1.x FROM a AS t1 WHERE t1.x IN (SELECT s.pk FROM b AS s)"
+        assert find_p0_alias(query, "pk") == "t1"
+
     def test_no_table_raises_error(self):
         """Test that ValueError is raised when no table is found."""
         query = "SELECT 1"

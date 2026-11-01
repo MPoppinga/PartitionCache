@@ -526,10 +526,8 @@ class TestRocksDictCacheHandler:
         assert text_result == "text"
 
     def test_empty_set_handling(self, cache_handler, mock_rocksdict):
-        """Test handling of empty sets."""
+        """An empty set needs a registered partition key: its datatype cannot be inferred."""
         empty_set = set()
         mock_rocksdict.get.return_value = None
 
-        # This should raise StopIteration when trying to get sample from empty set
-        with pytest.raises(StopIteration):
-            cache_handler.set_cache("empty_key", empty_set)
+        assert cache_handler.set_cache("empty_key", empty_set) is False
