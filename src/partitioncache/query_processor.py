@@ -821,16 +821,18 @@ def detect_partition_join_from_query(
 
 
 # A single-quoted SQL string literal ('' is an escaped quote inside it)
-_STRING_LITERAL_RE = re.compile(r"'(?:[^']|'')*'")
+# String literals and double-quoted identifiers: alias detection and renaming must skip both, and a quote of
+# one kind inside the other (an apostrophe in "user's") must not be read as the start of a literal
+_STRING_LITERAL_RE = re.compile(r"'(?:[^']|'')*'" + r'|"(?:[^"]|"")*"')
 
 
 def _strip_string_literals(text: str) -> str:
-    """Replace every string literal with '' so that alias and column detection cannot match inside a literal."""
-    return _STRING_LITERAL_RE.sub("''", text)
+    """Empty every string literal (and quoted identifier) so that alias and column detection cannot match inside one."""
+    return _STRING_LITERAL_RE.sub(lambda m: m.group(0)[0] * 2, text)
 
 
 def _sub_outside_literals(pattern: str, repl: str | Callable[[re.Match[str]], str], text: str) -> str:
-    """``re.sub`` that leaves string literals untouched (e.g. alias renaming must not rewrite ``'u.city'``)."""
+    """``re.sub`` that leaves string literals and quoted identifiers untouched (alias renaming must not rewrite ``'u.city'``)."""
     parts = []
     pos = 0
     for literal in _STRING_LITERAL_RE.finditer(text):

@@ -325,6 +325,17 @@ class TestAliasLikeTextInStringLiterals:
         assert variants
         assert all("'u.name' AS label" in v for v in variants)
 
+    def test_quoted_aliases_with_apostrophes_in_preserved_select_clause(self):
+        """An apostrophe inside a double-quoted alias is not the start of a string literal."""
+        from partitioncache.query_processor import generate_all_query_hash_pairs
+
+        query = 'SELECT u.name AS "user\'s", u.id AS "id\'s", u.age FROM users u WHERE u.city_id = 1 AND u.age > 3'
+        pairs = generate_all_query_hash_pairs(query, "city_id", min_component_size=1, strip_select=False, warn_no_partition_key=False)
+
+        assert pairs
+        for variant, _ in pairs:
+            assert variant.startswith('SELECT t1.name AS "user\'s", t1.id AS "id\'s", t1.age FROM users AS t1'), variant
+
     def test_comments_with_quotes_in_preserved_select_clause(self):
         """A quote inside a comment of the kept SELECT list must not stop alias renaming."""
         from partitioncache.query_processor import generate_all_query_hash_pairs
