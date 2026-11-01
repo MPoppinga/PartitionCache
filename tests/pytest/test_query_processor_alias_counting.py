@@ -10,6 +10,8 @@ Key distinction (with regex remap):
 - Three+ distinct aliases → other_functions
 """
 
+import pytest
+
 from partitioncache.query_processor import extract_and_group_query_conditions
 
 
@@ -261,3 +263,87 @@ class TestInputAliasesLookLikeCanonicalAliases:
         variants = generate_partial_queries(query, "city_id", strip_select=False, warn_no_partition_key=False)
 
         assert "SELECT t1.name, t2.name FROM pois AS t1, pois AS t2 WHERE t1.city_id = t2.city_id AND t1.price < t2.price" in variants
+
+
+class TestAliasLikeTextInStringLiterals:
+    """Text inside a string literal that looks like ``alias.column`` must neither be renamed nor steer
+    alias detection; otherwise conditions are attached to the wrong table (wrong cache entries).
+
+    Property checked: the generated variants do not depend on the literal's content.
+    """
+
+    CASES = [
+        (
+            "SELECT * FROM users AS u, shops AS s WHERE u.city_id = s.city_id AND u.city_id = 1 AND u.name = {L} AND DIST(u.g, s.g) < 2.5",
+            "city_id",
+            {},
+        ),
+        (
+            "SELECT * FROM lineorder AS lo, customer AS c, supplier AS s WHERE lo.lo_custkey = c.c_custkey "
+            "AND lo.lo_suppkey = s.s_suppkey AND c.c_region = {L} AND s.s_nation = 'X'",
+            "lo_orderkey",
+            {},
+        ),
+        ("SELECT * FROM lineorder AS lo, customer AS c WHERE lo.lo_custkey = c.c_custkey AND c.c_region = {L}", "c_custkey", {}),
+        (
+            "SELECT * FROM users AS u, shops AS s WHERE u.city_id = s.city_id "
+            "AND u.city_id IN (SELECT z.city_id FROM zones AS z WHERE z.label = {L}) AND s.kind = 'k'",
+            "city_id",
+            {},
+        ),
+        (
+            "SELECT * FROM trips AS t, pois AS p WHERE ST_DWithin(t.geom, p.geom, 100) AND p.name = {L} AND t.fare > 3",
+            "geom",
+            {"skip_partition_key_joins": True, "geometry_column": "geom"},
+        ),
+    ]
+    LITERALS = ["'u.city_id'", "'s.x lo.lo_custkey c.c_custkey z.city_id t.geom p.name'", "'{pk}'"]
+
+    @staticmethod
+    def _variants(query: str, partition_key: str, kwargs: dict, literal: str) -> list[str]:
+        from partitioncache.query_processor import generate_all_query_hash_pairs
+
+        pairs = generate_all_query_hash_pairs(query, partition_key, warn_no_partition_key=False, **kwargs)
+        return sorted(q.replace(literal, "'plain'") for q, _ in pairs)
+
+    @pytest.mark.parametrize("template,partition_key,kwargs", CASES)
+    @pytest.mark.parametrize("literal", LITERALS)
+    def test_variants_do_not_depend_on_literal_content(self, template, partition_key, kwargs, literal):
+        literal = literal.format(pk=partition_key)
+        baseline = self._variants(template.format(L="'plain'"), partition_key, kwargs, "'plain'")
+        with_literal = self._variants(template.format(L=literal), partition_key, kwargs, literal)
+
+        assert baseline
+        assert with_literal == baseline
+
+    def test_literal_in_preserved_select_clause_is_not_renamed(self):
+        from partitioncache.query_processor import generate_partial_queries
+
+        query = "SELECT 'u.name' AS label, u.name FROM users u, shops s WHERE u.city_id = s.city_id AND s.kind = 'k'"
+        variants = generate_partial_queries(query, "city_id", strip_select=False, warn_no_partition_key=False)
+
+        assert variants
+        assert all("'u.name' AS label" in v for v in variants)
+
+    def test_quoted_aliases_with_apostrophes_in_preserved_select_clause(self):
+        """An apostrophe inside a double-quoted alias is not the start of a string literal."""
+        from partitioncache.query_processor import generate_all_query_hash_pairs
+
+        query = 'SELECT u.name AS "user\'s", u.id AS "id\'s", u.age FROM users u WHERE u.city_id = 1 AND u.age > 3'
+        pairs = generate_all_query_hash_pairs(query, "city_id", min_component_size=1, strip_select=False, warn_no_partition_key=False)
+
+        assert pairs
+        for variant, _ in pairs:
+            assert variant.startswith('SELECT t1.name AS "user\'s", t1.id AS "id\'s", t1.age FROM users AS t1'), variant
+
+    def test_comments_with_quotes_in_preserved_select_clause(self):
+        """A quote inside a comment of the kept SELECT list must not stop alias renaming."""
+        from partitioncache.query_processor import generate_all_query_hash_pairs
+
+        query = "SELECT u.name, -- user's name\n u.id, -- user's id\n u.age FROM users u WHERE u.city_id = 1 AND u.age > 3"
+        pairs = generate_all_query_hash_pairs(query, "city_id", min_component_size=1, strip_select=False, warn_no_partition_key=False)
+
+        assert pairs
+        for variant, _ in pairs:
+            assert "u." not in variant and "/*" not in variant, variant
+            assert variant.startswith("SELECT t1.name, t1.id, t1.age FROM users AS t1")

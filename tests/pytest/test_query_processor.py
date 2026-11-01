@@ -8,9 +8,11 @@ import pytest
 from partitioncache.query_processor import (
     clean_query,
     extract_conjunctive_conditions,
+    generate_all_hashes,
     generate_all_query_hash_pairs,
     is_distance_function,
     normalize_distance_conditions,
+    order_variants_for_population,
     remove_k_conditions,
 )
 
@@ -642,3 +644,67 @@ class TestProtectedPatterns:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestOrderVariantsForPopulation:
+    """Variants are populated smallest first, so their relaxations are cached before them."""
+
+    STAR_QUERY = (
+        "SELECT lo.lo_orderkey FROM lineorder lo, customer c, supplier s, date d "
+        "WHERE lo.lo_custkey = c.c_custkey AND lo.lo_suppkey = s.s_suppkey AND lo.lo_orderdate = d.d_datekey "
+        "AND c.c_region = 'ASIA' AND c.c_nation = 'CHINA' AND s.s_region = 'ASIA' AND d.d_year = 1997"
+    )
+
+    def test_sorts_by_table_count_then_condition_count(self):
+        pairs = [
+            ("SELECT DISTINCT t1.pk FROM a AS t1, b AS t2 WHERE t1.pk = t2.pk AND t2.x = 1", "two_tables"),
+            ("SELECT DISTINCT t1.pk FROM a AS t1 WHERE t1.x = 1 AND t1.y = 2", "one_table_two_conditions"),
+            ("SELECT DISTINCT t1.pk FROM a AS t1", "one_table_no_condition"),
+            ("SELECT DISTINCT t1.pk FROM a AS t1 WHERE t1.x = 1", "one_table_one_condition"),
+        ]
+        assert [h for _, h in order_variants_for_population(pairs)] == [
+            "one_table_no_condition",
+            "one_table_one_condition",
+            "one_table_two_conditions",
+            "two_tables",
+        ]
+
+    def test_subquery_tables_do_not_count(self):
+        pairs = [
+            ("SELECT DISTINCT t1.pk FROM a AS t1, b AS t2 WHERE t1.pk = t2.pk", "two_tables"),
+            ("SELECT DISTINCT t1.pk FROM a AS t1 WHERE t1.pk IN (SELECT x.pk FROM x, y WHERE x.id = y.id)", "one_table_with_subquery"),
+        ]
+        assert [h for _, h in order_variants_for_population(pairs)] == ["one_table_with_subquery", "two_tables"]
+
+    def test_stable_and_unparseable_last(self):
+        pairs = [
+            ("NOT SQL (((", "broken"),
+            ("SELECT DISTINCT t1.pk FROM a AS t1 WHERE t1.x = 1", "first"),
+            ("SELECT DISTINCT t1.pk FROM b AS t1 WHERE t1.x = 1", "second"),
+        ]
+        assert [h for _, h in order_variants_for_population(pairs)] == ["first", "second", "broken"]
+
+    @pytest.mark.parametrize("partition_key", ["lo_custkey", "lo_suppkey", "lo_orderdate"])
+    @pytest.mark.parametrize("max_conditions_removed", [None, 1])
+    def test_cached_relaxations_precede_each_variant(self, partition_key, max_conditions_removed):
+        """Every variant whose hash the cache lookup of a variant finds comes before that variant."""
+        pairs = generate_all_query_hash_pairs(
+            self.STAR_QUERY,
+            partition_key,
+            min_component_size=1,
+            partition_key_source_table="lineorder",
+            max_conditions_removed=max_conditions_removed,
+            warn_no_partition_key=False,
+        )
+        ordered = order_variants_for_population(pairs)
+        assert sorted(ordered) == sorted(pairs)
+
+        position = {h: i for i, (_, h) in enumerate(ordered)}
+        restricted = 0
+        for i, (variant, h) in enumerate(ordered):
+            lookup = set(generate_all_hashes(variant, partition_key, min_component_size=1, partition_key_source_table="lineorder"))
+            relaxations = (lookup & position.keys()) - {h}
+            assert all(position[r] < i for r in relaxations), variant
+            restricted += bool(relaxations)
+        # The check is only meaningful if most variants have relaxations to be restricted with
+        assert restricted >= len(ordered) // 2

@@ -2,6 +2,7 @@
 Handles the connection to a MySQL/MariaDB database
 """
 
+import json
 from logging import getLogger
 from typing import Any
 
@@ -50,13 +51,34 @@ class MySQLDBHandler(AbstractDBHandler):
             if self.cur.rowcount == 0:
                 return []
 
-            result = [row[0] for row in self.cur.fetchall()]  # type: ignore
+            result = [row[0] for row in self.cur.fetchall() if row[0] is not None]  # type: ignore
             self.cur.reset()  # Reset the cursor after fetching
             return result
         except mysql.connector.Error as e:
+            # Raise instead of returning []: callers cache the result, and an empty list is a valid
+            # "no rows" result that restricts later queries to nothing
             logger.error(f"Error executing query: {query}")
             logger.error(e)
-            return []
+            raise
+
+    def estimate_cost(self, query: str) -> float | None:
+        """Return ``query_block.cost_info.query_cost`` from ``EXPLAIN FORMAT=JSON``; the query is not executed.
+
+        MariaDB's JSON plan has no ``cost_info``, and MySQL puts no cost at the top level of some plans (e.g.
+        UNION, where it is under ``query_block.union_result``); it returns None there.
+        """
+        self.cur.execute(f"EXPLAIN FORMAT=JSON {query}")
+        row = self.cur.fetchone()
+        self.cur.reset()
+        if not row or not row[0]:
+            return None
+        raw: Any = row[0]
+        plan: dict[str, Any] = json.loads(raw) if isinstance(raw, str | bytes | bytearray) else raw
+        cost = plan.get("query_block", {}).get("cost_info", {}).get("query_cost")
+        if cost is None:
+            logger.debug("EXPLAIN FORMAT=JSON has no query_block.cost_info.query_cost; no cost estimate")
+            return None
+        return float(cost)
 
     def close(self) -> None:
         try:

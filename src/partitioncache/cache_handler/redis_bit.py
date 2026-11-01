@@ -116,9 +116,10 @@ class RedisBitCacheHandler(RedisAbstractCacheHandler):
             return set(bitval.search(bitarray("1"))), valid_keys_count
 
     def set_cache(self, key: str, partition_key_identifiers: set[int] | set[str] | set[float] | set[datetime], partition_key: str = "partition_key") -> bool:
-        """Store a set of partition key identifiers in the cache for a specific partition key. Only integer values are supported."""
-        if not partition_key_identifiers:
-            return True
+        """Store a set of partition key identifiers in the cache for a specific partition key. Only integer values are supported.
+
+        An empty set is stored as all-zero bits, which get() returns as set(): the query has no rows.
+        """
         # Ensure partition exists with correct datatype and bitsize
         self._ensure_partition_exists(partition_key)
         bitsize = self._get_partition_bitsize(partition_key)
@@ -127,15 +128,22 @@ class RedisBitCacheHandler(RedisAbstractCacheHandler):
             bitsize = self.default_bitsize
             self._set_partition_metadata(partition_key, "integer", bitsize)
         val = bitarray(bitsize)
+        val.setall(0)
         try:
             for k in partition_key_identifiers:
-                if isinstance(k, int):
-                    val[k] = 1
-                elif isinstance(k, str):
-                    val[int(k)] = 1
-                else:
-                    raise ValueError("Only integer values are supported")
-        except (IndexError, ValueError):
+                if isinstance(k, str):
+                    try:
+                        k = int(k)
+                    except ValueError:
+                        raise TypeError(k) from None
+                if not isinstance(k, int):
+                    raise TypeError(k)
+                if k < 0:  # bitarray[-1] would silently set the last bit
+                    raise IndexError(k)
+                val[k] = 1
+        except TypeError as e:
+            raise ValueError(f"Only integer values are supported for bit arrays: {e.args[0]!r}") from None
+        except IndexError:
             raise ValueError(f"Partition key identifiers {partition_key_identifiers} is out of range for bitarray of size {bitsize}") from None
         try:
             cache_key = self._get_cache_key(key, partition_key)

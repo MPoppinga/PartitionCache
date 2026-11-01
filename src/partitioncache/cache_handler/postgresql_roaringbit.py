@@ -3,7 +3,6 @@ from logging import getLogger
 
 from bitarray import bitarray
 from psycopg import sql
-from psycopg.errors import IntegrityError
 from pyroaring import BitMap
 
 from partitioncache.cache_handler.postgresql_abstract import PostgreSQLAbstractCacheHandler
@@ -157,10 +156,10 @@ class PostgreSQLRoaringBitCacheHandler(PostgreSQLAbstractCacheHandler):
             key: The cache key
             partition_key_identifiers: Can be a set of integers, a BitMap, a bitarray, or a list of integers
             partition_key: The partition key (column) identifier
-        """
-        if not partition_key_identifiers:
-            return True
 
+        An empty input is stored as an empty bitmap, which ``get`` returns as an empty BitMap: the query
+        has no rows. NULL stays reserved for the ``set_null`` marker.
+        """
         try:
             # Ensure partition table exists
             self._ensure_partition_table(partition_key, "integer")
@@ -183,7 +182,7 @@ class PostgreSQLRoaringBitCacheHandler(PostgreSQLAbstractCacheHandler):
             table_name = f"{self.tableprefix}_cache_{partition_key}"
             self.cursor.execute(
                 sql.SQL(
-                    "INSERT INTO {0} (query_hash, partition_keys) VALUES (%s, rb_build(%s)) ON CONFLICT (query_hash) DO UPDATE SET partition_keys = EXCLUDED.partition_keys"
+                    "INSERT INTO {0} (query_hash, partition_keys) VALUES (%s, rb_build(%s::INTEGER[])) ON CONFLICT (query_hash) DO UPDATE SET partition_keys = EXCLUDED.partition_keys"
                 ).format(sql.Identifier(table_name)),
                 (key, value_list),
             )
@@ -362,41 +361,19 @@ class PostgreSQLRoaringBitCacheHandler(PostgreSQLAbstractCacheHandler):
 
             table_name = f"{self.tableprefix}_cache_{partition_key}"
 
-            # Build lazy insertion query using roaring bitmap aggregation
-            lazy_insert_query = sql.SQL(
-                """
-                INSERT INTO {table_name} (query_hash, partition_keys)
-                SELECT {key}, rb_build_agg({partition_col}::INTEGER)
-                FROM ({query}) AS query_result
-                ON CONFLICT (query_hash) DO UPDATE SET
-                    partition_keys = EXCLUDED.partition_keys
-                """
-            ).format(
-                table_name=sql.Identifier(table_name),
-                key=sql.Literal(key),
-                partition_col=sql.Identifier(partition_key),
-                query=sql.SQL(query)
+            # Server-side SELECT then INSERT: parallel, and the keys stay in the database.
+            # rb_build('{}') is an empty bitmap; rb_build_agg over zero rows was NULL, the set_null marker.
+            self._store_keys_lazily(table_name, key, query, partition_key, "INTEGER[]", "rb_build($2)")
+
+            # Also store in queries table for existence checks. An upsert instead of INSERT plus UPDATE on
+            # IntegrityError: after the failed INSERT the transaction is aborted and the UPDATE raised too.
+            self.cursor.execute(
+                sql.SQL(
+                    "INSERT INTO {table} (query_hash, partition_key, query) VALUES (%s, %s, %s) "
+                    "ON CONFLICT (query_hash, partition_key) DO UPDATE SET last_seen = now()"
+                ).format(table=sql.Identifier(self.tableprefix + "_queries")),
+                (key, partition_key, ""),
             )
-
-            self.cursor.execute(lazy_insert_query)
-
-            # Also store in queries table for existence checks
-            try:
-                self.cursor.execute(
-                    sql.SQL("INSERT INTO {table} (query_hash, partition_key, query) VALUES (%s, %s, %s)").format(
-                        table=sql.Identifier(self.tableprefix + "_queries")
-                    ),
-                    (key, partition_key, "")
-                )
-            except IntegrityError:
-                # Update if insert fails
-                self.cursor.execute(
-                    sql.SQL("UPDATE {table} SET last_seen = now() WHERE query_hash = %s AND partition_key = %s").format(
-                        table=sql.Identifier(self.tableprefix + "_queries")
-                    ),
-                    (key, partition_key)
-                )
-
             self.db.commit()
             return True
 

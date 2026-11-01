@@ -2,13 +2,18 @@ import time
 from datetime import datetime
 from logging import getLogger
 
+import psycopg
 from bitarray import bitarray
 from psycopg import sql
-from psycopg.errors import IntegrityError
 
 from partitioncache.cache_handler.postgresql_abstract import PostgreSQLAbstractCacheHandler, _ends_read_transaction
 
 logger = getLogger("PartitionCache")
+
+
+# SQLSTATEs the lazy insertion raises for keys a bit array cannot hold
+BITSIZE_EXCEEDED_SQLSTATE = "PCB01"
+NEGATIVE_KEY_SQLSTATE = "PCB02"
 
 
 class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
@@ -16,7 +21,16 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
         return "postgresql_bit"
 
     def __init__(
-        self, db_name: str, db_host: str, db_user: str, db_password: str, db_port: str | int, db_tableprefix: str, bitsize: int, timeout: str = "0"
+        self,
+        db_name: str,
+        db_host: str,
+        db_user: str,
+        db_password: str,
+        db_port: str | int,
+        db_tableprefix: str,
+        bitsize: int,
+        timeout: str = "0",
+        bitsize_buffer: int = 0,
     ) -> None:
         """
         Initialize the cache handler with the given db name.
@@ -24,8 +38,14 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
 
         Args:
             timeout: Statement timeout in seconds (default: "0" for no timeout)
+            bitsize_buffer: Extra bits added when a key does not fit and the partition's bit arrays grow
+                (to max key + 1 + buffer). Each growth rewrites the cache table, so a buffer avoids growing
+                for every slightly larger key. Default 0.
         """
+        if bitsize_buffer < 0:
+            raise ValueError("bitsize_buffer must not be negative")
         self.default_bitsize = bitsize
+        self.bitsize_buffer = bitsize_buffer
         super().__init__(db_name, db_host, db_user, db_password, db_port, db_tableprefix, timeout)
 
     def _recreate_metadata_table(self, supported_datatypes: set[str]) -> None:
@@ -128,9 +148,12 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
         return result[0] if result else None
 
     def _set_partition_bitsize(self, partition_key: str, bitsize: int) -> None:
-        """Update the bitsize for a partition key in metadata."""
+        """Grow the bitsize for a partition key in metadata; a smaller bitsize keeps the current one.
+
+        Shrinking would cut the stored bit arrays and drop their keys, so the bitsize trigger refuses it.
+        """
         self.cursor.execute(
-            sql.SQL("UPDATE {0} SET bitsize = %s WHERE partition_key = %s").format(sql.Identifier(self.tableprefix + "_partition_metadata")),
+            sql.SQL("UPDATE {0} SET bitsize = GREATEST(bitsize, %s) WHERE partition_key = %s").format(sql.Identifier(self.tableprefix + "_partition_metadata")),
             (bitsize, partition_key),
         )
         self.db.commit()
@@ -254,11 +277,9 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
     def set_cache(self, key: str, partition_key_identifiers: set[int] | set[str] | set[float] | set[datetime], partition_key: str = "partition_key") -> bool:
         """
         Set the partition key identifiers of the given hash in the cache for a specific partition key.
-        Only integer values are supported for bit arrays.
+        Only integer values are supported for bit arrays. An empty set is stored as an all-zero bit
+        array, which ``get`` returns as ``set()``: the query has no rows.
         """
-        if not partition_key_identifiers:
-            return True
-
         try:
             # Convert all keys to integers first
             int_keys = []
@@ -270,12 +291,19 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
                 else:
                     raise ValueError(f"Only integer values are supported for bit arrays: {k} : {partition_key_identifiers}")
 
-            # Determine required bitsize based on data
-            max_value = max(int_keys)
-            required_bitsize = max(max_value + 1, self.default_bitsize)  # Ensure at least default size
+            # A negative key has no bit position; bitarray[-1] would silently set the last bit
+            negative = [k for k in int_keys if k < 0]
+            if negative:
+                raise ValueError(f"Bit arrays cannot store negative partition keys: {sorted(negative)[:5]}")
 
-            # Atomically ensure partition table exists and get actual bitsize
-            _, actual_bitsize = self._ensure_partition_table(partition_key, "integer", bitsize=required_bitsize)
+            # Grow the bit arrays (with the configured buffer) when a key does not fit
+            max_value = max(int_keys, default=-1)
+            existing_bitsize = self._get_partition_bitsize(partition_key)
+            base_bitsize = existing_bitsize if existing_bitsize is not None else self.default_bitsize
+            if max_value >= base_bitsize:
+                actual_bitsize = self._expand_bitsize(partition_key, max_value, existing_bitsize)
+            else:
+                _, actual_bitsize = self._ensure_partition_table(partition_key, "integer", bitsize=base_bitsize)
 
             # Validate all keys fit within the actual bitsize
             if max_value >= actual_bitsize:
@@ -413,6 +441,88 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
             .as_string()
         )
 
+    def get_intersected_dilated_sql_wk(self, keys, partition_key: str, dilation: int) -> str:
+        """Intersection SQL where each cached bit array is dilated by ``dilation`` bits first.
+
+        Dilation of a bit array is a shift-OR: a set bit at index ``b`` is spread to every
+        index within ``dilation`` of ``b``. PostgreSQL bit-string shifts preserve length and
+        pad with zeros, so buckets at the ends clip instead of wrapping around.
+
+        Each row is dilated *before* BIT_AND, mirroring the buffer-then-intersect order of the
+        spatial handlers. Dilating the intersection result instead would be unsound.
+        """
+        table_name = f"{self.tableprefix}_cache_{partition_key}"
+        keys_part = sql.SQL("ARRAY[{}]").format(sql.SQL(", ").join(sql.Literal(key) for key in keys))
+
+        shifted: list[sql.Composable] = [sql.SQL("partition_keys")]
+        for offset in range(1, dilation + 1):
+            shifted.append(sql.SQL("(partition_keys >> {})").format(sql.Literal(offset)))
+            shifted.append(sql.SQL("(partition_keys << {})").format(sql.Literal(offset)))
+        dilated_expr = sql.SQL(" | ").join(shifted)
+
+        return (
+            sql.SQL(
+                "SELECT BIT_AND(dilated) AS bit_result FROM "
+                "(SELECT {dilated_expr} AS dilated FROM {table} WHERE query_hash = ANY({keys})) AS selected"
+            )
+            .format(dilated_expr=dilated_expr, table=sql.Identifier(table_name), keys=keys_part)
+            .as_string()
+        )
+
+    def get_intersected_dilated_lazy(self, keys: set[str], partition_key: str = "partition_key", dilation: int = 0) -> tuple[str | None, int]:
+        """Lazy intersection with each cached bit array dilated by ``dilation`` buckets first."""
+        try:
+            if dilation < 0:
+                raise ValueError(f"dilation must be non-negative, got {dilation}")
+            if dilation == 0:
+                return self.get_intersected_lazy(keys, partition_key)
+
+            filtered_keys = self.filter_existing_keys(keys, partition_key)
+            if not filtered_keys:
+                return None, 0
+
+            intersect_sql_str = self.get_intersected_dilated_sql_wk(filtered_keys, partition_key, dilation)
+            r = (
+                sql.SQL("""(
+       WITH bit_result AS (
+            {0}
+        ),
+        numbered_bits AS (
+            SELECT
+                bit_result,
+                generate_series(0, bit_length(bit_result) - 1) AS bit_index
+            FROM bit_result
+        )
+        SELECT unnest(array_agg(bit_index)) AS {1}
+        FROM numbered_bits
+        WHERE get_bit(bit_result, bit_index) = 1)
+        """)
+                .format(sql.SQL(intersect_sql_str), sql.Identifier(partition_key))  # type: ignore[arg-type]
+                .as_string()
+            )
+            return r, len(filtered_keys)
+        except Exception as e:
+            logger.error(f"Failed to get dilated lazy intersection in partition {partition_key}: {e}")
+            return None, 0
+
+    def get_intersected_dilated(
+        self, keys: set[str], partition_key: str = "partition_key", dilation: int = 0
+    ) -> tuple[set[int] | None, int]:
+        """Materialised counterpart of :meth:`get_intersected_dilated_lazy`."""
+        try:
+            if dilation == 0:
+                result, count = self.get_intersected(keys, partition_key)
+                return result, count  # type: ignore[return-value]
+
+            lazy_sql, count = self.get_intersected_dilated_lazy(keys, partition_key, dilation)
+            if lazy_sql is None:
+                return None, 0
+            self.cursor.execute(lazy_sql)  # type: ignore[arg-type]
+            return {row[0] for row in self.cursor.fetchall()}, count
+        except Exception as e:
+            logger.error(f"Failed to get dilated intersection in partition {partition_key}: {e}")
+            return None, 0
+
     def get_intersected_lazy(self, keys: set[str], partition_key: str = "partition_key") -> tuple[str | None, int]:
         """Get lazy intersection for partition-specific table."""
         filtered_keys = self.filter_existing_keys(keys, partition_key)  # TODO: Check if this is needed, or if we can just use the keys directly
@@ -446,6 +556,38 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
 
         return r, len(filtered_keys)
 
+    def _expand_bitsize(self, partition_key: str, max_key: int, current_bitsize: int | None) -> int:
+        """Grow the partition's bit arrays so that max_key fits, plus the configured buffer.
+
+        The metadata update fires the bitsize trigger, which widens the cache table's BIT column; stored
+        entries are zero-padded on the right, so they keep their keys. Returns the new bitsize.
+        """
+        required = max(max_key + 1 + self.bitsize_buffer, self.default_bitsize)
+        _, actual_bitsize = self._ensure_partition_table(partition_key, "integer", bitsize=required)
+        if current_bitsize is not None and actual_bitsize > current_bitsize:
+            logger.warning(f"Partition key {max_key} exceeds bitsize {current_bitsize} of partition '{partition_key}': bit arrays grown to {actual_bitsize}")
+        return actual_bitsize
+
+    def _store_bits_lazily(self, table_name: str, key: str, query: str, partition_key: str, bitsize: int) -> None:
+        """Store a variant's keys as a bit array on the server; keys that do not fit raise instead of being dropped."""
+        bitsize = int(bitsize)
+        bit_value = (
+            "(WITH bit_positions AS (SELECT position FROM unnest($2) AS u(position)),"
+            f" bit_array AS (SELECT generate_series(0, {bitsize} - 1) AS bit_index),"
+            " bit_string AS ("
+            " SELECT string_agg(CASE WHEN bit_array.bit_index IN (SELECT position FROM bit_positions) THEN '1' ELSE '0' END,"
+            " '' ORDER BY bit_array.bit_index) AS bit_value FROM bit_array)"
+            f" SELECT bit_value::BIT({bitsize}) FROM bit_string)"
+        )
+        check = (
+            "SELECT min(k), max(k) FROM unnest(v_keys) AS k INTO v_min, v_max; "
+            "IF v_min < 0 THEN RAISE EXCEPTION 'Partition key % is negative; bit arrays cannot store it', v_min "
+            f"USING ERRCODE = '{NEGATIVE_KEY_SQLSTATE}'; END IF; "
+            f"IF v_max >= {bitsize} THEN RAISE EXCEPTION 'Partition key % exceeds bitsize {bitsize}', v_max "
+            f"USING ERRCODE = '{BITSIZE_EXCEEDED_SQLSTATE}', DETAIL = v_max::text; END IF;"
+        )
+        self._store_keys_lazily(table_name, key, query, partition_key, "INTEGER[]", bit_value, check)
+
     def set_cache_lazy(self, key: str, query: str, partition_key: str = "partition_key") -> bool:
         """
         Store partition key identifiers in cache by executing the provided query directly.
@@ -477,64 +619,27 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
 
             table_name = f"{self.tableprefix}_cache_{partition_key}"
 
-            # Build lazy insertion query that creates a bit array from query results
-            lazy_insert_query = sql.SQL(
-                """
-                WITH query_result AS (
-                    {query}
-                ),
-                bit_positions AS (
-                    SELECT {partition_col}::INTEGER AS position
-                    FROM query_result
-                    WHERE {partition_col}::INTEGER >= 0 AND {partition_col}::INTEGER < {bitsize}
-                ),
-                bit_array AS (
-                    SELECT generate_series(0, {bitsize} - 1) AS bit_index
-                ),
-                bit_string AS (
-                    SELECT string_agg(
-                        CASE WHEN bit_array.bit_index IN (SELECT position FROM bit_positions)
-                             THEN '1'
-                             ELSE '0'
-                        END,
-                        ''
-                        ORDER BY bit_array.bit_index
-                    ) AS bit_value
-                    FROM bit_array
-                )
-                INSERT INTO {table_name} (query_hash, partition_keys)
-                SELECT {key}, bit_value::BIT({bitsize})
-                FROM bit_string
-                ON CONFLICT (query_hash) DO UPDATE SET
-                    partition_keys = EXCLUDED.partition_keys
-                """
-            ).format(
-                query=sql.SQL(query),  # type: ignore[arg-type]
-                partition_col=sql.Identifier(partition_key),
-                bitsize=sql.Literal(bitsize),
-                table_name=sql.Identifier(table_name),
-                key=sql.Literal(key)
-            )
-
-            self.cursor.execute(lazy_insert_query)
-
-            # Also store in queries table for existence checks
             try:
-                self.cursor.execute(
-                    sql.SQL("INSERT INTO {table} (query_hash, partition_key, query) VALUES (%s, %s, %s)").format(
-                        table=sql.Identifier(self.tableprefix + "_queries")
-                    ),
-                    (key, partition_key, "")
-                )
-            except IntegrityError:
-                # Update if insert fails
-                self.cursor.execute(
-                    sql.SQL("UPDATE {table} SET last_seen = now() WHERE query_hash = %s AND partition_key = %s").format(
-                        table=sql.Identifier(self.tableprefix + "_queries")
-                    ),
-                    (key, partition_key)
-                )
+                self._store_bits_lazily(table_name, key, query, partition_key, bitsize)
+            except psycopg.Error as e:
+                if e.sqlstate != BITSIZE_EXCEEDED_SQLSTATE:
+                    raise
+                # A key does not fit: grow the bit arrays and run the variant once more. The keys never
+                # left the database, so they are recomputed rather than resent.
+                self.db.rollback()
+                max_key = int(e.diag.message_detail or bitsize)
+                bitsize = self._expand_bitsize(partition_key, max_key, bitsize)
+                self._store_bits_lazily(table_name, key, query, partition_key, bitsize)
 
+            # Also store in queries table for existence checks. An upsert instead of INSERT plus UPDATE on
+            # IntegrityError: after the failed INSERT the transaction is aborted and the UPDATE raised too.
+            self.cursor.execute(
+                sql.SQL(
+                    "INSERT INTO {table} (query_hash, partition_key, query) VALUES (%s, %s, %s) "
+                    "ON CONFLICT (query_hash, partition_key) DO UPDATE SET last_seen = now()"
+                ).format(table=sql.Identifier(self.tableprefix + "_queries")),
+                (key, partition_key, ""),
+            )
             self.db.commit()
             return True
 

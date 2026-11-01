@@ -3,7 +3,6 @@ from datetime import datetime
 from logging import getLogger
 
 from psycopg import sql
-from psycopg.errors import IntegrityError
 
 from partitioncache.cache_handler.postgresql_abstract import PostgreSQLAbstractCacheHandler
 
@@ -98,13 +97,21 @@ class PostgreSQLArrayCacheHandler(PostgreSQLAbstractCacheHandler):
             return True
 
     def set_cache(self, key: str, partition_key_identifiers: set[int] | set[str] | set[float] | set[datetime], partition_key: str = "partition_key") -> bool:
-        """Store partition key identifiers in the cache for a specific partition key (column)."""
-        if not partition_key_identifiers:
-            return True
+        """Store partition key identifiers in the cache for a specific partition key (column).
 
+        An empty set is stored as an empty array, which ``get`` returns as ``set()``: the query has no
+        rows. It needs a registered partition key, since the datatype cannot be inferred from it.
+        """
         try:
             # Try to get datatype from metadata
             datatype = self._get_partition_datatype(partition_key)
+
+            if not partition_key_identifiers:
+                if datatype is None:
+                    logger.error(f"Cannot store an empty set for unregistered partition key '{partition_key}': its datatype is unknown")
+                    return False
+                self._store_array(key, "{}", partition_key)
+                return True
 
             # Determine the datatype of the incoming partition key identifiers
             sample = next(iter(partition_key_identifiers))
@@ -133,26 +140,7 @@ class PostgreSQLArrayCacheHandler(PostgreSQLAbstractCacheHandler):
                     return False
 
             # Convert set to list for PostgreSQL array serialization
-            val = list(partition_key_identifiers)
-
-            # Get partition-specific table
-            table_name = f"{self.tableprefix}_cache_{partition_key}"
-            self.cursor.execute(
-                sql.SQL(
-                    "INSERT INTO {0} (query_hash, partition_keys) VALUES (%s, %s) ON CONFLICT (query_hash) DO UPDATE SET partition_keys = EXCLUDED.partition_keys"
-                ).format(sql.Identifier(table_name)),
-                (key, val),
-            )
-
-            # Also create entry in queries table for exists() method to work properly
-            self.cursor.execute(
-                sql.SQL(
-                    "INSERT INTO {0} (query_hash, partition_key, query) VALUES (%s, %s, %s) ON CONFLICT (query_hash, partition_key) DO UPDATE SET last_seen = now()"
-                ).format(sql.Identifier(self.tableprefix + "_queries")),
-                (key, partition_key, ""),  # Empty query text for cache entries
-            )
-
-            self.db.commit()
+            self._store_array(key, list(partition_key_identifiers), partition_key)
             return True
         except Exception as e:
             logger.error(f"Failed to set cache for hash {hash} in partition {partition_key}: {e}")
@@ -162,6 +150,24 @@ class PostgreSQLArrayCacheHandler(PostgreSQLAbstractCacheHandler):
             except Exception as rollback_error:
                 logger.error(f"Failed to rollback transaction: {rollback_error}")
             return False
+
+    def _store_array(self, key: str, value: list | str, partition_key: str) -> None:
+        """Upsert the cache row and the queries row in one transaction; value is a list or an array literal."""
+        table_name = f"{self.tableprefix}_cache_{partition_key}"
+        self.cursor.execute(
+            sql.SQL(
+                "INSERT INTO {0} (query_hash, partition_keys) VALUES (%s, %s) ON CONFLICT (query_hash) DO UPDATE SET partition_keys = EXCLUDED.partition_keys"
+            ).format(sql.Identifier(table_name)),
+            (key, value),
+        )
+        # Also create entry in queries table for exists() method to work properly
+        self.cursor.execute(
+            sql.SQL(
+                "INSERT INTO {0} (query_hash, partition_key, query) VALUES (%s, %s, %s) ON CONFLICT (query_hash, partition_key) DO UPDATE SET last_seen = now()"
+            ).format(sql.Identifier(self.tableprefix + "_queries")),
+            (key, partition_key, ""),  # Empty query text for cache entries
+        )
+        self.db.commit()
 
     def get(self, key: str, partition_key: str = "partition_key") -> set[int] | set[str] | set[float] | set[datetime] | None:
         """Get value from partition-specific cache table."""
@@ -224,6 +230,87 @@ class PostgreSQLArrayCacheHandler(PostgreSQLAbstractCacheHandler):
             logger.error(f"Failed to get lazy intersection in partition {partition_key}: {e}")
             return None, 0
 
+    def get_intersected_dilated_sql(self, keys: set[str], partition_key: str, dilation: int) -> sql.Composed:
+        """Return SQL intersecting cached sets after dilating each of them by ``dilation`` buckets.
+
+        Each cached set is expanded independently before the intersection, mirroring the
+        buffer-then-intersect order used by the spatial handlers. Dilating the intersection
+        instead would be unsound.
+        """
+        table_name = f"{self.tableprefix}_cache_{partition_key}"
+        keys_list = sorted(keys)
+
+        dilated_ctes = [
+            sql.SQL(
+                "{alias} AS (SELECT DISTINCT u.v + g.d AS v "
+                "FROM (SELECT unnest(partition_keys) AS v FROM {table} WHERE query_hash = {key}) AS u, "
+                "generate_series({lo}, {hi}) AS g(d))"
+            ).format(
+                alias=sql.Identifier(f"d{i}"),
+                table=sql.Identifier(table_name),
+                key=sql.Literal(key),
+                lo=sql.Literal(-dilation),
+                hi=sql.Literal(dilation),
+            )
+            for i, key in enumerate(keys_list)
+        ]
+
+        intersected = sql.SQL(" INTERSECT ").join(
+            sql.SQL("SELECT v FROM {}").format(sql.Identifier(f"d{i}")) for i in range(len(keys_list))
+        )
+        return sql.SQL("WITH {ctes} {body}").format(ctes=sql.SQL(", ").join(dilated_ctes), body=intersected)
+
+    def get_intersected_dilated_lazy(self, keys: set[str], partition_key: str = "partition_key", dilation: int = 0) -> tuple[str | None, int]:
+        """Lazy intersection with each cached set dilated by ``dilation`` buckets first.
+
+        Only integer partition keys can be dilated; bucket arithmetic is meaningless for text
+        or timestamp keys. Returns (None, 0) for those, so callers fall back cleanly.
+        """
+        try:
+            if dilation < 0:
+                raise ValueError(f"dilation must be non-negative, got {dilation}")
+
+            datatype = self._get_partition_datatype(partition_key)
+            if datatype is None:
+                return None, 0
+            if datatype != "integer":
+                logger.error(f"Temporal dilation requires an integer partition key, got '{datatype}' for '{partition_key}'")
+                return None, 0
+
+            filtered_keys = self.filter_existing_keys(keys, partition_key)
+            if not filtered_keys:
+                return None, 0
+
+            if dilation == 0:
+                return self.get_intersected_lazy(filtered_keys, partition_key)
+
+            query = sql.SQL("SELECT v AS {partition_col} FROM ({inner}) AS dilated_intersection").format(
+                partition_col=sql.Identifier(partition_key),
+                inner=self.get_intersected_dilated_sql(filtered_keys, partition_key, dilation),
+            )
+            return query.as_string(), len(filtered_keys)
+        except Exception as e:
+            logger.error(f"Failed to get dilated lazy intersection in partition {partition_key}: {e}")
+            return None, 0
+
+    def get_intersected_dilated(
+        self, keys: set[str], partition_key: str = "partition_key", dilation: int = 0
+    ) -> tuple[set[int] | None, int]:
+        """Materialised counterpart of :meth:`get_intersected_dilated_lazy`."""
+        try:
+            if dilation == 0:
+                result, count = self.get_intersected(keys, partition_key)
+                return result, count  # type: ignore[return-value]
+
+            lazy_sql, count = self.get_intersected_dilated_lazy(keys, partition_key, dilation)
+            if lazy_sql is None:
+                return None, 0
+            self.cursor.execute(lazy_sql)
+            return {row[0] for row in self.cursor.fetchall()}, count
+        except Exception as e:
+            logger.error(f"Failed to get dilated intersection in partition {partition_key}: {e}")
+            return None, 0
+
     def set_cache_lazy(self, key: str, query: str, partition_key: str = "partition_key") -> bool:
         """
         Store partition key identifiers in cache by executing the provided query directly.
@@ -250,43 +337,20 @@ class PostgreSQLArrayCacheHandler(PostgreSQLAbstractCacheHandler):
 
             table_name = f"{self.tableprefix}_cache_{partition_key}"
 
-            # Build lazy insertion query
-            lazy_insert_query = sql.SQL(
-                """
-                INSERT INTO {table_name} (query_hash, partition_keys)
-                SELECT {key}, ARRAY(SELECT {partition_col} FROM ({query}) AS query_result)
-                ON CONFLICT (query_hash) DO UPDATE SET
-                    partition_keys = EXCLUDED.partition_keys
-                """
-            ).format(
-                table_name=sql.Identifier(table_name),
-                key=sql.Literal(key),
-                partition_col=sql.Identifier(partition_key),
-                query=sql.SQL(query)  # type: ignore[arg-type]
+            # Server-side SELECT then INSERT: parallel, and the keys stay in the database
+            array_types = {"integer": "INTEGER[]", "float": "NUMERIC[]", "text": "TEXT[]", "timestamp": "TIMESTAMP[]"}
+            self._store_keys_lazily(table_name, key, query, partition_key, array_types.get(datatype, "TEXT[]"))
+
+            # Also store in queries table for existence checks. An upsert instead of INSERT plus UPDATE on
+            # IntegrityError: after the failed INSERT the transaction is aborted and the UPDATE raised too.
+            self.cursor.execute(
+                sql.SQL(
+                    "INSERT INTO {table} (query_hash, partition_key, query) VALUES (%s, %s, %s) "
+                    "ON CONFLICT (query_hash, partition_key) DO UPDATE SET last_seen = now()"
+                ).format(table=sql.Identifier(self.tableprefix + "_queries")),
+                (key, partition_key, ""),
             )
-
-            self.cursor.execute(lazy_insert_query)
             self.db.commit()
-
-            # Also store in queries table for existence checks
-            queries_table = f"{self.tableprefix}_queries"
-            try:
-                self.cursor.execute(
-                    sql.SQL("INSERT INTO {table} (query_hash, partition_key, query) VALUES (%s, %s, %s)").format(
-                        table=sql.Identifier(queries_table)
-                    ),
-                    (key, partition_key, "")
-                )
-                self.db.commit()
-            except IntegrityError:
-                # Update if insert fails
-                self.cursor.execute(
-                    sql.SQL("UPDATE {table} SET last_seen = now() WHERE query_hash = %s AND partition_key = %s").format(
-                        table=sql.Identifier(queries_table)
-                    ),
-                    (key, partition_key)
-                )
-                self.db.commit()
 
             return True
 

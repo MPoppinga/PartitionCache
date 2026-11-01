@@ -1,0 +1,113 @@
+name: "Security Log Benchmark"
+fact_table: "auth_events"
+p0_alias: "e1"
+
+env_file: "examples/security_log_benchmark/.env"
+query_dir: "examples/security_log_benchmark/queries"
+
+# Query files are organized as {partition_key_dir}/{query_file}.sql
+query_subdirectory_pattern: "{partition_key}/{query_file}"
+
+data_setup:
+  script: "examples/security_log_benchmark/generate_security_log_data.py"
+  docker_compose: "examples/security_log_benchmark/docker-compose.yml"
+  example_command: "python examples/security_log_benchmark/generate_security_log_data.py --scale 0.01 --drop-existing"
+  required_tables: ["auth_events", "process_events", "redteam_events"]
+
+executors:
+  duckdb:
+    enabled: false
+  postgresql:
+    enabled: true
+
+partition_keys:
+  # Conventional entity keys: the group-by field of a Sigma correlation rule.
+  src_user_id: { datatype: integer }
+  src_host_id: { datatype: integer }
+  # Temporal keys. temporal_bucket_width enables dilation: each cached bucket set is widened
+  # by ceil(window / bucket_width) before intersection, so a correlated pair spanning two
+  # adjacent buckets is not dropped. This is the 1-D counterpart of the spatial buffer.
+  bucket_1h:
+    datatype: integer
+    temporal_bucket_width: 3600
+  bucket_1d:
+    datatype: integer
+    temporal_bucket_width: 86400
+
+query_partition_keys:
+  user_q1: [src_user_id]
+  user_q2: [src_user_id]
+  user_q3: [src_user_id]
+  host_q1: [src_host_id]
+  host_q2: [src_host_id]
+  host_q3: [src_host_id]
+  bucket_1h_q1: [bucket_1h]
+  bucket_1h_q2: [bucket_1h]
+  bucket_1h_q3: [bucket_1h]
+  bucket_1d_q1: [bucket_1d]
+  bucket_1d_q2: [bucket_1d]
+  bucket_1d_q3: [bucket_1d]
+
+query_flights:
+  1: [user_q1, user_q2, user_q3]
+  2: [host_q1, host_q2, host_q3]
+  3: [bucket_1h_q1, bucket_1h_q2, bucket_1h_q3]
+  4: [bucket_1d_q1, bucket_1d_q2, bucket_1d_q3]
+
+# bucket_1h -> bucket_1d is a temporal granularity hierarchy, the temporal analogue of
+# zipcode -> landkreis in the OSM POI workload.
+hierarchy_labels:
+  bucket_1h: "1 hour"
+  bucket_1d: "1 day"
+
+spatial_queries: []
+
+query_processing:
+  keep_all_attributes: true
+  follow_graph: true
+  strip_select: true
+  auto_detect_partition_join: true
+  # Per-key, not global -- this workload mixes entity keys and temporal keys, which need
+  # opposite settings. The runner turns it on automatically for keys that declare
+  # temporal_bucket_width (or a geometry datatype); leaving it off here keeps the real
+  # group-by equality (e2.src_user_id = e1.src_user_id) in the entity-key fragments.
+  skip_partition_key_joins: false
+  # Distance normalization would only add log noise here; the correlation windows are
+  # already exact literals and must not be rounded.
+  bucket_steps: 0
+  population:
+    max_conditions_removed: 1
+    keep_all_attributes: false
+  lookup:
+    max_conditions_removed: 2
+    keep_all_attributes: false
+
+fragment_filter:
+  require_in_from: []
+  exclude_from_from: [redteam_events]
+
+cache:
+  table_prefix: "seclog_cache"
+  # Per-partition-key sizing: bucket_1h tops out around 1400 while event_id reaches 20M, so a
+  # single global bitsize would allocate megabyte bit arrays for the temporal keys.
+  bitsize_strategy: auto
+  min_bitsize: 20000
+
+backends:
+  postgresql: [postgresql_array, postgresql_bit]
+
+fact_stats:
+  strategy: count_with_max
+  table: "auth_events"
+  count_column: "*"
+  max_column: "event_id"
+
+modes:
+  cross_dimension:
+    phase1_flights: [1]
+    phase2_flights: [2]
+  hierarchy:
+    flights: [3, 4]
+  cold_warm:
+    flight: 1
+  representative_queries: [user_q1, host_q1, bucket_1h_q1]

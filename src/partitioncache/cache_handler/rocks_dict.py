@@ -234,6 +234,9 @@ class RocksDictCacheHandler(RocksDictAbstractCacheHandler):
             if existing_datatype not in ("integer", "float", "text", "timestamp", "geometry"):
                 raise ValueError(f"Unsupported datatype in metadata: {existing_datatype}")
         else:
+            if not partition_key_identifiers:
+                logger.error(f"Cannot store an empty set for unregistered partition key '{partition_key}': its datatype is unknown")
+                return False
             sample = next(iter(partition_key_identifiers))
             if isinstance(sample, int):
                 datatype = "integer"

@@ -150,9 +150,12 @@ class TestRocksDictRoaringBitCacheHandler:
         with pytest.raises(ValueError, match="Only integer values"):
             cache_handler.set_cache("text_key", {"a", "b"})
 
-    def test_set_cache_empty(self, cache_handler, mock_rocksdict):
+    def test_set_cache_empty_stores_an_empty_bitmap(self, cache_handler, mock_rocksdict):
         result = cache_handler.set_cache("empty_key", set())
         assert result is True
+        calls = mock_rocksdict.__setitem__.call_args_list
+        cache_call = [c for c in calls if c[0][0] == "cache:partition_key:empty_key"][0]
+        assert BitMap.deserialize(cache_call[0][1]) == BitMap()
 
     def test_set_cache_wrong_datatype_partition(self, cache_handler, mock_rocksdict):
         mock_rocksdict.get.return_value = "text"
