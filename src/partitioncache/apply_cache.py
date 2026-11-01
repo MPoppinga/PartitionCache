@@ -6,9 +6,13 @@ It utilizes the given cache to extend the SQL query with the set of possible par
 
 """
 
+import math
+import numbers
 import random
 import secrets
+from collections.abc import Callable
 from datetime import datetime
+from decimal import Decimal
 from logging import getLogger
 from typing import Any, Literal
 
@@ -1292,6 +1296,33 @@ def extend_query_with_h3_cell_lookup(
     return prep_sql + parsed_query.sql()
 
 
+def _check_cost_gate(query: str, cost_estimator: Callable[[str], float | None] | None, min_query_cost: float | None) -> tuple[bool, dict[str, int]]:
+    """Decide whether the planner cost of ``query`` is too low for the cache to pay off.
+
+    Returns ``(gated, gate_stats)``. ``gate_stats`` is empty when the gate is not configured; otherwise it holds
+    ``cost_gated`` (0/1) and, when the estimator produced a value, ``query_cost`` (rounded). A failing or cost-less
+    estimator never blocks the cache: the gate is a performance optimisation, not a correctness check.
+    """
+    if min_query_cost is None:
+        return False, {}
+    if cost_estimator is None:
+        raise ValueError("min_query_cost requires a cost_estimator (e.g. PostgresDBHandler.estimate_cost)")
+    try:
+        cost: Any = cost_estimator(query)  # custom estimators may return Decimal, numpy numbers or junk
+    except Exception as e:
+        logger.warning(f"Query cost estimation failed, applying the cache anyway: {e}")
+        return False, {"cost_gated": 0}
+    if isinstance(cost, bool) or not isinstance(cost, numbers.Real | Decimal) or not math.isfinite(cost):
+        if cost is not None:
+            logger.warning(f"Query cost estimator returned {cost!r}, not a finite number; applying the cache anyway")
+        return False, {"cost_gated": 0}
+    cost = float(cost)
+    gated = cost < min_query_cost
+    if gated:
+        logger.info(f"Planner cost {cost:.0f} is below min_query_cost {min_query_cost:.0f}; cache not applied")
+    return gated, {"cost_gated": int(gated), "query_cost": round(cost)}
+
+
 def apply_cache_lazy(
     query: str,
     cache_handler: AbstractCacheHandler_Lazy,
@@ -1319,6 +1350,8 @@ def apply_cache_lazy(
     protected_patterns: list[str] | None = None,
     sql_dialect: str = "postgres",
     partition_key_source_table: str | None = None,
+    cost_estimator: Callable[[str], float | None] | None = None,
+    min_query_cost: float | None = None,
     **kwargs: Any,
 ) -> tuple[str, dict[str, int]]:
     """
@@ -1354,9 +1387,17 @@ def apply_cache_lazy(
         spatial_method: Method for applying the spatial filter:
             - "SUBDIVIDE_TMP_TABLE": Create a temp table with ST_Subdivide + GiST index (default, optimal).
             - "SUBDIVIDE_INLINE": Inline ST_Subdivide in an EXISTS subquery (simpler, no temp table).
+        cost_estimator: Callable returning the planner's cost estimate for a query without executing it, or None
+            when no estimate is available (e.g. ``PostgresDBHandler.estimate_cost``). Must run against the data
+            database, which is not necessarily the cache database. Only used together with ``min_query_cost``.
+        min_query_cost: If set, the cache is skipped when the estimated cost of the original query is below this
+            value: for cheap queries the cache overhead exceeds the possible saving. The check runs before variant
+            generation, so a gated query costs one planning pass only. Cost units are installation-specific
+            (``seq_page_cost``, ``random_page_cost``) and have to be calibrated. A failing estimator or one that
+            returns None never blocks the cache. Requires ``cost_estimator``.
 
     Returns:
-        tuple[str, dict[str, int]]: Enhanced query and statistics.
+        tuple[str, dict[str, int]]: Enhanced query and statistics (same keys as ``apply_cache``).
     """
     # Handle deprecated kwargs
     deprecated = handle_deprecated_kwargs(kwargs, "apply_cache_lazy")
@@ -1366,6 +1407,10 @@ def apply_cache_lazy(
         partition_join_table = deprecated["partition_join_table"]
     if "auto_detect_partition_join" in deprecated:
         auto_detect_partition_join = deprecated["auto_detect_partition_join"]
+
+    gated, gate_stats = _check_cost_gate(query, cost_estimator, min_query_cost)
+    if gated:
+        return query, {"generated_variants": 0, "cache_hits": 0, "enhanced": 0, "p0_rewritten": 0, **gate_stats}
 
     # Spatial mode is selected by passing a geometry column
     if geometry_column is not None:
@@ -1394,7 +1439,7 @@ def apply_cache_lazy(
         )
 
         generated_variants = len(hashes)
-        stats: dict[str, int] = {"generated_variants": generated_variants, "cache_hits": 0, "enhanced": 0, "p0_rewritten": 0}
+        stats: dict[str, int] = {"generated_variants": generated_variants, "cache_hits": 0, "enhanced": 0, "p0_rewritten": 0, **gate_stats}
         if not hashes:
             return query, stats
 
@@ -1513,7 +1558,7 @@ def apply_cache_lazy(
         p0_rewritten = 1 if working_query != query else 0
 
     # Create statistics
-    stats = {"generated_variants": generated_variants, "cache_hits": used_hashes, "enhanced": 0, "p0_rewritten": p0_rewritten}
+    stats = {"generated_variants": generated_variants, "cache_hits": used_hashes, "enhanced": 0, "p0_rewritten": p0_rewritten, **gate_stats}
 
     # If no cache hits, return working query
     if not lazy_cache_subquery or not lazy_cache_subquery.strip():
@@ -1566,6 +1611,8 @@ def apply_cache(
     spatial_method: Literal["SUBDIVIDE_INLINE", "SUBDIVIDE_TMP_TABLE", "DUMP_TMP_TABLE", "DUMP_CTE"] = "SUBDIVIDE_TMP_TABLE",
     subdivide_max_vertices: int = 256,
     partition_key_source_table: str | None = None,
+    cost_estimator: Callable[[str], float | None] | None = None,
+    min_query_cost: float | None = None,
     **kwargs: Any,
 ) -> tuple[str, dict[str, int]]:
     """
@@ -1610,6 +1657,14 @@ def apply_cache(
         spatial_method: Method for applying the spatial filter:
             - "SUBDIVIDE_TMP_TABLE": Create a temp table with ST_Subdivide + GiST index (default, optimal).
             - "SUBDIVIDE_INLINE": Inline ST_Subdivide in an EXISTS subquery (simpler, no temp table).
+        cost_estimator: Callable returning the planner's cost estimate for a query without executing it, or None
+            when no estimate is available (e.g. ``PostgresDBHandler.estimate_cost``). Must run against the data
+            database, which is not necessarily the cache database. Only used together with ``min_query_cost``.
+        min_query_cost: If set, the cache is skipped when the estimated cost of the original query is below this
+            value: for cheap queries the cache overhead exceeds the possible saving. The check runs before variant
+            generation, so a gated query costs one planning pass only. Cost units are installation-specific
+            (``seq_page_cost``, ``random_page_cost``) and have to be calibrated. A failing estimator or one that
+            returns None never blocks the cache. Requires ``cost_estimator``.
 
     Returns:
         tuple[str, dict[str, int]]: A tuple containing:
@@ -1619,6 +1674,8 @@ def apply_cache(
                 - 'cache_hits': Number of cache hits (hashes found in cache)
                 - 'enhanced': 1 if query was enhanced, 0 if returned unchanged
                 - 'p0_rewritten': 1 if query was rewritten with p0 table, 0 otherwise
+                - 'cost_gated' / 'query_cost': only when ``min_query_cost`` is set; 'cost_gated' is 1 if the cache
+                  was skipped because the planner cost was below the threshold, 'query_cost' the rounded estimate
 
     Example:
         ```python
@@ -1650,6 +1707,10 @@ def apply_cache(
     if "auto_detect_partition_join" in deprecated:
         auto_detect_partition_join = deprecated["auto_detect_partition_join"]
 
+    gated, gate_stats = _check_cost_gate(query, cost_estimator, min_query_cost)
+    if gated:
+        return query, {"generated_variants": 0, "cache_hits": 0, "enhanced": 0, "p0_rewritten": 0, **gate_stats}
+
     # Spatial mode is selected by passing a geometry column
     if geometry_column is not None:
         # Spatial path: generate hashes with spatial params, apply spatial filter
@@ -1678,7 +1739,7 @@ def apply_cache(
         )
 
         generated_variants = len(cache_entry_hashes)
-        stats: dict[str, int] = {"generated_variants": generated_variants, "cache_hits": 0, "enhanced": 0, "p0_rewritten": 0}
+        stats: dict[str, int] = {"generated_variants": generated_variants, "cache_hits": 0, "enhanced": 0, "p0_rewritten": 0, **gate_stats}
 
         # Count cache hits
         used_hashes = len(cache_handler.filter_existing_keys(set(cache_entry_hashes), partition_key))  # type: ignore[attr-defined]
@@ -1795,7 +1856,7 @@ def apply_cache(
         p0_rewritten = 1 if working_query != query else 0
 
     # Create statistics dictionary
-    stats = {"generated_variants": generated_variants, "cache_hits": used_hashes, "enhanced": 0, "p0_rewritten": p0_rewritten}
+    stats = {"generated_variants": generated_variants, "cache_hits": used_hashes, "enhanced": 0, "p0_rewritten": p0_rewritten, **gate_stats}
 
     # If no cache hits, return working query (potentially p0-rewritten)
     if partition_keys is None:
