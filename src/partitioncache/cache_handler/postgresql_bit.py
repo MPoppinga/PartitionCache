@@ -474,8 +474,6 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
 
             table_name = f"{self.tableprefix}_cache_{partition_key}"
 
-            # SELECT and INSERT are separate statements so the variant query can run in parallel;
-            # the INSERT builds the bit array from the returned keys
             # Server-side SELECT then INSERT: parallel, and the keys stay in the database. The bit array
             # is built from the key array literal (%L) inside the block.
             bit_value = (
