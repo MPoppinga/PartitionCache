@@ -29,6 +29,7 @@ from partitioncache.cli.common_args import (
     load_environment_with_validation,
     parse_variant_generation_json_args,
     resolve_cache_backend,
+    sql_dialect_for_backend,
 )
 from partitioncache.db_handler import get_db_handler
 from partitioncache.logging_utils import configure_enhanced_logging, get_thread_aware_logger
@@ -298,6 +299,7 @@ def apply_cache_optimization(query: str, query_hash: str, partition_key: str, pa
                     partition_key=partition_key,
                     method=extend_method,
                     analyze_tmp_table=True,
+                    sql_dialect=sql_dialect_for_backend(args.db_backend),
                 )
 
                 logger.info(

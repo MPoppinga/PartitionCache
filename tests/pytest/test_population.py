@@ -34,6 +34,15 @@ class TestVariantSignature:
         b = "SELECT DISTINCT t2.pk FROM d AS t1, f AS t2 WHERE t1.k = t2.k AND t2.k IN (SELECT s.k FROM s WHERE s.v = t2.v)"
         assert is_relaxation_of(variant_signature(a, "pk"), variant_signature(b, "pk"))
 
+    def test_quoted_table_names_stay_distinct(self):
+        a = 'SELECT DISTINCT a.pk FROM "LO" AS a WHERE a.y = 2'
+        b = "SELECT DISTINCT b.pk FROM lo AS b WHERE b.x = 1 AND b.y = 2"
+        assert not is_relaxation_of(variant_signature(a, "pk"), variant_signature(b, "pk"))
+
+    def test_ordered_limit_subquery_is_accepted(self):
+        query = "SELECT DISTINCT t1.pk FROM f AS t1 WHERE t1.k IN (SELECT s.k FROM s ORDER BY s.k LIMIT 5)"
+        assert variant_signature(query, "pk") is not None
+
     def test_schemas_distinguish_tables(self):
         """s1.lo and s2.lo are different tables, also when their conditions look alike."""
         a = "SELECT DISTINCT a.pk FROM s1.lo AS a WHERE a.y = 2"
@@ -46,7 +55,7 @@ class TestVariantSignature:
         pairs = generate_all_query_hash_pairs(query, "pk", min_component_size=1, warn_no_partition_key=False)
         signatures = [variant_signature(v, "pk") for v, _ in pairs]
         for sig in signatures:
-            assert sig is not None and all(name.startswith(("s1.", "s2.")) for name in sig[0])
+            assert sig is not None and all(name.startswith(('"s1".', '"s2".')) for name in sig[0])
         for a in signatures:
             for b in signatures:
                 if a is not b and is_relaxation_of(a, b):
@@ -66,6 +75,13 @@ class TestVariantSignature:
             "SELECT DISTINCT t1.pk, t1.k FROM f AS t1",
             "SELECT DISTINCT t1.pk FROM f AS t1 WHERE random() < 0.5",
             "SELECT DISTINCT t1.pk FROM f AS t1 WHERE t1.ts < now()",
+            "WITH a AS (SELECT * FROM f WHERE 1 = 0) SELECT a.pk FROM a",
+            "SELECT DISTINCT t1.pk FROM f AS t1 CONNECT BY PRIOR t1.pk = t1.k",
+            "SELECT DISTINCT t1.pk FROM f AS t1 WHERE t1.ts < LOCALTIMESTAMP",
+            "SELECT DISTINCT t1.pk FROM f AS t1 WHERE t1.ts < 'now'::timestamp",
+            "SELECT DISTINCT t1.pk FROM f AS t1 WHERE random_normal() > 0",
+            "SELECT DISTINCT t1.pk FROM f AS t1 WHERE t1.k IN (SELECT s.k FROM s TABLESAMPLE BERNOULLI (10))",
+            "SELECT DISTINCT t1.pk FROM f AS t1 WHERE t1.k IN (SELECT s.k FROM s LIMIT 5)",
             "SELECT DISTINCT t1.pk FROM f AS t1 JOIN d AS t2 ON t1.k = t2.k",
             "SELECT DISTINCT t1.pk FROM f AS t1 LEFT JOIN d AS t2 ON t1.k = t2.k",
             "SELECT DISTINCT t1.pk FROM f AS t1, f AS t2 WHERE t1.k = t2.k",
@@ -235,3 +251,25 @@ def test_order_is_reproducible_for_variants_of_the_same_size():
 
     pairs = [("SELECT DISTINCT t1.pk FROM a AS t1 WHERE t1.x = 1", "h2"), ("SELECT DISTINCT t1.pk FROM b AS t1 WHERE t1.x = 1", "h1")]
     assert order_variants_for_population(pairs) == order_variants_for_population(list(reversed(pairs)))
+
+
+def test_restriction_renders_keys_for_the_given_dialect():
+    """A key ending in a backslash must be escaped the MySQL way when the database is MySQL."""
+    small = ("SELECT DISTINCT t1.pk FROM f AS t1 WHERE t1.x = 1", "small")
+    large = ("SELECT DISTINCT t1.pk FROM f AS t1, d AS t2 WHERE t1.k = t2.k AND t1.x = 1", "large")
+    cache = FakeCache({"small": {"a\\", "b"}})
+
+    class RecordingDB:
+        def __init__(self):
+            self.executed = []
+
+        def execute(self, query):
+            self.executed.append(query)
+            return ["b"]
+
+    db = RecordingDB()
+    stats = populate_query_variants([small, large], "pk", cache, db, sql_dialect="mysql")
+
+    assert stats.restricted == 1
+    assert "'a\\\\'" in db.executed[0]
+    assert cache.entries["large"] == {"b"}

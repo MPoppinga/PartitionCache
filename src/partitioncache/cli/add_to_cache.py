@@ -20,6 +20,7 @@ from partitioncache.cli.common_args import (
     load_environment_with_validation,
     parse_variant_generation_json_args,
     resolve_cache_backend,
+    sql_dialect_for_backend,
 )
 from partitioncache.db_handler import get_db_handler
 from partitioncache.population import populate_query_variants
@@ -272,11 +273,18 @@ def main():
                 else:
                     raise ValueError(f"Unsupported database backend: {args.db_backend}")
 
+                population_failed = False
                 if args.restrict_variants or args.max_restriction_keys is not None:
                     stats = populate_query_variants(
-                        query_hash_pairs, args.partition_key, cache_handler, db_handler, max_restriction_keys=args.max_restriction_keys
+                        query_hash_pairs,
+                        args.partition_key,
+                        cache_handler,
+                        db_handler,
+                        max_restriction_keys=args.max_restriction_keys,
+                        sql_dialect=sql_dialect_for_backend(args.db_backend),
                     )
                     logger.info(f"Populated query variants: {stats}")
+                    population_failed = bool(stats.failed or stats.store_failed)
                 else:
                     # Process each query-hash pair
                     for fragment_query, hash_value in query_hash_pairs:
@@ -295,6 +303,10 @@ def main():
 
                 db_handler.close()
                 cache.close()
+                if population_failed:
+                    # Same outcome as the plain loop, where a failing variant aborts with an error
+                    logger.error(f"{stats.failed} variants failed to execute and {stats.store_failed} failed to store")
+                    exit(1)
 
         except Exception as e:
             logger.error(f"Error processing query: {str(e)}")

@@ -800,6 +800,7 @@ class TestCacheOptimization:
             partition_key=partition_key,
             method="IN",
             analyze_tmp_table=True,
+            sql_dialect="sqlite",  # from --db-backend
         )
 
     @patch("partitioncache.cli.monitor_cache_queue.get_partition_keys")
@@ -947,3 +948,15 @@ class TestVariantOrder:
                 delattr(mcq_module, "args")
 
         assert mock_push.call_args.args[0] == [small, large]
+
+    @patch("partitioncache.cli.monitor_cache_queue.extend_query_with_partition_keys")
+    @patch("partitioncache.cli.monitor_cache_queue.get_partition_keys")
+    def test_restriction_uses_the_dialect_of_the_db_backend(self, mock_get_keys, mock_extend, mock_args):
+        mock_args.enable_cache_optimization = True
+        mock_args.disable_cache_optimization = False
+        mock_args.prefer_lazy_optimization = False
+        mock_args.cache_optimization_method = "IN"
+        mock_args.db_backend = "mysql"
+        mock_get_keys.return_value = ({"a\\", "b"}, 4, 2)
+        apply_cache_optimization("SELECT 1", "h", "pk", "text", Mock(), mock_args)
+        assert mock_extend.call_args.kwargs["sql_dialect"] == "mysql"

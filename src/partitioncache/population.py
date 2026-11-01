@@ -39,6 +39,7 @@ def populate_query_variants(
     restrict: bool = True,
     max_restriction_keys: int | None = None,
     method: Literal["IN", "VALUES", "TMP_TABLE_IN", "TMP_TABLE_JOIN"] = "IN",
+    sql_dialect: str = "postgres",
 ) -> PopulationStats:
     """Execute and cache the variants of one query, restricting each with the keys of its relaxations.
 
@@ -54,6 +55,7 @@ def populate_query_variants(
         max_restriction_keys: Only restrict when the intersection has at most this many keys; a restriction
             to most of the keys filters little and costs a long key list. None means no limit.
         method: How the keys are attached, see ``extend_query_with_partition_keys``.
+        sql_dialect: Dialect of the database, used to render the key literals (e.g. "mysql").
 
     Returns:
         PopulationStats. An empty intersection means the variant has no rows; it is stored as an empty
@@ -91,7 +93,7 @@ def populate_query_variants(
                     stats.empty_without_execution += 1
                     continue
                 if max_restriction_keys is None or len(intersection) <= max_restriction_keys:
-                    to_execute = extend_query_with_partition_keys(variant, intersection, partition_key, method=method)
+                    to_execute = extend_query_with_partition_keys(variant, intersection, partition_key, method=method, sql_dialect=sql_dialect)
                     stats.restricted += 1
 
         try:

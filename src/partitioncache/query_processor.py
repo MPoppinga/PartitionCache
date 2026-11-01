@@ -2260,13 +2260,19 @@ def order_variants_for_population(query_hash_pairs: list[tuple[str, str]]) -> li
 
 VariantSignature = tuple[frozenset[str], frozenset[str], str]
 
-# Results that can differ between two executions make conditions incomparable across variants
-_VOLATILE_EXPRESSIONS = (exp.Rand, exp.CurrentTimestamp, exp.CurrentDate, exp.CurrentTime, exp.CurrentDatetime, exp.Uuid)
+# Results that can differ between two executions make conditions incomparable across variants. Functions
+# not listed here (including user-defined ones) are assumed to be deterministic.
+_VOLATILE_EXPRESSIONS = (
+    exp.Rand, exp.CurrentTimestamp, exp.CurrentDate, exp.CurrentTime, exp.CurrentDatetime, exp.Localtimestamp, exp.Uuid, exp.TableSample,
+)
 _VOLATILE_FUNCTION_NAMES = {
-    "random", "rand", "now", "clock_timestamp", "statement_timestamp", "transaction_timestamp", "timeofday",
+    "random", "rand", "random_normal", "now", "clock_timestamp", "statement_timestamp", "transaction_timestamp", "timeofday",
     "localtime", "localtimestamp", "nextval", "currval", "setval", "setseed", "gen_random_uuid", "uuid_generate_v4",
 }
+_VOLATILE_DATETIME_LITERALS = {"now", "today", "tomorrow", "yesterday"}
 _PLAIN_TABLE_ARGS = {"this", "db", "catalog", "alias"}
+# A variant is SELECT [DISTINCT] key FROM tables WHERE conditions; any other clause makes it ungradable
+_ALLOWED_SELECT_ARGS = {"expressions", "distinct", "from_", "joins", "where", "order"}
 
 
 def _plain_table(source: exp.Expr | None) -> exp.Table | None:
@@ -2282,9 +2288,19 @@ def _plain_table(source: exp.Expr | None) -> exp.Table | None:
 
 
 def _is_volatile(expression: exp.Expr) -> bool:
+    """True if the expression can give different results in two executions, so its rows are not a fixed set.
+
+    Covers volatile functions, 'now'-style datetime literals, sampling, and subqueries with LIMIT but no
+    ORDER BY (which rows they keep is arbitrary).
+    """
     if any(True for _ in expression.find_all(*_VOLATILE_EXPRESSIONS)):
         return True
-    return any(func.name.lower() in _VOLATILE_FUNCTION_NAMES for func in expression.find_all(exp.Anonymous))
+    if any(func.name.lower() in _VOLATILE_FUNCTION_NAMES for func in expression.find_all(exp.Anonymous)):
+        return True
+    for cast in expression.find_all(exp.Cast):
+        if isinstance(cast.this, exp.Literal) and cast.this.is_string and cast.this.this.strip().lower() in _VOLATILE_DATETIME_LITERALS:
+            return True
+    return any(sub.args.get("limit") is not None and sub.args.get("order") is None for sub in expression.find_all(exp.Select))
 
 
 def variant_signature(query: str, partition_key: str) -> VariantSignature | None:
@@ -2310,7 +2326,7 @@ def variant_signature(query: str, partition_key: str) -> VariantSignature | None
         select = sqlglot.parse_one(query)
     except sqlglot.ParseError:
         return None
-    if not isinstance(select, exp.Select) or any(select.args.get(arg) for arg in ("group", "having", "limit", "offset", "with", "qualify", "kind", "into")):
+    if not isinstance(select, exp.Select) or any(value for key, value in select.args.items() if key not in _ALLOWED_SELECT_ARGS):
         return None
     distinct = select.args.get("distinct")
     if distinct is not None and distinct.args.get("on") is not None:
@@ -2326,10 +2342,11 @@ def variant_signature(query: str, partition_key: str) -> VariantSignature | None
     tables = [table for table in plain_tables if table is not None]
     if len(tables) != len(plain_tables):
         return None
-    names = [exp.table_name(table) for table in tables]
+    # Quoted, so "LO" and lo (different tables in PostgreSQL) stay apart
+    names = [exp.table_name(table, identify=True) for table in tables]
     if len(set(names)) != len(names):
         return None
-    alias_to_table = {table.alias_or_name: exp.table_name(table) for table in tables}
+    alias_to_table = {table.alias_or_name: exp.table_name(table, identify=True) for table in tables}
 
     if len(select.expressions) != 1:
         return None
@@ -2354,7 +2371,8 @@ def variant_signature(query: str, partition_key: str) -> VariantSignature | None
         # Aliases introduced inside the condition (IN/EXISTS subqueries) must not shadow outer ones
         inner_tables = list(condition.find_all(exp.Table))
         inner_aliases = {table.alias_or_name for table in inner_tables}
-        if (inner_aliases | {exp.table_name(table) for table in inner_tables}) & (alias_to_table.keys() | set(names)):
+        inner_names = {exp.table_name(table) for table in inner_tables} | {exp.table_name(table, identify=True) for table in inner_tables}
+        if (inner_aliases | inner_names) & (alias_to_table.keys() | set(names)):
             return None
         for col in condition.find_all(exp.Column):
             if not col.table or col.args.get("db") or col.args.get("catalog"):

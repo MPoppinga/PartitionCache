@@ -480,6 +480,11 @@ def validate_mutual_exclusivity(args: argparse.Namespace, groups: list[tuple[str
             sys.exit(1)
 
 
+def sql_dialect_for_backend(db_backend: str | None) -> str:
+    """The sqlglot dialect for a --db-backend value (postgresql, mysql, sqlite); PostgreSQL by default."""
+    return {"postgresql": "postgres", "mysql": "mysql", "sqlite": "sqlite"}.get(db_backend or "", "postgres")
+
+
 def get_database_connection_params(args: argparse.Namespace, backend_type: str | None = None) -> dict[str, Any]:
     """
     Get database connection parameters based on backend type and environment.
