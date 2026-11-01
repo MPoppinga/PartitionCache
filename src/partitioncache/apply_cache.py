@@ -6,8 +6,13 @@ It utilizes the given cache to extend the SQL query with the set of possible par
 
 """
 
+import math
+import numbers
 import random
+import secrets
+from collections.abc import Callable
 from datetime import datetime
+from decimal import Decimal
 from logging import getLogger
 from typing import Any, Literal
 
@@ -191,7 +196,9 @@ def find_p0_alias(query: str, partition_key: str, auto_detect_partition_join: bo
     Find the appropriate table alias for cache restrictions.
 
     Uses the query processor's partition-join detection logic.
-    If no partition-join table is detected, falls back to the first table in the query.
+    If no partition-join table is detected, falls back to the first table in the query,
+    unless the partition key column is qualified only with other aliases; then the first
+    such alias (SELECT list first) is used.
 
     Args:
         query: SQL query to analyze
@@ -223,8 +230,16 @@ def find_p0_alias(query: str, partition_key: str, auto_detect_partition_join: bo
         # If partition-join detection fails (e.g., no FROM clause), fall through to default
         pass
 
-    # Fallback to first table
-    return first_table.alias_or_name
+    # Fallback to the first table, unless only other tables carry the partition key: generated
+    # variants without partition_key_source_table can list a dimension before the fact table
+    first_alias = first_table.alias_or_name
+    select = parsed_query if isinstance(parsed_query, exp.Select) else parsed_query.find(exp.Select)
+    if select is not None:
+        key_columns = [*(col for e in select.expressions for col in e.find_all(exp.Column)), *select.find_all(exp.Column)]
+        key_aliases: list[str] = [col.table for col in key_columns if col.name == partition_key and col.table and col.parent_select is select]
+        if key_aliases and first_alias not in key_aliases:
+            return key_aliases[0]
+    return first_alias
 
 
 def rewrite_query_with_p0_table( # TODO: Check duplication with query_processor
@@ -349,6 +364,43 @@ def _get_partition_key_sql_type(partition_keys: set[int] | set[str] | set[float]
     return "TEXT"
 
 
+def _key_list_sentinel() -> str:
+    """Return a unique identifier that stands in for a partition-key list during the sqlglot rewrite.
+
+    The token is a plain lowercase identifier, so sqlglot renders it verbatim (no quoting, no
+    rewriting) in every dialect, and the random suffix makes a collision with the user's query
+    text practically impossible. `_splice_key_list` still asserts that it occurs exactly once.
+    """
+    return f"__pcache_keys_{secrets.token_hex(8)}__"
+
+
+def _format_spliced_partition_key(pk: int | str | float | datetime, sql_dialect: str = "postgres") -> str:
+    """Format one key for a spliced (unparsed) list.
+
+    Integers as numbers, everything else as a string literal rendered by sqlglot for ``sql_dialect``, so
+    quotes and backslashes are escaped the way that dialect expects (MySQL treats a backslash as an
+    escape character). The former parse-based path rejected such keys with a sqlglot TokenError.
+    """
+    if isinstance(pk, int):
+        return str(pk)
+    return exp.Literal.string(str(pk)).sql(dialect=sql_dialect)
+
+
+def _splice_key_list(rendered_sql: str, sentinel: str, key_list: str) -> str:
+    """Replace the single occurrence of `sentinel` in `rendered_sql` with the formatted key list.
+
+    Formerly the key list itself was parsed with sqlglot (`parse_one(f"... IN ({keys})")`), which
+    is linear in the number of keys but with a large constant: a 100k-key list took seconds. The
+    list is now formatted by `_format_partition_key_for_sql` and joined with the separators
+    sqlglot would have produced (", " inside IN, "), (" inside VALUES), so the output is
+    byte-identical to the parsed form.
+    """
+    occurrences = rendered_sql.count(sentinel)
+    if occurrences != 1:
+        raise AssertionError(f"partition-key placeholder {sentinel!r} occurs {occurrences} times in the rendered query, expected exactly once")
+    return rendered_sql.replace(sentinel, key_list, 1)
+
+
 def _add_where_condition(parsed_query: exp.Expr, condition_expr: exp.Expr) -> None:
     """Add a WHERE condition to a parsed query, creating WHERE clause if needed."""
     existing_where: exp.Where | None = parsed_query.find(exp.Where)
@@ -468,16 +520,20 @@ def extend_query_with_partition_keys(
     parsed_query = sqlglot.parse_one(query)
 
     if method == "IN":
-        partition_keys_str = ",".join(_format_partition_key_for_sql(pk) for pk in partition_keys)
-        partition_expr = sqlglot.parse_one(f"{p0_alias}.{partition_key} IN ({partition_keys_str})")
+        # The key list is not parsed: a placeholder identifier goes through sqlglot and the
+        # formatted list is spliced into the rendered SQL afterwards (see _splice_key_list).
+        sentinel = _key_list_sentinel()
+        partition_expr = sqlglot.parse_one(f"{p0_alias}.{partition_key} IN ({sentinel})")
         _add_where_condition(parsed_query, partition_expr)
-        return parsed_query.sql()
+        key_list = ", ".join(_format_spliced_partition_key(pk, sql_dialect) for pk in partition_keys)
+        return _splice_key_list(parsed_query.sql(), sentinel, key_list)
 
     elif method == "VALUES":
-        partition_keys_str = "),(".join(_format_partition_key_for_sql(pk) for pk in partition_keys)
-        partition_expr = sqlglot.parse_one(f"{p0_alias}.{partition_key} IN (VALUES({partition_keys_str}))")
+        sentinel = _key_list_sentinel()
+        partition_expr = sqlglot.parse_one(f"{p0_alias}.{partition_key} IN (VALUES({sentinel}))")
         _add_where_condition(parsed_query, partition_expr)
-        return parsed_query.sql()
+        key_list = "), (".join(_format_spliced_partition_key(pk, sql_dialect) for pk in partition_keys)
+        return _splice_key_list(parsed_query.sql(), sentinel, key_list)
 
     elif method == "TMP_TABLE_JOIN":
         tmp_table_setup, table_name = _create_tmp_table_setup(partition_keys, analyze_tmp_table, sql_dialect)
@@ -1240,6 +1296,33 @@ def extend_query_with_h3_cell_lookup(
     return prep_sql + parsed_query.sql()
 
 
+def _check_cost_gate(query: str, cost_estimator: Callable[[str], float | None] | None, min_query_cost: float | None) -> tuple[bool, dict[str, int]]:
+    """Decide whether the planner cost of ``query`` is too low for the cache to pay off.
+
+    Returns ``(gated, gate_stats)``. ``gate_stats`` is empty when the gate is not configured; otherwise it holds
+    ``cost_gated`` (0/1) and, when the estimator produced a value, ``query_cost`` (rounded). A failing or cost-less
+    estimator never blocks the cache: the gate is a performance optimisation, not a correctness check.
+    """
+    if min_query_cost is None:
+        return False, {}
+    if cost_estimator is None:
+        raise ValueError("min_query_cost requires a cost_estimator (e.g. PostgresDBHandler.estimate_cost)")
+    try:
+        cost: Any = cost_estimator(query)  # custom estimators may return Decimal, numpy numbers or junk
+    except Exception as e:
+        logger.warning(f"Query cost estimation failed, applying the cache anyway: {e}")
+        return False, {"cost_gated": 0}
+    if isinstance(cost, bool) or not isinstance(cost, numbers.Real | Decimal) or not math.isfinite(cost):
+        if cost is not None:
+            logger.warning(f"Query cost estimator returned {cost!r}, not a finite number; applying the cache anyway")
+        return False, {"cost_gated": 0}
+    cost = float(cost)
+    gated = cost < min_query_cost
+    if gated:
+        logger.info(f"Planner cost {cost:.0f} is below min_query_cost {min_query_cost:.0f}; cache not applied")
+    return gated, {"cost_gated": int(gated), "query_cost": round(cost)}
+
+
 def apply_cache_lazy(
     query: str,
     cache_handler: AbstractCacheHandler_Lazy,
@@ -1267,6 +1350,8 @@ def apply_cache_lazy(
     protected_patterns: list[str] | None = None,
     sql_dialect: str = "postgres",
     partition_key_source_table: str | None = None,
+    cost_estimator: Callable[[str], float | None] | None = None,
+    min_query_cost: float | None = None,
     **kwargs: Any,
 ) -> tuple[str, dict[str, int]]:
     """
@@ -1302,9 +1387,17 @@ def apply_cache_lazy(
         spatial_method: Method for applying the spatial filter:
             - "SUBDIVIDE_TMP_TABLE": Create a temp table with ST_Subdivide + GiST index (default, optimal).
             - "SUBDIVIDE_INLINE": Inline ST_Subdivide in an EXISTS subquery (simpler, no temp table).
+        cost_estimator: Callable returning the planner's cost estimate for a query without executing it, or None
+            when no estimate is available (e.g. ``PostgresDBHandler.estimate_cost``). Must run against the data
+            database, which is not necessarily the cache database. Only used together with ``min_query_cost``.
+        min_query_cost: If set, the cache is skipped when the estimated cost of the original query is below this
+            value: for cheap queries the cache overhead exceeds the possible saving. The check runs before variant
+            generation, so a gated query costs one planning pass only. Cost units are installation-specific
+            (``seq_page_cost``, ``random_page_cost``) and have to be calibrated. A failing estimator or one that
+            returns None never blocks the cache. Requires ``cost_estimator``.
 
     Returns:
-        tuple[str, dict[str, int]]: Enhanced query and statistics.
+        tuple[str, dict[str, int]]: Enhanced query and statistics (same keys as ``apply_cache``).
     """
     # Handle deprecated kwargs
     deprecated = handle_deprecated_kwargs(kwargs, "apply_cache_lazy")
@@ -1314,6 +1407,10 @@ def apply_cache_lazy(
         partition_join_table = deprecated["partition_join_table"]
     if "auto_detect_partition_join" in deprecated:
         auto_detect_partition_join = deprecated["auto_detect_partition_join"]
+
+    gated, gate_stats = _check_cost_gate(query, cost_estimator, min_query_cost)
+    if gated:
+        return query, {"generated_variants": 0, "cache_hits": 0, "enhanced": 0, "p0_rewritten": 0, **gate_stats}
 
     # Spatial mode is selected by passing a geometry column
     if geometry_column is not None:
@@ -1342,7 +1439,7 @@ def apply_cache_lazy(
         )
 
         generated_variants = len(hashes)
-        stats: dict[str, int] = {"generated_variants": generated_variants, "cache_hits": 0, "enhanced": 0, "p0_rewritten": 0}
+        stats: dict[str, int] = {"generated_variants": generated_variants, "cache_hits": 0, "enhanced": 0, "p0_rewritten": 0, **gate_stats}
         if not hashes:
             return query, stats
 
@@ -1461,7 +1558,7 @@ def apply_cache_lazy(
         p0_rewritten = 1 if working_query != query else 0
 
     # Create statistics
-    stats = {"generated_variants": generated_variants, "cache_hits": used_hashes, "enhanced": 0, "p0_rewritten": p0_rewritten}
+    stats = {"generated_variants": generated_variants, "cache_hits": used_hashes, "enhanced": 0, "p0_rewritten": p0_rewritten, **gate_stats}
 
     # If no cache hits, return working query
     if not lazy_cache_subquery or not lazy_cache_subquery.strip():
@@ -1514,6 +1611,8 @@ def apply_cache(
     spatial_method: Literal["SUBDIVIDE_INLINE", "SUBDIVIDE_TMP_TABLE", "DUMP_TMP_TABLE", "DUMP_CTE"] = "SUBDIVIDE_TMP_TABLE",
     subdivide_max_vertices: int = 256,
     partition_key_source_table: str | None = None,
+    cost_estimator: Callable[[str], float | None] | None = None,
+    min_query_cost: float | None = None,
     **kwargs: Any,
 ) -> tuple[str, dict[str, int]]:
     """
@@ -1558,6 +1657,14 @@ def apply_cache(
         spatial_method: Method for applying the spatial filter:
             - "SUBDIVIDE_TMP_TABLE": Create a temp table with ST_Subdivide + GiST index (default, optimal).
             - "SUBDIVIDE_INLINE": Inline ST_Subdivide in an EXISTS subquery (simpler, no temp table).
+        cost_estimator: Callable returning the planner's cost estimate for a query without executing it, or None
+            when no estimate is available (e.g. ``PostgresDBHandler.estimate_cost``). Must run against the data
+            database, which is not necessarily the cache database. Only used together with ``min_query_cost``.
+        min_query_cost: If set, the cache is skipped when the estimated cost of the original query is below this
+            value: for cheap queries the cache overhead exceeds the possible saving. The check runs before variant
+            generation, so a gated query costs one planning pass only. Cost units are installation-specific
+            (``seq_page_cost``, ``random_page_cost``) and have to be calibrated. A failing estimator or one that
+            returns None never blocks the cache. Requires ``cost_estimator``.
 
     Returns:
         tuple[str, dict[str, int]]: A tuple containing:
@@ -1567,6 +1674,8 @@ def apply_cache(
                 - 'cache_hits': Number of cache hits (hashes found in cache)
                 - 'enhanced': 1 if query was enhanced, 0 if returned unchanged
                 - 'p0_rewritten': 1 if query was rewritten with p0 table, 0 otherwise
+                - 'cost_gated' / 'query_cost': only when ``min_query_cost`` is set; 'cost_gated' is 1 if the cache
+                  was skipped because the planner cost was below the threshold, 'query_cost' the rounded estimate
 
     Example:
         ```python
@@ -1598,6 +1707,10 @@ def apply_cache(
     if "auto_detect_partition_join" in deprecated:
         auto_detect_partition_join = deprecated["auto_detect_partition_join"]
 
+    gated, gate_stats = _check_cost_gate(query, cost_estimator, min_query_cost)
+    if gated:
+        return query, {"generated_variants": 0, "cache_hits": 0, "enhanced": 0, "p0_rewritten": 0, **gate_stats}
+
     # Spatial mode is selected by passing a geometry column
     if geometry_column is not None:
         # Spatial path: generate hashes with spatial params, apply spatial filter
@@ -1626,7 +1739,7 @@ def apply_cache(
         )
 
         generated_variants = len(cache_entry_hashes)
-        stats: dict[str, int] = {"generated_variants": generated_variants, "cache_hits": 0, "enhanced": 0, "p0_rewritten": 0}
+        stats: dict[str, int] = {"generated_variants": generated_variants, "cache_hits": 0, "enhanced": 0, "p0_rewritten": 0, **gate_stats}
 
         # Count cache hits
         used_hashes = len(cache_handler.filter_existing_keys(set(cache_entry_hashes), partition_key))  # type: ignore[attr-defined]
@@ -1743,7 +1856,7 @@ def apply_cache(
         p0_rewritten = 1 if working_query != query else 0
 
     # Create statistics dictionary
-    stats = {"generated_variants": generated_variants, "cache_hits": used_hashes, "enhanced": 0, "p0_rewritten": p0_rewritten}
+    stats = {"generated_variants": generated_variants, "cache_hits": used_hashes, "enhanced": 0, "p0_rewritten": p0_rewritten, **gate_stats}
 
     # If no cache hits, return working query (potentially p0-rewritten)
     if partition_keys is None:
