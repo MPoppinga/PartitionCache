@@ -5,6 +5,9 @@ Tests that clean_query() properly normalizes JOIN ON syntax to comma-separated F
 with conditions in WHERE, and strips GROUP BY/HAVING clauses.
 """
 
+import logging
+
+import pytest
 import sqlglot
 from sqlglot import exp
 
@@ -452,6 +455,20 @@ class TestOuterJoinExclusion:
 
     def test_detector_false_on_unparseable(self):
         assert not query_contains_top_level_outer_join("this is not sql")
+
+    @pytest.mark.parametrize("alias", ['"1u"', '"a$b"', '"my u"', "ü"])
+    def test_generate_all_query_hash_pairs_empty_for_alias_that_is_not_plain(self, alias, caplog):
+        """The alias handling would lose the alias's conditions and keep references to aliases outside FROM."""
+        query = f"SELECT {alias}.pk FROM users AS {alias}, orders AS o WHERE {alias}.pk = o.pk AND {alias}.age > 30 AND o.total > 5"
+        with caplog.at_level(logging.WARNING):
+            assert generate_all_query_hash_pairs(query, "pk") == []
+        assert "not a plain identifier" in caplog.text
+
+    @pytest.mark.parametrize("alias", ["u", '"u"', "_u", "u1"])
+    def test_plain_aliases_keep_their_conditions(self, alias):
+        query = f"SELECT {alias}.pk FROM users AS {alias}, orders AS o WHERE {alias}.pk = o.pk AND {alias}.age > 30 AND o.total > 5"
+        variants = {variant for variant, _ in generate_all_query_hash_pairs(query, "pk")}
+        assert "SELECT DISTINCT t1.pk FROM users AS t1 WHERE t1.age > 30" in variants
 
     def test_generate_all_query_hash_pairs_empty_for_outer_join(self):
         query = (

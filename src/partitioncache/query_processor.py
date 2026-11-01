@@ -52,6 +52,24 @@ def handle_deprecated_kwargs(kwargs: dict[str, Any], func_name: str) -> dict[str
     return result
 
 
+# The aliases the variant generator recognises in conditions (see the alias regex in the condition split)
+_PLAIN_IDENTIFIER_RE = re.compile(r"[A-Za-z_]\w*")
+
+
+def _has_alias_that_needs_quotes(query: str) -> bool:
+    """True if a table of the outermost FROM clause has an alias (or name) the variant generator does not recognise."""
+    try:
+        parsed = sqlglot.parse_one(query)
+    except Exception:
+        return False
+    select = parsed if isinstance(parsed, exp.Select) else parsed.find(exp.Select)
+    if select is None:
+        return False
+    return any(
+        not _PLAIN_IDENTIFIER_RE.fullmatch(table.alias_or_name) for table in select.find_all(exp.Table) if table.parent_select is select
+    )
+
+
 def query_contains_top_level_outer_join(query: str) -> bool:
     """Return True if the query has a LEFT/RIGHT/FULL JOIN at the outermost SELECT scope.
 
@@ -2123,6 +2141,16 @@ def generate_all_query_hash_pairs(
             "(LEFT/RIGHT/FULL JOIN); PartitionCache does not generate cache variants for it "
             "because the inner-join rewrite could exclude valid partitions. Returning no "
             "variants; execute the query unchanged."
+        )
+        return []
+
+    # The alias handling only recognises plain ASCII-led identifiers: for an alias such as "1u" or "a$b" its
+    # conditions would be lost and the variants would reference aliases that are not in their FROM clause
+    if _has_alias_that_needs_quotes(query):
+        logger.warning(
+            "generate_all_query_hash_pairs: query uses a table alias that is not a plain identifier "
+            "(letters, digits and underscores, not starting with a digit); PartitionCache does not generate "
+            "cache variants for it. Returning no variants; execute the query unchanged."
         )
         return []
 
