@@ -8,6 +8,7 @@ import logging
 import re
 import warnings
 from collections import defaultdict
+from collections.abc import Callable
 from itertools import combinations
 from typing import Any
 
@@ -202,13 +203,9 @@ def clean_query(query: str) -> str:
         str: Cleaned and normalized query suitable for cache variant generation
     """
 
-    # Remove single-line comments before whitespace normalization,
-    # otherwise collapsing newlines makes `--.*` wipe out everything
-    # from the first comment to the end of the (now single-line) string.
-    query = re.sub(r"--.*", "", query)
-
-    query = re.sub(r"\s+", " ", query)
-    query = re.sub(r"\s*=\s*", "=", query)
+    # Comments and whitespace are left to the sqlglot tokenizer: text-level replacements
+    # would also rewrite string literals ('a  b' vs 'a b', 'x = y' vs 'x=y') and give
+    # non-equivalent queries the same hash.
 
     # Remove trailing semicolons (they're not part of the SQL statement)
     query = query.rstrip().rstrip(";")
@@ -254,14 +251,15 @@ def clean_query(query: str) -> str:
     if outermost_select:
         outermost_select.set("expressions", [exp.Star()])
 
-    query = parsed.sql()
+    # Quoted identifiers are not supported downstream, so drop the quotes on the AST,
+    # where string literals are left untouched.
+    for identifier in parsed.find_all(exp.Identifier):
+        identifier.set("quoted", False)
+
+    query = parsed.sql(comments=False)
 
     # Removing tailing semicolon
     query = re.sub(r";\s*$", "", query)
-
-    # Remove all double quotes(postgresql) and backticks(mysql) from the normalized query
-    query = query.replace('"', "")  # TODO currently double quotes are not supported in identifiers in PartitionCache
-    query = query.replace("`", "")  # TODO currently backticks are not supported in identifiers in PartitionCache
 
     return query
 
@@ -495,7 +493,8 @@ def _detect_pk_bearing_aliases(
     Returns:
         Set of pk-bearing aliases.
     """
-    all_conditions = [cond for group in condition_groups for conds in group.values() for cond in conds]
+    # Literals blanked once per condition, so text inside them never counts as a reference
+    all_conditions = [_strip_string_literals(cond) for group in condition_groups for conds in group.values() for cond in conds]
     pk_bearing = set()
     for alias in table_aliases:
         token = re.compile(rf"\b{re.escape(alias)}\.{re.escape(partition_key)}\b")
@@ -568,8 +567,11 @@ def extract_and_group_query_conditions(
 
     # Iterate through all conditions and sort them into table_conditions and distance_conditions
     for condition in condition_list:
+        # Alias and column detection ignores string literals ('u.city_id' is not a column reference)
+        condition_refs = _strip_string_literals(condition)
+
         # find partition_key join_conditions and track them
-        if re.match(rf"\w*\.{partition_key}\s=\s\w*\.{partition_key}", condition):
+        if re.match(rf"\w*\.{partition_key}\s=\s\w*\.{partition_key}", condition_refs):
             # Extract the two aliases involved in the join
             parts = condition.split("=")
             left_alias = parts[0].strip().split(".")[0]
@@ -578,12 +580,12 @@ def extract_and_group_query_conditions(
                 partition_key_joins[(min(left_alias, right_alias), max(left_alias, right_alias))].append(condition)
             continue  # Skip adding to other conditions
         elif (
-            condition.count(partition_key) >= 1
+            condition_refs.count(partition_key) >= 1
             and (sqlglot.parse_one(condition).find(exp.In) or any(op in condition for op in ["BETWEEN", ">", "<", "=", "!=", "<>"]))
             and not _is_partition_key_fk_join(condition, partition_key, table_aliases)
         ):
             # Partition key condition (IN, BETWEEN, comparison, etc.) — store with alias intact
-            pk_alias_match = re.match(r'(?:NOT\s+)?(\w+)\.', condition)
+            pk_alias_match = re.match(r'(?:NOT\s+)?(\w+)\.', condition_refs)
             if pk_alias_match:
                 pk_alias = pk_alias_match.group(1)
             elif table_aliases:
@@ -596,7 +598,7 @@ def extract_and_group_query_conditions(
         # count how many distinct table aliases are in the condition
         aliases_present: set[str] = set()
         for alias in table_aliases:
-            if f"{alias}." in condition:
+            if f"{alias}." in condition_refs:
                 aliases_present.add(alias)
         nr_alias_in_condition = len(aliases_present)
 
@@ -609,7 +611,7 @@ def extract_and_group_query_conditions(
 
         # Multi-reference, multi-alias, or zero-alias conditions need alias substitution
         # Filter against outer FROM aliases to exclude inner subquery table references
-        all_alias: set = set(re.findall(r"[a-zA-Z_]\w*(?=\.)", condition)) & set(table_aliases)
+        all_alias: set = set(re.findall(r"[a-zA-Z_]\w*(?=\.)", condition_refs)) & set(table_aliases)
         parsed = sqlglot.parse_one(condition)
         table_identifiers = tuple(sorted({col.table for col in parsed.find_all(exp.Column) if col.table}))
         # AND/OR are exp.Func subclasses since sqlglot 30; only real function calls count here
@@ -818,6 +820,29 @@ def detect_partition_join_from_query(
     )
 
 
+# A single-quoted SQL string literal ('' is an escaped quote inside it)
+# String literals and double-quoted identifiers: alias detection and renaming must skip both, and a quote of
+# one kind inside the other (an apostrophe in "user's") must not be read as the start of a literal
+_STRING_LITERAL_RE = re.compile(r"'(?:[^']|'')*'" + r'|"(?:[^"]|"")*"')
+
+
+def _strip_string_literals(text: str) -> str:
+    """Empty every string literal (and quoted identifier) so that alias and column detection cannot match inside one."""
+    return _STRING_LITERAL_RE.sub(lambda m: m.group(0)[0] * 2, text)
+
+
+def _sub_outside_literals(pattern: str, repl: str | Callable[[re.Match[str]], str], text: str) -> str:
+    """``re.sub`` that leaves string literals and quoted identifiers untouched (alias renaming must not rewrite ``'u.city'``)."""
+    parts = []
+    pos = 0
+    for literal in _STRING_LITERAL_RE.finditer(text):
+        parts.append(re.sub(pattern, repl, text[pos : literal.start()]))
+        parts.append(literal.group(0))
+        pos = literal.end()
+    parts.append(re.sub(pattern, repl, text[pos:]))
+    return "".join(parts)
+
+
 def _rename_aliases(text: str, mapping: dict[str, str], qualified_only: bool = False) -> str:
     """
     Rename table aliases in a single pass.
@@ -838,7 +863,7 @@ def _rename_aliases(text: str, mapping: dict[str, str], qualified_only: bool = F
         return text
     names = "|".join(re.escape(name) for name in sorted(mapping, key=len, reverse=True))
     end = r"(?=\.)" if qualified_only else r"\b"
-    return re.sub(rf"\b({names}){end}", lambda m: mapping[m.group(1)], text)
+    return _sub_outside_literals(rf"\b({names}){end}", lambda m: mapping[m.group(1)], text)
 
 
 def _build_select_clause(
@@ -1259,7 +1284,7 @@ def generate_partial_queries(
             for table_condition_key in table_conditions_keys:
                 table_alias = new_alias_by_key[table_condition_key]
                 new_table_list.append(table_alias)
-                query_where.extend([re.sub(rf'\b{re.escape(table_condition_key)}\.', f'{table_alias}.', x) for x in var_attribute_conditions[table_condition_key]])
+                query_where.extend([_sub_outside_literals(rf'\b{re.escape(table_condition_key)}\.', f'{table_alias}.', x) for x in var_attribute_conditions[table_condition_key]])
 
             # set the correct table aliases in the distance conditions (in one pass, input aliases may be named t<N>)
             relvant_conditions_for_combination = [_rename_aliases(cc, new_alias_by_key) for cc in relvant_conditions_for_combination]
@@ -1367,12 +1392,12 @@ def generate_partial_queries(
                 partition_join_conditions_list = []
                 if detected_partition_join_alias in attribute_conditions:
                     for cond in attribute_conditions[detected_partition_join_alias]:
-                        partition_join_conditions_list.append(re.sub(rf'\b{re.escape(detected_partition_join_alias)}\.', f'{partition_join_new_alias}.', cond))
+                        partition_join_conditions_list.append(_sub_outside_literals(rf'\b{re.escape(detected_partition_join_alias)}\.', f'{partition_join_new_alias}.', cond))
                 # Also include single-table other_functions that only reference the partition-join table
                 for keys, oconds in other_functions.items():
                     if len(keys) == 1 and keys[0] == detected_partition_join_alias:
                         for cond in oconds:
-                            mapped_cond = re.sub(rf'\b{re.escape(detected_partition_join_alias)}\b', partition_join_new_alias, cond)
+                            mapped_cond = _sub_outside_literals(rf'\b{re.escape(detected_partition_join_alias)}\b', partition_join_new_alias, cond)
                             partition_join_conditions_list.append(mapped_cond)
 
                 # Build the combined query with partition-join table
@@ -1417,7 +1442,7 @@ def generate_partial_queries(
                         for comb in itertools.combinations(all_pk_conditions_pj, i):
                             query_where_comb = combined_where.copy()
                             for orig_alias, subquery in comb:
-                                remapped = re.sub(rf'\b{re.escape(orig_alias)}\.', f'{partition_join_new_alias}.', subquery)
+                                remapped = _sub_outside_literals(rf'\b{re.escape(orig_alias)}\.', f'{partition_join_new_alias}.', subquery)
                                 query_where_comb.append(remapped)
                             # Build WHERE clause only if conditions exist
                             select_clause = _build_select_clause(
@@ -1457,7 +1482,7 @@ def generate_partial_queries(
                                 remap_target = original_to_new_alias_mapping.get(orig_alias) or pk_source_alias or new_table_list[0]
                             else:
                                 remap_target = new_table_list[0]
-                            remapped = re.sub(rf'\b{re.escape(orig_alias)}\.', f'{remap_target}.', subquery)
+                            remapped = _sub_outside_literals(rf'\b{re.escape(orig_alias)}\.', f'{remap_target}.', subquery)
                             query_where_comb.append(remapped)
                         if geometry_column and len(new_table_list) > 1:
                             # Spatial multi-alias: separate geometry columns per alias for grouped match sets
@@ -1720,7 +1745,8 @@ def normalize_distance_conditions(original_query: str, bucket_steps: float = 1.0
             new_condition = f"{left_part} > {valuef:g}"
         query = query.replace(distance_condition, new_condition)
 
-    return " ".join(query.split())
+    # Collapse the whitespace left by the replacements, but not inside string literals
+    return re.sub(r"('(?:[^']|'')*')|\s+", lambda m: m.group(1) or " ", query).strip()
 
 
 def _add_constraints_to_query(query: str, add_constraints: dict[str, str]) -> str:
@@ -2110,7 +2136,9 @@ def generate_all_query_hash_pairs(
             _parsed = sqlglot.parse_one(query)
             _sel = _parsed.find(exp.Select) if not isinstance(_parsed, exp.Select) else _parsed
             if _sel and _sel.expressions and not (len(_sel.expressions) == 1 and isinstance(_sel.expressions[0], exp.Star)):
-                pre_clean_select_clause = ", ".join(e.sql() for e in _sel.expressions)
+                # Without comments: a comment such as "-- user's name" holds a quote that would read as the
+                # start of a string literal and stop alias renaming; comments also do not belong in hashes
+                pre_clean_select_clause = ", ".join(e.sql(comments=False) for e in _sel.expressions)
         except Exception:
             pre_clean_select_clause = None
 
