@@ -256,19 +256,8 @@ class PostgreSQLArrayCacheHandler(PostgreSQLAbstractCacheHandler):
 
             table_name = f"{self.tableprefix}_cache_{partition_key}"
 
-            # SELECT and INSERT are separate statements so the variant query can run in parallel
-            keys_literal = self._select_keys_as_array_literal(query, partition_key)
-            self.cursor.execute(
-                sql.SQL(
-                    """
-                    INSERT INTO {table_name} (query_hash, partition_keys)
-                    VALUES (%s, %s)
-                    ON CONFLICT (query_hash) DO UPDATE SET
-                        partition_keys = EXCLUDED.partition_keys
-                    """
-                ).format(table_name=sql.Identifier(table_name)),
-                (key, keys_literal),
-            )
+            # Server-side SELECT then INSERT: parallel, and the keys stay in the database
+            self._store_keys_lazily(table_name, key, query, partition_key)
 
             # Also store in queries table for existence checks. An upsert instead of INSERT plus UPDATE on
             # IntegrityError: after the failed INSERT the transaction is aborted and the UPDATE raised too.

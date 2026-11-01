@@ -577,3 +577,24 @@ def test_unicode_key(cache_handler):
                     assert set(values_param) == {1, 2, 3}, f"Expected {{1, 2, 3}}, got {set(values_param)}"
                     break
     assert insert_found, "Expected INSERT INTO ... ON CONFLICT SQL with unicode key not found"
+
+
+def test_set_cache_lazy_keeps_the_keys_in_the_database(cache_handler):
+    """Lazy insertion runs the variant and the INSERT server-side in one DO block; nothing is fetched to the client."""
+    from psycopg import sql
+
+    original_as_string = sql.Composable.as_string
+    events = []
+    cache_handler.cursor.execute.side_effect = lambda *args, **kwargs: events.append(("execute", args))
+    cache_handler.cursor.fetchone.side_effect = lambda: events.append(("fetchone",)) or ("integer",)
+    cache_handler.cursor.fetchall.side_effect = lambda: events.append(("fetchall",)) or []
+    # The unit-test connection is a mock; compose the SQL without one
+    with patch.object(sql.Composable, "as_string", lambda self, context=None: original_as_string(self, None)):
+        assert cache_handler.set_cache_lazy("lazy_key", "SELECT pk FROM t WHERE x = 'a''b'", "pk") is True
+
+    blocks = [i for i, event in enumerate(events) if event[0] == "execute" and str(event[1][0]).startswith("DO $")]
+    assert len(blocks) == 1
+    statement = events[blocks[0]][1]
+    assert len(statement) == 1, "the DO block takes no parameters, so % in the query is not interpreted"
+    assert "INTO v_keys" in statement[0] and "SELECT pk FROM t WHERE x = ''a''''b''" in statement[0]
+    assert not any(event[0] in ("fetchone", "fetchall") for event in events[blocks[0]:]), "lazy insertion must not fetch keys"

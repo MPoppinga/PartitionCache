@@ -476,45 +476,19 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
 
             # SELECT and INSERT are separate statements so the variant query can run in parallel;
             # the INSERT builds the bit array from the returned keys
-            keys_literal = self._select_keys_as_array_literal(query, partition_key)
-            lazy_insert_query = sql.SQL(
-                """
-                WITH query_result AS (
-                    SELECT unnest(%s::INTEGER[]) AS {partition_col}
-                ),
-                bit_positions AS (
-                    SELECT {partition_col}::INTEGER AS position
-                    FROM query_result
-                    WHERE {partition_col}::INTEGER >= 0 AND {partition_col}::INTEGER < {bitsize}
-                ),
-                bit_array AS (
-                    SELECT generate_series(0, {bitsize} - 1) AS bit_index
-                ),
-                bit_string AS (
-                    SELECT string_agg(
-                        CASE WHEN bit_array.bit_index IN (SELECT position FROM bit_positions)
-                             THEN '1'
-                             ELSE '0'
-                        END,
-                        ''
-                        ORDER BY bit_array.bit_index
-                    ) AS bit_value
-                    FROM bit_array
-                )
-                INSERT INTO {table_name} (query_hash, partition_keys)
-                SELECT {key}, bit_value::BIT({bitsize})
-                FROM bit_string
-                ON CONFLICT (query_hash) DO UPDATE SET
-                    partition_keys = EXCLUDED.partition_keys
-                """
-            ).format(
-                partition_col=sql.Identifier(partition_key),
-                bitsize=sql.Literal(bitsize),
-                table_name=sql.Identifier(table_name),
-                key=sql.Literal(key)
+            # Server-side SELECT then INSERT: parallel, and the keys stay in the database. The bit array
+            # is built from the key array literal (%L) inside the block.
+            bit_value = (
+                "(WITH bit_positions AS ("
+                " SELECT position FROM unnest(%L::INTEGER[]) AS u(position)"
+                f" WHERE position >= 0 AND position < {int(bitsize)}"
+                f"), bit_array AS (SELECT generate_series(0, {int(bitsize)} - 1) AS bit_index),"
+                " bit_string AS ("
+                " SELECT string_agg(CASE WHEN bit_array.bit_index IN (SELECT position FROM bit_positions) THEN '1' ELSE '0' END,"
+                " '' ORDER BY bit_array.bit_index) AS bit_value FROM bit_array)"
+                f" SELECT bit_value::BIT({int(bitsize)}) FROM bit_string)"
             )
-
-            self.cursor.execute(lazy_insert_query, (keys_literal,))
+            self._store_keys_lazily(table_name, key, query, partition_key, bit_value)
 
             # Also store in queries table for existence checks. An upsert instead of INSERT plus UPDATE on
             # IntegrityError: after the failed INSERT the transaction is aborted and the UPDATE raised too.

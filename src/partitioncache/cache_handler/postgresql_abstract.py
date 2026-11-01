@@ -1,3 +1,4 @@
+import secrets
 import threading
 from abc import abstractmethod
 from collections.abc import Callable
@@ -289,29 +290,46 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
             logger.debug(f"Failed to get all queries for partition {partition_key}: {e}")
             return []
 
-    def _select_keys_as_array_literal(self, query: str, partition_key: str) -> str:
-        """Run a variant query as a plain SELECT and return its partition keys as one array literal.
+    def _store_keys_lazily(self, table_name: str, key: str, query: str, partition_key: str, value_template: str = "%L") -> None:
+        """Run a variant query and store its partition keys without moving them through Python.
 
-        Lazy insertion used to be one ``INSERT ... SELECT``, but PostgreSQL never plans parallel workers
-        for a statement that writes, so the variant query ran single-threaded. As a separate SELECT it can
-        run in parallel; the result travels as one array value in its text form ('{1,2,3}'), which the
-        caller's INSERT casts back to the column type, so no per-key conversion happens in Python.
+        A single INSERT ... SELECT keeps the keys in the database, but PostgreSQL never plans parallel
+        workers for a statement that writes, so the variant query ran single-threaded. A DO block runs the
+        variant with EXECUTE ... INTO, which can use parallel workers, and the INSERT as a second statement,
+        both on the server: the keys still never reach the client.
 
-        NULL keys belong to no partition and are dropped, as on the non-lazy path. ARRAY(subquery) is
-        '{}' for zero rows and never NULL, so an empty result cannot be mistaken for the NULL marker
-        of ``set_null``; a missing value raises instead of passing as empty.
+        The keys travel inside the block as one array literal; value_template turns it (the %L) into the
+        column value, e.g. "rb_build(%L::INTEGER[])". NULL keys belong to no partition and are dropped, as
+        on the non-lazy path. ARRAY(subquery) is '{}' for zero rows and never NULL, so an empty result
+        cannot be mistaken for the NULL marker of set_null; a missing value raises instead.
         """
-        self.cursor.execute(
-            sql.SQL("SELECT ARRAY(SELECT {col} FROM ({query}) AS query_result WHERE {col} IS NOT NULL)::text").format(
-                col=sql.Identifier(partition_key),
-                query=sql.SQL(query),  # type: ignore[arg-type]
-            )
+        select = sql.SQL("SELECT ARRAY(SELECT {col} FROM ({query}) AS query_result WHERE {col} IS NOT NULL)::text").format(
+            col=sql.Identifier(partition_key),
+            query=sql.SQL(query),  # type: ignore[arg-type]
         )
-        row = self.cursor.fetchone()
-        if row is None or row[0] is None:
-            raise RuntimeError("Lazy insertion query returned no key array")
-        keys_literal: str = row[0]
-        return keys_literal
+        insert_prefix = sql.SQL("INSERT INTO {table} (query_hash, partition_keys) VALUES ({key}, ").format(
+            table=sql.Identifier(table_name), key=sql.Literal(key)
+        )
+        # The INSERT is a format() string inside the block: % outside value_template must be escaped
+        insert_format = (
+            insert_prefix.as_string(self.db).replace("%", "%%")
+            + value_template
+            + ") ON CONFLICT (query_hash) DO UPDATE SET partition_keys = EXCLUDED.partition_keys"
+        )
+        select_literal = sql.Literal(select.as_string(self.db)).as_string(self.db)
+        insert_literal = sql.Literal(insert_format).as_string(self.db)
+        tag = "pc" + secrets.token_hex(6)
+        while f"${tag}$" in select_literal or f"${tag}$" in insert_literal:
+            tag = "pc" + secrets.token_hex(6)
+        block = (
+            f"DO ${tag}$ DECLARE v_keys text; BEGIN "
+            f"EXECUTE {select_literal} INTO v_keys; "
+            "IF v_keys IS NULL THEN RAISE EXCEPTION 'Lazy insertion query returned no key array'; END IF; "
+            f"EXECUTE format({insert_literal}, v_keys); "
+            f"END ${tag}$"
+        )
+        # No parameters are passed, so psycopg does not interpret % in the block
+        self.cursor.execute(block)  # type: ignore[arg-type]
 
     def set_null(self, key: str, partition_key: str = "partition_key") -> bool:
         """Set null value in partition-specific table."""

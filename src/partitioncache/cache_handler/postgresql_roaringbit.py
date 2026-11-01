@@ -361,19 +361,9 @@ class PostgreSQLRoaringBitCacheHandler(PostgreSQLAbstractCacheHandler):
 
             table_name = f"{self.tableprefix}_cache_{partition_key}"
 
-            # SELECT and INSERT are separate statements so the variant query can run in parallel.
+            # Server-side SELECT then INSERT: parallel, and the keys stay in the database.
             # rb_build('{}') is an empty bitmap; rb_build_agg over zero rows was NULL, the set_null marker.
-            keys_literal = self._select_keys_as_array_literal(query, partition_key)
-            lazy_insert_query = sql.SQL(
-                """
-                INSERT INTO {table_name} (query_hash, partition_keys)
-                VALUES (%s, rb_build(%s::INTEGER[]))
-                ON CONFLICT (query_hash) DO UPDATE SET
-                    partition_keys = EXCLUDED.partition_keys
-                """
-            ).format(table_name=sql.Identifier(table_name))
-
-            self.cursor.execute(lazy_insert_query, (key, keys_literal))
+            self._store_keys_lazily(table_name, key, query, partition_key, "rb_build(%L::INTEGER[])")
 
             # Also store in queries table for existence checks. An upsert instead of INSERT plus UPDATE on
             # IntegrityError: after the failed INSERT the transaction is aborted and the UPDATE raised too.
