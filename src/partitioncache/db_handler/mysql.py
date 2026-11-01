@@ -50,13 +50,15 @@ class MySQLDBHandler(AbstractDBHandler):
             if self.cur.rowcount == 0:
                 return []
 
-            result = [row[0] for row in self.cur.fetchall()]  # type: ignore
+            result = [row[0] for row in self.cur.fetchall() if row[0] is not None]  # type: ignore
             self.cur.reset()  # Reset the cursor after fetching
             return result
         except mysql.connector.Error as e:
+            # Raise instead of returning []: callers cache the result, and an empty list is a valid
+            # "no rows" result that restricts later queries to nothing
             logger.error(f"Error executing query: {query}")
             logger.error(e)
-            return []
+            raise
 
     def close(self) -> None:
         try:

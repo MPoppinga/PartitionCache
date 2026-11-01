@@ -116,9 +116,10 @@ class RedisBitCacheHandler(RedisAbstractCacheHandler):
             return set(bitval.search(bitarray("1"))), valid_keys_count
 
     def set_cache(self, key: str, partition_key_identifiers: set[int] | set[str] | set[float] | set[datetime], partition_key: str = "partition_key") -> bool:
-        """Store a set of partition key identifiers in the cache for a specific partition key. Only integer values are supported."""
-        if not partition_key_identifiers:
-            return True
+        """Store a set of partition key identifiers in the cache for a specific partition key. Only integer values are supported.
+
+        An empty set is stored as all-zero bits, which get() returns as set(): the query has no rows.
+        """
         # Ensure partition exists with correct datatype and bitsize
         self._ensure_partition_exists(partition_key)
         bitsize = self._get_partition_bitsize(partition_key)
@@ -127,6 +128,7 @@ class RedisBitCacheHandler(RedisAbstractCacheHandler):
             bitsize = self.default_bitsize
             self._set_partition_metadata(partition_key, "integer", bitsize)
         val = bitarray(bitsize)
+        val.setall(0)
         try:
             for k in partition_key_identifiers:
                 if isinstance(k, int):

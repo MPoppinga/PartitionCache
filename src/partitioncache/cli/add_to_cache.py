@@ -281,14 +281,13 @@ def main():
                             cache.set_query(hash_value, fragment_query)
                             continue
 
-                        # Execute query and store results
+                        # Execute query and store results. An empty result is stored too: the variant has no
+                        # rows, which restricts later queries to nothing. Execution errors raise instead.
                         result = set(db_handler.execute(fragment_query))
-                        if result:
-                            cache.set_cache(hash_value, result)
-                            cache.set_query(hash_value, fragment_query)
+                        if cache.set_cache(hash_value, result) and cache.set_query(hash_value, fragment_query):
                             logger.debug(f"Stored query {hash_value} with {len(result)} results")
                         else:
-                            logger.warning(f"Query {hash_value} returned no results")
+                            logger.error(f"Failed to store query {hash_value} with {len(result)} results")
 
                 db_handler.close()
                 cache.close()
