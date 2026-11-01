@@ -132,9 +132,13 @@ class RocksDBBitCacheHandler(RocksDBAbstractCacheHandler):
         try:
             for k in partition_key_identifiers:
                 if isinstance(k, int):
+                    if k < 0:  # bitarray[-1] would silently set the last bit
+                        raise IndexError(k)
                     bitval[k] = 1
                 elif isinstance(k, str):
                     try:
+                        if int(k) < 0:
+                            raise IndexError(k)
                         bitval[int(k)] = 1
                     except ValueError:
                         raise ValueError(f"RocksDB bit handler only supports integer values or numeric strings. Got non-numeric string: '{k}'") from None

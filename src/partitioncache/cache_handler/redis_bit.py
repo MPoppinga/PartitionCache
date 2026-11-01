@@ -131,12 +131,13 @@ class RedisBitCacheHandler(RedisAbstractCacheHandler):
         val.setall(0)
         try:
             for k in partition_key_identifiers:
-                if isinstance(k, int):
-                    val[k] = 1
-                elif isinstance(k, str):
-                    val[int(k)] = 1
-                else:
+                if isinstance(k, str):
+                    k = int(k)
+                if not isinstance(k, int):
                     raise ValueError("Only integer values are supported")
+                if k < 0:  # bitarray[-1] would silently set the last bit
+                    raise IndexError(k)
+                val[k] = 1
         except (IndexError, ValueError):
             raise ValueError(f"Partition key identifiers {partition_key_identifiers} is out of range for bitarray of size {bitsize}") from None
         try:

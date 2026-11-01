@@ -305,6 +305,10 @@ class DuckDBBitCacheHandler(AbstractCacheHandler_Lazy):
         Returns:
             Actual bitsize or None if validation fails
         """
+        negative = [k for k in int_keys if k < 0]
+        if negative:
+            logger.error(f"Bit arrays cannot store negative partition keys: {sorted(negative)[:5]}")
+            return None
         max_value = max(int_keys, default=-1)
         existing_bitsize = self._get_partition_bitsize(partition_key)
 
@@ -713,12 +717,18 @@ class DuckDBBitCacheHandler(AbstractCacheHandler_Lazy):
                 {query}
             ),
             bit_positions AS (
-                SELECT {partition_key}::INTEGER AS position
+                -- A key outside the bit array fails the statement instead of being dropped
+                SELECT CASE
+                    WHEN {partition_key}::INTEGER < 0 OR {partition_key}::INTEGER >= {actual_bitsize}
+                    THEN error('Partition key ' || {partition_key} || ' is outside the bit array range 0..{actual_bitsize - 1} of partition {partition_key}')
+                    ELSE {partition_key}::INTEGER
+                END AS position
                 FROM query_result
-                WHERE {partition_key}::INTEGER >= 0 AND {partition_key}::INTEGER < {actual_bitsize}
+                WHERE {partition_key} IS NOT NULL
             ),
             bit_array AS (
-                SELECT generate_series(0, {actual_bitsize} - 1) AS bit_index
+                -- range() as a table function yields rows; generate_series() in a SELECT list is one list value
+                SELECT bit_index FROM range(0, {actual_bitsize}) AS r(bit_index)
             ),
             bit_string AS (
                 SELECT string_agg(

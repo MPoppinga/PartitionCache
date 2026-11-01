@@ -301,7 +301,12 @@ The PostgreSQL bit handler requires a mandatory bitsize configuration:
 ```bash
 # Required environment variable
 export PG_BIT_CACHE_BITSIZE=10000  # Must be set
+# Optional: extra bits when the bit arrays grow (default 0)
+export PG_BIT_CACHE_BITSIZE_BUFFER=1000
 ```
+
+**Keys outside the bit array:**
+A key beyond the bitsize grows the partition's bit arrays to `max key + 1 + buffer`, eager and lazy alike, and logs a warning. Stored entries are zero-padded and keep their keys. Each growth rewrites the cache table, so a buffer avoids growing for every slightly larger key. The pg_cron processor grows the same way and reads its buffer from the setting `partitioncache.bitsize_buffer` of the database it runs in (`ALTER DATABASE <db> SET partitioncache.bitsize_buffer = 1000`). Negative keys cannot be stored in a bit array and fail the insert. `duckdb_bit`, `redis_bit` and `rocksdb_bit` do not grow: a key outside the bitsize fails the insert, it is never dropped.
 
 **Fixed-Length Bit Arrays:**
 All cache tables use fixed-length `BIT(n)` columns for consistent BIT_AND operations:

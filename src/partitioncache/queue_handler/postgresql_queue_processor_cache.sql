@@ -210,9 +210,12 @@ DECLARE
     -- array/bit/roaringbit: the variant runs as this plain SELECT and returns its keys as one array literal
     v_select_query TEXT;
     v_keys TEXT;
+    v_min_key BIGINT;
+    v_max_key BIGINT;
+    v_grown_bitsize INTEGER;
     -- Bit array from the key literal (%L) and the bitsize (%s, twice)
     v_bit_template TEXT := 'WITH bit_positions AS (
-            SELECT position FROM unnest(%L::INTEGER[]) AS u(position) WHERE position >= 0
+            SELECT position FROM unnest(%L::INTEGER[]) AS u(position)
         ),
         bit_array AS (
             SELECT generate_series(0, %s - 1) AS bit_index
@@ -433,6 +436,20 @@ BEGIN
                     RAISE EXCEPTION 'Variant query returned no key array';
                 END IF;
                 IF p_cache_backend = 'bit' THEN
+                    -- Keys a bit array cannot hold are not dropped: a negative key fails the job, a key
+                    -- beyond the bitsize grows the partition's bit arrays to max key + 1 + buffer, where
+                    -- the buffer is the setting partitioncache.bitsize_buffer (ALTER DATABASE ... SET), default 0
+                    EXECUTE 'SELECT min(k), max(k) FROM unnest($1::INTEGER[]) AS k' INTO v_min_key, v_max_key USING v_keys;
+                    IF v_min_key < 0 THEN
+                        RAISE EXCEPTION 'Partition key % is negative; bit arrays cannot store it', v_min_key;
+                    END IF;
+                    IF v_max_key >= v_bitsize THEN
+                        v_grown_bitsize := v_max_key + 1 + COALESCE(NULLIF(current_setting('partitioncache.bitsize_buffer', true), '')::INTEGER, 0);
+                        PERFORM partitioncache_bootstrap_partition(p_table_prefix, p_partition_key, v_datatype, p_cache_backend, v_grown_bitsize);
+                        EXECUTE format('SELECT bitsize FROM %I WHERE partition_key = %L', v_metadata_table, p_partition_key) INTO v_grown_bitsize;
+                        RAISE WARNING 'Partition key % exceeds bitsize % of partition %: bit arrays grown to %', v_max_key, v_bitsize, p_partition_key, v_grown_bitsize;
+                        v_bitsize := v_grown_bitsize;
+                    END IF;
                     v_insert_query := format('INSERT INTO %I (query_hash, partition_keys) SELECT %L, (%s) ON CONFLICT (query_hash) DO UPDATE SET partition_keys = EXCLUDED.partition_keys', v_cache_table, p_query_hash, format(v_bit_template, v_keys, v_bitsize, v_bitsize));
                 ELSIF p_cache_backend = 'roaringbit' THEN
                     v_insert_query := format('INSERT INTO %I (query_hash, partition_keys) VALUES (%L, rb_build(%L::INTEGER[])) ON CONFLICT (query_hash) DO UPDATE SET partition_keys = EXCLUDED.partition_keys', v_cache_table, p_query_hash, v_keys);
