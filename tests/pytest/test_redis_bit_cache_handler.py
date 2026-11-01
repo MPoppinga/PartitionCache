@@ -106,13 +106,13 @@ def test_set_cache_int(cache_handler, mock_redis):
 def test_set_cache_invalid_type(cache_handler, mock_redis):
     cache_handler._get_partition_datatype = lambda pk: "integer"
     cache_handler._get_partition_bitsize = lambda pk: cache_handler.default_bitsize
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="Only integer values"):
         cache_handler.set_cache("invalid_bit_key", {"a", "b", "c"})
 
 def test_set_cache_out_of_range(cache_handler, mock_redis):
     cache_handler._get_partition_datatype = lambda pk: "integer"
     cache_handler._get_partition_bitsize = lambda pk: cache_handler.default_bitsize
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="out of range"):
         cache_handler.set_cache("out_of_range_key", {100})
 
 def test_set_null(cache_handler, mock_redis):
