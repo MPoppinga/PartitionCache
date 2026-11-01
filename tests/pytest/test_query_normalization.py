@@ -456,7 +456,8 @@ class TestOuterJoinExclusion:
     def test_detector_false_on_unparseable(self):
         assert not query_contains_top_level_outer_join("this is not sql")
 
-    @pytest.mark.parametrize("alias", ['"1u"', '"a$b"', '"my u"'])
+    # नाम and the decomposed é contain combining marks: identifiers for Python, not word characters for re
+    @pytest.mark.parametrize("alias", ['"1u"', '"a$b"', '"my u"', "नाम", "e\u0301"])
     def test_generate_all_query_hash_pairs_empty_for_alias_that_is_not_plain(self, alias, caplog):
         """The alias handling would lose the alias's conditions and keep references to aliases outside FROM."""
         query = f"SELECT {alias}.pk FROM users AS {alias}, orders AS o WHERE {alias}.pk = o.pk AND {alias}.age > 30 AND o.total > 5"

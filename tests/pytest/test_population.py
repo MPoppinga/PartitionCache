@@ -104,6 +104,8 @@ class TestVariantSignature:
             "SELECT DISTINCT t1.pk FROM f AS t1 WHERE t1.owner = SESSION_USER",
             "SELECT DISTINCT t1.pk FROM f AS t1 WHERE t1.k = current_setting('app.k')::int",
             "SELECT DISTINCT t1.pk FROM f AS t1 WHERE age(t1.ts) < INTERVAL '1 day'",
+            "SELECT DISTINCT t1.pk FROM f AS t1 WHERE t1.s = current_schema()",
+            "SELECT DISTINCT t1.pk FROM f AS t1 WHERE t1.ip = inet_client_addr()",
             "SELECT DISTINCT t1.pk FROM f AS t1 JOIN d AS t2 ON t1.k = t2.k",
             "SELECT DISTINCT t1.pk FROM f AS t1 LEFT JOIN d AS t2 ON t1.k = t2.k",
             "SELECT DISTINCT t1.pk FROM f AS t1, f AS t2 WHERE t1.k = t2.k",

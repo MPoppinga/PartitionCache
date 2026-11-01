@@ -53,11 +53,13 @@ def handle_deprecated_kwargs(kwargs: dict[str, Any], func_name: str) -> dict[str
     return result
 
 
-def _has_alias_that_needs_quotes(query: str) -> bool:
-    """True if a table of the outermost FROM clause has an alias (or, without one, a name) that is not an identifier.
+# An alias as the condition split recognises it: word characters, not starting with a digit
+_IDENTIFIER_RE = re.compile(r"[^\W\d]\w*")
+_ALIAS_REFERENCE_RE = re.compile(_IDENTIFIER_RE.pattern + r"(?=\.)")
 
-    The variant generator recognises aliases as word characters not starting with a digit (str.isidentifier).
-    """
+
+def _has_alias_that_needs_quotes(query: str) -> bool:
+    """True if a table of the outermost FROM clause has an alias (or, without one, a name) the condition split does not recognise."""
     try:
         parsed = sqlglot.parse_one(query)
     except Exception:
@@ -66,7 +68,7 @@ def _has_alias_that_needs_quotes(query: str) -> bool:
     if select is None:
         return False
     return any(
-        not table.alias_or_name.isidentifier() for table in select.find_all(exp.Table) if table.parent_select is select
+        not _IDENTIFIER_RE.fullmatch(table.alias_or_name) for table in select.find_all(exp.Table) if table.parent_select is select
     )
 
 
@@ -629,7 +631,7 @@ def extract_and_group_query_conditions(
 
         # Multi-reference, multi-alias, or zero-alias conditions need alias substitution
         # Filter against outer FROM aliases to exclude inner subquery table references
-        all_alias: set = set(re.findall(r"[^\W\d]\w*(?=\.)", condition_refs)) & set(table_aliases)
+        all_alias: set = set(_ALIAS_REFERENCE_RE.findall(condition_refs)) & set(table_aliases)
         parsed = sqlglot.parse_one(condition)
         table_identifiers = tuple(sorted({col.table for col in parsed.find_all(exp.Column) if col.table}))
         # AND/OR are exp.Func subclasses since sqlglot 30; only real function calls count here
@@ -2320,12 +2322,13 @@ VariantSignature = tuple[frozenset[str], frozenset[str], str]
 # not listed here (including user-defined ones) are assumed to be deterministic.
 _VOLATILE_EXPRESSIONS = (
     exp.Rand, exp.CurrentTimestamp, exp.CurrentDate, exp.CurrentTime, exp.CurrentDatetime, exp.Localtimestamp, exp.Uuid, exp.TableSample,
-    exp.CurrentUser, exp.SessionUser,
+    exp.CurrentUser, exp.SessionUser, exp.CurrentSchema,
 )
 _VOLATILE_FUNCTION_NAMES = {
     "random", "rand", "random_normal", "now", "clock_timestamp", "statement_timestamp", "transaction_timestamp", "timeofday",
     "localtime", "localtimestamp", "nextval", "currval", "setval", "setseed", "gen_random_uuid", "uuid_generate_v4",
     "txid_current", "txid_current_if_assigned", "pg_current_xact_id", "pg_backend_pid", "current_setting",
+    "inet_client_addr", "inet_client_port",
 }
 _VOLATILE_DATETIME_LITERALS = {"now", "today", "tomorrow", "yesterday"}
 _PLAIN_TABLE_ARGS = {"this", "db", "catalog", "alias"}
