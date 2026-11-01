@@ -660,6 +660,7 @@ The helper wraps a subset of the handler interface. All methods operate on the h
 - `delete(key)` - Remove entry
 - `set_null(key)` / `is_null(key)` - Negative-cache markers
 - `set_query(key, querytext)` - Store query metadata only
+- `get_query(key)` - Query text stored for a key (None if not stored)
 - `get_intersected(keys)` - Intersect several cached sets
 - `filter_existing_keys(keys, check_query=False)` - Subset of keys present in cache
 - `get_all_keys()` - All keys of the bound partition
@@ -668,7 +669,7 @@ The helper wraps a subset of the handler interface. All methods operate on the h
 
 `LazyPartitionCacheHelper` (returned automatically by `create_cache_helper` for lazy-capable backends) additionally provides `get_intersected_lazy(keys)`.
 
-Handler-level operations without a helper counterpart — e.g. `get_query`, `get_all_queries`, `register_partition_key`, `get_partition_keys` (list all partitions) — are reached via `underlying_handler`:
+Handler-level operations without a helper counterpart — e.g. `get_all_queries`, `register_partition_key`, `get_partition_keys` (list all partitions) — are reached via `underlying_handler`:
 
 **Example:**
 ```python
@@ -684,7 +685,8 @@ cache.set_entry(query_hash, {1, 5, 10}, query)
 
 # Retrieve cache data and metadata
 user_ids = cache.get(query_hash)
-original_query = cache.underlying_handler.get_query(query_hash, cache.partition_key)
+original_query = cache.get_query(query_hash)
+all_queries = cache.underlying_handler.get_all_queries(cache.partition_key)
 ```
 
 ##### Working with additional partition keys
