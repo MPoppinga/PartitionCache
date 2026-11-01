@@ -5,6 +5,9 @@ Tests that clean_query() properly normalizes JOIN ON syntax to comma-separated F
 with conditions in WHERE, and strips GROUP BY/HAVING clauses.
 """
 
+import logging
+
+import pytest
 import sqlglot
 from sqlglot import exp
 
@@ -452,6 +455,24 @@ class TestOuterJoinExclusion:
 
     def test_detector_false_on_unparseable(self):
         assert not query_contains_top_level_outer_join("this is not sql")
+
+    # नाम and the decomposed é contain combining marks: identifiers for Python, not word characters for re
+    @pytest.mark.parametrize("alias", ['"1u"', '"a$b"', '"my u"', "नाम", "e\u0301"])
+    def test_generate_all_query_hash_pairs_empty_for_alias_that_is_not_plain(self, alias, caplog):
+        """The alias handling would lose the alias's conditions and keep references to aliases outside FROM."""
+        query = f"SELECT {alias}.pk FROM users AS {alias}, orders AS o WHERE {alias}.pk = o.pk AND {alias}.age > 30 AND o.total > 5"
+        with caplog.at_level(logging.WARNING):
+            assert generate_all_query_hash_pairs(query, "pk") == []
+        assert "not a plain identifier" in caplog.text
+
+    @pytest.mark.parametrize("alias", ['"u"', "_u", "u1", "ü", "é1", "Ölfeld"])
+    def test_identifier_aliases_give_the_same_variants_as_a_plain_alias(self, alias):
+        def variants(a):
+            query = f"SELECT {a}.pk FROM users AS {a}, orders AS o WHERE {a}.pk = o.pk AND {a}.age > o.total AND {a}.x = 1"
+            return sorted(generate_all_query_hash_pairs(query, "pk"))
+
+        assert variants(alias) == variants("u")
+        assert any("t1.total < t2.age" in variant for variant, _ in variants(alias))
 
     def test_generate_all_query_hash_pairs_empty_for_outer_join(self):
         query = (

@@ -1308,15 +1308,20 @@ def _check_cost_gate(query: str, cost_estimator: Callable[[str], float | None] |
     if cost_estimator is None:
         raise ValueError("min_query_cost requires a cost_estimator (e.g. PostgresDBHandler.estimate_cost)")
     try:
-        cost: Any = cost_estimator(query)  # custom estimators may return Decimal, numpy numbers or junk
+        raw_cost: Any = cost_estimator(query)  # custom estimators may return Decimal, numpy numbers or junk
+        cost: Any = raw_cost
     except Exception as e:
         logger.warning(f"Query cost estimation failed, applying the cache anyway: {e}")
         return False, {"cost_gated": 0}
-    if isinstance(cost, bool) or not isinstance(cost, numbers.Real | Decimal) or not math.isfinite(cost):
-        if cost is not None:
-            logger.warning(f"Query cost estimator returned {cost!r}, not a finite number; applying the cache anyway")
+    try:
+        valid = not isinstance(cost, bool) and isinstance(cost, numbers.Real | Decimal) and math.isfinite(cost)
+        cost = float(cost) if valid else None
+    except (ValueError, OverflowError):  # Decimal('sNaN'), integers beyond the float range
+        cost = None
+    if cost is None:
+        if raw_cost is not None:
+            logger.warning(f"Query cost estimator returned {raw_cost!r}, not a finite number; applying the cache anyway")
         return False, {"cost_gated": 0}
-    cost = float(cost)
     gated = cost < min_query_cost
     if gated:
         logger.info(f"Planner cost {cost:.0f} is below min_query_cost {min_query_cost:.0f}; cache not applied")

@@ -4,6 +4,7 @@
 import json
 import logging
 import sys
+from decimal import Decimal
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
@@ -129,13 +130,13 @@ class TestCostGate:
 
 class TestEstimatorResultValidation:
     def test_decimal_cost_is_used(self, apply):
-        from decimal import Decimal
-
         (enhanced, stats), _ = apply(cost_estimator=Mock(return_value=Decimal("42.4")), min_query_cost=1000)
         assert enhanced == QUERY
         assert stats["cost_gated"] == 1 and stats["query_cost"] == 42
 
-    @pytest.mark.parametrize("value", [float("nan"), float("inf"), "87.5", True])
+    @pytest.mark.parametrize(
+        "value", [float("nan"), float("inf"), "87.5", True, Decimal("sNaN"), 10**400], ids=["nan", "inf", "str", "bool", "snan", "huge_int"]
+    )
     def test_non_finite_or_non_numeric_cost_applies_the_cache(self, apply, value):
         (enhanced, stats), _ = apply(cost_estimator=Mock(return_value=value), min_query_cost=1000)
         assert enhanced != QUERY

@@ -39,9 +39,22 @@ class TestVariantSignature:
         b = "SELECT DISTINCT b.pk FROM lo AS b WHERE b.x = 1 AND b.y = 2"
         assert not is_relaxation_of(variant_signature(a, "pk"), variant_signature(b, "pk"))
 
-    def test_ordered_limit_subquery_is_accepted(self):
-        query = "SELECT DISTINCT t1.pk FROM f AS t1 WHERE t1.k IN (SELECT s.k FROM s ORDER BY s.k LIMIT 5)"
-        assert variant_signature(query, "pk") is not None
+    def test_unquoted_names_are_case_folded(self):
+        a = "SELECT DISTINCT a.PK FROM LO AS a WHERE a.y = 2"
+        b = "SELECT DISTINCT b.pk FROM lo AS b WHERE b.x = 1 AND b.Y = 2"
+        assert is_relaxation_of(variant_signature(a, "pk"), variant_signature(b, "pk"))
+
+    def test_unknown_dialect_raises(self):
+        with pytest.raises(ValueError):
+            variant_signature("SELECT DISTINCT t1.pk FROM f AS t1", "pk", "postgresql")
+
+    def test_age_of_two_timestamps_is_deterministic(self):
+        assert variant_signature("SELECT DISTINCT t1.pk FROM f AS t1 WHERE age(t1.a, t1.b) < INTERVAL '1 day'", "pk") is not None
+
+    def test_sqlite_folds_quoted_names_too(self):
+        a = 'SELECT DISTINCT a.pk FROM "LO" AS a WHERE a.y = 2'
+        b = "SELECT DISTINCT b.pk FROM lo AS b WHERE b.x = 1 AND b.y = 2"
+        assert is_relaxation_of(variant_signature(a, "pk", "sqlite"), variant_signature(b, "pk", "sqlite"))
 
     def test_schemas_distinguish_tables(self):
         """s1.lo and s2.lo are different tables, also when their conditions look alike."""
@@ -82,6 +95,17 @@ class TestVariantSignature:
             "SELECT DISTINCT t1.pk FROM f AS t1 WHERE random_normal() > 0",
             "SELECT DISTINCT t1.pk FROM f AS t1 WHERE t1.k IN (SELECT s.k FROM s TABLESAMPLE BERNOULLI (10))",
             "SELECT DISTINCT t1.pk FROM f AS t1 WHERE t1.k IN (SELECT s.k FROM s LIMIT 5)",
+            "SELECT DISTINCT t1.pk FROM f AS t1 WHERE t1.k IN (SELECT s.k FROM s ORDER BY s.k LIMIT 5)",
+            "SELECT DISTINCT t1.pk FROM f AS t1 WHERE t1.k IN (SELECT s.k FROM s ORDER BY s.k OFFSET 5)",
+            "SELECT DISTINCT t1.pk FROM f AS t1 WHERE t1.k IN (SELECT DISTINCT ON (s.g) s.k FROM s ORDER BY s.g)",
+            "SELECT DISTINCT t1.pk FROM f AS t1 WHERE t1.ts < 'now'",
+            "SELECT DISTINCT t1.pk FROM f AS t1 WHERE t1.xid = txid_current()",
+            "SELECT DISTINCT t1.pk FROM f AS t1 WHERE t1.owner = CURRENT_USER",
+            "SELECT DISTINCT t1.pk FROM f AS t1 WHERE t1.owner = SESSION_USER",
+            "SELECT DISTINCT t1.pk FROM f AS t1 WHERE t1.k = current_setting('app.k')::int",
+            "SELECT DISTINCT t1.pk FROM f AS t1 WHERE age(t1.ts) < INTERVAL '1 day'",
+            "SELECT DISTINCT t1.pk FROM f AS t1 WHERE t1.s = current_schema()",
+            "SELECT DISTINCT t1.pk FROM f AS t1 WHERE t1.ip = inet_client_addr()",
             "SELECT DISTINCT t1.pk FROM f AS t1 JOIN d AS t2 ON t1.k = t2.k",
             "SELECT DISTINCT t1.pk FROM f AS t1 LEFT JOIN d AS t2 ON t1.k = t2.k",
             "SELECT DISTINCT t1.pk FROM f AS t1, f AS t2 WHERE t1.k = t2.k",
@@ -236,6 +260,19 @@ class TestPopulateQueryVariants:
         assert stats.failed == 1
         assert smallest[1] not in cache.entries
         assert cache.entries == {h: keys for h, keys in reference.entries.items() if h != smallest[1]}
+
+    @pytest.mark.parametrize(("sql_dialect", "restricted"), [("sqlite", 1), ("postgres", 0)])
+    def test_dialect_decides_whether_quoted_names_are_the_same_table(self, star_db, sql_dialect, restricted):
+        """In SQLite "F" is table f, so the first variant restricts the second; in PostgreSQL they differ."""
+        pairs = [
+            ('SELECT DISTINCT t1.pk FROM "F" AS t1 WHERE t1.k = 1', "small"),
+            ("SELECT DISTINCT t1.pk FROM f AS t1 WHERE t1.k = 1 AND t1.j = 0", "large"),
+        ]
+        cache = FakeCache()
+        stats = populate_query_variants(pairs, "pk", cache, CountingDB(star_db), sql_dialect=sql_dialect)
+        assert stats.restricted == restricted
+        assert stats.failed == 0
+        assert cache.entries["large"] == {pk for pk in range(1, 201) if pk % 7 == 1 and pk % 5 == 0}
 
     def test_store_failures_are_counted(self, star_db):
         class FailingCache(FakeCache):
