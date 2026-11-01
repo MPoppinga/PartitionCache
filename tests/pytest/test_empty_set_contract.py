@@ -191,7 +191,7 @@ def test_empty_set_for_unregistered_partition_key(handler_case):
 
 
 def test_rocksdb_set_text_partition_keys(tmp_path):
-    """Comma-joined text sets: the empty set reads back empty, keys the format cannot represent are rejected."""
+    """Comma-joined text sets: the empty set reads back empty, keys the format cannot represent are refused (False)."""
     pytest.importorskip("rocksdb")
     from partitioncache.cache_handler.rocks_db_set import RocksDBCacheHandler
 
@@ -203,7 +203,7 @@ def test_rocksdb_set_text_partition_keys(tmp_path):
         assert handler.set_cache("full", {"Berlin", "Hamburg"}, "city") is True
         assert handler.get("full", "city") == {"Berlin", "Hamburg"}
         for bad in ({"a,b"}, {""}, {"\x00"}):
-            with pytest.raises(ValueError):
-                handler.set_cache("bad", bad, "city")
+            assert handler.set_cache("bad", bad, "city") is False
+        assert handler.get("bad", "city") is None
     finally:
         handler.close()

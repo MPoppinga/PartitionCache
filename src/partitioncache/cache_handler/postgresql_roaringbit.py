@@ -363,7 +363,7 @@ class PostgreSQLRoaringBitCacheHandler(PostgreSQLAbstractCacheHandler):
 
             # Server-side SELECT then INSERT: parallel, and the keys stay in the database.
             # rb_build('{}') is an empty bitmap; rb_build_agg over zero rows was NULL, the set_null marker.
-            self._store_keys_lazily(table_name, key, query, partition_key, "rb_build(%L::INTEGER[])")
+            self._store_keys_lazily(table_name, key, query, partition_key, "INTEGER[]", "rb_build($2)")
 
             # Also store in queries table for existence checks. An upsert instead of INSERT plus UPDATE on
             # IntegrityError: after the failed INSERT the transaction is aborted and the UPDATE raised too.

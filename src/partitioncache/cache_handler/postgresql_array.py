@@ -257,7 +257,8 @@ class PostgreSQLArrayCacheHandler(PostgreSQLAbstractCacheHandler):
             table_name = f"{self.tableprefix}_cache_{partition_key}"
 
             # Server-side SELECT then INSERT: parallel, and the keys stay in the database
-            self._store_keys_lazily(table_name, key, query, partition_key)
+            array_types = {"integer": "INTEGER[]", "float": "NUMERIC[]", "text": "TEXT[]", "timestamp": "TIMESTAMP[]"}
+            self._store_keys_lazily(table_name, key, query, partition_key, array_types.get(datatype, "TEXT[]"))
 
             # Also store in queries table for existence checks. An upsert instead of INSERT plus UPDATE on
             # IntegrityError: after the failed INSERT the transaction is aborted and the UPDATE raised too.
