@@ -1,4 +1,7 @@
-"""PostgresDBHandler.estimate_cost against a real PostgreSQL: one statement only, caller's transaction untouched."""
+"""PostgresDBHandler.estimate_cost against a real PostgreSQL: one statement only, caller's transaction untouched.
+
+The module name contains postgresql_array so the CI job of that backend selects it (-k postgresql_array).
+"""
 
 import os
 
