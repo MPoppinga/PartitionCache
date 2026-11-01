@@ -4,6 +4,8 @@ import sqlite3
 import sys
 from unittest.mock import patch
 
+import pytest
+
 from partitioncache.cache_handler.rocks_dict import RocksDictCacheHandler
 from partitioncache.cli import add_to_cache
 from partitioncache.query_processor import generate_all_query_hash_pairs
@@ -39,3 +41,17 @@ def test_empty_variant_result_is_stored(tmp_path, monkeypatch):
         handler.close()
     assert stored and all(value is not None for value in stored.values()), stored
     assert set() in stored.values()  # the variants with d.x = 7 have no rows
+
+
+def test_restrict_variants_exits_non_zero_when_variants_fail(tmp_path, monkeypatch):
+    db_path = tmp_path / "db.sqlite"
+    sqlite3.connect(db_path).close()  # empty database: every variant fails
+    env_file = tmp_path / "empty.env"
+    env_file.write_text("")
+    monkeypatch.setenv("CACHE_BACKEND", "rocksdict")
+    monkeypatch.setenv("ROCKSDB_DICT_PATH", str(tmp_path / "cache"))
+    argv = ["pcache-add", "--direct", "--restrict-variants", "--query", QUERY, "--partition-key", "pk", "--partition-datatype", "integer",
+            "--db-backend", "sqlite", "--db-dir", str(db_path), "--env-file", str(env_file), "--min-component-size", "1"]
+    with patch.object(sys, "argv", argv), pytest.raises(SystemExit) as exit_info:
+        add_to_cache.main()
+    assert exit_info.value.code == 1

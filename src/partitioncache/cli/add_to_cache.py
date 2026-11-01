@@ -20,9 +20,17 @@ from partitioncache.cli.common_args import (
     load_environment_with_validation,
     parse_variant_generation_json_args,
     resolve_cache_backend,
+    sql_dialect_for_backend,
 )
 from partitioncache.db_handler import get_db_handler
-from partitioncache.query_processor import clean_query, generate_all_query_hash_pairs, hash_query, query_contains_top_level_outer_join
+from partitioncache.population import populate_query_variants
+from partitioncache.query_processor import (
+    clean_query,
+    generate_all_query_hash_pairs,
+    hash_query,
+    order_variants_for_population,
+    query_contains_top_level_outer_join,
+)
 
 logger = getLogger("PartitionCache")
 
@@ -46,6 +54,17 @@ def main():
     mode_group.add_argument("--queue", action="store_true", help="Add query variants to the variant queue instead of executing directly")
     mode_group.add_argument("--queue-original", action="store_true", help="Add query to original query queue instead of the variant queue")
     mode_group.add_argument("--direct", action="store_true", help="Calculate query variants directly instead of using the incoming queue")
+    mode_group.add_argument(
+        "--restrict-variants",
+        action="store_true",
+        help="With --direct: execute variants smallest first and restrict each to the keys of its already populated relaxations",
+    )
+    mode_group.add_argument(
+        "--max-restriction-keys",
+        type=int,
+        default=None,
+        help="With --direct: only restrict a variant when the intersection has at most this many keys (implies --restrict-variants)",
+    )
 
     # Add common argument groups
     add_cache_args(parser, require_partition_key=True)
@@ -57,6 +76,10 @@ def main():
     add_verbosity_args(parser)
 
     args = parser.parse_args()
+    if args.max_restriction_keys is not None and args.max_restriction_keys < 0:
+        parser.error("--max-restriction-keys must not be negative")
+    if (args.restrict_variants or args.max_restriction_keys is not None) and not args.direct:
+        parser.error("--restrict-variants and --max-restriction-keys require --direct")
 
     # Configure logging based on verbosity
     configure_logging(args)
@@ -144,6 +167,8 @@ def main():
                 geometry_column=geometry_column,
                 max_conditions_removed=args.max_conditions_removed,
             )
+            # Smallest variants first, so the monitor's cache optimization can restrict the larger ones with them
+            query_hash_pairs = order_variants_for_population(query_hash_pairs)
             success = partitioncache.push_to_query_fragment_queue(query_hash_pairs, args.partition_key, args.partition_datatype, queue_provider, cache_backend=queue_cache_backend)
         else:  # Push the cleaned query as a single variant (no recomposition)
             query = clean_query(query)
@@ -248,23 +273,40 @@ def main():
                 else:
                     raise ValueError(f"Unsupported database backend: {args.db_backend}")
 
-                # Process each query-hash pair
-                for fragment_query, hash_value in query_hash_pairs:
-                    if cache.exists(hash_value):
-                        logger.debug(f"Query {hash_value} already in cache")
-                        cache.set_query(hash_value, fragment_query)
-                        continue
+                population_failed = False
+                if args.restrict_variants or args.max_restriction_keys is not None:
+                    stats = populate_query_variants(
+                        query_hash_pairs,
+                        args.partition_key,
+                        cache_handler,
+                        db_handler,
+                        max_restriction_keys=args.max_restriction_keys,
+                        sql_dialect=sql_dialect_for_backend(args.db_backend),
+                    )
+                    logger.info(f"Populated query variants: {stats}")
+                    population_failed = bool(stats.failed or stats.store_failed)
+                else:
+                    # Process each query-hash pair
+                    for fragment_query, hash_value in query_hash_pairs:
+                        if cache.exists(hash_value):
+                            logger.debug(f"Query {hash_value} already in cache")
+                            cache.set_query(hash_value, fragment_query)
+                            continue
 
-                    # Execute query and store results. An empty result is stored too: the variant has no
-                    # rows, which restricts later queries to nothing. Execution errors raise instead.
-                    result = set(db_handler.execute(fragment_query))
-                    if cache.set_cache(hash_value, result) and cache.set_query(hash_value, fragment_query):
-                        logger.debug(f"Stored query {hash_value} with {len(result)} results")
-                    else:
-                        logger.error(f"Failed to store query {hash_value} with {len(result)} results")
+                        # Execute query and store results. An empty result is stored too: the variant has no
+                        # rows, which restricts later queries to nothing. Execution errors raise instead.
+                        result = set(db_handler.execute(fragment_query))
+                        if cache.set_cache(hash_value, result) and cache.set_query(hash_value, fragment_query):
+                            logger.debug(f"Stored query {hash_value} with {len(result)} results")
+                        else:
+                            logger.error(f"Failed to store query {hash_value} with {len(result)} results")
 
                 db_handler.close()
                 cache.close()
+                if population_failed:
+                    # Same outcome as the plain loop, where a failing variant aborts with an error
+                    logger.error(f"{stats.failed} variants failed to execute and {stats.store_failed} failed to store")
+                    exit(1)
 
         except Exception as e:
             logger.error(f"Error processing query: {str(e)}")

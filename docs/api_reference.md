@@ -708,6 +708,43 @@ cache.underlying_handler.register_partition_key("region_id", "integer")
 
 The exported lower-level API: generates all query variants and returns them as `list[tuple[str, str]]` of `(variant_query, hash)` pairs — the format consumed by `push_to_query_variant_queue()`. Accepts the full variant-generation parameter set (`auto_detect_partition_join`, `partition_join_table`, `max_component_size`, `bucket_steps`, `add_constraints`, `remove_constraints_all`, `remove_constraints_add`, `max_conditions_removed`, `protected_patterns`, and the spatial parameters `skip_partition_key_joins`/`geometry_column`).
 
+The pairs come in arbitrary (set) order.
+
+### `order_variants_for_population(query_hash_pairs: list[tuple[str, str]])`
+
+Returns the pairs sorted smallest first: fewest tables in the outer `FROM`, then fewest `WHERE` conditions (stable; unparseable variants last). The relaxations of a variant join fewer tables or keep fewer conditions, so when variants are populated in this order, the cached keys of its relaxations exist when a variant runs and can restrict it. `pcache-monitor` and `pcache-add --queue` apply it before pushing to the variant queue.
+
+```python
+import partitioncache
+from partitioncache import generate_all_query_hash_pairs, order_variants_for_population
+from partitioncache.query_processor import generate_all_hashes
+
+for variant, variant_hash in order_variants_for_population(generate_all_query_hash_pairs(query, "city_id")):
+    lookup = set(generate_all_hashes(variant, "city_id")) - {variant_hash}
+    keys, _hits = cache_handler.get_intersected(lookup, "city_id")
+    if keys is not None and len(keys) <= max_keys:
+        variant = partitioncache.extend_query_with_partition_keys(variant, keys, "city_id")
+    ...  # execute variant and store its keys under variant_hash
+```
+
+### `populate_query_variants(query_hash_pairs, partition_key, cache_handler, db_handler, restrict=True, max_restriction_keys=None, method="IN")`
+
+Executes and caches the variants of one query sequentially, smallest first. Each variant is restricted to the intersection of the keys of its already populated relaxations, which stay in memory, so no cache lookup or hash generation is needed per variant. A relaxation is recognised structurally by `variant_signature`/`is_relaxation_of` in `partitioncache.query_processor`: its tables and conditions (aliases replaced by table names) are a subset of the variant's, so its keys are a superset. Variants the subset test cannot judge soundly (a table used twice, explicit JOIN syntax, unqualified columns, grouping) are executed unrestricted.
+
+- Variants already in the cache are not executed; their keys are read once and restrict the others.
+- An empty intersection means the variant has no rows; it is stored as an empty set without executing it.
+- `max_restriction_keys`: restrict only when the intersection has at most this many keys.
+- `db_handler.execute` must raise on errors. A failure returned as an empty result would be cached as "no rows" and empty every variant it restricts; `SQLiteDBHandler` logs errors and returns `[]`.
+
+**Returns:** `PopulationStats` with `executed`, `restricted`, `empty_without_execution`, `already_cached`, `failed`.
+
+```python
+from partitioncache import generate_all_query_hash_pairs, populate_query_variants
+
+pairs = generate_all_query_hash_pairs(query, "flight_id", partition_key_source_table="flights")
+stats = populate_query_variants(pairs, "flight_id", cache_handler, db_handler, max_restriction_keys=flight_count // 4)
+```
+
 ### `generate_all_hashes(query: str, partition_key: str, min_component_size=1, follow_graph=True, fix_attributes=True, canonicalize_queries=False)`
 
 Generates query variants and their hashes for cache lookup. Thin wrapper around `generate_all_query_hash_pairs` returning only the hashes.

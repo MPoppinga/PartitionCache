@@ -9,6 +9,7 @@ It utilizes the given cache to extend the SQL query with the set of possible par
 import math
 import numbers
 import random
+import secrets
 from collections.abc import Callable
 from datetime import datetime
 from decimal import Decimal
@@ -195,7 +196,9 @@ def find_p0_alias(query: str, partition_key: str, auto_detect_partition_join: bo
     Find the appropriate table alias for cache restrictions.
 
     Uses the query processor's partition-join detection logic.
-    If no partition-join table is detected, falls back to the first table in the query.
+    If no partition-join table is detected, falls back to the first table in the query,
+    unless the partition key column is qualified only with other aliases; then the first
+    such alias (SELECT list first) is used.
 
     Args:
         query: SQL query to analyze
@@ -227,8 +230,16 @@ def find_p0_alias(query: str, partition_key: str, auto_detect_partition_join: bo
         # If partition-join detection fails (e.g., no FROM clause), fall through to default
         pass
 
-    # Fallback to first table
-    return first_table.alias_or_name
+    # Fallback to the first table, unless only other tables carry the partition key: generated
+    # variants without partition_key_source_table can list a dimension before the fact table
+    first_alias = first_table.alias_or_name
+    select = parsed_query if isinstance(parsed_query, exp.Select) else parsed_query.find(exp.Select)
+    if select is not None:
+        key_columns = [*(col for e in select.expressions for col in e.find_all(exp.Column)), *select.find_all(exp.Column)]
+        key_aliases: list[str] = [col.table for col in key_columns if col.name == partition_key and col.table and col.parent_select is select]
+        if key_aliases and first_alias not in key_aliases:
+            return key_aliases[0]
+    return first_alias
 
 
 def rewrite_query_with_p0_table( # TODO: Check duplication with query_processor
@@ -353,6 +364,43 @@ def _get_partition_key_sql_type(partition_keys: set[int] | set[str] | set[float]
     return "TEXT"
 
 
+def _key_list_sentinel() -> str:
+    """Return a unique identifier that stands in for a partition-key list during the sqlglot rewrite.
+
+    The token is a plain lowercase identifier, so sqlglot renders it verbatim (no quoting, no
+    rewriting) in every dialect, and the random suffix makes a collision with the user's query
+    text practically impossible. `_splice_key_list` still asserts that it occurs exactly once.
+    """
+    return f"__pcache_keys_{secrets.token_hex(8)}__"
+
+
+def _format_spliced_partition_key(pk: int | str | float | datetime, sql_dialect: str = "postgres") -> str:
+    """Format one key for a spliced (unparsed) list.
+
+    Integers as numbers, everything else as a string literal rendered by sqlglot for ``sql_dialect``, so
+    quotes and backslashes are escaped the way that dialect expects (MySQL treats a backslash as an
+    escape character). The former parse-based path rejected such keys with a sqlglot TokenError.
+    """
+    if isinstance(pk, int):
+        return str(pk)
+    return exp.Literal.string(str(pk)).sql(dialect=sql_dialect)
+
+
+def _splice_key_list(rendered_sql: str, sentinel: str, key_list: str) -> str:
+    """Replace the single occurrence of `sentinel` in `rendered_sql` with the formatted key list.
+
+    Formerly the key list itself was parsed with sqlglot (`parse_one(f"... IN ({keys})")`), which
+    is linear in the number of keys but with a large constant: a 100k-key list took seconds. The
+    list is now formatted by `_format_partition_key_for_sql` and joined with the separators
+    sqlglot would have produced (", " inside IN, "), (" inside VALUES), so the output is
+    byte-identical to the parsed form.
+    """
+    occurrences = rendered_sql.count(sentinel)
+    if occurrences != 1:
+        raise AssertionError(f"partition-key placeholder {sentinel!r} occurs {occurrences} times in the rendered query, expected exactly once")
+    return rendered_sql.replace(sentinel, key_list, 1)
+
+
 def _add_where_condition(parsed_query: exp.Expr, condition_expr: exp.Expr) -> None:
     """Add a WHERE condition to a parsed query, creating WHERE clause if needed."""
     existing_where: exp.Where | None = parsed_query.find(exp.Where)
@@ -472,16 +520,20 @@ def extend_query_with_partition_keys(
     parsed_query = sqlglot.parse_one(query)
 
     if method == "IN":
-        partition_keys_str = ",".join(_format_partition_key_for_sql(pk) for pk in partition_keys)
-        partition_expr = sqlglot.parse_one(f"{p0_alias}.{partition_key} IN ({partition_keys_str})")
+        # The key list is not parsed: a placeholder identifier goes through sqlglot and the
+        # formatted list is spliced into the rendered SQL afterwards (see _splice_key_list).
+        sentinel = _key_list_sentinel()
+        partition_expr = sqlglot.parse_one(f"{p0_alias}.{partition_key} IN ({sentinel})")
         _add_where_condition(parsed_query, partition_expr)
-        return parsed_query.sql()
+        key_list = ", ".join(_format_spliced_partition_key(pk, sql_dialect) for pk in partition_keys)
+        return _splice_key_list(parsed_query.sql(), sentinel, key_list)
 
     elif method == "VALUES":
-        partition_keys_str = "),(".join(_format_partition_key_for_sql(pk) for pk in partition_keys)
-        partition_expr = sqlglot.parse_one(f"{p0_alias}.{partition_key} IN (VALUES({partition_keys_str}))")
+        sentinel = _key_list_sentinel()
+        partition_expr = sqlglot.parse_one(f"{p0_alias}.{partition_key} IN (VALUES({sentinel}))")
         _add_where_condition(parsed_query, partition_expr)
-        return parsed_query.sql()
+        key_list = "), (".join(_format_spliced_partition_key(pk, sql_dialect) for pk in partition_keys)
+        return _splice_key_list(parsed_query.sql(), sentinel, key_list)
 
     elif method == "TMP_TABLE_JOIN":
         tmp_table_setup, table_name = _create_tmp_table_setup(partition_keys, analyze_tmp_table, sql_dialect)
