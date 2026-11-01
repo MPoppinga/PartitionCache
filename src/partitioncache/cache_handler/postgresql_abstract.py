@@ -1,3 +1,4 @@
+import secrets
 import threading
 from abc import abstractmethod
 from collections.abc import Callable
@@ -288,6 +289,51 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
         except Exception as e:
             logger.debug(f"Failed to get all queries for partition {partition_key}: {e}")
             return []
+
+    def _store_keys_lazily(
+        self, table_name: str, key: str, query: str, partition_key: str, array_type: str = "INTEGER[]", value_expr: str = "$2", check: str = ""
+    ) -> None:
+        """Run a variant query and store its partition keys without moving them through Python.
+
+        A single INSERT ... SELECT keeps the keys in the database, but PostgreSQL never plans parallel
+        workers for a statement that writes, so the variant query ran single-threaded. A DO block runs the
+        variant with EXECUTE ... INTO, which can use parallel workers, and the INSERT as a second statement,
+        both on the server: the keys never reach the client.
+
+        The keys stay a typed array (array_type, e.g. "INTEGER[]") and reach the INSERT as parameter $2
+        (the cache key is $1); value_expr turns them into the column value, e.g. "rb_build($2)". NULL keys
+        belong to no partition and are dropped, as on the non-lazy path. ARRAY(subquery) is '{}' for zero
+        rows and never NULL, so an empty result cannot be mistaken for the NULL marker of set_null; a
+        missing value raises instead.
+
+        check is PL/pgSQL run between the two statements, with the keys in v_keys and the variables
+        v_min / v_max (bigint) available, e.g. to reject keys a bit array cannot hold.
+        """
+        select = sql.SQL("SELECT ARRAY(SELECT {col} FROM ({query}) AS query_result WHERE {col} IS NOT NULL)").format(
+            col=sql.Identifier(partition_key),
+            query=sql.SQL(query),  # type: ignore[arg-type]
+        )
+        insert = (
+            sql.SQL("INSERT INTO {table} (query_hash, partition_keys) VALUES ($1, ").format(table=sql.Identifier(table_name)).as_string(self.db)
+            + value_expr
+            + ") ON CONFLICT (query_hash) DO UPDATE SET partition_keys = EXCLUDED.partition_keys"
+        )
+        select_literal = sql.Literal(select.as_string(self.db)).as_string(self.db)
+        insert_literal = sql.Literal(insert).as_string(self.db)
+        key_literal = sql.Literal(key).as_string(self.db)
+        tag = "pc" + secrets.token_hex(6)
+        while any(f"${tag}$" in literal for literal in (select_literal, insert_literal, key_literal)):
+            tag = "pc" + secrets.token_hex(6)
+        block = (
+            f"DO ${tag}$ DECLARE v_keys {array_type}; v_min bigint; v_max bigint; BEGIN "
+            f"EXECUTE {select_literal} INTO v_keys; "
+            "IF v_keys IS NULL THEN RAISE EXCEPTION 'Lazy insertion query returned no key array'; END IF; "
+            f"{check} "
+            f"EXECUTE {insert_literal} USING {key_literal}, v_keys; "
+            f"END ${tag}$"
+        )
+        # No parameters are passed, so psycopg does not interpret % in the block
+        self.cursor.execute(block)  # type: ignore[arg-type]
 
     def set_null(self, key: str, partition_key: str = "partition_key") -> bool:
         """Set null value in partition-specific table."""

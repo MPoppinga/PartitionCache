@@ -422,6 +422,10 @@ pcache-postgresql-queue-processor setup \
     --enable-after-setup
 ```
 
+#### Upgrading
+
+The processor functions live in the database and are only replaced by `setup`. After upgrading PartitionCache, run `pcache-postgresql-queue-processor setup` again; until then the jobs keep running the old functions. In particular, processors installed before bit arrays grew automatically drop keys at or beyond the bitsize from `postgresql_bit` entries instead of growing the bit arrays (see the PostgreSQL bit handler in [Cache Handlers](cache_handlers.md)).
+
 ## Configuration
 
 ### Environment Variables

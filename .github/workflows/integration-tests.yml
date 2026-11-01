@@ -395,6 +395,20 @@ jobs:
           --ignore tests/integration/test_pg_cron_integration.py \
           --no-setup
 
+    - name: Run empty-set contract and bit key range tests against Redis and PostgreSQL
+      # The unit-test job has no services, so the Redis and PostgreSQL cases of this file only run here
+      if: matrix.suffix == 'redis_set'
+      shell: micromamba-shell {0}
+      env:
+        PARTITIONCACHE_TEST_REDIS_HOST: localhost
+        PARTITIONCACHE_TEST_REDIS_PORT: 6379
+        PARTITIONCACHE_TEST_PG_HOST: localhost
+        PARTITIONCACHE_TEST_PG_PORT: 5432
+        PARTITIONCACHE_TEST_PG_USER: integration_user
+        PARTITIONCACHE_TEST_PG_PASSWORD: integration_password
+      run: |
+        PARTITIONCACHE_TEST_PG_DB="$PG_DBNAME" python -m pytest tests/pytest/test_empty_set_contract.py tests/pytest/test_bit_key_range.py -v -rs
+
     - name: Upload artifacts
       uses: actions/upload-artifact@v4
       if: always()

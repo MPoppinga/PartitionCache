@@ -230,9 +230,11 @@ Lazy counterpart to `extend_query_with_partition_keys`: integrates a lazy SQL su
 - `buffer_distance` (float | None, optional): Buffer distance in meters for spatial filter (required when `geometry_column` is set).
 - `spatial_method` (Literal["SUBDIVIDE_INLINE", "SUBDIVIDE_TMP_TABLE", "DUMP_TMP_TABLE", "DUMP_CTE"], optional): Strategy for applying the spatial filter (default: "SUBDIVIDE_TMP_TABLE")
 - `subdivide_max_vertices` (int, optional): Maximum vertices per subdivided filter geometry (default: 256)
+- `cost_estimator` (Callable[[str], float | None] | None, optional): Returns the planner cost of a query without executing it, e.g. `PostgresDBHandler.estimate_cost`. Only used together with `min_query_cost` (default: None)
+- `min_query_cost` (float | None, optional): Skip the cache when the estimated cost of the original query is below this value — see [Cost gate](#cost-gate-min_query_cost) (default: None, gate off)
 
 **Returns:**
-- `Tuple[str, Dict]`: (enhanced_query, statistics)
+- `Tuple[str, Dict]`: (enhanced_query, statistics). With `min_query_cost` set, the statistics also contain `cost_gated` (1 if the cache was skipped) and `query_cost` (rounded estimate, when available)
 
 **Example:**
 ```python
@@ -301,9 +303,35 @@ enhanced_query, stats = partitioncache.apply_cache_lazy(
 )
 ```
 
+#### Cost gate (`min_query_cost`)
+
+For cheap queries the cache overhead (variant generation, cache lookup, temp table) exceeds what the restriction can save. `apply_cache_lazy` and `apply_cache` can therefore ask the database planner first and return the query unchanged when its estimated cost is below `min_query_cost`. The check runs before variant generation, so a gated query costs one `EXPLAIN` only.
+
+```python
+from partitioncache.db_handler.postgres import PostgresDBHandler
+
+data_db = PostgresDBHandler(host, port, user, password, dbname)  # the data database, not the cache database
+enhanced_query, stats = partitioncache.apply_cache_lazy(
+    query=query,
+    cache_handler=cache.underlying_handler,
+    partition_key="user_id",
+    cost_estimator=data_db.estimate_cost,
+    min_query_cost=10_000,  # calibrate per installation, see below
+)
+if stats.get("cost_gated"):
+    print(f"cache skipped, planner cost {stats['query_cost']}")
+```
+
+- `estimate_cost` is implemented for PostgreSQL (`EXPLAIN (FORMAT JSON)`, `Plan.Total Cost`) and MySQL (`EXPLAIN FORMAT=JSON`, `query_block.cost_info.query_cost`). DuckDB, SQLite and MariaDB return `None` — they expose no scalar cost — and the cache is applied as usual. Any callable with the same signature works as `cost_estimator`.
+- Cost units are planner units, not milliseconds, and depend on `seq_page_cost`/`random_page_cost`; the threshold has to be calibrated per installation and workload, e.g. by comparing `estimate_cost` of representative queries with their measured runtime with and without the cache.
+- The gate only catches queries that are cheap *according to the planner*. Planner over-estimates (a query estimated expensive that finishes in milliseconds) pass the gate and get the cache as before; large cached key sets and bad plans for the enhanced query are not covered.
+- A failing estimator, or one that returns something other than a finite number, is logged and the cache is applied; `min_query_cost` without `cost_estimator` raises `ValueError`.
+- Every query that is not gated pays for the `EXPLAIN` on the data connection: the statement plus BEGIN/ROLLBACK (or SAVEPOINT/ROLLBACK TO when the caller has a transaction open).
+- `PostgresDBHandler.estimate_cost` runs the `EXPLAIN` in a transaction (or savepoint) that is always rolled back, so it does not commit or abort a transaction the caller has open, and it rejects text that contains more than one statement. MySQL returns `None` for plans without a top-level cost, such as `UNION`.
+
 #### `apply_cache(query, cache_handler, partition_key, ..., geometry_column=None, buffer_distance=None)`
 
-Applies partition cache to a query using regular (non-lazy) cache handlers. Supports spatial mode.
+Applies partition cache to a query using regular (non-lazy) cache handlers. Supports spatial mode. Accepts the same `cost_estimator` / `min_query_cost` gate as `apply_cache_lazy`.
 
 **Spatial Parameters** (in addition to standard parameters):
 - `geometry_column` (str | None, optional): Enables spatial mode. Requires a spatial cache handler with `get_spatial_filter()` method.
@@ -679,6 +707,43 @@ cache.underlying_handler.register_partition_key("region_id", "integer")
 ### `generate_all_query_hash_pairs(query: str, partition_key: str, min_component_size=1, follow_graph=True, keep_all_attributes=True, canonicalize_queries=False, ...)`
 
 The exported lower-level API: generates all query variants and returns them as `list[tuple[str, str]]` of `(variant_query, hash)` pairs — the format consumed by `push_to_query_variant_queue()`. Accepts the full variant-generation parameter set (`auto_detect_partition_join`, `partition_join_table`, `max_component_size`, `bucket_steps`, `add_constraints`, `remove_constraints_all`, `remove_constraints_add`, `max_conditions_removed`, `protected_patterns`, and the spatial parameters `skip_partition_key_joins`/`geometry_column`).
+
+The pairs come in arbitrary (set) order.
+
+### `order_variants_for_population(query_hash_pairs: list[tuple[str, str]])`
+
+Returns the pairs sorted smallest first: fewest tables in the outer `FROM`, then fewest `WHERE` conditions (stable; unparseable variants last). The relaxations of a variant join fewer tables or keep fewer conditions, so when variants are populated in this order, the cached keys of its relaxations exist when a variant runs and can restrict it. `pcache-monitor` and `pcache-add --queue` apply it before pushing to the variant queue.
+
+```python
+import partitioncache
+from partitioncache import generate_all_query_hash_pairs, order_variants_for_population
+from partitioncache.query_processor import generate_all_hashes
+
+for variant, variant_hash in order_variants_for_population(generate_all_query_hash_pairs(query, "city_id")):
+    lookup = set(generate_all_hashes(variant, "city_id")) - {variant_hash}
+    keys, _hits = cache_handler.get_intersected(lookup, "city_id")
+    if keys is not None and len(keys) <= max_keys:
+        variant = partitioncache.extend_query_with_partition_keys(variant, keys, "city_id")
+    ...  # execute variant and store its keys under variant_hash
+```
+
+### `populate_query_variants(query_hash_pairs, partition_key, cache_handler, db_handler, restrict=True, max_restriction_keys=None, method="IN")`
+
+Executes and caches the variants of one query sequentially, smallest first. Each variant is restricted to the intersection of the keys of its already populated relaxations, which stay in memory, so no cache lookup or hash generation is needed per variant. A relaxation is recognised structurally by `variant_signature`/`is_relaxation_of` in `partitioncache.query_processor`: its tables and conditions (aliases replaced by table names) are a subset of the variant's, so its keys are a superset. Variants the subset test cannot judge soundly (a table used twice, explicit JOIN syntax, unqualified columns, grouping) are executed unrestricted.
+
+- Variants already in the cache are not executed; their keys are read once and restrict the others.
+- An empty intersection means the variant has no rows; it is stored as an empty set without executing it.
+- `max_restriction_keys`: restrict only when the intersection has at most this many keys.
+- `db_handler.execute` must raise on errors. A failure returned as an empty result would be cached as "no rows" and empty every variant it restricts; `SQLiteDBHandler` logs errors and returns `[]`.
+
+**Returns:** `PopulationStats` with `executed`, `restricted`, `empty_without_execution`, `already_cached`, `failed`.
+
+```python
+from partitioncache import generate_all_query_hash_pairs, populate_query_variants
+
+pairs = generate_all_query_hash_pairs(query, "flight_id", partition_key_source_table="flights")
+stats = populate_query_variants(pairs, "flight_id", cache_handler, db_handler, max_restriction_keys=flight_count // 4)
+```
 
 ### `generate_all_hashes(query: str, partition_key: str, min_component_size=1, follow_graph=True, fix_attributes=True, canonicalize_queries=False)`
 

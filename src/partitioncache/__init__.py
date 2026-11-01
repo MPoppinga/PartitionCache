@@ -22,7 +22,8 @@ from partitioncache.apply_cache import (
 )
 from partitioncache.cache_handler import get_cache_handler
 from partitioncache.cache_handler.helper import PartitionCacheHelper, create_partitioncache_helper
-from partitioncache.query_processor import generate_all_query_hash_pairs
+from partitioncache.population import PopulationStats, populate_query_variants
+from partitioncache.query_processor import generate_all_query_hash_pairs, order_variants_for_population
 
 try:
     from partitioncache.cache_handler.rocks_db_bit import RocksDBBitCacheHandler
@@ -113,6 +114,9 @@ __all__ = [
     "push_to_query_variant_queue",
     "get_queue_lengths",
     "generate_all_query_hash_pairs",
+    "order_variants_for_population",
+    "populate_query_variants",
+    "PopulationStats",
     "PartitionCacheHelper",
     "DataType",
     "DataSet",

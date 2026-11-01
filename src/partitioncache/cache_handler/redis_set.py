@@ -1,6 +1,13 @@
 from datetime import datetime
+from logging import getLogger
 
 from partitioncache.cache_handler.redis_abstract import RedisAbstractCacheHandler
+
+logger = getLogger("PartitionCache")
+
+# Redis cannot hold an empty SET, so an empty result is a string with this value. It differs from the
+# set_null marker b"\x00", so "the query has no rows" never reads as "no result".
+EMPTY_SET_MARKER = b"\x01empty"
 
 
 class RedisCacheHandler(RedisAbstractCacheHandler):
@@ -38,6 +45,8 @@ class RedisCacheHandler(RedisAbstractCacheHandler):
             value = self.db.get(cache_key)
             if value == b"\x00":  # Check for null byte marker
                 return None
+            if value == EMPTY_SET_MARKER:
+                return set()
             raise ValueError(f"The key '{cache_key}' contains a string, not a set")
 
         if key_type != b"set":
@@ -68,8 +77,13 @@ class RedisCacheHandler(RedisAbstractCacheHandler):
         key_types = pipe.execute()
 
         valid_cache_keys: list[str] = [cache_key for cache_key, key_type in zip(cache_keys, key_types, strict=False) if key_type == b"set"]
+        string_cache_keys = [cache_key for cache_key, key_type in zip(cache_keys, key_types, strict=False) if key_type == b"string"]
+        empty_count = sum(value == EMPTY_SET_MARKER for value in self.db.mget(string_cache_keys)) if string_cache_keys else 0
         valid_keys_count = len(valid_cache_keys)
 
+        # A stored empty result makes the whole intersection empty
+        if empty_count:
+            return set(), valid_keys_count + empty_count
         if not valid_cache_keys:
             return None, 0
         elif len(valid_cache_keys) == 1:
@@ -98,9 +112,22 @@ class RedisCacheHandler(RedisAbstractCacheHandler):
         return None, 0
 
     def set_cache(self, key: str, partition_key_identifiers: set[int] | set[str] | set[float] | set[datetime], partition_key: str = "partition_key") -> bool:
-        """Store a set of partition key identifiers in the cache for a specific partition key."""
+        """Store a set of partition key identifiers in the cache for a specific partition key.
+
+        The stored value replaces any earlier one. An empty set is stored as EMPTY_SET_MARKER and needs a
+        registered partition key, since its datatype cannot be inferred.
+        """
         # Try to get datatype from metadata
         existing_datatype = self._get_partition_datatype(partition_key)
+        if not partition_key_identifiers:
+            if existing_datatype is None:
+                logger.error(f"Cannot store an empty set for unregistered partition key '{partition_key}': its datatype is unknown")
+                return False
+            try:
+                self.db.set(self._get_cache_key(key, partition_key), EMPTY_SET_MARKER)
+                return True
+            except Exception:
+                return False
         if existing_datatype is not None:
             if existing_datatype == "integer":
                 if not all(isinstance(v, int) for v in partition_key_identifiers):
@@ -127,7 +154,11 @@ class RedisCacheHandler(RedisAbstractCacheHandler):
             self._set_partition_datatype(partition_key, datatype)
         try:
             cache_key = self._get_cache_key(key, partition_key)
-            self.db.sadd(cache_key, *str_values)
+            # Replace, not extend: SADD alone merged into an earlier set and failed on a non-set value
+            pipe = self.db.pipeline()
+            pipe.delete(cache_key)
+            pipe.sadd(cache_key, *str_values)
+            pipe.execute()
             return True
         except Exception:
             return False

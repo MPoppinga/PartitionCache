@@ -8,6 +8,7 @@ import datetime
 import os
 import threading
 import time
+from typing import Any, Literal
 
 import psycopg
 
@@ -28,11 +29,12 @@ from partitioncache.cli.common_args import (
     load_environment_with_validation,
     parse_variant_generation_json_args,
     resolve_cache_backend,
+    sql_dialect_for_backend,
 )
 from partitioncache.db_handler import get_db_handler
 from partitioncache.logging_utils import configure_enhanced_logging, get_thread_aware_logger
 from partitioncache.query_accelerator import create_query_accelerator
-from partitioncache.query_processor import generate_all_query_hash_pairs
+from partitioncache.query_processor import generate_all_query_hash_pairs, order_variants_for_population
 from partitioncache.queue import (
     get_queue_lengths,
     pop_from_original_query_queue,
@@ -183,6 +185,8 @@ def query_fragment_processor(args, constraint_args):
                 geometry_column=geometry_column,
                 max_conditions_removed=args.max_conditions_removed,
             )
+            # Smallest variants first, so cache optimization can restrict the larger ones with them
+            query_hash_pairs = order_variants_for_population(query_hash_pairs)
             logger.debug(f"Generated {len(query_hash_pairs)} query variants from original query")
 
             # Push variants to the variant queue using the partition_key and datatype from queue
@@ -219,14 +223,15 @@ def apply_cache_optimization(query: str, query_hash: str, partition_key: str, pa
             - was_optimized: Whether optimization was applied
             - stats: Dictionary with optimization statistics
     """
-    stats = {"total_hashes": 0, "cache_hits": 0, "method_used": None}
+    stats: dict[str, Any] = {"total_hashes": 0, "cache_hits": 0, "method_used": None}
 
     if not args.enable_cache_optimization or args.disable_cache_optimization:
         return query, False, stats
 
     try:
-        # Check if we should use lazy optimization
-        use_lazy = args.prefer_lazy_optimization and isinstance(cache_handler, AbstractCacheHandler_Lazy)
+        max_keys = args.max_restriction_keys
+        # Check if we should use lazy optimization; a key limit needs the key count, which only the standard path materializes
+        use_lazy = args.prefer_lazy_optimization and isinstance(cache_handler, AbstractCacheHandler_Lazy) and max_keys is None
 
         if use_lazy:
             # Use lazy intersection - no min-hits check needed
@@ -278,18 +283,28 @@ def apply_cache_optimization(query: str, query_hash: str, partition_key: str, pa
 
             # An empty set is a valid result (the query has no rows); extend_query_with_partition_keys handles it
             if hits >= args.min_cache_hits and partition_keys is not None:
-                method = args.cache_optimization_method
-                stats["method_used"] = method
+                if max_keys is not None and len(partition_keys) > max_keys:
+                    # A restriction to most of the keys filters little and costs a long key list
+                    logger.debug(f"Skipped cache optimization for {query_hash}: {len(partition_keys)} keys exceed --max-restriction-keys {max_keys}")
+                    return query, False, stats
+                # IN_SUBQUERY exists only for the lazy path
+                extend_method: Literal["IN", "VALUES", "TMP_TABLE_JOIN", "TMP_TABLE_IN"] = (
+                    "IN" if args.cache_optimization_method == "IN_SUBQUERY" else args.cache_optimization_method
+                )
+                stats["method_used"] = extend_method
 
                 optimized_query = extend_query_with_partition_keys(
                     query=query,
                     partition_keys=partition_keys,
                     partition_key=partition_key,
-                    method=method,
+                    method=extend_method,
                     analyze_tmp_table=True,
+                    sql_dialect=sql_dialect_for_backend(args.db_backend),
                 )
 
-                logger.info(f"Applied cache optimization to {query_hash}: {hits}/{total_hashes} cache hits, {len(partition_keys)} keys, method={method}")
+                logger.info(
+                    f"Applied cache optimization to {query_hash}: {hits}/{total_hashes} cache hits, {len(partition_keys)} keys, method={extend_method}"
+                )
                 return optimized_query, True, stats
 
         # No optimization applied
@@ -333,7 +348,7 @@ def run_and_store_query(query: str, query_hash: str, partition_key: str, partiti
                 existing_bitsize = cache_handler._get_partition_bitsize(partition_key)  # type: ignore[attr-defined]
                 if args.bitsize is not None:
                     kwargs["bitsize"] = args.bitsize
-                    if existing_bitsize is not None and existing_bitsize != args.bitsize:
+                    if existing_bitsize is not None and existing_bitsize < args.bitsize:  # never shrink: stored bit arrays would lose keys
                         logger.info(f"Updating bitsize from {existing_bitsize} to {args.bitsize} for partition '{partition_key}'")
                         cache_handler._set_partition_bitsize(partition_key, args.bitsize)  # type: ignore[attr-defined]
                 elif existing_bitsize is not None:
@@ -444,6 +459,13 @@ def run_and_store_query(query: str, query_hash: str, partition_key: str, partiti
                     logger.error(f"QUERY EXECUTION ERROR: Failed to execute query for {query_hash} after {execution_time:.2f}s: {type(e).__name__}: {e}")
                     log_query_time(f"{query_hash}_error", execution_time)
                     cache_handler.set_query_status(query_hash, partition_key, "failed")
+            except Exception as e:
+                # Errors of the other DB backends (sqlite3, mysql.connector): nothing is cached, the
+                # query is marked failed, so a failure never passes as an empty result
+                execution_time = time.perf_counter() - execution_start
+                logger.error(f"QUERY EXECUTION ERROR: Failed to execute query for {query_hash} after {execution_time:.2f}s: {type(e).__name__}: {e}")
+                log_query_time(f"{query_hash}_error", execution_time)
+                cache_handler.set_query_status(query_hash, partition_key, "failed")
             finally:
                 if db_handler:
                     db_handler.close()
@@ -726,6 +748,12 @@ def main():
         help="Method for applying cache restrictions (default: IN)",
     )
     optimization_group.add_argument("--min-cache-hits", type=int, default=1, help="Minimum cache hits required for non-lazy optimization (default: 1)")
+    optimization_group.add_argument(
+        "--max-restriction-keys",
+        type=int,
+        default=None,
+        help="Only restrict a variant when the cached intersection has at most this many keys; implies non-lazy optimization (default: no limit)",
+    )
     optimization_group.add_argument("--prefer-lazy-optimization", action="store_true", default=True, help="Prefer lazy methods when available (default: True)")
     optimization_group.add_argument(
         "--no-prefer-lazy-optimization", dest="prefer_lazy_optimization", action="store_false", help="Disable preference for lazy optimization"
@@ -765,6 +793,8 @@ def main():
 
     global args
     args = parser.parse_args()
+    if args.max_restriction_keys is not None and args.max_restriction_keys < 0:
+        parser.error("--max-restriction-keys must not be negative")
 
     # Configure enhanced logging with thread-aware formatting
     configure_enhanced_logging(verbose=getattr(args, "verbose", False), quiet=getattr(args, "quiet", False), logger_name="PartitionCache")
@@ -875,6 +905,7 @@ def main():
         logger.info("- Cache optimization ENABLED:")
         logger.info(f"  - Method: {args.cache_optimization_method}")
         logger.info(f"  - Min cache hits: {args.min_cache_hits}")
+        logger.info(f"  - Max restriction keys: {args.max_restriction_keys if args.max_restriction_keys is not None else 'no limit'}")
         logger.info(f"  - Prefer lazy: {args.prefer_lazy_optimization}")
 
     # Log lazy insertion configuration

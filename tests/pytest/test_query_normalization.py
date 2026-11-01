@@ -5,6 +5,9 @@ Tests that clean_query() properly normalizes JOIN ON syntax to comma-separated F
 with conditions in WHERE, and strips GROUP BY/HAVING clauses.
 """
 
+import logging
+
+import pytest
 import sqlglot
 from sqlglot import exp
 
@@ -453,6 +456,24 @@ class TestOuterJoinExclusion:
     def test_detector_false_on_unparseable(self):
         assert not query_contains_top_level_outer_join("this is not sql")
 
+    # नाम and the decomposed é contain combining marks: identifiers for Python, not word characters for re
+    @pytest.mark.parametrize("alias", ['"1u"', '"a$b"', '"my u"', "नाम", "e\u0301"])
+    def test_generate_all_query_hash_pairs_empty_for_alias_that_is_not_plain(self, alias, caplog):
+        """The alias handling would lose the alias's conditions and keep references to aliases outside FROM."""
+        query = f"SELECT {alias}.pk FROM users AS {alias}, orders AS o WHERE {alias}.pk = o.pk AND {alias}.age > 30 AND o.total > 5"
+        with caplog.at_level(logging.WARNING):
+            assert generate_all_query_hash_pairs(query, "pk") == []
+        assert "not a plain identifier" in caplog.text
+
+    @pytest.mark.parametrize("alias", ['"u"', "_u", "u1", "ü", "é1", "Ölfeld"])
+    def test_identifier_aliases_give_the_same_variants_as_a_plain_alias(self, alias):
+        def variants(a):
+            query = f"SELECT {a}.pk FROM users AS {a}, orders AS o WHERE {a}.pk = o.pk AND {a}.age > o.total AND {a}.x = 1"
+            return sorted(generate_all_query_hash_pairs(query, "pk"))
+
+        assert variants(alias) == variants("u")
+        assert any("t1.total < t2.age" in variant for variant, _ in variants(alias))
+
     def test_generate_all_query_hash_pairs_empty_for_outer_join(self):
         query = (
             "SELECT o.region FROM orders o "
@@ -478,3 +499,66 @@ class TestOuterJoinExclusion:
         )
         pairs = generate_all_query_hash_pairs(query, "region", warn_no_partition_key=False)
         assert len(pairs) > 0
+
+
+class TestStringLiteralPreservation:
+    """clean_query() must not rewrite string literals (otherwise non-equivalent queries share a hash)."""
+
+    BASE = "SELECT * FROM users AS u WHERE u.city_id = 1 AND u.name = {literal}"
+
+    def _hashes(self, query: str) -> set[str]:
+        return set(generate_all_hashes(query, "city_id", warn_no_partition_key=False))
+
+    def test_doubled_quote_inside_literal_survives_bucketing(self):
+        from partitioncache.query_processor import normalize_distance_conditions
+
+        query = "SELECT * FROM t AS a, t AS b WHERE a.name = 'it''s  two' AND DIST(a.g, b.g) BETWEEN 1.6 AND 3.6"
+        normalized = normalize_distance_conditions(query, bucket_steps=1.0)
+        assert "'it''s  two'" in normalized
+        assert "BETWEEN 1 AND 4" in normalized
+
+    def test_whitespace_inside_literal_is_kept(self):
+        double_space = clean_query(self.BASE.format(literal="'a  b'"))
+        single_space = clean_query(self.BASE.format(literal="'a b'"))
+
+        assert "'a  b'" in double_space
+        assert double_space != single_space
+        # Variants that keep the condition must keep the literal byte for byte
+        # (the distance-bucketing variant used to collapse it to 'a b')
+        variants = [q for q, _ in generate_all_query_hash_pairs(self.BASE.format(literal="'a  b'"), "city_id", warn_no_partition_key=False)]
+        assert not any("'a b'" in q for q in variants)
+        assert self._hashes(self.BASE.format(literal="'a  b'")) != self._hashes(self.BASE.format(literal="'a b'"))
+
+    def test_equals_sign_inside_literal_is_kept(self):
+        spaced = clean_query(self.BASE.format(literal="'x = y'"))
+        compact = clean_query(self.BASE.format(literal="'x=y'"))
+
+        assert "'x = y'" in spaced
+        assert spaced != compact
+
+    def test_double_dash_inside_literal_is_not_a_comment(self):
+        cleaned = clean_query("SELECT * FROM users AS u WHERE u.name = 'a--b' AND u.city_id = 1")
+
+        assert "'a--b'" in cleaned
+        assert "u.city_id = 1" in cleaned
+
+    def test_quote_characters_inside_literal_are_kept(self):
+        assert "'a\"b'" in clean_query(self.BASE.format(literal="'a\"b'"))
+        assert "'a`b'" in clean_query(self.BASE.format(literal="'a`b'"))
+
+    def test_quoted_identifiers_are_still_unquoted(self):
+        quoted = clean_query('SELECT * FROM "users" AS "u" WHERE "u"."city_id" = 1')
+
+        assert quoted == clean_query("SELECT * FROM users AS u WHERE u.city_id = 1")
+
+    def test_comments_and_layout_do_not_change_the_result(self):
+        plain = "SELECT * FROM users AS u WHERE u.city_id = 1 AND u.age > 30"
+        commented = """
+        SELECT *   -- all columns
+        FROM users AS u /* block comment */
+        WHERE u.city_id=1
+          AND u.age > 30;
+        """
+
+        assert clean_query(commented) == clean_query(plain)
+        assert self._hashes(commented) == self._hashes(plain)
