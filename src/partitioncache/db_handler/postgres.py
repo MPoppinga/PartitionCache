@@ -77,7 +77,9 @@ class PostgresDBHandler(AbstractDBHandler):
         transaction open, so the caller's transaction is neither committed nor aborted. A binary cursor sends
         it as an unnamed extended-protocol statement, which PostgreSQL accepts for a single statement only:
         text that contains several statements raises instead of running the others. No named prepared
-        statement is created, so the caller's prepared statements survive the rollback.
+        statement is created. psycopg itself still sends DEALLOCATE ALL on the rollback when it holds
+        automatically prepared statements on this connection (prepare_threshold), which also drops prepared
+        statements the caller created with PREPARE.
         """
         with self.conn.transaction(force_rollback=True), self.conn.cursor(binary=True) as cur:
             cur.execute(f"EXPLAIN (FORMAT JSON) {query}")
