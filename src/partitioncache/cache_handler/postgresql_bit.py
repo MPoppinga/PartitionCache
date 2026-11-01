@@ -475,10 +475,10 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
             table_name = f"{self.tableprefix}_cache_{partition_key}"
 
             # Server-side SELECT then INSERT: parallel, and the keys stay in the database. The bit array
-            # is built from the key array literal (%L) inside the block.
+            # is built from the key array ($2) inside the block.
             bit_value = (
                 "(WITH bit_positions AS ("
-                " SELECT position FROM unnest(%L::INTEGER[]) AS u(position)"
+                " SELECT position FROM unnest($2) AS u(position)"
                 f" WHERE position >= 0 AND position < {int(bitsize)}"
                 f"), bit_array AS (SELECT generate_series(0, {int(bitsize)} - 1) AS bit_index),"
                 " bit_string AS ("
@@ -486,7 +486,7 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
                 " '' ORDER BY bit_array.bit_index) AS bit_value FROM bit_array)"
                 f" SELECT bit_value::BIT({int(bitsize)}) FROM bit_string)"
             )
-            self._store_keys_lazily(table_name, key, query, partition_key, bit_value)
+            self._store_keys_lazily(table_name, key, query, partition_key, "INTEGER[]", bit_value)
 
             # Also store in queries table for existence checks. An upsert instead of INSERT plus UPDATE on
             # IntegrityError: after the failed INSERT the transaction is aborted and the UPDATE raised too.

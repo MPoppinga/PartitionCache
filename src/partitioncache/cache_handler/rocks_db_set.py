@@ -96,7 +96,11 @@ class RocksDBCacheHandler(RocksDBAbstractCacheHandler):
             if existing_datatype == "integer":
                 struct_value = self._format_int_set(partition_key_identifiers)  # type: ignore
             elif existing_datatype == "text":
-                struct_value = self._format_str_set(partition_key_identifiers)  # type: ignore
+                try:
+                    struct_value = self._format_str_set(partition_key_identifiers)  # type: ignore
+                except ValueError as e:
+                    logger.error(f"Failed to store key {key}: {e}")
+                    return False
             else:
                 raise ValueError(f"Unsupported datatype in metadata: {existing_datatype}")
             datatype = existing_datatype
@@ -111,7 +115,11 @@ class RocksDBCacheHandler(RocksDBAbstractCacheHandler):
                 struct_value = self._format_int_set(partition_key_identifiers)  # type: ignore
             elif isinstance(sample, str):
                 datatype = "text"
-                struct_value = self._format_str_set(partition_key_identifiers)  # type: ignore
+                try:
+                    struct_value = self._format_str_set(partition_key_identifiers)  # type: ignore
+                except ValueError as e:
+                    logger.error(f"Failed to store key {key}: {e}")
+                    return False
             else:
                 raise ValueError(f"Unsupported partition key identifier type: {type(sample)}")
             self._set_partition_datatype(partition_key, datatype)
