@@ -488,6 +488,14 @@ class TestStringLiteralPreservation:
     def _hashes(self, query: str) -> set[str]:
         return set(generate_all_hashes(query, "city_id", warn_no_partition_key=False))
 
+    def test_doubled_quote_inside_literal_survives_bucketing(self):
+        from partitioncache.query_processor import normalize_distance_conditions
+
+        query = "SELECT * FROM t AS a, t AS b WHERE a.name = 'it''s  two' AND DIST(a.g, b.g) BETWEEN 1.6 AND 3.6"
+        normalized = normalize_distance_conditions(query, bucket_steps=1.0)
+        assert "'it''s  two'" in normalized
+        assert "BETWEEN 1 AND 4" in normalized
+
     def test_whitespace_inside_literal_is_kept(self):
         double_space = clean_query(self.BASE.format(literal="'a  b'"))
         single_space = clean_query(self.BASE.format(literal="'a b'"))

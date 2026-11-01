@@ -210,7 +210,7 @@ The correctness invariant maintained throughout is: *every generated query varia
 3. **CNF normalization and simplification**: the query is parsed with sqlglot and passed through `sqlglot.optimizer.normalize.normalize` (conjunctive normal form) and `sqlglot.optimizer.simplify.simplify` (which, among other things, orders comparison operands consistently). CNF is a prerequisite for the conjunctive decomposition in Section 4.2, which treats the `WHERE` clause as a flat list of AND-ed conditions.
 4. **Clause removal**: `ORDER BY`, `LIMIT`, `GROUP BY`, and `HAVING` are removed from all SELECT scopes. These clauses do not affect *which* partition keys a query touches, only how results are presented or aggregated, so removing them lets queries differing only in these clauses share cache entries.
 5. **SELECT replacement**: the expressions of the outermost SELECT are replaced with `*` (subqueries and CTEs keep their column lists). The projected columns are irrelevant for partition-key reachability, and replacing them avoids confusing downstream regex-based condition parsing.
-6. **Identifier quoting removal**: quotes are removed from identifiers in the parsed tree (quoted identifiers are not supported downstream); quote characters inside string literals are kept.
+6. **Identifier quoting removal**: quotes are removed from identifiers in the parsed tree (quoted identifiers are not supported downstream); quote characters inside string literals are kept. Identifiers that need their quotes (mixed case such as `"MyCol"`, reserved words, spaces) therefore do not survive cleaning.
 
 #### DD-03: Canonical query normalization before hashing (sqlglot-based)
 - **Status:** implemented (core path)

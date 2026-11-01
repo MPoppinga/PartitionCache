@@ -493,11 +493,12 @@ def _detect_pk_bearing_aliases(
     Returns:
         Set of pk-bearing aliases.
     """
-    all_conditions = [cond for group in condition_groups for conds in group.values() for cond in conds]
+    # Literals blanked once per condition, so text inside them never counts as a reference
+    all_conditions = [_strip_string_literals(cond) for group in condition_groups for conds in group.values() for cond in conds]
     pk_bearing = set()
     for alias in table_aliases:
         token = re.compile(rf"\b{re.escape(alias)}\.{re.escape(partition_key)}\b")
-        if any(token.search(_strip_string_literals(cond)) for cond in all_conditions):
+        if any(token.search(cond) for cond in all_conditions):
             pk_bearing.add(alias)
     if partition_key_source_table:
         if partition_key_source_table in table_aliases:
@@ -2133,7 +2134,9 @@ def generate_all_query_hash_pairs(
             _parsed = sqlglot.parse_one(query)
             _sel = _parsed.find(exp.Select) if not isinstance(_parsed, exp.Select) else _parsed
             if _sel and _sel.expressions and not (len(_sel.expressions) == 1 and isinstance(_sel.expressions[0], exp.Star)):
-                pre_clean_select_clause = ", ".join(e.sql() for e in _sel.expressions)
+                # Without comments: a comment such as "-- user's name" holds a quote that would read as the
+                # start of a string literal and stop alias renaming; comments also do not belong in hashes
+                pre_clean_select_clause = ", ".join(e.sql(comments=False) for e in _sel.expressions)
         except Exception:
             pre_clean_select_clause = None
 
