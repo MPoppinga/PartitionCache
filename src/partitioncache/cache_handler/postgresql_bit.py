@@ -4,7 +4,6 @@ from logging import getLogger
 
 from bitarray import bitarray
 from psycopg import sql
-from psycopg.errors import IntegrityError
 
 from partitioncache.cache_handler.postgresql_abstract import PostgreSQLAbstractCacheHandler, _ends_read_transaction
 
@@ -254,11 +253,9 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
     def set_cache(self, key: str, partition_key_identifiers: set[int] | set[str] | set[float] | set[datetime], partition_key: str = "partition_key") -> bool:
         """
         Set the partition key identifiers of the given hash in the cache for a specific partition key.
-        Only integer values are supported for bit arrays.
+        Only integer values are supported for bit arrays. An empty set is stored as an all-zero bit
+        array, which ``get`` returns as ``set()``: the query has no rows.
         """
-        if not partition_key_identifiers:
-            return True
-
         try:
             # Convert all keys to integers first
             int_keys = []
@@ -271,7 +268,7 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
                     raise ValueError(f"Only integer values are supported for bit arrays: {k} : {partition_key_identifiers}")
 
             # Determine required bitsize based on data
-            max_value = max(int_keys)
+            max_value = max(int_keys, default=-1)
             required_bitsize = max(max_value + 1, self.default_bitsize)  # Ensure at least default size
 
             # Atomically ensure partition table exists and get actual bitsize
@@ -477,64 +474,29 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
 
             table_name = f"{self.tableprefix}_cache_{partition_key}"
 
-            # Build lazy insertion query that creates a bit array from query results
-            lazy_insert_query = sql.SQL(
-                """
-                WITH query_result AS (
-                    {query}
-                ),
-                bit_positions AS (
-                    SELECT {partition_col}::INTEGER AS position
-                    FROM query_result
-                    WHERE {partition_col}::INTEGER >= 0 AND {partition_col}::INTEGER < {bitsize}
-                ),
-                bit_array AS (
-                    SELECT generate_series(0, {bitsize} - 1) AS bit_index
-                ),
-                bit_string AS (
-                    SELECT string_agg(
-                        CASE WHEN bit_array.bit_index IN (SELECT position FROM bit_positions)
-                             THEN '1'
-                             ELSE '0'
-                        END,
-                        ''
-                        ORDER BY bit_array.bit_index
-                    ) AS bit_value
-                    FROM bit_array
-                )
-                INSERT INTO {table_name} (query_hash, partition_keys)
-                SELECT {key}, bit_value::BIT({bitsize})
-                FROM bit_string
-                ON CONFLICT (query_hash) DO UPDATE SET
-                    partition_keys = EXCLUDED.partition_keys
-                """
-            ).format(
-                query=sql.SQL(query),  # type: ignore[arg-type]
-                partition_col=sql.Identifier(partition_key),
-                bitsize=sql.Literal(bitsize),
-                table_name=sql.Identifier(table_name),
-                key=sql.Literal(key)
+            # Server-side SELECT then INSERT: parallel, and the keys stay in the database. The bit array
+            # is built from the key array ($2) inside the block.
+            bit_value = (
+                "(WITH bit_positions AS ("
+                " SELECT position FROM unnest($2) AS u(position)"
+                f" WHERE position >= 0 AND position < {int(bitsize)}"
+                f"), bit_array AS (SELECT generate_series(0, {int(bitsize)} - 1) AS bit_index),"
+                " bit_string AS ("
+                " SELECT string_agg(CASE WHEN bit_array.bit_index IN (SELECT position FROM bit_positions) THEN '1' ELSE '0' END,"
+                " '' ORDER BY bit_array.bit_index) AS bit_value FROM bit_array)"
+                f" SELECT bit_value::BIT({int(bitsize)}) FROM bit_string)"
             )
+            self._store_keys_lazily(table_name, key, query, partition_key, "INTEGER[]", bit_value)
 
-            self.cursor.execute(lazy_insert_query)
-
-            # Also store in queries table for existence checks
-            try:
-                self.cursor.execute(
-                    sql.SQL("INSERT INTO {table} (query_hash, partition_key, query) VALUES (%s, %s, %s)").format(
-                        table=sql.Identifier(self.tableprefix + "_queries")
-                    ),
-                    (key, partition_key, "")
-                )
-            except IntegrityError:
-                # Update if insert fails
-                self.cursor.execute(
-                    sql.SQL("UPDATE {table} SET last_seen = now() WHERE query_hash = %s AND partition_key = %s").format(
-                        table=sql.Identifier(self.tableprefix + "_queries")
-                    ),
-                    (key, partition_key)
-                )
-
+            # Also store in queries table for existence checks. An upsert instead of INSERT plus UPDATE on
+            # IntegrityError: after the failed INSERT the transaction is aborted and the UPDATE raised too.
+            self.cursor.execute(
+                sql.SQL(
+                    "INSERT INTO {table} (query_hash, partition_key, query) VALUES (%s, %s, %s) "
+                    "ON CONFLICT (query_hash, partition_key) DO UPDATE SET last_seen = now()"
+                ).format(table=sql.Identifier(self.tableprefix + "_queries")),
+                (key, partition_key, ""),
+            )
             self.db.commit()
             return True
 

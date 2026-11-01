@@ -78,11 +78,17 @@ class RocksDBBitCacheHandler(RocksDBAbstractCacheHandler):
 
         count_match = 0
         result: bitarray | None = None
+        empty_found = False
 
         for key in keys:
             cache_key = self._get_cache_key(key, partition_key)
             value = self.db.get(cache_key.encode())
             if value is None or value == b"\x00":
+                continue
+            if value == b"":
+                # A stored empty result (see set_cache) makes the whole intersection empty
+                empty_found = True
+                count_match += 1
                 continue
 
             bitval = bitarray()
@@ -95,17 +101,26 @@ class RocksDBBitCacheHandler(RocksDBAbstractCacheHandler):
                 result &= bitval
                 count_match += 1
 
+        if empty_found:
+            return set(), count_match
         if result is None:
             return None, count_match
         else:
             return set(result.search(bitarray("1"))), count_match
 
     def set_cache(self, key: str, partition_key_identifiers: set[int] | set[str] | set[float] | set[datetime], partition_key: str = "partition_key") -> bool:
-        """Store a set of partition key identifiers in the cache for a specific partition key. Only integer values are supported."""
-        if not partition_key_identifiers:
-            return True
+        """Store a set of partition key identifiers in the cache for a specific partition key. Only integer values are supported.
+
+        An empty set is stored as b"": all-zero bytes would equal the b"\x00" null marker for bitsizes up to 8.
+        """
         # Ensure partition exists with correct datatype and bitsize
         self._ensure_partition_exists(partition_key)
+        if not partition_key_identifiers:
+            try:
+                self.db.put(self._get_cache_key(key, partition_key).encode(), b"", sync=True)
+                return True
+            except Exception:
+                return False
 
         # Get the correct bitsize for this partition
         bitsize = self._get_partition_bitsize(partition_key)
@@ -113,6 +128,7 @@ class RocksDBBitCacheHandler(RocksDBAbstractCacheHandler):
             bitsize = self.default_bitsize
 
         bitval = bitarray(bitsize)
+        bitval.setall(0)
         try:
             for k in partition_key_identifiers:
                 if isinstance(k, int):

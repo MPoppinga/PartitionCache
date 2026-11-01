@@ -3,7 +3,6 @@ from datetime import datetime
 from logging import getLogger
 
 from psycopg import sql
-from psycopg.errors import IntegrityError
 
 from partitioncache.cache_handler.postgresql_abstract import PostgreSQLAbstractCacheHandler
 
@@ -98,13 +97,21 @@ class PostgreSQLArrayCacheHandler(PostgreSQLAbstractCacheHandler):
             return True
 
     def set_cache(self, key: str, partition_key_identifiers: set[int] | set[str] | set[float] | set[datetime], partition_key: str = "partition_key") -> bool:
-        """Store partition key identifiers in the cache for a specific partition key (column)."""
-        if not partition_key_identifiers:
-            return True
+        """Store partition key identifiers in the cache for a specific partition key (column).
 
+        An empty set is stored as an empty array, which ``get`` returns as ``set()``: the query has no
+        rows. It needs a registered partition key, since the datatype cannot be inferred from it.
+        """
         try:
             # Try to get datatype from metadata
             datatype = self._get_partition_datatype(partition_key)
+
+            if not partition_key_identifiers:
+                if datatype is None:
+                    logger.error(f"Cannot store an empty set for unregistered partition key '{partition_key}': its datatype is unknown")
+                    return False
+                self._store_array(key, "{}", partition_key)
+                return True
 
             # Determine the datatype of the incoming partition key identifiers
             sample = next(iter(partition_key_identifiers))
@@ -133,26 +140,7 @@ class PostgreSQLArrayCacheHandler(PostgreSQLAbstractCacheHandler):
                     return False
 
             # Convert set to list for PostgreSQL array serialization
-            val = list(partition_key_identifiers)
-
-            # Get partition-specific table
-            table_name = f"{self.tableprefix}_cache_{partition_key}"
-            self.cursor.execute(
-                sql.SQL(
-                    "INSERT INTO {0} (query_hash, partition_keys) VALUES (%s, %s) ON CONFLICT (query_hash) DO UPDATE SET partition_keys = EXCLUDED.partition_keys"
-                ).format(sql.Identifier(table_name)),
-                (key, val),
-            )
-
-            # Also create entry in queries table for exists() method to work properly
-            self.cursor.execute(
-                sql.SQL(
-                    "INSERT INTO {0} (query_hash, partition_key, query) VALUES (%s, %s, %s) ON CONFLICT (query_hash, partition_key) DO UPDATE SET last_seen = now()"
-                ).format(sql.Identifier(self.tableprefix + "_queries")),
-                (key, partition_key, ""),  # Empty query text for cache entries
-            )
-
-            self.db.commit()
+            self._store_array(key, list(partition_key_identifiers), partition_key)
             return True
         except Exception as e:
             logger.error(f"Failed to set cache for hash {hash} in partition {partition_key}: {e}")
@@ -162,6 +150,24 @@ class PostgreSQLArrayCacheHandler(PostgreSQLAbstractCacheHandler):
             except Exception as rollback_error:
                 logger.error(f"Failed to rollback transaction: {rollback_error}")
             return False
+
+    def _store_array(self, key: str, value: list | str, partition_key: str) -> None:
+        """Upsert the cache row and the queries row in one transaction; value is a list or an array literal."""
+        table_name = f"{self.tableprefix}_cache_{partition_key}"
+        self.cursor.execute(
+            sql.SQL(
+                "INSERT INTO {0} (query_hash, partition_keys) VALUES (%s, %s) ON CONFLICT (query_hash) DO UPDATE SET partition_keys = EXCLUDED.partition_keys"
+            ).format(sql.Identifier(table_name)),
+            (key, value),
+        )
+        # Also create entry in queries table for exists() method to work properly
+        self.cursor.execute(
+            sql.SQL(
+                "INSERT INTO {0} (query_hash, partition_key, query) VALUES (%s, %s, %s) ON CONFLICT (query_hash, partition_key) DO UPDATE SET last_seen = now()"
+            ).format(sql.Identifier(self.tableprefix + "_queries")),
+            (key, partition_key, ""),  # Empty query text for cache entries
+        )
+        self.db.commit()
 
     def get(self, key: str, partition_key: str = "partition_key") -> set[int] | set[str] | set[float] | set[datetime] | None:
         """Get value from partition-specific cache table."""
@@ -250,43 +256,20 @@ class PostgreSQLArrayCacheHandler(PostgreSQLAbstractCacheHandler):
 
             table_name = f"{self.tableprefix}_cache_{partition_key}"
 
-            # Build lazy insertion query
-            lazy_insert_query = sql.SQL(
-                """
-                INSERT INTO {table_name} (query_hash, partition_keys)
-                SELECT {key}, ARRAY(SELECT {partition_col} FROM ({query}) AS query_result)
-                ON CONFLICT (query_hash) DO UPDATE SET
-                    partition_keys = EXCLUDED.partition_keys
-                """
-            ).format(
-                table_name=sql.Identifier(table_name),
-                key=sql.Literal(key),
-                partition_col=sql.Identifier(partition_key),
-                query=sql.SQL(query)  # type: ignore[arg-type]
+            # Server-side SELECT then INSERT: parallel, and the keys stay in the database
+            array_types = {"integer": "INTEGER[]", "float": "NUMERIC[]", "text": "TEXT[]", "timestamp": "TIMESTAMP[]"}
+            self._store_keys_lazily(table_name, key, query, partition_key, array_types.get(datatype, "TEXT[]"))
+
+            # Also store in queries table for existence checks. An upsert instead of INSERT plus UPDATE on
+            # IntegrityError: after the failed INSERT the transaction is aborted and the UPDATE raised too.
+            self.cursor.execute(
+                sql.SQL(
+                    "INSERT INTO {table} (query_hash, partition_key, query) VALUES (%s, %s, %s) "
+                    "ON CONFLICT (query_hash, partition_key) DO UPDATE SET last_seen = now()"
+                ).format(table=sql.Identifier(self.tableprefix + "_queries")),
+                (key, partition_key, ""),
             )
-
-            self.cursor.execute(lazy_insert_query)
             self.db.commit()
-
-            # Also store in queries table for existence checks
-            queries_table = f"{self.tableprefix}_queries"
-            try:
-                self.cursor.execute(
-                    sql.SQL("INSERT INTO {table} (query_hash, partition_key, query) VALUES (%s, %s, %s)").format(
-                        table=sql.Identifier(queries_table)
-                    ),
-                    (key, partition_key, "")
-                )
-                self.db.commit()
-            except IntegrityError:
-                # Update if insert fails
-                self.cursor.execute(
-                    sql.SQL("UPDATE {table} SET last_seen = now() WHERE query_hash = %s AND partition_key = %s").format(
-                        table=sql.Identifier(queries_table)
-                    ),
-                    (key, partition_key)
-                )
-                self.db.commit()
 
             return True
 

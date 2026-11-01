@@ -21,16 +21,19 @@ class SQLiteDBHandler(AbstractDBHandler):
             self.conn.commit()  # Ensure changes are committed
             if self.cur.rowcount == 0:
                 return []
-            return [row[0] for row in self.cur.fetchall()]
+            return [row[0] for row in self.cur.fetchall() if row[0] is not None]
         except sqlite3.Error as e:
+            # Raise instead of returning []: callers cache the result, and an empty list is a valid
+            # "no rows" result that restricts later queries to nothing
             logger.error(f"Error executing query: {query}")
             logger.error(e)
-            return []
+            raise
 
     def close(self) -> None:
         try:
-            self.conn.close()
+            # Cursor first: closing it after the connection raised ProgrammingError
             self.cur.close()
+            self.conn.close()
         except sqlite3.Error as e:
             logger.error(f"Error closing SQLite connection: {e}")
             raise
