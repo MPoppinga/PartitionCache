@@ -204,6 +204,22 @@ class PartitionCacheHelper:
             logger.error(f"Failed to set_query for key {key}: {e}")
             return False
 
+    def get_query(self, key: str) -> str | None:
+        """
+        Get the query text associated with a key.
+
+        Args:
+            key: The cache key
+
+        Returns:
+            str | None: The stored query text, or None if not found
+        """
+        try:
+            return self._cache_handler.get_query(key=key, partition_key=self._partition_key)
+        except Exception as e:
+            logger.error(f"Failed to get_query for key {key}: {e}")
+            return None
+
     def set_entry(self, key: str, partition_key_identifiers: DataSet, query_text: str, force_update: bool = False) -> bool:
         """
         High-level method that stores both cache data and query metadata.
