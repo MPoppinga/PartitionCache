@@ -426,6 +426,79 @@ def extract_conjunctive_conditions(sql: str) -> list[str]:
     return conditions
 
 
+_COMPARISONS = (exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE)
+
+
+def _unwrap_condition(condition: str) -> tuple[exp.Expr | None, bool]:
+    """Parse a condition and strip parentheses and NOT; returns (node, negated) or (None, False) on parse errors."""
+    try:
+        node = sqlglot.parse_one(condition)
+    except Exception:
+        return None, False
+    negated = False
+    while isinstance(node, exp.Paren | exp.Not):
+        negated ^= isinstance(node, exp.Not)
+        node = node.this
+    return node, negated
+
+
+def _partition_key_condition_alias(condition: str, partition_key: str, table_aliases: list[str]) -> str | None:
+    """Return the outer alias whose partition key the condition restricts, or None if it is no partition key condition.
+
+    A partition key condition is an IN, BETWEEN or comparison (optionally negated) with ``<alias>.<partition_key>``
+    as its direct operand, where the partition key of that alias is the only outer column it references (also inside
+    subqueries). It depends on the partition key alone, so it holds for every variant. Anything else, e.g.
+    ``NOT EXISTS (... a.pk = x.pk AND DIST(x.x, a.x) < 3)``, is an attribute condition of the aliases it references.
+    """
+    node, _ = _unwrap_condition(condition)
+    if isinstance(node, exp.In | exp.Between):
+        operands = [node.this]
+    elif isinstance(node, _COMPARISONS):
+        operands = [node.left, node.right]
+    else:
+        return None
+    key_columns = [op for op in operands if isinstance(op, exp.Column) and op.name == partition_key]
+    if len(key_columns) != 1:
+        return None
+    # An unqualified partition key column refers to the first table, as before
+    alias = key_columns[0].table or (table_aliases[0] if table_aliases else "unknown")
+    outer = set(table_aliases) | {alias}
+    for column in node.find_all(exp.Column):
+        if column is key_columns[0]:
+            continue
+        if column.find_ancestor(exp.Select) is None:
+            return None  # any other column outside a subquery belongs to an outer table
+        if column.table in outer and (column.table != alias or column.name != partition_key):
+            return None  # a subquery correlated on anything but this alias's partition key
+    return alias
+
+
+def _partition_key_subqueries(condition: str, table_aliases: list[str]) -> list[str]:
+    """Subqueries whose rows include every partition key a condition admits, for use as variants of their own.
+
+    Only a plain ``<alias>.<pk> IN (SELECT ...)`` qualifies (each branch of an INTERSECT on its own). A negated IN
+    selects the keys to exclude, and a subquery that references an outer alias is no query of its own.
+    """
+    node, negated = _unwrap_condition(condition)
+    if negated or not isinstance(node, exp.In) or node.args.get("query") is None:
+        return []
+    query = node.args["query"]
+    query = query.this if isinstance(query, exp.Subquery) else query
+    branches: list[exp.Expr] = []
+    pending = [query]
+    while pending:
+        part = pending.pop(0)
+        if isinstance(part, exp.Intersect):
+            pending[:0] = [part.this, part.expression]
+        else:
+            branches.append(part)
+    return [
+        branch.sql()
+        for branch in branches
+        if isinstance(branch, exp.Select) and not any(column.table in table_aliases for column in branch.find_all(exp.Column))
+    ]
+
+
 def _is_partition_key_fk_join(condition: str, partition_key: str, table_aliases: list[str]) -> bool:
     """Check whether a condition is an attachment join on the partition key.
 
@@ -600,18 +673,11 @@ def extract_and_group_query_conditions(
                 partition_key_joins[(min(left_alias, right_alias), max(left_alias, right_alias))].append(condition)
             continue  # Skip adding to other conditions
         elif (
-            condition_refs.count(partition_key) >= 1
-            and (sqlglot.parse_one(condition).find(exp.In) or any(op in condition for op in ["BETWEEN", ">", "<", "=", "!=", "<>"]))
+            partition_key in condition_refs
+            and (pk_alias := _partition_key_condition_alias(condition, partition_key, table_aliases)) is not None
             and not _is_partition_key_fk_join(condition, partition_key, table_aliases)
         ):
-            # Partition key condition (IN, BETWEEN, comparison, etc.) — store with alias intact
-            pk_alias_match = re.match(r'(?:NOT\s+)?(\w+)\.', condition_refs)
-            if pk_alias_match:
-                pk_alias = pk_alias_match.group(1)
-            elif table_aliases:
-                pk_alias = table_aliases[0]
-            else:
-                pk_alias = "unknown"
+            # Partition key condition (IN, BETWEEN, comparison on <alias>.<pk>) — store with alias intact
             partition_key_conditions[pk_alias].append(condition)
             continue
 
@@ -1518,19 +1584,10 @@ def generate_partial_queries(
                                 q = f"{select_clause} FROM {', '.join(new_table_list_with_alias)}"
                         ret.append(q)
 
-    # Add also the raw partition_key queries
+    # Add also the subqueries of `pk IN (SELECT ...)` conditions as variants of their own
     for pk_conds in partition_key_conditions.values():
         for partition_key_part in pk_conds:
-            # Get part in brackets
-            part = re.search(r"\((.*)\)", partition_key_part)
-            if part:
-                spart = part.group(1)
-            else:
-                continue
-            sublist = spart.split("INTERSECT")
-            for sub in sublist:
-                sub = sub.strip()
-                ret.append(sub)
+            ret.extend(_partition_key_subqueries(partition_key_part, table_aliases))
 
     # Process each query with sqlglot, skipping unparseable variants
     result = []
