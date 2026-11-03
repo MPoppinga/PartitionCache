@@ -1774,9 +1774,11 @@ def _add_constraints_to_query(query: str, add_constraints: dict[str, str]) -> st
     Add constraints to specific tables in a query.
 
     Each constraint is added once per occurrence of its table in the outer FROM clause, with its columns
-    qualified by that occurrence's alias, and the WHERE clause is rebuilt in the variant generator's
-    canonical order. The result is the variant a query with the condition written out would produce, so
-    both share cache entries, and self-joins get one unambiguous condition per alias.
+    qualified by that occurrence's alias (also references to the table name inside the constraint's
+    subqueries), and the WHERE clause is rebuilt in the variant generator's canonical order. Self-joins get
+    one unambiguous condition per alias. The result equals the variant of the query with the condition
+    written out, so both share cache entries, unless the added condition changes the order in which the
+    generator numbers the aliases (t1, t2, ...): the aliases of the given variant are kept.
 
     Args:
         query: The SQL query to modify
@@ -1806,7 +1808,22 @@ def _add_constraints_to_query(query: str, add_constraints: dict[str, str]) -> st
                 logger.warning(f"Failed to parse constraint '{add_constraints[table.name]}': {e}")
                 continue
             for column in constraint_expr.find_all(exp.Column):
-                if column.find_ancestor(exp.Select) is None and column.table in ("", table.name):
+                inner_select = column.find_ancestor(exp.Select)
+                if inner_select is None:
+                    qualify = column.table in ("", table.name)
+                else:
+                    # Inside a subquery of the constraint only references to the table name, unless an enclosing subquery
+                    # has a FROM entry of that name itself
+                    shadowed = False
+                    node: exp.Expr | None = inner_select
+                    while node is not None:
+                        if isinstance(node, exp.Select) and any(
+                            source.alias_or_name == table.name for source in node.find_all(exp.Table) if source.parent_select is node
+                        ):
+                            shadowed = True
+                        node = node.parent
+                    qualify = column.table == table.name and not shadowed
+                if qualify:
                     column.set("table", exp.to_identifier(table.alias_or_name))
             new_constraints.append(constraint_expr)
 
@@ -1820,7 +1837,8 @@ def _add_constraints_to_query(query: str, add_constraints: dict[str, str]) -> st
         )
         for constraint_expr in new_constraints:
             conjuncts.extend(constraint_expr.flatten() if isinstance(constraint_expr, exp.And) else [constraint_expr])
-        texts = sorted({c.sql() for c in conjuncts})
+        # An OR conjunct keeps its parentheses, as in generated variants; joined with AND it would otherwise bind differently
+        texts = sorted({(exp.paren(c, copy=False) if isinstance(c, exp.Or) else c).sql() for c in conjuncts})
         select_stmt.set("where", exp.Where(this=sqlglot.parse_one(f"SELECT * FROM t WHERE {' AND '.join(texts)}").args["where"].this))
         simplified: exp.Expr = sqlglot.optimizer.simplify.simplify(parsed)
         return simplified.sql()
