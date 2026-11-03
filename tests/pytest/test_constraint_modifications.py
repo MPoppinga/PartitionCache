@@ -135,6 +135,30 @@ class TestAddConstraints:
         assert isinstance(result, str)
 
 
+    def test_constraint_is_qualified_per_occurrence_of_its_table(self):
+        """A self-join gets one condition per alias; unqualified, the column would be ambiguous."""
+        query = "SELECT DISTINCT t1.pk FROM points AS t1, points AS t2, regions AS t3 WHERE t1.pk = t2.pk AND t1.type = 6"
+        result = _add_constraints_to_query(query, {"points": "element = 6"})
+        assert result == (
+            "SELECT DISTINCT t1.pk FROM points AS t1, points AS t2, regions AS t3 "
+            "WHERE t1.element = 6 AND t1.pk = t2.pk AND t1.type = 6 AND t2.element = 6"
+        )
+
+    def test_columns_qualified_with_the_table_name_get_the_alias(self):
+        result = _add_constraints_to_query("SELECT DISTINCT t1.pk FROM points AS t1", {"points": "points.element = 6"})
+        assert result == "SELECT DISTINCT t1.pk FROM points AS t1 WHERE t1.element = 6"
+
+    def test_variants_match_a_query_with_the_condition_written_out(self):
+        """Entries populated with add_constraints must be found by queries that contain the condition themselves."""
+        query = "SELECT a.pk FROM points AS a, points AS b WHERE a.pk = b.pk AND a.type = 6 AND b.type = 7 AND DIST(a.x, b.x) <= 2"
+        written_out = query + " AND a.element = 6 AND b.element = 6"
+
+        added = generate_all_query_hash_pairs(query, "pk", min_component_size=1, warn_no_partition_key=False, add_constraints={"points": "element = 6"})
+        explicit = generate_all_query_hash_pairs(written_out, "pk", min_component_size=1, warn_no_partition_key=False)
+
+        assert {h for _, h in explicit} <= {h for _, h in added}
+
+
 class TestRemoveConstraints:
     """Test remove_constraints functionality."""
 
@@ -418,8 +442,8 @@ class TestRobustnessAndErrorHandling:
 
         result = _add_constraints_to_query(query, {"points": complex_constraint})
 
-        assert "size BETWEEN 1 AND 10" in result
-        assert "color IN ('red', 'blue')" in result
+        # Qualified with the table's alias and in the variant generator's form (BETWEEN as two bounds)
+        assert result == "SELECT * FROM points WHERE points.color IN ('red', 'blue') AND points.size <= 10 AND points.size >= 1 AND x > 0"
 
     def test_empty_query_set(self):
         """Test _apply_constraint_modifications with empty query set."""
