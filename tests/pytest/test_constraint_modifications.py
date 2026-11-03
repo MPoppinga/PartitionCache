@@ -8,6 +8,8 @@ Tests the new constraint modification features added to generate_all_query_hash_
 - remove_constraints_add for creating additional variants with removed constraints
 """
 
+import sqlglot
+from sqlglot import exp
 
 from partitioncache.query_processor import (
     _add_constraints_to_query,
@@ -133,6 +135,59 @@ class TestAddConstraints:
 
         # Depending on implementation, might return original or attempt to add
         assert isinstance(result, str)
+
+
+    def test_constraint_is_qualified_per_occurrence_of_its_table(self):
+        """A self-join gets one condition per alias; unqualified, the column would be ambiguous."""
+        query = "SELECT DISTINCT t1.pk FROM points AS t1, points AS t2, regions AS t3 WHERE t1.pk = t2.pk AND t1.type = 6"
+        result = _add_constraints_to_query(query, {"points": "element = 6"})
+        assert result == (
+            "SELECT DISTINCT t1.pk FROM points AS t1, points AS t2, regions AS t3 "
+            "WHERE t1.element = 6 AND t1.pk = t2.pk AND t1.type = 6 AND t2.element = 6"
+        )
+
+    def test_columns_qualified_with_the_table_name_get_the_alias(self):
+        result = _add_constraints_to_query("SELECT DISTINCT t1.pk FROM points AS t1", {"points": "points.element = 6"})
+        assert result == "SELECT DISTINCT t1.pk FROM points AS t1 WHERE t1.element = 6"
+
+    def test_or_conjunct_keeps_its_parentheses(self):
+        query = "SELECT DISTINCT t1.pk FROM points AS t1 WHERE (t1.type = 2 OR t1.type = 3) AND t1.v = 1"
+        result = _add_constraints_to_query(query, {"points": "element = 6"})
+        assert result == "SELECT DISTINCT t1.pk FROM points AS t1 WHERE t1.element = 6 AND (t1.type = 2 OR t1.type = 3) AND t1.v = 1"
+
+    def test_or_constraint_keeps_its_parentheses(self):
+        result = _add_constraints_to_query("SELECT DISTINCT t1.pk FROM points AS t1 WHERE t1.v = 1", {"points": "element = 6 OR element = 7"})
+        assert result == "SELECT DISTINCT t1.pk FROM points AS t1 WHERE (t1.element = 6 OR t1.element = 7) AND t1.v = 1"
+
+    def test_subquery_correlated_through_the_table_name_gets_the_alias(self):
+        query = "SELECT DISTINCT t1.pk FROM points AS t1 WHERE t1.v = 1"
+        correlated = _add_constraints_to_query(query, {"points": "EXISTS (SELECT 1 FROM tags AS g WHERE g.pid = points.id)"})
+        assert correlated == "SELECT DISTINCT t1.pk FROM points AS t1 WHERE EXISTS(SELECT 1 FROM tags AS g WHERE g.pid = t1.id) AND t1.v = 1"
+        own_table = _add_constraints_to_query(query, {"points": "EXISTS (SELECT 1 FROM points WHERE points.id = 3)"})
+        assert "points.id = 3" in own_table
+
+    def test_self_join_with_or_condition_matches_the_written_out_query(self):
+        query = "SELECT a.pk FROM points AS a, points AS b WHERE a.pk = b.pk AND a.type = 6 AND (b.type = 2 OR b.type = 3) AND DIST(a.x, b.x) <= 2"
+        written_out = query + " AND a.element = 6 AND b.element = 6"
+
+        added = generate_all_query_hash_pairs(query, "pk", min_component_size=1, warn_no_partition_key=False, add_constraints={"points": "element = 6"})
+        explicit = generate_all_query_hash_pairs(written_out, "pk", min_component_size=1, warn_no_partition_key=False)
+
+        assert {h for _, h in explicit} <= {h for _, h in added}
+        # The OR must keep binding only the type conditions, never the join or the other conjuncts
+        for variant, _ in added:
+            for disjunction in sqlglot.parse_one(variant).find_all(exp.Or):
+                assert {column.name for column in disjunction.find_all(exp.Column)} == {"type"}, variant
+
+    def test_variants_match_a_query_with_the_condition_written_out(self):
+        """Entries populated with add_constraints must be found by queries that contain the condition themselves."""
+        query = "SELECT a.pk FROM points AS a, points AS b WHERE a.pk = b.pk AND a.type = 6 AND b.type = 7 AND DIST(a.x, b.x) <= 2"
+        written_out = query + " AND a.element = 6 AND b.element = 6"
+
+        added = generate_all_query_hash_pairs(query, "pk", min_component_size=1, warn_no_partition_key=False, add_constraints={"points": "element = 6"})
+        explicit = generate_all_query_hash_pairs(written_out, "pk", min_component_size=1, warn_no_partition_key=False)
+
+        assert {h for _, h in explicit} <= {h for _, h in added}
 
 
 class TestRemoveConstraints:
@@ -418,8 +473,8 @@ class TestRobustnessAndErrorHandling:
 
         result = _add_constraints_to_query(query, {"points": complex_constraint})
 
-        assert "size BETWEEN 1 AND 10" in result
-        assert "color IN ('red', 'blue')" in result
+        # Qualified with the table's alias and in the variant generator's form (BETWEEN as two bounds)
+        assert result == "SELECT * FROM points WHERE points.color IN ('red', 'blue') AND points.size <= 10 AND points.size >= 1 AND x > 0"
 
     def test_empty_query_set(self):
         """Test _apply_constraint_modifications with empty query set."""

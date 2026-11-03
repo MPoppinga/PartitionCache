@@ -1773,9 +1773,17 @@ def _add_constraints_to_query(query: str, add_constraints: dict[str, str]) -> st
     """
     Add constraints to specific tables in a query.
 
+    Each constraint is added once per occurrence of its table in the outer FROM clause, with its columns
+    qualified by that occurrence's alias (also references to the table name inside the constraint's
+    subqueries), and the WHERE clause is rebuilt in the variant generator's canonical order. Self-joins get
+    one unambiguous condition per alias. The result equals the variant of the query with the condition
+    written out, so both share cache entries, unless the added condition changes the order in which the
+    generator numbers the aliases (t1, t2, ...): the aliases of the given variant are kept.
+
     Args:
         query: The SQL query to modify
-        add_constraints: Dict mapping table names to constraints (e.g. {"points_table": "size = 4"})
+        add_constraints: Dict mapping table names to constraints (e.g. {"points_table": "size = 4"});
+            columns may be unqualified or qualified with the table name
 
     Returns:
         Modified query with constraints added
@@ -1785,61 +1793,55 @@ def _add_constraints_to_query(query: str, add_constraints: dict[str, str]) -> st
 
     try:
         parsed = sqlglot.parse_one(query)
-
-        # Check if we have any of the target tables in the query
-        has_target_table = False
-        for table in parsed.find_all(exp.Table):
-            if table.name in add_constraints:
-                has_target_table = True
-                break
-
-        if not has_target_table:
-            return query
-
-        # Find the main SELECT statement
         select_stmt = parsed if isinstance(parsed, exp.Select) else parsed.find(exp.Select)
         if not select_stmt:
             return query
 
-        # Build combined constraint for all matching tables
-        new_constraints = []
-        for table_name, constraint in add_constraints.items():
-            # Check if this table exists in the query
-            table_exists = any(table.name == table_name for table in parsed.find_all(exp.Table))
-            if table_exists:
-                try:
-                    # Parse the constraint as an expression
-                    constraint_parsed = sqlglot.parse_one(f"SELECT * FROM t WHERE {constraint}")
-                    where_clause = constraint_parsed.find(exp.Where)
-                    if where_clause and where_clause.this:
-                        constraint_expr = where_clause.this
-                        new_constraints.append(constraint_expr)
-                except Exception as e:
-                    logger.warning(f"Failed to parse constraint '{constraint}': {e}")
+        new_constraints: list[exp.Expr] = []
+        for table in select_stmt.find_all(exp.Table):
+            if table.parent_select is not select_stmt or table.name not in add_constraints:
+                continue
+            try:
+                # Detached from the helper SELECT, so only columns inside subqueries of the constraint have a SELECT ancestor
+                constraint_expr = sqlglot.parse_one(f"SELECT * FROM t WHERE {add_constraints[table.name]}").args["where"].this.copy()
+            except Exception as e:
+                logger.warning(f"Failed to parse constraint '{add_constraints[table.name]}': {e}")
+                continue
+            for column in constraint_expr.find_all(exp.Column):
+                inner_select = column.find_ancestor(exp.Select)
+                if inner_select is None:
+                    qualify = column.table in ("", table.name)
+                else:
+                    # Inside a subquery of the constraint only references to the table name, unless an enclosing subquery
+                    # has a FROM entry of that name itself
+                    shadowed = False
+                    node: exp.Expr | None = inner_select
+                    while node is not None:
+                        if isinstance(node, exp.Select) and any(
+                            source.alias_or_name == table.name for source in node.find_all(exp.Table) if source.parent_select is node
+                        ):
+                            shadowed = True
+                        node = node.parent
+                    qualify = column.table == table.name and not shadowed
+                if qualify:
+                    column.set("table", exp.to_identifier(table.alias_or_name))
+            new_constraints.append(constraint_expr)
 
         if not new_constraints:
             return query
 
-        # Get existing WHERE clause
+        # Same order as generated variants: conjuncts sorted as text, then simplified
         existing_where = select_stmt.args.get("where")
-
-        if existing_where:
-            # Combine with existing WHERE clause using AND
-            combined_condition = existing_where.this
-            for constraint_expr in new_constraints:
-                combined_condition = exp.And(this=combined_condition, expression=constraint_expr)
-            select_stmt.set("where", exp.Where(this=combined_condition))
-        else:
-            # Create new WHERE clause
-            if len(new_constraints) == 1:
-                where_condition = new_constraints[0]
-            else:
-                where_condition = new_constraints[0]
-                for constraint_expr in new_constraints[1:]:
-                    where_condition = exp.And(this=where_condition, expression=constraint_expr)
-            select_stmt.set("where", exp.Where(this=where_condition))
-
-        return parsed.sql()
+        conjuncts = list(existing_where.this.flatten()) if existing_where and isinstance(existing_where.this, exp.And) else (
+            [existing_where.this] if existing_where else []
+        )
+        for constraint_expr in new_constraints:
+            conjuncts.extend(constraint_expr.flatten() if isinstance(constraint_expr, exp.And) else [constraint_expr])
+        # An OR conjunct keeps its parentheses, as in generated variants; joined with AND it would otherwise bind differently
+        texts = sorted({(exp.paren(c, copy=False) if isinstance(c, exp.Or) else c).sql() for c in conjuncts})
+        select_stmt.set("where", exp.Where(this=sqlglot.parse_one(f"SELECT * FROM t WHERE {' AND '.join(texts)}").args["where"].this))
+        simplified: exp.Expr = sqlglot.optimizer.simplify.simplify(parsed)
+        return simplified.sql()
     except Exception as e:
         logger.warning(f"Failed to add constraints to query: {e}")
         return query
