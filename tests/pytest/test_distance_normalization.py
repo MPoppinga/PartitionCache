@@ -323,3 +323,33 @@ class TestBucketingLoosensTheWholeCondition:
         for variant in variants:
             if "DIST(" in variant:
                 assert " OR " in variant, variant
+
+
+class TestBucketBoundsAreExact:
+    """Float division and 6-digit formatting could move a bound past its value and tighten the condition."""
+
+    @pytest.mark.parametrize(
+        ("condition", "steps", "bucketed"),
+        [
+            ("DIST(a.x, a.y) >= 1234567.5", 1, "DIST(a.x, a.y) >= 1234567"),
+            ("DIST(a.x, a.y) > 12.34567", 1e-05, "DIST(a.x, a.y) > 12.34567"),
+            ("DIST(a.x, a.y) > 1.7", 0.1, "DIST(a.x, a.y) > 1.7"),
+            ("DIST(a.x, a.y) < 1.71", 0.1, "DIST(a.x, a.y) < 1.8"),
+            ("(DIST(a.x, a.y)) < 2.5", 1, "(DIST(a.x, a.y)) < 3"),
+            ("DIST(a.x, a.y) < 1e3", 1, "DIST(a.x, a.y) < 1000"),
+        ],
+    )
+    def test_bound(self, condition, steps, bucketed):
+        query = f"SELECT a.pk FROM points AS a WHERE {condition}"
+        assert normalize_distance_conditions(query, bucket_steps=steps) == f"SELECT a.pk FROM points AS a WHERE {bucketed}"
+
+    @pytest.mark.parametrize("steps", [0.1, 0.25, 1, 1e-05, 1000])
+    def test_upper_bounds_never_drop_below_and_lower_bounds_never_rise_above_the_value(self, steps):
+        from decimal import Decimal
+
+        values = [Decimal(i) / 100 for i in range(0, 1000, 7)] + [Decimal("1234567.5"), Decimal("12.34567"), Decimal("98765432.123")]
+        for value in values:
+            upper = normalize_distance_conditions(f"SELECT a.pk FROM t AS a WHERE DIST(a.x, a.y) < {value}", bucket_steps=steps)
+            lower = normalize_distance_conditions(f"SELECT a.pk FROM t AS a WHERE DIST(a.x, a.y) > {value}", bucket_steps=steps)
+            assert Decimal(upper.rsplit("< ", 1)[1]) >= value, (value, upper)
+            assert Decimal(lower.rsplit("> ", 1)[1]) <= value, (value, lower)

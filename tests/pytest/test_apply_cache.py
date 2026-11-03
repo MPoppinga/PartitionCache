@@ -1143,6 +1143,15 @@ class TestSqlTheCacheCannotProcess:
         assert enhanced == self.BROKEN
         assert stats["sql_error"] == 1
 
+    @pytest.mark.parametrize(
+        "query", ["SELECT 1", "SELECT a.pk FROM points AS a WHERE " + " AND ".join(f"a.c{i} = {i}" for i in range(1200))], ids=["no_from", "deep_and"]
+    )
+    def test_shapes_the_variant_generator_cannot_handle(self, query):
+        handler = Mock(spec=AbstractCacheHandler_Lazy)
+        enhanced, stats = apply_cache_lazy(query, handler, "pk")
+        assert enhanced == query
+        assert stats["sql_error"] == 1
+
     def test_configuration_errors_still_raise(self):
         with pytest.raises(ValueError, match="does not support lazy intersection"):
             apply_cache_lazy("SELECT a.pk FROM points AS a WHERE a.x = 1", Mock(), "pk")

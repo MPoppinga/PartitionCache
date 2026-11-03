@@ -1337,16 +1337,18 @@ _P = ParamSpec("_P")
 def _runs_uncached_on_sql_errors(func: Callable[_P, tuple[str, dict[str, int]]]) -> Callable[_P, tuple[str, dict[str, int]]]:  # noqa: UP047
     """Return the query unchanged when the cache cannot process its SQL, instead of failing the query.
 
-    The cache is an optimization: SQL that the variant generation or the rewrite cannot parse or handle (a
-    sqlglot error) makes the query run without the cache, with a warning and ``sql_error: 1`` in the statistics.
-    Configuration errors (e.g. a handler without lazy support) still raise.
+    The cache is an optimization: SQL that the variant generation or the rewrite cannot parse or handle makes the
+    query run without the cache, with a warning and ``sql_error: 1`` in the statistics. This covers sqlglot errors,
+    RecursionError (very deeply nested SQL, e.g. thousands of conjuncts) and IndexError (SQL shapes the variant
+    generator does not expect, e.g. no FROM clause). Configuration errors (ValueError, e.g. a handler without lazy
+    support) and errors of the cache backend still raise.
     """
 
     @functools.wraps(func)
     def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> tuple[str, dict[str, int]]:
         try:
             return func(*args, **kwargs)
-        except sqlglot.errors.SqlglotError as e:
+        except (sqlglot.errors.SqlglotError, RecursionError, IndexError) as e:
             query = kwargs["query"] if "query" in kwargs else args[0]
             first_line = str(e).splitlines()[0] if str(e) else ""
             logger.warning(f"{func.__name__}: the query cannot be processed ({type(e).__name__}: {first_line}); it runs without the cache")
