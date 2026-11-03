@@ -763,15 +763,37 @@ class TestPartitionKeyConditionClassification:
         assert "SELECT b.pk FROM good AS b WHERE b.flag = 1" in variants
         assert "SELECT d.pk FROM ok AS d" in variants
 
-    def test_or_of_partition_key_comparisons_gives_no_bare_condition(self):
-        query = "SELECT a.pk FROM t AS a, u AS c WHERE a.pk = c.pk AND c.w = 2 AND (a.pk = 1 OR a.pk = 2)"
-        for variant in _variants(query, "pk"):
+    @pytest.mark.parametrize("condition", ["(a.pk = 1 OR a.pk = 2)", "a.pk % 10 = 3"])
+    def test_condition_on_the_partition_key_alone_holds_for_every_variant(self, condition):
+        query = f"SELECT a.pk FROM t AS a, u AS c WHERE a.pk = c.pk AND c.w = 2 AND {condition}"
+        variants = _variants(query, "pk")
+        for variant in variants:
             assert variant.startswith("SELECT"), variant
-
-    def test_in_subquery_correlated_with_another_alias_keeps_its_aliases(self):
-        query = """
-        SELECT a.pk FROM t AS a, u AS c WHERE a.pk = c.pk AND c.w = 2
-          AND a.pk IN (SELECT s.pk FROM s WHERE s.z = c.z)
-        """
-        for variant in _variants(query, "pk"):
             assert _references_only_own_aliases(variant), variant
+        assert any(v.startswith("SELECT DISTINCT t1.pk FROM u AS t1 WHERE") and "t1.pk" in v.split("WHERE")[1] for v in variants), variants
+
+    # The subquery alias b sorts between the outer aliases a and c, s after them
+    @pytest.mark.parametrize("inner", ["s AS b", "s"])
+    def test_in_subquery_correlated_with_another_alias_joins_both(self, inner):
+        alias = inner.split()[-1]
+        query = f"""
+        SELECT a.pk FROM t AS a, u AS c WHERE a.pk = c.pk AND c.w = 2 AND a.v = 1
+          AND a.pk IN (SELECT {alias}.pk FROM {inner} WHERE {alias}.z = c.z)
+        """
+        variants = _variants(query, "pk")
+        for variant in variants:
+            assert _references_only_own_aliases(variant), variant
+        assert any(f"t1.pk IN (SELECT {alias}.pk FROM {inner} WHERE {alias}.z = t2.z)" in v and "u AS t2" in v for v in variants), variants
+
+    @pytest.mark.parametrize(
+        ("condition", "expected"),
+        [
+            ("a.pk = ANY (SELECT b.pk FROM good AS b)", ["SELECT b.pk FROM good AS b"]),
+            ("a.pk IN (SELECT b.pk FROM good AS b UNION SELECT d.pk FROM ok AS d)", ["SELECT b.pk FROM good AS b UNION SELECT d.pk FROM ok AS d"]),
+            ("a.pk IN ((SELECT b.pk FROM good AS b) INTERSECT (SELECT d.pk FROM ok AS d))", ["SELECT b.pk FROM good AS b", "SELECT d.pk FROM ok AS d"]),
+        ],
+    )
+    def test_subqueries_that_contain_all_admitted_keys_are_variants(self, condition, expected):
+        variants = _variants(f"SELECT a.pk FROM t AS a WHERE a.v = 1 AND {condition}", "pk")
+        for subquery in expected:
+            assert subquery in variants
