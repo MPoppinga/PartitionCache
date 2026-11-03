@@ -1613,20 +1613,62 @@ def is_distance_function(condition: str) -> bool:
         return False
 
 
+_BUCKET_COMPARISONS: dict[type[exp.Expr], type[exp.Expr]] = {exp.LT: exp.GT, exp.LTE: exp.GTE, exp.GT: exp.LT, exp.GTE: exp.LTE}  # operator -> mirrored
+
+
+def _bucket_bound(value: float, bucket_steps: float, up: bool) -> float:
+    """Round a non-negative bound to the bucket grid: up to the next boundary or down to the previous one."""
+    floor = int(value / bucket_steps) * bucket_steps
+    return floor + bucket_steps if up and floor != value else floor
+
+
+def _numeric_literal(node: exp.Expr) -> float | None:
+    """The value of a non-negative numeric literal, else None (negative values are left alone)."""
+    if isinstance(node, exp.Paren):
+        return _numeric_literal(node.this)
+    if isinstance(node, exp.Literal) and not node.is_string:
+        try:
+            value = float(node.this)
+        except ValueError:
+            return None
+        return value if value >= 0 else None
+    return None
+
+
+def _monotone_polarity(node: exp.Expr, where: exp.Where) -> bool | None:
+    """Whether ``node`` occurs positively (True) or under an odd number of NOTs (False) in the WHERE clause.
+
+    None if the path to the WHERE clause passes anything but AND, OR, NOT and parentheses (a function argument,
+    CASE, a subquery ...): there, loosening the comparison need not loosen the condition.
+    """
+    positive = True
+    parent = node.parent
+    while parent is not where:
+        if isinstance(parent, exp.Not):
+            positive = not positive
+        elif not isinstance(parent, exp.And | exp.Or | exp.Paren):
+            return None
+        parent = parent.parent
+    return positive
+
+
 def normalize_distance_conditions(original_query: str, bucket_steps: float = 1.0, restrict_to_dist_functions=True) -> str:
     """
-    This function takes a query and normalizes the distance conditions.
-    It replaces the distance conditions with lower bound bucket bracket  and upper bound bucket bracket
-    of the BETWEEN clause.
+    Normalize the distance conditions of a query to a grid of ``bucket_steps``.
 
-    Min values gets replaced by the next lower bucket value
-    Max values gets replaced by the next higher bucket value
-    eg.
-    1.6 - 3.6 -> 1 - 4 WITH bucket_steps = 1
-    1.6 - 3.6 -> 0 - 4 WITH bucket_steps = 2
+    Every comparison of a distance function with a non-negative number in the outer WHERE clause is loosened to
+    the next bucket boundary, so that queries with nearby distances share variants: an upper bound is rounded up,
+    a lower bound down (e.g. ``BETWEEN 1.6 AND 3.6`` -> ``BETWEEN 1 AND 4`` with bucket_steps = 1, ``0 - 4`` with
+    bucket_steps = 2). Under NOT the directions flip, so the condition as a whole is always loosened, also inside
+    OR and NOT BETWEEN. Comparisons in other contexts (function arguments, CASE, subqueries) stay unchanged.
 
-    query: str: The query to be normalized
-    partition_key: str: The identifier of the search space
+    Args:
+        original_query: The query to be normalized.
+        bucket_steps: Bucket width; 0 or negative returns the query unchanged.
+        restrict_to_dist_functions: Only bucket comparisons of distance functions (default), else of any expression.
+
+    Returns:
+        The normalized query.
     """
     bucket_steps = float(bucket_steps)
 
@@ -1634,193 +1676,40 @@ def normalize_distance_conditions(original_query: str, bucket_steps: float = 1.0
     if bucket_steps <= 0:
         return original_query
 
-    original_query = sqlglot.parse_one(original_query).sql()
-    condition_list = extract_conjunctive_conditions(original_query)
+    parsed = sqlglot.parse_one(original_query)
+    where = parsed.args.get("where") if isinstance(parsed, exp.Select) else None
+    if where is None:
+        return parsed.sql()
 
-    query = original_query
-    distance_conditions_between = []
-    distance_conditions_smaller = []
-    distance_conditions_greater = []
+    def bucketable(side: exp.Expr) -> bool:
+        return not restrict_to_dist_functions or (isinstance(side, exp.Func) and is_distance_function(side.sql()))
 
-    for condition in condition_list:
-        if " BETWEEN " in condition.upper():
-            distance_conditions_between.append(condition)
-        elif "<" in condition or "<=" in condition:
-            distance_conditions_smaller.append(condition)
-        elif ">" in condition or ">=" in condition:
-            distance_conditions_greater.append(condition)
-        else:
-            pass
-
-    # TODO Ensure one of the values is a literal number
-    # TODO Ensure number is on second position
-    # TODO Ensure number is not negative (verify that this is needed)
-
-    # Check if at least one value is a number
-    for distance_condition in list(distance_conditions_between + distance_conditions_smaller + distance_conditions_greater):
-        if not any(str(x).replace(".", "", 1).isdigit() for x in distance_condition.split()):
-            logger.warning(f"No numeric value found in distance condition: {distance_condition}")
-            if distance_condition in distance_conditions_between:
-                distance_conditions_between.remove(distance_condition)
-            if distance_condition in distance_conditions_smaller:
-                distance_conditions_smaller.remove(distance_condition)
-            if distance_condition in distance_conditions_greater:
-                distance_conditions_greater.remove(distance_condition)
-
-    # Check if number is on right side of comparison operator for distance functions # TODO check if this is needed, should be handled by sqlglot
-    for distance_condition in list(distance_conditions_between + distance_conditions_smaller + distance_conditions_greater):
-        if is_distance_function(distance_condition):
-            if "<" in distance_condition or ">" in distance_condition:
-                parts = re.split(r"(<=|>=|<|>)", distance_condition)
-                if len(parts) == 2 and not str(parts[1].strip()).replace(".", "", 1).isdigit():
-                    logger.warning(f"Numeric value not on right side of comparison in distance condition: {distance_condition}")
-                    if distance_condition in distance_conditions_between:
-                        distance_conditions_between.remove(distance_condition)
-                    if distance_condition in distance_conditions_smaller:
-                        distance_conditions_smaller.remove(distance_condition)
-                    if distance_condition in distance_conditions_greater:
-                        distance_conditions_greater.remove(distance_condition)
-
-    # Check for negative numbers
-    for distance_condition in list(distance_conditions_between + distance_conditions_smaller + distance_conditions_greater):
-        numbers = [float(x) for x in re.findall(r"-?\d*\.?\d+", distance_condition)]
-        if any(n < 0 for n in numbers):
-            logger.warning(f"Negative value found in distance condition: {distance_condition}")
-            if distance_condition in distance_conditions_between:
-                distance_conditions_between.remove(distance_condition)
-            if distance_condition in distance_conditions_smaller:
-                distance_conditions_smaller.remove(distance_condition)
-            if distance_condition in distance_conditions_greater:
-                distance_conditions_greater.remove(distance_condition)
-
-    for distance_condition in distance_conditions_between:
-        if restrict_to_dist_functions and not is_distance_function(distance_condition):
+    for node in list(where.find_all(exp.Between, *_BUCKET_COMPARISONS)):
+        if node.find_ancestor(exp.Select) is not parsed:
+            continue  # inside a subquery
+        positive = _monotone_polarity(node, where)
+        if positive is None:
             continue
-        lower_bound, upper_bound = distance_condition.split(" BETWEEN ")[1].split(" AND ")
-
-        lower_bound = lower_bound.strip()
-        lower_bound = lower_bound.replace(";", "")
-        upper_bound = upper_bound.strip()
-        upper_bound = upper_bound.replace(";", "")
-
-        # do nothing if either is negative
-        if float(lower_bound) < 0 or float(upper_bound) < 0:
+        if isinstance(node, exp.Between):
+            low, high = _numeric_literal(node.args["low"]), _numeric_literal(node.args["high"])
+            if low is None or high is None or not bucketable(node.this):
+                continue
+            node.set("low", exp.Literal.number(f"{_bucket_bound(low, bucket_steps, up=not positive):g}"))
+            node.set("high", exp.Literal.number(f"{_bucket_bound(high, bucket_steps, up=positive):g}"))
             continue
-
-        # Floor lower bound
-        lower_boundf = int(float(lower_bound) / bucket_steps) * bucket_steps
-
-        # Ceil upper bound
-        if int(float(upper_bound) / bucket_steps) * bucket_steps == float(upper_bound):
-            upper_boundf = int(float(upper_bound) / bucket_steps) * bucket_steps
+        operator = type(node)
+        if _numeric_literal(node.expression) is not None and bucketable(node.this):
+            literal_arg = "expression"
+        elif _numeric_literal(node.this) is not None and bucketable(node.expression):
+            literal_arg, operator = "this", _BUCKET_COMPARISONS[operator]  # 2.5 > DIST(...) is DIST(...) < 2.5
         else:
-            upper_boundf = int(float(upper_bound) / bucket_steps) * bucket_steps + bucket_steps
-
-        new_condition = f"{distance_condition.split('BETWEEN')[0]} BETWEEN {lower_boundf:g} AND {upper_boundf:g}"
-        query = query.replace(distance_condition, new_condition)
-
-    # TODO ensure robustness with flipped conditions
-    for distance_condition in distance_conditions_smaller:
-        if restrict_to_dist_functions and not is_distance_function(distance_condition):
             continue
+        value = _numeric_literal(node.args[literal_arg])
+        assert value is not None
+        upper_bound = operator in (exp.LT, exp.LTE)
+        node.set(literal_arg, exp.Literal.number(f"{_bucket_bound(value, bucket_steps, up=upper_bound == positive):g}"))
 
-        # More robust parsing: use regex to extract the numeric value correctly
-        if "<=" in distance_condition:
-            # Use regex to find the number after <=, avoiding parsing issues with subsequent AND clauses
-            match = re.search(r"<=\s*([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)", distance_condition)
-            if not match:
-                logger.warning(f"Could not extract numeric value from condition: {distance_condition}")
-                continue
-
-            value_str = match.group(1)
-            try:
-                value = float(value_str)
-            except ValueError:
-                logger.warning(f"Could not parse numeric value '{value_str}' from condition: {distance_condition}")
-                continue
-
-            if value < 0:
-                continue
-            # For <= operator: round up to next bucket boundary
-            bucket_floor = int(value / bucket_steps) * bucket_steps
-            if bucket_floor == value:
-                # Value is exactly on bucket boundary, keep it
-                valuef = value
-            else:
-                # Round up to next bucket boundary
-                valuef = bucket_floor + bucket_steps
-            left_part = distance_condition.split("<=")[0]
-            new_condition = f"{left_part} <= {valuef:g}"
-        else:
-            # Similar robust parsing for < operator
-            match = re.search(r"<\s*([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)", distance_condition)
-            if not match:
-                logger.warning(f"Could not extract numeric value from condition: {distance_condition}")
-                continue
-
-            value_str = match.group(1)
-            try:
-                value = float(value_str)
-            except ValueError:
-                logger.warning(f"Could not parse numeric value '{value_str}' from condition: {distance_condition}")
-                continue
-
-            if value < 0:
-                continue
-            b = int(value / bucket_steps) * bucket_steps
-            if b == value:
-                valuef = b
-            else:
-                valuef = b + bucket_steps
-            left_part = distance_condition.split("<")[0]
-            new_condition = f"{left_part} < {valuef:g}"
-        query = query.replace(distance_condition, new_condition)
-
-    for distance_condition in distance_conditions_greater:
-        if restrict_to_dist_functions and not is_distance_function(distance_condition):
-            continue
-
-        # More robust parsing for >= and > operators
-        if ">=" in distance_condition:
-            match = re.search(r">=\s*([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)", distance_condition)
-            if not match:
-                logger.warning(f"Could not extract numeric value from condition: {distance_condition}")
-                continue
-
-            value_str = match.group(1)
-            try:
-                value = float(value_str)
-            except ValueError:
-                logger.warning(f"Could not parse numeric value '{value_str}' from condition: {distance_condition}")
-                continue
-
-            if value < 0:
-                continue
-            valuef = int(value / bucket_steps) * bucket_steps
-            left_part = distance_condition.split(">=")[0]
-            new_condition = f"{left_part} >= {valuef:g}"
-        else:
-            match = re.search(r">\s*([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)", distance_condition)
-            if not match:
-                logger.warning(f"Could not extract numeric value from condition: {distance_condition}")
-                continue
-
-            value_str = match.group(1)
-            try:
-                value = float(value_str)
-            except ValueError:
-                logger.warning(f"Could not parse numeric value '{value_str}' from condition: {distance_condition}")
-                continue
-
-            if value < 0:
-                continue
-            valuef = int(value / bucket_steps) * bucket_steps
-            left_part = distance_condition.split(">")[0]
-            new_condition = f"{left_part} > {valuef:g}"
-        query = query.replace(distance_condition, new_condition)
-
-    # Collapse the whitespace left by the replacements, but not inside string literals
-    return re.sub(r"('(?:[^']|'')*')|\s+", lambda m: m.group(1) or " ", query).strip()
+    return parsed.sql()
 
 
 def _add_constraints_to_query(query: str, add_constraints: dict[str, str]) -> str:

@@ -258,3 +258,68 @@ class TestDistanceNormalization:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestBucketingLoosensTheWholeCondition:
+    """Bucketing must loosen the condition as a whole (no false negatives) and must never break the query."""
+
+    @pytest.mark.parametrize(
+        ("condition", "bucketed"),
+        [
+            ("DIST(a.x, a.y) < 2.5 OR a.type = 3", "DIST(a.x, a.y) < 3 OR a.type = 3"),
+            ("a.v = 1 AND (DIST(a.x, a.y) < 2.5 OR a.type = 3)", "a.v = 1 AND (DIST(a.x, a.y) < 3 OR a.type = 3)"),
+            ("NOT DIST(a.x, a.y) BETWEEN 2.5 AND 5.5", "NOT DIST(a.x, a.y) BETWEEN 3 AND 5"),
+            ("NOT DIST(a.x, a.y) < 2.5", "NOT DIST(a.x, a.y) < 2"),
+            ("NOT (DIST(a.x, a.y) >= 2.5 AND a.type = 3)", "NOT (DIST(a.x, a.y) >= 3 AND a.type = 3)"),
+            ("2.5 > DIST(a.x, a.y)", "3 > DIST(a.x, a.y)"),
+            ("DIST(a.x, a.y) BETWEEN 1.6 AND 3.6", "DIST(a.x, a.y) BETWEEN 1 AND 4"),
+            # Not monotone in the comparison: left unchanged
+            ("COALESCE(DIST(a.x, a.y) < 2.5, FALSE)", "COALESCE(DIST(a.x, a.y) < 2.5, FALSE)"),
+            ("a.pk IN (SELECT b.pk FROM points AS b WHERE DIST(b.x, b.y) < 2.5)", "a.pk IN (SELECT b.pk FROM points AS b WHERE DIST(b.x, b.y) < 2.5)"),
+        ],
+    )
+    def test_bucketed_condition(self, condition, bucketed):
+        assert normalize_distance_conditions(f"SELECT a.pk FROM points AS a WHERE {condition}", bucket_steps=1) == (
+            f"SELECT a.pk FROM points AS a WHERE {bucketed}"
+        )
+
+    @pytest.mark.parametrize(
+        "condition",
+        [
+            "DIST(a.x, a.y) < 2.5 OR a.type = 3",
+            "NOT DIST(a.x, a.y) BETWEEN 2.5 AND 5.5",
+            "NOT DIST(a.x, a.y) <= 2.5",
+            "NOT (DIST(a.x, a.y) > 4.2 OR a.type = 1)",
+            "DIST(a.x, a.y) > 1.5 AND NOT DIST(a.x, a.y) >= 6.5",
+            "3.3 <= DIST(a.x, a.y)",
+        ],
+    )
+    def test_every_row_of_the_query_satisfies_the_bucketed_query(self, condition):
+        import sqlite3
+
+        conn = sqlite3.connect(":memory:")
+        conn.create_function("DIST", 2, lambda x, y: abs(x - y))
+        conn.execute("CREATE TABLE points (pk INTEGER, x REAL, y REAL, type INTEGER)")
+        conn.executemany("INSERT INTO points VALUES (?, 0, ?, ?)", [(i, i * 0.05, i % 4) for i in range(200)])
+        query = f"SELECT a.pk FROM points AS a WHERE {condition}"
+        original = {row[0] for row in conn.execute(query)}
+        bucketed = {row[0] for row in conn.execute(normalize_distance_conditions(query, bucket_steps=1))}
+        assert original <= bucketed
+        assert original
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "SELECT a.pk FROM points AS a, points AS b WHERE a.pk = b.pk AND a.type = 1 AND b.type = 2 AND DIST(a.x, b.x) NOT BETWEEN 2.5 AND 5.5",
+            "SELECT a.pk FROM points AS a WHERE a.v = 1 AND (DIST(a.x, a.y) < 2.5 OR a.type = 3)",
+        ],
+    )
+    def test_variant_generation_does_not_raise_and_keeps_or_branches(self, query):
+        from partitioncache.query_processor import generate_all_query_hash_pairs
+
+        variants = [v for v, _ in generate_all_query_hash_pairs(query, "pk", min_component_size=1, warn_no_partition_key=False, bucket_steps=1.0)]
+        assert variants
+        # Both distance conditions are disjunctions (NOT BETWEEN as < OR >); no variant may keep only one side
+        for variant in variants:
+            if "DIST(" in variant:
+                assert " OR " in variant, variant
