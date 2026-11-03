@@ -343,6 +343,11 @@ class TestBucketBoundsAreExact:
         query = f"SELECT a.pk FROM points AS a WHERE {condition}"
         assert normalize_distance_conditions(query, bucket_steps=steps) == f"SELECT a.pk FROM points AS a WHERE {bucketed}"
 
+    def test_bounds_beyond_decimal_precision_stay_unchanged(self):
+        query = "SELECT a.pk FROM points AS a WHERE DIST(a.x, a.y) < 1e30 AND DIST(a.x, a.z) < 2.5"
+        assert normalize_distance_conditions(query, bucket_steps=1) == "SELECT a.pk FROM points AS a WHERE DIST(a.x, a.y) < 1e30 AND DIST(a.x, a.z) < 3"
+        assert normalize_distance_conditions(query, bucket_steps=float("inf")) == query
+
     @pytest.mark.parametrize("steps", [0.1, 0.25, 1, 1e-05, 1000])
     def test_upper_bounds_never_drop_below_and_lower_bounds_never_rise_above_the_value(self, steps):
         from decimal import Decimal

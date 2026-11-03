@@ -1617,13 +1617,17 @@ def is_distance_function(condition: str) -> bool:
 _BUCKET_COMPARISONS: dict[type[exp.Expr], type[exp.Expr]] = {exp.LT: exp.GT, exp.LTE: exp.GTE, exp.GT: exp.LT, exp.GTE: exp.LTE}  # operator -> mirrored
 
 
-def _bucket_bound(value: Decimal, bucket_steps: Decimal, up: bool) -> exp.Expr:
+def _bucket_bound(value: Decimal, bucket_steps: Decimal, up: bool) -> exp.Expr | None:
     """Round a non-negative bound to the bucket grid, up to the next boundary or down to the previous one.
 
     Decimal arithmetic and exact formatting: float division (1.7 // 0.1 * 0.1 = 1.7000000000000002) or printing
     with few significant digits (1234567.5 -> 1.23457e+06) could move a bound past its value and tighten it.
+    Returns None (bound left unchanged) if the quotient exceeds Decimal's precision (e.g. 1e30 with step 1).
     """
-    floor = (value // bucket_steps) * bucket_steps
+    try:
+        floor = (value // bucket_steps) * bucket_steps
+    except InvalidOperation:
+        return None
     bound = floor + bucket_steps if up and floor != value else floor
     return exp.Literal.number(format(bound.normalize(), "f"))
 
@@ -1680,6 +1684,8 @@ def normalize_distance_conditions(original_query: str, bucket_steps: float = 1.0
     if float(bucket_steps) <= 0:
         return original_query
     steps = Decimal(str(bucket_steps))
+    if not steps.is_finite():
+        return original_query
 
     parsed = sqlglot.parse_one(original_query)
     where = parsed.args.get("where") if isinstance(parsed, exp.Select) else None
@@ -1701,8 +1707,10 @@ def normalize_distance_conditions(original_query: str, bucket_steps: float = 1.0
             low, high = _numeric_literal(node.args["low"]), _numeric_literal(node.args["high"])
             if low is None or high is None or not bucketable(node.this):
                 continue
-            node.set("low", _bucket_bound(low, steps, up=not positive))
-            node.set("high", _bucket_bound(high, steps, up=positive))
+            new_low, new_high = _bucket_bound(low, steps, up=not positive), _bucket_bound(high, steps, up=positive)
+            if new_low is not None and new_high is not None:
+                node.set("low", new_low)
+                node.set("high", new_high)
             continue
         operator = type(node)
         if _numeric_literal(node.expression) is not None and bucketable(node.this):
@@ -1714,7 +1722,9 @@ def normalize_distance_conditions(original_query: str, bucket_steps: float = 1.0
         value = _numeric_literal(node.args[literal_arg])
         assert value is not None
         upper_bound = operator in (exp.LT, exp.LTE)
-        node.set(literal_arg, _bucket_bound(value, steps, up=upper_bound == positive))
+        bound = _bucket_bound(value, steps, up=upper_bound == positive)
+        if bound is not None:
+            node.set(literal_arg, bound)
 
     return parsed.sql()
 
