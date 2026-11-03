@@ -235,6 +235,7 @@ Lazy counterpart to `extend_query_with_partition_keys`: integrates a lazy SQL su
 
 **Returns:**
 - `Tuple[str, Dict]`: (enhanced_query, statistics). With `min_query_cost` set, the statistics also contain `cost_gated` (1 if the cache was skipped) and `query_cost` (rounded estimate, when available)
+- SQL the cache cannot parse or rewrite never fails the query: it is returned unchanged with a warning, and the statistics contain `sql_error: 1` (also for `apply_cache`). Configuration errors, e.g. a handler without lazy support, still raise.
 
 **Example:**
 ```python

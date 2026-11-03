@@ -2,6 +2,7 @@
 Tests for the apply_cache module, specifically extend_query_with_partition_keys function.
 """
 
+import logging
 import warnings
 from datetime import datetime
 from unittest.mock import Mock
@@ -17,7 +18,7 @@ from partitioncache.apply_cache import (
     find_p0_alias,
     rewrite_query_with_p0_table,
 )
-from partitioncache.cache_handler.abstract import AbstractCacheHandler_Lazy
+from partitioncache.cache_handler.abstract import AbstractCacheHandler, AbstractCacheHandler_Lazy
 
 
 class TestFindP0Alias:
@@ -1120,3 +1121,28 @@ class TestTempTableSqlDialect:
         )
         assert "ON COMMIT DROP" in pg and "DROP TABLE IF EXISTS" not in pg
         assert "ON COMMIT DROP" not in duck and "DROP TABLE IF EXISTS" in duck
+
+
+class TestSqlTheCacheCannotProcess:
+    """SQL the cache cannot parse or rewrite makes the query run without the cache, it never fails it."""
+
+    BROKEN = "SELECT a.pk FROM points AS a WHERE a.x = ("
+
+    def test_apply_cache_lazy_returns_the_query_unchanged(self, caplog):
+        handler = Mock(spec=AbstractCacheHandler_Lazy)
+        with caplog.at_level(logging.WARNING, logger="PartitionCache"):
+            enhanced, stats = apply_cache_lazy(self.BROKEN, handler, "pk")
+        assert enhanced == self.BROKEN
+        assert stats["sql_error"] == 1 and stats["enhanced"] == 0
+        assert "runs without the cache" in caplog.text
+        handler.get_intersected_lazy.assert_not_called()
+
+    def test_apply_cache_returns_the_query_unchanged(self):
+        handler = Mock(spec=AbstractCacheHandler)
+        enhanced, stats = apply_cache(query=self.BROKEN, cache_handler=handler, partition_key="pk")
+        assert enhanced == self.BROKEN
+        assert stats["sql_error"] == 1
+
+    def test_configuration_errors_still_raise(self):
+        with pytest.raises(ValueError, match="does not support lazy intersection"):
+            apply_cache_lazy("SELECT a.pk FROM points AS a WHERE a.x = 1", Mock(), "pk")

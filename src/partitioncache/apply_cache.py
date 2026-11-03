@@ -6,6 +6,7 @@ It utilizes the given cache to extend the SQL query with the set of possible par
 
 """
 
+import functools
 import math
 import numbers
 import random
@@ -14,9 +15,10 @@ from collections.abc import Callable
 from datetime import datetime
 from decimal import Decimal
 from logging import getLogger
-from typing import Any, Literal
+from typing import Any, Literal, ParamSpec
 
 import sqlglot
+import sqlglot.errors
 import sqlglot.expressions as exp
 
 from partitioncache.cache_handler.abstract import AbstractCacheHandler, AbstractCacheHandler_Lazy
@@ -1328,6 +1330,32 @@ def _check_cost_gate(query: str, cost_estimator: Callable[[str], float | None] |
     return gated, {"cost_gated": int(gated), "query_cost": round(cost)}
 
 
+# ParamSpec instead of PEP 695 type parameters: the package supports Python 3.10
+_P = ParamSpec("_P")
+
+
+def _runs_uncached_on_sql_errors(func: Callable[_P, tuple[str, dict[str, int]]]) -> Callable[_P, tuple[str, dict[str, int]]]:  # noqa: UP047
+    """Return the query unchanged when the cache cannot process its SQL, instead of failing the query.
+
+    The cache is an optimization: SQL that the variant generation or the rewrite cannot parse or handle (a
+    sqlglot error) makes the query run without the cache, with a warning and ``sql_error: 1`` in the statistics.
+    Configuration errors (e.g. a handler without lazy support) still raise.
+    """
+
+    @functools.wraps(func)
+    def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> tuple[str, dict[str, int]]:
+        try:
+            return func(*args, **kwargs)
+        except sqlglot.errors.SqlglotError as e:
+            query = kwargs["query"] if "query" in kwargs else args[0]
+            first_line = str(e).splitlines()[0] if str(e) else ""
+            logger.warning(f"{func.__name__}: the query cannot be processed ({type(e).__name__}: {first_line}); it runs without the cache")
+            return str(query), {"generated_variants": 0, "cache_hits": 0, "enhanced": 0, "p0_rewritten": 0, "sql_error": 1}
+
+    return wrapper
+
+
+@_runs_uncached_on_sql_errors
 def apply_cache_lazy(
     query: str,
     cache_handler: AbstractCacheHandler_Lazy,
@@ -1592,6 +1620,7 @@ def apply_cache_lazy(
     return enhanced_query, stats
 
 
+@_runs_uncached_on_sql_errors
 def apply_cache(
     query: str,
     cache_handler: AbstractCacheHandler,
