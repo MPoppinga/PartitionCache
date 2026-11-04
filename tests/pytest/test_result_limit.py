@@ -86,24 +86,36 @@ class TestPostgreSQLProcessorResultLimit:
         assert len(postgresql_array.get("any", "pk")) == 50
 
 
-def test_queries_table_from_before_the_limit_status_is_migrated(postgresql_array):
-    """A queries table whose CHECK lacks 'limit' (created by older versions) accepts it after handler setup."""
+def _array_handler(prefix):
     from partitioncache.cache_handler.postgresql_array import PostgreSQLArrayCacheHandler
 
-    table = postgresql_array.tableprefix + "_queries"
+    return PostgreSQLArrayCacheHandler(
+        db_name=os.getenv("PARTITIONCACHE_TEST_PG_DB", "postgres"),
+        db_host=os.getenv("PARTITIONCACHE_TEST_PG_HOST", ""),
+        db_user=os.getenv("PARTITIONCACHE_TEST_PG_USER", "postgres"),
+        db_password=os.getenv("PARTITIONCACHE_TEST_PG_PASSWORD", ""),
+        db_port=int(os.getenv("PARTITIONCACHE_TEST_PG_PORT", "5432")),
+        db_tableprefix=prefix,
+    )
+
+
+def _restore_old_status_check(conn, table):
+    """Give the queries table the status CHECK of versions before 'limit'."""
+    name = conn.execute("SELECT conname FROM pg_constraint WHERE conrelid = to_regclass(quote_ident(%s)) AND contype = 'c'", (table,)).fetchone()[0]
+    conn.execute(f'ALTER TABLE "{table}" DROP CONSTRAINT "{name}", ADD CONSTRAINT "{name}" CHECK (status IN (\'ok\', \'timeout\', \'failed\'))')
+
+
+@pytest.mark.parametrize("case", ["lower", "Mixed"])
+def test_queries_table_from_before_the_limit_status_is_migrated(case):
+    """A queries table whose CHECK lacks 'limit' (created by older versions) accepts it after handler setup."""
+    if not os.getenv("PARTITIONCACHE_TEST_PG_HOST"):
+        pytest.skip("PARTITIONCACHE_TEST_PG_HOST not set")
+    prefix = f"resultlimit_{uuid.uuid4().hex[:8]}" if case == "lower" else f"ResultLimit_{uuid.uuid4().hex[:8]}"
+    _array_handler(prefix).close()
     conn = _pg_connect()
     try:
-        name = conn.execute("SELECT conname FROM pg_constraint WHERE conrelid = %s::regclass AND contype = 'c'", (table,)).fetchone()[0]
-        conn.execute(f"ALTER TABLE {table} DROP CONSTRAINT {name}, ADD CONSTRAINT {name} CHECK (status IN ('ok', 'timeout', 'failed'))")
-
-        handler = PostgreSQLArrayCacheHandler(
-            db_name=os.getenv("PARTITIONCACHE_TEST_PG_DB", "postgres"),
-            db_host=os.getenv("PARTITIONCACHE_TEST_PG_HOST", ""),
-            db_user=os.getenv("PARTITIONCACHE_TEST_PG_USER", "postgres"),
-            db_password=os.getenv("PARTITIONCACHE_TEST_PG_PASSWORD", ""),
-            db_port=int(os.getenv("PARTITIONCACHE_TEST_PG_PORT", "5432")),
-            db_tableprefix=postgresql_array.tableprefix,
-        )
+        _restore_old_status_check(conn, prefix + "_queries")
+        handler = _array_handler(prefix)
         try:
             handler.set_query("q", "SELECT 1", "pk")
             assert handler.set_query_status("q", "pk", "limit") is True
@@ -112,6 +124,54 @@ def test_queries_table_from_before_the_limit_status_is_migrated(postgresql_array
             handler.close()
     finally:
         conn.close()
+
+
+def test_migration_gives_way_to_an_open_transaction_on_the_queries_table():
+    """Waiting for the exclusive lock would stall every reader of the table; the handler starts without migrating."""
+    import time
+
+    if not os.getenv("PARTITIONCACHE_TEST_PG_HOST"):
+        pytest.skip("PARTITIONCACHE_TEST_PG_HOST not set")
+    prefix = f"resultlimit_{uuid.uuid4().hex[:8]}"
+    table = prefix + "_queries"
+    _array_handler(prefix).close()
+    conn, job = _pg_connect(), _pg_connect()
+    try:
+        _restore_old_status_check(conn, table)
+        conn.execute(f"INSERT INTO {table} (query_hash, query, partition_key) VALUES ('busy', 'SELECT 1', 'pk')")
+        job.autocommit = False
+        job.execute(f"UPDATE {table} SET last_seen = now() WHERE query_hash = 'busy'")  # a running job
+
+        started = time.monotonic()
+        _array_handler(prefix).close()
+        assert time.monotonic() - started < 10
+        definition = conn.execute(f"SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = '{table}'::regclass AND contype = 'c'").fetchone()[0]
+        assert "'limit'" not in definition
+
+        job.commit()
+        _array_handler(prefix).close()
+        definition = conn.execute(f"SELECT pg_get_constraintdef(oid), convalidated FROM pg_constraint WHERE conrelid = '{table}'::regclass AND contype = 'c'").fetchone()
+        assert "'limit'" in definition[0] and definition[1]
+    finally:
+        job.rollback()
+        job.close()
+        conn.close()
+
+
+def test_duckdb_treats_limit_as_a_known_status():
+    pytest.importorskip("duckdb")
+    from partitioncache.cache_handler.duckdb_bit import DuckDBBitCacheHandler
+
+    handler = DuckDBBitCacheHandler(":memory:", table_prefix="resultlimit", bitsize=16)
+    try:
+        handler.register_partition_key("pk", "integer")
+        handler.set_query("k", "SELECT 1", "pk")
+        assert handler.set_query_status("k", "pk", "limit") is True
+        assert handler.exists("k", "pk", check_query=True)
+        assert handler.filter_existing_keys({"k"}, "pk", check_query=True) == {"k"}
+        assert handler.get("k", "pk") is None
+    finally:
+        handler.close()
 
 
 @pytest.mark.parametrize("backend", ["rocksdict", "rocksdb", "redis_set"])

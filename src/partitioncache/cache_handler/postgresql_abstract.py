@@ -114,12 +114,15 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
         """Extend the status CHECK of a queries table created before the 'limit' status existed.
 
         Without it the queue processor's result limit could not record 'limit'; the job failed on the
-        constraint instead. Runs the ALTER only when the constraint lacks 'limit'. A failure (e.g. a user
-        without ALTER rights) is logged and leaves the table as it is.
+        constraint instead. Runs the ALTER only when the constraint lacks 'limit'. The new constraint is added
+        NOT VALID, which needs the exclusive lock only briefly and scans nothing, and validated separately under
+        a lock that blocks neither reads nor writes. A lock_timeout keeps a busy table (e.g. a running job) from
+        stalling every reader behind the waiting ALTER. A failure (timeout, a user without ALTER rights) is
+        logged and leaves the table as it is; the next handler start tries again.
         """
         table = self.tableprefix + "_queries"
         find_constraint = (
-            "SELECT conname FROM pg_constraint WHERE conrelid = to_regclass(%s) AND contype = 'c' "
+            "SELECT conname FROM pg_constraint WHERE conrelid = to_regclass(quote_ident(%s)) AND contype = 'c' "
             "AND pg_get_constraintdef(oid) LIKE '%%status%%' AND pg_get_constraintdef(oid) NOT LIKE '%%''limit''%%'"
         )
         try:
@@ -129,13 +132,20 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
             if not outdated:
                 return
             with self._serialized_ddl():
+                self.cursor.execute("SET LOCAL lock_timeout = '2s'")
                 self.cursor.execute(find_constraint, (table,))
-                for (name,) in list(self.cursor.fetchall()):
+                names = [name for (name,) in list(self.cursor.fetchall())]
+                for name in names:
                     self.cursor.execute(
-                        sql.SQL("ALTER TABLE {0} DROP CONSTRAINT {1}, ADD CONSTRAINT {1} CHECK (status IN ('ok', 'timeout', 'failed', 'limit'))").format(
-                            sql.Identifier(table), sql.Identifier(name)
-                        )
+                        sql.SQL(
+                            "ALTER TABLE {0} DROP CONSTRAINT {1}, ADD CONSTRAINT {1} CHECK (status IN ('ok', 'timeout', 'failed', 'limit')) NOT VALID"
+                        ).format(sql.Identifier(table), sql.Identifier(name))
                     )
+            self.db.commit()
+            # The new set contains the old one, so validation cannot fail; it only marks the constraint validated
+            self.cursor.execute("SET LOCAL lock_timeout = '2s'")
+            for name in names:
+                self.cursor.execute(sql.SQL("ALTER TABLE {0} VALIDATE CONSTRAINT {1}").format(sql.Identifier(table), sql.Identifier(name)))
             self.db.commit()
             logger.info(f"METADATA: {table} now accepts the status 'limit'")
         except Exception as e:
