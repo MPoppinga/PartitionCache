@@ -50,6 +50,7 @@ def test_get_string_type_null_marker(cache_handler, mock_redis):
 
 def test_get_bitarray(cache_handler, mock_redis):
     cache_key = "cache:partition_key:bit_key"
+    cache_handler._get_partition_bitsize = lambda pk: cache_handler.default_bitsize
     mock_redis.type.return_value = b"string"
     mock_redis.get.return_value = _packed({1, 3})
     result = cache_handler.get("bit_key")
@@ -60,10 +61,11 @@ def test_get_bitarray(cache_handler, mock_redis):
 def test_get_intersected_single_key(cache_handler, mock_redis):
     cache_key = "cache:partition_key:key1"
     cache_handler._get_partition_datatype = lambda pk: "integer"
+    cache_handler._get_partition_bitsize = lambda pk: cache_handler.default_bitsize
     type_pipe = Mock()
     type_pipe.execute.return_value = [b"string"]
     marker_pipe = Mock()
-    marker_pipe.execute.return_value = [b"\x50\x00"]
+    marker_pipe.execute.return_value = [b"\x50\x00", 13]  # GETRANGE and STRLEN per key
     mock_redis.pipeline.side_effect = [type_pipe, marker_pipe]
     mock_redis.get.return_value = _packed({1, 3})
     result, count = cache_handler.get_intersected({"key1"})
@@ -74,10 +76,11 @@ def test_get_intersected_single_key(cache_handler, mock_redis):
 
 def test_get_intersected_multiple_keys(cache_handler, mock_redis):
     cache_handler._get_partition_datatype = lambda pk: "integer"
+    cache_handler._get_partition_bitsize = lambda pk: cache_handler.default_bitsize
     type_pipe = Mock()
     type_pipe.execute.return_value = [b"string", b"string", b"hash"]
     marker_pipe = Mock()
-    marker_pipe.execute.return_value = [b"\x00\x00", b"\x50\x00"]  # a leading zero byte is data, not the null marker
+    marker_pipe.execute.return_value = [b"\x00\x00", 13, b"\x50\x00", 13]  # a leading zero byte is data, not the null marker
     mock_redis.pipeline.side_effect = [type_pipe, marker_pipe]
     mock_redis.get.return_value = _packed({1, 3})
 
@@ -88,10 +91,11 @@ def test_get_intersected_multiple_keys(cache_handler, mock_redis):
 
 def test_get_intersected_excludes_null_marker_from_count(cache_handler, mock_redis):
     cache_handler._get_partition_datatype = lambda pk: "integer"
+    cache_handler._get_partition_bitsize = lambda pk: cache_handler.default_bitsize
     type_pipe = Mock()
     type_pipe.execute.return_value = [b"string", b"string", b"none"]
     marker_pipe = Mock()
-    marker_pipe.execute.return_value = [b"\x00", b"\x50\x00"]
+    marker_pipe.execute.return_value = [b"\x00", 1, b"\x50\x00", 13]
     mock_redis.pipeline.side_effect = [type_pipe, marker_pipe]
     mock_redis.get.return_value = _packed({1, 3})
 
@@ -196,3 +200,40 @@ def test_redis_intersection_with_empty_sets(redis_handler):
     handler.set_cache("empty2", set(), pk)
     assert handler.get_intersected({"high", "empty1"}, pk) == (set(), 2)
     assert handler.get_intersected({"empty1", "empty2"}, pk) == (set(), 2)
+
+
+def _store_legacy(handler, key: str, partition_key: str, keys: set[int], bitsize: int = 1000) -> str:
+    """Write an entry the way versions before the packed format did: one ASCII '0'/'1' per partition key."""
+    bits = bitarray(bitsize)
+    bits.setall(0)
+    for k in keys:
+        bits[k] = 1
+    cache_key = handler._get_cache_key(key, partition_key)
+    handler.db.set(cache_key, bits.to01())
+    return cache_key
+
+
+def test_redis_legacy_entry_is_converted_on_get(redis_handler):
+    handler, pk = redis_handler
+    cache_key = _store_legacy(handler, "legacy", pk, {5, 999})
+    assert handler.get("legacy", pk) == {5, 999}
+    assert handler.db.strlen(cache_key) == 125
+    assert handler.get("legacy", pk) == {5, 999}
+
+
+def test_redis_legacy_entry_is_converted_before_intersection(redis_handler):
+    handler, pk = redis_handler
+    cache_key = _store_legacy(handler, "legacy", pk, {5, 999})
+    _store_legacy(handler, "legacy_empty", pk, set())
+    handler.set_cache("new", {5, 6, 999}, pk)
+    assert handler.get_intersected({"legacy", "new"}, pk) == ({5, 999}, 2)
+    assert handler.db.strlen(cache_key) == 125
+    assert handler.get_intersected({"legacy_empty", "new"}, pk) == (set(), 2)
+
+
+def test_redis_entry_of_unknown_length_is_ignored(redis_handler):
+    handler, pk = redis_handler
+    handler.db.set(handler._get_cache_key("broken", pk), b"\x01\x02\x03")
+    handler.set_cache("new", {5, 6}, pk)
+    assert handler.get("broken", pk) is None
+    assert handler.get_intersected({"broken", "new"}, pk) == ({5, 6}, 1)

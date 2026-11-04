@@ -74,7 +74,30 @@ class RedisBitCacheHandler(RedisAbstractCacheHandler):
         if value == b"\x00":  # Check for null byte marker
             return None
 
-        return self._decode_bits(value)  # type: ignore[arg-type]
+        packed = self._as_packed(cache_key, value, self._bitsize_for_read(partition_key))  # type: ignore[arg-type]
+        return None if packed is None else self._decode_bits(packed)
+
+    def _bitsize_for_read(self, partition_key: str) -> int:
+        return self._get_partition_bitsize(partition_key) or self.default_bitsize
+
+    def _as_packed(self, cache_key: str, value: bytes, bitsize: int) -> bytes | None:
+        """Return the packed bits of a stored entry, or None if the entry is in no known format.
+
+        Earlier versions stored one ASCII '0'/'1' per partition key. Decoding such an entry as packed bits yields
+        wrong keys, so it is converted and rewritten in place. The formats cannot be confused: a legacy entry is
+        bitsize bytes of b"0"/b"1", a packed entry is ceil(bitsize / 8) bytes (or b""), and for bitsize 1 the only
+        non-empty packed value is b"\x80".
+        """
+        if len(value) == bitsize and not value.strip(b"01"):
+            bits = bitarray(value.decode(), endian="big")
+            packed = bits.tobytes() if bits.any() else b""
+            self.db.set(cache_key, packed)
+            logger.info(f"Converted legacy redis_bit entry {cache_key} to packed bits")
+            return packed
+        if len(value) in (0, (bitsize + 7) // 8):
+            return value
+        logger.warning(f"Ignoring redis_bit entry {cache_key}: {len(value)} bytes do not match bitsize {bitsize}")
+        return None
 
     @staticmethod
     def _decode_bits(value: bytes | None) -> set[int]:
@@ -105,8 +128,20 @@ class RedisBitCacheHandler(RedisAbstractCacheHandler):
         marker_pipe = self.db.pipeline()
         for cache_key in string_cache_keys:
             marker_pipe.getrange(cache_key, 0, 1)
-        prefixes = marker_pipe.execute() if string_cache_keys else []
-        valid_cache_keys: list[str] = [cache_key for cache_key, prefix in zip(string_cache_keys, prefixes, strict=False) if prefix != b"\x00"]
+            marker_pipe.strlen(cache_key)
+        replies = marker_pipe.execute() if string_cache_keys else []
+        prefixes, lengths = replies[0::2], replies[1::2]
+        bitsize = self._bitsize_for_read(partition_key) if string_cache_keys else 0
+        valid_cache_keys: list[str] = []
+        for cache_key, prefix, length in zip(string_cache_keys, prefixes, lengths, strict=False):
+            if prefix == b"\x00":
+                continue
+            # Entries not in packed form (legacy ASCII bits) would corrupt the BITOP: convert them first, or skip them
+            if length not in (0, (bitsize + 7) // 8) or length == bitsize:
+                value = self.db.get(cache_key)
+                if value is None or self._as_packed(cache_key, value, bitsize) is None:  # type: ignore[arg-type]
+                    continue
+            valid_cache_keys.append(cache_key)
         valid_keys_count = len(valid_cache_keys)
 
         randuuid = str(uuid.uuid4())
