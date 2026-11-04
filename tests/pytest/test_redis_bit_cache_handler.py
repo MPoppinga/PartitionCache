@@ -237,3 +237,18 @@ def test_redis_entry_of_unknown_length_is_ignored(redis_handler):
     handler.set_cache("new", {5, 6}, pk)
     assert handler.get("broken", pk) is None
     assert handler.get_intersected({"broken", "new"}, pk) == ({5, 6}, 1)
+
+
+def test_redis_legacy_entry_is_read_when_rewrite_fails(redis_handler, monkeypatch):
+    handler, pk = redis_handler
+    cache_key = _store_legacy(handler, "legacy", pk, {5, 999})
+    handler.set_cache("new", {5, 6}, pk)
+
+    def read_only_set(*args, **kwargs):
+        raise ConnectionError("READONLY You can't write against a read only replica.")
+
+    monkeypatch.setattr(handler.db, "set", read_only_set)
+    assert handler.get("legacy", pk) == {5, 999}
+    # BITOP would read the unconverted bytes, so the entry is left out of the intersection
+    assert handler.get_intersected({"legacy", "new"}, pk) == ({5, 6}, 1)
+    assert handler.db.strlen(cache_key) == 1000
