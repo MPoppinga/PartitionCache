@@ -294,7 +294,7 @@ class RedisAbstractCacheHandler(AbstractCacheHandler):
         """Set the status of a query using termination bits for Redis backend."""
         try:
             # Valid statuses
-            valid_statuses = {"ok", "timeout", "failed"}
+            valid_statuses = {"ok", "timeout", "failed", "limit"}
             if status not in valid_statuses:
                 raise ValueError(f"Invalid status '{status}'. Must be one of: {valid_statuses}")
 
@@ -310,15 +310,15 @@ class RedisAbstractCacheHandler(AbstractCacheHandler):
                 if self.db.exists(query_key):
                     self.db.hset(query_key, "status", "ok")
                     self.db.hset(query_key, "last_seen", str(datetime.now()))
-            elif status == "failed":
-                # Set limit termination bit
-                self.db.set(limit_key, "\x00")
+            elif status in ("failed", "limit"):
+                # Termination marker: "limit" for a result over the result limit, "\x00" (historically) for failed
+                self.db.set(limit_key, "limit" if status == "limit" else "\x00")
                 # Remove timeout bit if it exists
                 self.db.delete(timeout_key)
                 # Update query metadata if it exists
                 query_key = f"query:{partition_key}:{key}"
                 if self.db.exists(query_key):
-                    self.db.hset(query_key, "status", "failed")
+                    self.db.hset(query_key, "status", status)
                     self.db.hset(query_key, "last_seen", str(datetime.now()))
             elif status == "timeout":
                 # Set timeout termination bit
@@ -343,8 +343,9 @@ class RedisAbstractCacheHandler(AbstractCacheHandler):
             limit_key = self._get_cache_key(f"_LIMIT_{key}", partition_key)
             timeout_key = self._get_cache_key(f"_TIMEOUT_{key}", partition_key)
 
-            if self.db.exists(limit_key):
-                return "failed"
+            marker = self.db.get(limit_key)
+            if marker is not None:
+                return "limit" if marker in (b"limit", "limit") else "failed"
             elif self.db.exists(timeout_key):
                 return "timeout"
 

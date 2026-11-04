@@ -101,7 +101,7 @@ class PostgreSQLRoaringBitCacheHandler(PostgreSQLAbstractCacheHandler):
                         query_hash TEXT NOT NULL,
                         query TEXT NOT NULL,
                         partition_key TEXT NOT NULL,
-                        status TEXT NOT NULL DEFAULT 'ok' CHECK (status IN ('ok', 'timeout', 'failed')),
+                        status TEXT NOT NULL DEFAULT 'ok' CHECK (status IN ('ok', 'timeout', 'failed', 'limit')),
                         last_seen TIMESTAMP NOT NULL DEFAULT now(),
                         PRIMARY KEY (query_hash, partition_key)
                     );""").format(sql.Identifier(self.tableprefix + "_queries"))
