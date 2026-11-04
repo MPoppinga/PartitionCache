@@ -152,7 +152,7 @@ class DuckDBBitCacheHandler(AbstractCacheHandler_Lazy):
                     query_hash TEXT NOT NULL,
                     query TEXT NOT NULL,
                     partition_key TEXT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'ok' CHECK (status IN ('ok', 'timeout', 'failed')),
+                    status TEXT NOT NULL DEFAULT 'ok' CHECK (status IN ('ok', 'timeout', 'failed', 'limit')),
                     last_seen TIMESTAMP DEFAULT now(),
                     PRIMARY KEY (query_hash, partition_key)
                 )
@@ -1093,7 +1093,7 @@ class DuckDBBitCacheHandler(AbstractCacheHandler_Lazy):
         Args:
             key: Cache key
             partition_key: Partition key name
-            status: Status ('ok', 'timeout', 'failed')
+            status: Status ('ok', 'timeout', 'failed', 'limit')
 
         Returns:
             bool: True if successful

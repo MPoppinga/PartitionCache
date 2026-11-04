@@ -344,6 +344,8 @@ SELECT partitioncache_update_processor_config_cron(
 );
 ```
 
+**Result limit:** with `result_limit` set (also `pcache-postgresql-queue-processor update-config --result-limit N`), a variant whose result has at least that many partition keys is not stored: its cache entry is removed and the query is recorded with the status `limit` in `{table_prefix}_queries`, so it is not computed again, and lookups leave it out. Processors set up before this fix ignored the setting; run `setup` again after upgrading. The cache handlers extend the status constraint of existing queries tables on startup.
+
 #### `partitioncache_manual_process_queue(p_count, p_job_name)`
 Manually process queue items:
 

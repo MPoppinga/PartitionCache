@@ -65,6 +65,7 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
 
         # Create metadata tables with supported datatypes
         self._recreate_metadata_table(self.get_supported_datatypes())
+        self._allow_limit_status()
         logger.info(f"CACHE_HANDLER {self.__class__.__name__}: Initialization complete for tableprefix={db_tableprefix}")
 
     def _recreate_metadata_table(self, supported_datatypes: set[str]) -> None:
@@ -94,7 +95,7 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
                     query_hash TEXT NOT NULL,
                     query TEXT NOT NULL,
                     partition_key TEXT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'ok' CHECK (status IN ('ok', 'timeout', 'failed')),
+                    status TEXT NOT NULL DEFAULT 'ok' CHECK (status IN ('ok', 'timeout', 'failed', 'limit')),
                     last_seen TIMESTAMP NOT NULL DEFAULT now(),
                     PRIMARY KEY (query_hash, partition_key)
                 );""").format(sql.Identifier(self.tableprefix + "_queries"))
@@ -108,6 +109,38 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
             except Exception as rollback_error:
                 logger.error(f"Failed to rollback after metadata table creation error: {rollback_error}")
             raise
+
+    def _allow_limit_status(self) -> None:
+        """Extend the status CHECK of a queries table created before the 'limit' status existed.
+
+        Without it the queue processor's result limit could not record 'limit'; the job failed on the
+        constraint instead. Runs the ALTER only when the constraint lacks 'limit'. A failure (e.g. a user
+        without ALTER rights) is logged and leaves the table as it is.
+        """
+        table = self.tableprefix + "_queries"
+        find_constraint = (
+            "SELECT conname FROM pg_constraint WHERE conrelid = to_regclass(%s) AND contype = 'c' "
+            "AND pg_get_constraintdef(oid) LIKE '%%status%%' AND pg_get_constraintdef(oid) NOT LIKE '%%''limit''%%'"
+        )
+        try:
+            self.cursor.execute(find_constraint, (table,))
+            outdated = list(self.cursor.fetchall())
+            self.db.commit()
+            if not outdated:
+                return
+            with self._serialized_ddl():
+                self.cursor.execute(find_constraint, (table,))
+                for (name,) in list(self.cursor.fetchall()):
+                    self.cursor.execute(
+                        sql.SQL("ALTER TABLE {0} DROP CONSTRAINT {1}, ADD CONSTRAINT {1} CHECK (status IN ('ok', 'timeout', 'failed', 'limit'))").format(
+                            sql.Identifier(table), sql.Identifier(name)
+                        )
+                    )
+            self.db.commit()
+            logger.info(f"METADATA: {table} now accepts the status 'limit'")
+        except Exception as e:
+            logger.warning(f"METADATA: could not extend the status constraint of {table} to 'limit': {e}")
+            self.db.rollback()
 
     @contextmanager
     def _serialized_ddl(self):
@@ -624,7 +657,7 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
         """Set the status of a query in the queries table."""
         try:
             # Valid statuses based on the CHECK constraint
-            valid_statuses = {"ok", "timeout", "failed"}
+            valid_statuses = {"ok", "timeout", "failed", "limit"}
             if status not in valid_statuses:
                 raise ValueError(f"Invalid status '{status}'. Must be one of: {valid_statuses}")
 
