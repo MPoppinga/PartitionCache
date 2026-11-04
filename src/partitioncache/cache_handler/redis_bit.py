@@ -74,7 +74,14 @@ class RedisBitCacheHandler(RedisAbstractCacheHandler):
         if value == b"\x00":  # Check for null byte marker
             return None
 
-        bitval = bitarray(value.decode())  # type: ignore
+        return self._decode_bits(value)  # type: ignore[arg-type]
+
+    @staticmethod
+    def _decode_bits(value: bytes | None) -> set[int]:
+        """Decode a packed bit array (bit i = Redis bit offset i, big-endian within each byte)."""
+        bitval = bitarray(endian="big")
+        if value:
+            bitval.frombytes(value)
         return set(bitval.search(bitarray("1")))
 
     def get_intersected(self, keys: set[str], partition_key: str = "partition_key") -> tuple[set[int] | set[str] | set[float] | set[datetime] | None, int]:
@@ -93,11 +100,13 @@ class RedisBitCacheHandler(RedisAbstractCacheHandler):
         key_types = type_pipe.execute()
         string_cache_keys: list[str] = [cache_key for cache_key, key_type in zip(cache_keys, key_types, strict=False) if key_type == b"string"]
 
+        # The null marker is exactly b"\x00". A packed bit array is never that value: an empty set is stored as b"",
+        # a non-empty set with bitsize <= 8 has a non-zero byte, and bitsize > 8 needs at least two bytes.
         marker_pipe = self.db.pipeline()
         for cache_key in string_cache_keys:
-            marker_pipe.getrange(cache_key, 0, 0)
-        first_bytes = marker_pipe.execute() if string_cache_keys else []
-        valid_cache_keys: list[str] = [cache_key for cache_key, first_byte in zip(string_cache_keys, first_bytes, strict=False) if first_byte != b"\x00"]
+            marker_pipe.getrange(cache_key, 0, 1)
+        prefixes = marker_pipe.execute() if string_cache_keys else []
+        valid_cache_keys: list[str] = [cache_key for cache_key, prefix in zip(string_cache_keys, prefixes, strict=False) if prefix != b"\x00"]
         valid_keys_count = len(valid_cache_keys)
 
         randuuid = str(uuid.uuid4())
@@ -111,14 +120,16 @@ class RedisBitCacheHandler(RedisAbstractCacheHandler):
         else:
             temp_key = f"temp_{randuuid}"
             self.db.bitop("AND", temp_key, *valid_cache_keys)
-            bitval = bitarray(self.db.get(temp_key).decode())  # type: ignore
+            value = self.db.get(temp_key)  # None if all sources were empty strings: Redis then creates no destination key
             self.db.delete(temp_key)
-            return set(bitval.search(bitarray("1"))), valid_keys_count
+            return self._decode_bits(value), valid_keys_count  # type: ignore[arg-type]
 
     def set_cache(self, key: str, partition_key_identifiers: set[int] | set[str] | set[float] | set[datetime], partition_key: str = "partition_key") -> bool:
         """Store a set of partition key identifiers in the cache for a specific partition key. Only integer values are supported.
 
-        An empty set is stored as all-zero bits, which get() returns as set(): the query has no rows.
+        The bits are stored packed (one bit per partition key, big-endian within each byte, matching Redis bit offsets),
+        so BITOP AND intersects them directly. An empty set is stored as b"", which get() returns as set(): the query
+        has no rows. All-zero bytes would equal the b"\x00" null marker for bitsizes up to 8.
         """
         # Ensure partition exists with correct datatype and bitsize
         self._ensure_partition_exists(partition_key)
@@ -127,7 +138,7 @@ class RedisBitCacheHandler(RedisAbstractCacheHandler):
             # Fallback to default bitsize if metadata is corrupted or missing
             bitsize = self.default_bitsize
             self._set_partition_metadata(partition_key, "integer", bitsize)
-        val = bitarray(bitsize)
+        val = bitarray(bitsize, endian="big")
         val.setall(0)
         try:
             for k in partition_key_identifiers:
@@ -147,7 +158,7 @@ class RedisBitCacheHandler(RedisAbstractCacheHandler):
             raise ValueError(f"Partition key identifiers {partition_key_identifiers} is out of range for bitarray of size {bitsize}") from None
         try:
             cache_key = self._get_cache_key(key, partition_key)
-            self.db.set(cache_key, val.to01())
+            self.db.set(cache_key, val.tobytes() if val.any() else b"")
             return True
         except Exception as e:
             logger.error(f"Failed to set partition key identifiers for hash {key} in partition {partition_key}: {e}")
