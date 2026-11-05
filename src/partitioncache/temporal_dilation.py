@@ -179,8 +179,8 @@ def compute_temporal_window(query: str, temporal_column: str, partition_key: str
     past. The window is the longest shortest path over these bounds, so chained windows add up.
 
     The aliases of the partition key's table are those whose table equals ``partition_key_source_table``; if it is
-    not given, the table of the column ``partition_key`` in the SELECT list, else the tables whose time column the
-    query references (dimension tables joined to them are ignored).
+    not given, the table of the column ``partition_key`` in the SELECT list (as the variant generator detects it),
+    else every alias of the outer FROM clause.
 
     Args:
         query: The query.
@@ -202,12 +202,8 @@ def compute_temporal_window(query: str, temporal_column: str, partition_key: str
             if column is not None and column.name == partition_key and column.table in alias_to_table:
                 partition_key_source_table = alias_to_table[column.table]
                 break
-    if partition_key_source_table is not None:
-        tables = {partition_key_source_table}
-    else:
-        # The tables with the time column; dimension tables joined to them carry neither it nor the partition key
-        tables = {alias_to_table[col.table] for col in parsed.find_all(exp.Column) if col.name == temporal_column and col.table in alias_to_table}
-    aliases = {alias for alias, table in alias_to_table.items() if not tables or table in tables}
+    # Without a source table the variant generator selects the partition key from every table, so every alias counts
+    aliases = {alias for alias, table in alias_to_table.items() if partition_key_source_table is None or table == partition_key_source_table}
     if len(aliases) <= 1:
         return 0.0
 

@@ -102,16 +102,16 @@ class TestAliasesOfThePartitionKeyTable:
         query = "SELECT e1.w FROM ev AS e1, users AS u, ev AS e2 WHERE u.id = e1.uid AND e2.ts BETWEEN e1.ts AND e1.ts + 60"
         assert compute_temporal_window(query, "ts", "w") == 60.0
 
-    def test_without_the_partition_key_in_select_the_tables_with_the_time_column_count(self):
-        query = "SELECT COUNT(*) FROM ev AS e1, users AS u, ev AS e2 WHERE u.id = e1.uid AND e2.ts BETWEEN e1.ts AND e1.ts + 60"
-        assert compute_temporal_window(query, "ts", "w") == 60.0
-        query = "SELECT COUNT(*) FROM ev AS e1, ev AS e2 WHERE e2.uid = e1.uid AND e2.ts > 4"
+    def test_without_the_partition_key_in_select_every_alias_counts(self):
+        """The generator then selects the partition key from every table, also from logins, which no window bounds."""
+        query = "SELECT COUNT(*) FROM events AS e, logins AS l WHERE e.uid = l.uid AND e.ts > 0 AND l.kind = 1"
         assert compute_temporal_window(query, "ts", "w") is None
+        query = "SELECT COUNT(*) FROM ev AS e1, ev AS e2 WHERE e2.ts BETWEEN e1.ts AND e1.ts + 60"
+        assert compute_temporal_window(query, "ts", "w") == 60.0
 
     def test_explicit_source_table(self):
         query = "SELECT 1 FROM ev AS e1, logins AS l WHERE l.uid = e1.uid"
         assert compute_temporal_window(query, "ts", partition_key_source_table="ev") == 0.0
-        # Without it, neither table can be told apart as a dimension table
         assert compute_temporal_window(query, "ts") is None
 
 

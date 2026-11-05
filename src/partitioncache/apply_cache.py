@@ -1711,7 +1711,8 @@ def apply_cache_lazy(
         temporal_bucket_width=temporal_bucket_width,
         dilation_buckets=dilation_buckets,
         temporal_column=temporal_column,
-        partition_key_source_table=partition_key_source_table,
+        # Only temporal lookups use it here, so that other lookups keep the variants they had
+        partition_key_source_table=partition_key_source_table if _is_temporal(temporal_bucket_width, dilation_buckets) else None,
     )
 
     # Step 2: Optionally rewrite with p0 table
@@ -2024,7 +2025,8 @@ def apply_cache(
         temporal_bucket_width=temporal_bucket_width,
         dilation_buckets=dilation_buckets,
         temporal_column=temporal_column,
-        partition_key_source_table=partition_key_source_table,
+        # Only temporal lookups use it here, so that other lookups keep the variants they had
+        partition_key_source_table=partition_key_source_table if _is_temporal(temporal_bucket_width, dilation_buckets) else None,
     )
 
     # Step 2: Optionally rewrite original query with p0 table
