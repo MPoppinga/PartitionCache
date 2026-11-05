@@ -255,6 +255,11 @@ Advanced options for controlling how query variants are generated for better cac
   - **Purpose**: Controls bucketing of distance ranges for better cache hits
   - **Example**: With `--bucket-steps 0.5`, distance `BETWEEN 1.6 AND 3.6` becomes `BETWEEN 1.5 AND 4.0`
 
+#### Partition Key Joins
+- `--skip-partition-key-joins KEYS` - Comma-separated partition keys whose variants get no equality on the partition key between tables
+  - **Default**: none (or `PARTITION_CACHE_SKIP_PARTITION_KEY_JOINS`); geometry keys always skip it
+  - **Purpose**: Time-bucket keys used with temporal dilation; lookups skip these joins for them, so population must too or the hashes differ (see the API reference, "Temporal dilation")
+
 #### Constraint Modification
 - `--add-constraints JSON` - Add constraints to specific tables
   - **Format**: JSON object mapping table names to constraint conditions
@@ -559,6 +564,11 @@ Controls how query variants are generated when processing original queries from 
 #### Distance Normalization
 - `--bucket-steps FLOAT` - Step size for normalizing distance conditions
   - **Default**: `1.0` (or `PARTITION_CACHE_BUCKET_STEPS` environment variable)
+
+#### Partition Key Joins
+- `--skip-partition-key-joins KEYS` - Comma-separated partition keys whose variants get no equality on the partition key between tables
+  - **Default**: none (or `PARTITION_CACHE_SKIP_PARTITION_KEY_JOINS`); geometry keys always skip it
+  - **Purpose**: Time-bucket keys used with temporal dilation; lookups skip these joins for them, so population must too or the hashes differ (see the API reference, "Temporal dilation")
 
 #### Constraint Modification
 - `--add-constraints JSON` - Add constraints to specific tables

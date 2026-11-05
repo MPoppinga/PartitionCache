@@ -54,6 +54,7 @@ def mock_args():
     args.add_constraints = None
     args.remove_constraints_all = None
     args.remove_constraints_add = None
+    args.skip_partition_key_joins = []
     # Add cache optimization args - disable by default for tests
     args.enable_cache_optimization = False
     args.disable_cache_optimization = True
@@ -85,6 +86,20 @@ def mock_redis():
 
 class TestQueryFragmentProcessor:
     """Test query fragment processor functionality."""
+
+    @patch("partitioncache.cli.monitor_cache_queue.exit_event")
+    @patch("partitioncache.cli.monitor_cache_queue.pop_from_original_query_queue_blocking")
+    @patch("partitioncache.cli.monitor_cache_queue.generate_all_query_hash_pairs")
+    @patch("partitioncache.cli.monitor_cache_queue.push_to_query_fragment_queue")
+    def test_listed_partition_keys_skip_partition_key_joins(self, mock_push_fragments, mock_generate, mock_pop_blocking, mock_exit_event, mock_args, mock_env):
+        """--skip-partition-key-joins applies per partition key, as lookups of a temporal key need it."""
+        mock_generate.return_value = [("SELECT DISTINCT t1.w FROM ev t1", "hash1")]
+        mock_args.skip_partition_key_joins = ["w"]
+        for partition_key, expected in (("w", True), ("other", False)):
+            mock_exit_event.is_set.side_effect = [False, True]
+            mock_pop_blocking.return_value = ("SELECT * FROM ev", partition_key, "integer")
+            query_fragment_processor(mock_args, (None, None, None))
+            assert mock_generate.call_args[1]["skip_partition_key_joins"] is expected
 
     @patch("partitioncache.cli.monitor_cache_queue.exit_event")
     @patch("partitioncache.cli.monitor_cache_queue.pop_from_original_query_queue_blocking")

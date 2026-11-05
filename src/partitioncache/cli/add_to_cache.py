@@ -163,7 +163,7 @@ def main():
                 add_constraints=add_constraints,
                 remove_constraints_all=remove_constraints_all,
                 remove_constraints_add=remove_constraints_add,
-                skip_partition_key_joins=is_spatial,
+                skip_partition_key_joins=is_spatial or args.partition_key in args.skip_partition_key_joins,
                 geometry_column=geometry_column,
                 max_conditions_removed=args.max_conditions_removed,
             )
@@ -229,7 +229,7 @@ def main():
                     add_constraints=add_constraints,
                     remove_constraints_all=remove_constraints_all,
                     remove_constraints_add=remove_constraints_add,
-                    skip_partition_key_joins=is_spatial,
+                    skip_partition_key_joins=is_spatial or args.partition_key in args.skip_partition_key_joins,
                     geometry_column=geometry_column,
                     max_conditions_removed=args.max_conditions_removed,
                 )

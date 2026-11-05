@@ -110,6 +110,7 @@ Retrieves cached partition keys for a query with comprehensive statistics.
 - `remove_constraints_all` (list[str] | None): List of attribute names to remove from all query variants
 - `remove_constraints_add` (list[str] | None): List of attribute names to remove, creating additional variants
 - `skip_partition_key_joins` (bool): Spatial mode — generate query variants without partition-key equijoins (default: False)
+- `temporal_bucket_width`, `temporal_column`, `dilation_buckets`: Temporal dilation for time-bucket partition keys, see [Temporal dilation](#temporal-dilation-temporal_bucket_width-temporal_column)
 - `geometry_column` (str | None): Geometry column for spatial variant generation
 - `max_conditions_removed` (int | None): Upper bound on the number of conditions removed when generating reduced variants
 - `protected_patterns` (list[str] | None): Condition substrings that must never be removed
@@ -226,6 +227,7 @@ Lazy counterpart to `extend_query_with_partition_keys`: integrates a lazy SQL su
 - `max_conditions_removed` (int | None, optional): Upper bound on the number of conditions removed when generating reduced variants (default: None)
 - `protected_patterns` (list[str] | None, optional): Condition substrings that must never be removed (default: None)
 - `skip_partition_key_joins` (bool, optional): Spatial mode — generate query variants without partition-key equijoins (default: False)
+- `temporal_bucket_width`, `temporal_column`, `dilation_buckets` (optional): Temporal dilation for time-bucket partition keys, see below
 - `geometry_column` (str | None, optional): Enables spatial mode. Uses this geometry column for variant SELECT clauses and spatial filter. Requires a spatial cache handler with `get_spatial_filter_lazy()` method.
 - `buffer_distance` (float | None, optional): Buffer distance in meters for spatial filter (required when `geometry_column` is set).
 - `spatial_method` (Literal["SUBDIVIDE_INLINE", "SUBDIVIDE_TMP_TABLE", "DUMP_TMP_TABLE", "DUMP_CTE"], optional): Strategy for applying the spatial filter (default: "SUBDIVIDE_TMP_TABLE")
@@ -329,6 +331,27 @@ if stats.get("cost_gated"):
 - A failing estimator, or one that returns something other than a finite number, is logged and the cache is applied; `min_query_cost` without `cost_estimator` raises `ValueError`.
 - Every query that is not gated pays for the `EXPLAIN` on the data connection: the statement plus BEGIN/ROLLBACK (or SAVEPOINT/ROLLBACK TO when the caller has a transaction open).
 - `PostgresDBHandler.estimate_cost` runs the `EXPLAIN` in a transaction (or savepoint) that is always rolled back, so it does not commit or abort a transaction the caller has open, and it rejects text that contains more than one statement. MySQL returns `None` for plans without a top-level cost, such as `UNION`.
+
+#### Temporal dilation (`temporal_bucket_width`, `temporal_column`)
+
+When the partition key is a time bucket (e.g. `w = ts / 3600`), a correlation query such as "a failed logon followed by a successful one within 20 minutes" can match two rows in adjacent buckets. Intersecting the cached bucket sets would drop such pairs. With temporal dilation, `get_partition_keys`, `get_partition_keys_lazy`, `apply_cache` and `apply_cache_lazy` widen each cached set by `k` buckets before intersecting them.
+
+```python
+enhanced_query, stats = partitioncache.apply_cache_lazy(
+    query="SELECT a.id, b.id FROM events a, events b WHERE a.kind = 'fail' AND b.kind = 'ok' AND b.ts BETWEEN a.ts AND a.ts + 1200",
+    cache_handler=cache.underlying_handler,
+    partition_key="w",
+    temporal_bucket_width=3600,  # width of one bucket, in the unit of ts
+    temporal_column="ts",        # the column the bucket is derived from
+)
+```
+
+- `k = ceil(window / temporal_bucket_width)`. The window is read only from conditions on `alias.temporal_column`: `BETWEEN`, `ABS(a.ts - b.ts) <= W`, or a lower and an upper bound in separate conditions. A difference bounded on one side only (`b.ts <= a.ts + 1200`) does not count. Chained windows add up.
+- If two aliases of the partition key's table are not bounded in time against each other, no `k` is sound: the query runs without the cache (no partition keys, no restriction).
+- `dilation_buckets` sets `k` directly instead (`0` turns dilation off, which can lose rows).
+- A temporal key gets its variants without partition key joins (`t1.w = t2.w`), which would drop pairs across a bucket boundary. Population must do the same, or the variant hashes differ and the cache is never hit: pass `skip_partition_key_joins=True` to `generate_all_query_hash_pairs`, or list the key in `--skip-partition-key-joins` of `pcache-add` and `pcache-monitor`.
+- Dilated intersections are implemented in SQL for `postgresql_array` and `postgresql_bit`; the non-lazy API falls back to a Python intersection for other handlers with integer keys. A lazy call on a handler without a dilated intersection, and non-integer keys, run without the cache.
+- Dilation inflates each cached set by up to `2k + 1` buckets. A bucket width at least as large as the typical window keeps `k` at 1.
 
 #### `apply_cache(query, cache_handler, partition_key, ..., geometry_column=None, buffer_distance=None)`
 

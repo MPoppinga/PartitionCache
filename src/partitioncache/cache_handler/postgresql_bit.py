@@ -445,8 +445,9 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
         """Intersection SQL where each cached bit array is dilated by ``dilation`` bits first.
 
         Dilation of a bit array is a shift-OR: a set bit at index ``b`` is spread to every
-        index within ``dilation`` of ``b``. PostgreSQL bit-string shifts preserve length and
-        pad with zeros, so buckets at the ends clip instead of wrapping around.
+        index within ``dilation`` of ``b``. PostgreSQL bit-string shifts preserve length, so
+        each array is first extended by ``dilation`` zero bits; otherwise a bucket just past
+        the bitsize (one no cached set contains) would be shifted out.
 
         Each row is dilated *before* BIT_AND, mirroring the buffer-then-intersect order of the
         spatial handlers. Dilating the intersection result instead would be unsound.
@@ -454,10 +455,11 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
         table_name = f"{self.tableprefix}_cache_{partition_key}"
         keys_part = sql.SQL("ARRAY[{}]").format(sql.SQL(", ").join(sql.Literal(key) for key in keys))
 
-        shifted: list[sql.Composable] = [sql.SQL("partition_keys")]
+        padded = sql.SQL("(partition_keys::VARBIT || {}::VARBIT)").format(sql.Literal("0" * dilation))
+        shifted: list[sql.Composable] = [padded]
         for offset in range(1, dilation + 1):
-            shifted.append(sql.SQL("(partition_keys >> {})").format(sql.Literal(offset)))
-            shifted.append(sql.SQL("(partition_keys << {})").format(sql.Literal(offset)))
+            shifted.append(sql.SQL("({} >> {})").format(padded, sql.Literal(offset)))
+            shifted.append(sql.SQL("({} << {})").format(padded, sql.Literal(offset)))
         dilated_expr = sql.SQL(" | ").join(shifted)
 
         return (
