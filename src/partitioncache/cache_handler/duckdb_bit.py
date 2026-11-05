@@ -152,7 +152,7 @@ class DuckDBBitCacheHandler(AbstractCacheHandler_Lazy):
                     query_hash TEXT NOT NULL,
                     query TEXT NOT NULL,
                     partition_key TEXT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'ok' CHECK (status IN ('ok', 'timeout', 'failed')),
+                    status TEXT NOT NULL DEFAULT 'ok' CHECK (status IN ('ok', 'timeout', 'failed', 'limit')),
                     last_seen TIMESTAMP DEFAULT now(),
                     PRIMARY KEY (query_hash, partition_key)
                 )
@@ -797,8 +797,8 @@ class DuckDBBitCacheHandler(AbstractCacheHandler_Lazy):
                 status = self.get_query_status(key, partition_key)
                 if status is None:
                     return False
-                if status in ("timeout", "failed"):
-                    return True  # Don't check cache for failed queries
+                if status in ("timeout", "failed", "limit"):
+                    return True  # Don't check cache for failed or over-limit queries
 
             # Check cache entry
             table_name = self._get_safe_table_name(partition_key)
@@ -932,7 +932,7 @@ class DuckDBBitCacheHandler(AbstractCacheHandler_Lazy):
                     SELECT query_hash FROM {self.table_prefix}_queries
                     WHERE query_hash IN ({",".join("?" * len(keys))})
                     AND partition_key = ?
-                    AND status IN ('ok', 'timeout', 'failed')
+                    AND status IN ('ok', 'timeout', 'failed', 'limit')
                 """,
                     tuple(keys) + (partition_key,),
                 ).fetchall()
@@ -1093,7 +1093,7 @@ class DuckDBBitCacheHandler(AbstractCacheHandler_Lazy):
         Args:
             key: Cache key
             partition_key: Partition key name
-            status: Status ('ok', 'timeout', 'failed')
+            status: Status ('ok', 'timeout', 'failed', 'limit')
 
         Returns:
             bool: True if successful

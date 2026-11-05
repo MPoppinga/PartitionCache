@@ -235,6 +235,7 @@ Lazy counterpart to `extend_query_with_partition_keys`: integrates a lazy SQL su
 
 **Returns:**
 - `Tuple[str, Dict]`: (enhanced_query, statistics). With `min_query_cost` set, the statistics also contain `cost_gated` (1 if the cache was skipped) and `query_cost` (rounded estimate, when available)
+- SQL the cache cannot parse or rewrite never fails the query: it is returned unchanged with a warning, and the statistics contain `sql_error: 1` (also for `apply_cache`). This covers sqlglot errors, `RecursionError` (very deeply nested SQL) and `IndexError` (SQL shapes the variant generator does not expect, e.g. no FROM clause). Configuration errors (`ValueError`, e.g. a handler without lazy support) and cache backend errors still raise.
 
 **Example:**
 ```python
@@ -660,6 +661,7 @@ The helper wraps a subset of the handler interface. All methods operate on the h
 - `delete(key)` - Remove entry
 - `set_null(key)` / `is_null(key)` - Negative-cache markers
 - `set_query(key, querytext)` - Store query metadata only
+- `get_query(key)` - Query text stored for a key (None if not stored)
 - `get_intersected(keys)` - Intersect several cached sets
 - `filter_existing_keys(keys, check_query=False)` - Subset of keys present in cache
 - `get_all_keys()` - All keys of the bound partition
@@ -668,7 +670,7 @@ The helper wraps a subset of the handler interface. All methods operate on the h
 
 `LazyPartitionCacheHelper` (returned automatically by `create_cache_helper` for lazy-capable backends) additionally provides `get_intersected_lazy(keys)`.
 
-Handler-level operations without a helper counterpart — e.g. `get_query`, `get_all_queries`, `register_partition_key`, `get_partition_keys` (list all partitions) — are reached via `underlying_handler`:
+Handler-level operations without a helper counterpart — e.g. `get_all_queries`, `register_partition_key`, `get_partition_keys` (list all partitions) — are reached via `underlying_handler`:
 
 **Example:**
 ```python
@@ -684,7 +686,8 @@ cache.set_entry(query_hash, {1, 5, 10}, query)
 
 # Retrieve cache data and metadata
 user_ids = cache.get(query_hash)
-original_query = cache.underlying_handler.get_query(query_hash, cache.partition_key)
+original_query = cache.get_query(query_hash)
+all_queries = cache.underlying_handler.get_all_queries(cache.partition_key)
 ```
 
 ##### Working with additional partition keys

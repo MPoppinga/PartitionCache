@@ -1258,7 +1258,9 @@ def main():
     parser_update.add_argument("--frequency", type=_parse_frequency_seconds_arg, help="New frequency (seconds or 30s/5m/2h/1d)")
     parser_update.add_argument("--timeout", type=_parse_timeout_seconds_arg, help="New timeout (seconds or 30s/5m/2h/1d)")
     parser_update.add_argument("--table-prefix", type=str, help="New table prefix for the cache tables")
-    parser_update.add_argument("--result-limit", type=int, help="New result limit for queries (NULL to disable)")
+    parser_update.add_argument(
+        "--result-limit", type=int, help="Results with this many or more partition keys are not stored; the query gets the status 'limit'"
+    )
     parser_update.set_defaults(
         func=lambda args: update_processor_config(
             get_pg_cron_connection(),

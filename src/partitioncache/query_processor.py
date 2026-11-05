@@ -9,6 +9,7 @@ import re
 import warnings
 from collections import defaultdict
 from collections.abc import Callable
+from decimal import Decimal, InvalidOperation
 from itertools import combinations
 from typing import Any
 
@@ -426,6 +427,79 @@ def extract_conjunctive_conditions(sql: str) -> list[str]:
     return conditions
 
 
+def _unwrap_condition(condition: str) -> tuple[exp.Expr | None, bool]:
+    """Parse a condition and strip parentheses and NOT; returns (node, negated) or (None, False) on parse errors."""
+    try:
+        node = sqlglot.parse_one(condition)
+    except Exception:
+        return None, False
+    negated = False
+    while isinstance(node, exp.Paren | exp.Not):
+        negated ^= isinstance(node, exp.Not)
+        node = node.this
+    return node, negated
+
+
+def _partition_key_condition_alias(condition: str, partition_key: str, table_aliases: list[str]) -> str | None:
+    """Return the outer alias whose partition key the condition restricts, or None if it is no partition key condition.
+
+    A partition key condition depends on one alias's partition key alone: every column outside a subquery is
+    ``<alias>.<partition_key>`` of the same alias, and subqueries reference the outer query only through it
+    (e.g. ``a.pk IN (...)``, ``a.pk BETWEEN 1 AND 9``, ``(a.pk = 1 OR a.pk = 2)``, ``a.pk % 10 = 3``). It holds
+    for every variant. Anything else, e.g. ``NOT EXISTS (... a.pk = x.pk AND DIST(x.x, a.x) < 3)`` or
+    ``lo.lo_custkey = c.c_custkey + 1``, is classified by the aliases it references.
+    """
+    node, _ = _unwrap_condition(condition)
+    if node is None:
+        return None
+    columns = list(node.find_all(exp.Column))
+    top_level = [column for column in columns if column.find_ancestor(exp.Select) is None]
+    if not top_level or any(column.name != partition_key for column in top_level):
+        return None
+    # An unqualified partition key column refers to the first table, as before
+    aliases = {column.table or (table_aliases[0] if table_aliases else "unknown") for column in top_level}
+    if len(aliases) != 1:
+        return None
+    alias = aliases.pop()
+    outer = set(table_aliases) | {alias}
+    for column in columns:
+        if column.find_ancestor(exp.Select) is not None and column.table in outer and (column.table != alias or column.name != partition_key):
+            return None  # a subquery correlated on anything but this alias's partition key
+    return alias
+
+
+def _key_set_queries(query: exp.Expr) -> list[exp.Expr]:
+    """Queries whose rows include every row of ``query``: the query itself, or each branch of an INTERSECT."""
+    while isinstance(query, exp.Subquery | exp.Paren):
+        query = query.this
+    if isinstance(query, exp.Intersect):
+        return _key_set_queries(query.this) + _key_set_queries(query.expression)
+    return [query] if isinstance(query, exp.Select | exp.Union | exp.Except) else []
+
+
+def _partition_key_subqueries(condition: str, table_aliases: list[str]) -> list[str]:
+    """Subqueries whose rows include every partition key a condition admits, for use as variants of their own.
+
+    Only ``<alias>.<pk> IN (subquery)`` and ``<alias>.<pk> = ANY (subquery)`` qualify (each branch of an INTERSECT on
+    its own). A negated condition selects the keys to exclude, and a subquery that references an outer alias is no
+    query of its own.
+    """
+    node, negated = _unwrap_condition(condition)
+    if negated:
+        return []
+    if isinstance(node, exp.In) and node.args.get("query") is not None:
+        query = node.args["query"]
+    elif isinstance(node, exp.EQ) and isinstance(node.expression, exp.Any) and isinstance(node.this, exp.Column):
+        query = node.expression.this
+    else:
+        return []
+    return [
+        branch.sql()
+        for branch in _key_set_queries(query)
+        if not any(column.table in table_aliases for column in branch.find_all(exp.Column))
+    ]
+
+
 def _is_partition_key_fk_join(condition: str, partition_key: str, table_aliases: list[str]) -> bool:
     """Check whether a condition is an attachment join on the partition key.
 
@@ -599,19 +673,8 @@ def extract_and_group_query_conditions(
             if left_alias in table_aliases and right_alias in table_aliases:
                 partition_key_joins[(min(left_alias, right_alias), max(left_alias, right_alias))].append(condition)
             continue  # Skip adding to other conditions
-        elif (
-            condition_refs.count(partition_key) >= 1
-            and (sqlglot.parse_one(condition).find(exp.In) or any(op in condition for op in ["BETWEEN", ">", "<", "=", "!=", "<>"]))
-            and not _is_partition_key_fk_join(condition, partition_key, table_aliases)
-        ):
-            # Partition key condition (IN, BETWEEN, comparison, etc.) — store with alias intact
-            pk_alias_match = re.match(r'(?:NOT\s+)?(\w+)\.', condition_refs)
-            if pk_alias_match:
-                pk_alias = pk_alias_match.group(1)
-            elif table_aliases:
-                pk_alias = table_aliases[0]
-            else:
-                pk_alias = "unknown"
+        elif partition_key in condition_refs and (pk_alias := _partition_key_condition_alias(condition, partition_key, table_aliases)) is not None:
+            # Partition key condition (depends on <alias>.<pk> alone) — store with alias intact
             partition_key_conditions[pk_alias].append(condition)
             continue
 
@@ -633,7 +696,8 @@ def extract_and_group_query_conditions(
         # Filter against outer FROM aliases to exclude inner subquery table references
         all_alias: set = set(_ALIAS_REFERENCE_RE.findall(condition_refs)) & set(table_aliases)
         parsed = sqlglot.parse_one(condition)
-        table_identifiers = tuple(sorted({col.table for col in parsed.find_all(exp.Column) if col.table}))
+        # Keyed by the outer aliases only: an alias of a subquery inside the condition is in no combination
+        table_identifiers = tuple(sorted(all_alias)) or tuple(sorted({col.table for col in parsed.find_all(exp.Column) if col.table}))
         # AND/OR are exp.Func subclasses since sqlglot 30; only real function calls count here
         if any(not isinstance(func, exp.Connector) for func in parsed.find_all(exp.Func)):
             if len(all_alias) == 2:
@@ -649,7 +713,7 @@ def extract_and_group_query_conditions(
             continue
         else:
             if len(all_alias) == 2:
-                distance_conditions[(table_identifiers[0], table_identifiers[1])].append(condition)
+                distance_conditions[table_identifiers].append(condition)
                 continue
             else:
                 other_functions[table_identifiers].append(condition)
@@ -1518,19 +1582,10 @@ def generate_partial_queries(
                                 q = f"{select_clause} FROM {', '.join(new_table_list_with_alias)}"
                         ret.append(q)
 
-    # Add also the raw partition_key queries
+    # Add also the subqueries of `pk IN (SELECT ...)` conditions as variants of their own
     for pk_conds in partition_key_conditions.values():
         for partition_key_part in pk_conds:
-            # Get part in brackets
-            part = re.search(r"\((.*)\)", partition_key_part)
-            if part:
-                spart = part.group(1)
-            else:
-                continue
-            sublist = spart.split("INTERSECT")
-            for sub in sublist:
-                sub = sub.strip()
-                ret.append(sub)
+            ret.extend(_partition_key_subqueries(partition_key_part, table_aliases))
 
     # Process each query with sqlglot, skipping unparseable variants
     result = []
@@ -1559,223 +1614,136 @@ def is_distance_function(condition: str) -> bool:
         return False
 
 
+_BUCKET_COMPARISONS: dict[type[exp.Expr], type[exp.Expr]] = {exp.LT: exp.GT, exp.LTE: exp.GTE, exp.GT: exp.LT, exp.GTE: exp.LTE}  # operator -> mirrored
+
+
+def _bucket_bound(value: Decimal, bucket_steps: Decimal, up: bool) -> exp.Expr | None:
+    """Round a non-negative bound to the bucket grid, up to the next boundary or down to the previous one.
+
+    Decimal arithmetic and exact formatting: float division (1.7 // 0.1 * 0.1 = 1.7000000000000002) or printing
+    with few significant digits (1234567.5 -> 1.23457e+06) could move a bound past its value and tighten it.
+    Returns None (bound left unchanged) if the quotient exceeds Decimal's precision (e.g. 1e30 with step 1).
+    """
+    try:
+        floor = (value // bucket_steps) * bucket_steps
+    except InvalidOperation:
+        return None
+    bound = floor + bucket_steps if up and floor != value else floor
+    return exp.Literal.number(format(bound.normalize(), "f"))
+
+
+def _numeric_literal(node: exp.Expr) -> Decimal | None:
+    """The exact value of a non-negative numeric literal, else None (negative values are left alone)."""
+    if isinstance(node, exp.Paren):
+        return _numeric_literal(node.this)
+    if isinstance(node, exp.Literal) and not node.is_string:
+        try:
+            value = Decimal(node.this)
+        except InvalidOperation:
+            return None
+        return value if value.is_finite() and value >= 0 else None
+    return None
+
+
+def _monotone_polarity(node: exp.Expr, where: exp.Where) -> bool | None:
+    """Whether ``node`` occurs positively (True) or under an odd number of NOTs (False) in the WHERE clause.
+
+    None if the path to the WHERE clause passes anything but AND, OR, NOT and parentheses (a function argument,
+    CASE, a subquery ...): there, loosening the comparison need not loosen the condition.
+    """
+    positive = True
+    parent = node.parent
+    while parent is not where:
+        if isinstance(parent, exp.Not):
+            positive = not positive
+        elif not isinstance(parent, exp.And | exp.Or | exp.Paren):
+            return None
+        parent = parent.parent
+    return positive
+
+
 def normalize_distance_conditions(original_query: str, bucket_steps: float = 1.0, restrict_to_dist_functions=True) -> str:
     """
-    This function takes a query and normalizes the distance conditions.
-    It replaces the distance conditions with lower bound bucket bracket  and upper bound bucket bracket
-    of the BETWEEN clause.
+    Normalize the distance conditions of a query to a grid of ``bucket_steps``.
 
-    Min values gets replaced by the next lower bucket value
-    Max values gets replaced by the next higher bucket value
-    eg.
-    1.6 - 3.6 -> 1 - 4 WITH bucket_steps = 1
-    1.6 - 3.6 -> 0 - 4 WITH bucket_steps = 2
+    Every comparison of a distance function with a non-negative number in the outer WHERE clause is loosened to
+    the next bucket boundary, so that queries with nearby distances share variants: an upper bound is rounded up,
+    a lower bound down (e.g. ``BETWEEN 1.6 AND 3.6`` -> ``BETWEEN 1 AND 4`` with bucket_steps = 1, ``0 - 4`` with
+    bucket_steps = 2). Under NOT the directions flip, so the condition as a whole is always loosened, also inside
+    OR and NOT BETWEEN. Comparisons in other contexts (function arguments, CASE, subqueries) stay unchanged.
 
-    query: str: The query to be normalized
-    partition_key: str: The identifier of the search space
+    Args:
+        original_query: The query to be normalized.
+        bucket_steps: Bucket width; 0 or negative returns the query unchanged.
+        restrict_to_dist_functions: Only bucket comparisons of distance functions (default), else of any expression.
+
+    Returns:
+        The normalized query.
     """
-    bucket_steps = float(bucket_steps)
-
     # If bucket_steps is 0 or negative, return original query without distance normalization
-    if bucket_steps <= 0:
+    if float(bucket_steps) <= 0:
+        return original_query
+    steps = Decimal(str(bucket_steps))
+    if not steps.is_finite():
         return original_query
 
-    original_query = sqlglot.parse_one(original_query).sql()
-    condition_list = extract_conjunctive_conditions(original_query)
+    parsed = sqlglot.parse_one(original_query)
+    where = parsed.args.get("where") if isinstance(parsed, exp.Select) else None
+    if where is None:
+        return parsed.sql()
 
-    query = original_query
-    distance_conditions_between = []
-    distance_conditions_smaller = []
-    distance_conditions_greater = []
+    def bucketable(side: exp.Expr) -> bool:
+        while isinstance(side, exp.Paren):
+            side = side.this
+        return not restrict_to_dist_functions or (isinstance(side, exp.Func) and is_distance_function(side.sql()))
 
-    for condition in condition_list:
-        if " BETWEEN " in condition.upper():
-            distance_conditions_between.append(condition)
-        elif "<" in condition or "<=" in condition:
-            distance_conditions_smaller.append(condition)
-        elif ">" in condition or ">=" in condition:
-            distance_conditions_greater.append(condition)
-        else:
-            pass
-
-    # TODO Ensure one of the values is a literal number
-    # TODO Ensure number is on second position
-    # TODO Ensure number is not negative (verify that this is needed)
-
-    # Check if at least one value is a number
-    for distance_condition in list(distance_conditions_between + distance_conditions_smaller + distance_conditions_greater):
-        if not any(str(x).replace(".", "", 1).isdigit() for x in distance_condition.split()):
-            logger.warning(f"No numeric value found in distance condition: {distance_condition}")
-            if distance_condition in distance_conditions_between:
-                distance_conditions_between.remove(distance_condition)
-            if distance_condition in distance_conditions_smaller:
-                distance_conditions_smaller.remove(distance_condition)
-            if distance_condition in distance_conditions_greater:
-                distance_conditions_greater.remove(distance_condition)
-
-    # Check if number is on right side of comparison operator for distance functions # TODO check if this is needed, should be handled by sqlglot
-    for distance_condition in list(distance_conditions_between + distance_conditions_smaller + distance_conditions_greater):
-        if is_distance_function(distance_condition):
-            if "<" in distance_condition or ">" in distance_condition:
-                parts = re.split(r"(<=|>=|<|>)", distance_condition)
-                if len(parts) == 2 and not str(parts[1].strip()).replace(".", "", 1).isdigit():
-                    logger.warning(f"Numeric value not on right side of comparison in distance condition: {distance_condition}")
-                    if distance_condition in distance_conditions_between:
-                        distance_conditions_between.remove(distance_condition)
-                    if distance_condition in distance_conditions_smaller:
-                        distance_conditions_smaller.remove(distance_condition)
-                    if distance_condition in distance_conditions_greater:
-                        distance_conditions_greater.remove(distance_condition)
-
-    # Check for negative numbers
-    for distance_condition in list(distance_conditions_between + distance_conditions_smaller + distance_conditions_greater):
-        numbers = [float(x) for x in re.findall(r"-?\d*\.?\d+", distance_condition)]
-        if any(n < 0 for n in numbers):
-            logger.warning(f"Negative value found in distance condition: {distance_condition}")
-            if distance_condition in distance_conditions_between:
-                distance_conditions_between.remove(distance_condition)
-            if distance_condition in distance_conditions_smaller:
-                distance_conditions_smaller.remove(distance_condition)
-            if distance_condition in distance_conditions_greater:
-                distance_conditions_greater.remove(distance_condition)
-
-    for distance_condition in distance_conditions_between:
-        if restrict_to_dist_functions and not is_distance_function(distance_condition):
+    for node in list(where.find_all(exp.Between, *_BUCKET_COMPARISONS)):
+        if node.find_ancestor(exp.Select) is not parsed:
+            continue  # inside a subquery
+        positive = _monotone_polarity(node, where)
+        if positive is None:
             continue
-        lower_bound, upper_bound = distance_condition.split(" BETWEEN ")[1].split(" AND ")
-
-        lower_bound = lower_bound.strip()
-        lower_bound = lower_bound.replace(";", "")
-        upper_bound = upper_bound.strip()
-        upper_bound = upper_bound.replace(";", "")
-
-        # do nothing if either is negative
-        if float(lower_bound) < 0 or float(upper_bound) < 0:
+        if isinstance(node, exp.Between):
+            low, high = _numeric_literal(node.args["low"]), _numeric_literal(node.args["high"])
+            if low is None or high is None or not bucketable(node.this):
+                continue
+            new_low, new_high = _bucket_bound(low, steps, up=not positive), _bucket_bound(high, steps, up=positive)
+            if new_low is not None and new_high is not None:
+                node.set("low", new_low)
+                node.set("high", new_high)
             continue
-
-        # Floor lower bound
-        lower_boundf = int(float(lower_bound) / bucket_steps) * bucket_steps
-
-        # Ceil upper bound
-        if int(float(upper_bound) / bucket_steps) * bucket_steps == float(upper_bound):
-            upper_boundf = int(float(upper_bound) / bucket_steps) * bucket_steps
+        operator = type(node)
+        if _numeric_literal(node.expression) is not None and bucketable(node.this):
+            literal_arg = "expression"
+        elif _numeric_literal(node.this) is not None and bucketable(node.expression):
+            literal_arg, operator = "this", _BUCKET_COMPARISONS[operator]  # 2.5 > DIST(...) is DIST(...) < 2.5
         else:
-            upper_boundf = int(float(upper_bound) / bucket_steps) * bucket_steps + bucket_steps
-
-        new_condition = f"{distance_condition.split('BETWEEN')[0]} BETWEEN {lower_boundf:g} AND {upper_boundf:g}"
-        query = query.replace(distance_condition, new_condition)
-
-    # TODO ensure robustness with flipped conditions
-    for distance_condition in distance_conditions_smaller:
-        if restrict_to_dist_functions and not is_distance_function(distance_condition):
             continue
+        value = _numeric_literal(node.args[literal_arg])
+        assert value is not None
+        upper_bound = operator in (exp.LT, exp.LTE)
+        bound = _bucket_bound(value, steps, up=upper_bound == positive)
+        if bound is not None:
+            node.set(literal_arg, bound)
 
-        # More robust parsing: use regex to extract the numeric value correctly
-        if "<=" in distance_condition:
-            # Use regex to find the number after <=, avoiding parsing issues with subsequent AND clauses
-            match = re.search(r"<=\s*([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)", distance_condition)
-            if not match:
-                logger.warning(f"Could not extract numeric value from condition: {distance_condition}")
-                continue
-
-            value_str = match.group(1)
-            try:
-                value = float(value_str)
-            except ValueError:
-                logger.warning(f"Could not parse numeric value '{value_str}' from condition: {distance_condition}")
-                continue
-
-            if value < 0:
-                continue
-            # For <= operator: round up to next bucket boundary
-            bucket_floor = int(value / bucket_steps) * bucket_steps
-            if bucket_floor == value:
-                # Value is exactly on bucket boundary, keep it
-                valuef = value
-            else:
-                # Round up to next bucket boundary
-                valuef = bucket_floor + bucket_steps
-            left_part = distance_condition.split("<=")[0]
-            new_condition = f"{left_part} <= {valuef:g}"
-        else:
-            # Similar robust parsing for < operator
-            match = re.search(r"<\s*([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)", distance_condition)
-            if not match:
-                logger.warning(f"Could not extract numeric value from condition: {distance_condition}")
-                continue
-
-            value_str = match.group(1)
-            try:
-                value = float(value_str)
-            except ValueError:
-                logger.warning(f"Could not parse numeric value '{value_str}' from condition: {distance_condition}")
-                continue
-
-            if value < 0:
-                continue
-            b = int(value / bucket_steps) * bucket_steps
-            if b == value:
-                valuef = b
-            else:
-                valuef = b + bucket_steps
-            left_part = distance_condition.split("<")[0]
-            new_condition = f"{left_part} < {valuef:g}"
-        query = query.replace(distance_condition, new_condition)
-
-    for distance_condition in distance_conditions_greater:
-        if restrict_to_dist_functions and not is_distance_function(distance_condition):
-            continue
-
-        # More robust parsing for >= and > operators
-        if ">=" in distance_condition:
-            match = re.search(r">=\s*([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)", distance_condition)
-            if not match:
-                logger.warning(f"Could not extract numeric value from condition: {distance_condition}")
-                continue
-
-            value_str = match.group(1)
-            try:
-                value = float(value_str)
-            except ValueError:
-                logger.warning(f"Could not parse numeric value '{value_str}' from condition: {distance_condition}")
-                continue
-
-            if value < 0:
-                continue
-            valuef = int(value / bucket_steps) * bucket_steps
-            left_part = distance_condition.split(">=")[0]
-            new_condition = f"{left_part} >= {valuef:g}"
-        else:
-            match = re.search(r">\s*([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)", distance_condition)
-            if not match:
-                logger.warning(f"Could not extract numeric value from condition: {distance_condition}")
-                continue
-
-            value_str = match.group(1)
-            try:
-                value = float(value_str)
-            except ValueError:
-                logger.warning(f"Could not parse numeric value '{value_str}' from condition: {distance_condition}")
-                continue
-
-            if value < 0:
-                continue
-            valuef = int(value / bucket_steps) * bucket_steps
-            left_part = distance_condition.split(">")[0]
-            new_condition = f"{left_part} > {valuef:g}"
-        query = query.replace(distance_condition, new_condition)
-
-    # Collapse the whitespace left by the replacements, but not inside string literals
-    return re.sub(r"('(?:[^']|'')*')|\s+", lambda m: m.group(1) or " ", query).strip()
+    return parsed.sql()
 
 
 def _add_constraints_to_query(query: str, add_constraints: dict[str, str]) -> str:
     """
     Add constraints to specific tables in a query.
 
+    Each constraint is added once per occurrence of its table in the outer FROM clause, with its columns
+    qualified by that occurrence's alias (also references to the table name inside the constraint's
+    subqueries), and the WHERE clause is rebuilt in the variant generator's canonical order. Self-joins get
+    one unambiguous condition per alias. The result equals the variant of the query with the condition
+    written out, so both share cache entries, unless the added condition changes the order in which the
+    generator numbers the aliases (t1, t2, ...): the aliases of the given variant are kept.
+
     Args:
         query: The SQL query to modify
-        add_constraints: Dict mapping table names to constraints (e.g. {"points_table": "size = 4"})
+        add_constraints: Dict mapping table names to constraints (e.g. {"points_table": "size = 4"});
+            columns may be unqualified or qualified with the table name
 
     Returns:
         Modified query with constraints added
@@ -1785,61 +1753,55 @@ def _add_constraints_to_query(query: str, add_constraints: dict[str, str]) -> st
 
     try:
         parsed = sqlglot.parse_one(query)
-
-        # Check if we have any of the target tables in the query
-        has_target_table = False
-        for table in parsed.find_all(exp.Table):
-            if table.name in add_constraints:
-                has_target_table = True
-                break
-
-        if not has_target_table:
-            return query
-
-        # Find the main SELECT statement
         select_stmt = parsed if isinstance(parsed, exp.Select) else parsed.find(exp.Select)
         if not select_stmt:
             return query
 
-        # Build combined constraint for all matching tables
-        new_constraints = []
-        for table_name, constraint in add_constraints.items():
-            # Check if this table exists in the query
-            table_exists = any(table.name == table_name for table in parsed.find_all(exp.Table))
-            if table_exists:
-                try:
-                    # Parse the constraint as an expression
-                    constraint_parsed = sqlglot.parse_one(f"SELECT * FROM t WHERE {constraint}")
-                    where_clause = constraint_parsed.find(exp.Where)
-                    if where_clause and where_clause.this:
-                        constraint_expr = where_clause.this
-                        new_constraints.append(constraint_expr)
-                except Exception as e:
-                    logger.warning(f"Failed to parse constraint '{constraint}': {e}")
+        new_constraints: list[exp.Expr] = []
+        for table in select_stmt.find_all(exp.Table):
+            if table.parent_select is not select_stmt or table.name not in add_constraints:
+                continue
+            try:
+                # Detached from the helper SELECT, so only columns inside subqueries of the constraint have a SELECT ancestor
+                constraint_expr = sqlglot.parse_one(f"SELECT * FROM t WHERE {add_constraints[table.name]}").args["where"].this.copy()
+            except Exception as e:
+                logger.warning(f"Failed to parse constraint '{add_constraints[table.name]}': {e}")
+                continue
+            for column in constraint_expr.find_all(exp.Column):
+                inner_select = column.find_ancestor(exp.Select)
+                if inner_select is None:
+                    qualify = column.table in ("", table.name)
+                else:
+                    # Inside a subquery of the constraint only references to the table name, unless an enclosing subquery
+                    # has a FROM entry of that name itself
+                    shadowed = False
+                    node: exp.Expr | None = inner_select
+                    while node is not None:
+                        if isinstance(node, exp.Select) and any(
+                            source.alias_or_name == table.name for source in node.find_all(exp.Table) if source.parent_select is node
+                        ):
+                            shadowed = True
+                        node = node.parent
+                    qualify = column.table == table.name and not shadowed
+                if qualify:
+                    column.set("table", exp.to_identifier(table.alias_or_name))
+            new_constraints.append(constraint_expr)
 
         if not new_constraints:
             return query
 
-        # Get existing WHERE clause
+        # Same order as generated variants: conjuncts sorted as text, then simplified
         existing_where = select_stmt.args.get("where")
-
-        if existing_where:
-            # Combine with existing WHERE clause using AND
-            combined_condition = existing_where.this
-            for constraint_expr in new_constraints:
-                combined_condition = exp.And(this=combined_condition, expression=constraint_expr)
-            select_stmt.set("where", exp.Where(this=combined_condition))
-        else:
-            # Create new WHERE clause
-            if len(new_constraints) == 1:
-                where_condition = new_constraints[0]
-            else:
-                where_condition = new_constraints[0]
-                for constraint_expr in new_constraints[1:]:
-                    where_condition = exp.And(this=where_condition, expression=constraint_expr)
-            select_stmt.set("where", exp.Where(this=where_condition))
-
-        return parsed.sql()
+        conjuncts = list(existing_where.this.flatten()) if existing_where and isinstance(existing_where.this, exp.And) else (
+            [existing_where.this] if existing_where else []
+        )
+        for constraint_expr in new_constraints:
+            conjuncts.extend(constraint_expr.flatten() if isinstance(constraint_expr, exp.And) else [constraint_expr])
+        # An OR conjunct keeps its parentheses, as in generated variants; joined with AND it would otherwise bind differently
+        texts = sorted({(exp.paren(c, copy=False) if isinstance(c, exp.Or) else c).sql() for c in conjuncts})
+        select_stmt.set("where", exp.Where(this=sqlglot.parse_one(f"SELECT * FROM t WHERE {' AND '.join(texts)}").args["where"].this))
+        simplified: exp.Expr = sqlglot.optimizer.simplify.simplify(parsed)
+        return simplified.sql()
     except Exception as e:
         logger.warning(f"Failed to add constraints to query: {e}")
         return query

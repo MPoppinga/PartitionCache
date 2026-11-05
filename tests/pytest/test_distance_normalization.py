@@ -258,3 +258,103 @@ class TestDistanceNormalization:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestBucketingLoosensTheWholeCondition:
+    """Bucketing must loosen the condition as a whole (no false negatives) and must never break the query."""
+
+    @pytest.mark.parametrize(
+        ("condition", "bucketed"),
+        [
+            ("DIST(a.x, a.y) < 2.5 OR a.type = 3", "DIST(a.x, a.y) < 3 OR a.type = 3"),
+            ("a.v = 1 AND (DIST(a.x, a.y) < 2.5 OR a.type = 3)", "a.v = 1 AND (DIST(a.x, a.y) < 3 OR a.type = 3)"),
+            ("NOT DIST(a.x, a.y) BETWEEN 2.5 AND 5.5", "NOT DIST(a.x, a.y) BETWEEN 3 AND 5"),
+            ("NOT DIST(a.x, a.y) < 2.5", "NOT DIST(a.x, a.y) < 2"),
+            ("NOT (DIST(a.x, a.y) >= 2.5 AND a.type = 3)", "NOT (DIST(a.x, a.y) >= 3 AND a.type = 3)"),
+            ("2.5 > DIST(a.x, a.y)", "3 > DIST(a.x, a.y)"),
+            ("DIST(a.x, a.y) BETWEEN 1.6 AND 3.6", "DIST(a.x, a.y) BETWEEN 1 AND 4"),
+            # Not monotone in the comparison: left unchanged
+            ("COALESCE(DIST(a.x, a.y) < 2.5, FALSE)", "COALESCE(DIST(a.x, a.y) < 2.5, FALSE)"),
+            ("a.pk IN (SELECT b.pk FROM points AS b WHERE DIST(b.x, b.y) < 2.5)", "a.pk IN (SELECT b.pk FROM points AS b WHERE DIST(b.x, b.y) < 2.5)"),
+        ],
+    )
+    def test_bucketed_condition(self, condition, bucketed):
+        assert normalize_distance_conditions(f"SELECT a.pk FROM points AS a WHERE {condition}", bucket_steps=1) == (
+            f"SELECT a.pk FROM points AS a WHERE {bucketed}"
+        )
+
+    @pytest.mark.parametrize(
+        "condition",
+        [
+            "DIST(a.x, a.y) < 2.5 OR a.type = 3",
+            "NOT DIST(a.x, a.y) BETWEEN 2.5 AND 5.5",
+            "NOT DIST(a.x, a.y) <= 2.5",
+            "NOT (DIST(a.x, a.y) > 4.2 OR a.type = 1)",
+            "DIST(a.x, a.y) > 1.5 AND NOT DIST(a.x, a.y) >= 6.5",
+            "3.3 <= DIST(a.x, a.y)",
+        ],
+    )
+    def test_every_row_of_the_query_satisfies_the_bucketed_query(self, condition):
+        import sqlite3
+
+        conn = sqlite3.connect(":memory:")
+        conn.create_function("DIST", 2, lambda x, y: abs(x - y))
+        conn.execute("CREATE TABLE points (pk INTEGER, x REAL, y REAL, type INTEGER)")
+        conn.executemany("INSERT INTO points VALUES (?, 0, ?, ?)", [(i, i * 0.05, i % 4) for i in range(200)])
+        query = f"SELECT a.pk FROM points AS a WHERE {condition}"
+        original = {row[0] for row in conn.execute(query)}
+        bucketed = {row[0] for row in conn.execute(normalize_distance_conditions(query, bucket_steps=1))}
+        assert original <= bucketed
+        assert original
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "SELECT a.pk FROM points AS a, points AS b WHERE a.pk = b.pk AND a.type = 1 AND b.type = 2 AND DIST(a.x, b.x) NOT BETWEEN 2.5 AND 5.5",
+            "SELECT a.pk FROM points AS a WHERE a.v = 1 AND (DIST(a.x, a.y) < 2.5 OR a.type = 3)",
+        ],
+    )
+    def test_variant_generation_does_not_raise_and_keeps_or_branches(self, query):
+        from partitioncache.query_processor import generate_all_query_hash_pairs
+
+        variants = [v for v, _ in generate_all_query_hash_pairs(query, "pk", min_component_size=1, warn_no_partition_key=False, bucket_steps=1.0)]
+        assert variants
+        # Both distance conditions are disjunctions (NOT BETWEEN as < OR >); no variant may keep only one side
+        for variant in variants:
+            if "DIST(" in variant:
+                assert " OR " in variant, variant
+
+
+class TestBucketBoundsAreExact:
+    """Float division and 6-digit formatting could move a bound past its value and tighten the condition."""
+
+    @pytest.mark.parametrize(
+        ("condition", "steps", "bucketed"),
+        [
+            ("DIST(a.x, a.y) >= 1234567.5", 1, "DIST(a.x, a.y) >= 1234567"),
+            ("DIST(a.x, a.y) > 12.34567", 1e-05, "DIST(a.x, a.y) > 12.34567"),
+            ("DIST(a.x, a.y) > 1.7", 0.1, "DIST(a.x, a.y) > 1.7"),
+            ("DIST(a.x, a.y) < 1.71", 0.1, "DIST(a.x, a.y) < 1.8"),
+            ("(DIST(a.x, a.y)) < 2.5", 1, "(DIST(a.x, a.y)) < 3"),
+            ("DIST(a.x, a.y) < 1e3", 1, "DIST(a.x, a.y) < 1000"),
+        ],
+    )
+    def test_bound(self, condition, steps, bucketed):
+        query = f"SELECT a.pk FROM points AS a WHERE {condition}"
+        assert normalize_distance_conditions(query, bucket_steps=steps) == f"SELECT a.pk FROM points AS a WHERE {bucketed}"
+
+    def test_bounds_beyond_decimal_precision_stay_unchanged(self):
+        query = "SELECT a.pk FROM points AS a WHERE DIST(a.x, a.y) < 1e30 AND DIST(a.x, a.z) < 2.5"
+        assert normalize_distance_conditions(query, bucket_steps=1) == "SELECT a.pk FROM points AS a WHERE DIST(a.x, a.y) < 1e30 AND DIST(a.x, a.z) < 3"
+        assert normalize_distance_conditions(query, bucket_steps=float("inf")) == query
+
+    @pytest.mark.parametrize("steps", [0.1, 0.25, 1, 1e-05, 1000])
+    def test_upper_bounds_never_drop_below_and_lower_bounds_never_rise_above_the_value(self, steps):
+        from decimal import Decimal
+
+        values = [Decimal(i) / 100 for i in range(0, 1000, 7)] + [Decimal("1234567.5"), Decimal("12.34567"), Decimal("98765432.123")]
+        for value in values:
+            upper = normalize_distance_conditions(f"SELECT a.pk FROM t AS a WHERE DIST(a.x, a.y) < {value}", bucket_steps=steps)
+            lower = normalize_distance_conditions(f"SELECT a.pk FROM t AS a WHERE DIST(a.x, a.y) > {value}", bucket_steps=steps)
+            assert Decimal(upper.rsplit("< ", 1)[1]) >= value, (value, upper)
+            assert Decimal(lower.rsplit("> ", 1)[1]) <= value, (value, lower)

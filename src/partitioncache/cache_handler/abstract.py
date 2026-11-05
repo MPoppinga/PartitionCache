@@ -294,7 +294,8 @@ class AbstractCacheHandler(ABC):
         Args:
             key (str): The query hash to set status for.
             partition_key (str, optional): The partition key. Defaults to "partition_key".
-            status (str, optional): The status to set ('ok', 'timeout', 'failed'). Defaults to "ok".
+            status (str, optional): The status to set: 'ok', 'timeout', 'failed', or 'limit' (the result
+                exceeded the configured result limit and was not stored). Defaults to "ok".
 
         Returns:
             bool: True if the operation was successful, False otherwise.
@@ -311,7 +312,7 @@ class AbstractCacheHandler(ABC):
             partition_key (str, optional): The partition key. Defaults to "partition_key".
 
         Returns:
-            str | None: The status ('ok', 'timeout', 'failed') or None if not found.
+            str | None: The status ('ok', 'timeout', 'failed', 'limit') or None if not found.
         """
         raise NotImplementedError
 

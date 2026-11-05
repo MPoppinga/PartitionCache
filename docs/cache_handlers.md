@@ -45,9 +45,10 @@ PartitionCache supports multiple cache backends with different performance chara
 
 #### Redis Bit Handler
 - **Type**: `redis_bit`
-- **Storage**: Redis bit arrays
+- **Storage**: Redis bit arrays, one bit per partition key (`ceil(bitsize / 8)` bytes per entry)
 - **Datatypes**: `integer` only  
 - **Best for**: Large integer datasets in distributed setup
+- **Format note**: Earlier versions stored one ASCII character per partition key. Such entries are converted to packed bits in place when they are first read, so existing caches keep working and shrink as they are used.
 - **Memory**: Efficient for integers
 - **Scalability**: Excellent (network-distributed)
 

@@ -4,6 +4,8 @@ This replaces multiple fragmented test files with comprehensive coverage.
 """
 
 import pytest
+import sqlglot
+from sqlglot import exp
 
 from partitioncache.query_processor import (
     clean_query,
@@ -708,3 +710,90 @@ class TestOrderVariantsForPopulation:
             restricted += bool(relaxations)
         # The check is only meaningful if most variants have relaxations to be restricted with
         assert restricted >= len(ordered) // 2
+
+
+def _variants(query, partition_key):
+    return [variant for variant, _ in generate_all_query_hash_pairs(query, partition_key, min_component_size=1, warn_no_partition_key=False)]
+
+
+def _references_only_own_aliases(variant):
+    parsed = sqlglot.parse_one(variant)
+    aliases = {table.alias_or_name for table in parsed.find_all(exp.Table)}
+    return all(not column.table or column.table in aliases for column in parsed.find_all(exp.Column))
+
+
+class TestPartitionKeyConditionClassification:
+    """Only conditions on <alias>.<partition key> itself hold for every variant; anything else keeps its alias."""
+
+    POINTS_QUERY = """
+    SELECT a.pocket_key FROM points AS a, points AS b, points AS c
+    WHERE a.pocket_key = b.pocket_key AND b.pocket_key = c.pocket_key
+      AND a.type = 1 AND b.type = 2 AND c.type = 3
+      AND DIST(a.x, b.x) <= 2.0 AND DIST(b.x, c.x) <= 2.0
+      AND NOT EXISTS (SELECT 1 FROM points AS x WHERE DIST(x.x, a.x) <= 3.5 AND a.pocket_key = x.pocket_key AND x.type = 9)
+    """
+
+    def test_correlated_not_exists_stays_on_its_alias(self):
+        """Attached to b, the NOT EXISTS would drop pockets where b (not a) has a type-9 neighbour: false negatives."""
+        variants = _variants(self.POINTS_QUERY, "pocket_key")
+        with_not_exists = [v for v in variants if "NOT EXISTS" in v]
+        assert with_not_exists
+        for variant in with_not_exists:
+            where = sqlglot.parse_one(variant).args["where"].this
+            not_exists = next(c for c in where.flatten() if isinstance(c, exp.Not))
+            correlated = {col.table for col in not_exists.find_all(exp.Column)} - {"x"}
+            type_1 = {c.this.table for c in where.flatten() if isinstance(c, exp.EQ) and c.this.name == "type" and c.expression.this == "1"}
+            assert correlated == type_1, variant
+
+    def test_every_variant_is_a_query_on_its_own_aliases(self):
+        for variant in _variants(self.POINTS_QUERY, "pocket_key"):
+            assert variant.startswith("SELECT DISTINCT"), variant
+            assert _references_only_own_aliases(variant), variant
+
+    def test_not_in_subquery_is_no_variant(self):
+        """The subquery of NOT IN selects the keys to exclude."""
+        query = "SELECT a.pk FROM t AS a WHERE a.v = 1 AND a.pk NOT IN (SELECT b.pk FROM bad AS b WHERE b.flag = 1)"
+        variants = _variants(query, "pk")
+        assert "SELECT b.pk FROM bad AS b WHERE b.flag = 1" not in variants
+        assert any("NOT t1.pk IN (SELECT b.pk FROM bad AS b WHERE b.flag = 1)" in v for v in variants)
+
+    def test_in_subquery_is_a_variant(self):
+        query = "SELECT a.pk FROM t AS a WHERE a.v = 1 AND a.pk IN (SELECT b.pk FROM good AS b WHERE b.flag = 1 INTERSECT SELECT d.pk FROM ok AS d)"
+        variants = _variants(query, "pk")
+        assert "SELECT b.pk FROM good AS b WHERE b.flag = 1" in variants
+        assert "SELECT d.pk FROM ok AS d" in variants
+
+    @pytest.mark.parametrize("condition", ["(a.pk = 1 OR a.pk = 2)", "a.pk % 10 = 3"])
+    def test_condition_on_the_partition_key_alone_holds_for_every_variant(self, condition):
+        query = f"SELECT a.pk FROM t AS a, u AS c WHERE a.pk = c.pk AND c.w = 2 AND {condition}"
+        variants = _variants(query, "pk")
+        for variant in variants:
+            assert variant.startswith("SELECT"), variant
+            assert _references_only_own_aliases(variant), variant
+        assert any(v.startswith("SELECT DISTINCT t1.pk FROM u AS t1 WHERE") and "t1.pk" in v.split("WHERE")[1] for v in variants), variants
+
+    # The subquery alias b sorts between the outer aliases a and c, s after them
+    @pytest.mark.parametrize("inner", ["s AS b", "s"])
+    def test_in_subquery_correlated_with_another_alias_joins_both(self, inner):
+        alias = inner.split()[-1]
+        query = f"""
+        SELECT a.pk FROM t AS a, u AS c WHERE a.pk = c.pk AND c.w = 2 AND a.v = 1
+          AND a.pk IN (SELECT {alias}.pk FROM {inner} WHERE {alias}.z = c.z)
+        """
+        variants = _variants(query, "pk")
+        for variant in variants:
+            assert _references_only_own_aliases(variant), variant
+        assert any(f"t1.pk IN (SELECT {alias}.pk FROM {inner} WHERE {alias}.z = t2.z)" in v and "u AS t2" in v for v in variants), variants
+
+    @pytest.mark.parametrize(
+        ("condition", "expected"),
+        [
+            ("a.pk = ANY (SELECT b.pk FROM good AS b)", ["SELECT b.pk FROM good AS b"]),
+            ("a.pk IN (SELECT b.pk FROM good AS b UNION SELECT d.pk FROM ok AS d)", ["SELECT b.pk FROM good AS b UNION SELECT d.pk FROM ok AS d"]),
+            ("a.pk IN ((SELECT b.pk FROM good AS b) INTERSECT (SELECT d.pk FROM ok AS d))", ["SELECT b.pk FROM good AS b", "SELECT d.pk FROM ok AS d"]),
+        ],
+    )
+    def test_subqueries_that_contain_all_admitted_keys_are_variants(self, condition, expected):
+        variants = _variants(f"SELECT a.pk FROM t AS a WHERE a.v = 1 AND {condition}", "pk")
+        for subquery in expected:
+            assert subquery in variants
