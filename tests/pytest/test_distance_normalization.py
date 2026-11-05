@@ -3,6 +3,7 @@ Unit tests for distance condition normalization
 """
 
 import pytest
+import sqlglot
 
 from partitioncache.query_processor import clean_query, extract_conjunctive_conditions, normalize_distance_conditions
 
@@ -358,3 +359,53 @@ class TestBucketBoundsAreExact:
             lower = normalize_distance_conditions(f"SELECT a.pk FROM t AS a WHERE DIST(a.x, a.y) > {value}", bucket_steps=steps)
             assert Decimal(upper.rsplit("< ", 1)[1]) >= value, (value, upper)
             assert Decimal(lower.rsplit("> ", 1)[1]) <= value, (value, lower)
+
+
+class TestRadiusBucketing:
+    """The radius of ST_DWithin / ST_DFullyWithin is loosened like an upper bound of a distance comparison."""
+
+    @pytest.mark.parametrize(
+        ("condition", "bucketed"),
+        [
+            ("ST_DWithin(a.g, b.g, 512.3)", "ST_DWITHIN(a.g, b.g, 520)"),
+            ("ST_DWithin(a.g, b.g, 500)", "ST_DWITHIN(a.g, b.g, 500)"),
+            ("NOT ST_DWithin(a.g, b.g, 512.3)", "NOT ST_DWITHIN(a.g, b.g, 510)"),
+            ("ST_DWithin(a.g, b.g, 512.3) OR a.t = 1", "ST_DWITHIN(a.g, b.g, 520) OR a.t = 1"),
+            ("ST_DWithin(a.g, ST_MakePoint(1, 2), 99.5, TRUE)", "ST_DWITHIN(a.g, ST_MAKEPOINT(1, 2), 100, TRUE)"),
+            ("ST_DFullyWithin(a.g, b.g, (2.5))", "ST_DFULLYWITHIN(a.g, b.g, 10)"),
+            # Radius not a literal, not monotone in the radius, or inside a subquery: left unchanged
+            ("ST_DWithin(a.g, b.g, a.r)", "ST_DWITHIN(a.g, b.g, a.r)"),
+            ("ST_DWithin(a.g, b.g, -5.5)", "ST_DWITHIN(a.g, b.g, -5.5)"),
+            ("COALESCE(ST_DWithin(a.g, b.g, 5.5), FALSE)", "COALESCE(ST_DWITHIN(a.g, b.g, 5.5), FALSE)"),
+            ("a.pk IN (SELECT c.pk FROM p AS c WHERE ST_DWithin(c.g, a.g, 5.5))", "a.pk IN (SELECT c.pk FROM p AS c WHERE ST_DWITHIN(c.g, a.g, 5.5))"),
+        ],
+    )
+    def test_bucketed_radius(self, condition, bucketed):
+        query = f"SELECT a.pk FROM p AS a, p AS b WHERE {condition}"
+        assert normalize_distance_conditions(query, bucket_steps=10) == f"SELECT a.pk FROM p AS a, p AS b WHERE {bucketed}"
+
+    @pytest.mark.parametrize(
+        "condition",
+        ["ST_DWithin(a.x, b.x, 2.5)", "NOT ST_DWithin(a.x, b.x, 2.5)", "ST_DWithin(a.x, b.x, 1.5) OR NOT ST_DWithin(a.x, b.x, 6.5)"],
+    )
+    def test_every_row_of_the_query_satisfies_the_bucketed_query(self, condition):
+        import sqlite3
+
+        conn = sqlite3.connect(":memory:")
+        conn.create_function("ST_DWITHIN", 3, lambda x, y, r: abs(x - y) <= r)
+        conn.execute("CREATE TABLE points (pk INTEGER, x REAL)")
+        conn.executemany("INSERT INTO points VALUES (?, ?)", [(i, i * 0.05) for i in range(200)])
+        query = f"SELECT a.pk, b.pk FROM points AS a, points AS b WHERE a.pk = 0 AND {condition}"
+        original = set(conn.execute(query))
+        bucketed_query = normalize_distance_conditions(query, bucket_steps=1)
+        assert bucketed_query != sqlglot.parse_one(query).sql()
+        assert original <= set(conn.execute(bucketed_query))
+        assert original
+
+    def test_variants_include_the_bucketed_radius(self):
+        from partitioncache.query_processor import generate_all_query_hash_pairs
+
+        query = "SELECT a.pk FROM p AS a, p AS b WHERE a.pk = b.pk AND a.t = 1 AND ST_DWithin(a.g, b.g, 512.3)"
+        variants = [v for v, _ in generate_all_query_hash_pairs(query, "pk", min_component_size=1, warn_no_partition_key=False, bucket_steps=10)]
+        assert any("ST_DWITHIN(t2.g, t1.g, 520)" in v for v in variants)
+        assert any("ST_DWITHIN(t2.g, t1.g, 512.3)" in v for v in variants)

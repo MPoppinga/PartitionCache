@@ -254,6 +254,7 @@ Advanced options for controlling how query variants are generated for better cac
   - **Default**: `1.0` (or `PARTITION_CACHE_BUCKET_STEPS` environment variable)
   - **Purpose**: Controls bucketing of distance ranges for better cache hits
   - **Example**: With `--bucket-steps 0.5`, distance `BETWEEN 1.6 AND 3.6` becomes `BETWEEN 1.5 AND 4.0`
+  - The radius of `ST_DWithin`/`ST_DFullyWithin` is rounded up the same way: with `--bucket-steps 50`, `ST_DWithin(a.geom, b.geom, 120)` becomes `ST_DWithin(a.geom, b.geom, 150)`
 
 #### Constraint Modification
 - `--add-constraints JSON` - Add constraints to specific tables
