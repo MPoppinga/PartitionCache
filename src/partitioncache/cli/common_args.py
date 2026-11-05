@@ -411,6 +411,14 @@ def add_variant_generation_args(parser: argparse.ArgumentParser) -> None:
         "Default: 1 (remove one condition at a time). Higher values generate more variants via C(n,k) combinations. "
         "(default: 1 or PARTITION_CACHE_MAX_CONDITIONS_REMOVED)",
     )
+    variant_group.add_argument(
+        "--skip-partition-key-joins",
+        type=lambda value: [key.strip() for key in value.split(",") if key.strip()],
+        default=[key.strip() for key in os.getenv("PARTITION_CACHE_SKIP_PARTITION_KEY_JOINS", "").split(",") if key.strip()],
+        help="Comma-separated partition keys whose variants get no equality on the partition key between tables, as needed for "
+        "time buckets used with temporal dilation (geometry keys always skip it). Lookups must use the same setting "
+        "(default: none or PARTITION_CACHE_SKIP_PARTITION_KEY_JOINS)",
+    )
 
 
 def resolve_cache_backend(args: argparse.Namespace) -> str:

@@ -257,6 +257,11 @@ Advanced options for controlling how query variants are generated for better cac
   - The radius of `ST_DWithin`/`ST_DFullyWithin` is rounded up the same way: with `--bucket-steps 50`, `ST_DWithin(a.geom, b.geom, 120)` becomes `ST_DWithin(a.geom, b.geom, 150)`
   - Choose the step in the unit of the distances: with geometries in degrees (SRID 4326) the default `1.0` turns `ST_DWithin(a.geom, b.geom, 0.001)` into a radius of 1, a variant that is expensive to fill and hardly filters
 
+#### Partition Key Joins
+- `--skip-partition-key-joins KEYS` - Comma-separated partition keys whose variants get no equality on the partition key between tables
+  - **Default**: none (or `PARTITION_CACHE_SKIP_PARTITION_KEY_JOINS`); geometry keys always skip it
+  - **Purpose**: Time-bucket keys used with temporal dilation; lookups skip these joins for them, so population must too or the hashes differ (see the API reference, "Temporal dilation")
+
 #### Constraint Modification
 - `--add-constraints JSON` - Add constraints to specific tables
   - **Format**: JSON object mapping table names to constraint conditions
@@ -561,6 +566,11 @@ Controls how query variants are generated when processing original queries from 
 #### Distance Normalization
 - `--bucket-steps FLOAT` - Step size for normalizing distance conditions
   - **Default**: `1.0` (or `PARTITION_CACHE_BUCKET_STEPS` environment variable)
+
+#### Partition Key Joins
+- `--skip-partition-key-joins KEYS` - Comma-separated partition keys whose variants get no equality on the partition key between tables
+  - **Default**: none (or `PARTITION_CACHE_SKIP_PARTITION_KEY_JOINS`); geometry keys always skip it
+  - **Purpose**: Time-bucket keys used with temporal dilation; lookups skip these joins for them, so population must too or the hashes differ (see the API reference, "Temporal dilation")
 
 #### Constraint Modification
 - `--add-constraints JSON` - Add constraints to specific tables
