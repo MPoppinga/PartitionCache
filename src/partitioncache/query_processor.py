@@ -1615,6 +1615,7 @@ def is_distance_function(condition: str) -> bool:
 
 
 _BUCKET_COMPARISONS: dict[type[exp.Expr], type[exp.Expr]] = {exp.LT: exp.GT, exp.LTE: exp.GTE, exp.GT: exp.LT, exp.GTE: exp.LTE}  # operator -> mirrored
+_RADIUS_FUNCTIONS = frozenset({"ST_DWITHIN", "ST_DFULLYWITHIN"})  # true for every radius above the one given
 
 
 def _bucket_bound(value: Decimal, bucket_steps: Decimal, up: bool) -> exp.Expr | None:
@@ -1669,8 +1670,9 @@ def normalize_distance_conditions(original_query: str, bucket_steps: float = 1.0
     Every comparison of a distance function with a non-negative number in the outer WHERE clause is loosened to
     the next bucket boundary, so that queries with nearby distances share variants: an upper bound is rounded up,
     a lower bound down (e.g. ``BETWEEN 1.6 AND 3.6`` -> ``BETWEEN 1 AND 4`` with bucket_steps = 1, ``0 - 4`` with
-    bucket_steps = 2). Under NOT the directions flip, so the condition as a whole is always loosened, also inside
-    OR and NOT BETWEEN. Comparisons in other contexts (function arguments, CASE, subqueries) stay unchanged.
+    bucket_steps = 2). The radius of ``ST_DWithin`` / ``ST_DFullyWithin`` is rounded up the same way. Under NOT the
+    directions flip, so the condition as a whole is always loosened, also inside OR and NOT BETWEEN. Comparisons in
+    other contexts (function arguments, CASE, subqueries) stay unchanged.
 
     Args:
         original_query: The query to be normalized.
@@ -1725,6 +1727,17 @@ def normalize_distance_conditions(original_query: str, bucket_steps: float = 1.0
         bound = _bucket_bound(value, steps, up=upper_bound == positive)
         if bound is not None:
             node.set(literal_arg, bound)
+
+    for func in list(where.find_all(exp.Anonymous)):
+        if func.name.upper() not in _RADIUS_FUNCTIONS or len(func.expressions) < 3 or func.find_ancestor(exp.Select) is not parsed:
+            continue
+        positive = _monotone_polarity(func, where)
+        radius = _numeric_literal(func.expressions[2])
+        if positive is None or radius is None:
+            continue
+        bound = _bucket_bound(radius, steps, up=positive)
+        if bound is not None:
+            func.expressions[2].replace(bound)
 
     return parsed.sql()
 
