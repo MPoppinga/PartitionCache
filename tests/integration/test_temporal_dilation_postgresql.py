@@ -106,3 +106,20 @@ def test_dilation_reaches_past_the_last_bucket_of_the_bit_array(handler):
     handler.set_cache("top", {BITSIZE - 1}, "w")
     keys, _ = handler.get_intersected_dilated({"top"}, "w", 1)
     assert keys == {BITSIZE - 2, BITSIZE - 1, BITSIZE}
+
+
+def test_p0_table_is_not_used_for_a_temporal_key(conn, handler):
+    """The p0 rewrite joins every alias on w (alias.w = p0.w), which would drop the pairs across a bucket boundary."""
+    conn.execute("DROP TABLE IF EXISTS pc_td_p0")
+    conn.execute("CREATE TABLE pc_td_p0 AS SELECT generate_series(0, 30) AS w")
+    try:
+        _populate(handler, QUERY)
+        expected = _rows(conn, QUERY)
+        p0 = {"use_p0_table": True, "p0_table_name": "pc_td_p0", "p0_alias": "p0"}
+        lazy_query, lazy_stats = apply_cache_lazy(QUERY, handler, "w", min_component_size=1, **TEMPORAL, **p0)
+        plain_query, plain_stats = apply_cache(QUERY, handler, "w", min_component_size=1, **TEMPORAL, **p0)
+        assert lazy_stats["p0_rewritten"] == plain_stats["p0_rewritten"] == 0
+        assert lazy_stats["enhanced"] == plain_stats["enhanced"] == 1
+        assert _rows(conn, lazy_query) == _rows(conn, plain_query) == expected
+    finally:
+        conn.execute("DROP TABLE IF EXISTS pc_td_p0")

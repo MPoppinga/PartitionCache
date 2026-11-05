@@ -349,6 +349,8 @@ enhanced_query, stats = partitioncache.apply_cache_lazy(
 - `k = ceil(window / temporal_bucket_width)`. The window is read only from conditions on `alias.temporal_column`: `BETWEEN`, `ABS(a.ts - b.ts) <= W`, or a lower and an upper bound in separate conditions. A difference bounded on one side only (`b.ts <= a.ts + 1200`) does not count. Chained windows add up.
 - If two aliases of the partition key's table are not bounded in time against each other, no `k` is sound: the query runs without the cache (no partition keys, no restriction).
 - `dilation_buckets` sets `k` directly instead (`0` turns dilation off, which can lose rows).
+- Only numeric time columns (e.g. epoch seconds) give a window; a bound written with `INTERVAL` is not read, so such queries run without the cache.
+- `use_p0_table` is ignored for a temporal key: its join `alias.w = p0.w` would put all aliases into the same bucket.
 - A temporal key gets its variants without partition key joins (`t1.w = t2.w`), which would drop pairs across a bucket boundary. Population must do the same, or the variant hashes differ and the cache is never hit: pass `skip_partition_key_joins=True` to `generate_all_query_hash_pairs`, or list the key in `--skip-partition-key-joins` of `pcache-add` and `pcache-monitor`.
 - Dilated intersections are implemented in SQL for `postgresql_array` and `postgresql_bit`; the non-lazy API falls back to a Python intersection for other handlers with integer keys. A lazy call on a handler without a dilated intersection, and non-integer keys, run without the cache.
 - Dilation inflates each cached set by up to `2k + 1` buckets. A bucket width at least as large as the typical window keeps `k` at 1.

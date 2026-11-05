@@ -1718,6 +1718,12 @@ def apply_cache_lazy(
     # Step 2: Optionally rewrite with p0 table
     working_query = query
     p0_rewritten = 0
+    if use_p0_table and _is_temporal(temporal_bucket_width, dilation_buckets):
+        # The p0 rewrite joins every alias on the partition key (alias.w = p0.w), which drops the pairs across a bucket
+        # boundary that temporal dilation keeps; restrict the anchor alias instead (p0_alias names the p0 table here)
+        logger.warning("use_p0_table is ignored for a temporal partition key: it would put all aliases into the same bucket")
+        use_p0_table = False
+        p0_alias = None
     if use_p0_table:
         p0_table_alias = p0_alias if p0_alias else "p0"
         working_query = rewrite_query_with_p0_table(
@@ -2032,6 +2038,12 @@ def apply_cache(
     # Step 2: Optionally rewrite original query with p0 table
     working_query = query
     p0_rewritten = 0
+    if use_p0_table and _is_temporal(temporal_bucket_width, dilation_buckets):
+        # The p0 rewrite joins every alias on the partition key (alias.w = p0.w), which drops the pairs across a bucket
+        # boundary that temporal dilation keeps; restrict the anchor alias instead (p0_alias names the p0 table here)
+        logger.warning("use_p0_table is ignored for a temporal partition key: it would put all aliases into the same bucket")
+        use_p0_table = False
+        p0_alias = None
     if use_p0_table:
         p0_table_alias = p0_alias if p0_alias else "p0"
         working_query = rewrite_query_with_p0_table(
