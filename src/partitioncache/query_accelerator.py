@@ -52,6 +52,16 @@ def validate_table_name(table_name: str) -> None:
         raise ValueError(msg)
 
 
+def _quote(identifier: str) -> str:
+    """Quote an SQL identifier (the same rules in DuckDB and PostgreSQL)."""
+    return '"' + identifier.replace('"', '""') + '"'
+
+
+def _conninfo_value(value: Any) -> str:
+    """Quote a libpq connection string value, so spaces, quotes and backslashes survive."""
+    return "'" + str(value).replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
 class DuckDBQueryAccelerator:
     """
     DuckDB-based query accelerator for PostgreSQL database queries.
@@ -75,9 +85,10 @@ class DuckDBQueryAccelerator:
         duckdb_memory_limit: str = "2GB",
         duckdb_threads: int = 4,
         enable_statistics: bool = True,
-        duckdb_database_path: str = "/tmp/partitioncache_accel.duckdb",
+        duckdb_database_path: str = ":memory:",
         force_reload_tables: bool = False,
         query_timeout: float = 0,
+        read_unloaded_from_postgres: bool = False,
     ):
         """
         Initialize DuckDB query accelerator.
@@ -88,9 +99,12 @@ class DuckDBQueryAccelerator:
             duckdb_memory_limit: Memory limit for DuckDB instance
             duckdb_threads: Number of threads for DuckDB
             enable_statistics: Whether to collect performance statistics
-            duckdb_database_path: Path to DuckDB database file (':memory:' for in-memory)
+            duckdb_database_path: Path to DuckDB database file (':memory:', the default, for in-memory). Tables in a
+                file are reused on the next start without reloading (a snapshot), unless force_reload_tables is set.
             force_reload_tables: Force reload tables from PostgreSQL even if they exist in DuckDB
             query_timeout: Query timeout in seconds (0 = no timeout)
+            read_unloaded_from_postgres: Let DuckDB read tables that were not preloaded directly from PostgreSQL
+                (through the attached database) instead of running the whole query on PostgreSQL.
         """
         self.postgresql_params = postgresql_connection_params
         self.tables_to_preload = preload_tables or []
@@ -100,6 +114,8 @@ class DuckDBQueryAccelerator:
         self.duckdb_database_path = duckdb_database_path
         self.force_reload_tables = force_reload_tables
         self.query_timeout = query_timeout
+        self.read_unloaded_from_postgres = read_unloaded_from_postgres
+        self._search_path: str | None = None
 
         # Performance statistics
         self.stats = {
@@ -155,6 +171,8 @@ class DuckDBQueryAccelerator:
             # Configure DuckDB settings
             self.duckdb_conn.execute(f"SET memory_limit = '{self.duckdb_memory_limit}'")
             self.duckdb_conn.execute(f"SET threads = {self.duckdb_threads}")
+            # PostgreSQL semantics for integer division (7 / 2 = 3); DuckDB returns 3.5 by default
+            self.duckdb_conn.execute("SET GLOBAL integer_division = true")  # global: queries run on cursors
 
             # Install and load PostgreSQL extension
             logger.debug("Installing PostgreSQL extension for DuckDB...")
@@ -163,6 +181,15 @@ class DuckDBQueryAccelerator:
 
             # Create PostgreSQL connection for metadata and preloading
             self._connect_postgresql()
+
+            if self.read_unloaded_from_postgres:
+                self._attach_postgresql()
+
+            if self.duckdb_database_path != ":memory:" and not self.force_reload_tables:
+                logger.warning(
+                    f"DuckDB database file {self.duckdb_database_path}: tables already in it are reused without reloading, so "
+                    "changes in PostgreSQL since they were loaded are not seen (use force_reload_tables or ':memory:')"
+                )
 
             self._initialized = True
             logger.info("DuckDB query accelerator initialized successfully")
@@ -183,8 +210,8 @@ class DuckDBQueryAccelerator:
             # Handle timeout parameter separately (not a connection parameter)
             timeout = conn_params.pop("timeout", None)
 
-            # Create connection
-            self.postgresql_conn = psycopg.connect(**conn_params)
+            # Autocommit: no idle transaction holding locks, and a failed fallback query does not abort the next ones
+            self.postgresql_conn = psycopg.connect(**conn_params, autocommit=True)
 
             # Set timeout if specified
             if timeout and timeout != "0":
@@ -224,32 +251,7 @@ class DuckDBQueryAccelerator:
         preload_start = time.perf_counter()
 
         try:
-            # Install and load PostgreSQL extension if not already loaded
-            self.duckdb_conn.execute("INSTALL postgres")
-            self.duckdb_conn.execute("LOAD postgres")
-
-            # Build connection string for DuckDB PostgreSQL extension
-            pg_conn_str = self._build_duckdb_postgres_connection_string()
-
-            # Check if postgres_db is already attached (for persistent databases)
-            try:
-                # Try to query if the database exists
-                result = self.duckdb_conn.execute("SELECT 1 FROM duckdb_databases() WHERE database_name = 'postgres_db'").fetchone()
-                if result is None:
-                    # Not attached, attach it now
-                    self.duckdb_conn.execute(f"ATTACH '{pg_conn_str}' AS postgres_db (TYPE POSTGRES)")
-                else:
-                    logger.debug("PostgreSQL database already attached as postgres_db")
-            except Exception:
-                # If the check fails, try to attach (for older DuckDB versions)
-                try:
-                    self.duckdb_conn.execute(f"ATTACH '{pg_conn_str}' AS postgres_db (TYPE POSTGRES)")
-                except Exception as attach_error:
-                    # If attach fails with "already exists", that's OK
-                    if "already exists" in str(attach_error):
-                        logger.debug("PostgreSQL database already attached as postgres_db")
-                    else:
-                        raise
+            self._attach_postgresql()
 
             tables_loaded = 0
 
@@ -260,41 +262,22 @@ class DuckDBQueryAccelerator:
 
                     logger.debug(f"Preloading table: {table_name}")
 
-                    # Validate table exists in PostgreSQL
-                    if not self._table_exists_in_postgresql(table_name):
+                    relation = self._resolve_postgresql_relation(table_name)
+                    if relation is None:
                         logger.warning(f"Table {table_name} does not exist in PostgreSQL, skipping")
                         continue
+                    schema, name = relation
+                    local_schema = self._local_schema(table_name, schema)
+                    local = f"{_quote(local_schema)}.{_quote(name)}"
 
-                    # Drop existing table if force reload is enabled or in memory mode
-                    if self.force_reload_tables or self.duckdb_database_path == ":memory:":
-                        try:
-                            # Table name is safe after validation
-                            self.duckdb_conn.execute(f"DROP TABLE IF EXISTS {table_name}")
-                            logger.debug(f"Dropped existing table {table_name} for reload")
-                        except Exception:
-                            pass  # Table might not exist
+                    self.duckdb_conn.execute(f"CREATE SCHEMA IF NOT EXISTS {_quote(local_schema)}")
+                    self.duckdb_conn.execute(f"CREATE OR REPLACE TABLE {local} AS SELECT * FROM postgres_db.{_quote(schema)}.{_quote(name)}")
+                    if "." in table_name and schema == "public":
+                        # Queries may also name the table public.<name>; DuckDB's default schema is main
+                        self.duckdb_conn.execute("CREATE SCHEMA IF NOT EXISTS public")
+                        self.duckdb_conn.execute(f"CREATE OR REPLACE VIEW public.{_quote(name)} AS SELECT * FROM {local}")
 
-                    # Create table in DuckDB by copying from PostgreSQL
-                    # Use CREATE OR REPLACE for better handling
-                    try:
-                        # Table names are safe after validation
-                        self.duckdb_conn.execute(f"""
-                            CREATE OR REPLACE TABLE {table_name} AS
-                            SELECT * FROM postgres_db.{table_name}
-                        """)
-                    except Exception as create_error:
-                        # If CREATE OR REPLACE is not supported, try regular CREATE
-                        if "CREATE OR REPLACE" in str(create_error):
-                            self.duckdb_conn.execute(f"""
-                                CREATE TABLE {table_name} AS
-                                SELECT * FROM postgres_db.{table_name}
-                            """)
-                        else:
-                            raise
-
-                    # Get row count for logging
-                    # Table name is safe after validation
-                    result = self.duckdb_conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()
+                    result = self.duckdb_conn.execute(f"SELECT COUNT(*) FROM {local}").fetchone()
                     row_count = result[0] if result else 0
 
                     logger.debug(f"Preloaded table {table_name} with {row_count:,} rows")
@@ -319,38 +302,66 @@ class DuckDBQueryAccelerator:
             return False
 
     def _build_duckdb_postgres_connection_string(self) -> str:
-        """Build PostgreSQL connection string for DuckDB postgres extension."""
+        """Build the libpq connection string for DuckDB's postgres extension, with every value quoted."""
         params = self.postgresql_params
+        values = {
+            "host": params.get("host", "localhost"),
+            "port": params.get("port", 5432),
+            "dbname": params.get("dbname") or params.get("database"),
+            "user": params.get("user"),
+            "password": params.get("password"),
+        }
+        return " ".join(f"{key}={_conninfo_value(value)}" for key, value in values.items() if value is not None and value != "")
 
-        # Build connection string components
-        host = params.get("host", "localhost")
-        port = params.get("port", 5432)
-        dbname = params.get("dbname") or params.get("database")
-        user = params.get("user")
-        password = params.get("password")
+    def _attach_postgresql(self) -> None:
+        """Attach the PostgreSQL database read-only as postgres_db (once) and, if enabled, put it on the search path."""
+        self.duckdb_conn.execute("INSTALL postgres")
+        self.duckdb_conn.execute("LOAD postgres")
+        attached = self.duckdb_conn.execute("SELECT 1 FROM duckdb_databases() WHERE database_name = 'postgres_db'").fetchone()
+        if attached is None:
+            conn_str = self._build_duckdb_postgres_connection_string().replace("'", "''")
+            self.duckdb_conn.execute(f"ATTACH '{conn_str}' AS postgres_db (TYPE POSTGRES, READ_ONLY)")
+        if self.read_unloaded_from_postgres:
+            row = self.duckdb_conn.execute("SELECT current_database()").fetchone()
+            catalog = (row[0] if row else "memory").replace("'", "''")
+            # search_path cannot be set globally; _cursor() sets it on every cursor
+            self._search_path = f"{catalog}.main,postgres_db.public"
+            self.duckdb_conn.execute(f"SET search_path = '{self._search_path}'")
 
-        conn_str = f"host={host} port={port}"
-        if dbname:
-            conn_str += f" dbname={dbname}"
-        if user:
-            conn_str += f" user={user}"
-        if password:
-            conn_str += f" password={password}"
+    def _cursor(self) -> "duckdb.DuckDBPyConnection":
+        """A cursor for one query, with the search path that reaches the attached PostgreSQL database if enabled."""
+        cursor = self.duckdb_conn.cursor()
+        if self._search_path is not None:
+            cursor.execute(f"SET search_path = '{self._search_path}'")
+        return cursor
 
-        return conn_str
+    def _resolve_postgresql_relation(self, table_name: str) -> tuple[str, str] | None:
+        """(schema, name) of the table, view or materialized view, as written (quoted) or case-folded; None if missing."""
+        parts = table_name.split(".")
+        candidates = [".".join(_quote(part) for part in parts), table_name]
+        with self.postgresql_conn.cursor() as cursor:
+            for candidate in candidates:
+                try:
+                    cursor.execute(
+                        "SELECT n.nspname, c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.oid = to_regclass(%s)",
+                        (candidate,),
+                    )
+                except psycopg.Error:
+                    continue  # not a valid name in this spelling
+                row = cursor.fetchone()
+                if row is not None:
+                    return row[0], row[1]
+        return None
+
+    @staticmethod
+    def _local_schema(table_name: str, schema: str) -> str:
+        """DuckDB schema for a preloaded table: main for unqualified names and public, else the PostgreSQL schema."""
+        return schema if "." in table_name and schema != "public" else "main"
 
     def _table_exists_in_postgresql(self, table_name: str) -> bool:
         """Check if table, view, or materialized view exists in PostgreSQL."""
         try:
-            with self.postgresql_conn.cursor() as cursor:
-                # Check for tables and views in information_schema.tables
-                cursor.execute("SELECT 1 FROM information_schema.tables WHERE table_name = %s", (table_name,))
-                if cursor.fetchone() is not None:
-                    return True
-
-                # Check for materialized views in pg_matviews
-                cursor.execute("SELECT 1 FROM pg_matviews WHERE matviewname = %s", (table_name,))
-                return cursor.fetchone() is not None
+            return self._resolve_postgresql_relation(table_name) is not None
         except Exception as e:
             logger.debug(f"Failed to check table/view existence for {table_name}: {e}")
             return False
@@ -359,8 +370,14 @@ class DuckDBQueryAccelerator:
         """Check if all preload tables exist in DuckDB."""
         try:
             for table_name in self.tables_to_preload:
-                # Query DuckDB's information schema to check if table exists
-                result = self.duckdb_conn.execute("SELECT 1 FROM information_schema.tables WHERE table_name = ?", (table_name,)).fetchone()
+                relation = self._resolve_postgresql_relation(table_name)
+                if relation is None:
+                    continue  # not in PostgreSQL either; preloading would skip it
+                schema, name = relation
+                result = self.duckdb_conn.execute(
+                    "SELECT 1 FROM duckdb_tables() WHERE database_name = current_database() AND schema_name = ? AND table_name = ?",
+                    (self._local_schema(table_name, schema), name),
+                ).fetchone()
                 if result is None:
                     logger.debug(f"Table {table_name} not found in DuckDB")
                     return False
@@ -396,7 +413,7 @@ class DuckDBQueryAccelerator:
                 result_set = self._execute_with_timeout(query)
             else:
                 # Execute query with thread-local cursor
-                cursor = self.duckdb_conn.cursor()
+                cursor = self._cursor()
                 result = cursor.execute(query).fetchall()
                 result_set = {row[0] if len(row) == 1 else row for row in result}
                 cursor.close()
@@ -431,14 +448,15 @@ class DuckDBQueryAccelerator:
         Raises:
             concurrent.futures.TimeoutError: If query times out
         """
-        result_container = {"result": None, "exception": None, "completed": False}
+        result_container: dict[str, Any] = {"result": None, "exception": None, "completed": False, "cursor": None}
 
         def _duckdb_query_worker():
             """Worker function that executes the DuckDB query."""
             cursor = None
             try:
                 # Create thread-local cursor for thread safety
-                cursor = self.duckdb_conn.cursor()
+                cursor = self._cursor()
+                result_container["cursor"] = cursor
                 result = cursor.execute(query).fetchall()
                 result_container["result"] = {row[0] if len(row) == 1 else row for row in result}
                 result_container["completed"] = True
@@ -465,15 +483,19 @@ class DuckDBQueryAccelerator:
         if worker_thread.is_alive():
             # Query timed out - attempt to interrupt connection
             logger.warning(f"DuckDB query timed out after {self.query_timeout}s, attempting to interrupt")
+            # The query runs on the worker's cursor (its own connection); interrupting the parent connection would not stop it
+            target = result_container["cursor"] or self.duckdb_conn
             try:
-                if self.duckdb_conn:
-                    self.duckdb_conn.interrupt()
-                    logger.debug("DuckDB connection interrupted successfully")
+                if target is not None:
+                    target.interrupt()
+                    logger.debug("DuckDB query interrupted")
             except Exception as interrupt_error:
-                logger.debug(f"Failed to interrupt DuckDB connection: {interrupt_error}")
+                logger.debug(f"Failed to interrupt DuckDB query: {interrupt_error}")
 
-            # Wait a bit more for graceful cleanup
-            worker_thread.join(timeout=1.0)
+            # Wait for the worker to stop before falling back
+            worker_thread.join(timeout=10.0)
+            if worker_thread.is_alive():
+                logger.error("DuckDB query did not stop after the interrupt; it keeps running in the background")
 
             # Raise timeout error to trigger fallback
             timeout_msg = f"Query timed out after {self.query_timeout} seconds"

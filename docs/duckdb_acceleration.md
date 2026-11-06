@@ -80,6 +80,25 @@ pcache-monitor \
 | `--duckdb-memory-limit` | string | `"2GB"` | Memory limit for DuckDB instance |
 | `--duckdb-threads` | integer | `4` | Number of DuckDB processing threads |
 | `--disable-acceleration-stats` | flag | `false` | Disable performance statistics logging |
+| `--duckdb-database-path` | string | `:memory:` | DuckDB database file for the preloaded tables; tables already in the file are reused without reloading (see below) |
+| `--force-reload-tables` | flag | `false` | Reload preloaded tables from PostgreSQL even if they are in the database file |
+| `--duckdb-read-unloaded-tables` | flag | `false` | Let DuckDB read tables that were not preloaded directly from PostgreSQL instead of running the whole query on PostgreSQL |
+
+### What can be preloaded
+
+- Tables, views, materialized views and partitioned tables, each copied as a table.
+- Names as in PostgreSQL: `orders`, mixed-case names created quoted (`MixedCase`), names that need quoting such as `my-table`, and schema-qualified names (`sales.orders`, kept in a DuckDB schema of the same name; `public.orders` and `orders` both go to DuckDB's default schema).
+- Several tables at once (comma-separated); a table that fails to load is skipped with a warning, the others are loaded. All tables share `--duckdb-memory-limit`.
+
+### Consistency with PostgreSQL
+
+Cache entries are computed from what DuckDB returns, so DuckDB must see the same data and compute the same results:
+
+- **Snapshot:** preloaded tables are a copy taken at startup. Rows changed in PostgreSQL afterwards are not seen until the next start. With `--duckdb-database-path` set to a file, tables already in the file are reused across starts (logged as a warning); use `--force-reload-tables` or the default `:memory:` when the data changes.
+- **Integer division** follows PostgreSQL (`7 / 2 = 3`, DuckDB's `integer_division` setting).
+- **Text ordering** is byte-wise in DuckDB; with a non-C collation in PostgreSQL, range comparisons on text (`name > 'M'`) can differ. Equality and `LIKE` are not affected.
+- A query DuckDB cannot run (unknown table or function, PostgreSQL-only syntax) runs on PostgreSQL instead, through an autocommit connection. A DuckDB query that exceeds the timeout is interrupted and also runs on PostgreSQL.
+- With `--duckdb-read-unloaded-tables`, unqualified names that are not preloaded are read from PostgreSQL's `public` schema through DuckDB's read-only attachment; schema-qualified names that are not preloaded still run on PostgreSQL.
 
 ## Requirements
 
@@ -170,7 +189,7 @@ Choose tables for preloading based on:
 1. **Query Frequency**: Tables accessed frequently by partition queries
 2. **Table Size**: Medium-sized tables (1K-10M rows) benefit most
 3. **Join Patterns**: Tables commonly joined in analytical queries
-4. **Update Frequency**: Relatively static tables work best
+4. **Update Frequency**: Relatively static tables work best: the preloaded copy is a snapshot from startup
 
 ### Memory Configuration
 

@@ -59,7 +59,7 @@ class TestDuckDBQueryAccelerator:
 
         # Verify connections were created
         mock_duckdb.connect.assert_called_once_with(":memory:")
-        mock_psycopg.connect.assert_called_once_with(**postgresql_params)
+        mock_psycopg.connect.assert_called_once_with(**postgresql_params, autocommit=True)
 
     @patch("partitioncache.query_accelerator.duckdb")
     @patch("partitioncache.query_accelerator.psycopg")
@@ -93,7 +93,7 @@ class TestDuckDBQueryAccelerator:
         # Verify DuckDB configuration was applied
         execute_calls = mock_duckdb_conn.execute.call_args_list
         config_calls = [call for call in execute_calls if "SET" in str(call)]
-        assert len(config_calls) == 2  # Exactly: memory_limit and threads
+        assert len(config_calls) == 3  # Exactly: memory_limit, threads and integer_division
 
         # Verify the specific SET calls
         config_sql = [str(call) for call in config_calls]
@@ -124,7 +124,7 @@ class TestDuckDBQueryAccelerator:
         accelerator.initialize()
 
         # Mock table existence checks
-        accelerator._table_exists_in_postgresql = Mock(return_value=True)
+        accelerator._resolve_postgresql_relation = Mock(return_value=("public", "test_table"))
         accelerator._tables_exist_in_duckdb = Mock(return_value=False)  # Force reload from PostgreSQL
 
         # Set up mock for the database check and table creation
@@ -220,6 +220,7 @@ class TestDuckDBQueryAccelerator:
         mock_duckdb_conn.execute.side_effect = [
             None,  # First call for "SET memory_limit = '2GB'"
             None,  # Second call for "SET threads = 4"
+            None,  # "SET GLOBAL integer_division = true"
             None,  # Third call for "INSTALL postgres"
             None,  # Fourth call for "LOAD postgres"
             Exception("DuckDB query failed"),  # Fifth call (actual query) fails
@@ -474,6 +475,7 @@ class TestDuckDBQueryAccelerator:
         mock_duckdb_conn.execute.side_effect = [
             None,  # First call for "SET memory_limit = '2GB'"
             None,  # Second call for "SET threads = 4"
+            None,  # "SET GLOBAL integer_division = true"
             None,  # Third call for "INSTALL postgres"
             None,  # Fourth call for "LOAD postgres"
             Exception("Catalog Error: Table with name 'missing_table' does not exist"),  # Query fails with missing table
@@ -535,3 +537,19 @@ class TestDuckDBIntegrationHelpers:
 if __name__ == "__main__":
     # Allow running tests directly for development
     pytest.main([__file__, "-v", "--tb=short"])
+
+
+def test_connection_string_values_are_quoted():
+    from psycopg.conninfo import conninfo_to_dict
+
+    from partitioncache.query_accelerator import DuckDBQueryAccelerator
+
+    params = {"host": "db host", "port": 5432, "user": "u", "password": "p w'd\\x", "dbname": "my db"}
+    conninfo = DuckDBQueryAccelerator(params)._build_duckdb_postgres_connection_string()
+    assert conninfo_to_dict(conninfo) == {"host": "db host", "port": "5432", "user": "u", "password": "p w'd\\x", "dbname": "my db"}
+
+
+def test_default_database_is_in_memory():
+    from partitioncache.query_accelerator import DuckDBQueryAccelerator
+
+    assert DuckDBQueryAccelerator({}).duckdb_database_path == ":memory:"

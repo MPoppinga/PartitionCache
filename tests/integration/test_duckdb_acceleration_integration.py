@@ -805,3 +805,93 @@ class TestDuckDBAccelerationMonitorIntegration:
 if __name__ == "__main__":
     # Allow running tests directly for development
     pytest.main([__file__, "-v", "--tb=short"])
+
+
+@pytest.mark.integration
+class TestDuckDBAccelerationRobustness:
+    """Objects beyond plain tables, PostgreSQL semantics, and recovery from errors and timeouts."""
+
+    @pytest.fixture(scope="class")
+    def objects(self, postgresql_params):
+        import psycopg
+
+        conn = psycopg.connect(**postgresql_params, autocommit=True)
+        statements = [
+            "DROP SCHEMA IF EXISTS acc_rb_s CASCADE",
+            'DROP TABLE IF EXISTS acc_rb_points, acc_rb_part, "AccRbMixed", "acc-rb-dash" CASCADE',
+            "CREATE TABLE acc_rb_points (pk int, x float8, kind text)",
+            "INSERT INTO acc_rb_points SELECT g, g * 0.5, CASE WHEN g % 2 = 0 THEN 'a' ELSE 'b' END FROM generate_series(1, 200) g",
+            "CREATE VIEW acc_rb_view AS SELECT pk, x FROM acc_rb_points WHERE kind = 'a'",
+            "CREATE MATERIALIZED VIEW acc_rb_mview AS SELECT pk, x * 2 AS x2 FROM acc_rb_points WHERE pk <= 100",
+            "CREATE TABLE acc_rb_part (pk int, region int) PARTITION BY RANGE (region)",
+            "CREATE TABLE acc_rb_part_1 PARTITION OF acc_rb_part FOR VALUES FROM (0) TO (10)",
+            "CREATE TABLE acc_rb_part_2 PARTITION OF acc_rb_part FOR VALUES FROM (10) TO (20)",
+            "INSERT INTO acc_rb_part SELECT g, g % 20 FROM generate_series(1, 200) g",
+            "CREATE SCHEMA acc_rb_s",
+            "CREATE TABLE acc_rb_s.tab (pk int, v int)",
+            "INSERT INTO acc_rb_s.tab SELECT g, g FROM generate_series(1, 50) g",
+            'CREATE TABLE "AccRbMixed" (pk int)',
+            'INSERT INTO "AccRbMixed" SELECT generate_series(1, 10)',
+            'CREATE TABLE "acc-rb-dash" (pk int)',
+            'INSERT INTO "acc-rb-dash" VALUES (1), (2)',
+        ]
+        for statement in statements:
+            conn.execute(statement)
+        yield conn
+        conn.execute("DROP SCHEMA IF EXISTS acc_rb_s CASCADE")
+        conn.execute('DROP TABLE IF EXISTS acc_rb_points, acc_rb_part, "AccRbMixed", "acc-rb-dash" CASCADE')
+        conn.close()
+
+    @staticmethod
+    def _accelerator(postgresql_params, tables, **kwargs):
+        accelerator = DuckDBQueryAccelerator(postgresql_params, preload_tables=tables, enable_statistics=False, duckdb_database_path=":memory:", **kwargs)
+        assert accelerator.initialize()
+        assert accelerator.preload_tables()
+        return accelerator
+
+    @staticmethod
+    def _assert_runs_in_duckdb(accelerator, conn, query):
+        accelerated = accelerator.stats["queries_accelerated"]
+        result = accelerator.execute_query(query)
+        assert accelerator.stats["queries_accelerated"] == accelerated + 1, f"ran on PostgreSQL: {query}"
+        assert result == {row[0] for row in conn.execute(query).fetchall()}
+
+    def test_views_partitions_schemas_and_quoted_names_are_preloaded(self, postgresql_params, objects):
+        tables = ["acc_rb_points", "acc_rb_view", "acc_rb_mview", "acc_rb_part", "acc_rb_s.tab", "AccRbMixed", "acc-rb-dash"]
+        with self._accelerator(postgresql_params, tables) as accelerator:
+            assert accelerator.stats["tables_preloaded"] == len(tables)
+            for query in (
+                "SELECT pk FROM acc_rb_view WHERE x > 50",
+                "SELECT pk FROM acc_rb_mview WHERE x2 > 50",
+                "SELECT pk FROM acc_rb_part WHERE region = 3",
+                "SELECT pk FROM acc_rb_s.tab WHERE v > 25",
+                'SELECT pk FROM "AccRbMixed"',
+                'SELECT pk FROM "acc-rb-dash"',
+            ):
+                self._assert_runs_in_duckdb(accelerator, objects, query)
+
+    def test_integer_division_as_in_postgresql(self, postgresql_params, objects):
+        with self._accelerator(postgresql_params, ["acc_rb_points"]) as accelerator:
+            self._assert_runs_in_duckdb(accelerator, objects, "SELECT pk FROM acc_rb_points WHERE pk / 3 = 10")
+
+    def test_tables_not_preloaded_are_read_from_postgresql(self, postgresql_params, objects):
+        with self._accelerator(postgresql_params, ["acc_rb_points"], read_unloaded_from_postgres=True) as accelerator:
+            self._assert_runs_in_duckdb(accelerator, objects, "SELECT p.pk FROM acc_rb_points p, acc_rb_part q WHERE p.pk = q.pk AND q.region = 1")
+
+    def test_fallback_keeps_working_after_an_error(self, postgresql_params, objects):
+        with self._accelerator(postgresql_params, []) as accelerator:
+            with pytest.raises(Exception):
+                accelerator.execute_query("SELECT no_such_column FROM acc_rb_points")
+            assert accelerator.execute_query("SELECT pk FROM acc_rb_points WHERE pk < 3") == {1, 2}
+            assert accelerator.postgresql_conn.info.transaction_status.name == "IDLE"
+
+    def test_timed_out_query_is_stopped(self, postgresql_params, objects):
+        import threading
+
+        with self._accelerator(postgresql_params, [], query_timeout=1) as accelerator:
+            accelerator._execute_fallback = lambda query: set()
+            start = time.perf_counter()
+            accelerator.execute_query("SELECT count(*) FROM range(3000000000) t(i) WHERE hash(i) % 7 = 3")
+            assert accelerator.stats["queries_timeout"] == 1
+            assert time.perf_counter() - start < 15
+            assert not [thread for thread in threading.enumerate() if thread.daemon and thread is not threading.current_thread() and thread.is_alive()]
