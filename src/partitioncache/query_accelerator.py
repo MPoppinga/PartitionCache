@@ -181,6 +181,7 @@ class DuckDBQueryAccelerator:
 
             # Create PostgreSQL connection for metadata and preloading
             self._connect_postgresql()
+            self._use_postgresql_timezone()
 
             if self.read_unloaded_from_postgres:
                 self._attach_postgresql()
@@ -225,6 +226,19 @@ class DuckDBQueryAccelerator:
             logger.error(f"Failed to connect to PostgreSQL for accelerator: {e}")
             self._update_stats(connection_errors=1)
             raise
+
+    def _use_postgresql_timezone(self) -> None:
+        """Evaluate timestamptz in PostgreSQL's session time zone; DuckDB would use the machine's local zone.
+
+        Comparisons with timestamp literals, extract(), ::date and date_trunc() depend on it. If DuckDB does not
+        know the zone, initialization fails and queries run on PostgreSQL.
+        """
+        assert self.postgresql_conn is not None and self.duckdb_conn is not None
+        row = self.postgresql_conn.execute("SHOW TimeZone").fetchone()
+        timezone = row[0] if row else None
+        if timezone:
+            # Global, like integer_division: queries run on cursors, which do not inherit local settings
+            self.duckdb_conn.execute(f"SET GLOBAL TimeZone = '{str(timezone).replace(chr(39), chr(39) * 2)}'")
 
     def preload_tables(self) -> bool:
         """
@@ -272,7 +286,7 @@ class DuckDBQueryAccelerator:
 
                     self.duckdb_conn.execute(f"CREATE SCHEMA IF NOT EXISTS {_quote(local_schema)}")
                     self.duckdb_conn.execute(f"CREATE OR REPLACE TABLE {local} AS SELECT * FROM postgres_db.{_quote(schema)}.{_quote(name)}")
-                    if "." in table_name and schema == "public":
+                    if schema == "public":
                         # Queries may also name the table public.<name>; DuckDB's default schema is main
                         self.duckdb_conn.execute("CREATE SCHEMA IF NOT EXISTS public")
                         self.duckdb_conn.execute(f"CREATE OR REPLACE VIEW public.{_quote(name)} AS SELECT * FROM {local}")
@@ -315,6 +329,7 @@ class DuckDBQueryAccelerator:
 
     def _attach_postgresql(self) -> None:
         """Attach the PostgreSQL database read-only as postgres_db (once) and, if enabled, put it on the search path."""
+        assert self.duckdb_conn is not None
         self.duckdb_conn.execute("INSTALL postgres")
         self.duckdb_conn.execute("LOAD postgres")
         attached = self.duckdb_conn.execute("SELECT 1 FROM duckdb_databases() WHERE database_name = 'postgres_db'").fetchone()
@@ -324,12 +339,15 @@ class DuckDBQueryAccelerator:
         if self.read_unloaded_from_postgres:
             row = self.duckdb_conn.execute("SELECT current_database()").fetchone()
             catalog = (row[0] if row else "memory").replace("'", "''")
-            # search_path cannot be set globally; _cursor() sets it on every cursor
-            self._search_path = f"{catalog}.main,postgres_db.public"
+            # search_path cannot be set globally; _cursor() sets it on every cursor. The local public schema comes before
+            # PostgreSQL's, so public.<name> finds a preloaded table (its view) before reading PostgreSQL live
+            self.duckdb_conn.execute("CREATE SCHEMA IF NOT EXISTS public")
+            self._search_path = f"{catalog}.main,{catalog}.public,postgres_db.public"
             self.duckdb_conn.execute(f"SET search_path = '{self._search_path}'")
 
     def _cursor(self) -> "duckdb.DuckDBPyConnection":
         """A cursor for one query, with the search path that reaches the attached PostgreSQL database if enabled."""
+        assert self.duckdb_conn is not None
         cursor = self.duckdb_conn.cursor()
         if self._search_path is not None:
             cursor.execute(f"SET search_path = '{self._search_path}'")
@@ -337,6 +355,7 @@ class DuckDBQueryAccelerator:
 
     def _resolve_postgresql_relation(self, table_name: str) -> tuple[str, str] | None:
         """(schema, name) of the table, view or materialized view, as written (quoted) or case-folded; None if missing."""
+        assert self.postgresql_conn is not None
         parts = table_name.split(".")
         candidates = [".".join(_quote(part) for part in parts), table_name]
         with self.postgresql_conn.cursor() as cursor:

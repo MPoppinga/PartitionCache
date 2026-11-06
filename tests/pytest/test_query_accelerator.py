@@ -10,6 +10,15 @@ from unittest.mock import Mock, patch
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _no_timezone_query(request, monkeypatch):
+    """The mocked PostgreSQL connections cannot answer SHOW TimeZone; it has its own test below."""
+    if request.node.name != "test_duckdb_uses_the_postgresql_session_time_zone":
+        from partitioncache.query_accelerator import DuckDBQueryAccelerator
+
+        monkeypatch.setattr(DuckDBQueryAccelerator, "_use_postgresql_timezone", lambda self: None)
+
+
 class TestDuckDBQueryAccelerator:
     """Test suite for DuckDB query accelerator implementation."""
 
@@ -553,3 +562,14 @@ def test_default_database_is_in_memory():
     from partitioncache.query_accelerator import DuckDBQueryAccelerator
 
     assert DuckDBQueryAccelerator({}).duckdb_database_path == ":memory:"
+
+
+def test_duckdb_uses_the_postgresql_session_time_zone():
+    from partitioncache.query_accelerator import DuckDBQueryAccelerator
+
+    accelerator = DuckDBQueryAccelerator({})
+    accelerator.postgresql_conn = Mock()
+    accelerator.postgresql_conn.execute.return_value.fetchone.return_value = ("America/St_John's",)
+    accelerator.duckdb_conn = Mock()
+    accelerator._use_postgresql_timezone()
+    accelerator.duckdb_conn.execute.assert_called_once_with("SET GLOBAL TimeZone = 'America/St_John''s'")

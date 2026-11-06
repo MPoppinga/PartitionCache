@@ -880,7 +880,9 @@ class TestDuckDBAccelerationRobustness:
 
     def test_fallback_keeps_working_after_an_error(self, postgresql_params, objects):
         with self._accelerator(postgresql_params, []) as accelerator:
-            with pytest.raises(Exception):
+            import psycopg
+
+            with pytest.raises(psycopg.errors.UndefinedColumn):
                 accelerator.execute_query("SELECT no_such_column FROM acc_rb_points")
             assert accelerator.execute_query("SELECT pk FROM acc_rb_points WHERE pk < 3") == {1, 2}
             assert accelerator.postgresql_conn.info.transaction_status.name == "IDLE"
@@ -895,3 +897,35 @@ class TestDuckDBAccelerationRobustness:
             assert accelerator.stats["queries_timeout"] == 1
             assert time.perf_counter() - start < 15
             assert not [thread for thread in threading.enumerate() if thread.daemon and thread is not threading.current_thread() and thread.is_alive()]
+
+    @pytest.mark.parametrize("preload_name", ["acc_rb_points", "public.acc_rb_points"])
+    def test_both_spellings_of_a_public_table_use_the_preloaded_copy(self, postgresql_params, objects, preload_name):
+        with self._accelerator(postgresql_params, [preload_name], read_unloaded_from_postgres=True) as accelerator:
+            objects.execute("INSERT INTO acc_rb_points VALUES (9999, 1.0, 'a')")
+            try:
+                assert 9999 not in accelerator.execute_query("SELECT pk FROM acc_rb_points")
+                assert 9999 not in accelerator.execute_query("SELECT pk FROM public.acc_rb_points")
+            finally:
+                objects.execute("DELETE FROM acc_rb_points WHERE pk = 9999")
+
+    def test_timestamptz_is_evaluated_in_the_postgresql_session_time_zone(self, postgresql_params, objects):
+        """DuckDB would use the machine's zone; the session zone here is far from any runner's (UTC+14)."""
+        objects.execute("DROP TABLE IF EXISTS acc_rb_ev")
+        objects.execute("CREATE TABLE acc_rb_ev (pk int, ts timestamptz)")
+        objects.execute("INSERT INTO acc_rb_ev VALUES (1, '2024-01-01 00:30:00+00'), (2, '2023-12-31 23:30:00+00'), (3, '2024-01-01 12:00:00+00')")
+        params = dict(postgresql_params, options="-c TimeZone=Pacific/Kiritimati")
+        try:
+            import psycopg
+
+            reference = psycopg.connect(**params, autocommit=True)
+            with self._accelerator(params, ["acc_rb_ev"]) as accelerator:
+                for query in (
+                    "SELECT pk FROM acc_rb_ev WHERE ts < '2024-01-01 13:00:00'",
+                    "SELECT pk FROM acc_rb_ev WHERE extract(hour FROM ts) = 14",
+                    "SELECT pk FROM acc_rb_ev WHERE ts::date = '2024-01-01'",
+                    "SELECT pk FROM acc_rb_ev WHERE date_trunc('day', ts) = '2024-01-02'",
+                ):
+                    self._assert_runs_in_duckdb(accelerator, reference, query)
+            reference.close()
+        finally:
+            objects.execute("DROP TABLE IF EXISTS acc_rb_ev")
