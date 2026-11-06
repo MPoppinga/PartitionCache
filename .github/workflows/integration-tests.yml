@@ -407,7 +407,7 @@ jobs:
         PARTITIONCACHE_TEST_PG_USER: integration_user
         PARTITIONCACHE_TEST_PG_PASSWORD: integration_password
       run: |
-        PARTITIONCACHE_TEST_PG_DB="$PG_DBNAME" python -m pytest tests/pytest/test_empty_set_contract.py tests/pytest/test_bit_key_range.py tests/pytest/test_result_limit.py -v -rs
+        PARTITIONCACHE_TEST_PG_DB="$PG_DBNAME" python -m pytest tests/pytest/test_empty_set_contract.py tests/pytest/test_bit_key_range.py tests/pytest/test_result_limit.py tests/pytest/test_processor_cron_schedule.py -v -rs
 
     - name: Upload artifacts
       uses: actions/upload-artifact@v4
