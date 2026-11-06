@@ -152,7 +152,7 @@ class DuckDBBitCacheHandler(AbstractCacheHandler_Lazy):
                     query_hash TEXT NOT NULL,
                     query TEXT NOT NULL,
                     partition_key TEXT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'ok' CHECK (status IN ('ok', 'timeout', 'failed')),
+                    status TEXT NOT NULL DEFAULT 'ok' CHECK (status IN ('ok', 'timeout', 'failed', 'limit')),
                     last_seen TIMESTAMP DEFAULT now(),
                     PRIMARY KEY (query_hash, partition_key)
                 )
@@ -305,7 +305,11 @@ class DuckDBBitCacheHandler(AbstractCacheHandler_Lazy):
         Returns:
             Actual bitsize or None if validation fails
         """
-        max_value = max(int_keys)
+        negative = [k for k in int_keys if k < 0]
+        if negative:
+            logger.error(f"Bit arrays cannot store negative partition keys: {sorted(negative)[:5]}")
+            return None
+        max_value = max(int_keys, default=-1)
         existing_bitsize = self._get_partition_bitsize(partition_key)
 
         if existing_bitsize is None:
@@ -450,11 +454,9 @@ class DuckDBBitCacheHandler(AbstractCacheHandler_Lazy):
         Returns:
             bool: True if successful
 
-        Note: Creates DuckDB native BITSTRING with bits set for each integer value.
+        Note: Creates DuckDB native BITSTRING with bits set for each integer value. An empty set is
+        stored as all-zero bits, which get() returns as set(): the query has no rows.
         """
-        if not partition_key_identifiers:
-            return True
-
         try:
             # Convert all values to integers
             int_keys = self._convert_to_integers(partition_key_identifiers)
@@ -516,6 +518,11 @@ class DuckDBBitCacheHandler(AbstractCacheHandler_Lazy):
         try:
             table_name = self._get_safe_table_name(partition_key)
 
+            # None only for a missing row or the set_null marker; all-zero bits are the empty set
+            row = self.conn.execute(f"SELECT partition_keys IS NULL FROM {table_name} WHERE query_hash = ?", (key,)).fetchone()
+            if row is None or row[0]:
+                return None
+
             # Use DuckDB's native bitstring functions to extract set bits
             result = self.conn.execute(
                 f"""
@@ -536,9 +543,6 @@ class DuckDBBitCacheHandler(AbstractCacheHandler_Lazy):
                     pos::INTEGER
                 ) = 1
             """, (key, key)).fetchall()
-
-            if not result:
-                return None
 
             return {row[0] for row in result}
 
@@ -713,12 +717,18 @@ class DuckDBBitCacheHandler(AbstractCacheHandler_Lazy):
                 {query}
             ),
             bit_positions AS (
-                SELECT {partition_key}::INTEGER AS position
+                -- A key outside the bit array fails the statement instead of being dropped
+                SELECT CASE
+                    WHEN {partition_key}::INTEGER < 0 OR {partition_key}::INTEGER >= {actual_bitsize}
+                    THEN error('Partition key ' || {partition_key} || ' is outside the bit array range 0..{actual_bitsize - 1} of partition {partition_key}')
+                    ELSE {partition_key}::INTEGER
+                END AS position
                 FROM query_result
-                WHERE {partition_key}::INTEGER >= 0 AND {partition_key}::INTEGER < {actual_bitsize}
+                WHERE {partition_key} IS NOT NULL
             ),
             bit_array AS (
-                SELECT generate_series(0, {actual_bitsize} - 1) AS bit_index
+                -- range() as a table function yields rows; generate_series() in a SELECT list is one list value
+                SELECT bit_index FROM range(0, {actual_bitsize}) AS r(bit_index)
             ),
             bit_string AS (
                 SELECT string_agg(
@@ -787,8 +797,8 @@ class DuckDBBitCacheHandler(AbstractCacheHandler_Lazy):
                 status = self.get_query_status(key, partition_key)
                 if status is None:
                     return False
-                if status in ("timeout", "failed"):
-                    return True  # Don't check cache for failed queries
+                if status in ("timeout", "failed", "limit"):
+                    return True  # Don't check cache for failed or over-limit queries
 
             # Check cache entry
             table_name = self._get_safe_table_name(partition_key)
@@ -922,7 +932,7 @@ class DuckDBBitCacheHandler(AbstractCacheHandler_Lazy):
                     SELECT query_hash FROM {self.table_prefix}_queries
                     WHERE query_hash IN ({",".join("?" * len(keys))})
                     AND partition_key = ?
-                    AND status IN ('ok', 'timeout', 'failed')
+                    AND status IN ('ok', 'timeout', 'failed', 'limit')
                 """,
                     tuple(keys) + (partition_key,),
                 ).fetchall()
@@ -945,6 +955,7 @@ class DuckDBBitCacheHandler(AbstractCacheHandler_Lazy):
                         f"""
                         SELECT query_hash FROM {table_name}
                         WHERE query_hash IN ({",".join("?" * len(ok_keys))})
+                        AND partition_keys IS NOT NULL
                     """,
                         tuple(row[0] for row in ok_keys),
                     ).fetchall()
@@ -958,12 +969,14 @@ class DuckDBBitCacheHandler(AbstractCacheHandler_Lazy):
                 return existing_cache_keys | failed_keys
 
             else:
-                # Just check cache table
+                # Just check cache table; NULL rows are set_null markers and must not take part in
+                # intersections (BIT_AND over them is NULL, which read back as an empty intersection)
                 table_name = self._get_safe_table_name(partition_key)
                 result = self.conn.execute(
                     f"""
                     SELECT query_hash FROM {table_name}
                     WHERE query_hash IN ({",".join("?" * len(keys))})
+                    AND partition_keys IS NOT NULL
                 """,
                     tuple(keys),
                 ).fetchall()
@@ -1073,27 +1086,40 @@ class DuckDBBitCacheHandler(AbstractCacheHandler_Lazy):
         except Exception:
             return []
 
-    def set_query_status(self, key: str, partition_key: str = "partition_key", status: str = "ok") -> bool:
+    def set_query_status(self, key: str, partition_key: str = "partition_key", status: str = "ok", query: str | None = None) -> bool:
         """
         Set query status.
 
         Args:
             key: Cache key
             partition_key: Partition key name
-            status: Status ('ok', 'timeout', 'failed')
+            status: Status ('ok', 'timeout', 'failed', 'limit')
+            query: Query text; with it the row is inserted when it does not exist yet, without it only an
+                existing row is updated
 
         Returns:
             bool: True if successful
         """
         try:
-            self.conn.execute(
-                f"""
-                UPDATE {self.table_prefix}_queries
-                SET status = ?, last_seen = now()
-                WHERE query_hash = ? AND partition_key = ?
-            """,
-                (status, key, partition_key),
-            )
+            if query is not None:
+                self.conn.execute(
+                    f"""
+                    INSERT INTO {self.table_prefix}_queries (query_hash, partition_key, query, status, last_seen)
+                    VALUES (?, ?, ?, ?, now())
+                    ON CONFLICT (query_hash, partition_key) DO UPDATE SET
+                    status = EXCLUDED.status, last_seen = now()
+                """,
+                    (key, partition_key, query, status),
+                )
+            else:
+                self.conn.execute(
+                    f"""
+                    UPDATE {self.table_prefix}_queries
+                    SET status = ?, last_seen = now()
+                    WHERE query_hash = ? AND partition_key = ?
+                """,
+                    (status, key, partition_key),
+                )
 
             return True
 

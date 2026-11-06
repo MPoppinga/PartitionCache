@@ -257,11 +257,11 @@ class RocksDBAbstractCacheHandler(AbstractCacheHandler):
         except Exception:
             return None
 
-    def set_query_status(self, key: str, partition_key: str = "partition_key", status: str = "ok") -> bool:
+    def set_query_status(self, key: str, partition_key: str = "partition_key", status: str = "ok", query: str | None = None) -> bool:
         """Set the status of a query using termination bits for RocksDB backend."""
         try:
             # Valid statuses
-            valid_statuses = {"ok", "timeout", "failed"}
+            valid_statuses = {"ok", "timeout", "failed", "limit"}
             if status not in valid_statuses:
                 raise ValueError(f"Invalid status '{status}'. Must be one of: {valid_statuses}")
 
@@ -283,9 +283,9 @@ class RocksDBAbstractCacheHandler(AbstractCacheHandler):
                         parts = parts[:3] + ["ok"]  # Replace or add status
                         updated_data = "|".join(parts)
                         self.db.put(query_key.encode("utf-8"), updated_data.encode("utf-8"), sync=True)
-            elif status == "failed":
-                # Set limit termination bit
-                self.db.put(limit_key.encode("utf-8"), b"\x00", sync=True)
+            elif status in ("failed", "limit"):
+                # Termination marker: b"limit" for a result over the result limit, b"\x00" (historically) for failed
+                self.db.put(limit_key.encode("utf-8"), b"limit" if status == "limit" else b"\x00", sync=True)
                 # Remove timeout bit if it exists
                 self.db.delete(timeout_key.encode("utf-8"))
                 # Update query metadata if it exists
@@ -294,7 +294,7 @@ class RocksDBAbstractCacheHandler(AbstractCacheHandler):
                 if query_data:
                     parts = query_data.decode("utf-8").split("|", 3)
                     if len(parts) >= 3:
-                        parts = parts[:3] + ["failed"]
+                        parts = parts[:3] + [status]
                         updated_data = "|".join(parts)
                         self.db.put(query_key.encode("utf-8"), updated_data.encode("utf-8"), sync=True)
             elif status == "timeout":
@@ -324,8 +324,9 @@ class RocksDBAbstractCacheHandler(AbstractCacheHandler):
             limit_key = self._get_cache_key(f"_LIMIT_{key}", partition_key)
             timeout_key = self._get_cache_key(f"_TIMEOUT_{key}", partition_key)
 
-            if self.db.get(limit_key.encode("utf-8")) is not None:
-                return "failed"
+            marker = self.db.get(limit_key.encode("utf-8"))
+            if marker is not None:
+                return "limit" if marker == b"limit" else "failed"
             elif self.db.get(timeout_key.encode("utf-8")) is not None:
                 return "timeout"
 

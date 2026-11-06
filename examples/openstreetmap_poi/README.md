@@ -116,21 +116,24 @@ This script will:
 - Extract POIs (amenities, shops, tourism, leisure)
 - Assign zipcode and administrative boundaries to each POI
 
-### 5. Run Example Queries
+### 5. Run Benchmark (Unified Runner)
 
-Test queries with both partition strategies:
+Test queries with all partition strategies using the unified benchmark runner:
 
 ```bash
-python run_poi_queries.py
+# Run all queries
+python examples/benchmark/run_benchmark.py --config config/osm_poi.yaml --db-backend postgresql --mode all
+
+# Run a specific flight
+python examples/benchmark/run_benchmark.py --config config/osm_poi.yaml --db-backend postgresql --mode flight 1
 ```
 
 This will:
 - Run the same queries against zipcode, landkreis, and spatial partition keys
 - Show performance comparisons between strategies
 - Demonstrate cache hit/miss scenarios
-- Provide helpful hints for adding queries to cache
 
-Expected output shows timing comparisons and cache effectiveness for each partition strategy.
+> **Note:** The benchmark runner has moved to `examples/benchmark/run_benchmark.py`. See [examples/benchmark/README.md](../benchmark/README.md) for full documentation.
 
 ## Working with the Cache
 
@@ -298,6 +301,27 @@ Each partition strategy (`zipcode`, `landkreis`, `spatial`) has three test queri
 
 The `zipcode` and `landkreis` variants include partition key join conditions (e.g. `p2.zipcode = p1.zipcode`), while the `spatial` variants use only `ST_DWithin` spatial joins without partition key joins.
 
+### Flight 4: Harder Spatial Queries (spatial_benchmark/)
+
+Flight 4 contains 7 stress-test queries organized in 4 categories. All use only the `pois` table with `ST_DWithin` spatial joins, but exercise patterns that standard queries don't cover:
+
+| Query | Category | Pattern | Challenge |
+|-------|----------|---------|-----------|
+| qa1 | A: Index-defeating | Double leading-wildcard LIKE (`%Pizza%`, `%Apotheke%`) | Forces sequential scans; only GiST spatial index helps |
+| qa2 | A: Index-defeating | `LOWER()` + multi-pattern OR with 4 LIKE conditions | No btree usable; OR pattern may generate many fragments |
+| qb1 | B: High-cardinality | restaurant (95k) × cafe (29k) cross-product | Enormous cross-product before spatial filter |
+| qb2 | B: High-cardinality | Same-subtype self-join (restaurant × restaurant) with wildcards | 95k × 95k with leading wildcards = worst case for planner |
+| qb3 | B: High-cardinality | Triple join: restaurant × pharmacy × supermarket (500m) | 3-way spatial join creates very large search space |
+| qc1 | C: Chain topology | 4-table chain: pizza→pharmacy→supermarket→bakery (300m each) | Chain topology (not star); no single index covers it |
+| qd1 | D: Expression filter | `LENGTH()` + `LOWER()` on columns | Computed expressions defeat all indexes |
+
+```bash
+# Run Flight 4 (harder spatial queries)
+python examples/benchmark/run_benchmark.py \
+  --config config/osm_poi.yaml --db-backend postgresql \
+  --mode flight 4 --api lazy --repeat 3
+```
+
 ## Performance Comparison
 
 The example demonstrates how different partition strategies affect query performance:
@@ -306,7 +330,7 @@ The example demonstrates how different partition strategies affect query perform
 - **Landkreis partitioning**: Broader regions, good for administrative queries
 - **Spatial partitioning** (H3/BBox): Geometry-based, good for spatial proximity queries without explicit partition key columns
 
-Run `python run_poi_queries.py` to see performance comparisons between:
+Run the benchmark to see performance comparisons between:
 - Queries without cache
 - Queries with zipcode partitioning
 - Queries with landkreis partitioning

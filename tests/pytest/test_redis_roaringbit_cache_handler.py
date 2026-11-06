@@ -169,10 +169,14 @@ def test_set_cache_invalid_type(cache_handler, mock_redis):
         cache_handler.set_cache("invalid_key", {"a", "b", "c"})
 
 
-def test_set_cache_empty(cache_handler, mock_redis):
+def test_set_cache_empty_stores_an_empty_bitmap(cache_handler, mock_redis):
+    """An empty result is stored, not dropped: it means the query has no rows."""
+    cache_handler._get_partition_datatype = lambda pk: "integer"
     result = cache_handler.set_cache("empty_key", set())
     assert result is True
-    mock_redis.set.assert_not_called()
+    stored = mock_redis.set.call_args[0][1]
+    assert stored != b"\x00"
+    assert BitMap.deserialize(stored) == BitMap()
 
 
 def test_set_cache_creates_partition(cache_handler, mock_redis):

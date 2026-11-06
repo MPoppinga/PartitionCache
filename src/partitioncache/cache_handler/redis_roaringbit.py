@@ -93,10 +93,9 @@ class RedisRoaringBitCacheHandler(RedisAbstractCacheHandler):
     ) -> bool:
         """
         Store partition key identifiers as a serialized roaring bitmap.
-        Accepts set[int], BitMap, bitarray, or list of integers.
+        Accepts set[int], BitMap, bitarray, or list of integers. An empty input is stored as an empty
+        bitmap (serialized, it starts with b":0", so it never matches the b"\x00" null marker).
         """
-        if not partition_key_identifiers:
-            return True
 
         # Ensure partition exists with integer datatype
         existing_datatype = self._get_partition_datatype(partition_key)

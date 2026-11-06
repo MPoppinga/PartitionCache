@@ -569,7 +569,7 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
             cursor.execute(
                 sql.SQL("""
                 SELECT id, query, partition_key, partition_datatype FROM {}
-                ORDER BY priority DESC, created_at ASC
+                ORDER BY priority DESC, created_at ASC, id ASC
                 LIMIT 1 FOR UPDATE SKIP LOCKED
             """).format(sql.Identifier(self.original_queue_table))
             )
@@ -705,7 +705,7 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
             cursor.execute(
                 sql.SQL("""
                 SELECT id, query, hash, partition_key, partition_datatype, cache_backend FROM {}
-                ORDER BY priority DESC, created_at ASC
+                ORDER BY priority DESC, created_at ASC, id ASC
                 LIMIT 1 FOR UPDATE SKIP LOCKED
             """).format(sql.Identifier(self.fragment_queue_table))
             )

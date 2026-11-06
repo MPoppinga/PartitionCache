@@ -70,10 +70,21 @@ def test_set_cache(cache_handler):
     assert insert_found, "Expected INSERT INTO ... ON CONFLICT SQL statement not found"
 
 
-def test_set_cache_empty(cache_handler):
+def test_set_cache_empty_stores_an_empty_array(cache_handler):
+    """An empty result is stored ('{}'), not dropped: it means the query has no rows."""
     cache_handler.cursor.execute.reset_mock()
-    cache_handler.set_cache("empty_key", set())
-    assert not cache_handler.cursor.execute.called
+    cache_handler.cursor.fetchone.side_effect = [("integer",)]
+    assert cache_handler.set_cache("empty_key", set()) is True
+    inserts = [c for c in cache_handler.cursor.execute.call_args_list if "INSERT INTO" in str(c[0][0]) and "query_hash, partition_keys" in str(c[0][0])]
+    assert len(inserts) == 1
+    assert inserts[0][0][1] == ("empty_key", "{}")
+
+
+def test_set_cache_empty_needs_a_registered_partition_key(cache_handler):
+    cache_handler.cursor.execute.reset_mock()
+    cache_handler.cursor.fetchone.side_effect = [None]
+    assert cache_handler.set_cache("empty_key", set(), "unregistered") is False
+    assert not any("INSERT INTO" in str(c[0][0]) for c in cache_handler.cursor.execute.call_args_list)
 
 
 def test_set_cache_str_type(cache_handler):
@@ -566,3 +577,24 @@ def test_unicode_key(cache_handler):
                     assert set(values_param) == {1, 2, 3}, f"Expected {{1, 2, 3}}, got {set(values_param)}"
                     break
     assert insert_found, "Expected INSERT INTO ... ON CONFLICT SQL with unicode key not found"
+
+
+def test_set_cache_lazy_keeps_the_keys_in_the_database(cache_handler):
+    """Lazy insertion runs the variant and the INSERT server-side in one DO block; nothing is fetched to the client."""
+    from psycopg import sql
+
+    original_as_string = sql.Composable.as_string
+    events = []
+    cache_handler.cursor.execute.side_effect = lambda *args, **kwargs: events.append(("execute", args))
+    cache_handler.cursor.fetchone.side_effect = lambda: events.append(("fetchone",)) or ("integer",)
+    cache_handler.cursor.fetchall.side_effect = lambda: events.append(("fetchall",)) or []
+    # The unit-test connection is a mock; compose the SQL without one
+    with patch.object(sql.Composable, "as_string", lambda self, context=None: original_as_string(self, None)):
+        assert cache_handler.set_cache_lazy("lazy_key", "SELECT pk FROM t WHERE x = 'a''b'", "pk") is True
+
+    blocks = [i for i, event in enumerate(events) if event[0] == "execute" and str(event[1][0]).startswith("DO $")]
+    assert len(blocks) == 1
+    statement = events[blocks[0]][1]
+    assert len(statement) == 1, "the DO block takes no parameters, so % in the query is not interpreted"
+    assert "INTO v_keys" in statement[0] and "SELECT pk FROM t WHERE x = ''a''''b''" in statement[0]
+    assert not any(event[0] in ("fetchone", "fetchall") for event in events[blocks[0]:]), "lazy insertion must not fetch keys"

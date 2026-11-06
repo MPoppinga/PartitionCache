@@ -1,0 +1,230 @@
+{
+ "q3": [
+  {
+   "tagClass": "President",
+   "country": "India",
+   "_rows": "569",
+   "_ms": "208"
+  },
+  {
+   "tagClass": "Song",
+   "country": "China",
+   "_rows": "709",
+   "_ms": "317"
+  },
+  {
+   "tagClass": "Saint",
+   "country": "India",
+   "_rows": "595",
+   "_ms": "180"
+  },
+  {
+   "tagClass": "Philosopher",
+   "country": "China",
+   "_rows": "779",
+   "_ms": "177"
+  },
+  {
+   "tagClass": "Monarch",
+   "country": "China",
+   "_rows": "672",
+   "_ms": "283"
+  },
+  {
+   "tagClass": "TennisPlayer",
+   "country": "India",
+   "_rows": "636",
+   "_ms": "671"
+  }
+ ],
+ "q9": [
+  {
+   "startDate": "2012-08-30",
+   "endDate": "2012-12-10",
+   "_rows": "8633",
+   "_ms": "1275"
+  },
+  {
+   "startDate": "2012-08-31",
+   "endDate": "2012-12-03",
+   "_rows": "8626",
+   "_ms": "1199"
+  },
+  {
+   "startDate": "2012-08-31",
+   "endDate": "2012-11-23",
+   "_rows": "8451",
+   "_ms": "809"
+  },
+  {
+   "startDate": "2012-08-30",
+   "endDate": "2012-11-30",
+   "_rows": "8633",
+   "_ms": "935"
+  },
+  {
+   "startDate": "2012-08-27",
+   "endDate": "2012-11-21",
+   "_rows": "8455",
+   "_ms": "876"
+  },
+  {
+   "startDate": "2012-09-03",
+   "endDate": "2012-12-02",
+   "_rows": "8590",
+   "_ms": "1157"
+  }
+ ],
+ "q16": [
+  {
+   "tagA": "Enrique_Iglesias",
+   "dateA": "2012-04-28",
+   "tagB": "Bulgaria",
+   "dateB": "2011-02-02",
+   "maxKnowsLimit": "3",
+   "_rows": "3",
+   "_ms": "278"
+  },
+  {
+   "tagA": "Slavoj_\u017di\u017eek",
+   "dateA": "2011-01-15",
+   "tagB": "Nelson_Mandela",
+   "dateB": "2012-11-24",
+   "maxKnowsLimit": "3",
+   "_rows": "1",
+   "_ms": "219"
+  },
+  {
+   "tagA": "Slavoj_\u017di\u017eek",
+   "dateA": "2012-06-15",
+   "tagB": "Nelson_Mandela",
+   "dateB": "2012-11-24",
+   "maxKnowsLimit": "3",
+   "_rows": "2",
+   "_ms": "174"
+  },
+  {
+   "tagA": "Alexander_Downer",
+   "dateA": "2012-01-30",
+   "tagB": "Henry_II_of_England",
+   "dateB": "2012-09-21",
+   "maxKnowsLimit": "6",
+   "_rows": "3",
+   "_ms": "155"
+  }
+ ],
+ "q17": [
+  {
+   "tag": "Kissin_U",
+   "delta": "12",
+   "_rows": "1",
+   "_ms": "2198"
+  },
+  {
+   "tag": "Change_Clothes",
+   "delta": "12",
+   "_rows": "2",
+   "_ms": "8434"
+  },
+  {
+   "tag": "Everyway_That_I_Can",
+   "delta": "11",
+   "_rows": "1",
+   "_ms": "3258"
+  },
+  {
+   "tag": "Wang_Dang_Doodle",
+   "delta": "15",
+   "_rows": "2",
+   "_ms": "2723"
+  },
+  {
+   "tag": "He_Said_She_Said",
+   "delta": "12",
+   "_rows": "2",
+   "_ms": "2751"
+  },
+  {
+   "tag": "Heart_On",
+   "delta": "9",
+   "_rows": "1",
+   "_ms": "2337"
+  }
+ ],
+ "q11": [
+  {
+   "country": "India",
+   "startDate": "2012-10-04",
+   "endDate": "2013-01-16",
+   "_rows": "1",
+   "_ms": "611"
+  },
+  {
+   "country": "China",
+   "startDate": "2012-10-02",
+   "endDate": "2013-01-02",
+   "_rows": "1",
+   "_ms": "398"
+  },
+  {
+   "country": "China",
+   "startDate": "2012-10-06",
+   "endDate": "2013-01-06",
+   "_rows": "1",
+   "_ms": "391"
+  },
+  {
+   "country": "India",
+   "startDate": "2012-10-18",
+   "endDate": "2013-01-30",
+   "_rows": "1",
+   "_ms": "267"
+  },
+  {
+   "country": "China",
+   "startDate": "2012-10-17",
+   "endDate": "2013-01-17",
+   "_rows": "1",
+   "_ms": "212"
+  },
+  {
+   "country": "China",
+   "startDate": "2012-09-25",
+   "endDate": "2012-12-26",
+   "_rows": "1",
+   "_ms": "461"
+  }
+ ],
+ "q18": [
+  {
+   "tag": "Fyodor_Dostoyevsky",
+   "_rows": "16993",
+   "_ms": "39833"
+  },
+  {
+   "tag": "J._R._R._Tolkien",
+   "_rows": "18352",
+   "_ms": "58916"
+  },
+  {
+   "tag": "Johann_Sebastian_Bach",
+   "_rows": "19991",
+   "_ms": "48570"
+  },
+  {
+   "tag": "George_III_of_the_United_Kingdom",
+   "_rows": "15269",
+   "_ms": "33738"
+  },
+  {
+   "tag": "Charles_I_of_England",
+   "_rows": "17477",
+   "_ms": "38912"
+  },
+  {
+   "tag": "Gerald_Ford",
+   "_rows": "19278",
+   "_ms": "40572"
+  }
+ ]
+}

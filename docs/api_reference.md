@@ -105,11 +105,13 @@ Retrieves cached partition keys for a query with comprehensive statistics.
 - `follow_graph` (bool): If True, only connected partial queries are considered (default: True)
 - `auto_detect_partition_join` (bool): Whether to auto-detect partition-join tables (default: True)
 - `partition_join_table` (str | None): Explicitly specified partition-join table alias or name
-- `bucket_steps` (float): Step size for normalizing distance conditions (default: 1.0)
+- `bucket_steps` (float | dict | list): Step size for normalizing distance conditions (default: 1.0). A dict `{pattern: step}` buckets every numeric comparison whose expression contains the pattern (case-insensitive substring, first match wins), also plain columns, negative bounds and the `ST_DWithin` radius (pattern matched against the call), e.g. `{"alt_max": 500, "vrate": 1}`. A list of numbers and dicts adds one bucketed variant set per level, e.g. `[{"alt_max": 500}, {"alt_max": 2000}]`. Bounds are always rounded outward, so the variants only loosen the query.
+- `keep_all_attributes` (bool): If True, probe only the variants that population (`generate_all_query_hash_pairs`) creates by default, not also those with single-table attribute conditions removed: fewer hashes and faster variant generation, fewer hits (default: False)
 - `add_constraints` (dict[str, str] | None): Dict mapping table names to constraints to add
 - `remove_constraints_all` (list[str] | None): List of attribute names to remove from all query variants
 - `remove_constraints_add` (list[str] | None): List of attribute names to remove, creating additional variants
 - `skip_partition_key_joins` (bool): Spatial mode — generate query variants without partition-key equijoins (default: False)
+- `temporal_bucket_width`, `temporal_column`, `dilation_buckets`: Temporal dilation for time-bucket partition keys, see [Temporal dilation](#temporal-dilation-temporal_bucket_width-temporal_column)
 - `geometry_column` (str | None): Geometry column for spatial variant generation
 - `max_conditions_removed` (int | None): Upper bound on the number of conditions removed when generating reduced variants
 - `protected_patterns` (list[str] | None): Condition substrings that must never be removed
@@ -219,20 +221,25 @@ Lazy counterpart to `extend_query_with_partition_keys`: integrates a lazy SQL su
 - `p0_table_name` (str | None, optional): Name of the p0 table. Defaults to `{partition_key}_mv`
 - `auto_detect_partition_join` (bool, optional): Whether to auto-detect partition-join tables (default: True)
 - `partition_join_table` (str | None, optional): Explicitly specified partition-join table alias or name
-- `bucket_steps` (float, optional): Step size for normalizing distance conditions (default: 1.0)
+- `bucket_steps` (float | dict | list, optional): Step size for normalizing distance conditions (default: 1.0); per-attribute dict and levels as for `get_partition_keys`
+- `keep_all_attributes` (bool, optional): Probe only the variants population creates by default (default: False), see `get_partition_keys`
 - `add_constraints` (dict[str, str] | None, optional): Dict mapping table names to constraints to add
 - `remove_constraints_all` (list[str] | None, optional): List of attribute names to remove from all query variants
 - `remove_constraints_add` (list[str] | None, optional): List of attribute names to remove, creating additional variants
 - `max_conditions_removed` (int | None, optional): Upper bound on the number of conditions removed when generating reduced variants (default: None)
 - `protected_patterns` (list[str] | None, optional): Condition substrings that must never be removed (default: None)
 - `skip_partition_key_joins` (bool, optional): Spatial mode — generate query variants without partition-key equijoins (default: False)
+- `temporal_bucket_width`, `temporal_column`, `dilation_buckets` (optional): Temporal dilation for time-bucket partition keys, see below
 - `geometry_column` (str | None, optional): Enables spatial mode. Uses this geometry column for variant SELECT clauses and spatial filter. Requires a spatial cache handler with `get_spatial_filter_lazy()` method.
 - `buffer_distance` (float | None, optional): Buffer distance in meters for spatial filter (required when `geometry_column` is set).
 - `spatial_method` (Literal["SUBDIVIDE_INLINE", "SUBDIVIDE_TMP_TABLE", "DUMP_TMP_TABLE", "DUMP_CTE"], optional): Strategy for applying the spatial filter (default: "SUBDIVIDE_TMP_TABLE")
 - `subdivide_max_vertices` (int, optional): Maximum vertices per subdivided filter geometry (default: 256)
+- `cost_estimator` (Callable[[str], float | None] | None, optional): Returns the planner cost of a query without executing it, e.g. `PostgresDBHandler.estimate_cost`. Only used together with `min_query_cost` (default: None)
+- `min_query_cost` (float | None, optional): Skip the cache when the estimated cost of the original query is below this value — see [Cost gate](#cost-gate-min_query_cost) (default: None, gate off)
 
 **Returns:**
-- `Tuple[str, Dict]`: (enhanced_query, statistics)
+- `Tuple[str, Dict]`: (enhanced_query, statistics). With `min_query_cost` set, the statistics also contain `cost_gated` (1 if the cache was skipped) and `query_cost` (rounded estimate, when available)
+- SQL the cache cannot parse or rewrite never fails the query: it is returned unchanged with a warning, and the statistics contain `sql_error: 1` (also for `apply_cache`). This covers sqlglot errors, `RecursionError` (very deeply nested SQL) and `IndexError` (SQL shapes the variant generator does not expect, e.g. no FROM clause). Configuration errors (`ValueError`, e.g. a handler without lazy support) and cache backend errors still raise.
 
 **Example:**
 ```python
@@ -301,9 +308,58 @@ enhanced_query, stats = partitioncache.apply_cache_lazy(
 )
 ```
 
+#### Cost gate (`min_query_cost`)
+
+For cheap queries the cache overhead (variant generation, cache lookup, temp table) exceeds what the restriction can save. `apply_cache_lazy` and `apply_cache` can therefore ask the database planner first and return the query unchanged when its estimated cost is below `min_query_cost`. The check runs before variant generation, so a gated query costs one `EXPLAIN` only.
+
+```python
+from partitioncache.db_handler.postgres import PostgresDBHandler
+
+data_db = PostgresDBHandler(host, port, user, password, dbname)  # the data database, not the cache database
+enhanced_query, stats = partitioncache.apply_cache_lazy(
+    query=query,
+    cache_handler=cache.underlying_handler,
+    partition_key="user_id",
+    cost_estimator=data_db.estimate_cost,
+    min_query_cost=10_000,  # calibrate per installation, see below
+)
+if stats.get("cost_gated"):
+    print(f"cache skipped, planner cost {stats['query_cost']}")
+```
+
+- `estimate_cost` is implemented for PostgreSQL (`EXPLAIN (FORMAT JSON)`, `Plan.Total Cost`) and MySQL (`EXPLAIN FORMAT=JSON`, `query_block.cost_info.query_cost`). DuckDB, SQLite and MariaDB return `None` — they expose no scalar cost — and the cache is applied as usual. Any callable with the same signature works as `cost_estimator`.
+- Cost units are planner units, not milliseconds, and depend on `seq_page_cost`/`random_page_cost`; the threshold has to be calibrated per installation and workload, e.g. by comparing `estimate_cost` of representative queries with their measured runtime with and without the cache.
+- The gate only catches queries that are cheap *according to the planner*. Planner over-estimates (a query estimated expensive that finishes in milliseconds) pass the gate and get the cache as before; large cached key sets and bad plans for the enhanced query are not covered.
+- A failing estimator, or one that returns something other than a finite number, is logged and the cache is applied; `min_query_cost` without `cost_estimator` raises `ValueError`.
+- Every query that is not gated pays for the `EXPLAIN` on the data connection: the statement plus BEGIN/ROLLBACK (or SAVEPOINT/ROLLBACK TO when the caller has a transaction open).
+- `PostgresDBHandler.estimate_cost` runs the `EXPLAIN` in a transaction (or savepoint) that is always rolled back, so it does not commit or abort a transaction the caller has open, and it rejects text that contains more than one statement. MySQL returns `None` for plans without a top-level cost, such as `UNION`.
+
+#### Temporal dilation (`temporal_bucket_width`, `temporal_column`)
+
+When the partition key is a time bucket (e.g. `w = ts / 3600`), a correlation query such as "a failed logon followed by a successful one within 20 minutes" can match two rows in adjacent buckets. Intersecting the cached bucket sets would drop such pairs. With temporal dilation, `get_partition_keys`, `get_partition_keys_lazy`, `apply_cache` and `apply_cache_lazy` widen each cached set by `k` buckets before intersecting them.
+
+```python
+enhanced_query, stats = partitioncache.apply_cache_lazy(
+    query="SELECT a.id, b.id FROM events a, events b WHERE a.kind = 'fail' AND b.kind = 'ok' AND b.ts BETWEEN a.ts AND a.ts + 1200",
+    cache_handler=cache.underlying_handler,
+    partition_key="w",
+    temporal_bucket_width=3600,  # width of one bucket, in the unit of ts
+    temporal_column="ts",        # the column the bucket is derived from
+)
+```
+
+- `k = ceil(window / temporal_bucket_width)`. The window is read only from conditions on `alias.temporal_column`: `BETWEEN`, `ABS(a.ts - b.ts) <= W`, or a lower and an upper bound in separate conditions. A difference bounded on one side only (`b.ts <= a.ts + 1200`) does not count. Chained windows add up.
+- If two aliases of the partition key's table are not bounded in time against each other, no `k` is sound: the query runs without the cache (no partition keys, no restriction).
+- `dilation_buckets` sets `k` directly instead (`0` turns dilation off, which can lose rows).
+- Only numeric time columns (e.g. epoch seconds) give a window; a bound written with `INTERVAL` is not read, so such queries run without the cache.
+- `use_p0_table` is ignored for a temporal key: its join `alias.w = p0.w` would put all aliases into the same bucket.
+- A temporal key gets its variants without partition key joins (`t1.w = t2.w`), which would drop pairs across a bucket boundary. Population must do the same, or the variant hashes differ and the cache is never hit: pass `skip_partition_key_joins=True` to `generate_all_query_hash_pairs`, or list the key in `--skip-partition-key-joins` of `pcache-add` and `pcache-monitor`.
+- Dilated intersections are implemented in SQL for `postgresql_array` and `postgresql_bit`; the non-lazy API falls back to a Python intersection for other handlers with integer keys. A lazy call on a handler without a dilated intersection, and non-integer keys, run without the cache.
+- Dilation inflates each cached set by up to `2k + 1` buckets. A bucket width at least as large as the typical window keeps `k` at 1.
+
 #### `apply_cache(query, cache_handler, partition_key, ..., geometry_column=None, buffer_distance=None)`
 
-Applies partition cache to a query using regular (non-lazy) cache handlers. Supports spatial mode.
+Applies partition cache to a query using regular (non-lazy) cache handlers. Supports spatial mode. Accepts the same `cost_estimator` / `min_query_cost` gate as `apply_cache_lazy`.
 
 **Spatial Parameters** (in addition to standard parameters):
 - `geometry_column` (str | None, optional): Enables spatial mode. Requires a spatial cache handler with `get_spatial_filter()` method.
@@ -533,7 +589,7 @@ if cached_cities:
 
 ##### `exists(key: str, partition_key: str = "partition_key", check_query: bool = False) -> bool`
 
-Checks if a cache entry exists. With `check_query=True`, query metadata is consulted first: a missing query record returns False; an `'ok'` status additionally checks the cache entry; an error status (`'timeout'`/`'failed'`) returns True without a cache check.
+Checks if a cache entry exists. With `check_query=True`, query metadata is consulted first: a missing query record returns False; an `'ok'` status additionally checks the cache entry; an error status (`'timeout'`/`'failed'`/`'limit'`) returns True without a cache check.
 
 **Returns:**
 - `bool`: True if key exists
@@ -611,6 +667,8 @@ if lazy_subquery:
     """
 ```
 
+The PostgreSQL handlers (`postgresql_array`, `postgresql_bit`, `postgresql_roaringbit`) read the cache entries when the query runs, not when the subquery is built. If entries are evicted in between, the subquery falls back to a placeholder that `extend_query_with_partition_keys_lazy` (and `apply_cache_lazy`) replace with all partition keys of the restricted table, so the query runs without the restriction instead of returning no rows. A subquery embedded by hand, as above, keeps the placeholder as `NULL` and returns no rows in that case.
+
 ### PartitionCacheHelper
 
 High-level wrapper providing additional convenience methods and validation.
@@ -632,6 +690,7 @@ The helper wraps a subset of the handler interface. All methods operate on the h
 - `delete(key)` - Remove entry
 - `set_null(key)` / `is_null(key)` - Negative-cache markers
 - `set_query(key, querytext)` - Store query metadata only
+- `get_query(key)` - Query text stored for a key (None if not stored)
 - `get_intersected(keys)` - Intersect several cached sets
 - `filter_existing_keys(keys, check_query=False)` - Subset of keys present in cache
 - `get_all_keys()` - All keys of the bound partition
@@ -640,7 +699,7 @@ The helper wraps a subset of the handler interface. All methods operate on the h
 
 `LazyPartitionCacheHelper` (returned automatically by `create_cache_helper` for lazy-capable backends) additionally provides `get_intersected_lazy(keys)`.
 
-Handler-level operations without a helper counterpart — e.g. `get_query`, `get_all_queries`, `register_partition_key`, `get_partition_keys` (list all partitions) — are reached via `underlying_handler`:
+Handler-level operations without a helper counterpart — e.g. `get_all_queries`, `register_partition_key`, `get_partition_keys` (list all partitions) — are reached via `underlying_handler`:
 
 **Example:**
 ```python
@@ -656,7 +715,8 @@ cache.set_entry(query_hash, {1, 5, 10}, query)
 
 # Retrieve cache data and metadata
 user_ids = cache.get(query_hash)
-original_query = cache.underlying_handler.get_query(query_hash, cache.partition_key)
+original_query = cache.get_query(query_hash)
+all_queries = cache.underlying_handler.get_all_queries(cache.partition_key)
 ```
 
 ##### Working with additional partition keys
@@ -679,6 +739,43 @@ cache.underlying_handler.register_partition_key("region_id", "integer")
 ### `generate_all_query_hash_pairs(query: str, partition_key: str, min_component_size=1, follow_graph=True, keep_all_attributes=True, canonicalize_queries=False, ...)`
 
 The exported lower-level API: generates all query variants and returns them as `list[tuple[str, str]]` of `(variant_query, hash)` pairs — the format consumed by `push_to_query_variant_queue()`. Accepts the full variant-generation parameter set (`auto_detect_partition_join`, `partition_join_table`, `max_component_size`, `bucket_steps`, `add_constraints`, `remove_constraints_all`, `remove_constraints_add`, `max_conditions_removed`, `protected_patterns`, and the spatial parameters `skip_partition_key_joins`/`geometry_column`).
+
+The pairs come in arbitrary (set) order.
+
+### `order_variants_for_population(query_hash_pairs: list[tuple[str, str]])`
+
+Returns the pairs sorted smallest first: fewest tables in the outer `FROM`, then fewest `WHERE` conditions (stable; unparseable variants last). The relaxations of a variant join fewer tables or keep fewer conditions, so when variants are populated in this order, the cached keys of its relaxations exist when a variant runs and can restrict it. `pcache-monitor` and `pcache-add --queue` apply it before pushing to the variant queue.
+
+```python
+import partitioncache
+from partitioncache import generate_all_query_hash_pairs, order_variants_for_population
+from partitioncache.query_processor import generate_all_hashes
+
+for variant, variant_hash in order_variants_for_population(generate_all_query_hash_pairs(query, "city_id")):
+    lookup = set(generate_all_hashes(variant, "city_id")) - {variant_hash}
+    keys, _hits = cache_handler.get_intersected(lookup, "city_id")
+    if keys is not None and len(keys) <= max_keys:
+        variant = partitioncache.extend_query_with_partition_keys(variant, keys, "city_id")
+    ...  # execute variant and store its keys under variant_hash
+```
+
+### `populate_query_variants(query_hash_pairs, partition_key, cache_handler, db_handler, restrict=True, max_restriction_keys=None, method="IN")`
+
+Executes and caches the variants of one query sequentially, smallest first. Each variant is restricted to the intersection of the keys of its already populated relaxations, which stay in memory, so no cache lookup or hash generation is needed per variant. A relaxation is recognised structurally by `variant_signature`/`is_relaxation_of` in `partitioncache.query_processor`: its tables and conditions (aliases replaced by table names) are a subset of the variant's, so its keys are a superset. Variants the subset test cannot judge soundly (a table used twice, explicit JOIN syntax, unqualified columns, grouping) are executed unrestricted.
+
+- Variants already in the cache are not executed; their keys are read once and restrict the others.
+- An empty intersection means the variant has no rows; it is stored as an empty set without executing it.
+- `max_restriction_keys`: restrict only when the intersection has at most this many keys.
+- `db_handler.execute` must raise on errors. A failure returned as an empty result would be cached as "no rows" and empty every variant it restricts; `SQLiteDBHandler` logs errors and returns `[]`.
+
+**Returns:** `PopulationStats` with `executed`, `restricted`, `empty_without_execution`, `already_cached`, `failed`.
+
+```python
+from partitioncache import generate_all_query_hash_pairs, populate_query_variants
+
+pairs = generate_all_query_hash_pairs(query, "flight_id", partition_key_source_table="flights")
+stats = populate_query_variants(pairs, "flight_id", cache_handler, db_handler, max_restriction_keys=flight_count // 4)
+```
 
 ### `generate_all_hashes(query: str, partition_key: str, min_component_size=1, follow_graph=True, fix_attributes=True, canonicalize_queries=False)`
 

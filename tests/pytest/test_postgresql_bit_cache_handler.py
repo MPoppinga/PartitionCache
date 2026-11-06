@@ -108,12 +108,15 @@ def test_set_query(cache_handler):
     cache_handler.db.commit.assert_called()
 
 
-def test_set_cache_empty(cache_handler):
+def test_set_cache_empty_stores_all_zero_bits(cache_handler):
+    """An empty result is stored as an all-zero bit array, not dropped: it means the query has no rows."""
+    cache_handler.cursor.fetchone.return_value = (100,)
     cache_handler.cursor.execute.reset_mock()
-    cache_handler.set_cache("empty_key", set())
-
-    # Execute only for init calls
-    assert cache_handler.cursor.execute.call_count == 0
+    assert cache_handler.set_cache("empty_key", set()) is True
+    stored = [c[0][1] for c in cache_handler.cursor.execute.call_args_list if "query_hash, partition_keys" in str(c[0][0])]
+    assert len(stored) == 1
+    assert stored[0][0] == "empty_key"
+    assert set(stored[0][1]) == {"0"}
 
 
 def test_get(cache_handler):
