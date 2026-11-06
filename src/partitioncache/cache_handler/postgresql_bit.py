@@ -118,7 +118,7 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
                         query_hash TEXT NOT NULL,
                         query TEXT NOT NULL,
                         partition_key TEXT NOT NULL,
-                        status TEXT NOT NULL DEFAULT 'ok' CHECK (status IN ('ok', 'timeout', 'failed')),
+                        status TEXT NOT NULL DEFAULT 'ok' CHECK (status IN ('ok', 'timeout', 'failed', 'limit')),
                         last_seen TIMESTAMP NOT NULL DEFAULT now(),
                         PRIMARY KEY (query_hash, partition_key)
                     );""").format(sql.Identifier(self.tableprefix + "_queries"))
@@ -445,8 +445,9 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
         """Intersection SQL where each cached bit array is dilated by ``dilation`` bits first.
 
         Dilation of a bit array is a shift-OR: a set bit at index ``b`` is spread to every
-        index within ``dilation`` of ``b``. PostgreSQL bit-string shifts preserve length and
-        pad with zeros, so buckets at the ends clip instead of wrapping around.
+        index within ``dilation`` of ``b``. PostgreSQL bit-string shifts preserve length, so
+        each array is first extended by ``dilation`` zero bits; otherwise a bucket just past
+        the bitsize (one no cached set contains) would be shifted out.
 
         Each row is dilated *before* BIT_AND, mirroring the buffer-then-intersect order of the
         spatial handlers. Dilating the intersection result instead would be unsound.
@@ -454,10 +455,11 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
         table_name = f"{self.tableprefix}_cache_{partition_key}"
         keys_part = sql.SQL("ARRAY[{}]").format(sql.SQL(", ").join(sql.Literal(key) for key in keys))
 
-        shifted: list[sql.Composable] = [sql.SQL("partition_keys")]
+        padded = sql.SQL("(partition_keys::VARBIT || {}::VARBIT)").format(sql.Literal("0" * dilation))
+        shifted: list[sql.Composable] = [padded]
         for offset in range(1, dilation + 1):
-            shifted.append(sql.SQL("(partition_keys >> {})").format(sql.Literal(offset)))
-            shifted.append(sql.SQL("(partition_keys << {})").format(sql.Literal(offset)))
+            shifted.append(sql.SQL("({} >> {})").format(padded, sql.Literal(offset)))
+            shifted.append(sql.SQL("({} << {})").format(padded, sql.Literal(offset)))
         dilated_expr = sql.SQL(" | ").join(shifted)
 
         return (
@@ -482,25 +484,7 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
                 return None, 0
 
             intersect_sql_str = self.get_intersected_dilated_sql_wk(filtered_keys, partition_key, dilation)
-            r = (
-                sql.SQL("""(
-       WITH bit_result AS (
-            {0}
-        ),
-        numbered_bits AS (
-            SELECT
-                bit_result,
-                generate_series(0, bit_length(bit_result) - 1) AS bit_index
-            FROM bit_result
-        )
-        SELECT unnest(array_agg(bit_index)) AS {1}
-        FROM numbered_bits
-        WHERE get_bit(bit_result, bit_index) = 1)
-        """)
-                .format(sql.SQL(intersect_sql_str), sql.Identifier(partition_key))  # type: ignore[arg-type]
-                .as_string()
-            )
-            return r, len(filtered_keys)
+            return self._lazy_keys_subquery(self._set_bits_array_sql(intersect_sql_str), partition_key), len(filtered_keys)
         except Exception as e:
             logger.error(f"Failed to get dilated lazy intersection in partition {partition_key}: {e}")
             return None, 0
@@ -531,10 +515,17 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
             return None, 0
 
         intersect_sql_str = self.get_intersected_sql_wk(filtered_keys, partition_key)
+        return self._lazy_keys_subquery(self._set_bits_array_sql(intersect_sql_str), partition_key), len(filtered_keys)
 
-        r = (
-            sql.SQL("""(
-       WITH bit_result AS (
+    @staticmethod
+    def _set_bits_array_sql(intersect_sql_str: str) -> sql.Composed:
+        """Return the indexes of the set bits of a BIT_AND intersection as an SQL array.
+
+        BIT_AND skips missing entries and is NULL only when none is left; the array is then NULL as well. An
+        intersection without set bits gives ``'{}'`` (array_agg over no rows would be NULL).
+        """
+        return sql.SQL("""(
+        WITH bit_result AS (
             {0}
         ),
         numbered_bits AS (
@@ -543,18 +534,9 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
                 generate_series(0, bit_length(bit_result) - 1) AS bit_index
             FROM bit_result
         )
-        SELECT unnest(array_agg(bit_index)) AS {1}
+        SELECT CASE WHEN (SELECT bit_result FROM bit_result) IS NULL THEN NULL ELSE COALESCE(array_agg(bit_index), '{{}}') END
         FROM numbered_bits
-        WHERE get_bit(bit_result, bit_index) = 1)
-        """)
-            .format(
-                sql.SQL(intersect_sql_str),  # type: ignore
-                sql.Identifier(partition_key),
-            )
-            .as_string()
-        )
-
-        return r, len(filtered_keys)
+        WHERE get_bit(bit_result, bit_index) = 1)""").format(sql.SQL(intersect_sql_str))  # type: ignore[arg-type]
 
     def _expand_bitsize(self, partition_key: str, max_key: int, current_bitsize: int | None) -> int:
         """Grow the partition's bit arrays so that max_key fits, plus the configured buffer.

@@ -6,6 +6,7 @@ It utilizes the given cache to extend the SQL query with the set of possible par
 
 """
 
+import functools
 import math
 import numbers
 import random
@@ -14,27 +15,36 @@ from collections.abc import Callable
 from datetime import datetime
 from decimal import Decimal
 from logging import getLogger
-from typing import Any, Literal
+from typing import Any, Literal, ParamSpec
 
 import sqlglot
+import sqlglot.errors
 import sqlglot.expressions as exp
 
-from partitioncache.cache_handler.abstract import AbstractCacheHandler, AbstractCacheHandler_Lazy
+from partitioncache.cache_handler.abstract import LAZY_ALL_KEYS_PLACEHOLDER, AbstractCacheHandler, AbstractCacheHandler_Lazy
 from partitioncache.query_processor import compute_buffer_distance, detect_partition_join_from_query, generate_all_hashes, handle_deprecated_kwargs
-from partitioncache.temporal_dilation import compute_dilation_buckets, dilate_bucket_set
+from partitioncache.temporal_dilation import compute_dilation_buckets, compute_temporal_window, dilate_bucket_set
 
 logger = getLogger("PartitionCache")
 
 
 
-def _resolve_dilation(query: str, temporal_bucket_width: float | None, dilation_buckets: int | None) -> int:
+def _resolve_dilation(
+    query: str,
+    temporal_bucket_width: float | None,
+    dilation_buckets: int | None,
+    temporal_column: str | None = None,
+    partition_key: str | None = None,
+    partition_key_source_table: str | None = None,
+) -> int | None:
     """Resolve how many buckets the cached sets must be dilated by.
 
-    Mirrors how the spatial path resolves ``buffer_distance``: an explicit value wins, and
-    otherwise the correlation window is read out of the query itself.
+    Mirrors how the spatial path resolves ``buffer_distance``: an explicit value wins, and otherwise the window
+    is read from the query's conditions on ``temporal_column`` (see :func:`compute_temporal_window`).
 
-    Returns 0 when temporal dilation is not requested or the query carries no window, in
-    which case the plain intersection is already sound.
+    Returns 0 when temporal dilation is not requested or the query combines a single row of the partition key's
+    table, and None when two of its aliases are not bounded in time against each other: then no dilation is
+    sound and the cache must not be used for the query.
     """
     if dilation_buckets is not None:
         if dilation_buckets < 0:
@@ -42,7 +52,22 @@ def _resolve_dilation(query: str, temporal_bucket_width: float | None, dilation_
         return dilation_buckets
     if temporal_bucket_width is None:
         return 0
-    return compute_dilation_buckets(compute_buffer_distance(query), temporal_bucket_width)
+    if temporal_column is None:
+        raise ValueError("temporal_bucket_width requires temporal_column, the time column the partition key buckets")
+    window = compute_temporal_window(query, temporal_column, partition_key, partition_key_source_table)
+    if window is None:
+        return None
+    return compute_dilation_buckets(window, temporal_bucket_width)
+
+
+def _is_temporal(temporal_bucket_width: float | None, dilation_buckets: int | None) -> bool:
+    """Whether the partition key is a time bucket; its variants are then generated without partition key joins.
+
+    An equality ``t1.bucket = t2.bucket`` that the query does not contain would drop pairs across a bucket
+    boundary, which no dilation can bring back. Population must use the same setting (``skip_partition_key_joins``),
+    or the variant hashes differ.
+    """
+    return temporal_bucket_width is not None or dilation_buckets is not None
 
 
 def _intersect_dilated_fallback(
@@ -55,6 +80,9 @@ def _intersect_dilated_fallback(
     sound: dilating the intersection instead would be unsound, since the undilated
     intersection may already be empty.
     """
+    if cache_handler.get_datatype(partition_key) != "integer":
+        logger.warning(f"Temporal dilation needs an integer partition key; '{partition_key}' is not, the query runs without the cache")
+        return None, 0
     existing = cache_handler.filter_existing_keys(hashes, partition_key)
     if not existing:
         return None, 0
@@ -78,7 +106,7 @@ def get_partition_keys(
     follow_graph: bool = True,
     auto_detect_partition_join: bool = True,
     partition_join_table: str | None = None,
-    bucket_steps: float = 1.0,
+    bucket_steps: float | dict[str, float] | list = 1.0,
     add_constraints: dict[str, str] | None = None,
     remove_constraints_all: list[str] | None = None,
     remove_constraints_add: list[str] | None = None,
@@ -88,7 +116,9 @@ def get_partition_keys(
     protected_patterns: list[str] | None = None,
     temporal_bucket_width: float | None = None,
     dilation_buckets: int | None = None,
+    temporal_column: str | None = None,
     partition_key_source_table: str | None = None,
+    keep_all_attributes: bool = False,
     **kwargs: Any,
 ) -> tuple[set[int] | set[str] | set[float] | set[datetime] | None, int, int]:
     """
@@ -107,6 +137,16 @@ def get_partition_keys(
         remove_constraints_all: List of attribute names to remove from all query variants
         remove_constraints_add: List of attribute names to remove, creating additional variants
         protected_patterns: Conditions matching these patterns are never removed during variant generation.
+        temporal_bucket_width: Width of one bucket of a time-bucket partition key, in the unit of ``temporal_column``;
+            enables temporal dilation: each cached set is widened by ceil(window / width) buckets before the
+            intersection, with the window read from the query's conditions on ``temporal_column``.
+        dilation_buckets: Number of buckets to widen by, instead of the window (0 turns dilation off).
+        temporal_column: The time column the partition key buckets; required with ``temporal_bucket_width``.
+            With either temporal parameter, variants are generated without partition key joins, and a query
+            whose rows are not bounded in time against each other runs without the cache.
+        keep_all_attributes: If False (default), lookup also probes variants with single-table attribute
+            conditions removed (more hits, more variant-generation cost). True probes exactly the variants
+            that generate_all_query_hash_pairs produces with its defaults.
 
     Returns:
        tuple containing:
@@ -123,6 +163,13 @@ def get_partition_keys(
     if "auto_detect_partition_join" in deprecated:
         auto_detect_partition_join = deprecated["auto_detect_partition_join"]
 
+    dilation = _resolve_dilation(query, temporal_bucket_width, dilation_buckets, temporal_column, partition_key, partition_key_source_table)
+    if dilation is None:
+        logger.warning(f"Rows of the query are not bounded in time against each other on '{temporal_column}'; the query runs without the cache")
+        return None, 0, 0
+    if _is_temporal(temporal_bucket_width, dilation_buckets):
+        skip_partition_key_joins = True
+
     # Generate all hashes for the given query (Only consider subqueries with two ore more components that are connected, allow modifying attributes)
     cache_entry_hashes = generate_all_hashes(
         partition_key_source_table=partition_key_source_table,
@@ -130,7 +177,7 @@ def get_partition_keys(
         partition_key=partition_key,
         min_component_size=min_component_size,
         follow_graph=follow_graph,
-        fix_attributes=False,
+        fix_attributes=keep_all_attributes,
         canonicalize_queries=canonicalize_queries,
         auto_detect_partition_join=auto_detect_partition_join,
         partition_join_table=partition_join_table,
@@ -147,7 +194,6 @@ def get_partition_keys(
     logger.info(f"Found {len(cache_entry_hashes)} subqueries in query")
 
     # Get the partition keys from the cache based on the hashes
-    dilation = _resolve_dilation(query, temporal_bucket_width, dilation_buckets)
     if dilation > 0:
         # Temporal dilation: each cached bucket set is widened before intersection so that a
         # correlated pair spanning two adjacent buckets is not silently dropped.
@@ -172,7 +218,7 @@ def get_partition_keys_lazy(
     follow_graph: bool = True,
     auto_detect_partition_join: bool = True,
     partition_join_table: str | None = None,
-    bucket_steps: float = 1.0,
+    bucket_steps: float | dict[str, float] | list = 1.0,
     add_constraints: dict[str, str] | None = None,
     remove_constraints_all: list[str] | None = None,
     remove_constraints_add: list[str] | None = None,
@@ -182,7 +228,9 @@ def get_partition_keys_lazy(
     protected_patterns: list[str] | None = None,
     temporal_bucket_width: float | None = None,
     dilation_buckets: int | None = None,
+    temporal_column: str | None = None,
     partition_key_source_table: str | None = None,
+    keep_all_attributes: bool = False,
     **kwargs: Any,
 ) -> tuple[str | None, int, int]:
     """
@@ -202,6 +250,16 @@ def get_partition_keys_lazy(
         remove_constraints_all: List of attribute names to remove from all query variants
         remove_constraints_add: List of attribute names to remove, creating additional variants
         protected_patterns: Conditions matching these patterns are never removed during variant generation.
+        temporal_bucket_width: Width of one bucket of a time-bucket partition key, in the unit of ``temporal_column``;
+            enables temporal dilation: each cached set is widened by ceil(window / width) buckets before the
+            intersection, with the window read from the query's conditions on ``temporal_column``.
+        dilation_buckets: Number of buckets to widen by, instead of the window (0 turns dilation off).
+        temporal_column: The time column the partition key buckets; required with ``temporal_bucket_width``.
+            With either temporal parameter, variants are generated without partition key joins, and a query
+            whose rows are not bounded in time against each other runs without the cache.
+        keep_all_attributes: If False (default), lookup also probes variants with single-table attribute
+            conditions removed (more hits, more variant-generation cost). True probes exactly the variants
+            that generate_all_query_hash_pairs produces with its defaults.
 
     Returns:
         tuple[str, int, int]: A tuple containing:
@@ -221,12 +279,27 @@ def get_partition_keys_lazy(
     if "auto_detect_partition_join" in deprecated:
         auto_detect_partition_join = deprecated["auto_detect_partition_join"]
 
+    if not isinstance(cache_handler, AbstractCacheHandler_Lazy):
+        raise ValueError("Cache handler does not support lazy intersection")
+
+    dilation = _resolve_dilation(query, temporal_bucket_width, dilation_buckets, temporal_column, partition_key, partition_key_source_table)
+    if dilation is None:
+        logger.warning(f"Rows of the query are not bounded in time against each other on '{temporal_column}'; the query runs without the cache")
+        return None, 0, 0
+    if dilation > 0 and getattr(cache_handler, "get_intersected_dilated_lazy", None) is None:
+        # The Python fallback materialises the sets and cannot produce a subquery; skipping the dilation would
+        # return too few partition keys, so the query runs without the cache
+        logger.warning(f"{type(cache_handler).__name__} has no lazy dilated intersection; the query runs without the cache (the non-lazy API supports dilation)")
+        return None, 0, 0
+    if _is_temporal(temporal_bucket_width, dilation_buckets):
+        skip_partition_key_joins = True
+
     hashes = generate_all_hashes(
         partition_key_source_table=partition_key_source_table,
         query=query,
         partition_key=partition_key,
         min_component_size=min_component_size,
-        fix_attributes=False,
+        fix_attributes=keep_all_attributes,
         canonicalize_queries=canonicalize_queries,
         follow_graph=follow_graph,
         auto_detect_partition_join=auto_detect_partition_join,
@@ -241,21 +314,8 @@ def get_partition_keys_lazy(
         protected_patterns=protected_patterns,
     )
 
-    if not isinstance(cache_handler, AbstractCacheHandler_Lazy):
-        raise ValueError("Cache handler does not support lazy intersection")
-
-    dilation = _resolve_dilation(query, temporal_bucket_width, dilation_buckets)
     if dilation > 0:
-        dilated_lazy = getattr(cache_handler, "get_intersected_dilated_lazy", None)
-        if dilated_lazy is None:
-            # The Python fallback materialises the set and cannot produce a subquery, so the
-            # lazy contract cannot be met. Fail loudly instead of silently skipping dilation,
-            # which would return an unsound (too small) candidate set.
-            raise ValueError(
-                f"Cache handler {cache_handler!r} does not support dilated lazy intersection "
-                "(missing get_intersected_dilated_lazy); use the non-lazy API for temporal dilation"
-            )
-        lazy_cache_subquery, used_hashes = dilated_lazy(set(hashes), partition_key, dilation)
+        lazy_cache_subquery, used_hashes = cache_handler.get_intersected_dilated_lazy(set(hashes), partition_key, dilation)  # type: ignore[attr-defined]
     else:
         lazy_cache_subquery, used_hashes = cache_handler.get_intersected_lazy(set(hashes), partition_key=partition_key)
 
@@ -667,6 +727,37 @@ def _create_tmp_table_setup_from_subquery(
     return setup_sql, table_name
 
 
+def _all_partition_keys_sql(parsed_query: exp.Expr, p0_alias: str | None, partition_key: str, sql_dialect: str) -> str | None:
+    """Return an SQL array of all partition keys of the tables the lazy restriction applies to.
+
+    It replaces LAZY_ALL_KEYS_PLACEHOLDER, so that a lazy intersection whose cache entries are gone at execution
+    time does not restrict the query. The restriction targets the table with alias ``p0_alias``, or with
+    TMP_TABLE_JOIN and no alias every table of the FROM and JOIN clauses. Returns None when a target is not a
+    plain table (a subquery or a CTE, whose rows a separate statement could not read).
+    """
+    targets: list[exp.Expr]
+    if p0_alias is not None:
+        targets = [table for table in parsed_query.find_all(exp.Table) if table.alias_or_name == p0_alias]
+        del targets[1:]  # the first table with that alias
+    else:
+        # The same clauses TMP_TABLE_JOIN joins the temporary table to
+        clauses: list[exp.Join | exp.From] = list(parsed_query.find_all(exp.Join))
+        from_1st = parsed_query.find(exp.From)
+        if from_1st is not None:
+            clauses.append(from_1st)
+        targets = [clause.this for clause in clauses]
+    cte_names = {cte.alias_or_name for cte in parsed_query.find_all(exp.CTE)}
+    if not targets or any(not isinstance(target, exp.Table) or target.name in cte_names for target in targets):
+        return None
+
+    sources = []
+    for target in targets:
+        table = target.copy()
+        table.set("alias", None)
+        sources.append(f"SELECT {partition_key} AS v FROM {table.sql(dialect=sql_dialect)}")
+    return f"(SELECT array_agg(DISTINCT pcache_all_keys.v) FROM ({' UNION ALL '.join(sources)}) AS pcache_all_keys WHERE pcache_all_keys.v IS NOT NULL)"
+
+
 def extend_query_with_partition_keys_lazy(
     query: str,
     lazy_subquery: str,
@@ -707,6 +798,17 @@ def extend_query_with_partition_keys_lazy(
         p0_alias = find_p0_alias(query, partition_key, auto_detect_partition_join, partition_join_table)
 
     parsed_query = sqlglot.parse_one(query, read=sql_dialect)
+
+    if LAZY_ALL_KEYS_PLACEHOLDER in lazy_subquery:
+        # The handler's subquery reads cache entries that may be evicted before it runs; it then falls back to all keys
+        all_keys = _all_partition_keys_sql(parsed_query, p0_alias, partition_key, sql_dialect)
+        if all_keys is None:
+            logger.debug(
+                f"The cache restriction targets no plain table (alias {p0_alias!r}); if its cache entries are evicted before the query runs, "
+                "the query returns no rows"
+            )
+        else:
+            lazy_subquery = lazy_subquery.replace(LAZY_ALL_KEYS_PLACEHOLDER, all_keys)
 
     if method == "IN_SUBQUERY":
         partition_expr = sqlglot.parse_one(f"{p0_alias}.{partition_key} IN ({lazy_subquery})", read=sql_dialect)
@@ -1399,6 +1501,34 @@ def _check_cost_gate(query: str, cost_estimator: Callable[[str], float | None] |
     return gated, {"cost_gated": int(gated), "query_cost": round(cost)}
 
 
+# ParamSpec instead of PEP 695 type parameters: the package supports Python 3.11
+_P = ParamSpec("_P")
+
+
+def _runs_uncached_on_sql_errors(func: Callable[_P, tuple[str, dict[str, int]]]) -> Callable[_P, tuple[str, dict[str, int]]]:
+    """Return the query unchanged when the cache cannot process its SQL, instead of failing the query.
+
+    The cache is an optimization: SQL that the variant generation or the rewrite cannot parse or handle makes the
+    query run without the cache, with a warning and ``sql_error: 1`` in the statistics. This covers sqlglot errors,
+    RecursionError (very deeply nested SQL, e.g. thousands of conjuncts) and IndexError (SQL shapes the variant
+    generator does not expect, e.g. no FROM clause). Configuration errors (ValueError, e.g. a handler without lazy
+    support) and errors of the cache backend still raise.
+    """
+
+    @functools.wraps(func)
+    def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> tuple[str, dict[str, int]]:
+        try:
+            return func(*args, **kwargs)
+        except (sqlglot.errors.SqlglotError, RecursionError, IndexError) as e:
+            query = kwargs["query"] if "query" in kwargs else args[0]
+            first_line = str(e).splitlines()[0] if str(e) else ""
+            logger.warning(f"{func.__name__}: the query cannot be processed ({type(e).__name__}: {first_line}); it runs without the cache")
+            return str(query), {"generated_variants": 0, "cache_hits": 0, "enhanced": 0, "p0_rewritten": 0, "sql_error": 1}
+
+    return wrapper
+
+
+@_runs_uncached_on_sql_errors
 def apply_cache_lazy(
     query: str,
     cache_handler: AbstractCacheHandler_Lazy,
@@ -1413,7 +1543,7 @@ def apply_cache_lazy(
     p0_table_name: str | None = None,
     auto_detect_partition_join: bool = True,
     partition_join_table: str | None = None,
-    bucket_steps: float = 1.0,
+    bucket_steps: float | dict[str, float] | list = 1.0,
     add_constraints: dict[str, str] | None = None,
     remove_constraints_all: list[str] | None = None,
     remove_constraints_add: list[str] | None = None,
@@ -1426,10 +1556,12 @@ def apply_cache_lazy(
     protected_patterns: list[str] | None = None,
     temporal_bucket_width: float | None = None,
     dilation_buckets: int | None = None,
+    temporal_column: str | None = None,
     sql_dialect: str = "postgres",
     partition_key_source_table: str | None = None,
     cost_estimator: Callable[[str], float | None] | None = None,
     min_query_cost: float | None = None,
+    keep_all_attributes: bool = False,
     **kwargs: Any,
 ) -> tuple[str, dict[str, int]]:
     """
@@ -1455,6 +1587,16 @@ def apply_cache_lazy(
         remove_constraints_all: List of attribute names to remove from all query variants
         remove_constraints_add: List of attribute names to remove, creating additional variants
         protected_patterns: Conditions matching these patterns are never removed during variant generation.
+        temporal_bucket_width: Width of one bucket of a time-bucket partition key, in the unit of ``temporal_column``;
+            enables temporal dilation: each cached set is widened by ceil(window / width) buckets before the
+            intersection, with the window read from the query's conditions on ``temporal_column``.
+        dilation_buckets: Number of buckets to widen by, instead of the window (0 turns dilation off).
+        temporal_column: The time column the partition key buckets; required with ``temporal_bucket_width``.
+            With either temporal parameter, variants are generated without partition key joins, and a query
+            whose rows are not bounded in time against each other runs without the cache.
+        keep_all_attributes: If False (default), lookup also probes variants with single-table attribute
+            conditions removed (more hits, more variant-generation cost). True probes exactly the variants
+            that generate_all_query_hash_pairs produces with its defaults.
         sql_dialect: sqlglot dialect used to parse and render non-spatial queries. Defaults to PostgreSQL.
         geometry_column: If set, enables spatial cache mode. Uses this geometry column for variant
             SELECT clauses and spatial filter application. Requires a spatial cache handler with
@@ -1501,7 +1643,7 @@ def apply_cache_lazy(
             query=query,
             partition_key=partition_key,
             min_component_size=min_component_size,
-            fix_attributes=False,
+            fix_attributes=keep_all_attributes,
             canonicalize_queries=canonicalize_queries,
             follow_graph=follow_graph,
             auto_detect_partition_join=False,
@@ -1622,11 +1764,21 @@ def apply_cache_lazy(
         protected_patterns=protected_patterns,
         temporal_bucket_width=temporal_bucket_width,
         dilation_buckets=dilation_buckets,
+        temporal_column=temporal_column,
+        keep_all_attributes=keep_all_attributes,
+        # Only temporal lookups use it here, so that other lookups keep the variants they had
+        partition_key_source_table=partition_key_source_table if _is_temporal(temporal_bucket_width, dilation_buckets) else None,
     )
 
     # Step 2: Optionally rewrite with p0 table
     working_query = query
     p0_rewritten = 0
+    if use_p0_table and _is_temporal(temporal_bucket_width, dilation_buckets):
+        # The p0 rewrite joins every alias on the partition key (alias.w = p0.w), which drops the pairs across a bucket
+        # boundary that temporal dilation keeps; restrict the anchor alias instead (p0_alias names the p0 table here)
+        logger.warning("use_p0_table is ignored for a temporal partition key: it would put all aliases into the same bucket")
+        use_p0_table = False
+        p0_alias = None
     if use_p0_table:
         p0_table_alias = p0_alias if p0_alias else "p0"
         working_query = rewrite_query_with_p0_table(
@@ -1667,6 +1819,7 @@ def apply_cache_lazy(
     return enhanced_query, stats
 
 
+@_runs_uncached_on_sql_errors
 def apply_cache(
     query: str,
     cache_handler: AbstractCacheHandler,
@@ -1681,7 +1834,7 @@ def apply_cache(
     p0_table_name: str | None = None,
     auto_detect_partition_join: bool = True,
     partition_join_table: str | None = None,
-    bucket_steps: float = 1.0,
+    bucket_steps: float | dict[str, float] | list = 1.0,
     add_constraints: dict[str, str] | None = None,
     remove_constraints_all: list[str] | None = None,
     remove_constraints_add: list[str] | None = None,
@@ -1692,9 +1845,11 @@ def apply_cache(
     subdivide_max_vertices: int = 256,
     temporal_bucket_width: float | None = None,
     dilation_buckets: int | None = None,
+    temporal_column: str | None = None,
     partition_key_source_table: str | None = None,
     cost_estimator: Callable[[str], float | None] | None = None,
     min_query_cost: float | None = None,
+    keep_all_attributes: bool = False,
     **kwargs: Any,
 ) -> tuple[str, dict[str, int]]:
     """
@@ -1730,6 +1885,16 @@ def apply_cache(
         remove_constraints_all: List of attribute names to remove from all query variants
         remove_constraints_add: List of attribute names to remove, creating additional variants
         skip_partition_key_joins (bool): If True, skip partition key joins in variant generation.
+        temporal_bucket_width: Width of one bucket of a time-bucket partition key, in the unit of ``temporal_column``;
+            enables temporal dilation: each cached set is widened by ceil(window / width) buckets before the
+            intersection, with the window read from the query's conditions on ``temporal_column``.
+        dilation_buckets: Number of buckets to widen by, instead of the window (0 turns dilation off).
+        temporal_column: The time column the partition key buckets; required with ``temporal_bucket_width``.
+            With either temporal parameter, variants are generated without partition key joins, and a query
+            whose rows are not bounded in time against each other runs without the cache.
+        keep_all_attributes: If False (default), lookup also probes variants with single-table attribute
+            conditions removed (more hits, more variant-generation cost). True probes exactly the variants
+            that generate_all_query_hash_pairs produces with its defaults.
         geometry_column: If set, enables spatial cache mode. Uses this geometry column for variant
             SELECT clauses and spatial filter application. Requires a spatial cache handler with
             get_spatial_filter() method.
@@ -1808,7 +1973,7 @@ def apply_cache(
             partition_key=partition_key,
             min_component_size=min_component_size,
             follow_graph=True,
-            fix_attributes=False,
+            fix_attributes=keep_all_attributes,
             canonicalize_queries=canonicalize_queries,
             auto_detect_partition_join=False,
             partition_join_table=partition_join_table,
@@ -1924,11 +2089,21 @@ def apply_cache(
         skip_partition_key_joins=skip_partition_key_joins,
         temporal_bucket_width=temporal_bucket_width,
         dilation_buckets=dilation_buckets,
+        temporal_column=temporal_column,
+        keep_all_attributes=keep_all_attributes,
+        # Only temporal lookups use it here, so that other lookups keep the variants they had
+        partition_key_source_table=partition_key_source_table if _is_temporal(temporal_bucket_width, dilation_buckets) else None,
     )
 
     # Step 2: Optionally rewrite original query with p0 table
     working_query = query
     p0_rewritten = 0
+    if use_p0_table and _is_temporal(temporal_bucket_width, dilation_buckets):
+        # The p0 rewrite joins every alias on the partition key (alias.w = p0.w), which drops the pairs across a bucket
+        # boundary that temporal dilation keeps; restrict the anchor alias instead (p0_alias names the p0 table here)
+        logger.warning("use_p0_table is ignored for a temporal partition key: it would put all aliases into the same bucket")
+        use_p0_table = False
+        p0_alias = None
     if use_p0_table:
         p0_table_alias = p0_alias if p0_alias else "p0"
         working_query = rewrite_query_with_p0_table(

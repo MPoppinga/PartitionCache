@@ -101,7 +101,7 @@ class PostgreSQLRoaringBitCacheHandler(PostgreSQLAbstractCacheHandler):
                         query_hash TEXT NOT NULL,
                         query TEXT NOT NULL,
                         partition_key TEXT NOT NULL,
-                        status TEXT NOT NULL DEFAULT 'ok' CHECK (status IN ('ok', 'timeout', 'failed')),
+                        status TEXT NOT NULL DEFAULT 'ok' CHECK (status IN ('ok', 'timeout', 'failed', 'limit')),
                         last_seen TIMESTAMP NOT NULL DEFAULT now(),
                         PRIMARY KEY (query_hash, partition_key)
                     );""").format(sql.Identifier(self.tableprefix + "_queries"))
@@ -317,21 +317,11 @@ class PostgreSQLRoaringBitCacheHandler(PostgreSQLAbstractCacheHandler):
 
         intersect_sql_str = self.get_intersected_sql_wk(filtered_keys, partition_key)
 
-        r = (
-            sql.SQL("""(
-        WITH rb_result AS (
-            {0}
-        )
-        SELECT unnest(rb_to_array(rb_result)) AS {1}
-        FROM rb_result
-        WHERE rb_result IS NOT NULL)
-        """)
-            .format(
-                sql.SQL(intersect_sql_str),  # type: ignore
-                sql.Identifier(partition_key),
-            )
-            .as_string()
-        )
+        # rb_and_agg skips missing entries and is NULL only when none is left; an empty bitmap gives '{}'
+        keys_array = sql.SQL(
+            "(SELECT CASE WHEN rb_result IS NULL THEN NULL ELSE COALESCE(rb_to_array(rb_result), '{{}}') END FROM ({0}) AS intersection)"
+        ).format(sql.SQL(intersect_sql_str))  # type: ignore[arg-type]
+        r = self._lazy_keys_subquery(keys_array, partition_key)
 
         return r, len(filtered_keys)
 

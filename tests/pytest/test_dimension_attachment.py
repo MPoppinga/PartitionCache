@@ -116,12 +116,13 @@ class TestAttachmentJoinClassification:
         assert len(pk_conditions["lo"]) == 3, f"IN subquery and BETWEEN bounds must stay pk conditions: {pk_conditions['lo']}"
         assert dict(distance_conditions) == {}
 
-    def test_fk_join_with_expression_not_reclassified(self):
+    def test_fk_join_with_expression_is_a_two_alias_condition(self):
+        """Not a partition key condition: applied to every variant, it referenced c in variants without c."""
         query = SSB_Q7_1.replace("lo.lo_custkey = c.c_custkey", "lo.lo_custkey = c.c_custkey + 1")
         _attr, distance_conditions, _other, pk_conditions, _or, _aliases, _a2t, _pk_joins = _extract(query, "lo_custkey")
 
-        assert "c" in pk_conditions or "lo" in pk_conditions, "non-plain-column equality must keep current classification"
-        assert ("c", "lo") not in distance_conditions
+        assert dict(pk_conditions) == {}
+        assert distance_conditions[("c", "lo")] == ["lo.lo_custkey = c.c_custkey + 1"]
 
 
 # ======================================================================

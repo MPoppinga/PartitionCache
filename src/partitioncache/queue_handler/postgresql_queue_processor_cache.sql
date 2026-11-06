@@ -169,7 +169,8 @@ BEGIN
             COALESCE(v_queue_item.cache_backend, p_cache_backend),
             'cron',
             p_timeout_seconds,
-            p_default_bitsize
+            p_default_bitsize,
+            p_result_limit
         );
         RAISE NOTICE 'Job processed %', dispatched_job_id;
     END;
@@ -179,7 +180,9 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- Include the complete _partitioncache_execute_job function
+-- Include the complete _partitioncache_execute_job function. The version without p_result_limit is dropped:
+-- next to the new overload, a call with eleven arguments would be ambiguous.
+DROP FUNCTION IF EXISTS _partitioncache_execute_job(INTEGER, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, INTEGER, INTEGER);
 CREATE OR REPLACE FUNCTION _partitioncache_execute_job(
     p_item_id INTEGER,
     p_query TEXT,
@@ -191,7 +194,9 @@ CREATE OR REPLACE FUNCTION _partitioncache_execute_job(
     p_cache_backend TEXT,
     p_execution_source TEXT,
     p_timeout_seconds INTEGER DEFAULT 1800,
-    p_default_bitsize INTEGER DEFAULT NULL
+    p_default_bitsize INTEGER DEFAULT NULL,
+    -- Results with at least this many partition keys are not stored; the query gets the status 'limit'
+    p_result_limit INTEGER DEFAULT NULL
 )
 RETURNS BOOLEAN AS $$
 DECLARE
@@ -262,7 +267,7 @@ BEGIN
     
     -- Use passed timeout parameter
     v_timeout_seconds := COALESCE(p_timeout_seconds, 1800);
-    v_result_limit := NULL;
+    v_result_limit := p_result_limit;
     
     BEGIN
         -- Process the item using the same logic as the background processor

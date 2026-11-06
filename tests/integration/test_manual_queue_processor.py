@@ -393,3 +393,47 @@ class TestManualProcessingIntegration:
             # the internal implementation
 
         print("Manual processing respects queue implementation order")
+
+
+class TestManualProcessingResultLimit:
+    """The configured result_limit reaches the job: large results are not stored and get the status 'limit'."""
+
+    @pytest.fixture(autouse=True)
+    def setup_manual_processing(self):
+        from partitioncache.queue import clear_all_queues, reset_queue_handler
+
+        reset_queue_handler()
+        clear_all_queues()
+        yield
+        reset_queue_handler()
+
+    def test_result_limit_from_the_processor_config(self, db_session, cache_client, manual_queue_processor):
+        import os
+
+        from partitioncache.query_processor import hash_query
+
+        config_table = manual_queue_processor["config_table"]
+        partition_key = "zipcode"
+        large = "SELECT DISTINCT t1.zipcode FROM test_result_limit_locations AS t1"
+        small = "SELECT DISTINCT t1.zipcode FROM test_result_limit_locations AS t1 WHERE t1.zipcode = 3001"
+        with db_session.cursor() as cur:
+            cur.execute("CREATE TABLE IF NOT EXISTS test_result_limit_locations (zipcode INTEGER)")
+            cur.execute("TRUNCATE test_result_limit_locations")
+            cur.execute("INSERT INTO test_result_limit_locations VALUES (3001), (3002), (3003)")
+            cur.execute(f"UPDATE {config_table} SET result_limit = 3")
+            db_session.commit()
+        try:
+            pairs = [(large, hash_query(large)), (small, hash_query(small))]
+            assert push_to_query_fragment_queue(pairs, partition_key, "integer", cache_backend=os.getenv("CACHE_BACKEND"))
+            with db_session.cursor() as cur:
+                cur.execute("SELECT * FROM partitioncache_manual_process_queue(5)")
+                db_session.commit()
+
+            assert cache_client.get_query_status(hash_query(large), partition_key) == "limit"
+            assert cache_client.get(hash_query(large), partition_key) is None
+            assert cache_client.get_query_status(hash_query(small), partition_key) == "ok"
+            assert set(cache_client.get(hash_query(small), partition_key)) == {3001}
+        finally:
+            with db_session.cursor() as cur:
+                cur.execute(f"UPDATE {config_table} SET result_limit = NULL")
+                db_session.commit()

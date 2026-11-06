@@ -60,15 +60,19 @@ class TestDilateBucketSet:
 
 class TestResolveDilation:
     QUERY = (
-        "SELECT 1 FROM auth_events AS e1, auth_events AS e2 "
+        "SELECT e1.w FROM auth_events AS e1, auth_events AS e2 "
         "WHERE e1.event_code = 4625 AND e2.event_code = 4624 "
         "AND e2.src_user_id = e1.src_user_id "
         "AND e2.ts_epoch BETWEEN e1.ts_epoch AND e1.ts_epoch + 3600"
     )
 
     def test_derived_from_query_window(self):
-        assert _resolve_dilation(self.QUERY, 3600.0, None) == 1
-        assert _resolve_dilation(self.QUERY, 900.0, None) == 4
+        assert _resolve_dilation(self.QUERY, 3600.0, None, "ts_epoch", "w") == 1
+        assert _resolve_dilation(self.QUERY, 900.0, None, "ts_epoch", "w") == 4
+
+    def test_window_needs_the_time_column(self):
+        with pytest.raises(ValueError, match="temporal_column"):
+            _resolve_dilation(self.QUERY, 3600.0, None)
 
     def test_explicit_override_wins(self):
         assert _resolve_dilation(self.QUERY, 3600.0, 7) == 7
@@ -81,8 +85,12 @@ class TestResolveDilation:
         assert _resolve_dilation(self.QUERY, None, None) == 0
 
     def test_query_without_window_needs_no_dilation(self):
-        query = "SELECT 1 FROM auth_events AS e1 WHERE e1.event_code = 4625"
-        assert _resolve_dilation(query, 3600.0, None) == 0
+        query = "SELECT e1.w FROM auth_events AS e1 WHERE e1.event_code = 4625"
+        assert _resolve_dilation(query, 3600.0, None, "ts_epoch", "w") == 0
+
+    def test_unbounded_pair_allows_no_dilation(self):
+        query = "SELECT e1.w FROM auth_events AS e1, auth_events AS e2 WHERE e2.ts_epoch <= e1.ts_epoch + 3600"
+        assert _resolve_dilation(query, 3600.0, None, "ts_epoch", "w") is None
 
     def test_negative_override_rejected(self):
         with pytest.raises(ValueError):
@@ -92,8 +100,12 @@ class TestResolveDilation:
 class _FakeHandler:
     """Minimal cache handler exposing only what the generic fallback needs."""
 
-    def __init__(self, sets: dict[str, set[int]]):
+    def __init__(self, sets: dict[str, set[int]], datatype: str = "integer"):
         self._sets = sets
+        self._datatype = datatype
+
+    def get_datatype(self, partition_key):
+        return self._datatype
 
     def filter_existing_keys(self, keys, partition_key="partition_key"):
         return {k for k in keys if k in self._sets}
@@ -148,3 +160,53 @@ class TestIntersectDilatedFallback:
         handler = Handler({"a": {10}, "b": {11}})
         result, _ = _intersect_dilated_fallback(handler, {"a", "b"}, "bucket_1h", 1)
         assert result == {9, 10, 11}
+
+    def test_non_integer_keys_run_without_the_cache(self):
+        handler = _FakeHandler({"a": {"x"}}, datatype="text")
+        assert _intersect_dilated_fallback(handler, {"a"}, "bucket_1h", 1) == (None, 0)
+
+
+class TestTemporalLookup:
+    """A temporal key gets variants without partition key joins; queries no dilation can cover run without the cache."""
+
+    QUERY = "SELECT e1.w FROM ev AS e1, ev AS e2 WHERE e1.kind = 1 AND e2.kind = 2 AND e2.ts BETWEEN e1.ts AND e1.ts + 1200"
+
+    def _handler(self, sets):
+        from unittest.mock import MagicMock
+
+        from partitioncache.cache_handler.abstract import AbstractCacheHandler_Lazy
+
+        handler = MagicMock(spec=AbstractCacheHandler_Lazy)
+        handler.get_datatype.return_value = "integer"
+        handler.filter_existing_keys.side_effect = lambda keys, partition_key="w": {k for k in keys if k in sets}
+        handler.get.side_effect = lambda key, partition_key="w": sets.get(key)
+        return handler
+
+    def test_temporal_key_uses_the_variants_without_partition_key_joins(self):
+        from partitioncache.apply_cache import get_partition_keys
+        from partitioncache.query_processor import generate_all_query_hash_pairs
+
+        pairs = generate_all_query_hash_pairs(self.QUERY, "w", min_component_size=1, skip_partition_key_joins=True, warn_no_partition_key=False)
+        assert all(" = t2.w" not in variant and "t1.w = " not in variant for variant, _ in pairs)
+        handler = self._handler({key: {10} for _, key in pairs})
+        keys, generated, hits = get_partition_keys(self.QUERY, handler, "w", min_component_size=1, temporal_bucket_width=3600, temporal_column="ts")
+        assert hits == len(pairs) == generated
+        assert keys == {9, 10, 11}
+
+    def test_unbounded_query_runs_without_the_cache(self):
+        from partitioncache.apply_cache import get_partition_keys, get_partition_keys_lazy
+
+        query = "SELECT e1.w FROM ev AS e1, ev AS e2 WHERE e1.kind = 1 AND e2.ts <= e1.ts + 1200"
+        handler = self._handler({})
+        assert get_partition_keys(query, handler, "w", temporal_bucket_width=3600, temporal_column="ts") == (None, 0, 0)
+        assert get_partition_keys_lazy(query, handler, "w", temporal_bucket_width=3600, temporal_column="ts") == (None, 0, 0)
+        handler.get_intersected.assert_not_called()
+        handler.get_intersected_lazy.assert_not_called()
+
+    def test_lazy_handler_without_dilated_intersection_runs_without_the_cache(self):
+        from partitioncache.apply_cache import get_partition_keys_lazy
+
+        handler = self._handler({})
+        assert not hasattr(handler, "get_intersected_dilated_lazy")
+        assert get_partition_keys_lazy(self.QUERY, handler, "w", temporal_bucket_width=3600, temporal_column="ts") == (None, 0, 0)
+        handler.get_intersected_lazy.assert_not_called()

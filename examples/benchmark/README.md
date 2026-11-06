@@ -113,7 +113,8 @@ boundary problem the spatial buffer solves: a failed logon at 23:58 and its matc
 at 00:03 fall in *adjacent* buckets, so intersecting the per-fragment bucket sets drops the
 pair.
 
-Setting `temporal_bucket_width` on a partition key enables dilation. Each cached bucket set is
+Setting `temporal_bucket_width` (with `temporal_column`, the time column the bucket is derived
+from, here `ts_epoch`) on a partition key enables dilation. Each cached bucket set is
 widened by `ceil(window / bucket_width)` buckets **before** the intersection, mirroring how
 `postgis_bbox` buffers each geometry before intersecting. Dilating afterwards is unsound,
 because the undilated intersection may already be empty.

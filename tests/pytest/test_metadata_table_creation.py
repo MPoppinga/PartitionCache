@@ -43,9 +43,10 @@ class TestMetadataTableCreation:
         #   super().__init__() -> _recreate_metadata_table() (2 calls: metadata + queries tables)
         #   _load_sql_functions() (1 call: loads SQL file content)
         #   SELECT partitioncache_setup_array_extensions() (1 call)
-        # Total: exactly 4 execute calls
-        assert mock_cursor.execute.call_count == 4, (
-            f"Expected exactly 4 execute calls (metadata table + queries table + SQL functions + array extensions), "
+        #   _allow_limit_status() (1 call: checks the queries table's status constraint)
+        # Total: exactly 5 execute calls
+        assert mock_cursor.execute.call_count == 5, (
+            f"Expected exactly 5 execute calls (metadata table + queries table + status constraint check + SQL functions + array extensions), "
             f"got {mock_cursor.execute.call_count}"
         )
 
@@ -110,9 +111,10 @@ class TestMetadataTableCreation:
         #     4. CREATE TABLE partition_metadata (with bitsize column)
         #     5. CREATE TABLE queries
         #     6. _create_bitsize_trigger() - SELECT partitioncache_create_bitsize_trigger(...)
-        # Total: exactly 6 execute calls
-        assert mock_cursor.execute.call_count == 6, (
-            f"Expected exactly 6 execute calls (advisory lock + regclass check + SQL functions + metadata table + queries table + bitsize trigger), "
+        #   _allow_limit_status() - checks the queries table's status constraint
+        # Total: exactly 7 execute calls
+        assert mock_cursor.execute.call_count == 7, (
+            f"Expected exactly 7 execute calls (advisory lock + regclass check + SQL functions + metadata table + queries table + bitsize trigger + status constraint check), "
             f"got {mock_cursor.execute.call_count}"
         )
 
@@ -178,11 +180,13 @@ class TestMetadataTableCreation:
         #     2. _load_sql_functions() - loads SQL file content
         #     3. CREATE TABLE partition_metadata (integer-only constraint)
         #     4. CREATE TABLE queries
+        #   _allow_limit_status():
+        #     5. checks the queries table's status constraint
         #   Then in __init__():
-        #     5. CREATE EXTENSION IF NOT EXISTS roaringbitmap
-        # Total: exactly 5 execute calls
-        assert mock_cursor.execute.call_count == 5, (
-            f"Expected exactly 5 execute calls (advisory lock + SQL functions + metadata table + queries table + roaringbitmap extension), "
+        #     6. CREATE EXTENSION IF NOT EXISTS roaringbitmap
+        # Total: exactly 6 execute calls
+        assert mock_cursor.execute.call_count == 6, (
+            f"Expected exactly 6 execute calls (advisory lock + SQL functions + metadata table + queries table + status constraint check + roaringbitmap extension), "
             f"got {mock_cursor.execute.call_count}"
         )
 
@@ -205,9 +209,10 @@ class TestMetadataTableCreation:
             f"Fourth execute call should create queries table, got: {str(execute_calls[3])}"
         )
 
-        # Call 4: CREATE EXTENSION roaringbitmap
-        assert "roaringbitmap" in str(execute_calls[4]), (
-            f"Fifth execute call should create roaringbitmap extension, got: {str(execute_calls[4])}"
+        # Call 4: status constraint check; call 5: CREATE EXTENSION roaringbitmap
+        assert "pg_constraint" in str(execute_calls[4])
+        assert "roaringbitmap" in str(execute_calls[5]), (
+            f"Sixth execute call should create roaringbitmap extension, got: {str(execute_calls[5])}"
         )
 
         # Look for the specific roaringbit metadata table creation, not the general SQL function

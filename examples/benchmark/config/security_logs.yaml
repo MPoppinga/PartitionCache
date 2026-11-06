@@ -27,12 +27,16 @@ partition_keys:
   # Temporal keys. temporal_bucket_width enables dilation: each cached bucket set is widened
   # by ceil(window / bucket_width) before intersection, so a correlated pair spanning two
   # adjacent buckets is not dropped. This is the 1-D counterpart of the spatial buffer.
+  # temporal_column is the time column the bucket is derived from; only conditions on it
+  # count as the window.
   bucket_1h:
     datatype: integer
     temporal_bucket_width: 3600
+    temporal_column: ts_epoch
   bucket_1d:
     datatype: integer
     temporal_bucket_width: 86400
+    temporal_column: ts_epoch
 
 query_partition_keys:
   user_q1: [src_user_id]

@@ -12,7 +12,7 @@ import psycopg
 from psycopg import sql
 from psycopg.pq import TransactionStatus
 
-from partitioncache.cache_handler.abstract import AbstractCacheHandler_Lazy
+from partitioncache.cache_handler.abstract import LAZY_ALL_KEYS_PLACEHOLDER, AbstractCacheHandler_Lazy
 
 logger = getLogger("PartitionCache")
 
@@ -20,7 +20,7 @@ P = ParamSpec("P")
 R = TypeVar("R")
 
 
-def _ends_read_transaction(fn: Callable[P, R]) -> Callable[P, R]:  # noqa: UP047 -- PEP 695 syntax needs Python 3.12, package supports 3.10
+def _ends_read_transaction(fn: Callable[P, R]) -> Callable[P, R]:  # ParamSpec instead of PEP 695 type parameters: the package supports Python 3.11
     """Mark a read-only handler method so it leaves the connection idle. See _read_txn."""
 
     @wraps(fn)
@@ -65,6 +65,7 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
 
         # Create metadata tables with supported datatypes
         self._recreate_metadata_table(self.get_supported_datatypes())
+        self._allow_limit_status()
         logger.info(f"CACHE_HANDLER {self.__class__.__name__}: Initialization complete for tableprefix={db_tableprefix}")
 
     def _recreate_metadata_table(self, supported_datatypes: set[str]) -> None:
@@ -94,7 +95,7 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
                     query_hash TEXT NOT NULL,
                     query TEXT NOT NULL,
                     partition_key TEXT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'ok' CHECK (status IN ('ok', 'timeout', 'failed')),
+                    status TEXT NOT NULL DEFAULT 'ok' CHECK (status IN ('ok', 'timeout', 'failed', 'limit')),
                     last_seen TIMESTAMP NOT NULL DEFAULT now(),
                     PRIMARY KEY (query_hash, partition_key)
                 );""").format(sql.Identifier(self.tableprefix + "_queries"))
@@ -108,6 +109,48 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
             except Exception as rollback_error:
                 logger.error(f"Failed to rollback after metadata table creation error: {rollback_error}")
             raise
+
+    def _allow_limit_status(self) -> None:
+        """Extend the status CHECK of a queries table created before the 'limit' status existed.
+
+        Without it the queue processor's result limit could not record 'limit'; the job failed on the
+        constraint instead. Runs the ALTER only when the constraint lacks 'limit'. The new constraint is added
+        NOT VALID, which needs the exclusive lock only briefly and scans nothing, and validated separately under
+        a lock that blocks neither reads nor writes. A lock_timeout keeps a busy table (e.g. a running job) from
+        stalling every reader behind the waiting ALTER. A failure (timeout, a user without ALTER rights) is
+        logged and leaves the table as it is; the next handler start tries again.
+        """
+        table = self.tableprefix + "_queries"
+        find_constraint = (
+            "SELECT conname FROM pg_constraint WHERE conrelid = to_regclass(quote_ident(%s)) AND contype = 'c' "
+            "AND pg_get_constraintdef(oid) LIKE '%%status%%' AND pg_get_constraintdef(oid) NOT LIKE '%%''limit''%%'"
+        )
+        try:
+            self.cursor.execute(find_constraint, (table,))
+            outdated = list(self.cursor.fetchall())
+            self.db.commit()
+            if not outdated:
+                return
+            with self._serialized_ddl():
+                self.cursor.execute("SET LOCAL lock_timeout = '2s'")
+                self.cursor.execute(find_constraint, (table,))
+                names = [name for (name,) in list(self.cursor.fetchall())]
+                for name in names:
+                    self.cursor.execute(
+                        sql.SQL(
+                            "ALTER TABLE {0} DROP CONSTRAINT {1}, ADD CONSTRAINT {1} CHECK (status IN ('ok', 'timeout', 'failed', 'limit')) NOT VALID"
+                        ).format(sql.Identifier(table), sql.Identifier(name))
+                    )
+            self.db.commit()
+            # The new set contains the old one, so validation cannot fail; it only marks the constraint validated
+            self.cursor.execute("SET LOCAL lock_timeout = '2s'")
+            for name in names:
+                self.cursor.execute(sql.SQL("ALTER TABLE {0} VALIDATE CONSTRAINT {1}").format(sql.Identifier(table), sql.Identifier(name)))
+            self.db.commit()
+            logger.info(f"METADATA: {table} now accepts the status 'limit'")
+        except Exception as e:
+            logger.warning(f"METADATA: could not extend the status constraint of {table} to 'limit': {e}")
+            self.db.rollback()
 
     @contextmanager
     def _serialized_ddl(self):
@@ -437,6 +480,27 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
         result = self.cursor.fetchone()
         return result is not None
 
+    @staticmethod
+    def _lazy_keys_subquery(keys_array: sql.Composable, partition_key: str) -> str:
+        """Return the lazy intersection subquery for a scalar SQL array of partition keys.
+
+        ``keys_array`` must be ``'{}'`` for an empty intersection (no partition can match) and NULL when the cache
+        entries it reads are gone at execution time, e.g. evicted after filter_existing_keys found them. Then
+        LAZY_ALL_KEYS_PLACEHOLDER applies, which extend_query_with_partition_keys_lazy replaces with all keys of the
+        restricted table, so the restriction falls away instead of emptying the result.
+        """
+        return (
+            sql.SQL("SELECT unnest(COALESCE({keys_array}, {all_keys})) AS {partition_col}")
+            .format(keys_array=keys_array, all_keys=sql.SQL(LAZY_ALL_KEYS_PLACEHOLDER), partition_col=sql.Identifier(partition_key))
+            .as_string()
+        )
+
+    def _all_entries_present_sql(self, keys: set[str], partition_key: str) -> sql.Composed:
+        """Return an SQL condition that is true while every one of ``keys`` still has a non-NULL cache entry."""
+        return sql.SQL("((SELECT count(*) FROM {table} WHERE query_hash = ANY({keys}) AND partition_keys IS NOT NULL) = {count})").format(
+            table=sql.Identifier(f"{self.tableprefix}_cache_{partition_key}"), keys=sql.Literal(sorted(keys)), count=sql.Literal(len(keys))
+        )
+
     @_ends_read_transaction
     def filter_existing_keys(self, keys: set, partition_key: str = "partition_key", check_query: bool = False) -> set:
         """Return the set of keys that exist in the partition-specific cache."""
@@ -620,26 +684,32 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
             raise ValueError(f"Handler supports only {self.get_supported_datatypes()} datatypes, got: {datatype}")
         self._ensure_partition_table(partition_key, datatype, **kwargs)
 
-    def set_query_status(self, key: str, partition_key: str = "partition_key", status: str = "ok") -> bool:
-        """Set the status of a query in the queries table."""
+    def set_query_status(self, key: str, partition_key: str = "partition_key", status: str = "ok", query: str | None = None) -> bool:
+        """Set the status of a query in the queries table.
+
+        With ``query`` the row is inserted when it does not exist yet (as the PostgreSQL queue processor does),
+        so a query that never produced a cache entry still gets its status. Without it only an existing row is updated.
+        """
         try:
             # Valid statuses based on the CHECK constraint
-            valid_statuses = {"ok", "timeout", "failed"}
+            valid_statuses = {"ok", "timeout", "failed", "limit"}
             if status not in valid_statuses:
                 raise ValueError(f"Invalid status '{status}'. Must be one of: {valid_statuses}")
 
-            query_sql = sql.SQL("UPDATE {0} SET status = %s, last_seen = now() WHERE query_hash = %s AND partition_key = %s").format(
-                sql.Identifier(self.tableprefix + "_queries")
-            )
-
-            self.cursor.execute(query_sql, (status, key, partition_key))
-            rows_affected = self.cursor.rowcount
-
-            if rows_affected == 0:
-                # Query doesn't exist in queries table, try to insert it with the status
-                # This handles cases where set_query_status is called before set_query
-                logger.warning(f"Query {key} not found in queries table, cannot set status to {status}")
-                return False
+            table = sql.Identifier(self.tableprefix + "_queries")
+            if query is not None:
+                query_sql = sql.SQL(
+                    "INSERT INTO {0} (query_hash, partition_key, query, status, last_seen) VALUES (%s, %s, %s, %s, now()) "
+                    "ON CONFLICT (query_hash, partition_key) DO UPDATE SET status = EXCLUDED.status, last_seen = now()"
+                ).format(table)
+                self.cursor.execute(query_sql, (key, partition_key, query, status))
+            else:
+                query_sql = sql.SQL("UPDATE {0} SET status = %s, last_seen = now() WHERE query_hash = %s AND partition_key = %s").format(table)
+                self.cursor.execute(query_sql, (status, key, partition_key))
+                if self.cursor.rowcount == 0:
+                    # Without the query text there is no row to insert (query is NOT NULL)
+                    logger.warning(f"Query {key} not found in queries table, cannot set status to {status}")
+                    return False
 
             self.db.commit()
             return True

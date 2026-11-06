@@ -692,7 +692,10 @@ def _apply_temporal_settings(kwargs: dict, pk_config: dict) -> None:
     width = pk_config.get("temporal_bucket_width")
     if not width:
         return
+    if not pk_config.get("temporal_column"):
+        raise ValueError("temporal_bucket_width needs temporal_column (the time column the bucket is derived from) in the partition key config")
     kwargs["temporal_bucket_width"] = float(width)
+    kwargs["temporal_column"] = pk_config["temporal_column"]
     if DILATION_DISABLED:
         kwargs["dilation_buckets"] = 0
 

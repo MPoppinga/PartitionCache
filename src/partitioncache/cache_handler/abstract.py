@@ -4,6 +4,13 @@ from logging import getLogger
 
 logger = getLogger("PartitionCache")
 
+# Stands in for "every partition key" in a lazy intersection subquery: a handler writes
+# ``COALESCE(<keys array>, LAZY_ALL_KEYS_PLACEHOLDER)`` where the keys array is NULL when the cache
+# entries it was built from no longer exist (e.g. evicted between the lookup and the execution).
+# extend_query_with_partition_keys_lazy replaces it with all keys of the restricted table, so the
+# restriction then falls away. Used unreplaced it is a plain NULL, which keeps the old result.
+LAZY_ALL_KEYS_PLACEHOLDER = "/* partitioncache: all partition keys */ NULL"
+
 
 class AbstractCacheHandler(ABC):
     """
@@ -287,14 +294,18 @@ class AbstractCacheHandler(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def set_query_status(self, key: str, partition_key: str = "partition_key", status: str = "ok") -> bool:
+    def set_query_status(self, key: str, partition_key: str = "partition_key", status: str = "ok", query: str | None = None) -> bool:
         """
         Set the status of a query in the cache.
 
         Args:
             key (str): The query hash to set status for.
             partition_key (str, optional): The partition key. Defaults to "partition_key".
-            status (str, optional): The status to set ('ok', 'timeout', 'failed'). Defaults to "ok".
+            status (str, optional): The status to set: 'ok', 'timeout', 'failed', or 'limit' (the result
+                exceeded the configured result limit and was not stored). Defaults to "ok".
+            query (str | None, optional): The query text. Handlers that keep the status in a queries table row
+                insert the row with this text when the query has none yet; without it only an existing row is
+                updated. Handlers that store the status separately ignore it. Defaults to None.
 
         Returns:
             bool: True if the operation was successful, False otherwise.
@@ -311,7 +322,7 @@ class AbstractCacheHandler(ABC):
             partition_key (str, optional): The partition key. Defaults to "partition_key".
 
         Returns:
-            str | None: The status ('ok', 'timeout', 'failed') or None if not found.
+            str | None: The status ('ok', 'timeout', 'failed', 'limit') or None if not found.
         """
         raise NotImplementedError
 

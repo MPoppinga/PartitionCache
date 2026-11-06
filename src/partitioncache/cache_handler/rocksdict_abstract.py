@@ -262,10 +262,10 @@ class RocksDictAbstractCacheHandler(AbstractCacheHandler):
         """Get the datatype of the cache handler. If the partition key is not set, return None."""
         return self._get_partition_datatype(partition_key)
 
-    def set_query_status(self, key: str, partition_key: str = "partition_key", status: str = "ok") -> bool:
+    def set_query_status(self, key: str, partition_key: str = "partition_key", status: str = "ok", query: str | None = None) -> bool:
         """Set the status of a query using termination bits for RocksDict backend."""
         try:
-            valid_statuses = {"ok", "timeout", "failed"}
+            valid_statuses = {"ok", "timeout", "failed", "limit"}
             if status not in valid_statuses:
                 raise ValueError(f"Invalid status '{status}'. Must be one of: {valid_statuses}")
 
@@ -283,14 +283,15 @@ class RocksDictAbstractCacheHandler(AbstractCacheHandler):
                     query_data["status"] = "ok"
                     query_data["last_seen"] = datetime.now().isoformat()
                     self.db[query_key] = query_data
-            elif status == "failed":
-                self.db[limit_key] = "NULL"
+            elif status in ("failed", "limit"):
+                # Termination marker: "limit" for a result over the result limit, "NULL" (historically) for failed
+                self.db[limit_key] = "limit" if status == "limit" else "NULL"
                 if timeout_key in self.db:
                     del self.db[timeout_key]
                 query_key = f"query:{partition_key}:{key}"
                 query_data = self.db.get(query_key)
                 if query_data and isinstance(query_data, dict):
-                    query_data["status"] = "failed"
+                    query_data["status"] = status
                     query_data["last_seen"] = datetime.now().isoformat()
                     self.db[query_key] = query_data
             elif status == "timeout":
@@ -316,7 +317,7 @@ class RocksDictAbstractCacheHandler(AbstractCacheHandler):
             timeout_key = self._get_cache_key(f"_TIMEOUT_{key}", partition_key)
 
             if limit_key in self.db:
-                return "failed"
+                return "limit" if self.db[limit_key] == "limit" else "failed"
             elif timeout_key in self.db:
                 return "timeout"
 

@@ -250,10 +250,20 @@ pcache-add [options] --partition-key PARTITION_KEY {--direct|--queue|--queue-ori
 Advanced options for controlling how query variants are generated for better cache coverage:
 
 #### Distance Normalization
-- `--bucket-steps FLOAT` - Step size for normalizing distance conditions
+- `--bucket-steps STEPS` - Step size for normalizing distance conditions (number, JSON dict or JSON list)
   - **Default**: `1.0` (or `PARTITION_CACHE_BUCKET_STEPS` environment variable)
   - **Purpose**: Controls bucketing of distance ranges for better cache hits
   - **Example**: With `--bucket-steps 0.5`, distance `BETWEEN 1.6 AND 3.6` becomes `BETWEEN 1.5 AND 4.0`
+  - The radius of `ST_DWithin`/`ST_DFullyWithin` is rounded up the same way: with `--bucket-steps 50`, `ST_DWithin(a.geom, b.geom, 120)` becomes `ST_DWithin(a.geom, b.geom, 150)`
+  - **Per attribute**: a JSON dict `{pattern: step}` buckets every numeric comparison whose expression contains the pattern, also plain columns and negative bounds: `--bucket-steps '{"alt_max": 500, "vrate": 1}'` turns `alt_max <= 650` into `alt_max <= 1000` and `vrate <= -1.5` into `vrate <= -1`
+  - **Levels**: a JSON list adds one bucketed variant set per entry, e.g. `--bucket-steps '[{"alt_max": 500}, {"alt_max": 2000}]'`
+  - Lookups must use the same `bucket_steps`, or the bucketed variants are never hit
+  - Choose the step in the unit of the distances: with geometries in degrees (SRID 4326) the default `1.0` turns `ST_DWithin(a.geom, b.geom, 0.001)` into a radius of 1, a variant that is expensive to fill and hardly filters
+
+#### Partition Key Joins
+- `--skip-partition-key-joins KEYS` - Comma-separated partition keys whose variants get no equality on the partition key between tables
+  - **Default**: none (or `PARTITION_CACHE_SKIP_PARTITION_KEY_JOINS`); geometry keys always skip it
+  - **Purpose**: Time-bucket keys used with temporal dilation; lookups skip these joins for them, so population must too or the hashes differ (see the API reference, "Temporal dilation")
 
 #### Constraint Modification
 - `--add-constraints JSON` - Add constraints to specific tables
@@ -504,6 +514,8 @@ pcache-monitor [options]
 ### Output Control
 - `--limit LIMIT` - Limit number of returned partition keys per query
   - **Purpose**: Control memory usage for large result sets
+  - A result with at least LIMIT partition keys is not stored; the variant gets the status `limit` and is not run again (unless `--force-recalculate`)
+  - With `--limit`, lazy insertion is not used, because it stores results without counting them (spatial datatypes, which need lazy insertion, are populated without the limit)
 - `--status-log-interval STATUS_LOG_INTERVAL` - Status logging interval when idle
   - **Default**: 10 seconds
   - **Purpose**: Reduce log noise during quiet periods
@@ -557,8 +569,13 @@ Cache-aware optimization leverages existing cache entries to restrict the search
 Controls how query variants are generated when processing original queries from the queue:
 
 #### Distance Normalization
-- `--bucket-steps FLOAT` - Step size for normalizing distance conditions
+- `--bucket-steps STEPS` - Step size for normalizing distance conditions (number, JSON dict or JSON list)
   - **Default**: `1.0` (or `PARTITION_CACHE_BUCKET_STEPS` environment variable)
+
+#### Partition Key Joins
+- `--skip-partition-key-joins KEYS` - Comma-separated partition keys whose variants get no equality on the partition key between tables
+  - **Default**: none (or `PARTITION_CACHE_SKIP_PARTITION_KEY_JOINS`); geometry keys always skip it
+  - **Purpose**: Time-bucket keys used with temporal dilation; lookups skip these joins for them, so population must too or the hashes differ (see the API reference, "Temporal dilation")
 
 #### Constraint Modification
 - `--add-constraints JSON` - Add constraints to specific tables

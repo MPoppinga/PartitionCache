@@ -152,7 +152,7 @@ class DuckDBBitCacheHandler(AbstractCacheHandler_Lazy):
                     query_hash TEXT NOT NULL,
                     query TEXT NOT NULL,
                     partition_key TEXT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'ok' CHECK (status IN ('ok', 'timeout', 'failed')),
+                    status TEXT NOT NULL DEFAULT 'ok' CHECK (status IN ('ok', 'timeout', 'failed', 'limit')),
                     last_seen TIMESTAMP DEFAULT now(),
                     PRIMARY KEY (query_hash, partition_key)
                 )
@@ -797,8 +797,8 @@ class DuckDBBitCacheHandler(AbstractCacheHandler_Lazy):
                 status = self.get_query_status(key, partition_key)
                 if status is None:
                     return False
-                if status in ("timeout", "failed"):
-                    return True  # Don't check cache for failed queries
+                if status in ("timeout", "failed", "limit"):
+                    return True  # Don't check cache for failed or over-limit queries
 
             # Check cache entry
             table_name = self._get_safe_table_name(partition_key)
@@ -932,7 +932,7 @@ class DuckDBBitCacheHandler(AbstractCacheHandler_Lazy):
                     SELECT query_hash FROM {self.table_prefix}_queries
                     WHERE query_hash IN ({",".join("?" * len(keys))})
                     AND partition_key = ?
-                    AND status IN ('ok', 'timeout', 'failed')
+                    AND status IN ('ok', 'timeout', 'failed', 'limit')
                 """,
                     tuple(keys) + (partition_key,),
                 ).fetchall()
@@ -1086,27 +1086,40 @@ class DuckDBBitCacheHandler(AbstractCacheHandler_Lazy):
         except Exception:
             return []
 
-    def set_query_status(self, key: str, partition_key: str = "partition_key", status: str = "ok") -> bool:
+    def set_query_status(self, key: str, partition_key: str = "partition_key", status: str = "ok", query: str | None = None) -> bool:
         """
         Set query status.
 
         Args:
             key: Cache key
             partition_key: Partition key name
-            status: Status ('ok', 'timeout', 'failed')
+            status: Status ('ok', 'timeout', 'failed', 'limit')
+            query: Query text; with it the row is inserted when it does not exist yet, without it only an
+                existing row is updated
 
         Returns:
             bool: True if successful
         """
         try:
-            self.conn.execute(
-                f"""
-                UPDATE {self.table_prefix}_queries
-                SET status = ?, last_seen = now()
-                WHERE query_hash = ? AND partition_key = ?
-            """,
-                (status, key, partition_key),
-            )
+            if query is not None:
+                self.conn.execute(
+                    f"""
+                    INSERT INTO {self.table_prefix}_queries (query_hash, partition_key, query, status, last_seen)
+                    VALUES (?, ?, ?, ?, now())
+                    ON CONFLICT (query_hash, partition_key) DO UPDATE SET
+                    status = EXCLUDED.status, last_seen = now()
+                """,
+                    (key, partition_key, query, status),
+                )
+            else:
+                self.conn.execute(
+                    f"""
+                    UPDATE {self.table_prefix}_queries
+                    SET status = ?, last_seen = now()
+                    WHERE query_hash = ? AND partition_key = ?
+                """,
+                    (status, key, partition_key),
+                )
 
             return True
 

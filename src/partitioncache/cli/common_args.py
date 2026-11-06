@@ -335,6 +335,31 @@ def parse_variant_generation_json_args(args: argparse.Namespace) -> tuple[dict[s
     return add_constraints, remove_constraints_all, remove_constraints_add
 
 
+def parse_bucket_steps(value: str) -> float | dict[str, float] | list[float | dict[str, float]]:
+    """Parse --bucket-steps: a number, a JSON dict {pattern: step}, or a JSON list of numbers and such dicts."""
+    try:
+        return float(value)
+    except ValueError:
+        pass
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as e:
+        raise argparse.ArgumentTypeError(f"bucket steps must be a number, a JSON dict or a JSON list: {value!r}") from e
+
+    def level(item: Any) -> float | dict[str, float]:
+        if isinstance(item, bool):
+            raise argparse.ArgumentTypeError(f"invalid bucket step: {item!r}")
+        if isinstance(item, int | float):
+            return float(item)
+        if isinstance(item, dict) and all(isinstance(k, str) and isinstance(v, int | float) and not isinstance(v, bool) for k, v in item.items()):
+            return {k: float(v) for k, v in item.items()}
+        raise argparse.ArgumentTypeError(f"invalid bucket step: {item!r}")
+
+    if isinstance(parsed, list):
+        return [level(item) for item in parsed]
+    return level(parsed)
+
+
 def add_variant_generation_args(parser: argparse.ArgumentParser) -> None:
     """
     Add common variant generation arguments to an ArgumentParser.
@@ -381,9 +406,10 @@ def add_variant_generation_args(parser: argparse.ArgumentParser) -> None:
     )
     variant_group.add_argument(
         "--bucket-steps",
-        type=float,
-        default=float(os.getenv("PARTITION_CACHE_BUCKET_STEPS", "1.0")),
-        help="Step size for normalizing distance conditions (e.g., 1.0, 0.5, etc.) (default: 1.0 or PARTITION_CACHE_BUCKET_STEPS)",
+        type=parse_bucket_steps,
+        default=parse_bucket_steps(os.getenv("PARTITION_CACHE_BUCKET_STEPS", "1.0")),
+        help="Step size for normalizing distance conditions (e.g., 1.0, 0.5), a JSON dict of per-attribute steps "
+        '(e.g. \'{"alt": 500, "vrate": 1}\'), or a JSON list of such levels (default: 1.0 or PARTITION_CACHE_BUCKET_STEPS)',
     )
     variant_group.add_argument(
         "--add-constraints",
@@ -410,6 +436,14 @@ def add_variant_generation_args(parser: argparse.ArgumentParser) -> None:
         help="Maximum number of conditions to remove per table when generating attribute variants. "
         "Default: 1 (remove one condition at a time). Higher values generate more variants via C(n,k) combinations. "
         "(default: 1 or PARTITION_CACHE_MAX_CONDITIONS_REMOVED)",
+    )
+    variant_group.add_argument(
+        "--skip-partition-key-joins",
+        type=lambda value: [key.strip() for key in value.split(",") if key.strip()],
+        default=[key.strip() for key in os.getenv("PARTITION_CACHE_SKIP_PARTITION_KEY_JOINS", "").split(",") if key.strip()],
+        help="Comma-separated partition keys whose variants get no equality on the partition key between tables, as needed for "
+        "time buckets used with temporal dilation (geometry keys always skip it). Lookups must use the same setting "
+        "(default: none or PARTITION_CACHE_SKIP_PARTITION_KEY_JOINS)",
     )
 
 
