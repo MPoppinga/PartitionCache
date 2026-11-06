@@ -287,7 +287,7 @@ class AbstractCacheHandler(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def set_query_status(self, key: str, partition_key: str = "partition_key", status: str = "ok") -> bool:
+    def set_query_status(self, key: str, partition_key: str = "partition_key", status: str = "ok", query: str | None = None) -> bool:
         """
         Set the status of a query in the cache.
 
@@ -296,6 +296,9 @@ class AbstractCacheHandler(ABC):
             partition_key (str, optional): The partition key. Defaults to "partition_key".
             status (str, optional): The status to set: 'ok', 'timeout', 'failed', or 'limit' (the result
                 exceeded the configured result limit and was not stored). Defaults to "ok".
+            query (str | None, optional): The query text. Handlers that keep the status in a queries table row
+                insert the row with this text when the query has none yet; without it only an existing row is
+                updated. Handlers that store the status separately ignore it. Defaults to None.
 
         Returns:
             bool: True if the operation was successful, False otherwise.

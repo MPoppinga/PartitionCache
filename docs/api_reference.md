@@ -589,7 +589,7 @@ if cached_cities:
 
 ##### `exists(key: str, partition_key: str = "partition_key", check_query: bool = False) -> bool`
 
-Checks if a cache entry exists. With `check_query=True`, query metadata is consulted first: a missing query record returns False; an `'ok'` status additionally checks the cache entry; an error status (`'timeout'`/`'failed'`) returns True without a cache check.
+Checks if a cache entry exists. With `check_query=True`, query metadata is consulted first: a missing query record returns False; an `'ok'` status additionally checks the cache entry; an error status (`'timeout'`/`'failed'`/`'limit'`) returns True without a cache check.
 
 **Returns:**
 - `bool`: True if key exists

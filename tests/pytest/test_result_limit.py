@@ -207,3 +207,44 @@ def test_key_value_handlers_keep_limit_and_failed_apart(backend, tmp_path):
         for key in ("a", "b", "c"):
             handler.delete(key, partition_key)
         handler.close()
+
+
+@pytest.fixture(params=["postgresql_array", "duckdb_bit"])
+def queries_table_handler(request):
+    """A handler that keeps the query status in a queries table row (query text NOT NULL)."""
+    if request.param == "postgresql_array":
+        yield request.getfixturevalue("postgresql_array")
+        return
+    pytest.importorskip("duckdb")
+    from partitioncache.cache_handler.duckdb_bit import DuckDBBitCacheHandler
+
+    handler = DuckDBBitCacheHandler(":memory:", table_prefix="resultlimit", bitsize=16)
+    handler.register_partition_key("pk", "integer")
+    try:
+        yield handler
+    finally:
+        handler.close()
+
+
+@pytest.mark.parametrize("status", ["timeout", "failed", "limit"])
+def test_status_with_query_text_creates_the_row_of_a_new_query(queries_table_handler, status):
+    """A query that never produced a cache entry gets its status row, like in the PostgreSQL queue processor."""
+    handler = queries_table_handler
+    assert handler.set_query_status("new", "pk", status, query="SELECT 1") is True
+    assert handler.get_query_status("new", "pk") == status
+    assert handler.get_query("new", "pk") == "SELECT 1"
+    assert not handler.exists("new", "pk", check_query=False)
+
+
+def test_status_with_query_text_keeps_the_stored_query_text(queries_table_handler):
+    handler = queries_table_handler
+    handler.set_query("k", "SELECT a", "pk")
+    assert handler.set_query_status("k", "pk", "limit", query="SELECT b") is True
+    assert handler.get_query_status("k", "pk") == "limit"
+    assert handler.get_query("k", "pk") == "SELECT a"
+
+
+def test_status_without_query_text_creates_no_row(queries_table_handler):
+    handler = queries_table_handler
+    handler.set_query_status("unknown", "pk", "failed")
+    assert handler.get_query_status("unknown", "pk") is None

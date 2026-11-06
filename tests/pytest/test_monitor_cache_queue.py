@@ -345,7 +345,7 @@ class TestRunAndStoreQuery:
                 delattr(mcq_module, "args")
 
         assert result is True
-        mock_cache.set_query_status.assert_called_once_with("test_hash", "test_partition_key", "failed")
+        mock_cache.set_query_status.assert_called_once_with("test_hash", "test_partition_key", "limit", query="SELECT * FROM test")
         mock_cache.set_cache.assert_not_called()
 
     @patch("partitioncache.cli.monitor_cache_queue.get_cache_handler")
@@ -380,7 +380,7 @@ class TestRunAndStoreQuery:
                 delattr(mcq_module, "args")
 
         assert result is True
-        mock_cache.set_query_status.assert_called_once_with("test_hash", "test_partition_key", "timeout")
+        mock_cache.set_query_status.assert_called_once_with("test_hash", "test_partition_key", "timeout", query="SELECT * FROM test")
 
     @patch("partitioncache.cli.monitor_cache_queue.get_cache_handler")
     @patch("partitioncache.cli.monitor_cache_queue.get_db_handler")
@@ -410,7 +410,7 @@ class TestRunAndStoreQuery:
 
         assert result is False
         mock_cache.set_cache.assert_not_called()
-        mock_cache.set_query_status.assert_called_once_with("test_hash", "test_partition_key", "failed")
+        mock_cache.set_query_status.assert_called_once_with("test_hash", "test_partition_key", "failed", query="SELECT * FROM t")
         mock_db.close.assert_called_once()
 
     @patch("partitioncache.cli.monitor_cache_queue.get_cache_handler")
@@ -975,3 +975,121 @@ class TestVariantOrder:
         mock_get_keys.return_value = ({"a\\", "b"}, 4, 2)
         apply_cache_optimization("SELECT 1", "h", "pk", "text", Mock(), mock_args)
         assert mock_extend.call_args.kwargs["sql_dialect"] == "mysql"
+
+
+@pytest.fixture
+def duckdb_cache():
+    """A real cache handler whose status lives in a queries table row, like the PostgreSQL handlers."""
+    pytest.importorskip("duckdb")
+    from partitioncache.cache_handler.duckdb_bit import DuckDBBitCacheHandler
+
+    handler = DuckDBBitCacheHandler(":memory:", table_prefix="observer", bitsize=64)
+    handler.register_partition_key("pk", "integer")
+    try:
+        yield handler
+    finally:
+        handler.close()
+
+
+class TestTerminalStatusOfNewVariants:
+    """A variant that timed out or exceeded --limit gets a status row and is not run again when it is queued again."""
+
+    VARIANT = ("SELECT x FROM t", "new_variant", "pk", "integer", None)
+
+    def _run(self, cache, args, db):
+        import partitioncache.cli.monitor_cache_queue as mcq_module
+
+        original_args = getattr(mcq_module, "args", None)
+        mcq_module.args = args
+        try:
+            with patch("partitioncache.cli.monitor_cache_queue.get_cache_handler", return_value=cache):
+                with patch("partitioncache.cli.monitor_cache_queue.get_db_handler", return_value=db):
+                    return run_and_store_query(*self.VARIANT[:4])
+        finally:
+            if original_args is not None:
+                mcq_module.args = original_args
+            else:
+                delattr(mcq_module, "args")
+
+    def _requeue(self, cache, args):
+        """Pop the variant once in fragment_executor and return the mock that stands in for its execution."""
+        import partitioncache.cli.monitor_cache_queue as mcq_module
+
+        calls = [0]
+
+        def stop_after_a_few_rounds():
+            calls[0] += 1
+            return calls[0] > 3
+
+        original_args = getattr(mcq_module, "args", None)
+        mcq_module.args = args
+        try:
+            with (
+                patch("partitioncache.cli.monitor_cache_queue.exit_event") as exit_event,
+                patch("partitioncache.cli.monitor_cache_queue.pop_from_query_fragment_queue", side_effect=[self.VARIANT, None, None]),
+                patch("partitioncache.cli.monitor_cache_queue.pop_from_query_fragment_queue_blocking", side_effect=[self.VARIANT, None, None]),
+                patch("partitioncache.cli.monitor_cache_queue.get_cache_handler", return_value=cache),
+                patch("partitioncache.cli.monitor_cache_queue.get_queue_lengths", return_value={"original_query_queue": 0, "query_fragment_queue": 1}),
+                patch("partitioncache.cli.monitor_cache_queue.run_and_store_query", return_value=True) as run,
+            ):
+                exit_event.is_set.side_effect = stop_after_a_few_rounds
+                fragment_executor()
+            return run
+        finally:
+            mcq_module.active_futures.clear()
+            if original_args is not None:
+                mcq_module.args = original_args
+            else:
+                delattr(mcq_module, "args")
+
+    def test_limit_of_a_new_variant_is_recorded_and_not_run_again(self, duckdb_cache, mock_args):
+        mock_args.limit = 2
+        db = Mock()
+        db.execute.return_value = [1, 2, 3]
+
+        assert self._run(duckdb_cache, mock_args, db) is True
+
+        assert duckdb_cache.get_query_status("new_variant", "pk") == "limit"
+        assert duckdb_cache.get_query("new_variant", "pk") == "SELECT x FROM t"
+        assert duckdb_cache.get("new_variant", "pk") is None
+        self._requeue(duckdb_cache, mock_args).assert_not_called()
+
+    def test_timeout_of_a_new_variant_is_recorded_and_not_run_again(self, duckdb_cache, mock_args):
+        import psycopg
+
+        mock_args.long_running_query_timeout = "5"
+        db = Mock()
+        db.execute.side_effect = psycopg.OperationalError("canceling statement due to statement timeout")
+
+        assert self._run(duckdb_cache, mock_args, db) is True
+
+        assert duckdb_cache.get_query_status("new_variant", "pk") == "timeout"
+        assert duckdb_cache.get_query("new_variant", "pk") == "SELECT x FROM t"
+        self._requeue(duckdb_cache, mock_args).assert_not_called()
+
+    @pytest.mark.parametrize("status", ["timeout", "failed", "limit"])
+    def test_force_recalculate_runs_a_variant_with_a_terminal_status(self, duckdb_cache, mock_args, status):
+        duckdb_cache.set_query_status("new_variant", "pk", status, query="SELECT x FROM t")
+        mock_args.force_recalculate = True
+
+        self._requeue(duckdb_cache, mock_args).assert_called_once_with(*self.VARIANT)
+
+    def test_a_variant_without_status_is_run(self, duckdb_cache, mock_args):
+        self._requeue(duckdb_cache, mock_args).assert_called_once_with(*self.VARIANT)
+
+    @patch("partitioncache.cli.monitor_cache_queue.get_cache_handler")
+    @patch("partitioncache.cli.monitor_cache_queue.get_db_handler")
+    def test_limit_disables_lazy_insertion(self, mock_get_db, mock_get_cache, mock_args):
+        """Lazy insertion stores the result uncounted, so with --limit the result is fetched and counted."""
+        mock_args.limit = 2
+        mock_cache = Mock()
+        mock_get_cache.return_value = mock_cache
+        mock_db = Mock()
+        mock_db.execute.return_value = [1, 2, 3]
+        mock_get_db.return_value = mock_db
+
+        assert self._run(mock_cache, mock_args, mock_db) is True
+
+        mock_cache.set_entry_lazy.assert_not_called()
+        mock_cache.set_cache.assert_not_called()
+        mock_cache.set_query_status.assert_called_once_with("new_variant", "pk", "limit", query="SELECT x FROM t")
