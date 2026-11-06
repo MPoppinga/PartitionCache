@@ -85,16 +85,16 @@ pcache-monitor \
 
 ### Software Dependencies
 
-- **DuckDB**: Version 1.0+ with PostgreSQL extension support
+- **DuckDB**: Version 2.0+; the `postgres` extension is downloaded by DuckDB on first use (network access needed once per DuckDB version, otherwise the accelerator stays off and queries run on PostgreSQL)
 - **PostgreSQL**: Compatible with existing PartitionCache PostgreSQL requirements
-- **Python**: Python 3.8+ with `duckdb` package
+- **Python**: Python 3.11+ with the `duckdb` package
 
 ### Installation
 
 The DuckDB acceleration feature requires the `duckdb` Python package:
 
 ```bash
-pip install duckdb
+pip install "duckdb>=2.0"   # or: pip install -e ".[db]"
 ```
 
 ### PostgreSQL Extension (Optional)

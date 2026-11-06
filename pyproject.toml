@@ -34,7 +34,7 @@ db = [
     "psycopg",
     "rocksdict",
     "redis",
-    "duckdb",
+    "duckdb>=2.0",
     "mysql-connector-python",
 ]
 
@@ -44,7 +44,7 @@ rocksdb = [
 
 benchmark = [
     "pyyaml",
-    "duckdb",
+    "duckdb>=2.0",
     "psycopg",
     "python-dotenv",
 ]
