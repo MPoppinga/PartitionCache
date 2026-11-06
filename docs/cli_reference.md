@@ -514,6 +514,8 @@ pcache-monitor [options]
 ### Output Control
 - `--limit LIMIT` - Limit number of returned partition keys per query
   - **Purpose**: Control memory usage for large result sets
+  - A result with at least LIMIT partition keys is not stored; the variant gets the status `limit` and is not run again (unless `--force-recalculate`)
+  - With `--limit`, lazy insertion is not used, because it stores results without counting them (spatial datatypes, which need lazy insertion, are populated without the limit)
 - `--status-log-interval STATUS_LOG_INTERVAL` - Status logging interval when idle
   - **Default**: 10 seconds
   - **Purpose**: Reduce log noise during quiet periods

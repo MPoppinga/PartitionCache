@@ -317,6 +317,18 @@ def apply_cache_optimization(query: str, query_hash: str, partition_key: str, pa
     return query, False, stats
 
 
+TERMINAL_STATUSES = frozenset({"timeout", "failed", "limit"})
+
+
+def has_terminal_status(cache_handler, query_hash: str, partition_key: str) -> bool:
+    """Whether the query has a status that keeps it from being run again: 'timeout', 'failed' or 'limit'."""
+    status = cache_handler.get_query_status(query_hash, partition_key)
+    if status in TERMINAL_STATUSES:
+        logger.debug(f"Query {query_hash} skipped, it has the status '{status}'")
+        return True
+    return False
+
+
 def run_and_store_query(query: str, query_hash: str, partition_key: str, partition_datatype: str | None = None, item_cache_backend: str | None = None):
     """Worker function to execute and store a query."""
     logger.info(f"WORKER THREAD START: Processing query {query_hash}")
@@ -361,8 +373,17 @@ def run_and_store_query(query: str, query_hash: str, partition_key: str, partiti
             logger.info(f"PARTITION KEY REGISTERED: Successfully registered for {query_hash}")
 
         lazy_insertion_available = hasattr(cache_handler, "set_cache_lazy") and hasattr(cache_handler, "set_entry_lazy")
+        # Lazy insertion stores the result without counting it, so --limit could not be applied; spatial
+        # datatypes have no other path and are populated without the limit
+        limit_applies = args.limit is not None and partition_datatype != "geometry"
+        if args.limit is not None and not limit_applies:
+            logger.warning(f"--limit is not applied to spatial datatype '{partition_datatype}' (query {query_hash}), it needs lazy insertion")
         use_lazy_insertion = (
-            lazy_insertion_available and not args.force_recalculate and args.long_running_query_timeout == "0" and not args.disable_lazy_insertion
+            lazy_insertion_available
+            and not args.force_recalculate
+            and args.long_running_query_timeout == "0"
+            and not args.disable_lazy_insertion
+            and not limit_applies
         )
 
         if use_lazy_insertion:
@@ -387,7 +408,7 @@ def run_and_store_query(query: str, query_hash: str, partition_key: str, partiti
                 if "statement timeout" in str(e) or "query_canceled" in str(e):
                     logger.info(f"Query {query_hash} is a long running query (detected during lazy insertion)")
                     log_query_time(f"{query_hash}_timeout", execution_time)
-                    cache_handler.set_query_status(query_hash, partition_key, "timeout")
+                    cache_handler.set_query_status(query_hash, partition_key, "timeout", query=original_query)
                     success = True
                 else:
                     logger.error(f"Lazy insertion operational error for {original_hash}: {e}, falling back to traditional method")
@@ -435,8 +456,8 @@ def run_and_store_query(query: str, query_hash: str, partition_key: str, partiti
                 log_query_time(query_hash, execution_time)
 
                 if args.limit is not None and result is not None and len(result) >= args.limit:
-                    logger.info(f"Query {query_hash} limited to {args.limit} partition keys")
-                    cache_handler.set_query_status(query_hash, partition_key, "failed")
+                    logger.info(f"Query {query_hash} returned {len(result)} >= {args.limit} partition keys, not stored (status 'limit')")
+                    cache_handler.set_query_status(query_hash, partition_key, "limit", query=original_query)
                 else:
                     success_cache = cache_handler.set_cache(original_hash, result, partition_key)
                     success_query = cache_handler.set_query(original_hash, original_query, partition_key)
@@ -444,7 +465,7 @@ def run_and_store_query(query: str, query_hash: str, partition_key: str, partiti
                         logger.debug(f"Successfully stored {original_hash} in cache with {len(result)} results")
                     else:
                         logger.error(f"Failed to store {original_hash} in cache (cache_success={success_cache}, query_success={success_query})")
-                        cache_handler.set_query_status(original_hash, partition_key, "failed")
+                        cache_handler.set_query_status(original_hash, partition_key, "failed", query=original_query)
                 success = True
 
             except psycopg.OperationalError as e:
@@ -453,19 +474,19 @@ def run_and_store_query(query: str, query_hash: str, partition_key: str, partiti
                 if "timeout" in error_msg or "cancel" in error_msg:
                     logger.warning(f"QUERY TIMEOUT: Query {query_hash} was cancelled due to timeout after {execution_time:.2f}s")
                     log_query_time(f"{query_hash}_timeout", execution_time)
-                    cache_handler.set_query_status(query_hash, partition_key, "timeout")
+                    cache_handler.set_query_status(query_hash, partition_key, "timeout", query=original_query)
                     success = True
                 else:
                     logger.error(f"QUERY EXECUTION ERROR: Failed to execute query for {query_hash} after {execution_time:.2f}s: {type(e).__name__}: {e}")
                     log_query_time(f"{query_hash}_error", execution_time)
-                    cache_handler.set_query_status(query_hash, partition_key, "failed")
+                    cache_handler.set_query_status(query_hash, partition_key, "failed", query=original_query)
             except Exception as e:
                 # Errors of the other DB backends (sqlite3, mysql.connector): nothing is cached, the
                 # query is marked failed, so a failure never passes as an empty result
                 execution_time = time.perf_counter() - execution_start
                 logger.error(f"QUERY EXECUTION ERROR: Failed to execute query for {query_hash} after {execution_time:.2f}s: {type(e).__name__}: {e}")
                 log_query_time(f"{query_hash}_error", execution_time)
-                cache_handler.set_query_status(query_hash, partition_key, "failed")
+                cache_handler.set_query_status(query_hash, partition_key, "failed", query=original_query)
             finally:
                 if db_handler:
                     db_handler.close()
@@ -655,6 +676,11 @@ def fragment_executor():
                         continue
                     elif args.force_recalculate and main_cache_handler.exists(hash_value, partition_key, check_query=False):
                         logger.info(f"Query {hash_value} exists in cache but force-recalculate is enabled")
+
+                    # A variant that timed out, failed or exceeded --limit before has no cache entry but is not run
+                    # again, like in the PostgreSQL queue processor (unless force-recalculate)
+                    if not args.force_recalculate and has_terminal_status(main_cache_handler, hash_value, partition_key):
+                        continue
 
                     # Check if not already being processed
                     if any(h == hash_value for h in active_futures.values()):

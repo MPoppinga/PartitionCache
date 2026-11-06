@@ -262,7 +262,7 @@ class RocksDictAbstractCacheHandler(AbstractCacheHandler):
         """Get the datatype of the cache handler. If the partition key is not set, return None."""
         return self._get_partition_datatype(partition_key)
 
-    def set_query_status(self, key: str, partition_key: str = "partition_key", status: str = "ok") -> bool:
+    def set_query_status(self, key: str, partition_key: str = "partition_key", status: str = "ok", query: str | None = None) -> bool:
         """Set the status of a query using termination bits for RocksDict backend."""
         try:
             valid_statuses = {"ok", "timeout", "failed", "limit"}

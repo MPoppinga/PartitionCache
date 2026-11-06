@@ -1086,7 +1086,7 @@ class DuckDBBitCacheHandler(AbstractCacheHandler_Lazy):
         except Exception:
             return []
 
-    def set_query_status(self, key: str, partition_key: str = "partition_key", status: str = "ok") -> bool:
+    def set_query_status(self, key: str, partition_key: str = "partition_key", status: str = "ok", query: str | None = None) -> bool:
         """
         Set query status.
 
@@ -1094,19 +1094,32 @@ class DuckDBBitCacheHandler(AbstractCacheHandler_Lazy):
             key: Cache key
             partition_key: Partition key name
             status: Status ('ok', 'timeout', 'failed', 'limit')
+            query: Query text; with it the row is inserted when it does not exist yet, without it only an
+                existing row is updated
 
         Returns:
             bool: True if successful
         """
         try:
-            self.conn.execute(
-                f"""
-                UPDATE {self.table_prefix}_queries
-                SET status = ?, last_seen = now()
-                WHERE query_hash = ? AND partition_key = ?
-            """,
-                (status, key, partition_key),
-            )
+            if query is not None:
+                self.conn.execute(
+                    f"""
+                    INSERT INTO {self.table_prefix}_queries (query_hash, partition_key, query, status, last_seen)
+                    VALUES (?, ?, ?, ?, now())
+                    ON CONFLICT (query_hash, partition_key) DO UPDATE SET
+                    status = EXCLUDED.status, last_seen = now()
+                """,
+                    (key, partition_key, query, status),
+                )
+            else:
+                self.conn.execute(
+                    f"""
+                    UPDATE {self.table_prefix}_queries
+                    SET status = ?, last_seen = now()
+                    WHERE query_hash = ? AND partition_key = ?
+                """,
+                    (status, key, partition_key),
+                )
 
             return True
 

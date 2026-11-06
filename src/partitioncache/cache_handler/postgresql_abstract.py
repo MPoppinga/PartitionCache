@@ -663,26 +663,32 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
             raise ValueError(f"Handler supports only {self.get_supported_datatypes()} datatypes, got: {datatype}")
         self._ensure_partition_table(partition_key, datatype, **kwargs)
 
-    def set_query_status(self, key: str, partition_key: str = "partition_key", status: str = "ok") -> bool:
-        """Set the status of a query in the queries table."""
+    def set_query_status(self, key: str, partition_key: str = "partition_key", status: str = "ok", query: str | None = None) -> bool:
+        """Set the status of a query in the queries table.
+
+        With ``query`` the row is inserted when it does not exist yet (as the PostgreSQL queue processor does),
+        so a query that never produced a cache entry still gets its status. Without it only an existing row is updated.
+        """
         try:
             # Valid statuses based on the CHECK constraint
             valid_statuses = {"ok", "timeout", "failed", "limit"}
             if status not in valid_statuses:
                 raise ValueError(f"Invalid status '{status}'. Must be one of: {valid_statuses}")
 
-            query_sql = sql.SQL("UPDATE {0} SET status = %s, last_seen = now() WHERE query_hash = %s AND partition_key = %s").format(
-                sql.Identifier(self.tableprefix + "_queries")
-            )
-
-            self.cursor.execute(query_sql, (status, key, partition_key))
-            rows_affected = self.cursor.rowcount
-
-            if rows_affected == 0:
-                # Query doesn't exist in queries table, try to insert it with the status
-                # This handles cases where set_query_status is called before set_query
-                logger.warning(f"Query {key} not found in queries table, cannot set status to {status}")
-                return False
+            table = sql.Identifier(self.tableprefix + "_queries")
+            if query is not None:
+                query_sql = sql.SQL(
+                    "INSERT INTO {0} (query_hash, partition_key, query, status, last_seen) VALUES (%s, %s, %s, %s, now()) "
+                    "ON CONFLICT (query_hash, partition_key) DO UPDATE SET status = EXCLUDED.status, last_seen = now()"
+                ).format(table)
+                self.cursor.execute(query_sql, (key, partition_key, query, status))
+            else:
+                query_sql = sql.SQL("UPDATE {0} SET status = %s, last_seen = now() WHERE query_hash = %s AND partition_key = %s").format(table)
+                self.cursor.execute(query_sql, (status, key, partition_key))
+                if self.cursor.rowcount == 0:
+                    # Without the query text there is no row to insert (query is NOT NULL)
+                    logger.warning(f"Query {key} not found in queries table, cannot set status to {status}")
+                    return False
 
             self.db.commit()
             return True

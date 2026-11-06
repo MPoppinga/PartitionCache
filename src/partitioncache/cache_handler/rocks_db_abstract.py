@@ -257,7 +257,7 @@ class RocksDBAbstractCacheHandler(AbstractCacheHandler):
         except Exception:
             return None
 
-    def set_query_status(self, key: str, partition_key: str = "partition_key", status: str = "ok") -> bool:
+    def set_query_status(self, key: str, partition_key: str = "partition_key", status: str = "ok", query: str | None = None) -> bool:
         """Set the status of a query using termination bits for RocksDB backend."""
         try:
             # Valid statuses
