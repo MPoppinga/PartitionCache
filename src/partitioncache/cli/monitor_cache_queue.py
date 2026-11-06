@@ -810,11 +810,18 @@ def main():
     acceleration_group.add_argument(
         "--duckdb-database-path",
         type=str,
-        default="/tmp/partitioncache_accel.duckdb",
-        help="Path to DuckDB database file (default: /tmp/partitioncache_accel.duckdb, use ':memory:' for in-memory)",
+        default=":memory:",
+        help="Path to a DuckDB database file to keep the preloaded tables in (default: ':memory:'). Tables already in the "
+        "file are reused without reloading, a snapshot that misses later changes in PostgreSQL, unless --force-reload-tables is given",
     )
     acceleration_group.add_argument(
         "--force-reload-tables", action="store_true", default=False, help="Force reload tables from PostgreSQL even if they exist in DuckDB"
+    )
+    acceleration_group.add_argument(
+        "--duckdb-read-unloaded-tables",
+        action="store_true",
+        default=False,
+        help="Let DuckDB read tables that were not preloaded directly from PostgreSQL, instead of running such queries on PostgreSQL",
     )
 
     global args
@@ -880,6 +887,7 @@ def main():
                     duckdb_threads=args.duckdb_threads,
                     enable_statistics=not args.disable_acceleration_stats,
                     duckdb_database_path=args.duckdb_database_path,
+                    read_unloaded_from_postgres=args.duckdb_read_unloaded_tables,
                     force_reload_tables=args.force_reload_tables,
                     query_timeout=float(args.long_running_query_timeout),
                 )

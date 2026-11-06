@@ -39,7 +39,7 @@ jobs:
         python -m pip install --upgrade pip
         if [ "${{ matrix.python-version }}" = "3.15" ]; then
           # rocksdict has no 3.15 wheel; tests/pytest/conftest.py skips the files that need it
-          pip install -e ".[testing]" psycopg redis duckdb mysql-connector-python
+          pip install -e ".[testing]" psycopg redis "duckdb>=2.0" mysql-connector-python
         else
           pip install -e ".[testing,db]"
         fi
