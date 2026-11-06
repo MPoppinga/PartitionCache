@@ -35,12 +35,14 @@ def _redis_available() -> bool:
 
 
 def _rocksdict(tmp_path):
+    pytest.importorskip("rocksdict")
     from partitioncache.cache_handler.rocks_dict import RocksDictCacheHandler
 
     return RocksDictCacheHandler(str(tmp_path / "rocksdict"))
 
 
 def _rocksdict_roaringbit(tmp_path):
+    pytest.importorskip("rocksdict")
     from partitioncache.cache_handler.rocksdict_roaringbit import RocksDictRoaringBitCacheHandler
 
     return RocksDictRoaringBitCacheHandler(str(tmp_path / "rocksdict_roaring"))
