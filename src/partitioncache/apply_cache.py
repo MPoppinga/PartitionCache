@@ -106,7 +106,7 @@ def get_partition_keys(
     follow_graph: bool = True,
     auto_detect_partition_join: bool = True,
     partition_join_table: str | None = None,
-    bucket_steps: float = 1.0,
+    bucket_steps: float | dict[str, float] | list = 1.0,
     add_constraints: dict[str, str] | None = None,
     remove_constraints_all: list[str] | None = None,
     remove_constraints_add: list[str] | None = None,
@@ -118,6 +118,7 @@ def get_partition_keys(
     dilation_buckets: int | None = None,
     temporal_column: str | None = None,
     partition_key_source_table: str | None = None,
+    keep_all_attributes: bool = False,
     **kwargs: Any,
 ) -> tuple[set[int] | set[str] | set[float] | set[datetime] | None, int, int]:
     """
@@ -143,6 +144,9 @@ def get_partition_keys(
         temporal_column: The time column the partition key buckets; required with ``temporal_bucket_width``.
             With either temporal parameter, variants are generated without partition key joins, and a query
             whose rows are not bounded in time against each other runs without the cache.
+        keep_all_attributes: If False (default), lookup also probes variants with single-table attribute
+            conditions removed (more hits, more variant-generation cost). True probes exactly the variants
+            that generate_all_query_hash_pairs produces with its defaults.
 
     Returns:
        tuple containing:
@@ -173,7 +177,7 @@ def get_partition_keys(
         partition_key=partition_key,
         min_component_size=min_component_size,
         follow_graph=follow_graph,
-        fix_attributes=False,
+        fix_attributes=keep_all_attributes,
         canonicalize_queries=canonicalize_queries,
         auto_detect_partition_join=auto_detect_partition_join,
         partition_join_table=partition_join_table,
@@ -214,7 +218,7 @@ def get_partition_keys_lazy(
     follow_graph: bool = True,
     auto_detect_partition_join: bool = True,
     partition_join_table: str | None = None,
-    bucket_steps: float = 1.0,
+    bucket_steps: float | dict[str, float] | list = 1.0,
     add_constraints: dict[str, str] | None = None,
     remove_constraints_all: list[str] | None = None,
     remove_constraints_add: list[str] | None = None,
@@ -226,6 +230,7 @@ def get_partition_keys_lazy(
     dilation_buckets: int | None = None,
     temporal_column: str | None = None,
     partition_key_source_table: str | None = None,
+    keep_all_attributes: bool = False,
     **kwargs: Any,
 ) -> tuple[str | None, int, int]:
     """
@@ -252,6 +257,9 @@ def get_partition_keys_lazy(
         temporal_column: The time column the partition key buckets; required with ``temporal_bucket_width``.
             With either temporal parameter, variants are generated without partition key joins, and a query
             whose rows are not bounded in time against each other runs without the cache.
+        keep_all_attributes: If False (default), lookup also probes variants with single-table attribute
+            conditions removed (more hits, more variant-generation cost). True probes exactly the variants
+            that generate_all_query_hash_pairs produces with its defaults.
 
     Returns:
         tuple[str, int, int]: A tuple containing:
@@ -291,7 +299,7 @@ def get_partition_keys_lazy(
         query=query,
         partition_key=partition_key,
         min_component_size=min_component_size,
-        fix_attributes=False,
+        fix_attributes=keep_all_attributes,
         canonicalize_queries=canonicalize_queries,
         follow_graph=follow_graph,
         auto_detect_partition_join=auto_detect_partition_join,
@@ -1493,7 +1501,7 @@ def apply_cache_lazy(
     p0_table_name: str | None = None,
     auto_detect_partition_join: bool = True,
     partition_join_table: str | None = None,
-    bucket_steps: float = 1.0,
+    bucket_steps: float | dict[str, float] | list = 1.0,
     add_constraints: dict[str, str] | None = None,
     remove_constraints_all: list[str] | None = None,
     remove_constraints_add: list[str] | None = None,
@@ -1511,6 +1519,7 @@ def apply_cache_lazy(
     partition_key_source_table: str | None = None,
     cost_estimator: Callable[[str], float | None] | None = None,
     min_query_cost: float | None = None,
+    keep_all_attributes: bool = False,
     **kwargs: Any,
 ) -> tuple[str, dict[str, int]]:
     """
@@ -1543,6 +1552,9 @@ def apply_cache_lazy(
         temporal_column: The time column the partition key buckets; required with ``temporal_bucket_width``.
             With either temporal parameter, variants are generated without partition key joins, and a query
             whose rows are not bounded in time against each other runs without the cache.
+        keep_all_attributes: If False (default), lookup also probes variants with single-table attribute
+            conditions removed (more hits, more variant-generation cost). True probes exactly the variants
+            that generate_all_query_hash_pairs produces with its defaults.
         sql_dialect: sqlglot dialect used to parse and render non-spatial queries. Defaults to PostgreSQL.
         geometry_column: If set, enables spatial cache mode. Uses this geometry column for variant
             SELECT clauses and spatial filter application. Requires a spatial cache handler with
@@ -1589,7 +1601,7 @@ def apply_cache_lazy(
             query=query,
             partition_key=partition_key,
             min_component_size=min_component_size,
-            fix_attributes=False,
+            fix_attributes=keep_all_attributes,
             canonicalize_queries=canonicalize_queries,
             follow_graph=follow_graph,
             auto_detect_partition_join=False,
@@ -1711,6 +1723,7 @@ def apply_cache_lazy(
         temporal_bucket_width=temporal_bucket_width,
         dilation_buckets=dilation_buckets,
         temporal_column=temporal_column,
+        keep_all_attributes=keep_all_attributes,
         # Only temporal lookups use it here, so that other lookups keep the variants they had
         partition_key_source_table=partition_key_source_table if _is_temporal(temporal_bucket_width, dilation_buckets) else None,
     )
@@ -1779,7 +1792,7 @@ def apply_cache(
     p0_table_name: str | None = None,
     auto_detect_partition_join: bool = True,
     partition_join_table: str | None = None,
-    bucket_steps: float = 1.0,
+    bucket_steps: float | dict[str, float] | list = 1.0,
     add_constraints: dict[str, str] | None = None,
     remove_constraints_all: list[str] | None = None,
     remove_constraints_add: list[str] | None = None,
@@ -1794,6 +1807,7 @@ def apply_cache(
     partition_key_source_table: str | None = None,
     cost_estimator: Callable[[str], float | None] | None = None,
     min_query_cost: float | None = None,
+    keep_all_attributes: bool = False,
     **kwargs: Any,
 ) -> tuple[str, dict[str, int]]:
     """
@@ -1836,6 +1850,9 @@ def apply_cache(
         temporal_column: The time column the partition key buckets; required with ``temporal_bucket_width``.
             With either temporal parameter, variants are generated without partition key joins, and a query
             whose rows are not bounded in time against each other runs without the cache.
+        keep_all_attributes: If False (default), lookup also probes variants with single-table attribute
+            conditions removed (more hits, more variant-generation cost). True probes exactly the variants
+            that generate_all_query_hash_pairs produces with its defaults.
         geometry_column: If set, enables spatial cache mode. Uses this geometry column for variant
             SELECT clauses and spatial filter application. Requires a spatial cache handler with
             get_spatial_filter() method.
@@ -1914,7 +1931,7 @@ def apply_cache(
             partition_key=partition_key,
             min_component_size=min_component_size,
             follow_graph=True,
-            fix_attributes=False,
+            fix_attributes=keep_all_attributes,
             canonicalize_queries=canonicalize_queries,
             auto_detect_partition_join=False,
             partition_join_table=partition_join_table,
@@ -2031,6 +2048,7 @@ def apply_cache(
         temporal_bucket_width=temporal_bucket_width,
         dilation_buckets=dilation_buckets,
         temporal_column=temporal_column,
+        keep_all_attributes=keep_all_attributes,
         # Only temporal lookups use it here, so that other lookups keep the variants they had
         partition_key_source_table=partition_key_source_table if _is_temporal(temporal_bucket_width, dilation_buckets) else None,
     )

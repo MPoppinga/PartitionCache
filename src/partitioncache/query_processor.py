@@ -1633,16 +1633,29 @@ def _bucket_bound(value: Decimal, bucket_steps: Decimal, up: bool) -> exp.Expr |
     return exp.Literal.number(format(bound.normalize(), "f"))
 
 
-def _numeric_literal(node: exp.Expr) -> Decimal | None:
-    """The exact value of a non-negative numeric literal, else None (negative values are left alone)."""
+def _signed_bucket_bound(value: Decimal, bucket_steps: Decimal, up: bool) -> exp.Expr | None:
+    """_bucket_bound for any sign: a negative bound is the mirrored non-negative one (rounding up becomes down)."""
+    if value >= 0:
+        return _bucket_bound(value, bucket_steps, up)
+    bound = _bucket_bound(-value, bucket_steps, not up)
+    if bound is None or Decimal(bound.this) == 0:
+        return bound
+    return exp.Neg(this=bound)
+
+
+def _numeric_literal(node: exp.Expr, allow_negative: bool = False) -> Decimal | None:
+    """The exact value of a numeric literal, else None. Negative values (-5) only with allow_negative."""
     if isinstance(node, exp.Paren):
-        return _numeric_literal(node.this)
+        return _numeric_literal(node.this, allow_negative)
+    if allow_negative and isinstance(node, exp.Neg):
+        value = _numeric_literal(node.this)
+        return None if value is None else -value
     if isinstance(node, exp.Literal) and not node.is_string:
         try:
             value = Decimal(node.this)
         except InvalidOperation:
             return None
-        return value if value.is_finite() and value >= 0 else None
+        return value if value.is_finite() and (allow_negative or value >= 0) else None
     return None
 
 
@@ -1663,7 +1676,9 @@ def _monotone_polarity(node: exp.Expr, where: exp.Where) -> bool | None:
     return positive
 
 
-def normalize_distance_conditions(original_query: str, bucket_steps: float = 1.0, restrict_to_dist_functions=True) -> str:
+def normalize_distance_conditions(
+    original_query: str, bucket_steps: float | dict[str, float] = 1.0, restrict_to_dist_functions=True
+) -> str:
     """
     Normalize the distance conditions of a query to a grid of ``bucket_steps``.
 
@@ -1674,30 +1689,52 @@ def normalize_distance_conditions(original_query: str, bucket_steps: float = 1.0
     directions flip, so the condition as a whole is always loosened, also inside OR and NOT BETWEEN. Comparisons in
     other contexts (function arguments, CASE, subqueries) stay unchanged.
 
+    Per-attribute buckets: ``bucket_steps`` as a dict ``{pattern: step}`` buckets every comparison of an expression
+    whose SQL text contains the pattern (case-insensitive, first matching pattern wins) with that step, also plain
+    columns and negative bounds (``vrate <= -2.5`` -> ``vrate <= -2`` with step 1); ``restrict_to_dist_functions``
+    does not apply then.
+
     Args:
         original_query: The query to be normalized.
-        bucket_steps: Bucket width; 0 or negative returns the query unchanged.
+        bucket_steps: Bucket width; 0 or negative returns the query unchanged. Or a dict of per-attribute widths.
         restrict_to_dist_functions: Only bucket comparisons of distance functions (default), else of any expression.
 
     Returns:
         The normalized query.
     """
-    # If bucket_steps is 0 or negative, return original query without distance normalization
-    if float(bucket_steps) <= 0:
-        return original_query
-    steps = Decimal(str(bucket_steps))
-    if not steps.is_finite():
-        return original_query
+    if isinstance(bucket_steps, dict):
+        per_attr = {str(k).lower(): Decimal(str(v)) for k, v in bucket_steps.items()}
+        per_attr = {k: v for k, v in per_attr.items() if v.is_finite() and v > 0}
+        if not per_attr:
+            return original_query
+        allow_negative = True
+    else:
+        # If bucket_steps is 0 or negative, return original query without distance normalization
+        if float(bucket_steps) <= 0:
+            return original_query
+        steps = Decimal(str(bucket_steps))
+        if not steps.is_finite():
+            return original_query
+        allow_negative = False
 
     parsed = sqlglot.parse_one(original_query)
     where = parsed.args.get("where") if isinstance(parsed, exp.Select) else None
     if where is None:
         return parsed.sql()
 
-    def bucketable(side: exp.Expr) -> bool:
+    def step_for(side: exp.Expr) -> Decimal | None:
+        """Bucket width for comparisons of this expression, None if it is not bucketed."""
         while isinstance(side, exp.Paren):
             side = side.this
-        return not restrict_to_dist_functions or (isinstance(side, exp.Func) and is_distance_function(side.sql()))
+        if allow_negative:  # per-attribute steps
+            text = side.sql().lower()
+            return next((v for k, v in per_attr.items() if k in text), None)
+        if not restrict_to_dist_functions or (isinstance(side, exp.Func) and is_distance_function(side.sql())):
+            return steps
+        return None
+
+    def literal(node: exp.Expr) -> Decimal | None:
+        return _numeric_literal(node, allow_negative)
 
     for node in list(where.find_all(exp.Between, *_BUCKET_COMPARISONS)):
         if node.find_ancestor(exp.Select) is not parsed:
@@ -1706,25 +1743,25 @@ def normalize_distance_conditions(original_query: str, bucket_steps: float = 1.0
         if positive is None:
             continue
         if isinstance(node, exp.Between):
-            low, high = _numeric_literal(node.args["low"]), _numeric_literal(node.args["high"])
-            if low is None or high is None or not bucketable(node.this):
+            low, high, step = literal(node.args["low"]), literal(node.args["high"]), step_for(node.this)
+            if low is None or high is None or step is None:
                 continue
-            new_low, new_high = _bucket_bound(low, steps, up=not positive), _bucket_bound(high, steps, up=positive)
+            new_low, new_high = _signed_bucket_bound(low, step, up=not positive), _signed_bucket_bound(high, step, up=positive)
             if new_low is not None and new_high is not None:
                 node.set("low", new_low)
                 node.set("high", new_high)
             continue
         operator = type(node)
-        if _numeric_literal(node.expression) is not None and bucketable(node.this):
+        if literal(node.expression) is not None and (step := step_for(node.this)) is not None:
             literal_arg = "expression"
-        elif _numeric_literal(node.this) is not None and bucketable(node.expression):
+        elif literal(node.this) is not None and (step := step_for(node.expression)) is not None:
             literal_arg, operator = "this", _BUCKET_COMPARISONS[operator]  # 2.5 > DIST(...) is DIST(...) < 2.5
         else:
             continue
-        value = _numeric_literal(node.args[literal_arg])
+        value = literal(node.args[literal_arg])
         assert value is not None
         upper_bound = operator in (exp.LT, exp.LTE)
-        bound = _bucket_bound(value, steps, up=upper_bound == positive)
+        bound = _signed_bucket_bound(value, step, up=upper_bound == positive)
         if bound is not None:
             node.set(literal_arg, bound)
 
@@ -1733,13 +1770,19 @@ def normalize_distance_conditions(original_query: str, bucket_steps: float = 1.0
             continue
         positive = _monotone_polarity(func, where)
         radius = _numeric_literal(func.expressions[2])
-        if positive is None or radius is None:
+        step = step_for(func) if allow_negative else steps  # per-attribute: pattern matched against the call's text
+        if positive is None or radius is None or step is None:
             continue
-        bound = _bucket_bound(radius, steps, up=positive)
+        bound = _bucket_bound(radius, step, up=positive)
         if bound is not None:
             func.expressions[2].replace(bound)
 
     return parsed.sql()
+
+
+def normalize_attribute_conditions(query: str, bucket_steps: dict[str, float]) -> str:
+    """Relax numeric comparisons onto per-attribute bucket grids (normalize_distance_conditions with a dict)."""
+    return normalize_distance_conditions(query, bucket_steps)
 
 
 def _add_constraints_to_query(query: str, add_constraints: dict[str, str]) -> str:
@@ -2053,7 +2096,7 @@ def generate_all_query_hash_pairs(
     partition_join_table: str | None = None,
     warn_no_partition_key: bool = True,
     strip_select: bool = True,
-    bucket_steps: float = 1.0,
+    bucket_steps: float | dict[str, float] | list = 1.0,
     add_constraints: dict[str, str] | None = None,
     remove_constraints_all: list[str] | None = None,
     remove_constraints_add: list[str] | None = None,
@@ -2196,32 +2239,35 @@ def generate_all_query_hash_pairs(
     )
     query_set.update(query_set_diff_combinations)
 
-    # Create bucket variant with normalized distances (Example: 1.6 - 3.6 -> 1 - 4 WITH bucket_steps = 1)
-    nor_dist_query = normalize_distance_conditions(query, bucket_steps=bucket_steps)
+    # Create bucket variants with normalized distances (Example: 1.6 - 3.6 -> 1 - 4 WITH bucket_steps = 1).
+    # A list of bucket_steps yields one bucketed variant set per granularity level (fine to coarse).
+    bucket_levels = bucket_steps if isinstance(bucket_steps, list) else [bucket_steps]
+    nor_dist_queries = [normalize_distance_conditions(query, bucket_steps=b) for b in bucket_levels]
 
-    query_set.update(
-        set(
-            generate_partial_queries(
-                nor_dist_query,
-                partition_key,
-                min_component_size,
-                follow_graph,
-                keep_all_attributes,
-                other_functions_as_distance_conditions=True,  # TODO evaluate if how performance is affected if is turned off
-                auto_detect_partition_join=auto_detect_partition_join,
-                max_component_size=max_component_size,
-                partition_join_table=partition_join_table,
-                warn_no_partition_key=warn_no_partition_key,
-                strip_select=strip_select,
-                skip_partition_key_joins=skip_partition_key_joins,
-                geometry_column=geometry_column,
-                pre_clean_select_clause=pre_clean_select_clause,
-                partition_key_source_table=partition_key_source_table,
-                max_conditions_removed=max_conditions_removed,
-                protected_patterns=protected_patterns,
+    for nor_dist_query in nor_dist_queries:
+        query_set.update(
+            set(
+                generate_partial_queries(
+                    nor_dist_query,
+                    partition_key,
+                    min_component_size,
+                    follow_graph,
+                    keep_all_attributes,
+                    other_functions_as_distance_conditions=True,  # TODO evaluate if how performance is affected if is turned off
+                    auto_detect_partition_join=auto_detect_partition_join,
+                    max_component_size=max_component_size,
+                    partition_join_table=partition_join_table,
+                    warn_no_partition_key=warn_no_partition_key,
+                    strip_select=strip_select,
+                    skip_partition_key_joins=skip_partition_key_joins,
+                    geometry_column=geometry_column,
+                    pre_clean_select_clause=pre_clean_select_clause,
+                    partition_key_source_table=partition_key_source_table,
+                    max_conditions_removed=max_conditions_removed,
+                    protected_patterns=protected_patterns,
+                )
             )
         )
-    )
 
     # Apply constraint modifications to all generated queries
     query_set = _apply_constraint_modifications(
@@ -2233,10 +2279,11 @@ def generate_all_query_hash_pairs(
         # Generate normalized distance variants for modified queries
         additional_normalized_queries = set()
         for q in query_set:
-            if q != query and q != nor_dist_query:  # Avoid re-processing original queries
-                nor_q = normalize_distance_conditions(q, bucket_steps=bucket_steps)
-                if nor_q != q:  # Only add if normalization changed something
-                    additional_normalized_queries.add(nor_q)
+            if q != query and q not in nor_dist_queries:  # Avoid re-processing original queries
+                for b in bucket_levels:
+                    nor_q = normalize_distance_conditions(q, bucket_steps=b)
+                    if nor_q != q:  # Only add if normalization changed something
+                        additional_normalized_queries.add(nor_q)
         query_set.update(additional_normalized_queries)
 
     if canonicalize_queries:
@@ -2686,7 +2733,7 @@ def generate_all_hashes(
     partition_join_table: str | None = None,
     warn_no_partition_key: bool = True,
     strip_select: bool = True,
-    bucket_steps: float = 1.0,
+    bucket_steps: float | dict[str, float] | list = 1.0,
     add_constraints: dict[str, str] | None = None,
     remove_constraints_all: list[str] | None = None,
     remove_constraints_add: list[str] | None = None,
