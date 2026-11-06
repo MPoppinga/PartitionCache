@@ -8,7 +8,7 @@ on:
 
 env:
   CI: true
-  PYTHON_VERSION: "3.12"
+  PYTHON_VERSION: "3.14"
 
 jobs:
   build-postgres-image:

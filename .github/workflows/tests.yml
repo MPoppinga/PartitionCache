@@ -9,10 +9,12 @@ jobs:
   unit-tests:
     name: Unit Tests (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    # rocksdict has no Python 3.15 wheel yet, so the 3.15 job may fail while installing it
+    continue-on-error: ${{ matrix.python-version == '3.15' }}
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.12"]
+        python-version: ["3.11", "3.12", "3.13", "3.14", "3.15"]
 
     steps:
     - name: Checkout repository
@@ -52,7 +54,7 @@ jobs:
     
     - name: Upload coverage to Codecov
       uses: codecov/codecov-action@v4
-      if: matrix.python-version == '3.12'
+      if: matrix.python-version == '3.14'
       with:
         file: ./coverage.xml
         flags: unittests

@@ -20,7 +20,7 @@ P = ParamSpec("P")
 R = TypeVar("R")
 
 
-def _ends_read_transaction(fn: Callable[P, R]) -> Callable[P, R]:  # noqa: UP047 -- PEP 695 syntax needs Python 3.12, package supports 3.10
+def _ends_read_transaction(fn: Callable[P, R]) -> Callable[P, R]:  # ParamSpec instead of PEP 695 type parameters: the package supports Python 3.11
     """Mark a read-only handler method so it leaves the connection idle. See _read_txn."""
 
     @wraps(fn)

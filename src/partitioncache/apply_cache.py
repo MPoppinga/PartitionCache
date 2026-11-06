@@ -1451,11 +1451,11 @@ def _check_cost_gate(query: str, cost_estimator: Callable[[str], float | None] |
     return gated, {"cost_gated": int(gated), "query_cost": round(cost)}
 
 
-# ParamSpec instead of PEP 695 type parameters: the package supports Python 3.10
+# ParamSpec instead of PEP 695 type parameters: the package supports Python 3.11
 _P = ParamSpec("_P")
 
 
-def _runs_uncached_on_sql_errors(func: Callable[_P, tuple[str, dict[str, int]]]) -> Callable[_P, tuple[str, dict[str, int]]]:  # noqa: UP047
+def _runs_uncached_on_sql_errors(func: Callable[_P, tuple[str, dict[str, int]]]) -> Callable[_P, tuple[str, dict[str, int]]]:
     """Return the query unchanged when the cache cannot process its SQL, instead of failing the query.
 
     The cache is an optimization: SQL that the variant generation or the rewrite cannot parse or handle makes the

@@ -15,7 +15,7 @@ The complete workflow demonstrates:
 ## Prerequisites
 
 1. **Docker and Docker Compose** for PostGIS database
-2. **Python 3.10+** with PartitionCache installed
+2. **Python 3.11+** with PartitionCache installed
 3. **OpenStreetMap POI data** processed (see [OpenStreetMap POI Example](../examples/openstreetmap_poi/README.md))
 
 ## Quick Start
