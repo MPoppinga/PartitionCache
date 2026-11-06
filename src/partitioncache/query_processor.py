@@ -1770,9 +1770,10 @@ def normalize_distance_conditions(
             continue
         positive = _monotone_polarity(func, where)
         radius = _numeric_literal(func.expressions[2])
-        if positive is None or radius is None:
+        step = step_for(func) if allow_negative else steps  # per-attribute: pattern matched against the call's text
+        if positive is None or radius is None or step is None:
             continue
-        bound = _bucket_bound(radius, steps, up=positive)
+        bound = _bucket_bound(radius, step, up=positive)
         if bound is not None:
             func.expressions[2].replace(bound)
 

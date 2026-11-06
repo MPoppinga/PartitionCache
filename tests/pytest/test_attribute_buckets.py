@@ -65,3 +65,10 @@ def test_lazy_lookup_keep_all_attributes_probes_fewer_variants():
     n_loose = len(loose.get_intersected_lazy.call_args.args[0])
     n_strict = len(strict.get_intersected_lazy.call_args.args[0])
     assert 0 < n_strict < n_loose
+
+
+def test_radius_of_st_dwithin_with_per_attribute_steps():
+    q = "SELECT * FROM p AS a, p AS b WHERE ST_DWithin(a.g, b.g, 150) AND ABS(a.alt - b.alt) < 30"
+    out = normalize_attribute_conditions(q, {"st_dwithin": 1000, "abs(": 50})
+    assert "ST_DWITHIN(a.g, b.g, 1000)" in out and "< 50" in out
+    assert "ST_DWITHIN(a.g, b.g, 150)" in normalize_attribute_conditions(q, {"abs(": 50})  # radius not matched: unchanged
