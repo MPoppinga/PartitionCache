@@ -12,7 +12,7 @@ import psycopg
 from psycopg import sql
 from psycopg.pq import TransactionStatus
 
-from partitioncache.cache_handler.abstract import AbstractCacheHandler_Lazy
+from partitioncache.cache_handler.abstract import LAZY_ALL_KEYS_PLACEHOLDER, AbstractCacheHandler_Lazy
 
 logger = getLogger("PartitionCache")
 
@@ -479,6 +479,27 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
         )
         result = self.cursor.fetchone()
         return result is not None
+
+    @staticmethod
+    def _lazy_keys_subquery(keys_array: sql.Composable, partition_key: str) -> str:
+        """Return the lazy intersection subquery for a scalar SQL array of partition keys.
+
+        ``keys_array`` must be ``'{}'`` for an empty intersection (no partition can match) and NULL when the cache
+        entries it reads are gone at execution time, e.g. evicted after filter_existing_keys found them. Then
+        LAZY_ALL_KEYS_PLACEHOLDER applies, which extend_query_with_partition_keys_lazy replaces with all keys of the
+        restricted table, so the restriction falls away instead of emptying the result.
+        """
+        return (
+            sql.SQL("SELECT unnest(COALESCE({keys_array}, {all_keys})) AS {partition_col}")
+            .format(keys_array=keys_array, all_keys=sql.SQL(LAZY_ALL_KEYS_PLACEHOLDER), partition_col=sql.Identifier(partition_key))
+            .as_string()
+        )
+
+    def _all_entries_present_sql(self, keys: set[str], partition_key: str) -> sql.Composed:
+        """Return an SQL condition that is true while every one of ``keys`` still has a non-NULL cache entry."""
+        return sql.SQL("((SELECT count(*) FROM {table} WHERE query_hash = ANY({keys}) AND partition_keys IS NOT NULL) = {count})").format(
+            table=sql.Identifier(f"{self.tableprefix}_cache_{partition_key}"), keys=sql.Literal(sorted(keys)), count=sql.Literal(len(keys))
+        )
 
     @_ends_read_transaction
     def filter_existing_keys(self, keys: set, partition_key: str = "partition_key", check_query: bool = False) -> set:

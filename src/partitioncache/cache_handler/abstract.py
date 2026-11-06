@@ -4,6 +4,13 @@ from logging import getLogger
 
 logger = getLogger("PartitionCache")
 
+# Stands in for "every partition key" in a lazy intersection subquery: a handler writes
+# ``COALESCE(<keys array>, LAZY_ALL_KEYS_PLACEHOLDER)`` where the keys array is NULL when the cache
+# entries it was built from no longer exist (e.g. evicted between the lookup and the execution).
+# extend_query_with_partition_keys_lazy replaces it with all keys of the restricted table, so the
+# restriction then falls away. Used unreplaced it is a plain NULL, which keeps the old result.
+LAZY_ALL_KEYS_PLACEHOLDER = "/* partitioncache: all partition keys */ NULL"
+
 
 class AbstractCacheHandler(ABC):
     """
