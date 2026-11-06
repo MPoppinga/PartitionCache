@@ -484,25 +484,7 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
                 return None, 0
 
             intersect_sql_str = self.get_intersected_dilated_sql_wk(filtered_keys, partition_key, dilation)
-            r = (
-                sql.SQL("""(
-       WITH bit_result AS (
-            {0}
-        ),
-        numbered_bits AS (
-            SELECT
-                bit_result,
-                generate_series(0, bit_length(bit_result) - 1) AS bit_index
-            FROM bit_result
-        )
-        SELECT unnest(array_agg(bit_index)) AS {1}
-        FROM numbered_bits
-        WHERE get_bit(bit_result, bit_index) = 1)
-        """)
-                .format(sql.SQL(intersect_sql_str), sql.Identifier(partition_key))  # type: ignore[arg-type]
-                .as_string()
-            )
-            return r, len(filtered_keys)
+            return self._lazy_keys_subquery(self._set_bits_array_sql(intersect_sql_str), partition_key), len(filtered_keys)
         except Exception as e:
             logger.error(f"Failed to get dilated lazy intersection in partition {partition_key}: {e}")
             return None, 0
@@ -533,10 +515,17 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
             return None, 0
 
         intersect_sql_str = self.get_intersected_sql_wk(filtered_keys, partition_key)
+        return self._lazy_keys_subquery(self._set_bits_array_sql(intersect_sql_str), partition_key), len(filtered_keys)
 
-        r = (
-            sql.SQL("""(
-       WITH bit_result AS (
+    @staticmethod
+    def _set_bits_array_sql(intersect_sql_str: str) -> sql.Composed:
+        """Return the indexes of the set bits of a BIT_AND intersection as an SQL array.
+
+        BIT_AND skips missing entries and is NULL only when none is left; the array is then NULL as well. An
+        intersection without set bits gives ``'{}'`` (array_agg over no rows would be NULL).
+        """
+        return sql.SQL("""(
+        WITH bit_result AS (
             {0}
         ),
         numbered_bits AS (
@@ -545,18 +534,9 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
                 generate_series(0, bit_length(bit_result) - 1) AS bit_index
             FROM bit_result
         )
-        SELECT unnest(array_agg(bit_index)) AS {1}
+        SELECT CASE WHEN (SELECT bit_result FROM bit_result) IS NULL THEN NULL ELSE COALESCE(array_agg(bit_index), '{{}}') END
         FROM numbered_bits
-        WHERE get_bit(bit_result, bit_index) = 1)
-        """)
-            .format(
-                sql.SQL(intersect_sql_str),  # type: ignore
-                sql.Identifier(partition_key),
-            )
-            .as_string()
-        )
-
-        return r, len(filtered_keys)
+        WHERE get_bit(bit_result, bit_index) = 1)""").format(sql.SQL(intersect_sql_str))  # type: ignore[arg-type]
 
     def _expand_bitsize(self, partition_key: str, max_key: int, current_bitsize: int | None) -> int:
         """Grow the partition's bit arrays so that max_key fits, plus the configured buffer.

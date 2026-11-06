@@ -4,6 +4,7 @@ from logging import getLogger
 
 from psycopg import sql
 
+from partitioncache.cache_handler.abstract import LAZY_ALL_KEYS_PLACEHOLDER
 from partitioncache.cache_handler.postgresql_abstract import PostgreSQLAbstractCacheHandler
 
 logger = getLogger("PartitionCache")
@@ -222,10 +223,16 @@ class PostgreSQLArrayCacheHandler(PostgreSQLAbstractCacheHandler):
             if not filtered_keys:
                 return None, 0
 
-            query = sql.SQL("SELECT unnest(({intersectsql})) as {partition_col}").format(
-                intersectsql=self.get_intersected_sql(filtered_keys, partition_key, datatype), partition_col=sql.Identifier(partition_key)
-            )
-            return query.as_string(), len(filtered_keys)
+            intersection = self.get_intersected_sql(filtered_keys, partition_key, datatype)
+            if self.USE_AGGREGATES and self.array_intersect_agg_available:
+                # The aggregate skips missing entries and is NULL only when none is left
+                keys_array = sql.SQL("({})").format(intersection)
+            else:
+                # The per-key join has no row once one entry is missing, and the text intersection would be empty
+                keys_array = sql.SQL("(CASE WHEN {present} THEN ({intersection}) END)").format(
+                    present=self._all_entries_present_sql(filtered_keys, partition_key), intersection=intersection
+                )
+            return self._lazy_keys_subquery(keys_array, partition_key), len(filtered_keys)
         except Exception as e:
             logger.error(f"Failed to get lazy intersection in partition {partition_key}: {e}")
             return None, 0
@@ -284,9 +291,18 @@ class PostgreSQLArrayCacheHandler(PostgreSQLAbstractCacheHandler):
             if dilation == 0:
                 return self.get_intersected_lazy(filtered_keys, partition_key)
 
-            query = sql.SQL("SELECT v AS {partition_col} FROM ({inner}) AS dilated_intersection").format(
+            # INTERSECT over the per-key sets is empty once one entry is missing, so the keys are used only while all
+            # entries are present, otherwise LAZY_ALL_KEYS_PLACEHOLDER. Unlike an array, the set keeps the planner's
+            # row estimate of the intersection, which picks a hash join for large intersections.
+            present = self._all_entries_present_sql(filtered_keys, partition_key)
+            query = sql.SQL(
+                "SELECT v AS {partition_col} FROM ({inner}) AS dilated_intersection WHERE {present} "
+                "UNION ALL SELECT unnest(COALESCE(NULL::integer[], {all_keys})) WHERE NOT {present}"
+            ).format(
                 partition_col=sql.Identifier(partition_key),
                 inner=self.get_intersected_dilated_sql(filtered_keys, partition_key, dilation),
+                present=present,
+                all_keys=sql.SQL(LAZY_ALL_KEYS_PLACEHOLDER),
             )
             return query.as_string(), len(filtered_keys)
         except Exception as e:

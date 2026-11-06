@@ -21,7 +21,7 @@ import sqlglot
 import sqlglot.errors
 import sqlglot.expressions as exp
 
-from partitioncache.cache_handler.abstract import AbstractCacheHandler, AbstractCacheHandler_Lazy
+from partitioncache.cache_handler.abstract import LAZY_ALL_KEYS_PLACEHOLDER, AbstractCacheHandler, AbstractCacheHandler_Lazy
 from partitioncache.query_processor import compute_buffer_distance, detect_partition_join_from_query, generate_all_hashes, handle_deprecated_kwargs
 from partitioncache.temporal_dilation import compute_dilation_buckets, compute_temporal_window, dilate_bucket_set
 
@@ -727,6 +727,37 @@ def _create_tmp_table_setup_from_subquery(
     return setup_sql, table_name
 
 
+def _all_partition_keys_sql(parsed_query: exp.Expr, p0_alias: str | None, partition_key: str, sql_dialect: str) -> str | None:
+    """Return an SQL array of all partition keys of the tables the lazy restriction applies to.
+
+    It replaces LAZY_ALL_KEYS_PLACEHOLDER, so that a lazy intersection whose cache entries are gone at execution
+    time does not restrict the query. The restriction targets the table with alias ``p0_alias``, or with
+    TMP_TABLE_JOIN and no alias every table of the FROM and JOIN clauses. Returns None when a target is not a
+    plain table (a subquery or a CTE, whose rows a separate statement could not read).
+    """
+    targets: list[exp.Expr]
+    if p0_alias is not None:
+        targets = [table for table in parsed_query.find_all(exp.Table) if table.alias_or_name == p0_alias]
+        del targets[1:]  # the first table with that alias
+    else:
+        # The same clauses TMP_TABLE_JOIN joins the temporary table to
+        clauses: list[exp.Join | exp.From] = list(parsed_query.find_all(exp.Join))
+        from_1st = parsed_query.find(exp.From)
+        if from_1st is not None:
+            clauses.append(from_1st)
+        targets = [clause.this for clause in clauses]
+    cte_names = {cte.alias_or_name for cte in parsed_query.find_all(exp.CTE)}
+    if not targets or any(not isinstance(target, exp.Table) or target.name in cte_names for target in targets):
+        return None
+
+    sources = []
+    for target in targets:
+        table = target.copy()
+        table.set("alias", None)
+        sources.append(f"SELECT {partition_key} AS v FROM {table.sql(dialect=sql_dialect)}")
+    return f"(SELECT array_agg(DISTINCT pcache_all_keys.v) FROM ({' UNION ALL '.join(sources)}) AS pcache_all_keys WHERE pcache_all_keys.v IS NOT NULL)"
+
+
 def extend_query_with_partition_keys_lazy(
     query: str,
     lazy_subquery: str,
@@ -767,6 +798,17 @@ def extend_query_with_partition_keys_lazy(
         p0_alias = find_p0_alias(query, partition_key, auto_detect_partition_join, partition_join_table)
 
     parsed_query = sqlglot.parse_one(query, read=sql_dialect)
+
+    if LAZY_ALL_KEYS_PLACEHOLDER in lazy_subquery:
+        # The handler's subquery reads cache entries that may be evicted before it runs; it then falls back to all keys
+        all_keys = _all_partition_keys_sql(parsed_query, p0_alias, partition_key, sql_dialect)
+        if all_keys is None:
+            logger.debug(
+                f"The cache restriction targets no plain table (alias {p0_alias!r}); if its cache entries are evicted before the query runs, "
+                "the query returns no rows"
+            )
+        else:
+            lazy_subquery = lazy_subquery.replace(LAZY_ALL_KEYS_PLACEHOLDER, all_keys)
 
     if method == "IN_SUBQUERY":
         partition_expr = sqlglot.parse_one(f"{p0_alias}.{partition_key} IN ({lazy_subquery})", read=sql_dialect)
