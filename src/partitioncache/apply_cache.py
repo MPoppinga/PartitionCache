@@ -70,6 +70,45 @@ def _is_temporal(temporal_bucket_width: float | None, dilation_buckets: int | No
     return temporal_bucket_width is not None or dilation_buckets is not None
 
 
+def _temporal_lookup(
+    query: str,
+    cache_handler: AbstractCacheHandler,
+    partition_key: str,
+    temporal_bucket_width: float | None,
+    dilation_buckets: int | None,
+    temporal_column: str | None,
+    partition_key_source_table: str | None,
+    lazy: bool,
+) -> tuple[int, str | None]:
+    """The dilation for a lookup, and why it must run without the cache (None if it may use it).
+
+    Reasons, also reported as ``uncached_reason`` in the statistics of apply_cache and apply_cache_lazy:
+    ``temporal_unbounded`` (rows of the partition key's table without a time bound to each other),
+    ``no_dilated_lazy`` (a lazy lookup on a handler without a dilated intersection) and ``non_integer_key``
+    (buckets of a non-integer partition key cannot be dilated). In each case the cache would return too few
+    partition keys.
+    """
+    dilation = _resolve_dilation(query, temporal_bucket_width, dilation_buckets, temporal_column, partition_key, partition_key_source_table)
+    if dilation is None:
+        logger.warning(f"Rows of the query are not bounded in time against each other on '{temporal_column}'; the query runs without the cache")
+        return 0, "temporal_unbounded"
+    if dilation == 0:
+        return 0, None
+    if lazy and getattr(cache_handler, "get_intersected_dilated_lazy", None) is None:
+        # The Python fallback materialises the sets and cannot produce a subquery
+        logger.warning(f"{type(cache_handler).__name__} has no lazy dilated intersection; the query runs without the cache (the non-lazy API supports dilation)")
+        return dilation, "no_dilated_lazy"
+    datatype = cache_handler.get_datatype(partition_key)
+    if datatype is not None and datatype != "integer":
+        logger.warning(f"Temporal dilation needs an integer partition key; '{partition_key}' is {datatype}, the query runs without the cache")
+        return dilation, "non_integer_key"
+    return dilation, None
+
+
+def _uncached_stats(reason: str, gate_stats: dict[str, int]) -> dict[str, Any]:
+    return {"generated_variants": 0, "cache_hits": 0, "enhanced": 0, "p0_rewritten": 0, "uncached_reason": reason, **gate_stats}
+
+
 def _intersect_dilated_fallback(
     cache_handler: AbstractCacheHandler, hashes: set[str], partition_key: str, dilation: int
 ) -> tuple[set[int] | None, int]:
@@ -163,9 +202,10 @@ def get_partition_keys(
     if "auto_detect_partition_join" in deprecated:
         auto_detect_partition_join = deprecated["auto_detect_partition_join"]
 
-    dilation = _resolve_dilation(query, temporal_bucket_width, dilation_buckets, temporal_column, partition_key, partition_key_source_table)
-    if dilation is None:
-        logger.warning(f"Rows of the query are not bounded in time against each other on '{temporal_column}'; the query runs without the cache")
+    dilation, uncached_reason = _temporal_lookup(
+        query, cache_handler, partition_key, temporal_bucket_width, dilation_buckets, temporal_column, partition_key_source_table, lazy=False
+    )
+    if uncached_reason is not None:
         return None, 0, 0
     if _is_temporal(temporal_bucket_width, dilation_buckets):
         skip_partition_key_joins = True
@@ -282,14 +322,10 @@ def get_partition_keys_lazy(
     if not isinstance(cache_handler, AbstractCacheHandler_Lazy):
         raise ValueError("Cache handler does not support lazy intersection")
 
-    dilation = _resolve_dilation(query, temporal_bucket_width, dilation_buckets, temporal_column, partition_key, partition_key_source_table)
-    if dilation is None:
-        logger.warning(f"Rows of the query are not bounded in time against each other on '{temporal_column}'; the query runs without the cache")
-        return None, 0, 0
-    if dilation > 0 and getattr(cache_handler, "get_intersected_dilated_lazy", None) is None:
-        # The Python fallback materialises the sets and cannot produce a subquery; skipping the dilation would
-        # return too few partition keys, so the query runs without the cache
-        logger.warning(f"{type(cache_handler).__name__} has no lazy dilated intersection; the query runs without the cache (the non-lazy API supports dilation)")
+    dilation, uncached_reason = _temporal_lookup(
+        query, cache_handler, partition_key, temporal_bucket_width, dilation_buckets, temporal_column, partition_key_source_table, lazy=True
+    )
+    if uncached_reason is not None:
         return None, 0, 0
     if _is_temporal(temporal_bucket_width, dilation_buckets):
         skip_partition_key_joins = True
@@ -1632,6 +1668,13 @@ def apply_cache_lazy(
     if gated:
         return query, {"generated_variants": 0, "cache_hits": 0, "enhanced": 0, "p0_rewritten": 0, **gate_stats}
 
+    if _is_temporal(temporal_bucket_width, dilation_buckets):
+        _, uncached_reason = _temporal_lookup(
+            query, cache_handler, partition_key, temporal_bucket_width, dilation_buckets, temporal_column, partition_key_source_table, lazy=True
+        )
+        if uncached_reason is not None:
+            return query, _uncached_stats(uncached_reason, gate_stats)
+
     # Spatial mode is selected by passing a geometry column
     if geometry_column is not None:
         # Spatial path: generate hashes once, use get_spatial_filter_lazy() directly.
@@ -1957,6 +2000,13 @@ def apply_cache(
     gated, gate_stats = _check_cost_gate(query, cost_estimator, min_query_cost)
     if gated:
         return query, {"generated_variants": 0, "cache_hits": 0, "enhanced": 0, "p0_rewritten": 0, **gate_stats}
+
+    if _is_temporal(temporal_bucket_width, dilation_buckets):
+        _, uncached_reason = _temporal_lookup(
+            query, cache_handler, partition_key, temporal_bucket_width, dilation_buckets, temporal_column, partition_key_source_table, lazy=False
+        )
+        if uncached_reason is not None:
+            return query, _uncached_stats(uncached_reason, gate_stats)
 
     # Spatial mode is selected by passing a geometry column
     if geometry_column is not None:
