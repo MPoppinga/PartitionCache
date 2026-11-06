@@ -88,6 +88,8 @@ def _temporal_lookup(
     (buckets of a non-integer partition key cannot be dilated). In each case the cache would return too few
     partition keys.
     """
+    if lazy and not isinstance(cache_handler, AbstractCacheHandler_Lazy):
+        raise ValueError("Cache handler does not support lazy intersection")  # a usage error, not a reason to run uncached
     dilation = _resolve_dilation(query, temporal_bucket_width, dilation_buckets, temporal_column, partition_key, partition_key_source_table)
     if dilation is None:
         logger.warning(f"Rows of the query are not bounded in time against each other on '{temporal_column}'; the query runs without the cache")

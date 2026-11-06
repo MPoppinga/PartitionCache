@@ -273,3 +273,13 @@ class TestUncachedReason:
         _, stats = apply_cache_lazy(self.QUERY, handler, "w", **self.TEMPORAL)
         assert "uncached_reason" not in stats
         handler.get_intersected_dilated_lazy.assert_called_once()
+
+    def test_lazy_call_with_a_non_lazy_handler_still_raises(self):
+        from unittest.mock import MagicMock
+
+        from partitioncache.apply_cache import apply_cache_lazy
+        from partitioncache.cache_handler.abstract import AbstractCacheHandler
+
+        handler = MagicMock(spec=AbstractCacheHandler)
+        with pytest.raises(ValueError, match="does not support lazy intersection"):
+            apply_cache_lazy(self.QUERY, handler, "w", **self.TEMPORAL)
