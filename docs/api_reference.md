@@ -667,6 +667,8 @@ if lazy_subquery:
     """
 ```
 
+The PostgreSQL handlers (`postgresql_array`, `postgresql_bit`, `postgresql_roaringbit`) read the cache entries when the query runs, not when the subquery is built. If entries are evicted in between, the subquery falls back to a placeholder that `extend_query_with_partition_keys_lazy` (and `apply_cache_lazy`) replace with all partition keys of the restricted table, so the query runs without the restriction instead of returning no rows. A subquery embedded by hand, as above, keeps the placeholder as `NULL` and returns no rows in that case.
+
 ### PartitionCacheHelper
 
 High-level wrapper providing additional convenience methods and validation.
