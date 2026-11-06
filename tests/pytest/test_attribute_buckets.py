@@ -72,3 +72,81 @@ def test_radius_of_st_dwithin_with_per_attribute_steps():
     out = normalize_attribute_conditions(q, {"st_dwithin": 1000, "abs(": 50})
     assert "ST_DWITHIN(a.g, b.g, 1000)" in out and "< 50" in out
     assert "ST_DWITHIN(a.g, b.g, 150)" in normalize_attribute_conditions(q, {"abs(": 50})  # radius not matched: unchanged
+
+
+def test_negative_lower_bound_rounds_down():
+    """Rounding a negative lower bound toward zero would tighten it (vrate >= -2 drops vrate = -2.3)."""
+    out = normalize_attribute_conditions("SELECT * FROM t AS t1 WHERE t1.vrate >= -2.5 AND t1.v > -0.5", {"vrate": 1, "v": 1})
+    assert "t1.vrate >= -3" in out
+    assert "t1.v > -1" in out
+
+
+def test_float_steps_leave_plain_attributes_and_negative_bounds_alone():
+    query = "SELECT * FROM t AS t1 WHERE t1.a <= 2.5 AND DIST(t1.x, t1.y) >= -2.5"
+    assert normalize_attribute_conditions(query, {}) == query
+    from partitioncache.query_processor import normalize_distance_conditions
+
+    assert normalize_distance_conditions(query, 1.0) == "SELECT * FROM t AS t1 WHERE t1.a <= 2.5 AND DIST(t1.x, t1.y) >= -2.5"
+
+
+def test_every_row_of_the_query_satisfies_the_bucketed_query():
+    import random
+    import sqlite3
+
+    rng = random.Random(3)
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE t (pk INTEGER, a REAL, b REAL)")
+    conn.executemany("INSERT INTO t VALUES (?, ?, ?)", [(i, rng.uniform(-10, 10), rng.uniform(-10, 10)) for i in range(300)])
+    conditions = [
+        "t1.a <= -2.5",
+        "t1.a >= -2.5",
+        "NOT t1.a < -2.5",
+        "t1.a BETWEEN -3.5 AND -1.5 OR t1.b > 4.2",
+        "NOT (t1.a > 1.5 AND -0.5 >= t1.b)",
+        "t1.a NOT BETWEEN -1.5 AND 2.5",
+        "ABS(t1.a - t1.b) < 3.3",
+    ]
+    for condition in conditions:
+        query = f"SELECT t1.pk FROM t AS t1 WHERE {condition}"
+        original = set(conn.execute(query))
+        bucketed = normalize_attribute_conditions(query, {"t1.a": 2, "b": 0.5, "abs(": 1})
+        assert bucketed != query, condition
+        assert original <= set(conn.execute(bucketed)), (condition, bucketed)
+
+
+def test_lookup_entry_points_pass_keep_all_attributes():
+    from unittest.mock import MagicMock
+
+    from partitioncache.apply_cache import apply_cache, apply_cache_lazy, get_partition_keys
+    from partitioncache.cache_handler.abstract import AbstractCacheHandler_Lazy
+
+    q = "SELECT * FROM t AS t1, t AS t2 WHERE t1.pk = t2.pk AND t1.a = 1 AND t1.b = 2 AND t2.c = 3"
+
+    def probed(call, method_name, **kwargs):
+        handler = MagicMock(spec=AbstractCacheHandler_Lazy)
+        handler.get_intersected_lazy.return_value = (None, 0)
+        handler.get_intersected.return_value = (None, 0)
+        call(q, handler, "pk", min_component_size=1, bucket_steps=0, **kwargs)
+        return len(getattr(handler, method_name).call_args.args[0])
+
+    for call, method_name in ((apply_cache_lazy, "get_intersected_lazy"), (apply_cache, "get_intersected"), (get_partition_keys, "get_intersected")):
+        assert 0 < probed(call, method_name, keep_all_attributes=True) < probed(call, method_name)
+
+
+def test_cli_bucket_steps_accepts_numbers_dicts_and_levels():
+    import argparse
+
+    import pytest
+
+    from partitioncache.cli.common_args import parse_bucket_steps
+
+    assert parse_bucket_steps("0.5") == 0.5
+    assert parse_bucket_steps('{"alt": 500, "vrate": 1}') == {"alt": 500.0, "vrate": 1.0}
+    assert parse_bucket_steps('[1, {"alt": 2000}]') == [1.0, {"alt": 2000.0}]
+    for bad in ("x", '{"a": "b"}', "[[1]]", "true"):
+        with pytest.raises(argparse.ArgumentTypeError):
+            parse_bucket_steps(bad)
+    # The CLI's float conversion gives the same variants as the integer steps of the Python API
+    assert generate_all_query_hash_pairs(Q, "flight_id", bucket_steps=parse_bucket_steps('{"alt_max": 500}')) == generate_all_query_hash_pairs(
+        Q, "flight_id", bucket_steps={"alt_max": 500}
+    )

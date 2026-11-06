@@ -250,11 +250,14 @@ pcache-add [options] --partition-key PARTITION_KEY {--direct|--queue|--queue-ori
 Advanced options for controlling how query variants are generated for better cache coverage:
 
 #### Distance Normalization
-- `--bucket-steps FLOAT` - Step size for normalizing distance conditions
+- `--bucket-steps STEPS` - Step size for normalizing distance conditions (number, JSON dict or JSON list)
   - **Default**: `1.0` (or `PARTITION_CACHE_BUCKET_STEPS` environment variable)
   - **Purpose**: Controls bucketing of distance ranges for better cache hits
   - **Example**: With `--bucket-steps 0.5`, distance `BETWEEN 1.6 AND 3.6` becomes `BETWEEN 1.5 AND 4.0`
   - The radius of `ST_DWithin`/`ST_DFullyWithin` is rounded up the same way: with `--bucket-steps 50`, `ST_DWithin(a.geom, b.geom, 120)` becomes `ST_DWithin(a.geom, b.geom, 150)`
+  - **Per attribute**: a JSON dict `{pattern: step}` buckets every numeric comparison whose expression contains the pattern, also plain columns and negative bounds: `--bucket-steps '{"alt_max": 500, "vrate": 1}'` turns `alt_max <= 650` into `alt_max <= 1000` and `vrate <= -1.5` into `vrate <= -1`
+  - **Levels**: a JSON list adds one bucketed variant set per entry, e.g. `--bucket-steps '[{"alt_max": 500}, {"alt_max": 2000}]'`
+  - Lookups must use the same `bucket_steps`, or the bucketed variants are never hit
   - Choose the step in the unit of the distances: with geometries in degrees (SRID 4326) the default `1.0` turns `ST_DWithin(a.geom, b.geom, 0.001)` into a radius of 1, a variant that is expensive to fill and hardly filters
 
 #### Partition Key Joins
@@ -564,7 +567,7 @@ Cache-aware optimization leverages existing cache entries to restrict the search
 Controls how query variants are generated when processing original queries from the queue:
 
 #### Distance Normalization
-- `--bucket-steps FLOAT` - Step size for normalizing distance conditions
+- `--bucket-steps STEPS` - Step size for normalizing distance conditions (number, JSON dict or JSON list)
   - **Default**: `1.0` (or `PARTITION_CACHE_BUCKET_STEPS` environment variable)
 
 #### Partition Key Joins

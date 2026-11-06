@@ -105,7 +105,8 @@ Retrieves cached partition keys for a query with comprehensive statistics.
 - `follow_graph` (bool): If True, only connected partial queries are considered (default: True)
 - `auto_detect_partition_join` (bool): Whether to auto-detect partition-join tables (default: True)
 - `partition_join_table` (str | None): Explicitly specified partition-join table alias or name
-- `bucket_steps` (float): Step size for normalizing distance conditions (default: 1.0)
+- `bucket_steps` (float | dict | list): Step size for normalizing distance conditions (default: 1.0). A dict `{pattern: step}` buckets every numeric comparison whose expression contains the pattern (case-insensitive substring, first match wins), also plain columns, negative bounds and the `ST_DWithin` radius (pattern matched against the call), e.g. `{"alt_max": 500, "vrate": 1}`. A list of numbers and dicts adds one bucketed variant set per level, e.g. `[{"alt_max": 500}, {"alt_max": 2000}]`. Bounds are always rounded outward, so the variants only loosen the query.
+- `keep_all_attributes` (bool): If True, probe only the variants that population (`generate_all_query_hash_pairs`) creates by default, not also those with single-table attribute conditions removed: fewer hashes and faster variant generation, fewer hits (default: False)
 - `add_constraints` (dict[str, str] | None): Dict mapping table names to constraints to add
 - `remove_constraints_all` (list[str] | None): List of attribute names to remove from all query variants
 - `remove_constraints_add` (list[str] | None): List of attribute names to remove, creating additional variants
@@ -220,7 +221,8 @@ Lazy counterpart to `extend_query_with_partition_keys`: integrates a lazy SQL su
 - `p0_table_name` (str | None, optional): Name of the p0 table. Defaults to `{partition_key}_mv`
 - `auto_detect_partition_join` (bool, optional): Whether to auto-detect partition-join tables (default: True)
 - `partition_join_table` (str | None, optional): Explicitly specified partition-join table alias or name
-- `bucket_steps` (float, optional): Step size for normalizing distance conditions (default: 1.0)
+- `bucket_steps` (float | dict | list, optional): Step size for normalizing distance conditions (default: 1.0); per-attribute dict and levels as for `get_partition_keys`
+- `keep_all_attributes` (bool, optional): Probe only the variants population creates by default (default: False), see `get_partition_keys`
 - `add_constraints` (dict[str, str] | None, optional): Dict mapping table names to constraints to add
 - `remove_constraints_all` (list[str] | None, optional): List of attribute names to remove from all query variants
 - `remove_constraints_add` (list[str] | None, optional): List of attribute names to remove, creating additional variants
