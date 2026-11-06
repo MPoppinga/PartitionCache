@@ -66,8 +66,34 @@ def _parse_duration_arg(value: str, arg_name: str) -> int:
         raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
+def processor_cron_schedule(frequency_seconds: int) -> str:
+    """Return the pg_cron schedule for a processor frequency, as partitioncache_processor_cron_schedule does in SQL.
+
+    pg_cron takes '[1-59] seconds' or a five-field cron expression whose step stays within its field, so only
+    1-59 seconds, whole minutes up to 59, whole hours up to 23 and one day can be scheduled. Other values raise
+    ValueError instead of being changed to a different frequency.
+    """
+    if 1 <= frequency_seconds <= 59:
+        return f"{frequency_seconds} seconds"
+    if frequency_seconds % 60 == 0 and 1 <= frequency_seconds // 60 <= 59:
+        return f"*/{frequency_seconds // 60} * * * *"
+    if frequency_seconds % 3600 == 0 and 1 <= frequency_seconds // 3600 <= 23:
+        return f"0 */{frequency_seconds // 3600} * * *"
+    if frequency_seconds == 86400:
+        return "0 0 * * *"
+    raise ValueError(
+        f"A processor frequency of {frequency_seconds} seconds cannot be scheduled with pg_cron; "
+        "use 1-59 seconds, whole minutes up to 59, whole hours up to 23, or one day"
+    )
+
+
 def _parse_frequency_seconds_arg(value: str) -> int:
-    return _parse_duration_arg(value, "--frequency")
+    seconds = _parse_duration_arg(value, "--frequency")
+    try:
+        processor_cron_schedule(seconds)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+    return seconds
 
 
 def _parse_timeout_seconds_arg(value: str) -> int:
