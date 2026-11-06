@@ -226,6 +226,7 @@ def get_partition_keys_lazy(
     dilation_buckets: int | None = None,
     temporal_column: str | None = None,
     partition_key_source_table: str | None = None,
+    keep_all_attributes: bool = False,
     **kwargs: Any,
 ) -> tuple[str | None, int, int]:
     """
@@ -252,6 +253,9 @@ def get_partition_keys_lazy(
         temporal_column: The time column the partition key buckets; required with ``temporal_bucket_width``.
             With either temporal parameter, variants are generated without partition key joins, and a query
             whose rows are not bounded in time against each other runs without the cache.
+        keep_all_attributes: If False (default), lookup also probes variants with single-table attribute
+            conditions removed (more hits, more variant-generation cost). True probes exactly the variants
+            that generate_all_query_hash_pairs produces with its defaults.
 
     Returns:
         tuple[str, int, int]: A tuple containing:
@@ -291,7 +295,7 @@ def get_partition_keys_lazy(
         query=query,
         partition_key=partition_key,
         min_component_size=min_component_size,
-        fix_attributes=False,
+        fix_attributes=keep_all_attributes,
         canonicalize_queries=canonicalize_queries,
         follow_graph=follow_graph,
         auto_detect_partition_join=auto_detect_partition_join,
