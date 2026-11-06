@@ -742,7 +742,7 @@ pcache-postgresql-queue-processor disable
 ```bash
 pcache-postgresql-queue-processor update-config [--frequency DURATION] [--timeout DURATION] [--max-jobs COUNT]
 ```
-- `--frequency DURATION` - Processing frequency (accepts seconds or duration format: `30`, `30s`, `5m`, `2h`, `1d`). pg_cron can schedule 1-59 seconds, whole minutes up to 59, whole hours up to 23 and one day; other values (e.g. `90`) are rejected
+- `--frequency DURATION` - Processing frequency (accepts seconds or duration format: `30`, `30s`, `5m`, `2h`, `1d`). pg_cron can schedule 1-59 seconds, whole minutes up to 59, whole hours up to 23 and one day; other values (e.g. `90`) are rejected. A step that does not divide the hour or the day restarts at each full hour or midnight (e.g. `7m` runs at :56 and again at :00, `23h` at 23:00 and 00:00)
 - `--timeout DURATION` - Job timeout (accepts seconds or duration format: `30`, `30s`, `5m`, `2h`, `1d`)
 - `--max-jobs COUNT` - Maximum concurrent jobs
 - **Purpose**: Tune performance for your workload

@@ -872,6 +872,17 @@ jobs:
           tests/integration/test_error_recovery.py::TestQueueErrorRecovery::test_invalid_cron_job_handling \
           -v -rs
 
+    - name: Run pg_cron schedule tests
+      shell: micromamba-shell {0}
+      env:
+        PARTITIONCACHE_TEST_PG_HOST: localhost
+        PARTITIONCACHE_TEST_PG_PORT: 5432
+        PARTITIONCACHE_TEST_PG_USER: integration_user
+        PARTITIONCACHE_TEST_PG_PASSWORD: integration_password
+        PARTITIONCACHE_TEST_REQUIRE_PG_CRON: "1"
+      run: |
+        PARTITIONCACHE_TEST_PG_DB="$PG_DBNAME" python -m pytest tests/pytest/test_processor_cron_schedule.py -v -rs
+
     - name: Upload artifacts
       uses: actions/upload-artifact@v4
       if: always()

@@ -101,12 +101,48 @@ def test_sql_and_python_schedule_the_same_frequencies(pg_conn):
         assert _sql_schedule(pg_conn, seconds) == expected, seconds
 
 
-def test_pg_cron_accepts_every_produced_schedule(pg_conn):
-    with pg_conn.cursor() as cur:
+def _require_pg_cron(conn):
+    with conn.cursor() as cur:
         cur.execute("SELECT 1 FROM pg_extension WHERE extname = 'pg_cron'")
         if cur.fetchone() is None:
+            if os.getenv("PARTITIONCACHE_TEST_REQUIRE_PG_CRON"):
+                pytest.fail("PARTITIONCACHE_TEST_REQUIRE_PG_CRON is set but pg_cron is not installed in this database")
             pytest.skip("pg_cron is not installed in this database")
+
+
+def test_pg_cron_accepts_every_produced_schedule(pg_conn):
+    _require_pg_cron(pg_conn)
+    with pg_conn.cursor() as cur:
         schedules = sorted({processor_cron_schedule(s) for s in [*range(1, 60), *range(60, 3600, 60), *range(3600, 86401, 3600)]})
         for schedule in schedules:
             cur.execute("SELECT cron.unschedule(cron.schedule('partitioncache_schedule_probe', %s, 'SELECT 1'))", (schedule,))
             assert cur.fetchone() == (True,), schedule
+
+
+def test_config_trigger_rejects_or_schedules_the_frequency(pg_conn):
+    """The config trigger refuses a frequency pg_cron cannot schedule and schedules a whole hour as an hour step."""
+    import uuid
+
+    import psycopg
+
+    _require_pg_cron(pg_conn)
+    queue_prefix = f"cron_schedule_{uuid.uuid4().hex[:8]}"
+    config_table = f"{queue_prefix}_processor_config"
+    insert = (
+        f"INSERT INTO {config_table} (job_name, enabled, max_parallel_jobs, frequency_seconds, table_prefix, queue_prefix, cache_backend, target_database) "
+        f"VALUES (%s, false, 1, %s, 'unused', '{queue_prefix}', 'array', current_database())"
+    )
+    with pg_conn.cursor() as cur:
+        cur.execute(SQL_CRON_FILE.read_text())
+        cur.execute("SELECT partitioncache_initialize_cron_config_table(%s)", (queue_prefix,))
+        cur.execute("SELECT partitioncache_create_cron_config_trigger(%s)", (queue_prefix,))
+        cur.execute("SAVEPOINT before_insert")
+        with pytest.raises(psycopg.errors.InvalidParameterValue, match="cannot be scheduled with pg_cron"):
+            cur.execute(insert, (f"{queue_prefix}_every_90s", 90))
+        cur.execute("ROLLBACK TO SAVEPOINT before_insert")
+
+        cur.execute(insert, (f"{queue_prefix}_hourly", 3600))
+        cur.execute(f"SELECT (SELECT array_agg(schedule) FROM cron.job WHERE jobid = ANY(c.job_ids)) FROM {config_table} c")
+        assert cur.fetchone() == (["0 */1 * * *"],)
+        cur.execute(f"DELETE FROM {config_table}")  # unschedules the job
+    # pg_conn is rolled back by the fixture, which also drops the table, the trigger and the job

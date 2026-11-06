@@ -96,7 +96,6 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- Trigger function to synchronize config with pg_cron using cross-database scheduling
 -- Function to turn the processor frequency into a pg_cron schedule. pg_cron takes '[1-59] seconds' or a
 -- five-field cron expression whose step stays within its field, so only these frequencies can be scheduled;
 -- any other value is rejected instead of being changed to a different frequency.
@@ -117,6 +116,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql IMMUTABLE;
 
+-- Trigger function to synchronize config with pg_cron using cross-database scheduling
 CREATE OR REPLACE FUNCTION partitioncache_sync_cron_job()
 RETURNS TRIGGER AS $$
 DECLARE
