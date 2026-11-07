@@ -102,4 +102,6 @@ rewritten, stats = apply_cache(
   the only distance condition is under `NOT` or `OR`, in a subquery, or uses a `::geography` cast.
 - Queries with a CTE, a derived table in FROM, a set operation or an outer join also run uncached. Only the anchor
   table's aliases in the outer FROM are restricted.
+- So does a join with a table that has no geometry, e.g. a dimension table (`pois a, categories c WHERE a.cat = c.id`).
+  Its alias is not linked by `ST_DWithin`, and no distance bounds how far its rows lie from the anchor's.
 - The SRID must be metric: the same units as the `ST_DWithin` distances, with non-negative coordinates in range.
