@@ -55,7 +55,8 @@ GridMethod = Literal["CELL_AUTO", "CELL_STAR", "CELL_ARRAY", "CELL_ARRAY_ANCHOR"
 GRID_METHODS: tuple[str, ...] = ("CELL_AUTO", "CELL_STAR", "CELL_ARRAY", "CELL_ARRAY_ANCHOR")
 
 # Schema-qualified body: PG17+ runs CREATE INDEX and ANALYZE with search_path = pg_catalog, pg_temp. No SET
-# clause, because the planner must inline the function for a query to match an expression index on it.
+# clause, which would stop the planner from inlining it (an expression index still matches, but every row it is
+# evaluated for pays a function call).
 CELL_FUNCTION_DDL = f"""
 CREATE OR REPLACE FUNCTION public.{CELL_FUNCTION}(g public.geometry, s float8) RETURNS integer
 LANGUAGE sql IMMUTABLE PARALLEL SAFE
