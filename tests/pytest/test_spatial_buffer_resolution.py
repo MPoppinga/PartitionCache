@@ -46,6 +46,8 @@ def test_explicit_buffer_wins() -> None:
         "SELECT * FROM (SELECT * FROM pois) AS s WHERE s.subtype = 'a'",  # a derived table is not a single table
         # the fragments come from the CTE body, which joins two tables
         "WITH c AS (SELECT p1.name FROM pois AS p1, pois AS p2 WHERE p1.subtype = p2.subtype) SELECT * FROM c",
+        # a set operation: its second branch joins two tables
+        "SELECT p1.geom FROM pois AS p1 UNION SELECT p2.geom FROM pois AS p2, pois AS p3 WHERE p2.subtype = p3.subtype",
     ],
 )
 def test_several_tables_without_distances_need_an_explicit_buffer(query: str) -> None:
