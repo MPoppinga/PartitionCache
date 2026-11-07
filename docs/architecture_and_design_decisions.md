@@ -212,7 +212,9 @@ Before that, `generate_all_query_hash_pairs`, `apply_cache` and `apply_cache_laz
 - The default sqlglot dialect rejects `~`, and it renders `~*` as `REGEXP_I_LIKE`, a function no database provides.
 - A query without `~` is returned unchanged, so its hashes are unaffected.
 - When the cache leaves a query unchanged (no hits, cost gate), `apply_cache` returns the caller's own text.
-- A `~` that is not followed by a string literal is rejected as a `ParseError`, so `apply_cache` runs the query without the cache. PostGIS's bounding-box operator `a.geom ~ b.geom` must not become a regex match.
+- A regex match whose pattern is not a plain string literal is rejected as a `ParseError`, so `apply_cache` runs the query without the cache. PostGIS's bounding-box operators `a.geom ~ b.geom` and `a.geom ~ 'POINT(1 1)'::geometry` must not become regex matches.
+- Rendered for PostgreSQL, as the lazy paths do, `REGEXP_LIKE(a, 'p', 'i')` becomes `a ~* 'p'` again. `src/partitioncache/sqlglot_compat.py` patches sqlglot here, whose PostgreSQL rendering dropped the flag and made the match case-sensitive.
+- The default rendering, which the hashes and the non-lazy rewrite use, keeps `REGEXP_LIKE`. On PostgreSQL 14 or older, such an enhanced query fails (PostgreSQL 14 reaches end of life on 2026-11-12).
 
 `clean_query` performs, in order:
 

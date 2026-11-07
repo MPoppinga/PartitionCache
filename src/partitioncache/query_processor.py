@@ -79,44 +79,46 @@ def _as_regexp_like(node: exp.Expr) -> exp.Expr:
     return node
 
 
+def _require_literal_patterns(parsed: exp.Expr, kinds: tuple[type[exp.Expr], ...]) -> None:
+    """Raise ParseError unless every regex match of ``kinds`` compares against a plain string literal."""
+    for match in parsed.find_all(*kinds):
+        pattern = match.expression
+        if not (isinstance(pattern, exp.Literal) and pattern.is_string):
+            raise ParseError(
+                f"Unsupported '{match.sql()}': PartitionCache reads '~' only as a regex match against a plain string "
+                "literal (a.col ~ 'pattern'), not as a PostGIS bounding-box operator (a.geom ~ b.geom, a.geom ~ 'POINT(1 1)'::geometry)"
+            )
+
+
 def normalize_regex_operators(query: str) -> str:
-    """Rewrite PostgreSQL's regex match operators into ``REGEXP_LIKE`` (PostgreSQL 15+, MySQL 8+).
+    """Rewrite PostgreSQL's regex match operators into ``REGEXP_LIKE``.
 
     The default dialect rejects ``a ~ 'p'`` and ``a !~ 'p'``, and it reads ``a ~* 'p'`` but renders it as
     ``REGEXP_I_LIKE``, which no database provides. These become ``REGEXP_LIKE(a, 'p')`` and
-    ``REGEXP_LIKE(a, 'p', 'i')``, negated with ``NOT``. Any other query is returned unchanged, so its
-    hashes stay the same.
+    ``REGEXP_LIKE(a, 'p', 'i')``, negated with ``NOT``. Rendered for PostgreSQL they are ``~`` and ``~*`` again
+    (``sqlglot_compat`` keeps the flag); the default rendering, which the hashes use, needs PostgreSQL 15+.
+    Any other query is returned unchanged, so its hashes stay the same.
 
     Raises:
-        sqlglot.errors.ParseError: if the query does not parse with either reading, or if a ``~`` is not
-            followed by a string literal. PostGIS uses ``~`` and ``~=`` for bounding-box containment and
-            equality (``a.geom ~ b.geom``), which must not become a regex match. ``apply_cache`` runs such
-            queries without the cache, as before.
+        sqlglot.errors.ParseError: if the query does not parse with either reading, or if a regex match does not
+            compare against a plain string literal. PostGIS uses ``~`` and ``~=`` for bounding-box containment and
+            equality (``a.geom ~ b.geom``, ``a.geom ~ 'POINT(1 1)'::geometry``), which must not become a regex match.
+            ``apply_cache`` runs such queries without the cache, as before.
     """
     if "~" not in query:
         return query
     try:
         parsed = sqlglot.parse_one(query)
     except ParseError as default_error:
-        dialect = _RegexMatchOperators()
         try:
-            query_tokens = dialect.tokenize(query)
-            statements = dialect.parser().parse(query_tokens, query)
+            parsed = sqlglot.parse_one(query, read=_RegexMatchOperators)
         except ParseError:
             raise default_error from None
-        for i, token in enumerate(query_tokens):
-            followed_by_string = i + 1 < len(query_tokens) and query_tokens[i + 1].token_type == TokenType.STRING
-            if token.token_type == TokenType.RLIKE and token.text == "~" and not followed_by_string:
-                raise ParseError(
-                    f"Unsupported '~' at line {token.line}, column {token.col}: PartitionCache reads '~' only as a regex "
-                    "match against a string literal (a.col ~ 'pattern'), not as a PostGIS bounding-box operator"
-                ) from None
-        if len(statements) != 1 or statements[0] is None:
-            raise default_error from None
-        parsed = statements[0]
+        _require_literal_patterns(parsed, (exp.RegexpLike, exp.RegexpILike))
     else:
         if parsed.find(exp.RegexpILike) is None:
             return query
+        _require_literal_patterns(parsed, (exp.RegexpILike,))
     return parsed.transform(_as_regexp_like).sql()
 
 

@@ -90,3 +90,48 @@ def test_apply_cache_runs_postgis_tilde_queries_uncached() -> None:
     query = "SELECT * FROM t AS p1, t AS p2 WHERE p1.geom ~ p2.geom AND p1.zipcode = p2.zipcode"
     sql, stats = apply_cache(query, Mock(), "zipcode")
     assert sql == query and stats["sql_error"] == 1
+
+
+def _lazy_handler():
+    from unittest.mock import MagicMock
+
+    from partitioncache.cache_handler.abstract import AbstractCacheHandler_Lazy
+
+    handler = MagicMock(spec=AbstractCacheHandler_Lazy)
+    handler.filter_existing_keys.return_value = {"h1"}
+    handler.get_intersected_lazy.return_value = ("SELECT 1 AS zipcode", 1)
+    return handler
+
+
+@pytest.mark.parametrize("method", ["IN_SUBQUERY", "TMP_TABLE_IN"])
+@pytest.mark.parametrize("condition", ["p1.name ~* 'abc'", "REGEXP_LIKE(p1.name, 'abc', 'i')"])
+def test_lazy_rendering_keeps_the_case_insensitive_match(method: str, condition: str) -> None:
+    """The lazy paths render for PostgreSQL, where sqlglot used to drop the flag: ~* became ~ and lost rows."""
+    from partitioncache.apply_cache import apply_cache_lazy
+
+    sql, stats = apply_cache_lazy(
+        f"SELECT * FROM t AS p1 WHERE {condition} AND p1.zipcode > 0", _lazy_handler(), "zipcode", method=method, min_component_size=1
+    )
+    assert stats["enhanced"] == 1
+    assert "p1.name ~* 'abc'" in sql
+
+
+def test_postgres_rendering_of_regexp_like_flags() -> None:
+    import sqlglot
+
+    def pg(condition: str) -> str:
+        return sqlglot.parse_one(f"SELECT * FROM t WHERE {condition}").sql(dialect="postgres").removeprefix("SELECT * FROM t WHERE ")
+
+    assert pg("REGEXP_LIKE(t.a, 'x')") == "t.a ~ 'x'"
+    assert pg("NOT REGEXP_LIKE(t.a, 'x', 'i')") == "NOT t.a ~* 'x'"
+    assert pg("REGEXP_LIKE(t.a, 'x', 'c')") == "REGEXP_LIKE(t.a, 'x', 'c')"
+
+
+@pytest.mark.parametrize(
+    "condition",
+    ["a.geom ~ 'POINT(1 1)'::geometry", "a.geom ~ CAST('POINT(1 1)' AS geometry)", "a.name ~* 'x'::text"],
+)
+def test_tilde_against_a_cast_is_rejected(condition: str) -> None:
+    """A PostGIS bounding-box operator with a geometry literal must not become a regex match."""
+    with pytest.raises(ParseError, match="plain string literal"):
+        normalize_regex_operators(BASE + condition)
