@@ -55,6 +55,14 @@ pcache-manage setup {all,queue,cache} [OPTIONS]
   - Creates partition metadata tables
   - **Options:**
     - `--cache BACKEND` - Cache backend to setup (defaults to CACHE_BACKEND env var)
+- `grid` - Set up grid-cell spatial keys for a fact table (see `docs/spatial_grid_keys.md`)
+  - Installs `partitioncache_grid_cell(geometry, float8)`, checks that the table's extent fits the cell packing, and
+    optionally creates the expression indexes the rewritten queries use (connection from `DB_*`)
+  - **Options:**
+    - `--table TABLE` (required), `--geometry-column COL` (default `geom`)
+    - `--cell-size SIZE` (required, repeatable) - one grid key per size, in the SRID's units
+    - `--max-distance D` (required) - largest `ST_DWithin` diameter of the queries (packing margin)
+    - `--create-indexes`, `--index-prefix-column COL` - create `(cell)` and `(COL, cell)` indexes per size
 
 **Examples:**
 ```bash
@@ -299,6 +307,15 @@ Advanced options for controlling how query variants are generated for better cac
   - **Required when**: `--partition-datatype geometry` is used
   - **Note**: Buffer distance is not needed for cache population (only for cache application)
 
+### Grid-Cell Spatial Keys
+- `--grid-cell-size KEY=SIZE[,KEY=SIZE]` - Partition keys that hold grid cells of `--geometry-column` (default `geom`), with
+  their cell size
+  - **Default**: none (or `PARTITION_CACHE_GRID_CELL_SIZES`)
+  - **Requires**: `--partition-datatype integer` and a sparse-set backend (array, roaringbit, set handlers; not `*_bit`)
+  - **Effect**: Fragments select the distinct cells of their geometry columns. The variant flags the grid lookup uses are
+    forced (no partition-key joins, no join auto-detection). `--no-recompose` is rejected.
+  - Lookups go through `apply_cache(..., geometry_column=..., grid_cell_size=...)`; see `docs/spatial_grid_keys.md`
+
 ### Execution Mode (Mutually Exclusive - Required)
 
 #### Direct Execution
@@ -427,6 +444,9 @@ pcache-read --query QUERY [options]
 
 ### Required Parameters
 - `--query QUERY` - SQL query to look up in cache (**Required**)
+
+**Note:** `pcache-read` returns the plain intersection of cached sets. For grid-cell keys that intersection is not a
+sound restriction (the sets must be widened first), so read them through `apply_cache` instead.
 
 ### Cache Configuration
 - `--cache-backend CACHE_BACKEND` - Cache backend to query
@@ -576,6 +596,11 @@ Controls how query variants are generated when processing original queries from 
 - `--skip-partition-key-joins KEYS` - Comma-separated partition keys whose variants get no equality on the partition key between tables
   - **Default**: none (or `PARTITION_CACHE_SKIP_PARTITION_KEY_JOINS`); geometry keys always skip it
   - **Purpose**: Time-bucket keys used with temporal dilation; lookups skip these joins for them, so population must too or the hashes differ (see the API reference, "Temporal dilation")
+
+#### Grid-Cell Spatial Keys
+- `--grid-cell-size KEY=SIZE[,KEY=SIZE]` and `--geometry-column COL` - as for `pcache-add`. Fragments of the listed keys
+  are generated with the cell projection and the grid lookup's flags, and always run without cache optimization (the
+  plain integer lookup would not widen the sets). Entries whose backend is a bit handler are skipped with an error.
 
 #### Constraint Modification
 - `--add-constraints JSON` - Add constraints to specific tables
