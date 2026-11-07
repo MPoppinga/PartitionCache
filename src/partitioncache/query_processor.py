@@ -88,9 +88,10 @@ def normalize_regex_operators(query: str) -> str:
     hashes stay the same.
 
     Raises:
-        ValueError: if a ``~`` is not followed by a string literal. PostGIS uses ``~`` and ``~=`` for
-            bounding-box containment and equality (``a.geom ~ b.geom``), which must not become a regex match.
-        sqlglot.errors.ParseError: if the query does not parse with either reading.
+        sqlglot.errors.ParseError: if the query does not parse with either reading, or if a ``~`` is not
+            followed by a string literal. PostGIS uses ``~`` and ``~=`` for bounding-box containment and
+            equality (``a.geom ~ b.geom``), which must not become a regex match. ``apply_cache`` runs such
+            queries without the cache, as before.
     """
     if "~" not in query:
         return query
@@ -106,9 +107,9 @@ def normalize_regex_operators(query: str) -> str:
         for i, token in enumerate(query_tokens):
             followed_by_string = i + 1 < len(query_tokens) and query_tokens[i + 1].token_type == TokenType.STRING
             if token.token_type == TokenType.RLIKE and token.text == "~" and not followed_by_string:
-                raise ValueError(
+                raise ParseError(
                     f"Unsupported '~' at line {token.line}, column {token.col}: PartitionCache reads '~' only as a regex "
-                    "match against a string literal (a.col ~ 'pattern'); run queries with PostGIS bounding-box operators uncached"
+                    "match against a string literal (a.col ~ 'pattern'), not as a PostGIS bounding-box operator"
                 ) from None
         if len(statements) != 1 or statements[0] is None:
             raise default_error from None

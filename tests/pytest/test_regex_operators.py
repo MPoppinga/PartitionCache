@@ -38,7 +38,7 @@ def test_other_queries_are_returned_unchanged(condition: str) -> None:
 
 def test_tilde_against_a_non_literal_is_rejected() -> None:
     """PostGIS's bounding-box containment a.geom ~ b.geom must not be read as a regex match."""
-    with pytest.raises(ValueError, match="string literal"):
+    with pytest.raises(ParseError, match="string literal"):
         normalize_regex_operators("SELECT * FROM t AS a, t AS b WHERE a.geom ~ b.geom")
 
 
@@ -74,3 +74,19 @@ def test_apply_cache_accepts_regex_operators() -> None:
     sql, stats = apply_cache(query, handler, "zipcode", min_component_size=1)
     assert stats["enhanced"] == 1
     assert "REGEXP_LIKE(p1.name, '^Bio')" in sql and "IN (1, 2)" in sql
+
+
+def test_apply_cache_returns_the_callers_text_when_it_changes_nothing() -> None:
+    """Without cache hits the query keeps its operators: REGEXP_LIKE needs PostgreSQL 15+."""
+    handler = Mock()
+    handler.get_intersected.return_value = (None, 0)
+    handler.filter_existing_keys.return_value = set()
+    query = "SELECT * FROM t AS p1 WHERE p1.name ~* 'bio' AND p1.zipcode > 0"
+    sql, stats = apply_cache(query, handler, "zipcode", min_component_size=1)
+    assert stats["enhanced"] == 0 and sql == query
+
+
+def test_apply_cache_runs_postgis_tilde_queries_uncached() -> None:
+    query = "SELECT * FROM t AS p1, t AS p2 WHERE p1.geom ~ p2.geom AND p1.zipcode = p2.zipcode"
+    sql, stats = apply_cache(query, Mock(), "zipcode")
+    assert sql == query and stats["sql_error"] == 1

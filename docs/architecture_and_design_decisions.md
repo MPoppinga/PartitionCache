@@ -211,7 +211,8 @@ Before that, `generate_all_query_hash_pairs`, `apply_cache` and `apply_cache_laz
   - `!~` and `!~*` → the same form negated with `NOT`
 - The default sqlglot dialect rejects `~`, and it renders `~*` as `REGEXP_I_LIKE`, a function no database provides.
 - A query without `~` is returned unchanged, so its hashes are unaffected.
-- A `~` that is not followed by a string literal raises `ValueError`. PostGIS's bounding-box operator `a.geom ~ b.geom` must not become a regex match.
+- When the cache leaves a query unchanged (no hits, cost gate), `apply_cache` returns the caller's own text.
+- A `~` that is not followed by a string literal is rejected as a `ParseError`, so `apply_cache` runs the query without the cache. PostGIS's bounding-box operator `a.geom ~ b.geom` must not become a regex match.
 
 `clean_query` performs, in order:
 

@@ -1572,7 +1572,29 @@ def _runs_uncached_on_sql_errors(func: Callable[_P, tuple[str, dict[str, int]]])
     return wrapper
 
 
+def _accepts_regex_operators(fn: Callable[_P, tuple[str, dict[str, int]]]) -> Callable[_P, tuple[str, dict[str, int]]]:
+    """Run ``fn`` on the query with PostgreSQL's regex match operators rewritten (:func:`normalize_regex_operators`).
+
+    When ``fn`` returns the query unchanged, for example without cache hits, the caller's own text is returned, so
+    a query the cache does not change keeps its operators (``REGEXP_LIKE`` needs PostgreSQL 15+).
+    """
+
+    @functools.wraps(fn)
+    def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> tuple[str, dict[str, int]]:
+        original = kwargs["query"] if "query" in kwargs else args[0]
+        normalized = normalize_regex_operators(original)  # type: ignore[arg-type]
+        if "query" in kwargs:
+            kwargs["query"] = normalized
+        else:
+            args = (normalized, *args[1:])  # type: ignore[assignment]
+        enhanced_query, stats = fn(*args, **kwargs)
+        return (original if enhanced_query == normalized else enhanced_query), stats  # type: ignore[return-value]
+
+    return wrapper
+
+
 @_runs_uncached_on_sql_errors
+@_accepts_regex_operators
 def apply_cache_lazy(
     query: str,
     cache_handler: AbstractCacheHandler_Lazy,
@@ -1671,8 +1693,6 @@ def apply_cache_lazy(
         partition_join_table = deprecated["partition_join_table"]
     if "auto_detect_partition_join" in deprecated:
         auto_detect_partition_join = deprecated["auto_detect_partition_join"]
-
-    query = normalize_regex_operators(query)
 
     gated, gate_stats = _check_cost_gate(query, cost_estimator, min_query_cost)
     if gated:
@@ -1873,6 +1893,7 @@ def apply_cache_lazy(
 
 
 @_runs_uncached_on_sql_errors
+@_accepts_regex_operators
 def apply_cache(
     query: str,
     cache_handler: AbstractCacheHandler,
@@ -2006,8 +2027,6 @@ def apply_cache(
         partition_join_table = deprecated["partition_join_table"]
     if "auto_detect_partition_join" in deprecated:
         auto_detect_partition_join = deprecated["auto_detect_partition_join"]
-
-    query = normalize_regex_operators(query)
 
     gated, gate_stats = _check_cost_gate(query, cost_estimator, min_query_cost)
     if gated:
