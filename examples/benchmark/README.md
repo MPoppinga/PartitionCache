@@ -16,6 +16,7 @@ python examples/benchmark/run_benchmark.py --config config/<workload>.yaml [OPTI
 | `config/tpch.yaml` | TPC-H | DuckDB, PostgreSQL | l_orderkey, l_partkey, l_suppkey |
 | `config/nyc_taxi.yaml` | NYC Taxi + Spatial | PostgreSQL | trip_id |
 | `config/osm_poi.yaml` | OpenStreetMap POI | PostgreSQL | zipcode, landkreis, spatial |
+| `config/osm_poi_grid.yaml` | OpenStreetMap POI, grid-cell keys | PostgreSQL | cell100, cell200, cell400, cell800 |
 | `config/security_logs.yaml` | Security / log analysis | PostgreSQL | src_user_id, src_host_id, bucket_1h, bucket_1d |
 
 ## Per-Workload Setup
@@ -71,6 +72,36 @@ python examples/openstreetmap_poi/process_osm_data.py
 # Run benchmark
 python examples/benchmark/run_benchmark.py --config config/osm_poi.yaml --db-backend postgresql --mode all
 ```
+
+#### Grid-cell keys (`config/osm_poi_grid.yaml`)
+
+The grid config runs the 17 spatial queries with integer grid-cell keys (`partitioncache.spatial_grid`)
+instead of the geometry handlers.
+- **Population:** each fragment stores the cells `floor(x/s) << 16 | floor(y/s)` of its geometries.
+- **Lookup:** it widens every cell set by the disk stencil of the query's `ST_DWithin` diameter before
+  intersecting. This is the 2-D counterpart of temporal dilation.
+- **Rewrite:** the cell set restricts the query through a star join of neighbour pair tables (`CELL_STAR`)
+  or as a constant cell array, on every alias (`CELL_ARRAY`) or on the anchor only (`CELL_ARRAY_ANCHOR`).
+  `CELL_AUTO` picks between the star and the anchor-only array from the query's predicates.
+
+```bash
+# Once per database: cell function, packing check, cell expression indexes
+pcache-manage setup grid --table pois --cell-size 100 --cell-size 200 --cell-size 400 --cell-size 800 \
+    --max-distance 2000 --create-indexes --index-prefix-column subtype
+
+# All grid queries with each key's grid_method (CELL_AUTO)
+python examples/benchmark/run_benchmark.py --config config/osm_poi_grid.yaml --mode spatial
+
+# Every rewrite on every query (the cache is populated once and reused)
+python examples/benchmark/run_benchmark.py --config config/osm_poi_grid.yaml --mode grid-method-comparison
+```
+
+- **Requires** `partitioncache.spatial_grid` and `pcache-manage setup grid`. Without them `tests/pytest/test_benchmark_runner_grid.py` skips.
+- **At startup** the runner installs the cell function and checks the packing, but creates no indexes.
+- **Cell sizes:** each query maps to the key with the largest cell size s ≤ D/2, where D is the diameter of its distance graph; a single-alias query maps to the finest.
+- **Backends:** `postgresql_array` or `postgresql_roaringbit`. Bit backends are rejected, because cells are around 10^8.
+- **Comparing runs:** the cell expression indexes also change the plans of the uncached reference queries, so compare grid runs only with references measured on the same index set.
+- **Correctness:** `result_multiset_match` in the results compares the rows themselves, not only their count (`result_match`).
 
 ### Security Logs (plain PostgreSQL, no extensions)
 
@@ -152,6 +183,7 @@ numbers and the proposed refinement.
 | `--mode hierarchy` | Hierarchical drill-down with reuse tracking |
 | `--mode spatial` | Spatial-heavy queries |
 | `--mode spatial-method-comparison` | Compare SUBDIVIDE_INLINE vs SUBDIVIDE_TMP_TABLE for each spatial backend |
+| `--mode grid-method-comparison` | Run the queries of grid-cell keys with each grid rewrite (CELL_AUTO, CELL_STAR, CELL_ARRAY, CELL_ARRAY_ANCHOR) |
 | `--mode backend-comparison` | Compare cache backends |
 | `--mode method-comparison` | Compare query extension methods (IN, VALUES, TMP_TABLE_*) |
 | `--mode api-comparison` | Compare non-lazy vs lazy API paths |
@@ -170,6 +202,7 @@ numbers and the proposed refinement.
 | `--repeat N` | Repeat baseline/cached queries N times for stable timing | 1 |
 | `--output FILE` | Save results to JSON file | None |
 | `--no-dilation` | Disable temporal bucket dilation (unsound; for measuring lost rows) | off |
+| `--grid-method` | Rewrite for grid-cell keys, overriding each key's `grid_method` | the key's, else CELL_AUTO |
 
 ## Query Extension Methods
 
@@ -204,7 +237,7 @@ When `--output` is specified, results are saved with metadata:
 Each workload is defined by a YAML config file. Key sections:
 
 - **`fact_table`** / **`p0_alias`**: Fact table name and SQL alias
-- **`partition_keys`**: Map of partition key names to datatypes (`integer`, `text`, `geometry`)
+- **`partition_keys`**: Map of partition key names to datatypes (`integer`, `text`, `geometry`). A grid-cell key is an `integer` key with `grid_cell_size`, `geometry_column`, optionally `grid_method` and `grid_max_distance` (the margin the packing check reserves)
 - **`query_partition_keys`**: Map of query name to list of applicable partition keys
 - **`query_flights`**: Numbered groups of queries for sequential execution
 - **`query_processing`**: Parameters for `generate_all_query_hash_pairs()` (keep_all_attributes, follow_graph, strip_select, etc.)

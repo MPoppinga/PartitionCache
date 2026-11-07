@@ -246,6 +246,46 @@ enhanced_query, stats = partitioncache.apply_cache(
 )
 ```
 
+#### For Grid-Cell Keys (Integer Cells of the Geometry)
+
+A grid-cell key is an integer partition key whose fragments store the cells `floor(x/s) << 16 | floor(y/s)` of
+their geometries, in the metric SRID of the data (25832 here). The lookup widens each fragment's cell set by
+the query's `ST_DWithin` diameter before intersecting, so no match is lost. The cell set then restricts the
+query as a star join of neighbour pair tables or as a constant cell array. Use the cell size s ≤ D/2 for a
+query with `ST_DWithin` diameter D (at least two rings of cells).
+
+```bash
+# Once: cell function, packing check, cell expression indexes
+pcache-manage --env-file .env setup grid --table pois --geometry-column geom --cell-size 200 --max-distance 2000 \
+  --create-indexes --index-prefix-column subtype
+
+# Populate (integer datatype, a sparse-set backend; the geometry column defaults to geom)
+pcache-add --direct \
+  --query-file testqueries_examples/spatial/q1.sql \
+  --partition-key cell200 \
+  --partition-datatype integer \
+  --grid-cell-size cell200=200 \
+  --cache-backend postgresql_array \
+  --env .env
+```
+
+```python
+enhanced_query, stats = partitioncache.apply_cache(
+    query=sql_query,
+    cache_handler=handler,
+    partition_key="cell200",
+    geometry_column="geom",
+    grid_cell_size=200,          # must equal the size the key was populated with
+    grid_method="CELL_AUTO",     # or CELL_STAR, CELL_ARRAY, CELL_ARRAY_ANCHOR
+    p0_alias="p1",
+)
+# CELL_STAR returns "CREATE TEMPORARY TABLE ... ON COMMIT DROP; ...; SELECT ...": run it in one execute() call
+```
+
+Bit backends cannot hold cells (they are around 10^8), and `pcache-read` does not apply to grid keys: their
+cell sets are only sound after the widening of `apply_cache`. The benchmark config
+`examples/benchmark/config/osm_poi_grid.yaml` runs the spatial test queries this way.
+
 ### Reading from Cache
 
 ```bash
