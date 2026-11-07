@@ -50,17 +50,41 @@ def grid_table(db_session):
         cur.execute(f"DROP TABLE IF EXISTS {TABLE}")
 
 
+@pytest.fixture
+def fresh_grid_key(cache_client):
+    """No cache table for KEY, so the processor creates and registers it as for a new key.
+
+    The cache_client teardown drops the metadata table but only the cache tables of its own keys; a leftover
+    KEY table would make the processor skip the registration and the lookup would find no datatype.
+    """
+    table = f"{cache_client.tableprefix}_cache_{KEY}"
+
+    def drop() -> None:  # on the handler's connection: its open read transaction would block a DROP from another one
+        cache_client.cursor.execute(f"DROP TABLE IF EXISTS {table}")
+        cache_client.db.commit()
+
+    drop()
+    yield
+    drop()
+
+
 @pytest.mark.parametrize("method", ["CELL_STAR", "CELL_ARRAY", "CELL_ARRAY_ANCHOR"])
-def test_queued_grid_fragments_restrict_the_query_soundly(db_session, cache_client, manual_queue_processor, grid_table, method):
-    if repr(cache_client) not in ("postgresql_array", "postgresql_roaringbit"):
-        pytest.skip(f"grid keys need a sparse-set PostgreSQL backend, not {cache_client!r}")
+def test_queued_grid_fragments_restrict_the_query_soundly(db_session, cache_client, manual_queue_processor, grid_table, fresh_grid_key, method):
+    if repr(cache_client) != "postgresql_array":
+        pytest.skip(f"the manual processor fixture configures the array backend, not {cache_client!r}")
     from partitioncache.queue import clear_all_queues, reset_queue_handler
 
     reset_queue_handler()
     clear_all_queues()
     pairs = generate_all_query_hash_pairs(
-        QUERY, KEY, geometry_column="geom", grid_cell_size=200, min_component_size=2, keep_all_attributes=False,
-        warn_no_partition_key=False, **sg.GRID_GENERATION_KWARGS,
+        QUERY,
+        KEY,
+        geometry_column="geom",
+        grid_cell_size=200,
+        min_component_size=2,
+        keep_all_attributes=False,
+        warn_no_partition_key=False,
+        **sg.GRID_GENERATION_KWARGS,
     )
     assert push_to_query_fragment_queue(query_hash_pairs=pairs, partition_key=KEY, partition_datatype="integer")
     with db_session.cursor() as cur:
