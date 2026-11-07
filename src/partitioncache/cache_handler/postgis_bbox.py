@@ -330,6 +330,7 @@ class PostGISBBoxCacheHandler(PostGISSpatialAbstractCacheHandler):
 
         For a single key: ``ST_Buffer(partition_keys, buf)``
         For multiple keys: ``ST_Intersection(ST_Buffer(A, buf), ST_Buffer(B, buf))``
+        With ``buffer_distance <= 0`` the stored collections are intersected unbuffered.
         """
         table_name = f"{self.tableprefix}_cache_{partition_key}"
         keys_list = list(keys)
@@ -342,33 +343,16 @@ class PostGISBBoxCacheHandler(PostGISSpatialAbstractCacheHandler):
         _QUAD_SEGS = 8  # 16 blew a backend to 8.85 GB on a 1,000 m star (OOM, 2026-09-18); 8 with the circumscription is still sound
         buf = buffer_distance / math.cos(math.pi / (2 * _QUAD_SEGS))
 
-        if len(keys_list) == 1:
-            return sql.SQL(
-                "ST_Buffer((SELECT partition_keys FROM {table} WHERE query_hash = {key}), {buf}, 'quad_segs=8')"
-            ).format(
-                table=sql.Identifier(table_name),
-                key=sql.Literal(keys_list[0]),
-                buf=sql.Literal(buf),
-            )
+        def stored(key: str) -> sql.Composed:
+            collection = sql.SQL("(SELECT partition_keys FROM {table} WHERE query_hash = {key})").format(table=sql.Identifier(table_name), key=sql.Literal(key))
+            if buffer_distance <= 0:
+                # The stored points themselves: ST_Buffer of a point by 0 is empty and would drop every row
+                return collection
+            return sql.SQL("ST_Buffer({collection}, {buf}, 'quad_segs=8')").format(collection=collection, buf=sql.Literal(buf))
 
-        result = sql.SQL(
-            "ST_Buffer((SELECT partition_keys FROM {table} WHERE query_hash = {key}), {buf}, 'quad_segs=8')"
-        ).format(
-            table=sql.Identifier(table_name),
-            key=sql.Literal(keys_list[0]),
-            buf=sql.Literal(buf),
-        )
-
-        for i in range(1, len(keys_list)):
-            inner = sql.SQL(
-                "ST_Buffer((SELECT partition_keys FROM {table} WHERE query_hash = {key}), {buf}, 'quad_segs=8')"
-            ).format(
-                table=sql.Identifier(table_name),
-                key=sql.Literal(keys_list[i]),
-                buf=sql.Literal(buf),
-            )
-            result = sql.SQL("ST_Intersection({a}, {b})").format(a=result, b=inner)
-
+        result = stored(keys_list[0])
+        for key in keys_list[1:]:
+            result = sql.SQL("ST_Intersection({a}, {b})").format(a=result, b=stored(key))
         return result
 
     def get_spatial_filter(
