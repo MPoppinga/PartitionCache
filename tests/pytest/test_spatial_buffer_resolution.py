@@ -29,6 +29,11 @@ def test_buffer_is_derived_from_the_query(query: str, expected: float) -> None:
     assert _resolve_buffer_distance(query, None) == expected
 
 
+def test_cte_query_gets_the_diameter_of_its_body() -> None:
+    cte = "WITH c AS (SELECT p1.name FROM pois AS p1, pois AS p2 WHERE ST_DWithin(p1.geom, p2.geom, 300)) SELECT * FROM c"
+    assert _resolve_buffer_distance(cte, None) == 300.0
+
+
 def test_explicit_buffer_wins() -> None:
     assert _resolve_buffer_distance(POINT_RADIUS, 120.0) == 120.0
     assert _resolve_buffer_distance(STAR, 0.0) == 0.0
@@ -39,6 +44,8 @@ def test_explicit_buffer_wins() -> None:
     [
         "SELECT * FROM pois AS p1, pois AS p2 WHERE p1.subtype = 'a' AND p2.subtype = 'b'",
         "SELECT * FROM (SELECT * FROM pois) AS s WHERE s.subtype = 'a'",  # a derived table is not a single table
+        # the fragments come from the CTE body, which joins two tables
+        "WITH c AS (SELECT p1.name FROM pois AS p1, pois AS p2 WHERE p1.subtype = p2.subtype) SELECT * FROM c",
     ],
 )
 def test_several_tables_without_distances_need_an_explicit_buffer(query: str) -> None:
