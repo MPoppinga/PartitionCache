@@ -42,12 +42,21 @@ def test_check_grid_key() -> None:
     assert "bit backend" in str(check_grid_key("cell200", "integer", "postgresql_bit"))
 
 
-def test_cli_generation_flags_give_the_lookup_hashes() -> None:
-    """The flags the CLI forces for a grid key generate exactly the hashes the grid lookup searches for."""
-    common = {"query": STAR, "partition_key": "cell200", "geometry_column": "geom", "grid_cell_size": 200, "min_component_size": 2}
-    cli = {h for _, h in generate_all_query_hash_pairs(**common, keep_all_attributes=False, warn_no_partition_key=False, **GRID_GENERATION_KWARGS)}
-    lookup = set(generate_all_hashes(**common, fix_attributes=False, **GRID_GENERATION_KWARGS))
-    assert cli and cli == lookup
+STAR3 = (
+    "SELECT p1.name, p2.name, p3.name FROM pois AS p1, pois AS p2, pois AS p3 WHERE p1.subtype = 'school' "
+    "AND p2.subtype = 'library' AND p2.name LIKE '%Stadt%' AND p3.subtype = 'hospital' "
+    "AND ST_DWithin(p1.geom, p2.geom, 500) AND ST_DWithin(p1.geom, p3.geom, 300)"
+)
+
+
+def test_cli_population_hashes_are_found_by_the_grid_lookup() -> None:
+    """pcache-add generates the full-attribute variants (keep_all_attributes=True) with the grid flags. The lookup
+    finds all of them: exactly these when it keeps all attributes, and these plus the generalised variants by default.
+    """
+    common = {"query": STAR3, "partition_key": "cell200", "geometry_column": "geom", "grid_cell_size": 200, "min_component_size": 2}
+    cli = {h for _, h in generate_all_query_hash_pairs(**common, keep_all_attributes=True, warn_no_partition_key=False, **GRID_GENERATION_KWARGS)}
+    assert cli and cli == set(generate_all_hashes(**common, fix_attributes=True, **GRID_GENERATION_KWARGS))
+    assert cli < set(generate_all_hashes(**common, fix_attributes=False, **GRID_GENERATION_KWARGS))
 
 
 # ------------------------------------------------------------------------------------------- pcache-add
