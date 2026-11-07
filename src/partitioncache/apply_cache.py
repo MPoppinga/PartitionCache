@@ -1543,6 +1543,72 @@ def _check_cost_gate(query: str, cost_estimator: Callable[[str], float | None] |
 _P = ParamSpec("_P")
 
 
+def _apply_grid_cache(
+    query: str,
+    cache_handler: AbstractCacheHandler,
+    partition_key: str,
+    geometry_column: str,
+    grid_cell_size: float,
+    grid_method: str,
+    p0_alias: str | None,
+    gate_stats: dict[str, int],
+    hash_kwargs: dict[str, Any],
+) -> tuple[str, dict[str, Any]]:
+    """Grid-cell spatial key (``partitioncache.spatial_grid``): eager lookup, sound 2-D widening, rewrite.
+
+    The cached sets are fetched and widened in Python (widen the smallest, probe the rest); the cell set then
+    enters the query as a star join over neighbour pair tables (CELL_STAR), as a constant array on every
+    fact-table alias (CELL_ARRAY) or on the anchor only (CELL_ARRAY_ANCHOR); CELL_AUTO picks between the
+    star and the anchor-only array from the query's predicates.
+    """
+    from partitioncache import spatial_grid
+
+    if grid_method not in spatial_grid.GRID_METHODS:
+        raise ValueError(f"grid_method must be one of {spatial_grid.GRID_METHODS}, got {grid_method!r}")
+    hashes = generate_all_hashes(
+        query=query,
+        partition_key=partition_key,
+        geometry_column=geometry_column,
+        grid_cell_size=grid_cell_size,
+        **spatial_grid.GRID_GENERATION_KWARGS,
+        **hash_kwargs,
+    )
+    stats: dict[str, Any] = {"generated_variants": len(hashes), "cache_hits": 0, "enhanced": 0, "p0_rewritten": 0, **gate_stats}
+    if not hashes:
+        return query, stats
+    existing = sorted(cache_handler.filter_existing_keys(set(hashes), partition_key))
+    sets = [v for v in (cache_handler.get(h, partition_key) for h in existing) if v is not None]
+    stats["cache_hits"] = len(sets)
+    if not sets:
+        return query, stats
+
+    anchor = p0_alias
+    if anchor is None:
+        first = sqlglot.parse_one(query, dialect="postgres").find(exp.Table)
+        if first is None:
+            raise ValueError("No table found in query")
+        anchor = first.alias_or_name
+    plan = spatial_grid.plan_query(query, anchor, geometry_column)
+    offsets = spatial_grid.stencil(plan.diameter, grid_cell_size)
+    if not spatial_grid.cells_in_packing_range(sets, max(max(abs(dx), abs(dy)) for dx, dy in offsets)):  # type: ignore[arg-type]
+        logger.warning("Grid cells outside the packing range (negative or too close to the j limit); running uncached")
+        return query, _uncached_stats("grid cells outside the packing range", gate_stats)
+    cells = spatial_grid.intersect_widened(sets, offsets)  # type: ignore[arg-type]
+    stats["grid_cells"] = len(cells)
+    stats["enhanced"] = 1
+    if len(cells) == 0:
+        return _add_empty_intersection_condition(query), stats
+    if grid_method == "CELL_AUTO":
+        grid_method = spatial_grid.choose_grid_method(query, plan)
+    stats["grid_method"] = grid_method
+    if grid_method == "CELL_STAR":
+        setup, star_query = spatial_grid.rewrite_cell_star(query, cells, plan, geometry_column, grid_cell_size)
+        return "; ".join([*setup, star_query]), stats
+    aliases = plan.aliases if grid_method == "CELL_ARRAY" else [plan.anchor]
+    return spatial_grid.rewrite_cell_array(query, cells, aliases, geometry_column, grid_cell_size), stats
+
+
+
 def _runs_uncached_on_sql_errors(func: Callable[_P, tuple[str, dict[str, int]]]) -> Callable[_P, tuple[str, dict[str, int]]]:
     """Return the query unchanged when the cache cannot process its SQL, instead of failing the query.
 
@@ -1598,6 +1664,8 @@ def apply_cache_lazy(
     sql_dialect: str = "postgres",
     partition_key_source_table: str | None = None,
     cost_estimator: Callable[[str], float | None] | None = None,
+    grid_cell_size: float | None = None,
+    grid_method: str = "CELL_AUTO",
     min_query_cost: float | None = None,
     keep_all_attributes: bool = False,
     **kwargs: Any,
@@ -1676,6 +1744,18 @@ def apply_cache_lazy(
         )
         if uncached_reason is not None:
             return query, _uncached_stats(uncached_reason, gate_stats)
+
+    if grid_cell_size is not None:
+        if geometry_column is None:
+            raise ValueError("grid_cell_size requires geometry_column")
+        return _apply_grid_cache(
+            query, cache_handler, partition_key, geometry_column, grid_cell_size, grid_method, p0_alias, gate_stats,
+            {"partition_key_source_table": partition_key_source_table, "min_component_size": min_component_size,
+             "fix_attributes": keep_all_attributes, "canonicalize_queries": canonicalize_queries, "follow_graph": follow_graph,
+             "partition_join_table": partition_join_table, "bucket_steps": bucket_steps, "add_constraints": add_constraints,
+             "remove_constraints_all": remove_constraints_all, "remove_constraints_add": remove_constraints_add,
+             "max_conditions_removed": max_conditions_removed, "protected_patterns": protected_patterns},
+        )
 
     # Spatial mode is selected by passing a geometry column
     if geometry_column is not None:
@@ -1893,6 +1973,8 @@ def apply_cache(
     temporal_column: str | None = None,
     partition_key_source_table: str | None = None,
     cost_estimator: Callable[[str], float | None] | None = None,
+    grid_cell_size: float | None = None,
+    grid_method: str = "CELL_AUTO",
     min_query_cost: float | None = None,
     keep_all_attributes: bool = False,
     **kwargs: Any,
@@ -2009,6 +2091,18 @@ def apply_cache(
         )
         if uncached_reason is not None:
             return query, _uncached_stats(uncached_reason, gate_stats)
+
+    if grid_cell_size is not None:
+        if geometry_column is None:
+            raise ValueError("grid_cell_size requires geometry_column")
+        return _apply_grid_cache(
+            query, cache_handler, partition_key, geometry_column, grid_cell_size, grid_method, p0_alias, gate_stats,
+            {"partition_key_source_table": partition_key_source_table, "min_component_size": min_component_size,
+             "fix_attributes": keep_all_attributes, "canonicalize_queries": canonicalize_queries, "follow_graph": True,
+             "partition_join_table": partition_join_table, "bucket_steps": bucket_steps, "add_constraints": add_constraints,
+             "remove_constraints_all": remove_constraints_all, "remove_constraints_add": remove_constraints_add,
+             "max_conditions_removed": kwargs.get("max_conditions_removed"), "protected_patterns": kwargs.get("protected_patterns")},
+        )
 
     # Spatial mode is selected by passing a geometry column
     if geometry_column is not None:
