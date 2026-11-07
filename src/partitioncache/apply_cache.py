@@ -67,10 +67,12 @@ def _resolve_dilation(
 
 
 def _has_single_from_item(query: str) -> bool:
-    """Whether the outermost FROM clause holds exactly one table (no join, no derived table)."""
+    """Whether the outermost FROM clause holds exactly one table (no join, no derived table, no CTE)."""
     try:
         parsed = sqlglot.parse_one(query)
     except sqlglot.errors.ParseError:
+        return False
+    if parsed.find(exp.With) is not None:  # the fragments are generated from the CTE bodies, which may join tables
         return False
     select = parsed if isinstance(parsed, exp.Select) else parsed.find(exp.Select)
     if select is None or select.args.get("from_") is None:
