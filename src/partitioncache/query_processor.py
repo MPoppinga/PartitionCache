@@ -20,7 +20,11 @@ import sqlglot.optimizer
 import sqlglot.optimizer.canonicalize
 import sqlglot.optimizer.normalize
 import sqlglot.optimizer.simplify
+from sqlglot import tokens
+from sqlglot.dialects.dialect import Dialect
+from sqlglot.errors import ParseError
 from sqlglot.optimizer.normalize_identifiers import normalize_identifiers
+from sqlglot.tokens import TokenType
 
 import partitioncache.sqlglot_compat  # noqa: F401 -- keeps ST_Point/ST_MakePoint as parsed before sqlglot 26
 
@@ -57,6 +61,62 @@ def handle_deprecated_kwargs(kwargs: dict[str, Any], func_name: str) -> dict[str
 # An alias as the condition split recognises it: word characters, not starting with a digit
 _IDENTIFIER_RE = re.compile(r"[^\W\d]\w*")
 _ALIAS_REFERENCE_RE = re.compile(_IDENTIFIER_RE.pattern + r"(?=\.)")
+
+
+class _RegexMatchOperators(Dialect):
+    """The default dialect, with ``~`` read as PostgreSQL reads it: a regex match.
+
+    Only used for queries the default dialect rejects, because it loses the unary bitwise NOT ``~x``.
+    """
+
+    class Tokenizer(tokens.Tokenizer):
+        KEYWORDS = {**tokens.Tokenizer.KEYWORDS, "~": TokenType.RLIKE}
+
+
+def _as_regexp_like(node: exp.Expr) -> exp.Expr:
+    if isinstance(node, exp.RegexpILike):
+        return exp.RegexpLike(this=node.this, expression=node.expression, flag=exp.Literal.string("i"))
+    return node
+
+
+def normalize_regex_operators(query: str) -> str:
+    """Rewrite PostgreSQL's regex match operators into ``REGEXP_LIKE`` (PostgreSQL 15+, MySQL 8+).
+
+    The default dialect rejects ``a ~ 'p'`` and ``a !~ 'p'``, and it reads ``a ~* 'p'`` but renders it as
+    ``REGEXP_I_LIKE``, which no database provides. These become ``REGEXP_LIKE(a, 'p')`` and
+    ``REGEXP_LIKE(a, 'p', 'i')``, negated with ``NOT``. Any other query is returned unchanged, so its
+    hashes stay the same.
+
+    Raises:
+        ValueError: if a ``~`` is not followed by a string literal. PostGIS uses ``~`` and ``~=`` for
+            bounding-box containment and equality (``a.geom ~ b.geom``), which must not become a regex match.
+        sqlglot.errors.ParseError: if the query does not parse with either reading.
+    """
+    if "~" not in query:
+        return query
+    try:
+        parsed = sqlglot.parse_one(query)
+    except ParseError as default_error:
+        dialect = _RegexMatchOperators()
+        try:
+            query_tokens = dialect.tokenize(query)
+            statements = dialect.parser().parse(query_tokens, query)
+        except ParseError:
+            raise default_error from None
+        for i, token in enumerate(query_tokens):
+            followed_by_string = i + 1 < len(query_tokens) and query_tokens[i + 1].token_type == TokenType.STRING
+            if token.token_type == TokenType.RLIKE and token.text == "~" and not followed_by_string:
+                raise ValueError(
+                    f"Unsupported '~' at line {token.line}, column {token.col}: PartitionCache reads '~' only as a regex "
+                    "match against a string literal (a.col ~ 'pattern'); run queries with PostGIS bounding-box operators uncached"
+                ) from None
+        if len(statements) != 1 or statements[0] is None:
+            raise default_error from None
+        parsed = statements[0]
+    else:
+        if parsed.find(exp.RegexpILike) is None:
+            return query
+    return parsed.transform(_as_regexp_like).sql()
 
 
 def _has_alias_that_needs_quotes(query: str) -> bool:
@@ -2148,6 +2208,8 @@ def generate_all_query_hash_pairs(
         partition_join_table = deprecated["partition_join_table"]
     if "auto_detect_partition_join" in deprecated:
         auto_detect_partition_join = deprecated["auto_detect_partition_join"]
+
+    query = normalize_regex_operators(query)
 
     # Outer joins (LEFT/RIGHT/FULL) at the top-level scope cannot be safely decomposed
     # into cache variants: the comma-join rewrite used during normalization has inner-join

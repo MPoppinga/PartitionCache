@@ -22,7 +22,13 @@ import sqlglot.errors
 import sqlglot.expressions as exp
 
 from partitioncache.cache_handler.abstract import LAZY_ALL_KEYS_PLACEHOLDER, AbstractCacheHandler, AbstractCacheHandler_Lazy
-from partitioncache.query_processor import compute_buffer_distance, detect_partition_join_from_query, generate_all_hashes, handle_deprecated_kwargs
+from partitioncache.query_processor import (
+    compute_buffer_distance,
+    detect_partition_join_from_query,
+    generate_all_hashes,
+    handle_deprecated_kwargs,
+    normalize_regex_operators,
+)
 from partitioncache.temporal_dilation import compute_dilation_buckets, compute_temporal_window, dilate_bucket_set
 
 logger = getLogger("PartitionCache")
@@ -1666,6 +1672,8 @@ def apply_cache_lazy(
     if "auto_detect_partition_join" in deprecated:
         auto_detect_partition_join = deprecated["auto_detect_partition_join"]
 
+    query = normalize_regex_operators(query)
+
     gated, gate_stats = _check_cost_gate(query, cost_estimator, min_query_cost)
     if gated:
         return query, {"generated_variants": 0, "cache_hits": 0, "enhanced": 0, "p0_rewritten": 0, **gate_stats}
@@ -1998,6 +2006,8 @@ def apply_cache(
         partition_join_table = deprecated["partition_join_table"]
     if "auto_detect_partition_join" in deprecated:
         auto_detect_partition_join = deprecated["auto_detect_partition_join"]
+
+    query = normalize_regex_operators(query)
 
     gated, gate_stats = _check_cost_gate(query, cost_estimator, min_query_cost)
     if gated:
