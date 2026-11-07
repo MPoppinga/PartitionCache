@@ -68,10 +68,11 @@ def _has_single_from_item(query: str) -> bool:
         return False
     if parsed.find(exp.With) is not None:  # the fragments are generated from the CTE bodies, which may join tables
         return False
-    select = parsed if isinstance(parsed, exp.Select) else parsed.find(exp.Select)
-    if select is None or select.args.get("from_") is None:
+    if not isinstance(parsed, exp.Select):  # a set operation: its other branches may join tables
         return False
-    return not select.args.get("joins") and isinstance(select.args["from_"].this, exp.Table)
+    if parsed.args.get("from_") is None:
+        return False
+    return not parsed.args.get("joins") and isinstance(parsed.args["from_"].this, exp.Table)
 
 
 def _resolve_buffer_distance(query: str, buffer_distance: float | None) -> float:
