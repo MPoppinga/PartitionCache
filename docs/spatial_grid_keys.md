@@ -30,7 +30,8 @@ cell(p) = floor(x / s) << 16 | floor(y / s)        -- x, y in a metric SRID, s =
 
    - The body is schema-qualified, because PostgreSQL 17+ runs `CREATE INDEX` and `ANALYZE` with
      `search_path = pg_catalog, pg_temp`.
-   - It has no `SET search_path` clause, because the planner must inline it for the index to match.
+   - It has no `SET search_path` clause. Such a clause would also satisfy PostgreSQL 17+, and the index would still match,
+     but it stops the planner from inlining the function, so every row it is evaluated for pays a function call.
 2. **Required:** check that the table fits the packing (0 ≤ x/s < 2^15 and 0 ≤ y/s < 2^16, plus room for the stencil):
    `spatial_grid.check_extent(cursor, "pois", "geom", s, max_distance)`.
    - A y value that overflows into the x bits gives a valid-looking cell of another place.

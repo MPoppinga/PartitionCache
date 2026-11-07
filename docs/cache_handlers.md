@@ -114,7 +114,8 @@ See `docs/spatial_grid_keys.md`.
   Create expression indexes on the fact table for each cell size in use, for example
   `CREATE INDEX ON pois (partitioncache_grid_cell(geom, 200))` and `CREATE INDEX ON pois (subtype, partitioncache_grid_cell(geom, 200))`.
 - **Population**: `generate_all_query_hash_pairs(..., geometry_column="geom", grid_cell_size=200)` yields the spatial fragments.
-  Each fragment's SQL selects the distinct cells of all its geometry columns; the hash stays the spatial fragment's.
+  Each fragment's SQL selects the distinct cells of all its geometry columns; the hash covers this projection, so keys
+  of different cell sizes never share an entry.
 - **Lookup and soundness**:
   - `apply_cache(..., geometry_column="geom", grid_cell_size=200, grid_method=...)` fetches the cached cell sets.
   - Each set is widened by the disk stencil of the diameter D of the query's `ST_DWithin` graph. That is the Chebyshev
@@ -131,7 +132,20 @@ See `docs/spatial_grid_keys.md`.
 - **Not offered**: temp-table or CTE forms of the key set. The planner estimates their semi-join at its default of 200 groups
   and misplans.
 - **PostgreSQL 17+**: CREATE INDEX and ANALYZE run with `search_path = pg_catalog, pg_temp`. The cell function is therefore
-  schema-qualified and has no `SET search_path` clause, which would prevent the inlining the index match depends on.
+  schema-qualified and has no `SET search_path` clause, which would stop PostgreSQL from inlining it, so every row
+  would pay a function call (see the next section).
+
+#### Functions in Index Expressions and Materialized Views (PostgreSQL 17+)
+
+PostgreSQL 17 and later run the following maintenance operations with `search_path = pg_catalog, pg_temp`: `CREATE INDEX`, `REINDEX`, `CREATE` / `REFRESH MATERIALIZED VIEW`, `ANALYZE`, `VACUUM` and `CLUSTER`.
+
+- **Where it matters:** in the bodies of SQL-language functions. They are parsed when they are inlined during the operation, so any name in them without a schema fails with `function ... does not exist`. The names in the `CREATE INDEX` statement itself are unaffected: they are resolved when the statement is parsed.
+- **h3_postgis:** its geometry overload `h3_lat_lng_to_cell(geometry, integer)` is such a function (h3-pg 4.2.3, body `SELECT h3_lat_lng_to_cell($1::point, $2)`). An expression index or a materialized view on it fails with `SQL function "h3_lat_lng_to_cell" during inlining`.
+- **Fix for H3:** cast to `point` and call the core overload instead. This is what `pcache-manage setup h3-cells` does:
+  ```sql
+  CREATE INDEX pois_h3_9_idx ON pois (h3_lat_lng_to_cell(ST_Transform(ST_Centroid(geom), 4326)::point, 9));
+  ```
+- **Your own SQL functions** used in an index: schema-qualify every name in the body, e.g. `public.ST_X(g)`. A `SET search_path` clause on the function works too, but it stops PostgreSQL from inlining the function, so every row then pays a function call.
 
 ## Multi-Partition Support
 
