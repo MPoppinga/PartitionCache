@@ -2105,6 +2105,7 @@ def generate_all_query_hash_pairs(
     partition_key_source_table: str | None = None,
     max_conditions_removed: int | None = None,
     protected_patterns: list[str] | None = None,
+    grid_cell_size: float | None = None,
     **kwargs: Any,
 ) -> list[tuple[str, str]]:
     """
@@ -2136,6 +2137,10 @@ def generate_all_query_hash_pairs(
             (case-insensitive) are protected from removal during variant generation.
             Only unprotected conditions are candidates for removal. Useful for ensuring
             cheap relational filters are always present in every variant.
+        grid_cell_size: For a grid-cell spatial key (``partitioncache.spatial_grid``): requires
+            ``geometry_column``. The fragments are the spatial ones, but each pair's SQL selects the
+            distinct grid cells of all its geometry columns as the partition key, and the hash is that
+            projected SQL's, so entries of different cell sizes never share a hash.
 
     Returns:
         List of tuples containing (query_text, query_hash) pairs
@@ -2295,9 +2300,17 @@ def generate_all_query_hash_pairs(
             nquery = sqlglot.optimizer.canonicalize.canonicalize(sqlglot_query)
             q = nquery.sql()
             can_query_set.add(q)
-        return [(q, hash_query(q)) for q in can_query_set]
+        pairs = [(q, hash_query(q)) for q in can_query_set]
     else:
-        return [(q, hash_query(q)) for q in query_set]
+        pairs = [(q, hash_query(q)) for q in query_set]
+    if grid_cell_size is not None:
+        from partitioncache.spatial_grid import cell_projection_sql
+
+        if geometry_column is None:
+            raise ValueError("grid_cell_size requires geometry_column")
+        projected = (cell_projection_sql(q, geometry_column, grid_cell_size, partition_key) for q, _ in pairs)
+        pairs = [(pq, hash_query(pq)) for pq in projected]
+    return pairs
 
 
 def order_variants_for_population(query_hash_pairs: list[tuple[str, str]]) -> list[tuple[str, str]]:
@@ -2742,6 +2755,7 @@ def generate_all_hashes(
     partition_key_source_table: str | None = None,
     max_conditions_removed: int | None = None,
     protected_patterns: list[str] | None = None,
+    grid_cell_size: float | None = None,
     **kwargs: Any,
 ) -> list[str]:
     """
@@ -2777,6 +2791,7 @@ def generate_all_hashes(
         partition_key_source_table=partition_key_source_table,
         max_conditions_removed=max_conditions_removed,
         protected_patterns=protected_patterns,
+        grid_cell_size=grid_cell_size,
     )
     return [x[1] for x in qh_pairs]
 

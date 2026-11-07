@@ -99,6 +99,40 @@ PartitionCache supports multiple cache backends with different performance chara
 - **Spatial filtering**: Geometric `ST_Intersection` of cached bounding boxes
 - **Scalability**: Excellent (database-native)
 
+#### Grid-cell keys (any integer handler)
+
+A grid-cell key is not a handler. It is an **integer partition key** whose values are the cells
+`floor(x/s) << 16 | floor(y/s)` of a geometry column in a metric SRID. Integer handlers that store sparse
+sets hold it: `postgresql_array`, `postgresql_roaringbit`, `redis_set`, `rocksdict` and `rocksdb_set`.
+The bit handlers do not fit, because cells are large numbers (around 10^8), far beyond any useful bitsize.
+See `docs/spatial_grid_keys.md`.
+
+- **Setup**: install the cell function `spatial_grid.CELL_FUNCTION_DDL` (`public.partitioncache_grid_cell(geometry, float8)`)
+  manually.
+  - Then check the packing range once with `spatial_grid.check_extent(cursor, table, "geom", s, max_distance)`. The packing
+    needs a metric SRID, 0 ≤ x/s < 2^15 and 0 ≤ y/s < 2^16. At lookup, cells outside the range make the query run uncached.
+  Create expression indexes on the fact table for each cell size in use, for example
+  `CREATE INDEX ON pois (partitioncache_grid_cell(geom, 200))` and `CREATE INDEX ON pois (subtype, partitioncache_grid_cell(geom, 200))`.
+- **Population**: `generate_all_query_hash_pairs(..., geometry_column="geom", grid_cell_size=200)` yields the spatial fragments.
+  Each fragment's SQL selects the distinct cells of all its geometry columns; the hash stays the spatial fragment's.
+- **Lookup and soundness**:
+  - `apply_cache(..., geometry_column="geom", grid_cell_size=200, grid_method=...)` fetches the cached cell sets.
+  - Each set is widened by the disk stencil of the diameter D of the query's `ST_DWithin` graph. That is the Chebyshev
+    bound, exact in the SRID the query measures in.
+  - The widened sets are intersected: widen the smallest, probe the rest.
+  - The lookup is always eager. An empty intersection yields a `FALSE` condition.
+- **Methods (`grid_method`)**:
+  - `CELL_AUTO` (default): `CELL_ARRAY_ANCHOR` when a non-anchor alias has no equality or IN predicate against literals,
+    else `CELL_STAR`.
+  - `CELL_STAR`: a star join through per-distance neighbour pair tables `(c, nc)`, so every alias is restricted to the
+    cells next to *its* anchor's cell. There is no separate hub join, because it misleads the planner's estimates.
+  - `CELL_ARRAY`: `cell(alias) = ANY('{…}'::int[])` on every alias of the fact table.
+  - `CELL_ARRAY_ANCHOR`: the same on the anchor (`p0_alias`) only.
+- **Not offered**: temp-table or CTE forms of the key set. The planner estimates their semi-join at its default of 200 groups
+  and misplans.
+- **PostgreSQL 17+**: CREATE INDEX and ANALYZE run with `search_path = pg_catalog, pg_temp`. The cell function is therefore
+  schema-qualified and has no `SET search_path` clause, which would prevent the inlining the index match depends on.
+
 ## Multi-Partition Support
 
 ### Architecture
