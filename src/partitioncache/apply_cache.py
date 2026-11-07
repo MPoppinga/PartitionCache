@@ -66,6 +66,39 @@ def _resolve_dilation(
     return compute_dilation_buckets(window, temporal_bucket_width)
 
 
+def _has_single_from_item(query: str) -> bool:
+    """Whether the outermost FROM clause holds exactly one table (no join, no derived table, no CTE)."""
+    try:
+        parsed = sqlglot.parse_one(query)
+    except sqlglot.errors.ParseError:
+        return False
+    if parsed.find(exp.With) is not None:  # the fragments are generated from the CTE bodies, which may join tables
+        return False
+    if not isinstance(parsed, exp.Select):  # a set operation: its other branches may join tables
+        return False
+    if parsed.args.get("from_") is None:
+        return False
+    return not parsed.args.get("joins") and isinstance(parsed.args["from_"].this, exp.Table)
+
+
+def _resolve_buffer_distance(query: str, buffer_distance: float | None) -> float:
+    """The distance the cached geometries are widened by before they restrict the query.
+
+    An explicit value wins. A query over a single table needs no widening: every cached fragment holds that
+    table's own geometries, so each row the query returns lies in every cached set. A radius around a constant
+    point, as in ``ST_DWithin(p1.geom, ST_MakePoint(...), r)``, must therefore not widen the filter by r.
+    Otherwise it is the diameter of the query's distance graph (:func:`compute_buffer_distance`).
+    """
+    if buffer_distance is not None:
+        return buffer_distance
+    if _has_single_from_item(query):
+        return 0.0
+    buffer_distance = compute_buffer_distance(query)
+    if buffer_distance == 0.0:
+        raise ValueError("buffer_distance is required when geometry_column is set and query has no distance constraints")
+    return buffer_distance
+
+
 def _is_temporal(temporal_bucket_width: float | None, dilation_buckets: int | None) -> bool:
     """Whether the partition key is a time bucket; its variants are then generated without partition key joins.
 
@@ -1737,8 +1770,9 @@ def apply_cache_lazy(
             SELECT clauses and spatial filter application. Requires a spatial cache handler with
             get_spatial_filter_lazy() method.
         buffer_distance: Buffer distance in meters for spatial filter. If None and geometry_column
-            is set, auto-derived from distance constraints in the query (graph diameter).
-            Required when geometry_column is set and query has no distance constraints.
+            is set, auto-derived from distance constraints in the query (graph diameter); 0 for a
+            query over a single table, whose rows lie in every cached set. Required when
+            geometry_column is set and a query over several tables has no distance constraints.
         spatial_method: Method for applying the spatial filter:
             - "SUBDIVIDE_TMP_TABLE": Create a temp table with ST_Subdivide + GiST index (default, optimal).
             - "SUBDIVIDE_INLINE": Inline ST_Subdivide in an EXISTS subquery (simpler, no temp table).
@@ -1822,10 +1856,7 @@ def apply_cache_lazy(
         if not existing_hashes:
             return query, stats
 
-        if buffer_distance is None:
-            buffer_distance = compute_buffer_distance(query)
-            if buffer_distance == 0.0:
-                raise ValueError("buffer_distance is required when geometry_column is set and query has no distance constraints")
+        buffer_distance = _resolve_buffer_distance(query, buffer_distance)
 
         srid = getattr(cache_handler, "srid", 4326)
         spatial_filter_type = getattr(cache_handler, "spatial_filter_type", "geometry")
@@ -2056,8 +2087,9 @@ def apply_cache(
             SELECT clauses and spatial filter application. Requires a spatial cache handler with
             get_spatial_filter() method.
         buffer_distance: Buffer distance in meters for spatial filter. If None and geometry_column
-            is set, auto-derived from distance constraints in the query (graph diameter).
-            Required when geometry_column is set and query has no distance constraints.
+            is set, auto-derived from distance constraints in the query (graph diameter); 0 for a
+            query over a single table, whose rows lie in every cached set. Required when
+            geometry_column is set and a query over several tables has no distance constraints.
         spatial_method: Method for applying the spatial filter:
             - "SUBDIVIDE_TMP_TABLE": Create a temp table with ST_Subdivide + GiST index (default, optimal).
             - "SUBDIVIDE_INLINE": Inline ST_Subdivide in an EXISTS subquery (simpler, no temp table).
@@ -2137,10 +2169,7 @@ def apply_cache(
     # Spatial mode is selected by passing a geometry column
     if geometry_column is not None:
         # Spatial path: generate hashes with spatial params, apply spatial filter
-        if buffer_distance is None:
-            buffer_distance = compute_buffer_distance(query)
-            if buffer_distance == 0.0:
-                raise ValueError("buffer_distance is required when geometry_column is set and query has no distance constraints")
+        buffer_distance = _resolve_buffer_distance(query, buffer_distance)
 
         # Step 1: Generate hashes with spatial params
         cache_entry_hashes = generate_all_hashes(
