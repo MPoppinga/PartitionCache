@@ -12,10 +12,7 @@ from partitioncache.cli.common_args import check_grid_key, grid_cell_size_for, p
 from partitioncache.query_processor import generate_all_hashes, generate_all_query_hash_pairs
 from partitioncache.spatial_grid import GRID_GENERATION_KWARGS
 
-STAR = (
-    "SELECT p1.name, p2.name FROM pois AS p1, pois AS p2 WHERE p1.subtype = 'school' AND p2.subtype = 'library' "
-    "AND ST_DWithin(p1.geom, p2.geom, 500)"
-)
+STAR = "SELECT p1.name, p2.name FROM pois AS p1, pois AS p2 WHERE p1.subtype = 'school' AND p2.subtype = 'library' AND ST_DWithin(p1.geom, p2.geom, 500)"
 
 
 # ----------------------------------------------------------------------------------- argument helpers
@@ -65,9 +62,12 @@ def test_cli_population_hashes_are_found_by_the_grid_lookup() -> None:
 def _run_add(argv: list[str]):
     from partitioncache.cli import add_to_cache
 
-    with patch.object(sys, "argv", ["pcache-add", *argv]), patch.object(add_to_cache, "generate_all_query_hash_pairs") as gen, patch(
-        "partitioncache.push_to_query_fragment_queue", return_value=True
-    ) as push, patch.object(add_to_cache, "load_environment_with_validation"):
+    with (
+        patch.object(sys, "argv", ["pcache-add", *argv]),
+        patch.object(add_to_cache, "generate_all_query_hash_pairs") as gen,
+        patch("partitioncache.push_to_query_fragment_queue", return_value=True) as push,
+        patch.object(add_to_cache, "load_environment_with_validation"),
+    ):
         gen.return_value = [("SELECT DISTINCT v.c AS cell200 FROM x", "h1")]
         add_to_cache.main()
     return gen, push
@@ -77,8 +77,19 @@ def test_pcache_add_queue_forces_the_grid_flags(tmp_path) -> None:
     qf = tmp_path / "q.sql"
     qf.write_text(STAR)
     gen, push = _run_add(
-        ["--queue", "--query-file", str(qf), "--partition-key", "cell200", "--partition-datatype", "integer", "--grid-cell-size", "cell200=200",
-         "--cache-backend", "postgresql_array"]
+        [
+            "--queue",
+            "--query-file",
+            str(qf),
+            "--partition-key",
+            "cell200",
+            "--partition-datatype",
+            "integer",
+            "--grid-cell-size",
+            "cell200=200",
+            "--cache-backend",
+            "postgresql_array",
+        ]
     )
     kw = gen.call_args.kwargs
     assert kw["grid_cell_size"] == 200.0 and kw["geometry_column"] == "geom"
@@ -89,9 +100,7 @@ def test_pcache_add_queue_forces_the_grid_flags(tmp_path) -> None:
 def test_pcache_add_leaves_other_keys_unchanged(tmp_path) -> None:
     qf = tmp_path / "q.sql"
     qf.write_text("SELECT * FROM t AS t1 WHERE t1.zipcode = 1")
-    gen, _ = _run_add(
-        ["--queue", "--query-file", str(qf), "--partition-key", "zipcode", "--partition-datatype", "integer", "--grid-cell-size", "cell200=200"]
-    )
+    gen, _ = _run_add(["--queue", "--query-file", str(qf), "--partition-key", "zipcode", "--partition-datatype", "integer", "--grid-cell-size", "cell200=200"])
     assert "grid_cell_size" not in gen.call_args.kwargs
 
 
@@ -181,17 +190,27 @@ class TestSetupGrid:
         return [c.args[0] if isinstance(c.args[0], str) else c.args[0].as_string(None) for c in cursor.execute.call_args_list]
 
     def test_installs_function_checks_extent_and_quotes_index_names(self) -> None:
-        statements = self._run(table="pois; DROP TABLE users", geometry_column="geom", cell_sizes=[200.0], max_distance=1000,
-                               create_indexes=True, index_prefix_column="subtype")
+        statements = self._run(
+            table="pois; DROP TABLE users", geometry_column="geom", cell_sizes=[200.0], max_distance=1000, create_indexes=True, index_prefix_column="subtype"
+        )
         assert "CREATE OR REPLACE FUNCTION public.partitioncache_grid_cell" in statements[0]
         assert 'FROM "pois; DROP TABLE users"' in statements[1]  # extent check
         assert statements[2] == (
-            'CREATE INDEX IF NOT EXISTS "pois; DROP TABLE users_grid200_idx" ON "pois; DROP TABLE users" '
-            '("partitioncache_grid_cell"("geom", 200))'
+            'CREATE INDEX IF NOT EXISTS "pois; DROP TABLE users_grid200_idx" ON "pois; DROP TABLE users" ("partitioncache_grid_cell"("geom", 200))'
         )
         assert statements[3].startswith('CREATE INDEX IF NOT EXISTS "pois; DROP TABLE users_subtype_grid200_idx"')
         assert '("subtype", "partitioncache_grid_cell"("geom", 200))' in statements[3]
         assert statements[-1] == 'ANALYZE "pois; DROP TABLE users"'
+
+    def test_needs_no_password(self) -> None:
+        """trust/peer authentication or .pgpass: an unset DB_PASSWORD is left to libpq."""
+        from partitioncache.cli.manage_cache import setup_grid
+
+        env = {k: v for k, v in self.ENV.items() if k != "DB_PASSWORD"}
+        with patch.dict("os.environ", env, clear=True), patch("psycopg.connect") as mock_connect:
+            mock_connect.return_value.cursor.return_value.fetchone.return_value = (280_000.0, 5_236_000.0, 921_000.0, 6_101_000.0)
+            setup_grid(table="pois", geometry_column="geom", cell_sizes=[200.0], max_distance=1000)
+        assert mock_connect.call_args.kwargs["password"] is None
 
     def test_rejects_a_table_outside_the_packing(self) -> None:
         from partitioncache.cli.manage_cache import setup_grid
@@ -205,8 +224,10 @@ class TestSetupGrid:
         from partitioncache.cli import manage_cache
 
         argv = ["pcache-manage", "setup", "grid", "--table", "pois", "--cell-size", "200", "--cell-size", "400", "--max-distance", "1000"]
-        with patch.object(sys, "argv", argv), patch.object(manage_cache, "setup_grid") as mock_setup, patch.object(
-            manage_cache, "load_environment_with_validation", create=True
+        with (
+            patch.object(sys, "argv", argv),
+            patch.object(manage_cache, "setup_grid") as mock_setup,
+            patch.object(manage_cache, "load_environment_with_validation", create=True),
         ):
             manage_cache.main()
         kw = mock_setup.call_args.kwargs

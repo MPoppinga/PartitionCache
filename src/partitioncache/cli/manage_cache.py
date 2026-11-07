@@ -331,10 +331,15 @@ def setup_grid(
 
     if not cell_sizes or any(size <= 0 for size in cell_sizes):
         raise ValueError(f"cell sizes must be positive, got {cell_sizes}")
-    db_host, db_user, db_password, db_name = (os.getenv(v) for v in ("DB_HOST", "DB_USER", "DB_PASSWORD", "DB_NAME"))
-    if not all([db_host, db_user, db_password, db_name]):
-        raise ValueError("PostgreSQL connection not configured. Set DB_HOST, DB_USER, DB_PASSWORD, DB_NAME environment variables.")
-    conn = psycopg.connect(dbname=db_name, host=db_host, user=db_user, password=db_password, port=int(os.getenv("DB_PORT") or "5432"), autocommit=True)
+    db_host, db_user, db_name = (os.getenv(v) for v in ("DB_HOST", "DB_USER", "DB_NAME"))
+    if not all([db_host, db_user, db_name]):
+        raise ValueError(
+            "PostgreSQL connection not configured. Set DB_HOST, DB_USER, DB_NAME (and DB_PASSWORD unless trust/peer/.pgpass) environment variables."
+        )
+    # An empty DB_PASSWORD is left out, so trust/peer authentication, PGPASSWORD and .pgpass work
+    conn = psycopg.connect(
+        dbname=db_name, host=db_host, user=db_user, password=os.getenv("DB_PASSWORD") or None, port=int(os.getenv("DB_PORT") or "5432"), autocommit=True
+    )
     source = sql.Identifier(*table.split("."))
     base = table.split(".")[-1]
     try:
