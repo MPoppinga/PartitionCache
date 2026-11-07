@@ -20,7 +20,11 @@ import sqlglot.optimizer
 import sqlglot.optimizer.canonicalize
 import sqlglot.optimizer.normalize
 import sqlglot.optimizer.simplify
+from sqlglot import tokens
+from sqlglot.dialects.dialect import Dialect
+from sqlglot.errors import ParseError
 from sqlglot.optimizer.normalize_identifiers import normalize_identifiers
+from sqlglot.tokens import TokenType
 
 import partitioncache.sqlglot_compat  # noqa: F401 -- keeps ST_Point/ST_MakePoint as parsed before sqlglot 26
 
@@ -57,6 +61,65 @@ def handle_deprecated_kwargs(kwargs: dict[str, Any], func_name: str) -> dict[str
 # An alias as the condition split recognises it: word characters, not starting with a digit
 _IDENTIFIER_RE = re.compile(r"[^\W\d]\w*")
 _ALIAS_REFERENCE_RE = re.compile(_IDENTIFIER_RE.pattern + r"(?=\.)")
+
+
+class _RegexMatchOperators(Dialect):
+    """The default dialect, with ``~`` read as PostgreSQL reads it: a regex match.
+
+    Only used for queries the default dialect rejects, because it loses the unary bitwise NOT ``~x``.
+    """
+
+    class Tokenizer(tokens.Tokenizer):
+        KEYWORDS = {**tokens.Tokenizer.KEYWORDS, "~": TokenType.RLIKE}
+
+
+def _as_regexp_like(node: exp.Expr) -> exp.Expr:
+    if isinstance(node, exp.RegexpILike):
+        return exp.RegexpLike(this=node.this, expression=node.expression, flag=exp.Literal.string("i"))
+    return node
+
+
+def _require_literal_patterns(parsed: exp.Expr, kinds: tuple[type[exp.Expr], ...]) -> None:
+    """Raise ParseError unless every regex match of ``kinds`` compares against a plain string literal."""
+    for match in parsed.find_all(*kinds):
+        pattern = match.expression
+        if not (isinstance(pattern, exp.Literal) and pattern.is_string):
+            raise ParseError(
+                f"Unsupported '{match.sql()}': PartitionCache reads '~' only as a regex match against a plain string "
+                "literal (a.col ~ 'pattern'), not as a PostGIS bounding-box operator (a.geom ~ b.geom, a.geom ~ 'POINT(1 1)'::geometry)"
+            )
+
+
+def normalize_regex_operators(query: str) -> str:
+    """Rewrite PostgreSQL's regex match operators into ``REGEXP_LIKE``.
+
+    The default dialect rejects ``a ~ 'p'`` and ``a !~ 'p'``, and it reads ``a ~* 'p'`` but renders it as
+    ``REGEXP_I_LIKE``, which no database provides. These become ``REGEXP_LIKE(a, 'p')`` and
+    ``REGEXP_LIKE(a, 'p', 'i')``, negated with ``NOT``. Rendered for PostgreSQL they are ``~`` and ``~*`` again
+    (``sqlglot_compat`` keeps the flag); the default rendering, which the hashes use, needs PostgreSQL 15+.
+    Any other query is returned unchanged, so its hashes stay the same.
+
+    Raises:
+        sqlglot.errors.ParseError: if the query does not parse with either reading, or if a regex match does not
+            compare against a plain string literal. PostGIS uses ``~`` and ``~=`` for bounding-box containment and
+            equality (``a.geom ~ b.geom``, ``a.geom ~ 'POINT(1 1)'::geometry``), which must not become a regex match.
+            ``apply_cache`` runs such queries without the cache, as before.
+    """
+    if "~" not in query:
+        return query
+    try:
+        parsed = sqlglot.parse_one(query)
+    except ParseError as default_error:
+        try:
+            parsed = sqlglot.parse_one(query, read=_RegexMatchOperators)
+        except ParseError:
+            raise default_error from None
+        _require_literal_patterns(parsed, (exp.RegexpLike, exp.RegexpILike))
+    else:
+        if parsed.find(exp.RegexpILike) is None:
+            return query
+        _require_literal_patterns(parsed, (exp.RegexpILike,))
+    return parsed.transform(_as_regexp_like).sql()
 
 
 def _has_alias_that_needs_quotes(query: str) -> bool:
@@ -2153,6 +2216,8 @@ def generate_all_query_hash_pairs(
         partition_join_table = deprecated["partition_join_table"]
     if "auto_detect_partition_join" in deprecated:
         auto_detect_partition_join = deprecated["auto_detect_partition_join"]
+
+    query = normalize_regex_operators(query)
 
     # Outer joins (LEFT/RIGHT/FULL) at the top-level scope cannot be safely decomposed
     # into cache variants: the comma-join rewrite used during normalization has inner-join

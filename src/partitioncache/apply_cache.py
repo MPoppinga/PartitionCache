@@ -22,7 +22,13 @@ import sqlglot.errors
 import sqlglot.expressions as exp
 
 from partitioncache.cache_handler.abstract import LAZY_ALL_KEYS_PLACEHOLDER, AbstractCacheHandler, AbstractCacheHandler_Lazy
-from partitioncache.query_processor import compute_buffer_distance, detect_partition_join_from_query, generate_all_hashes, handle_deprecated_kwargs
+from partitioncache.query_processor import (
+    compute_buffer_distance,
+    detect_partition_join_from_query,
+    generate_all_hashes,
+    handle_deprecated_kwargs,
+    normalize_regex_operators,
+)
 from partitioncache.temporal_dilation import compute_dilation_buckets, compute_temporal_window, dilate_bucket_set
 
 logger = getLogger("PartitionCache")
@@ -1633,7 +1639,29 @@ def _runs_uncached_on_sql_errors(func: Callable[_P, tuple[str, dict[str, int]]])
     return wrapper
 
 
+def _accepts_regex_operators(fn: Callable[_P, tuple[str, dict[str, int]]]) -> Callable[_P, tuple[str, dict[str, int]]]:
+    """Run ``fn`` on the query with PostgreSQL's regex match operators rewritten (:func:`normalize_regex_operators`).
+
+    When ``fn`` returns the query unchanged, for example without cache hits, the caller's own text is returned, so
+    a query the cache does not change keeps its operators (``REGEXP_LIKE`` needs PostgreSQL 15+).
+    """
+
+    @functools.wraps(fn)
+    def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> tuple[str, dict[str, int]]:
+        original = kwargs["query"] if "query" in kwargs else args[0]
+        normalized = normalize_regex_operators(original)  # type: ignore[arg-type]
+        if "query" in kwargs:
+            kwargs["query"] = normalized
+        else:
+            args = (normalized, *args[1:])  # type: ignore[assignment]
+        enhanced_query, stats = fn(*args, **kwargs)
+        return (original if enhanced_query == normalized else enhanced_query), stats  # type: ignore[return-value]
+
+    return wrapper
+
+
 @_runs_uncached_on_sql_errors
+@_accepts_regex_operators
 def apply_cache_lazy(
     query: str,
     cache_handler: AbstractCacheHandler_Lazy,
@@ -1946,6 +1974,7 @@ def apply_cache_lazy(
 
 
 @_runs_uncached_on_sql_errors
+@_accepts_regex_operators
 def apply_cache(
     query: str,
     cache_handler: AbstractCacheHandler,

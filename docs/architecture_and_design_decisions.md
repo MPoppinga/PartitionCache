@@ -203,6 +203,19 @@ The correctness invariant maintained throughout is: *every generated query varia
 
 `src/partitioncache/query_processor.py::clean_query` converts an arbitrary input query into a stable canonical form before any decomposition or hashing takes place. Because cache keys are content hashes of query-variant text (Section 4.5), two queries that are semantically equivalent for partition-key purposes must reach an identical textual form, otherwise they produce different hashes and the cache misses spuriously.
 
+Before that, `generate_all_query_hash_pairs`, `apply_cache` and `apply_cache_lazy` pass the query through `src/partitioncache/query_processor.py::normalize_regex_operators`.
+
+- It rewrites PostgreSQL's regex match operators into `REGEXP_LIKE`, which needs PostgreSQL 15 or later:
+  - `a ~ 'p'` → `REGEXP_LIKE(a, 'p')`
+  - `a ~* 'p'` → `REGEXP_LIKE(a, 'p', 'i')`
+  - `!~` and `!~*` → the same form negated with `NOT`
+- The default sqlglot dialect rejects `~`, and it renders `~*` as `REGEXP_I_LIKE`, a function no database provides.
+- A query without `~` is returned unchanged, so its hashes are unaffected.
+- When the cache leaves a query unchanged (no hits, cost gate), `apply_cache` returns the caller's own text.
+- A regex match whose pattern is not a plain string literal is rejected as a `ParseError`, so `apply_cache` runs the query without the cache. PostGIS's bounding-box operators `a.geom ~ b.geom` and `a.geom ~ 'POINT(1 1)'::geometry` must not become regex matches.
+- Rendered for PostgreSQL, as the lazy paths do, `REGEXP_LIKE(a, 'p', 'i')` becomes `a ~* 'p'` again. `src/partitioncache/sqlglot_compat.py` patches sqlglot here, whose PostgreSQL rendering dropped the flag and made the match case-sensitive.
+- The default rendering, which the hashes and the non-lazy rewrite use, keeps `REGEXP_LIKE`. On PostgreSQL 14 or older, such an enhanced query fails (PostgreSQL 14 reaches end of life on 2026-11-12).
+
 `clean_query` performs, in order:
 
 1. **Comment and whitespace normalization**: trailing semicolons are dropped; comments and whitespace are handled by the sqlglot tokenizer, and the query is rendered without comments in the parser's canonical spacing. No text-level replacements run on the query string, because they would also rewrite string literals (`'a  b'` → `'a b'`, `'x = y'` → `'x=y'`) and give non-equivalent queries the same hash, i.e. a false hit.
