@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from typing import Any, cast
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -109,6 +110,76 @@ def test_unlinked_alias_is_rejected() -> None:
     q = "SELECT p1.name FROM pois AS p1, pois AS p2, pois AS p3 WHERE ST_DWithin(p1.geom, p2.geom, 100)"
     with pytest.raises(ValueError, match="not linked"):
         sg.plan_query(q, "p1", "geom")
+
+
+MIXED = "SELECT a.id FROM pois AS a, stations AS s WHERE a.type = 'cafe' AND s.kind = 'bus' AND ST_DWithin(a.geom, s.geom, 300)"
+
+
+def test_plan_spans_the_aliases_of_other_tables() -> None:
+    """The fragments store the stations' cells too, so the widening must cover the cafe-station distance."""
+    plan = sg.plan_query(MIXED, "a", "geom")
+    assert plan.aliases == ["a"] and plan.diameter == 300.0
+
+
+def test_widening_keeps_every_match_when_fragments_hold_other_tables() -> None:
+    """The fragments of MIXED: all cafes, all bus stations, and the cells of both sides of every pair within 300 m."""
+    s, d = 100.0, 300.0
+    cafes = np.column_stack([RNG.uniform(560_000, 563_000, 3000), RNG.uniform(5_930_000, 5_933_000, 3000)])
+    stops = np.column_stack([RNG.uniform(560_000, 563_000, 300), RNG.uniform(5_930_000, 5_933_000, 300)])
+    near = np.hypot(cafes[:, None, 0] - stops[None, :, 0], cafes[:, None, 1] - stops[None, :, 1]) <= d
+    ci, si = np.nonzero(near)
+    cafe_cells, stop_cells = sg.cells_of(cafes[:, 0], cafes[:, 1], s), sg.cells_of(stops[:, 0], stops[:, 1], s)
+    fragments = [set(cafe_cells.tolist()), set(stop_cells.tolist()), set(cafe_cells[ci].tolist()) | set(stop_cells[si].tolist())]
+    offsets = sg.stencil(sg.plan_query(MIXED, "a", "geom").diameter, s)
+    result = set(sg.intersect_widened(fragments, offsets).tolist())
+    assert len(ci) > 100 and set(cafe_cells[ci].tolist()) <= result
+
+
+@pytest.mark.parametrize(
+    "condition",
+    [
+        "NOT ST_DWithin(p1.geom, p2.geom, 100)",
+        "(ST_DWithin(p1.geom, p2.geom, 100) OR p1.id = p2.id)",
+        "EXISTS (SELECT 1 FROM pois AS p3 WHERE ST_DWithin(p1.geom, p2.geom, 100))",
+        "CASE WHEN ST_DWithin(p1.geom, p2.geom, 100) THEN TRUE ELSE p1.id = p2.id END",
+        "ST_DWithin(p1.geom::geography, p2.geom::geography, 100)",
+    ],
+)
+def test_only_top_level_dwithin_conjuncts_bound_the_distance(condition: str) -> None:
+    q = f"SELECT p1.name FROM pois AS p1, pois AS p2 WHERE p1.subtype = 'a' AND p2.subtype = 'b' AND {condition}"
+    with pytest.raises(sg.GridPlanError, match="not linked"):
+        sg.plan_query(q, "p1", "geom")
+
+
+def test_inner_join_on_bounds_the_distance() -> None:
+    q = "SELECT p1.name FROM pois AS p1 JOIN pois AS p2 ON ST_DWithin(p1.geom, p2.geom, 250) WHERE p1.subtype = 'a'"
+    assert sg.plan_query(q, "p1", "geom").diameter == 250.0
+
+
+def test_aliases_in_subqueries_are_not_restricted() -> None:
+    q = "SELECT p1.name FROM pois AS p1 WHERE p1.subtype = 'a' AND EXISTS (SELECT 1 FROM pois AS p9 WHERE p9.id = p1.id)"
+    assert sg.plan_query(q, "p1", "geom").aliases == ["p1"]
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "SELECT p1.name FROM pois AS p1, pois AS p2 WHERE p1.subtype = 'a' AND NOT ST_DWithin(p1.geom, p2.geom, 100)",
+        "WITH c AS (SELECT * FROM pois AS p1 WHERE p1.subtype = 'a') SELECT * FROM c",
+        "SELECT s.name FROM (SELECT * FROM pois AS p1) AS s WHERE s.subtype = 'a'",
+        "SELECT p1.name FROM pois AS p1 LEFT JOIN pois AS p2 ON ST_DWithin(p1.geom, p2.geom, 100)",
+    ],
+)
+def test_apply_cache_runs_unplannable_grid_queries_uncached(query: str) -> None:
+    handler = cast(Any, MagicMock())
+    sql, stats = apply_cache(query, handler, "cell100", geometry_column="geom", grid_cell_size=100)
+    assert sql == query and stats["enhanced"] == 0 and stats["uncached_reason"]
+    assert not handler.filter_existing_keys.called  # planned before the lookup
+
+
+def test_stencil_keeps_offsets_exactly_at_the_distance() -> None:
+    s = 0.1
+    assert (2, 2) in sg.stencil(math.sqrt(2) * s, s)  # min distance s * hypot(1, 1), rounding must not drop it
 
 
 # ------------------------------------------------------------------------------------- rewrites

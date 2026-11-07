@@ -9,8 +9,11 @@ cell(p) = floor(x / s) << 16 | floor(y / s)        -- x, y in a metric SRID, s =
 
 ## Why it is sound
 
-- Let D be the diameter of the query's `ST_DWithin` graph over its aliases (the longest shortest path).
-- Every alias of a match lies within D of the points that each cached fragment holds for that match.
+- Let D be the diameter of the query's `ST_DWithin` graph over **all** aliases of its outer FROM clause (the longest
+  shortest path), counting only `ST_DWithin` conditions that every result row satisfies: top-level conjuncts of the
+  outer WHERE and of inner-join ON clauses.
+- The fragments hold the cells of every alias they join, including aliases of other tables. Every alias of a match lies
+  within D of the points each cached fragment holds for that match.
 - Two points within D differ by at most ceil(D/s) cells in each direction.
 - So the lookup widens each fragment's cell set by the disk stencil of radius D and intersects the widened sets.
 - The result contains the cell of every alias of every match.
@@ -28,9 +31,12 @@ cell(p) = floor(x / s) << 16 | floor(y / s)        -- x, y in a metric SRID, s =
    - The body is schema-qualified, because PostgreSQL 17+ runs `CREATE INDEX` and `ANALYZE` with
      `search_path = pg_catalog, pg_temp`.
    - It has no `SET search_path` clause, because the planner must inline it for the index to match.
-2. Check that the table fits the packing (0 ≤ x/s < 2^15 and 0 ≤ y/s < 2^16, plus room for the stencil):
+2. **Required:** check that the table fits the packing (0 ≤ x/s < 2^15 and 0 ≤ y/s < 2^16, plus room for the stencil):
    `spatial_grid.check_extent(cursor, "pois", "geom", s, max_distance)`.
-   This is the only protection against y values that overflow into the x bits.
+   - A y value that overflows into the x bits gives a valid-looking cell of another place.
+   - The lookup cannot detect it, and matches would be lost.
+   - Skip this check only if the data's extent is known to fit.
+   - Re-run it when rows outside the checked extent are added.
 3. Create expression indexes for each cell size in use. The query expression must match them exactly:
 
    ```sql
@@ -91,6 +97,9 @@ rewritten, stats = apply_cache(
 
 - `ST_DWithin` constraints between aliases on the configured geometry column define D. Other distance expressions are
   ignored.
-- Every alias of the anchor's table must be linked to the anchor, otherwise no sound restriction exists and a `ValueError`
-  is raised.
+- Every alias of the outer FROM clause, of any table, must be linked to the anchor by such conditions. Otherwise no
+  sound restriction exists, and the query runs uncached (`stats["uncached_reason"]`). This happens, for example, when
+  the only distance condition is under `NOT` or `OR`, in a subquery, or uses a `::geography` cast.
+- Queries with a CTE, a derived table in FROM, a set operation or an outer join also run uncached. Only the anchor
+  table's aliases in the outer FROM are restricted.
 - The SRID must be metric: the same units as the `ST_DWithin` distances, with non-negative coordinates in range.

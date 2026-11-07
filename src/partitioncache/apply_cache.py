@@ -1565,6 +1565,14 @@ def _apply_grid_cache(
 
     if grid_method not in spatial_grid.GRID_METHODS:
         raise ValueError(f"grid_method must be one of {spatial_grid.GRID_METHODS}, got {grid_method!r}")
+    # Plan first: a query without a sound cell restriction (an alias not bounded by a top-level ST_DWithin, a CTE,
+    # a derived table) runs uncached without paying for the lookup
+    try:
+        anchor = p0_alias or spatial_grid.outer_tables(spatial_grid.outer_select(query))[0][0]
+        plan = spatial_grid.plan_query(query, anchor, geometry_column)
+    except spatial_grid.GridPlanError as e:
+        logger.info(f"Grid key {partition_key}: {e}; running uncached")
+        return query, _uncached_stats(str(e), gate_stats)
     hashes = generate_all_hashes(
         query=query,
         partition_key=partition_key,
@@ -1582,13 +1590,6 @@ def _apply_grid_cache(
     if not sets:
         return query, stats
 
-    anchor = p0_alias
-    if anchor is None:
-        first = sqlglot.parse_one(query, dialect="postgres").find(exp.Table)
-        if first is None:
-            raise ValueError("No table found in query")
-        anchor = first.alias_or_name
-    plan = spatial_grid.plan_query(query, anchor, geometry_column)
     offsets = spatial_grid.stencil(plan.diameter, grid_cell_size)
     if not spatial_grid.cells_in_packing_range(sets, max(max(abs(dx), abs(dy)) for dx, dy in offsets)):  # type: ignore[arg-type]
         logger.warning("Grid cells outside the packing range (negative or too close to the j limit); running uncached")

@@ -87,7 +87,10 @@ def stencil(distance: float, cell_size: float) -> list[tuple[int, int]]:
     if distance < 0 or cell_size <= 0:
         raise ValueError(f"need distance >= 0 and cell_size > 0, got {distance}, {cell_size}")
     k = math.ceil(distance / cell_size)
-    offsets = [(dx, dy) for dx, dy in product(range(-k, k + 1), repeat=2) if cell_size * math.hypot(max(abs(dx) - 1, 0), max(abs(dy) - 1, 0)) <= distance]
+    tolerance = 1e-9 * cell_size  # an offset exactly at the distance must survive the float rounding of hypot
+    offsets = [
+        (dx, dy) for dx, dy in product(range(-k, k + 1), repeat=2) if cell_size * math.hypot(max(abs(dx) - 1, 0), max(abs(dy) - 1, 0)) <= distance + tolerance
+    ]
     return sorted(offsets, key=lambda o: o[0] * o[0] + o[1] * o[1])
 
 
@@ -206,15 +209,75 @@ def check_extent(cursor, table: str, geometry_column: str, cell_size: float, max
 # ------------------------------------------------------------------------------------- query shape
 
 
-def dwithin_edges(query: str, geometry_column: str) -> list[tuple[str, str, float]]:
-    """``ST_DWithin(a.<geom>, b.<geom>, d)`` constraints between two aliases with a literal distance.
+class GridPlanError(ValueError):
+    """The query has no sound cell restriction; it runs without the cache."""
 
-    Deliberately narrower than ``query_processor.extract_distance_constraints``: other distance expressions
-    (SQRT/POWER, DIST ... BETWEEN) are in other units and say nothing about the metric cells.
+
+def outer_select(query: str) -> exp.Select:
+    """The query's only SELECT scope that the rewrite may restrict.
+
+    CTEs and set operations are rejected: the fragments of a CTE query come from its bodies, whose aliases the
+    outer WHERE cannot name.
     """
     tree = sqlglot.parse_one(query, dialect="postgres")
+    if not isinstance(tree, exp.Select):
+        raise GridPlanError("not a plain SELECT (a set operation or another statement)")
+    if tree.find(exp.With) is not None:
+        raise GridPlanError("the query has a CTE")
+    return tree
+
+
+def outer_tables(select: exp.Select) -> list[tuple[str, str]]:
+    """(alias, table name) of every item of the outermost FROM clause and its inner or cross joins."""
+    from_ = select.args.get("from_")
+    if from_ is None:
+        raise GridPlanError("no FROM clause")
+    items = [from_.this]
+    for join in select.args.get("joins") or []:
+        if join.side:  # LEFT / RIGHT / FULL: the ON conditions do not bound the preserved side
+            raise GridPlanError(f"outer join {join.sql()}")
+        items.append(join.this)
+    tables = []
+    for item in items:
+        if not isinstance(item, exp.Table):
+            raise GridPlanError(f"FROM item {item.sql()} is not a table")
+        tables.append((item.alias_or_name, item.name))
+    return tables
+
+
+def _conjuncts(node: exp.Expr | None) -> list[exp.Expr]:
+    if node is None:
+        return []
+    while isinstance(node, exp.Paren):
+        node = node.this
+    if isinstance(node, exp.And):
+        return _conjuncts(node.left) + _conjuncts(node.right)
+    return [node]
+
+
+def top_level_conjuncts(select: exp.Select) -> list[exp.Expr]:
+    """The conditions every result row satisfies: the AND-ed terms of the outer WHERE and of inner-join ONs.
+
+    A distance under NOT, OR, CASE or in a subquery bounds nothing and is not among them.
+    """
+    where = select.args.get("where")
+    conditions = _conjuncts(where.this if where is not None else None)
+    for join in select.args.get("joins") or []:
+        conditions += _conjuncts(join.args.get("on"))
+    return conditions
+
+
+def dwithin_edges(query: str, geometry_column: str) -> list[tuple[str, str, float]]:
+    """``ST_DWithin(a.<geom>, b.<geom>, d)`` top-level conjuncts between two aliases with a literal distance.
+
+    Deliberately narrower than ``query_processor.extract_distance_constraints``: other distance expressions
+    (SQRT/POWER, DIST ... BETWEEN) are in other units and say nothing about the metric cells, and only a
+    conjunct of the outer query bounds the distance of every result row.
+    """
     edges = []
-    for fn in tree.find_all(exp.Func):
+    for fn in top_level_conjuncts(outer_select(query)):
+        if not isinstance(fn, exp.Func):
+            continue
         name = fn.name if isinstance(fn, exp.Anonymous) else fn.sql_name()
         if name.upper() != "ST_DWITHIN":
             continue
@@ -253,13 +316,12 @@ def alias_distances(query: str, geometry_column: str) -> dict[str, dict[str, flo
 
 
 def fact_aliases(query: str, anchor: str) -> list[str]:
-    """Aliases of the anchor's table, in FROM order (the aliases the cell key applies to)."""
-    tree = sqlglot.parse_one(query, dialect="postgres")
-    tables = list(tree.find_all(exp.Table))
-    base = next((t.name for t in tables if t.alias_or_name == anchor), None)
+    """Aliases of the anchor's table in the outer FROM, in FROM order (the aliases the cell key applies to)."""
+    tables = outer_tables(outer_select(query))
+    base = dict(tables).get(anchor)
     if base is None:
-        raise ValueError(f"anchor alias {anchor!r} not in query")
-    return [t.alias_or_name for t in tables if t.name == base]
+        raise GridPlanError(f"anchor alias {anchor!r} is not in the outer FROM clause")
+    return [alias for alias, name in tables if name == base]
 
 
 @dataclass(frozen=True)
@@ -273,14 +335,24 @@ class GridPlan:
 
 
 def plan_query(query: str, anchor: str, geometry_column: str) -> GridPlan:
-    aliases = fact_aliases(query, anchor)
+    """Restricted aliases, diameter and anchor distances of a query, or GridPlanError if no sound restriction exists.
+
+    The fragments store the cells of every alias they join, of any table, so the diameter spans all aliases of the
+    outer FROM, and each of them must be linked to the anchor by top-level ST_DWithin conjuncts. Only the anchor
+    table's aliases are restricted.
+    """
+    tables = outer_tables(outer_select(query))
+    names = dict(tables)
+    if anchor not in names:
+        raise GridPlanError(f"anchor alias {anchor!r} is not in the outer FROM clause")
+    restricted = [alias for alias, name in tables if name == names[anchor]]
+    everyone = [alias for alias, _ in tables]
     dist = alias_distances(query, geometry_column)
-    if len(aliases) > 1:
-        missing = [a for a in aliases if a not in dist.get(anchor, {})]
-        if missing:
-            raise ValueError(f"aliases {missing} are not linked to {anchor} by ST_DWithin; no sound cell restriction exists")
-    diameter = max((d for a in aliases for b, d in dist.get(a, {}).items() if b in aliases), default=0.0)
-    return GridPlan(aliases, anchor, diameter, {a: dist.get(anchor, {}).get(a, 0.0) for a in aliases if a != anchor})
+    unlinked = [a for a in everyone if a != anchor and a not in dist.get(anchor, {})]
+    if unlinked:
+        raise GridPlanError(f"aliases {unlinked} are not linked to {anchor} by top-level ST_DWithin conjuncts; no sound cell restriction exists")
+    diameter = max((dist[a][b] for a in everyone for b in everyone if a != b), default=0.0)
+    return GridPlan(restricted, anchor, diameter, {a: dist[anchor][a] for a in restricted if a != anchor})
 
 
 # ------------------------------------------------------------------------------------------- rewrites
