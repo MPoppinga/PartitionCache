@@ -92,11 +92,11 @@ PartitionCache supports multiple cache backends with different performance chara
 
 #### PostGIS BBox Handler
 - **Type**: `postgis_bbox`
-- **Storage**: PostGIS geometry (MultiPolygon of grid cell envelopes)
+- **Storage**: PostGIS geometry, the collection (`ST_Collect`) of each variant's result geometries
 - **Datatypes**: `geometry`
 - **Requirements**: PostgreSQL + PostGIS extension
 - **Best for**: Grid-based spatial partitioning, bounding box intersection
-- **Spatial filtering**: Geometric `ST_Intersection` of cached bounding boxes
+- **Spatial filtering**: `ST_Intersection` of the cached collections, each widened by `ST_Buffer` with the query's buffer distance. Unbuffered for a buffer of 0, which a query over a single table gets when no `buffer_distance` is given.
 - **Scalability**: Excellent (database-native)
 
 ## Multi-Partition Support
