@@ -83,7 +83,7 @@ def test_eager_apply_routes_grid_keys_and_splits_the_star_setup(runner) -> None:
     star_sql = "CREATE TEMPORARY TABLE pc_nb_1 (c int, nc int) ON COMMIT DROP; INSERT INTO pc_nb_1 VALUES (1, 1); SELECT 1"
     stats = {"generated_variants": 3, "cache_hits": 2, "enhanced": 1, "grid_cells": 42, "grid_method": "CELL_STAR"}
     with (
-        patch.object(runner.partitioncache, "apply_cache", return_value=(star_sql, stats)) as apply,
+        patch.object(runner.partitioncache, "apply_cache_lazy", return_value=(star_sql, stats)) as apply,
         patch.object(runner.partitioncache, "get_partition_keys") as get_keys,
     ):
         enhanced, pk_stats, _ = runner.apply_cache_to_query(cache_manager, QUERY, ["cell200"], config)
@@ -116,3 +116,14 @@ def test_setup_rejects_bit_backends_and_checks_the_packing(runner) -> None:
     cursor = executor.conn.cursor.return_value.__enter__.return_value
     assert cursor.execute.call_args_list[0].args[0] == spatial_grid.CELL_FUNCTION_DDL
     assert check.call_args.args[1:] == ("pois", "geom", 200.0, 2000.0)
+
+
+def test_grid_kwargs_are_accepted_by_the_apply_function(runner) -> None:
+    """The real signature, not a mock: an unknown keyword (max_conditions_removed in apply_cache) failed every lookup."""
+    import inspect
+
+    import partitioncache
+
+    kwargs = runner._grid_apply_kwargs(GRID_KEY, _config(runner), 200.0)
+    assert "max_conditions_removed" in kwargs
+    inspect.signature(partitioncache.apply_cache_lazy).bind(query=QUERY, cache_handler=object(), partition_key="cell200", **kwargs)

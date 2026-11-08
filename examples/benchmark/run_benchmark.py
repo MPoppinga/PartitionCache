@@ -960,8 +960,9 @@ def apply_cache_to_query(
         grid_size = _grid_cell_size(pk_config)
         if grid_size:
             # The grid path looks up, widens and rewrites in one call; get_partition_keys would intersect the cell
-            # sets without the widening and report a misleading key count
-            result, grid_stats = partitioncache.apply_cache(
+            # sets without the widening and report a misleading key count. apply_cache_lazy, because apply_cache does
+            # not take max_conditions_removed / protected_patterns; for grid keys both run the same eager grid path.
+            result, grid_stats = partitioncache.apply_cache_lazy(
                 query=select_query, cache_handler=handler.underlying_handler, partition_key=pk, **_grid_apply_kwargs(pk_config, config, grid_size)
             )
             pk_stats[pk] = _grid_entry(grid_stats)
