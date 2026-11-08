@@ -144,12 +144,30 @@ def test_setup_rejects_bit_backends_and_checks_the_packing(runner) -> None:
     assert check.call_args.args[1:] == ("pois", "geom", 200.0, 2000.0)
 
 
-def test_grid_kwargs_are_accepted_by_the_apply_function(runner) -> None:
-    """The real signature, not a mock: an unknown keyword (max_conditions_removed in apply_cache) failed every lookup."""
+def test_grid_kwargs_are_named_parameters_of_the_apply_function(runner) -> None:
+    """The real signature, not a mock. Both apply functions take **kwargs, so binding proves nothing: apply_cache
+    rejected max_conditions_removed at run time (handle_deprecated_kwargs). Every grid argument must be a named one."""
     import inspect
 
     import partitioncache
 
-    kwargs = runner._grid_apply_kwargs(GRID_KEY, _config(runner), 200.0)
+    def named(fn) -> set[str]:
+        return {n for n, p in inspect.signature(fn).parameters.items() if p.kind is not p.VAR_KEYWORD}
+
+    kwargs = set(runner._grid_apply_kwargs(GRID_KEY, _config(runner), 200.0))
     assert "max_conditions_removed" in kwargs
-    inspect.signature(partitioncache.apply_cache_lazy).bind(query=QUERY, cache_handler=object(), partition_key="cell200", **kwargs)
+    assert kwargs <= named(partitioncache.apply_cache_lazy)
+    assert not kwargs <= named(partitioncache.apply_cache)  # why the eager path goes through apply_cache_lazy
+
+
+def test_population_counts_a_failed_store_as_failed(runner) -> None:
+    config = _config(runner)
+    handler = MagicMock()
+    handler.underlying_handler.exists.return_value = False
+    handler.set_entry.return_value = False
+    cache_manager = MagicMock()
+    cache_manager.get_handler.return_value = handler
+    executor = MagicMock()
+    executor.execute_fragment.return_value = {1, 2}
+    st = runner.populate_cache_for_query(executor, cache_manager, QUERY, ["cell200"], config)["cell200"]
+    assert st["fragments_failed"] == st["fragments_generated"] > 0

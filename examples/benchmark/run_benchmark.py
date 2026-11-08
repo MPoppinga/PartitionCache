@@ -805,7 +805,8 @@ def populate_cache_for_query(executor, cache_manager: CacheManager, query: str, 
     optimization_method = qp.get("population_optimization_method", "IN_SUBQUERY")
 
     for pk in partition_keys:
-        # existing: already cached (an earlier query's fragment); failed: raised; empty: executed, no keys, not stored
+        # existing: already cached (an earlier query's fragment); failed: raised, or its keys could not be stored;
+        # empty: executed, no keys, not stored
         pk_stats = {"fragments_generated": 0, "fragments_executed": 0, "fragments_existing": 0, "fragments_failed": 0, "fragments_empty": 0,
                     "partition_keys_cached": 0, "optimized_fragments": 0}
         handler = cache_manager.get_handler(pk)
@@ -918,11 +919,13 @@ def populate_cache_for_query(executor, cache_manager: CacheManager, query: str, 
                     pk_stats["partition_keys_cached"] = max(pk_stats["partition_keys_cached"], len(result_set))
 
                     if result_set:
-                        handler.set_entry(
+                        stored = handler.set_entry(
                             key=hash_val,
                             partition_key_identifiers=result_set,
                             query_text=fragment,
                         )
+                        if stored is False:  # the helper returns False when the store failed
+                            pk_stats["fragments_failed"] += 1
                     else:
                         pk_stats["fragments_empty"] += 1
             except Exception as e:
