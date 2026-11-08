@@ -2038,6 +2038,8 @@ def apply_cache(
     grid_method: str = "CELL_AUTO",
     min_query_cost: float | None = None,
     keep_all_attributes: bool = False,
+    max_conditions_removed: int | None = None,
+    protected_patterns: list[str] | None = None,
     **kwargs: Any,
 ) -> tuple[str, dict[str, int]]:
     """
@@ -2072,6 +2074,9 @@ def apply_cache(
         add_constraints: Dict mapping table names to constraints to add (e.g., {"table": "col = val"})
         remove_constraints_all: List of attribute names to remove from all query variants
         remove_constraints_add: List of attribute names to remove, creating additional variants
+        max_conditions_removed: Most attribute conditions a lookup variant may drop (None: no limit). Use the value
+            the cache was populated with, as in apply_cache_lazy.
+        protected_patterns: Conditions matching these patterns are never removed during variant generation.
         skip_partition_key_joins (bool): If True, skip partition key joins in variant generation.
         temporal_bucket_width: Width of one bucket of a time-bucket partition key, in the unit of ``temporal_column``;
             enables temporal dilation: each cached set is widened by ceil(window / width) buckets before the
@@ -2163,7 +2168,7 @@ def apply_cache(
              "fix_attributes": keep_all_attributes, "canonicalize_queries": canonicalize_queries, "follow_graph": True,
              "partition_join_table": partition_join_table, "bucket_steps": bucket_steps, "add_constraints": add_constraints,
              "remove_constraints_all": remove_constraints_all, "remove_constraints_add": remove_constraints_add,
-             "max_conditions_removed": kwargs.get("max_conditions_removed"), "protected_patterns": kwargs.get("protected_patterns")},
+             "max_conditions_removed": max_conditions_removed, "protected_patterns": protected_patterns},
         )
 
     # Spatial mode is selected by passing a geometry column
@@ -2186,6 +2191,8 @@ def apply_cache(
             add_constraints=add_constraints,
             remove_constraints_all=remove_constraints_all,
             remove_constraints_add=remove_constraints_add,
+            max_conditions_removed=max_conditions_removed,
+            protected_patterns=protected_patterns,
             skip_partition_key_joins=True,
             geometry_column=geometry_column,
         )
@@ -2292,6 +2299,8 @@ def apply_cache(
         remove_constraints_all=remove_constraints_all,
         remove_constraints_add=remove_constraints_add,
         skip_partition_key_joins=skip_partition_key_joins,
+        max_conditions_removed=max_conditions_removed,
+        protected_patterns=protected_patterns,
         temporal_bucket_width=temporal_bucket_width,
         dilation_buckets=dilation_buckets,
         temporal_column=temporal_column,
