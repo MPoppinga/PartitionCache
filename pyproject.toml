@@ -10,6 +10,7 @@ requires-python = ">=3.11"
 license = { text = "LGPL-3.0-or-later" }
 dependencies = [
     "networkx",
+    "numpy",
     "sqlglot[c]>=30.24.0,<31.0.0",
     "bitarray",
     "pyroaring",
@@ -34,7 +35,7 @@ db = [
     "psycopg",
     "rocksdict",
     "redis",
-    "duckdb",
+    "duckdb>=2.0",
     "mysql-connector-python",
 ]
 
@@ -44,7 +45,7 @@ rocksdb = [
 
 benchmark = [
     "pyyaml",
-    "duckdb",
+    "duckdb>=2.0",
     "psycopg",
     "python-dotenv",
 ]

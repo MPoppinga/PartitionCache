@@ -350,6 +350,7 @@ enhanced_query, stats = partitioncache.apply_cache_lazy(
 
 - `k = ceil(window / temporal_bucket_width)`. The window is read only from conditions on `alias.temporal_column`: `BETWEEN`, `ABS(a.ts - b.ts) <= W`, or a lower and an upper bound in separate conditions. A difference bounded on one side only (`b.ts <= a.ts + 1200`) does not count. Chained windows add up.
 - If two aliases of the partition key's table are not bounded in time against each other, no `k` is sound: the query runs without the cache (no partition keys, no restriction).
+- When a temporal query runs without the cache, the statistics of `apply_cache` and `apply_cache_lazy` say why in `uncached_reason`: `temporal_unbounded` (as above), `no_dilated_lazy` (a lazy call on a handler without a dilated intersection) or `non_integer_key`. The reason is also logged as a warning.
 - `dilation_buckets` sets `k` directly instead (`0` turns dilation off, which can lose rows).
 - Only numeric time columns (e.g. epoch seconds) give a window; a bound written with `INTERVAL` is not read, so such queries run without the cache.
 - `use_p0_table` is ignored for a temporal key: its join `alias.w = p0.w` would put all aliases into the same bucket.

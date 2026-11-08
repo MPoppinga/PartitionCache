@@ -130,6 +130,53 @@ def add_spatial_args(parser: argparse.ArgumentParser, include_buffer_distance: b
         )
 
 
+def parse_grid_cell_sizes(value: str) -> dict[str, float]:
+    """Parse --grid-cell-size: comma-separated KEY=SIZE pairs, e.g. ``cell200=200,cell400=400``."""
+    sizes: dict[str, float] = {}
+    for part in (p.strip() for p in value.split(",") if p.strip()):
+        key, sep, raw = part.partition("=")
+        try:
+            size = float(raw)
+        except ValueError:
+            size = -1.0
+        if not sep or not key.strip() or size <= 0:
+            raise argparse.ArgumentTypeError(f"expected KEY=SIZE with a positive size, got {part!r}")
+        sizes[key.strip()] = size
+    return sizes
+
+
+def add_grid_args(parser: argparse.ArgumentParser) -> None:
+    """Add --grid-cell-size: which partition keys are grid-cell spatial keys (``partitioncache.spatial_grid``)."""
+    env = os.getenv("PARTITION_CACHE_GRID_CELL_SIZES", "")
+    parser.add_argument_group("grid-cell spatial keys").add_argument(
+        "--grid-cell-size",
+        type=parse_grid_cell_sizes,
+        default=parse_grid_cell_sizes(env) if env else {},
+        metavar="KEY=SIZE[,KEY=SIZE]",
+        help="Partition keys that hold grid cells of the geometry column, with their cell size in the SRID's units. "
+        "Fragments then select cells (integer datatype, sparse-set backends only); lookups must use the same size "
+        "(default: none or PARTITION_CACHE_GRID_CELL_SIZES)",
+    )
+
+
+def grid_cell_size_for(args: argparse.Namespace, partition_key: str) -> float | None:
+    """The grid cell size configured for ``partition_key``, or None if it is not a grid key."""
+    sizes = getattr(args, "grid_cell_size", None)
+    if not isinstance(sizes, dict):
+        return None
+    size = sizes.get(partition_key)
+    return float(size) if size is not None else None
+
+
+def check_grid_key(partition_key: str, datatype: str, cache_backend: str | None) -> str | None:
+    """Why a grid key cannot use this datatype or backend, or None if it can."""
+    if datatype != "integer":
+        return f"grid key '{partition_key}' needs --partition-datatype integer, got '{datatype}'"
+    if cache_backend and cache_backend.endswith("_bit"):
+        return f"grid key '{partition_key}' cannot use the bit backend '{cache_backend}': cells exceed any useful bitsize"
+    return None
+
+
 def add_environment_args(parser: argparse.ArgumentParser) -> None:
     """
     Add environment file loading arguments to an ArgumentParser.

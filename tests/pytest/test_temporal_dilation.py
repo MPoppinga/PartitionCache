@@ -210,3 +210,76 @@ class TestTemporalLookup:
         assert not hasattr(handler, "get_intersected_dilated_lazy")
         assert get_partition_keys_lazy(self.QUERY, handler, "w", temporal_bucket_width=3600, temporal_column="ts") == (None, 0, 0)
         handler.get_intersected_lazy.assert_not_called()
+
+
+class TestUncachedReason:
+    """apply_cache and apply_cache_lazy report why a temporal query ran without the cache, not just zero hits."""
+
+    QUERY = "SELECT e1.w FROM ev AS e1, ev AS e2 WHERE e1.kind = 1 AND e2.kind = 2 AND e2.ts BETWEEN e1.ts AND e1.ts + 1200"
+    UNBOUNDED = "SELECT e1.w FROM ev AS e1, ev AS e2 WHERE e1.kind = 1 AND e2.ts <= e1.ts + 1200"
+    TEMPORAL = {"temporal_bucket_width": 3600, "temporal_column": "ts", "min_component_size": 1}
+
+    def _handler(self, datatype="integer", dilated_lazy=True):
+        from unittest.mock import MagicMock
+
+        from partitioncache.cache_handler.abstract import AbstractCacheHandler_Lazy
+
+        handler = MagicMock(spec=AbstractCacheHandler_Lazy)
+        handler.get_datatype.return_value = datatype
+        handler.filter_existing_keys.return_value = set()
+        handler.get_intersected.return_value = (None, 0)
+        handler.get_intersected_lazy.return_value = (None, 0)
+        if dilated_lazy:
+            handler.get_intersected_dilated_lazy = MagicMock(return_value=(None, 0))
+            handler.get_intersected_dilated = MagicMock(return_value=(None, 0))
+        return handler
+
+    @pytest.mark.parametrize(
+        ("query", "handler_kwargs", "expected"),
+        [
+            (UNBOUNDED, {}, "temporal_unbounded"),
+            (QUERY, {"dilated_lazy": False}, "no_dilated_lazy"),
+            (QUERY, {"datatype": "text"}, "non_integer_key"),
+        ],
+    )
+    def test_lazy_reports_the_reason(self, query, handler_kwargs, expected):
+        from partitioncache.apply_cache import apply_cache_lazy
+
+        handler = self._handler(**handler_kwargs)
+        enhanced, stats = apply_cache_lazy(query, handler, "w", **self.TEMPORAL)
+        assert enhanced == query
+        assert stats["uncached_reason"] == expected
+        assert stats["enhanced"] == 0
+        handler.get_intersected_lazy.assert_not_called()
+
+    @pytest.mark.parametrize(("query", "handler_kwargs", "expected"), [(UNBOUNDED, {}, "temporal_unbounded"), (QUERY, {"datatype": "text"}, "non_integer_key")])
+    def test_non_lazy_reports_the_reason(self, query, handler_kwargs, expected):
+        from partitioncache.apply_cache import apply_cache
+
+        enhanced, stats = apply_cache(query, self._handler(**handler_kwargs), "w", **self.TEMPORAL)
+        assert enhanced == query
+        assert stats["uncached_reason"] == expected
+
+    def test_non_lazy_python_fallback_is_not_a_reason(self):
+        from partitioncache.apply_cache import apply_cache
+
+        _, stats = apply_cache(self.QUERY, self._handler(dilated_lazy=False), "w", **self.TEMPORAL)
+        assert "uncached_reason" not in stats
+
+    def test_no_reason_when_the_cache_is_used(self):
+        from partitioncache.apply_cache import apply_cache_lazy
+
+        handler = self._handler()
+        _, stats = apply_cache_lazy(self.QUERY, handler, "w", **self.TEMPORAL)
+        assert "uncached_reason" not in stats
+        handler.get_intersected_dilated_lazy.assert_called_once()
+
+    def test_lazy_call_with_a_non_lazy_handler_still_raises(self):
+        from unittest.mock import MagicMock
+
+        from partitioncache.apply_cache import apply_cache_lazy
+        from partitioncache.cache_handler.abstract import AbstractCacheHandler
+
+        handler = MagicMock(spec=AbstractCacheHandler)
+        with pytest.raises(ValueError, match="does not support lazy intersection"):
+            apply_cache_lazy(self.QUERY, handler, "w", **self.TEMPORAL)

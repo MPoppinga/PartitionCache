@@ -871,7 +871,7 @@ class TestApplyCacheLazySpatialMode:
 
     @patch.object(_apply_cache_module, "generate_all_hashes")
     def test_spatial_mode_requires_buffer_distance(self, mock_hashes):
-        """When geometry_column is set but buffer_distance is None, should raise ValueError."""
+        """Several tables without distance constraints and no buffer_distance: no buffer is derivable."""
         mock_hashes.return_value = ["hash1"]
 
         handler = self._make_mock_handler(
@@ -882,7 +882,7 @@ class TestApplyCacheLazySpatialMode:
 
         with pytest.raises(ValueError, match="buffer_distance is required.*no distance constraints"):
             apply_cache_lazy(
-                query="SELECT * FROM poi AS p1",
+                query="SELECT * FROM poi AS p1, poi AS p2 WHERE p1.subtype = p2.subtype",
                 cache_handler=handler,
                 partition_key="spatial_h3",
                 geometry_column="geom",
@@ -1572,14 +1572,14 @@ class TestApplyCacheSpatialMode:
 
     @patch.object(_apply_cache_module, "generate_all_hashes")
     def test_spatial_mode_requires_buffer_distance(self, mock_hashes):
-        """When geometry_column is set but buffer_distance is None, should raise ValueError."""
+        """Several tables without distance constraints and no buffer_distance: no buffer is derivable."""
         mock_hashes.return_value = ["hash1"]
 
         handler = self._make_mock_handler()
 
         with pytest.raises(ValueError, match="buffer_distance is required.*no distance constraints"):
             apply_cache(
-                query="SELECT * FROM poi AS p1",
+                query="SELECT * FROM poi AS p1, poi AS p2 WHERE p1.subtype = p2.subtype",
                 cache_handler=handler,
                 partition_key="spatial_h3",
                 geometry_column="geom",

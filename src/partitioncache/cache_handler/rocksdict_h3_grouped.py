@@ -25,6 +25,34 @@ from partitioncache.cache_handler.rocks_dict import RocksDictCacheHandler, _grou
 logger = getLogger("PartitionCache")
 
 
+KRING_EDGE_MARGIN = 0.9  # edge lengths vary smoothly; margin for cells near the sampled ones but not among them
+KRING_EDGE_SAMPLE = 20_000
+
+
+def sound_kring_radius(cells: list[int], buffer_distance: float, sample: int = KRING_EDGE_SAMPLE, margin: float = KRING_EDGE_MARGIN) -> int:
+    """Ring count k such that two points within ``buffer_distance`` lie in cells at grid distance <= k.
+
+    Cells at grid distance g >= 2 are at least (g - 1) * e_min apart, where e_min is the shortest edge
+    among them: two rings apart they are separated by one edge, and every further ring adds more. So
+    k = floor(D / e_min) + 1 gives a ring k + 1 that is farther than D. e_min comes from the cells'
+    own edges (a deterministic sample of at most ``sample`` cells), shrunk by ``margin``.
+
+    The average edge length is not a bound: local edges are shorter (around 15 percent at resolution 9
+    in central Europe), and with k = ceil(D / average) two cells two rings apart can be closer than D.
+    """
+    if buffer_distance <= 0 or not cells:
+        return 0
+    import h3 as h3_lib  # type: ignore[import-untyped]
+
+    step = max(1, len(cells) // sample)
+    e_min = min(
+        h3_lib.edge_length(edge, unit="m")
+        for cell in cells[::step]
+        for edge in h3_lib.origin_to_directed_edges(h3_lib.int_to_str(cell) if isinstance(cell, int) else cell)
+    )
+    return int(math.floor(buffer_distance / (e_min * margin))) + 1
+
+
 class RocksDictH3GroupedCacheHandler(RocksDictCacheHandler):
     """
     Spatial extension of RocksDictCacheHandler for H3 grouped match sets.
@@ -246,18 +274,14 @@ class RocksDictH3GroupedCacheHandler(RocksDictCacheHandler):
             if not fragment_groups:
                 return None
 
-            # Now we need h3 for k-ring expansion
+            # Now we need h3 for k-ring expansion (checked here for a clear error message)
             try:
-                import h3 as h3_lib  # type: ignore[import-untyped]
+                import h3  # type: ignore[import-untyped]  # noqa: F401
             except ImportError as e:
                 raise ImportError("h3 library required for H3 cell filtering: pip install h3") from e
 
-            # Compute k from buffer_distance
-            if buffer_distance > 0:
-                edge_length = h3_lib.average_hexagon_edge_length(self.resolution, unit="m")
-                k = math.ceil(buffer_distance / edge_length)
-            else:
-                k = 0
+            # Compute k from buffer_distance and the cached cells' own edge lengths (sound, see sound_kring_radius)
+            k = sound_kring_radius(sorted({cell for groups in fragment_groups for group in groups for cell in group}), buffer_distance)
 
             # K-ring expansion + cross-variant intersection
             result = _grouped_kring_intersection(fragment_groups, k)

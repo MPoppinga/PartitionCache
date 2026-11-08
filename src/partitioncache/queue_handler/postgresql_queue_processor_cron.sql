@@ -18,7 +18,6 @@ BEGIN
             max_parallel_jobs INTEGER NOT NULL DEFAULT 5 CHECK (max_parallel_jobs > 0 AND max_parallel_jobs <= 20),
             frequency_seconds INTEGER NOT NULL DEFAULT 1 CHECK (frequency_seconds > 0),
             timeout_seconds INTEGER NOT NULL DEFAULT 1800 CHECK (timeout_seconds > 0), -- Default 30 minutes
-            stale_after_seconds INTEGER NOT NULL DEFAULT 3600 CHECK (stale_after_seconds > 0),
             table_prefix TEXT NOT NULL,
             queue_prefix TEXT NOT NULL,
             cache_backend TEXT NOT NULL,
@@ -97,6 +96,26 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+-- Function to turn the processor frequency into a pg_cron schedule. pg_cron takes '[1-59] seconds' or a
+-- five-field cron expression whose step stays within its field, so only these frequencies can be scheduled;
+-- any other value is rejected instead of being changed to a different frequency.
+CREATE OR REPLACE FUNCTION partitioncache_processor_cron_schedule(p_frequency_seconds INTEGER)
+RETURNS TEXT AS $$
+BEGIN
+    IF p_frequency_seconds BETWEEN 1 AND 59 THEN
+        RETURN p_frequency_seconds || ' seconds';
+    ELSIF p_frequency_seconds % 60 = 0 AND p_frequency_seconds / 60 BETWEEN 1 AND 59 THEN
+        RETURN '*/' || (p_frequency_seconds / 60) || ' * * * *';
+    ELSIF p_frequency_seconds % 3600 = 0 AND p_frequency_seconds / 3600 BETWEEN 1 AND 23 THEN
+        RETURN '0 */' || (p_frequency_seconds / 3600) || ' * * *';
+    ELSIF p_frequency_seconds = 86400 THEN
+        RETURN '0 0 * * *';
+    END IF;
+    RAISE EXCEPTION 'A processor frequency of % seconds cannot be scheduled with pg_cron; use 1-59 seconds, whole minutes up to 59, whole hours up to 23, or one day', p_frequency_seconds
+        USING ERRCODE = 'invalid_parameter_value';
+END;
+$$ LANGUAGE plpgsql IMMUTABLE;
+
 -- Trigger function to synchronize config with pg_cron using cross-database scheduling
 CREATE OR REPLACE FUNCTION partitioncache_sync_cron_job()
 RETURNS TRIGGER AS $$
@@ -168,6 +187,9 @@ BEGIN
                        NEW.job_name, NEW.table_prefix, NEW.queue_prefix,
                        NEW.cache_backend, NEW.timeout_seconds, NEW.result_limit, NEW.default_bitsize);
 
+    -- Fails for a frequency pg_cron cannot schedule, before the existing jobs are removed
+    v_schedule := partitioncache_processor_cron_schedule(NEW.frequency_seconds);
+
     -- First, unschedule existing jobs if this is an UPDATE
     IF (TG_OP = 'UPDATE' AND OLD.job_ids IS NOT NULL) THEN
         FOREACH v_old_job_id IN ARRAY OLD.job_ids LOOP
@@ -185,20 +207,6 @@ BEGIN
 
         BEGIN
             -- Use schedule_in_database to run jobs in the target database
-            -- Convert frequency to proper cron format
-            IF NEW.frequency_seconds < 60 THEN
-                v_schedule := CONCAT(NEW.frequency_seconds, ' seconds');
-            ELSE
-                -- Convert to cron format for intervals >= 60 seconds
-                IF NEW.frequency_seconds % 60 = 0 THEN
-                    -- Even minutes: use minute interval
-                    v_schedule := CONCAT('*/', NEW.frequency_seconds / 60, ' * * * *');
-                ELSE
-                    -- Use second-level cron format: "*/X * * * * *"
-                    v_schedule := CONCAT('*/', NEW.frequency_seconds, ' * * * * *');
-                END IF;
-            END IF;
-
             -- This should only be reached if pg_cron is available (checked above)
             SELECT cron.schedule_in_database(
                 v_job_name,

@@ -5,18 +5,22 @@ CLI tool to add queries to the cache either directly or via the queue.
 import argparse
 import os
 from logging import getLogger
+from typing import Any
 
 import partitioncache
 from partitioncache.cli.common_args import (
     add_cache_args,
     add_database_args,
     add_environment_args,
+    add_grid_args,
     add_queue_args,
     add_spatial_args,
     add_variant_generation_args,
     add_verbosity_args,
+    check_grid_key,
     configure_logging,
     get_database_connection_params,
+    grid_cell_size_for,
     load_environment_with_validation,
     parse_variant_generation_json_args,
     resolve_cache_backend,
@@ -31,8 +35,38 @@ from partitioncache.query_processor import (
     order_variants_for_population,
     query_contains_top_level_outer_join,
 )
+from partitioncache.spatial_grid import GRID_GENERATION_KWARGS
 
 logger = getLogger("PartitionCache")
+
+
+def _grid_kwargs(grid_size: float | None) -> dict[str, Any]:
+    """``grid_cell_size`` only for grid keys, so the variant generation of every other key is called unchanged."""
+    return {"grid_cell_size": grid_size} if grid_size is not None else {}
+
+
+def _generation_settings(args: argparse.Namespace) -> tuple[float | None, bool, bool]:
+    """(grid cell size, auto_detect_partition_join, skip_partition_key_joins) for variant generation.
+
+    A grid key forces the flags its lookup uses (spatial_grid.GRID_GENERATION_KWARGS), otherwise the
+    population would generate other fragments than the lookup searches for.
+    """
+    grid_size = grid_cell_size_for(args, args.partition_key)
+    if grid_size is None:
+        is_spatial = args.partition_datatype == "geometry"
+        return None, not args.no_auto_detect_partition_join, is_spatial or args.partition_key in args.skip_partition_key_joins
+    return grid_size, GRID_GENERATION_KWARGS["auto_detect_partition_join"], GRID_GENERATION_KWARGS["skip_partition_key_joins"]
+
+
+def _exit_if_grid_key_invalid(args: argparse.Namespace, grid_size: float | None) -> None:
+    if grid_size is None:
+        return
+    problem = check_grid_key(args.partition_key, args.partition_datatype, resolve_cache_backend(args))
+    if problem is None and args.no_recompose:
+        problem = f"grid key '{args.partition_key}' needs recomposition: --no-recompose would store the query's own rows, not cells"
+    if problem is not None:
+        logger.error(problem)
+        exit(1)
 
 
 def main():
@@ -71,6 +105,7 @@ def main():
     add_database_args(parser)
     add_queue_args(parser)
     add_spatial_args(parser, include_buffer_distance=False)
+    add_grid_args(parser)
     add_variant_generation_args(parser)
     add_environment_args(parser)
     add_verbosity_args(parser)
@@ -131,6 +166,8 @@ def main():
 
     elif args.queue:  # Add to queue for async processing
         is_spatial = args.partition_datatype == "geometry"
+        grid_size, auto_detect, skip_pk_joins = _generation_settings(args)
+        _exit_if_grid_key_invalid(args, grid_size)
 
         # Resolve cache backend to store with queue item (important for spatial routing)
         queue_cache_backend = resolve_cache_backend(args) if is_spatial else None
@@ -148,6 +185,8 @@ def main():
                     except Exception as e:
                         logger.debug("Could not resolve geometry column from cache handler, using default 'geom': %s", e)
                         geometry_column = "geom"
+            elif grid_size is not None:
+                geometry_column = args.geometry_column or "geom"
 
             query_hash_pairs = generate_all_query_hash_pairs(
                 query,
@@ -155,7 +194,7 @@ def main():
                 min_component_size=args.min_component_size,
                 follow_graph=args.follow_graph,
                 keep_all_attributes=True,
-                auto_detect_partition_join=not args.no_auto_detect_partition_join,
+                auto_detect_partition_join=auto_detect,
                 max_component_size=args.max_component_size,
                 partition_join_table=args.partition_join_table,
                 warn_no_partition_key=not args.no_warn_partition_key,
@@ -163,9 +202,10 @@ def main():
                 add_constraints=add_constraints,
                 remove_constraints_all=remove_constraints_all,
                 remove_constraints_add=remove_constraints_add,
-                skip_partition_key_joins=is_spatial or args.partition_key in args.skip_partition_key_joins,
+                skip_partition_key_joins=skip_pk_joins,
                 geometry_column=geometry_column,
                 max_conditions_removed=args.max_conditions_removed,
+                **_grid_kwargs(grid_size),
             )
             # Smallest variants first, so the monitor's cache optimization can restrict the larger ones with them
             query_hash_pairs = order_variants_for_population(query_hash_pairs)
@@ -182,6 +222,8 @@ def main():
 
     elif args.direct:  # Execute directly
         is_spatial = args.partition_datatype == "geometry"
+        grid_size, auto_detect, skip_pk_joins = _generation_settings(args)
+        _exit_if_grid_key_invalid(args, grid_size)
 
         if not args.no_recompose:
             logger.warning("Direct mode with recomposing may take a long time on large queries, consider using the queue instead")
@@ -210,6 +252,8 @@ def main():
             geometry_column = None
             if is_spatial:
                 geometry_column = args.geometry_column or getattr(cache_handler, "geometry_column", "geom")
+            elif grid_size is not None:
+                geometry_column = args.geometry_column or "geom"
 
             if not args.no_recompose:
                 logger.debug("Recomposing query")
@@ -221,7 +265,7 @@ def main():
                     min_component_size=args.min_component_size,
                     follow_graph=args.follow_graph,
                     keep_all_attributes=True,
-                    auto_detect_partition_join=not args.no_auto_detect_partition_join,
+                    auto_detect_partition_join=auto_detect,
                     max_component_size=args.max_component_size,
                     partition_join_table=args.partition_join_table,
                     warn_no_partition_key=not args.no_warn_partition_key,
@@ -229,9 +273,10 @@ def main():
                     add_constraints=add_constraints,
                     remove_constraints_all=remove_constraints_all,
                     remove_constraints_add=remove_constraints_add,
-                    skip_partition_key_joins=is_spatial or args.partition_key in args.skip_partition_key_joins,
+                    skip_partition_key_joins=skip_pk_joins,
                     geometry_column=geometry_column,
                     max_conditions_removed=args.max_conditions_removed,
+                    **_grid_kwargs(grid_size),
                 )
 
             else:

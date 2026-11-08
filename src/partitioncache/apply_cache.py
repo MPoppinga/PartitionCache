@@ -22,7 +22,13 @@ import sqlglot.errors
 import sqlglot.expressions as exp
 
 from partitioncache.cache_handler.abstract import LAZY_ALL_KEYS_PLACEHOLDER, AbstractCacheHandler, AbstractCacheHandler_Lazy
-from partitioncache.query_processor import compute_buffer_distance, detect_partition_join_from_query, generate_all_hashes, handle_deprecated_kwargs
+from partitioncache.query_processor import (
+    compute_buffer_distance,
+    detect_partition_join_from_query,
+    generate_all_hashes,
+    handle_deprecated_kwargs,
+    normalize_regex_operators,
+)
 from partitioncache.temporal_dilation import compute_dilation_buckets, compute_temporal_window, dilate_bucket_set
 
 logger = getLogger("PartitionCache")
@@ -60,6 +66,39 @@ def _resolve_dilation(
     return compute_dilation_buckets(window, temporal_bucket_width)
 
 
+def _has_single_from_item(query: str) -> bool:
+    """Whether the outermost FROM clause holds exactly one table (no join, no derived table, no CTE)."""
+    try:
+        parsed = sqlglot.parse_one(query)
+    except sqlglot.errors.ParseError:
+        return False
+    if parsed.find(exp.With) is not None:  # the fragments are generated from the CTE bodies, which may join tables
+        return False
+    if not isinstance(parsed, exp.Select):  # a set operation: its other branches may join tables
+        return False
+    if parsed.args.get("from_") is None:
+        return False
+    return not parsed.args.get("joins") and isinstance(parsed.args["from_"].this, exp.Table)
+
+
+def _resolve_buffer_distance(query: str, buffer_distance: float | None) -> float:
+    """The distance the cached geometries are widened by before they restrict the query.
+
+    An explicit value wins. A query over a single table needs no widening: every cached fragment holds that
+    table's own geometries, so each row the query returns lies in every cached set. A radius around a constant
+    point, as in ``ST_DWithin(p1.geom, ST_MakePoint(...), r)``, must therefore not widen the filter by r.
+    Otherwise it is the diameter of the query's distance graph (:func:`compute_buffer_distance`).
+    """
+    if buffer_distance is not None:
+        return buffer_distance
+    if _has_single_from_item(query):
+        return 0.0
+    buffer_distance = compute_buffer_distance(query)
+    if buffer_distance == 0.0:
+        raise ValueError("buffer_distance is required when geometry_column is set and query has no distance constraints")
+    return buffer_distance
+
+
 def _is_temporal(temporal_bucket_width: float | None, dilation_buckets: int | None) -> bool:
     """Whether the partition key is a time bucket; its variants are then generated without partition key joins.
 
@@ -68,6 +107,47 @@ def _is_temporal(temporal_bucket_width: float | None, dilation_buckets: int | No
     or the variant hashes differ.
     """
     return temporal_bucket_width is not None or dilation_buckets is not None
+
+
+def _temporal_lookup(
+    query: str,
+    cache_handler: AbstractCacheHandler,
+    partition_key: str,
+    temporal_bucket_width: float | None,
+    dilation_buckets: int | None,
+    temporal_column: str | None,
+    partition_key_source_table: str | None,
+    lazy: bool,
+) -> tuple[int, str | None]:
+    """The dilation for a lookup, and why it must run without the cache (None if it may use it).
+
+    Reasons, also reported as ``uncached_reason`` in the statistics of apply_cache and apply_cache_lazy:
+    ``temporal_unbounded`` (rows of the partition key's table without a time bound to each other),
+    ``no_dilated_lazy`` (a lazy lookup on a handler without a dilated intersection) and ``non_integer_key``
+    (buckets of a non-integer partition key cannot be dilated). In each case the cache would return too few
+    partition keys.
+    """
+    if lazy and not isinstance(cache_handler, AbstractCacheHandler_Lazy):
+        raise ValueError("Cache handler does not support lazy intersection")  # a usage error, not a reason to run uncached
+    dilation = _resolve_dilation(query, temporal_bucket_width, dilation_buckets, temporal_column, partition_key, partition_key_source_table)
+    if dilation is None:
+        logger.warning(f"Rows of the query are not bounded in time against each other on '{temporal_column}'; the query runs without the cache")
+        return 0, "temporal_unbounded"
+    if dilation == 0:
+        return 0, None
+    if lazy and getattr(cache_handler, "get_intersected_dilated_lazy", None) is None:
+        # The Python fallback materialises the sets and cannot produce a subquery
+        logger.warning(f"{type(cache_handler).__name__} has no lazy dilated intersection; the query runs without the cache (the non-lazy API supports dilation)")
+        return dilation, "no_dilated_lazy"
+    datatype = cache_handler.get_datatype(partition_key)
+    if datatype is not None and datatype != "integer":
+        logger.warning(f"Temporal dilation needs an integer partition key; '{partition_key}' is {datatype}, the query runs without the cache")
+        return dilation, "non_integer_key"
+    return dilation, None
+
+
+def _uncached_stats(reason: str, gate_stats: dict[str, int]) -> dict[str, Any]:
+    return {"generated_variants": 0, "cache_hits": 0, "enhanced": 0, "p0_rewritten": 0, "uncached_reason": reason, **gate_stats}
 
 
 def _intersect_dilated_fallback(
@@ -163,9 +243,10 @@ def get_partition_keys(
     if "auto_detect_partition_join" in deprecated:
         auto_detect_partition_join = deprecated["auto_detect_partition_join"]
 
-    dilation = _resolve_dilation(query, temporal_bucket_width, dilation_buckets, temporal_column, partition_key, partition_key_source_table)
-    if dilation is None:
-        logger.warning(f"Rows of the query are not bounded in time against each other on '{temporal_column}'; the query runs without the cache")
+    dilation, uncached_reason = _temporal_lookup(
+        query, cache_handler, partition_key, temporal_bucket_width, dilation_buckets, temporal_column, partition_key_source_table, lazy=False
+    )
+    if uncached_reason is not None:
         return None, 0, 0
     if _is_temporal(temporal_bucket_width, dilation_buckets):
         skip_partition_key_joins = True
@@ -282,14 +363,10 @@ def get_partition_keys_lazy(
     if not isinstance(cache_handler, AbstractCacheHandler_Lazy):
         raise ValueError("Cache handler does not support lazy intersection")
 
-    dilation = _resolve_dilation(query, temporal_bucket_width, dilation_buckets, temporal_column, partition_key, partition_key_source_table)
-    if dilation is None:
-        logger.warning(f"Rows of the query are not bounded in time against each other on '{temporal_column}'; the query runs without the cache")
-        return None, 0, 0
-    if dilation > 0 and getattr(cache_handler, "get_intersected_dilated_lazy", None) is None:
-        # The Python fallback materialises the sets and cannot produce a subquery; skipping the dilation would
-        # return too few partition keys, so the query runs without the cache
-        logger.warning(f"{type(cache_handler).__name__} has no lazy dilated intersection; the query runs without the cache (the non-lazy API supports dilation)")
+    dilation, uncached_reason = _temporal_lookup(
+        query, cache_handler, partition_key, temporal_bucket_width, dilation_buckets, temporal_column, partition_key_source_table, lazy=True
+    )
+    if uncached_reason is not None:
         return None, 0, 0
     if _is_temporal(temporal_bucket_width, dilation_buckets):
         skip_partition_key_joins = True
@@ -1505,6 +1582,73 @@ def _check_cost_gate(query: str, cost_estimator: Callable[[str], float | None] |
 _P = ParamSpec("_P")
 
 
+def _apply_grid_cache(
+    query: str,
+    cache_handler: AbstractCacheHandler,
+    partition_key: str,
+    geometry_column: str,
+    grid_cell_size: float,
+    grid_method: str,
+    p0_alias: str | None,
+    gate_stats: dict[str, int],
+    hash_kwargs: dict[str, Any],
+) -> tuple[str, dict[str, Any]]:
+    """Grid-cell spatial key (``partitioncache.spatial_grid``): eager lookup, sound 2-D widening, rewrite.
+
+    The cached sets are fetched and widened in Python (widen the smallest, probe the rest); the cell set then
+    enters the query as a star join over neighbour pair tables (CELL_STAR), as a constant array on every
+    fact-table alias (CELL_ARRAY) or on the anchor only (CELL_ARRAY_ANCHOR); CELL_AUTO picks between the
+    star and the anchor-only array from the query's predicates.
+    """
+    from partitioncache import spatial_grid
+
+    if grid_method not in spatial_grid.GRID_METHODS:
+        raise ValueError(f"grid_method must be one of {spatial_grid.GRID_METHODS}, got {grid_method!r}")
+    # Plan first: a query without a sound cell restriction (an alias not bounded by a top-level ST_DWithin, a CTE,
+    # a derived table) runs uncached without paying for the lookup
+    try:
+        anchor = p0_alias or spatial_grid.outer_tables(spatial_grid.outer_select(query))[0][0]
+        plan = spatial_grid.plan_query(query, anchor, geometry_column)
+    except spatial_grid.GridPlanError as e:
+        logger.info(f"Grid key {partition_key}: {e}; running uncached")
+        return query, _uncached_stats(str(e), gate_stats)
+    hashes = generate_all_hashes(
+        query=query,
+        partition_key=partition_key,
+        geometry_column=geometry_column,
+        grid_cell_size=grid_cell_size,
+        **spatial_grid.GRID_GENERATION_KWARGS,
+        **hash_kwargs,
+    )
+    stats: dict[str, Any] = {"generated_variants": len(hashes), "cache_hits": 0, "enhanced": 0, "p0_rewritten": 0, **gate_stats}
+    if not hashes:
+        return query, stats
+    existing = sorted(cache_handler.filter_existing_keys(set(hashes), partition_key))
+    sets = [v for v in (cache_handler.get(h, partition_key) for h in existing) if v is not None]
+    stats["cache_hits"] = len(sets)
+    if not sets:
+        return query, stats
+
+    offsets = spatial_grid.stencil(plan.diameter, grid_cell_size)
+    if not spatial_grid.cells_in_packing_range(sets, max(max(abs(dx), abs(dy)) for dx, dy in offsets)):  # type: ignore[arg-type]
+        logger.warning("Grid cells outside the packing range (negative or too close to the j limit); running uncached")
+        return query, _uncached_stats("grid cells outside the packing range", gate_stats)
+    cells = spatial_grid.intersect_widened(sets, offsets)  # type: ignore[arg-type]
+    stats["grid_cells"] = len(cells)
+    stats["enhanced"] = 1
+    if len(cells) == 0:
+        return _add_empty_intersection_condition(query), stats
+    if grid_method == "CELL_AUTO":
+        grid_method = spatial_grid.choose_grid_method(query, plan)
+    stats["grid_method"] = grid_method
+    if grid_method == "CELL_STAR":
+        setup, star_query = spatial_grid.rewrite_cell_star(query, cells, plan, geometry_column, grid_cell_size)
+        return "; ".join([*setup, star_query]), stats
+    aliases = plan.aliases if grid_method == "CELL_ARRAY" else [plan.anchor]
+    return spatial_grid.rewrite_cell_array(query, cells, aliases, geometry_column, grid_cell_size), stats
+
+
+
 def _runs_uncached_on_sql_errors(func: Callable[_P, tuple[str, dict[str, int]]]) -> Callable[_P, tuple[str, dict[str, int]]]:
     """Return the query unchanged when the cache cannot process its SQL, instead of failing the query.
 
@@ -1528,7 +1672,29 @@ def _runs_uncached_on_sql_errors(func: Callable[_P, tuple[str, dict[str, int]]])
     return wrapper
 
 
+def _accepts_regex_operators(fn: Callable[_P, tuple[str, dict[str, int]]]) -> Callable[_P, tuple[str, dict[str, int]]]:
+    """Run ``fn`` on the query with PostgreSQL's regex match operators rewritten (:func:`normalize_regex_operators`).
+
+    When ``fn`` returns the query unchanged, for example without cache hits, the caller's own text is returned, so
+    a query the cache does not change keeps its operators (``REGEXP_LIKE`` needs PostgreSQL 15+).
+    """
+
+    @functools.wraps(fn)
+    def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> tuple[str, dict[str, int]]:
+        original = kwargs["query"] if "query" in kwargs else args[0]
+        normalized = normalize_regex_operators(original)  # type: ignore[arg-type]
+        if "query" in kwargs:
+            kwargs["query"] = normalized
+        else:
+            args = (normalized, *args[1:])  # type: ignore[assignment]
+        enhanced_query, stats = fn(*args, **kwargs)
+        return (original if enhanced_query == normalized else enhanced_query), stats  # type: ignore[return-value]
+
+    return wrapper
+
+
 @_runs_uncached_on_sql_errors
+@_accepts_regex_operators
 def apply_cache_lazy(
     query: str,
     cache_handler: AbstractCacheHandler_Lazy,
@@ -1560,6 +1726,8 @@ def apply_cache_lazy(
     sql_dialect: str = "postgres",
     partition_key_source_table: str | None = None,
     cost_estimator: Callable[[str], float | None] | None = None,
+    grid_cell_size: float | None = None,
+    grid_method: str = "CELL_AUTO",
     min_query_cost: float | None = None,
     keep_all_attributes: bool = False,
     **kwargs: Any,
@@ -1602,8 +1770,9 @@ def apply_cache_lazy(
             SELECT clauses and spatial filter application. Requires a spatial cache handler with
             get_spatial_filter_lazy() method.
         buffer_distance: Buffer distance in meters for spatial filter. If None and geometry_column
-            is set, auto-derived from distance constraints in the query (graph diameter).
-            Required when geometry_column is set and query has no distance constraints.
+            is set, auto-derived from distance constraints in the query (graph diameter); 0 for a
+            query over a single table, whose rows lie in every cached set. Required when
+            geometry_column is set and a query over several tables has no distance constraints.
         spatial_method: Method for applying the spatial filter:
             - "SUBDIVIDE_TMP_TABLE": Create a temp table with ST_Subdivide + GiST index (default, optimal).
             - "SUBDIVIDE_INLINE": Inline ST_Subdivide in an EXISTS subquery (simpler, no temp table).
@@ -1631,6 +1800,25 @@ def apply_cache_lazy(
     gated, gate_stats = _check_cost_gate(query, cost_estimator, min_query_cost)
     if gated:
         return query, {"generated_variants": 0, "cache_hits": 0, "enhanced": 0, "p0_rewritten": 0, **gate_stats}
+
+    if _is_temporal(temporal_bucket_width, dilation_buckets):
+        _, uncached_reason = _temporal_lookup(
+            query, cache_handler, partition_key, temporal_bucket_width, dilation_buckets, temporal_column, partition_key_source_table, lazy=True
+        )
+        if uncached_reason is not None:
+            return query, _uncached_stats(uncached_reason, gate_stats)
+
+    if grid_cell_size is not None:
+        if geometry_column is None:
+            raise ValueError("grid_cell_size requires geometry_column")
+        return _apply_grid_cache(
+            query, cache_handler, partition_key, geometry_column, grid_cell_size, grid_method, p0_alias, gate_stats,
+            {"partition_key_source_table": partition_key_source_table, "min_component_size": min_component_size,
+             "fix_attributes": keep_all_attributes, "canonicalize_queries": canonicalize_queries, "follow_graph": follow_graph,
+             "partition_join_table": partition_join_table, "bucket_steps": bucket_steps, "add_constraints": add_constraints,
+             "remove_constraints_all": remove_constraints_all, "remove_constraints_add": remove_constraints_add,
+             "max_conditions_removed": max_conditions_removed, "protected_patterns": protected_patterns},
+        )
 
     # Spatial mode is selected by passing a geometry column
     if geometry_column is not None:
@@ -1668,10 +1856,7 @@ def apply_cache_lazy(
         if not existing_hashes:
             return query, stats
 
-        if buffer_distance is None:
-            buffer_distance = compute_buffer_distance(query)
-            if buffer_distance == 0.0:
-                raise ValueError("buffer_distance is required when geometry_column is set and query has no distance constraints")
+        buffer_distance = _resolve_buffer_distance(query, buffer_distance)
 
         srid = getattr(cache_handler, "srid", 4326)
         spatial_filter_type = getattr(cache_handler, "spatial_filter_type", "geometry")
@@ -1820,6 +2005,7 @@ def apply_cache_lazy(
 
 
 @_runs_uncached_on_sql_errors
+@_accepts_regex_operators
 def apply_cache(
     query: str,
     cache_handler: AbstractCacheHandler,
@@ -1848,6 +2034,8 @@ def apply_cache(
     temporal_column: str | None = None,
     partition_key_source_table: str | None = None,
     cost_estimator: Callable[[str], float | None] | None = None,
+    grid_cell_size: float | None = None,
+    grid_method: str = "CELL_AUTO",
     min_query_cost: float | None = None,
     keep_all_attributes: bool = False,
     **kwargs: Any,
@@ -1899,8 +2087,9 @@ def apply_cache(
             SELECT clauses and spatial filter application. Requires a spatial cache handler with
             get_spatial_filter() method.
         buffer_distance: Buffer distance in meters for spatial filter. If None and geometry_column
-            is set, auto-derived from distance constraints in the query (graph diameter).
-            Required when geometry_column is set and query has no distance constraints.
+            is set, auto-derived from distance constraints in the query (graph diameter); 0 for a
+            query over a single table, whose rows lie in every cached set. Required when
+            geometry_column is set and a query over several tables has no distance constraints.
         spatial_method: Method for applying the spatial filter:
             - "SUBDIVIDE_TMP_TABLE": Create a temp table with ST_Subdivide + GiST index (default, optimal).
             - "SUBDIVIDE_INLINE": Inline ST_Subdivide in an EXISTS subquery (simpler, no temp table).
@@ -1958,13 +2147,29 @@ def apply_cache(
     if gated:
         return query, {"generated_variants": 0, "cache_hits": 0, "enhanced": 0, "p0_rewritten": 0, **gate_stats}
 
+    if _is_temporal(temporal_bucket_width, dilation_buckets):
+        _, uncached_reason = _temporal_lookup(
+            query, cache_handler, partition_key, temporal_bucket_width, dilation_buckets, temporal_column, partition_key_source_table, lazy=False
+        )
+        if uncached_reason is not None:
+            return query, _uncached_stats(uncached_reason, gate_stats)
+
+    if grid_cell_size is not None:
+        if geometry_column is None:
+            raise ValueError("grid_cell_size requires geometry_column")
+        return _apply_grid_cache(
+            query, cache_handler, partition_key, geometry_column, grid_cell_size, grid_method, p0_alias, gate_stats,
+            {"partition_key_source_table": partition_key_source_table, "min_component_size": min_component_size,
+             "fix_attributes": keep_all_attributes, "canonicalize_queries": canonicalize_queries, "follow_graph": True,
+             "partition_join_table": partition_join_table, "bucket_steps": bucket_steps, "add_constraints": add_constraints,
+             "remove_constraints_all": remove_constraints_all, "remove_constraints_add": remove_constraints_add,
+             "max_conditions_removed": kwargs.get("max_conditions_removed"), "protected_patterns": kwargs.get("protected_patterns")},
+        )
+
     # Spatial mode is selected by passing a geometry column
     if geometry_column is not None:
         # Spatial path: generate hashes with spatial params, apply spatial filter
-        if buffer_distance is None:
-            buffer_distance = compute_buffer_distance(query)
-            if buffer_distance == 0.0:
-                raise ValueError("buffer_distance is required when geometry_column is set and query has no distance constraints")
+        buffer_distance = _resolve_buffer_distance(query, buffer_distance)
 
         # Step 1: Generate hashes with spatial params
         cache_entry_hashes = generate_all_hashes(

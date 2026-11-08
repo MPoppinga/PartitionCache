@@ -23,9 +23,13 @@ from partitioncache.cache_handler.abstract import AbstractCacheHandler_Lazy
 from partitioncache.cli.common_args import (
     add_database_args,
     add_environment_args,
+    add_grid_args,
+    add_spatial_args,
     add_variant_generation_args,
     add_verbosity_args,
+    check_grid_key,
     get_database_connection_params,
+    grid_cell_size_for,
     load_environment_with_validation,
     parse_variant_generation_json_args,
     resolve_cache_backend,
@@ -43,8 +47,14 @@ from partitioncache.queue import (
     pop_from_query_fragment_queue_blocking,
     push_to_query_fragment_queue,
 )
+from partitioncache.spatial_grid import GRID_GENERATION_KWARGS
 
 logger = get_thread_aware_logger("PartitionCache")
+
+
+def _grid_kwargs(grid_size: float | None) -> dict[str, Any]:
+    """``grid_cell_size`` only for grid keys, so the variant generation of every other key is called unchanged."""
+    return {"grid_cell_size": grid_size} if grid_size is not None else {}
 
 args: argparse.Namespace
 
@@ -154,6 +164,14 @@ def query_fragment_processor(args, constraint_args):
             query, partition_key, partition_datatype = query_result
             logger.debug(f"Processing original query into query variants for partition_key: {partition_key} (datatype: {partition_datatype})")
 
+            # Grid-cell keys: fragments select cells; the forced flags must match the grid lookup's
+            grid_size = grid_cell_size_for(args, partition_key)
+            if grid_size is not None:
+                problem = check_grid_key(partition_key, partition_datatype, resolve_cache_backend(args))
+                if problem is not None:
+                    logger.error(f"Skipping query: {problem}")
+                    continue
+
             # Detect spatial mode and resolve geometry column from handler
             is_spatial = partition_datatype == "geometry"
             resolved_backend = resolve_cache_backend(args) if is_spatial else None
@@ -165,6 +183,14 @@ def query_fragment_processor(args, constraint_args):
                 except Exception as e:
                     logger.debug("Could not resolve geometry column from cache handler, using default 'geom': %s", e)
                     geometry_column = "geom"
+            elif grid_size is not None:
+                geometry_column = getattr(args, "geometry_column", None) or "geom"
+            if grid_size is not None:
+                auto_detect = GRID_GENERATION_KWARGS["auto_detect_partition_join"]
+                skip_pk_joins = GRID_GENERATION_KWARGS["skip_partition_key_joins"]
+            else:
+                auto_detect = not args.no_auto_detect_partition_join
+                skip_pk_joins = is_spatial or partition_key in args.skip_partition_key_joins
 
             # Process the query into query variants using the partition_key from queue
             query_hash_pairs = generate_all_query_hash_pairs(
@@ -173,7 +199,7 @@ def query_fragment_processor(args, constraint_args):
                 min_component_size=args.min_component_size,
                 follow_graph=args.follow_graph,
                 keep_all_attributes=True,
-                auto_detect_partition_join=not args.no_auto_detect_partition_join,
+                auto_detect_partition_join=auto_detect,
                 max_component_size=args.max_component_size,
                 partition_join_table=args.partition_join_table,
                 warn_no_partition_key=not args.no_warn_partition_key,
@@ -181,9 +207,10 @@ def query_fragment_processor(args, constraint_args):
                 add_constraints=add_constraints,
                 remove_constraints_all=remove_constraints_all,
                 remove_constraints_add=remove_constraints_add,
-                skip_partition_key_joins=is_spatial or partition_key in args.skip_partition_key_joins,
+                skip_partition_key_joins=skip_pk_joins,
                 geometry_column=geometry_column,
                 max_conditions_removed=args.max_conditions_removed,
+                **_grid_kwargs(grid_size),
             )
             # Smallest variants first, so cache optimization can restrict the larger ones with them
             query_hash_pairs = order_variants_for_population(query_hash_pairs)
@@ -348,7 +375,9 @@ def run_and_store_query(query: str, query_hash: str, partition_key: str, partiti
         optimization_applied = False
         optimization_stats = {}
 
-        if args.enable_cache_optimization and not args.disable_cache_optimization:
+        # A grid key's fragments select cells; the plain integer lookup of the optimization would restrict them
+        # without the widening that keeps the restriction sound, so they always run unoptimized
+        if args.enable_cache_optimization and not args.disable_cache_optimization and grid_cell_size_for(args, partition_key) is None:
             query_to_execute, optimization_applied, optimization_stats = apply_cache_optimization(
                 query, query_hash, partition_key, partition_datatype, cache_handler, args
             )
@@ -789,6 +818,8 @@ def main():
     add_database_args(parser)
     add_environment_args(parser)
     add_variant_generation_args(parser)
+    add_spatial_args(parser, include_buffer_distance=False)
+    add_grid_args(parser)
     add_verbosity_args(parser)
 
     # Cache backend argument with bitsize support
@@ -810,11 +841,18 @@ def main():
     acceleration_group.add_argument(
         "--duckdb-database-path",
         type=str,
-        default="/tmp/partitioncache_accel.duckdb",
-        help="Path to DuckDB database file (default: /tmp/partitioncache_accel.duckdb, use ':memory:' for in-memory)",
+        default=":memory:",
+        help="Path to a DuckDB database file to keep the preloaded tables in (default: ':memory:'). Tables already in the "
+        "file are reused without reloading, a snapshot that misses later changes in PostgreSQL, unless --force-reload-tables is given",
     )
     acceleration_group.add_argument(
         "--force-reload-tables", action="store_true", default=False, help="Force reload tables from PostgreSQL even if they exist in DuckDB"
+    )
+    acceleration_group.add_argument(
+        "--duckdb-read-unloaded-tables",
+        action="store_true",
+        default=False,
+        help="Let DuckDB read tables that were not preloaded directly from PostgreSQL, instead of running such queries on PostgreSQL",
     )
 
     global args
@@ -880,6 +918,7 @@ def main():
                     duckdb_threads=args.duckdb_threads,
                     enable_statistics=not args.disable_acceleration_stats,
                     duckdb_database_path=args.duckdb_database_path,
+                    read_unloaded_from_postgres=args.duckdb_read_unloaded_tables,
                     force_reload_tables=args.force_reload_tables,
                     query_timeout=float(args.long_running_query_timeout),
                 )
