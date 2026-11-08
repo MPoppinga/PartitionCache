@@ -75,6 +75,32 @@ def test_population_projects_cells_with_the_lookup_hashes(runner) -> None:
     )
     assert stored and stored <= lookup
     assert stats["cell200"]["fragments_executed"] == len(fragments)
+    assert stats["cell200"]["fragments_existing"] == stats["cell200"]["fragments_failed"] == stats["cell200"]["fragments_empty"] == 0
+
+
+def test_population_counts_existing_failed_and_empty_fragments(runner) -> None:
+    """The story measures reuse: a cached fragment, a failed one and an empty one must not all look like 'executed'."""
+    config = _config(runner)
+    handler = MagicMock()
+    cache_manager = MagicMock()
+    cache_manager.get_handler.return_value = handler
+    seen: list[str] = []
+    handler.underlying_handler.exists.side_effect = lambda h, partition_key: not seen and not seen.append(h)  # the first only
+    calls = iter([RuntimeError("boom"), set()])
+
+    def execute(sql):
+        result = next(calls, {1, 2})
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    executor = MagicMock()
+    executor.execute_fragment.side_effect = execute
+    st = runner.populate_cache_for_query(executor, cache_manager, QUERY, ["cell200"], config)["cell200"]
+    assert st["fragments_generated"] >= 3
+    assert (st["fragments_existing"], st["fragments_failed"], st["fragments_empty"]) == (1, 1, 1)
+    assert st["fragments_executed"] == st["fragments_generated"] - 2  # every fragment that ran without an error
+    assert handler.set_entry.call_count == st["fragments_generated"] - 3  # the empty one is not stored
 
 
 def test_eager_apply_routes_grid_keys_and_splits_the_star_setup(runner) -> None:

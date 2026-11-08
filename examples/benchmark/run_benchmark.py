@@ -805,7 +805,9 @@ def populate_cache_for_query(executor, cache_manager: CacheManager, query: str, 
     optimization_method = qp.get("population_optimization_method", "IN_SUBQUERY")
 
     for pk in partition_keys:
-        pk_stats = {"fragments_generated": 0, "fragments_executed": 0, "partition_keys_cached": 0, "optimized_fragments": 0}
+        # existing: already cached (an earlier query's fragment); failed: raised; empty: executed, no keys, not stored
+        pk_stats = {"fragments_generated": 0, "fragments_executed": 0, "fragments_existing": 0, "fragments_failed": 0, "fragments_empty": 0,
+                    "partition_keys_cached": 0, "optimized_fragments": 0}
         handler = cache_manager.get_handler(pk)
         pk_config = config.partition_keys.get(pk, {})
 
@@ -865,6 +867,7 @@ def populate_cache_for_query(executor, cache_manager: CacheManager, query: str, 
 
         for fragment, hash_val in pairs:
             if handler.underlying_handler.exists(hash_val, partition_key=pk):
+                pk_stats["fragments_existing"] += 1
                 continue
 
             try:
@@ -920,7 +923,10 @@ def populate_cache_for_query(executor, cache_manager: CacheManager, query: str, 
                             partition_key_identifiers=result_set,
                             query_text=fragment,
                         )
+                    else:
+                        pk_stats["fragments_empty"] += 1
             except Exception as e:
+                pk_stats["fragments_failed"] += 1
                 print(f"    Warning: Fragment execution failed for {pk}: {e}")
 
         pk_stats["population_time"] = time.perf_counter() - pk_start
