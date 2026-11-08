@@ -1,0 +1,102 @@
+name: "OSM POI Benchmark (grid-cell keys)"
+# The spatial queries of osm_poi.yaml with grid-cell keys (partitioncache.spatial_grid) instead of the
+# geometry handlers. A grid key is an integer key whose fragments project
+# cell(geom) = floor(x/s) << 16 | floor(y/s) in the metric SRID of the data (25832 here).
+#
+# Setup once (cell function, packing check, cell expression indexes):
+#   pcache-manage setup grid --table pois --cell-size 100 --cell-size 200 --cell-size 400 --cell-size 800 \
+#       --max-distance 2000 --create-indexes --index-prefix-column subtype
+# The runner installs the function and checks the packing at startup, but does not create the indexes.
+fact_table: "pois"
+p0_alias: "p1"
+
+env_file: "examples/openstreetmap_poi/.env"
+query_dir: "examples/openstreetmap_poi/testqueries_examples"
+query_subdirectory_pattern: "{partition_key}/{query_file}"
+
+data_setup:
+  script: "examples/openstreetmap_poi/process_osm_data.py"
+  docker_compose: "examples/openstreetmap_poi/docker-compose.yml"
+  example_command: "python examples/openstreetmap_poi/process_osm_data.py"
+  required_tables: ["pois"]
+
+executors:
+  duckdb:
+    enabled: false
+  postgresql:
+    enabled: true
+
+# One key per cell size. A query uses the largest size s <= D/2, where D is the diameter of its
+# ST_DWithin graph (at least two rings of cells), else the finest; a single-alias query (D = 0) the finest.
+# grid_method: CELL_AUTO (default) picks the star join (CELL_STAR) or the anchor-only array (CELL_ARRAY_ANCHOR)
+# from the query's predicates; --grid-method overrides it for all keys.
+# grid_max_distance: the largest query diameter the packing check reserves margin for.
+partition_keys:
+  cell100: { datatype: integer, geometry_column: geom, grid_cell_size: 100, grid_method: CELL_AUTO, grid_max_distance: 2000 }
+  cell200: { datatype: integer, geometry_column: geom, grid_cell_size: 200, grid_method: CELL_AUTO, grid_max_distance: 2000 }
+  cell400: { datatype: integer, geometry_column: geom, grid_cell_size: 400, grid_method: CELL_AUTO, grid_max_distance: 2000 }
+  cell800: { datatype: integer, geometry_column: geom, grid_cell_size: 800, grid_method: CELL_AUTO, grid_max_distance: 2000 }
+
+query_partition_keys:   # D in metres
+  spatial_q1: [cell200]              # 700
+  spatial_q2: [cell400]              # 800
+  spatial_q3: [cell200]              # 700
+  spatial_q4: [cell100]              # 0 (single alias)
+  spatial_q5: [cell400]              # 1000
+  spatial_q6: [cell400]              # 1000
+  spatial_q7: [cell100]              # 200
+  spatial_q8: [cell200]              # 700
+  spatial_q9: [cell800]              # 1800
+  spatial_q10: [cell200]             # 450
+  spatial_benchmark_qa1: [cell100]   # 300
+  spatial_benchmark_qa2: [cell200]   # 500
+  spatial_benchmark_qb1: [cell100]   # 200
+  spatial_benchmark_qb2: [cell200]   # 500
+  spatial_benchmark_qb3: [cell400]   # 1000
+  spatial_benchmark_qc1: [cell400]   # 900
+  spatial_benchmark_qd1: [cell200]   # 400
+
+query_flights:
+  1: [spatial_q1, spatial_q2, spatial_q3, spatial_q4, spatial_q5, spatial_q6, spatial_q7, spatial_q8, spatial_q9, spatial_q10]
+  2: [spatial_benchmark_qa1, spatial_benchmark_qa2, spatial_benchmark_qb1, spatial_benchmark_qb2, spatial_benchmark_qb3, spatial_benchmark_qc1, spatial_benchmark_qd1]
+
+hierarchy_labels: {}
+
+spatial_queries: [spatial_q1, spatial_q2, spatial_q3, spatial_q4, spatial_q5, spatial_q6, spatial_q7, spatial_q8, spatial_q9, spatial_q10, spatial_benchmark_qa1, spatial_benchmark_qa2, spatial_benchmark_qb1, spatial_benchmark_qb2, spatial_benchmark_qb3, spatial_benchmark_qc1, spatial_benchmark_qd1]
+
+query_processing:
+  keep_all_attributes: true
+  follow_graph: true
+  strip_select: true
+  auto_detect_partition_join: true   # forced off for grid keys (GRID_GENERATION_KWARGS)
+  skip_partition_key_joins: false    # forced on for grid keys
+  population:
+    max_conditions_removed: 1
+    keep_all_attributes: false
+  lookup:
+    max_conditions_removed: 2
+    keep_all_attributes: false
+
+fragment_filter:
+  require_in_from: []
+  exclude_from_from: []
+
+cache:
+  table_prefix: "osm_poi_grid_cache"
+
+backends:
+  postgresql: [postgresql_array]   # cells are ~1e8: sparse sets only (array, roaringbit), no bit backends
+
+fact_stats:
+  strategy: count_distinct   # grid keys are skipped: they are no column of the table
+  table: "pois"
+
+modes:
+  cross_dimension:
+    phase1_flights: [1]
+    phase2_flights: [2]
+  hierarchy:
+    flights: []
+  cold_warm:
+    flight: 2
+  representative_queries: [spatial_q1, spatial_benchmark_qd1]

@@ -21,6 +21,7 @@ import re
 import statistics
 import sys
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -179,7 +180,9 @@ class PostgreSQLExecutor:
         For multi-statement queries (TMP_TABLE_IN/JOIN), executes setup statements
         first, then runs EXPLAIN ANALYZE on the final SELECT.
         """
-        with self.conn.cursor() as cur:
+        # One transaction: the setup creates temporary tables ON COMMIT DROP, which autocommit would drop
+        # right after their CREATE, before the EXPLAIN reads them
+        with self.conn.transaction(), self.conn.cursor() as cur:
             statements = [s.strip() for s in query.split(";") if s.strip()]
             if len(statements) > 1:
                 for stmt in statements[:-1]:
@@ -326,6 +329,17 @@ class CacheManager:
 # Set by --no-dilation. When True, temporal partition keys skip bucket dilation, which makes
 # the resulting candidate set unsound; used to measure the false negatives dilation prevents.
 DILATION_DISABLED = False
+GRID_METHOD: str | None = None  # --grid-method: overrides grid_method of every grid-cell key
+
+
+def _grid_cell_size(pk_config: dict) -> float | None:
+    """Cell size of a grid-cell spatial key (partitioncache.spatial_grid), None for any other key.
+
+    A grid key is an integer key whose fragments project the cell of each geometry, so it needs no
+    datatype of its own: ``datatype: integer`` plus ``grid_cell_size`` and ``geometry_column``.
+    """
+    size = pk_config.get("grid_cell_size")
+    return float(size) if size else None
 
 
 def load_query(config: BenchmarkConfig, query_name: str) -> str:
@@ -448,8 +462,8 @@ def compute_fact_table_stats(executor, config: BenchmarkConfig) -> dict:
         print(f"\nFact table ({table}) partition key cardinalities:")
         for pk in config.partition_keys:
             pk_cfg = config.partition_keys[pk]
-            if pk_cfg.get("datatype") == "geometry":
-                continue  # Skip geometry partition keys for count_distinct
+            if pk_cfg.get("datatype") == "geometry" or _grid_cell_size(pk_cfg):
+                continue  # Skip geometry and grid-cell keys for count_distinct: they are no column of the table
             rows, _ = executor.execute(f"SELECT COUNT(DISTINCT {pk}) FROM {table}")
             stats[pk] = rows[0][0]
             print(f"  {pk}: {stats[pk]:,} distinct values")
@@ -462,7 +476,7 @@ def compute_pk_max_values(executor, config: BenchmarkConfig) -> dict:
     table = config.fact_stats.get("table", config.fact_table)
     pk_max = {}
     for pk, pk_cfg in config.partition_keys.items():
-        if pk_cfg.get("datatype") in ("geometry", "text"):
+        if pk_cfg.get("datatype") in ("geometry", "text") or _grid_cell_size(pk_cfg):
             continue
         try:
             rows, _ = executor.execute(f"SELECT MAX({pk}) FROM {table}")
@@ -678,7 +692,7 @@ def _skip_pk_joins_for(pk_config: dict, qp: dict) -> bool:
       the fragment into a cross product over all entities: expensive to populate and far too
       unselective to be worth caching.
     """
-    if pk_config.get("temporal_bucket_width") or pk_config.get("datatype") == "geometry":
+    if pk_config.get("temporal_bucket_width") or pk_config.get("datatype") == "geometry" or _grid_cell_size(pk_config):
         return True
     return bool(qp.get("skip_partition_key_joins", False))
 
@@ -713,6 +727,66 @@ def _get_lookup_settings(qp: dict) -> dict:
         "max_conditions_removed": lookup.get("max_conditions_removed", qp.get("max_conditions_removed")),
         "protected_patterns": lookup.get("protected_patterns", qp.get("protected_patterns")),
     }
+
+
+def _grid_apply_kwargs(pk_config: dict, config: BenchmarkConfig, grid_size: float) -> dict:
+    """apply_cache / apply_cache_lazy arguments for a grid-cell key (the grid path generates with its own flags)."""
+    qp = config.query_processing
+    lookup_settings = _get_lookup_settings(qp)
+    kwargs: dict = {
+        "partition_key_source_table": config.fact_table,
+        "geometry_column": pk_config.get("geometry_column", "geom"),
+        "grid_cell_size": grid_size,
+        "grid_method": GRID_METHOD or pk_config.get("grid_method", "CELL_AUTO"),
+        "p0_alias": config.p0_alias,
+        "min_component_size": 1,
+        "follow_graph": qp.get("follow_graph", True),
+        "keep_all_attributes": lookup_settings["keep_all_attributes"],
+    }
+    if lookup_settings["max_conditions_removed"] is not None:
+        kwargs["max_conditions_removed"] = lookup_settings["max_conditions_removed"]
+    if lookup_settings.get("protected_patterns"):
+        kwargs["protected_patterns"] = lookup_settings["protected_patterns"]
+    if qp.get("bucket_steps") is not None:
+        kwargs["bucket_steps"] = qp["bucket_steps"]
+    return kwargs
+
+
+def _grid_entry(stats: dict) -> dict:
+    """Per-key apply statistics of a grid-cell key, in the runner's usual fields."""
+    entry = {
+        "variants_checked": stats.get("generated_variants", 0),
+        "cache_hits": stats.get("cache_hits", 0),
+        "partition_keys_found": stats.get("grid_cells", 0),  # cells of the widened intersection
+        "grid_method": stats.get("grid_method"),
+    }
+    if "uncached_reason" in stats:
+        entry["uncached_reason"] = stats["uncached_reason"]
+    return entry
+
+
+def setup_grid_keys(executor, config: BenchmarkConfig, cache_type: str) -> None:
+    """Install the cell function and check the cell packing for every grid-cell key of the config.
+
+    The cell expression indexes are not created here (they change the reference plans and take a while on large
+    tables): create them with ``pcache-manage setup grid --create-indexes``.
+    """
+    grid = {pk: c for pk, c in config.partition_keys.items() if _grid_cell_size(c)}
+    if not grid:
+        return
+    if not hasattr(executor, "conn"):
+        raise SystemExit("Grid-cell keys need the PostgreSQL executor")
+    if cache_type.endswith("_bit"):
+        raise SystemExit(f"Grid-cell keys need a sparse-set cache backend (cells are large integers), not {cache_type}")
+    from partitioncache import spatial_grid
+
+    print("\nGrid-cell keys:")
+    with executor.conn.cursor() as cur:
+        cur.execute(spatial_grid.CELL_FUNCTION_DDL)
+        for pk, c in grid.items():
+            size = _grid_cell_size(c)
+            spatial_grid.check_extent(cur, config.fact_table, c.get("geometry_column", "geom"), size, float(c.get("grid_max_distance", 2000)))
+            print(f"  {pk}: cell size {size:g}, method {GRID_METHOD or c.get('grid_method', 'CELL_AUTO')}")
 
 
 def populate_cache_for_query(executor, cache_manager: CacheManager, query: str, partition_keys: list[str], config: BenchmarkConfig) -> dict:
@@ -764,6 +838,15 @@ def populate_cache_for_query(executor, cache_manager: CacheManager, query: str, 
             gen_kwargs["geometry_column"] = pk_config.get("geometry_column", "geom")
             gen_kwargs["skip_partition_key_joins"] = True
 
+        # Grid-cell keys: fragments project cells; the generator flags must be the ones the grid lookup uses
+        grid_size = _grid_cell_size(pk_config)
+        if grid_size:
+            from partitioncache.spatial_grid import GRID_GENERATION_KWARGS
+
+            gen_kwargs["geometry_column"] = pk_config.get("geometry_column", "geom")
+            gen_kwargs["grid_cell_size"] = grid_size
+            gen_kwargs.update(GRID_GENERATION_KWARGS)
+
         pairs = generate_all_query_hash_pairs(**gen_kwargs)
 
         # Apply fragment filter if configured
@@ -773,7 +856,7 @@ def populate_cache_for_query(executor, cache_manager: CacheManager, query: str, 
         pk_stats["fragments_generated"] = len(pairs)
 
         # Sort fragments by estimated cost (cheaper first) when optimization is enabled
-        if enable_optimization and not pk_config.get("datatype") == "geometry":
+        if enable_optimization and not pk_config.get("datatype") == "geometry" and not grid_size:
             pairs = sorted(pairs, key=lambda p: _count_function_calls(p[0]))
 
         # Spatial partition keys use lazy insertion (server-side H3 conversion)
@@ -803,8 +886,9 @@ def populate_cache_for_query(executor, cache_manager: CacheManager, query: str, 
                         pk_stats["fragments_executed"] += 1
                 else:
                     exec_fragment = fragment
-                    # Optimization: narrow fragment using already-cached sub-fragments
-                    if enable_optimization:
+                    # Optimization: narrow fragment using already-cached sub-fragments. Not for grid keys: their
+                    # cells are no column, and a plain restriction would skip the widening that keeps it sound.
+                    if enable_optimization and not grid_size:
                         try:
                             cached_keys, _n_gen, n_hits = partitioncache.get_partition_keys(
                                 partition_key_source_table=config.fact_table,
@@ -872,6 +956,21 @@ def apply_cache_to_query(
         pk_config = config.partition_keys.get(pk, {})
 
         lookup_settings = _get_lookup_settings(qp)
+
+        grid_size = _grid_cell_size(pk_config)
+        if grid_size:
+            # The grid path looks up, widens and rewrites in one call; get_partition_keys would intersect the cell
+            # sets without the widening and report a misleading key count
+            result, grid_stats = partitioncache.apply_cache(
+                query=select_query, cache_handler=handler.underlying_handler, partition_key=pk, **_grid_apply_kwargs(pk_config, config, grid_size)
+            )
+            pk_stats[pk] = _grid_entry(grid_stats)
+            if grid_stats.get("enhanced"):
+                parts = [part.strip() for part in result.split(";") if part.strip()]  # CELL_STAR: pair-table setup + SELECT
+                select_query = parts[-1]
+                setup_statements.extend(parts[:-1])
+            continue
+
         get_kwargs: dict = {
             "partition_key_source_table": config.fact_table,
             "query": query,
@@ -1008,6 +1107,14 @@ def apply_cache_to_query_lazy(
     for pk in partition_keys:
         handler = cache_manager.get_handler(pk)
         pk_config = config.partition_keys.get(pk, {})
+
+        grid_size = _grid_cell_size(pk_config)
+        if grid_size:
+            enhanced, grid_stats = partitioncache.apply_cache_lazy(
+                query=enhanced, cache_handler=handler.underlying_handler, partition_key=pk, **_grid_apply_kwargs(pk_config, config, grid_size)
+            )
+            pk_stats[pk] = _grid_entry(grid_stats)
+            continue
 
         lazy_kwargs: dict = {
 
@@ -1177,6 +1284,8 @@ def run_single_query(
     result["speedup"] = result["baseline_time"] / result["cached_time"] if result["cached_time"] > 0 else float("inf")
     result["result_match"] = len(baseline_rows) == len(cached_rows)
     result["rows_lost"] = len(baseline_rows) - len(cached_rows)
+    # Same rows, not only as many: a restriction that drops one row and duplicates another keeps the count
+    result["result_multiset_match"] = Counter(map(repr, baseline_rows)) == Counter(map(repr, cached_rows))
 
     return result
 
@@ -1862,6 +1971,66 @@ def run_spatial_method_comparison(
     return flat_results
 
 
+def run_grid_method_comparison(executor, cache_manager, config, repeat=1, fact_stats=None, api="non-lazy", explain=False):
+    """Run every query of a grid-cell key with each grid rewrite (CELL_AUTO, CELL_STAR, CELL_ARRAY, CELL_ARRAY_ANCHOR).
+
+    The cell sets do not depend on the rewrite, so the cache is populated once (the first method's
+    cache_population_time) and reused by the others.
+    """
+    global GRID_METHOD
+    grid_pks = {pk for pk, c in config.partition_keys.items() if _grid_cell_size(c)}
+    queries = [q for q, pks in config.query_partition_keys.items() if grid_pks.intersection(pks)]
+    if not queries:
+        print("  No queries with a grid-cell key configured.")
+        return []
+    methods = ["CELL_AUTO", "CELL_STAR", "CELL_ARRAY", "CELL_ARRAY_ANCHOR"]
+    print(f"\n{'=' * 100}\n{config.name}: Grid Method Comparison ({api})\n{'=' * 100}")
+    print(f"Grid keys: {', '.join(sorted(grid_pks))}\nMethods: {', '.join(methods)}\nQueries: {', '.join(queries)}")
+    lazy = api == "lazy"
+    results = []
+    previous = GRID_METHOD
+    try:
+        for grid_method in methods:
+            GRID_METHOD = grid_method
+            print(f"\n### {grid_method}")
+            for query_name in queries:
+                print(f"\n--- {query_name} ---")
+                try:
+                    result = run_single_query(
+                        executor,
+                        cache_manager,
+                        query_name,
+                        config,
+                        repeat=repeat,
+                        fact_stats=fact_stats,
+                        method="IN_SUBQUERY" if lazy else "IN",
+                        api=api,
+                        explain=explain,
+                    )
+                    result["grid_method_requested"] = grid_method
+                    print_query_result(result)
+                except Exception as e:
+                    print(f"  Error: {e}")
+                    result = {"query": query_name, "error": str(e), "grid_method_requested": grid_method}
+                results.append(result)
+    finally:
+        GRID_METHOD = previous
+
+    print(f"\n{'Method':<18} {'Query':<26} {'Used':<18} {'Hits':>9} {'Cells':>8} {'Baseline':>10} {'Cached':>10} {'Speedup':>8} {'Same rows':>9}")
+    print("-" * 124)
+    for r in results:
+        if "error" in r:
+            print(f"{r['grid_method_requested']:<18} {r['query']:<26} ERROR {r['error'][:60]}")
+            continue
+        st = next(iter(r["apply_stats"].values()), {})
+        print(
+            f"{r['grid_method_requested']:<18} {r['query']:<26} {str(st.get('grid_method') or '-'):<18} "
+            f"{st.get('cache_hits', 0):>4}/{st.get('variants_checked', 0):<4} {st.get('partition_keys_found', 0):>8} "
+            f"{r['baseline_time']:>9.3f}s {r['cached_time']:>9.3f}s {r['speedup']:>7.2f}x {str(r['result_multiset_match']):>9}"
+        )
+    return results
+
+
 def run_backend_comparison(executor, config, db_backend, scale_factor=0.01, db_path=None, max_pk_value=0, pk_max_values=None, repeat=1, fact_stats=None, method="TMP_TABLE_IN", api="non-lazy"):
     """Compare different cache backends on representative queries."""
     print(f"\n{'=' * 80}")
@@ -2290,6 +2459,7 @@ Examples:
   python run_benchmark.py --config config/tpch.yaml --db-backend duckdb --mode flight 3
   python run_benchmark.py --config config/nyc_taxi.yaml --mode api-comparison
   python run_benchmark.py --config config/osm_poi.yaml --mode all
+  python run_benchmark.py --config config/osm_poi_grid.yaml --mode grid-method-comparison
 """,
     )
     parser.add_argument("--config", type=str, required=True, help="Path to YAML config file")
@@ -2302,7 +2472,7 @@ Examples:
         "--mode",
         nargs="+",
         default=["all"],
-        help="Benchmark mode: all | flight N | cross-dimension | cold-vs-warm | hierarchy | spatial | spatial-backend-comparison | spatial-method-comparison | backend-comparison | method-comparison | api-comparison",
+        help="Benchmark mode: all | flight N | cross-dimension | cold-vs-warm | hierarchy | spatial | spatial-backend-comparison | spatial-method-comparison | grid-method-comparison | backend-comparison | method-comparison | api-comparison",
     )
     parser.add_argument("--db-backend", type=str, default=None, help="Database backend: duckdb, postgresql (default: first enabled in config)")
     parser.add_argument("--cache-backend", type=str, default=None, help="Cache backend override (default: first in config's backends list)")
@@ -2331,12 +2501,20 @@ Examples:
         choices=["SUBDIVIDE_INLINE", "SUBDIVIDE_TMP_TABLE"],
         help="Spatial filter method: SUBDIVIDE_TMP_TABLE (temp table + GiST, default) or SUBDIVIDE_INLINE (no temp table)",
     )
+    parser.add_argument(
+        "--grid-method",
+        type=str,
+        default=None,
+        choices=["CELL_AUTO", "CELL_STAR", "CELL_ARRAY", "CELL_ARRAY_ANCHOR"],
+        help="Rewrite for grid-cell keys, overriding each key's grid_method (default: the key's, else CELL_AUTO)",
+    )
     parser.add_argument("--output", type=str, default=None, help="Save results to JSON file")
 
     args = parser.parse_args()
 
-    global DILATION_DISABLED
+    global DILATION_DISABLED, GRID_METHOD
     DILATION_DISABLED = args.no_dilation
+    GRID_METHOD = args.grid_method
     if DILATION_DISABLED:
         print("WARNING: temporal dilation disabled -- cached candidate sets are unsound and may lose rows")
 
@@ -2407,6 +2585,9 @@ Examples:
         # Validate tables
         if not validate_tables(executor, config):
             sys.exit(1)
+
+        # Grid-cell keys: cell function and packing check (indexes: pcache-manage setup grid)
+        setup_grid_keys(executor, config, cache_type)
 
         # Compute fact table stats
         fact_stats = compute_fact_table_stats(executor, config)
@@ -2482,6 +2663,8 @@ Examples:
                 fact_stats=fact_stats,
                 explain=explain,
             )
+        elif mode == "grid-method-comparison":
+            results = run_grid_method_comparison(executor, cache_manager, config, repeat=args.repeat, fact_stats=fact_stats, api=api, explain=explain)
         elif mode == "backend-comparison":
             results = run_backend_comparison(
                 executor,
