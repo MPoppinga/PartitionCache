@@ -1123,6 +1123,25 @@ class TestTempTableSqlDialect:
         assert "ON COMMIT DROP" not in duck and "DROP TABLE IF EXISTS" in duck
 
 
+class TestEagerPathKeepsTheQueryDialect:
+    """The eager rewrite parses and renders in sql_dialect; sqlglot's generic writer emitted ARRAY('a', 'b')."""
+
+    QUERY = "SELECT p.pocket_key FROM pocket_properties AS p WHERE prop_value LIKE ANY(ARRAY['%4BXA%', '%1UNL%'])"
+
+    @pytest.mark.parametrize("method", ["IN", "VALUES", "TMP_TABLE_IN", "TMP_TABLE_JOIN"])
+    def test_postgres_array_literal_survives(self, method):
+        result = extend_query_with_partition_keys(self.QUERY, {1, 2}, "pocket_key", method=method, p0_alias="p")
+        assert "LIKE ANY(ARRAY['%4BXA%', '%1UNL%'])" in result
+        assert "ARRAY(" not in result
+
+    def test_apply_cache(self):
+        handler = Mock(spec=AbstractCacheHandler)
+        handler.get_intersected.return_value = ({1, 2}, 1)
+        enhanced, stats = apply_cache(self.QUERY, handler, "pocket_key", p0_alias="p")
+        assert stats["enhanced"] == 1
+        assert "ARRAY['%4BXA%', '%1UNL%']" in enhanced and enhanced.endswith("p.pocket_key IN (1, 2)")
+
+
 class TestSqlTheCacheCannotProcess:
     """SQL the cache cannot parse or rewrite makes the query run without the cache, it never fails it."""
 
