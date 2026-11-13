@@ -14,7 +14,9 @@ from pathlib import Path
 
 import pytest
 
-from partitioncache.apply_cache import extend_query_with_partition_keys
+pytest.importorskip("yaml")  # the runner imports it; the unit test job does not install the benchmark extra
+
+from partitioncache.apply_cache import extend_query_with_partition_keys  # noqa: E402
 
 RUNNER = Path(__file__).resolve().parents[2] / "examples" / "benchmark" / "run_benchmark.py"
 
@@ -43,6 +45,10 @@ class TestExplainTarget:
         script = "CREATE TEMPORARY TABLE t (k INT);\n-- the query\nWITH x AS (SELECT k FROM t) SELECT * FROM x"
         setup, target = runner._explain_target(script)
         assert setup == ["CREATE TEMPORARY TABLE t (k INT)"] and target.endswith("WITH x AS (SELECT k FROM t) SELECT * FROM x")
+
+    def test_statements_of_comments_only_are_skipped(self, runner):
+        script = "CREATE TEMPORARY TABLE t (k INT);\n/* setup done */;\nSELECT * FROM t;\n/* trailing */"
+        assert runner._explain_target(script) == (["CREATE TEMPORARY TABLE t (k INT)"], "SELECT * FROM t")
 
 
 def _connection_params() -> dict:

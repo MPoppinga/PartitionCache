@@ -127,7 +127,10 @@ def _explain_target(query: str) -> tuple[list[str], str]:
     UNLOGGED_TABLE_JOIN script ends with the DROP of its key table after the SELECT. Statements after the
     target are not returned; the caller rolls the transaction back instead.
     """
-    statements = [s.strip() for s in query.split(";") if s.strip()]
+    # Statements of comments only (e.g. after the last ";") are dropped; they would be empty queries
+    statements = [s.strip() for s in query.split(";") if _LEADING_COMMENTS.sub("", s, count=1)]
+    if not statements:
+        return [], query
     queries = [i for i, s in enumerate(statements) if _LEADING_COMMENTS.sub("", s, count=1).split(None, 1)[0].upper() in ("SELECT", "WITH")]
     target = queries[-1] if queries else len(statements) - 1
     return statements[:target], statements[target]
