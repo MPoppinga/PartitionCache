@@ -19,6 +19,7 @@ from partitioncache.apply_cache import (
     extend_query_with_spatial_filter_lazy,
     get_partition_keys,
     get_partition_keys_lazy,
+    get_unlogged_cleanup_sql,
 )
 from partitioncache.cache_handler import get_cache_handler
 from partitioncache.cache_handler.helper import PartitionCacheHelper, create_partitioncache_helper
@@ -109,6 +110,7 @@ __all__ = [
     "extend_query_with_h3_cell_lookup",
     "apply_cache_lazy",
     "apply_cache",
+    "get_unlogged_cleanup_sql",
     "push_to_original_query_queue",
     "push_to_query_fragment_queue",
     "push_to_query_variant_queue",

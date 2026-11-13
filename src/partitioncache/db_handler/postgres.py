@@ -6,6 +6,7 @@ from logging import getLogger
 
 import psycopg
 
+from partitioncache.apply_cache import get_unlogged_cleanup_sql
 from partitioncache.db_handler.abstract import AbstractDBHandler
 
 logger = getLogger("PartitionCache")
@@ -61,6 +62,11 @@ class PostgresDBHandler(AbstractDBHandler):
         # emit `CREATE TEMPORARY TABLE ... ON COMMIT DROP; ...; SELECT`, where the rows are in the LAST
         # result set, not the first. Returns first column of all rows if not empty.
         rows = fetch_final_result_set(self.cur)
+        # UNLOGGED_TABLE_JOIN: the key table is a regular table, dropped here after the fetch and in the
+        # transaction of the script, so the commit below never leaves it behind
+        cleanup_sql = get_unlogged_cleanup_sql(query)
+        if cleanup_sql is not None:
+            self.cur.execute(cleanup_sql)
         # Only NULL is dropped: a truthiness test also dropped key 0 (and '' / 0.0), so its partition was
         # missing from the cached set and cache restrictions excluded it
         result = [row[0] for row in rows if row[0] is not None]

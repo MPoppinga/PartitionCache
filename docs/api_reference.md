@@ -143,7 +143,7 @@ Same parameters as `get_partition_keys`, but instead of materializing the partit
 **Returns:**
 - `Tuple[str | None, int, int]`: (lazy_subquery, subqueries_generated, cache_hits)
 
-#### `extend_query_with_partition_keys(query: str, partition_keys: set[int] | set[str] | set[float] | set[datetime], partition_key: str, method: Literal["IN", "VALUES", "TMP_TABLE_JOIN", "TMP_TABLE_IN"] = "IN", p0_alias: str | None = None, analyze_tmp_table: bool = True, auto_detect_partition_join: bool = True, partition_join_table: str | None = None)`
+#### `extend_query_with_partition_keys(query: str, partition_keys: set[int] | set[str] | set[float] | set[datetime], partition_key: str, method: Literal["IN", "VALUES", "TMP_TABLE_JOIN", "TMP_TABLE_IN", "UNLOGGED_TABLE_JOIN"] = "IN", p0_alias: str | None = None, analyze_tmp_table: bool = True, auto_detect_partition_join: bool = True, partition_join_table: str | None = None)`
 
 Optimizes a query by adding partition key restrictions.
 
@@ -151,7 +151,7 @@ Optimizes a query by adding partition key restrictions.
 - `query` (str): Original SQL query
 - `partition_keys` (set[int] | set[str] | set[float] | set[datetime]): Partition keys to restrict to
 - `partition_key` (str): Partition column name
-- `method` (Literal["IN", "VALUES", "TMP_TABLE_JOIN", "TMP_TABLE_IN"]): Optimization method
+- `method` (Literal["IN", "VALUES", "TMP_TABLE_JOIN", "TMP_TABLE_IN", "UNLOGGED_TABLE_JOIN"]): Optimization method
 - `p0_alias` (str | None): The alias of the table to use for the partition key.
 - `analyze_tmp_table` (bool): Whether to create index and analyze. (only for temporary table methods)
 - `auto_detect_partition_join` (bool): Whether to auto-detect partition-join tables when resolving the target alias (default: True)
@@ -195,7 +195,14 @@ print(optimized)
 >     rows = fetch_final_result_set(cur)  # rows of the final SELECT; temp table auto-dropped on commit
 > ```
 
-#### `extend_query_with_partition_keys_lazy(query: str, lazy_subquery: str, partition_key: str, method: Literal["IN_SUBQUERY", "TMP_TABLE_IN", "TMP_TABLE_JOIN"] = "IN_SUBQUERY", p0_alias: str | None = None, analyze_tmp_table: bool = True, auto_detect_partition_join: bool = True, partition_join_table: str | None = None, sql_dialect: str = "postgres")`
+> **`UNLOGGED_TABLE_JOIN` (PostgreSQL only).** Like `TMP_TABLE_JOIN`, but the key table is an unlogged table
+> (`partitioncache_unl_<hex>`, always with index and `ANALYZE`), which parallel workers can read; they cannot
+> read temporary tables. The last statement is still the `SELECT`. Nothing drops the table automatically:
+> after fetching, run `get_unlogged_cleanup_sql(script)` (`DROP TABLE IF EXISTS ...`, `None` for any other SQL)
+> in the same transaction and commit, so that an error rolls the `CREATE` back. `PostgresDBHandler.execute`
+> does this. The eager and the lazy function both offer the method.
+
+#### `extend_query_with_partition_keys_lazy(query: str, lazy_subquery: str, partition_key: str, method: Literal["IN_SUBQUERY", "TMP_TABLE_IN", "TMP_TABLE_JOIN", "UNLOGGED_TABLE_JOIN"] = "IN_SUBQUERY", p0_alias: str | None = None, analyze_tmp_table: bool = True, auto_detect_partition_join: bool = True, partition_join_table: str | None = None, sql_dialect: str = "postgres")`
 
 Lazy counterpart to `extend_query_with_partition_keys`: integrates a lazy SQL subquery (as returned by `get_partition_keys_lazy()`) into the query instead of a materialized key set.
 
@@ -210,7 +217,7 @@ Lazy counterpart to `extend_query_with_partition_keys`: integrates a lazy SQL su
 - `query` (str): SQL query to optimize
 - `cache_handler` (AbstractCacheHandler_Lazy): Cache backend instance
 - `partition_key` (str): Partition column name
-- `method` (Literal["IN_SUBQUERY", "TMP_TABLE_IN", "TMP_TABLE_JOIN"]): Integration method
+- `method` (Literal["IN_SUBQUERY", "TMP_TABLE_IN", "TMP_TABLE_JOIN", "UNLOGGED_TABLE_JOIN"]): Integration method
 - `p0_alias` (str | None, optional): Table alias for cache restrictions
 - `min_component_size` (int, optional): Minimum size of query components to consider for cache lookup (default: 2)
 - `canonicalize_queries` (bool, optional): Whether to canonicalize queries before hashing (default: False)
