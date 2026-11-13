@@ -201,6 +201,10 @@ print(optimized)
 > after fetching, run `get_unlogged_cleanup_sql(script)` (`DROP TABLE IF EXISTS ...`, `None` for any other SQL)
 > in the same transaction and commit, so that an error rolls the `CREATE` back. `PostgresDBHandler.execute`
 > does this. The eager and the lazy function both offer the method.
+> Privileges: `CREATE UNLOGGED TABLE` needs `CREATE` on the first schema of the `search_path` (since
+> PostgreSQL 15, `public` no longer grants it to every role), while temporary tables only need `TEMP`.
+> Without it the enhanced script fails when it runs. Other executors than `PostgresDBHandler` must call
+> `get_unlogged_cleanup_sql` themselves; leftover tables are found by the prefix `partitioncache_unl_`.
 
 #### `extend_query_with_partition_keys_lazy(query: str, lazy_subquery: str, partition_key: str, method: Literal["IN_SUBQUERY", "TMP_TABLE_IN", "TMP_TABLE_JOIN", "UNLOGGED_TABLE_JOIN"] = "IN_SUBQUERY", p0_alias: str | None = None, analyze_tmp_table: bool = True, auto_detect_partition_join: bool = True, partition_join_table: str | None = None, sql_dialect: str = "postgres")`
 
