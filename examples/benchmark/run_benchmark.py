@@ -117,6 +117,25 @@ class DuckDBExecutor:
         self.conn.close()
 
 
+_LEADING_COMMENTS = re.compile(r"\A(?:\s*--[^\n]*\n|\s*/\*.*?\*/)*\s*", re.S)
+
+
+def _explain_target(query: str) -> tuple[list[str], str]:
+    """Split a (multi-statement) script into the statements before its last SELECT and that SELECT.
+
+    The EXPLAIN target is the last statement that is a query (SELECT or WITH), not the last statement: an
+    UNLOGGED_TABLE_JOIN script ends with the DROP of its key table after the SELECT. Statements after the
+    target are not returned; the caller rolls the transaction back instead.
+    """
+    # Statements of comments only (e.g. after the last ";") are dropped; they would be empty queries
+    statements = [s.strip() for s in query.split(";") if _LEADING_COMMENTS.sub("", s, count=1)]
+    if not statements:
+        return [], query
+    queries = [i for i, s in enumerate(statements) if _LEADING_COMMENTS.sub("", s, count=1).split(None, 1)[0].upper() in ("SELECT", "WITH")]
+    target = queries[-1] if queries else len(statements) - 1
+    return statements[:target], statements[target]
+
+
 class PostgreSQLExecutor:
     """Execute queries against a PostgreSQL database with multi-statement support."""
 
@@ -177,21 +196,17 @@ class PostgreSQLExecutor:
     def explain_analyze(self, query: str) -> tuple[list[str], float]:
         """Run EXPLAIN ANALYZE and return (plan_lines, actual_time_ms).
 
-        For multi-statement queries (TMP_TABLE_IN/JOIN), executes setup statements
-        first, then runs EXPLAIN ANALYZE on the final SELECT.
+        For multi-statement scripts (TMP_TABLE_IN/JOIN, UNLOGGED_TABLE_JOIN, spatial filters), runs the
+        statements before the last SELECT, then EXPLAIN ANALYZE on that SELECT (see ``_explain_target``).
         """
-        # One transaction: the setup creates temporary tables ON COMMIT DROP, which autocommit would drop
-        # right after their CREATE, before the EXPLAIN reads them
-        with self.conn.transaction(), self.conn.cursor() as cur:
-            statements = [s.strip() for s in query.split(";") if s.strip()]
-            if len(statements) > 1:
-                for stmt in statements[:-1]:
-                    cur.execute(stmt)
-                explain_query = f"EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT) {statements[-1]}"
-            else:
-                explain_query = f"EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT) {query}"
-
-            cur.execute(explain_query)
+        setup, target = _explain_target(query)
+        # One transaction, rolled back: the setup creates temporary tables ON COMMIT DROP, which autocommit
+        # would drop right after their CREATE, and key tables that must not stay (an unlogged table is dropped
+        # by a statement after the SELECT, which is not run here)
+        with self.conn.transaction(force_rollback=True), self.conn.cursor() as cur:
+            for stmt in setup:
+                cur.execute(stmt)
+            cur.execute(f"EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT) {target}")
             rows = cur.fetchall()
 
         plan_lines = [row[0] for row in rows]

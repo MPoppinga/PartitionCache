@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 pytest.importorskip("partitioncache.spatial_grid")  # the grid core; the research branch has it after the main sync
+pytest.importorskip("yaml")  # the runner imports it; the unit test job does not install the benchmark extra
 
 from partitioncache import spatial_grid  # noqa: E402
 from partitioncache.query_processor import generate_all_hashes  # noqa: E402
