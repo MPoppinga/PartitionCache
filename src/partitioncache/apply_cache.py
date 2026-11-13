@@ -455,6 +455,7 @@ def rewrite_query_with_p0_table( # TODO: Check duplication with query_processor
     partition_key: str,
     mv_table_name: str | None = None,
     p0_alias: str = "p0",
+    sql_dialect: str = "postgres",
 ) -> str:
     """
     Rewrite a query to use a star-schema pattern with a p0 table for better optimizer decisions.
@@ -471,6 +472,7 @@ def rewrite_query_with_p0_table( # TODO: Check duplication with query_processor
         partition_key (str): The identifier for the partition.
         mv_table_name (str | None): Name of the materialized view table. Defaults to {partition_key}_mv.
         p0_alias (str): Alias name for the p0 table. Defaults to "p0".
+        sql_dialect (str): sqlglot dialect used to parse and render the query. Defaults to PostgreSQL.
 
     Returns:
         str: The rewritten query with star-schema p0 table integration.
@@ -478,7 +480,7 @@ def rewrite_query_with_p0_table( # TODO: Check duplication with query_processor
     if mv_table_name is None:
         mv_table_name = f"{partition_key}_mv"
 
-    parsed_query = sqlglot.parse_one(query)
+    parsed_query = sqlglot.parse_one(query, read=sql_dialect)
 
     # Check if p0 table already exists
     existing_tables = [table.name for table in parsed_query.find_all(exp.Table)]
@@ -501,7 +503,7 @@ def rewrite_query_with_p0_table( # TODO: Check duplication with query_processor
 
     # Convert to comma-separated tables format including p0
     current_table = from_clause.this
-    from_clause.set("this", exp.Table(this=f"{current_table.sql()}, {mv_table_name} AS {p0_alias}"))
+    from_clause.set("this", exp.Table(this=f"{current_table.sql(dialect=sql_dialect)}, {mv_table_name} AS {p0_alias}"))
 
     # Remove existing partition_key join conditions and replace with star-schema joins
     where_clause = _outer_where(parsed_query)
@@ -552,7 +554,7 @@ def rewrite_query_with_p0_table( # TODO: Check duplication with query_processor
                 new_where = exp.And(this=new_where, expression=condition)
             where_clause.set("this", new_where)
 
-    return parsed_query.sql()
+    return parsed_query.sql(dialect=sql_dialect)
 
 
 def _format_partition_key_for_sql(pk: int | str | float | datetime) -> str:
@@ -1988,6 +1990,7 @@ def apply_cache_lazy(
             partition_key=partition_key,
             mv_table_name=p0_table_name,
             p0_alias=p0_table_alias,
+            sql_dialect=sql_dialect,
         )
         p0_rewritten = 1 if working_query != query else 0
 
@@ -2057,6 +2060,7 @@ def apply_cache(
     keep_all_attributes: bool = False,
     max_conditions_removed: int | None = None,
     protected_patterns: list[str] | None = None,
+    sql_dialect: str = "postgres",
     **kwargs: Any,
 ) -> tuple[str, dict[str, int]]:
     """
@@ -2105,6 +2109,7 @@ def apply_cache(
         keep_all_attributes: If False (default), lookup also probes variants with single-table attribute
             conditions removed (more hits, more variant-generation cost). True probes exactly the variants
             that generate_all_query_hash_pairs produces with its defaults.
+        sql_dialect: sqlglot dialect used to parse and render non-spatial queries. Defaults to PostgreSQL.
         geometry_column: If set, enables spatial cache mode. Uses this geometry column for variant
             SELECT clauses and spatial filter application. Requires a spatial cache handler with
             get_spatial_filter() method.
@@ -2342,6 +2347,7 @@ def apply_cache(
             partition_key=partition_key,
             mv_table_name=p0_table_name,
             p0_alias=p0_table_alias,
+            sql_dialect=sql_dialect,
         )
         p0_rewritten = 1 if working_query != query else 0
 
@@ -2358,7 +2364,7 @@ def apply_cache(
     if not partition_keys:
         stats["enhanced"] = 1
         logger.info(f"Cache intersection of {used_hashes} cache hits is empty, restricting query to no rows")
-        return _add_empty_intersection_condition(working_query), stats
+        return _add_empty_intersection_condition(working_query, sql_dialect), stats
 
     # Step 3: Apply the partition keys to the working query
     # Determine the correct alias for cache restrictions
@@ -2379,6 +2385,7 @@ def apply_cache(
         analyze_tmp_table=analyze_tmp_table,
         auto_detect_partition_join=auto_detect_partition_join,
         partition_join_table=partition_join_table,
+        sql_dialect=sql_dialect,
     )
 
     stats["enhanced"] = 1
