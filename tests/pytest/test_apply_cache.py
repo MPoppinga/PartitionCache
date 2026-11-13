@@ -1155,3 +1155,47 @@ class TestSqlTheCacheCannotProcess:
     def test_configuration_errors_still_raise(self):
         with pytest.raises(ValueError, match="does not support lazy intersection"):
             apply_cache_lazy("SELECT a.pk FROM points AS a WHERE a.x = 1", Mock(), "pk")
+
+
+class TestRestrictionGoesToTheOuterWhere:
+    """The restriction belongs to the outermost SELECT; a nested WHERE (FILTER, subquery, CTE) must stay as it is."""
+
+    NESTED = {
+        "filter": ("SELECT COUNT(*) FILTER (WHERE p.x > 1) FROM pois AS p", "FILTER(WHERE p.x > 1)"),
+        "derived_table": (
+            "SELECT * FROM pois AS p JOIN (SELECT id FROM t WHERE t.y = 1) AS s ON s.id = p.id",
+            "(SELECT id FROM t WHERE t.y = 1)",
+        ),
+        "cte": ("WITH s AS (SELECT id FROM t WHERE t.y = 1) SELECT * FROM pois AS p, s WHERE TRUE", "(SELECT id FROM t WHERE t.y = 1)"),
+    }
+
+    @pytest.mark.parametrize("method", ["IN", "VALUES", "TMP_TABLE_IN"])
+    @pytest.mark.parametrize("case", ["filter", "derived_table"])
+    def test_eager_without_outer_where(self, method, case):
+        query, nested = self.NESTED[case]
+        result = extend_query_with_partition_keys(query, {1, 2}, "k", method=method, p0_alias="p")
+        assert nested in result
+        assert result.rstrip().split(" WHERE ")[-1].startswith("p.k IN (")
+
+    @pytest.mark.parametrize("method", ["IN_SUBQUERY", "TMP_TABLE_IN"])
+    @pytest.mark.parametrize("case", ["filter", "derived_table"])
+    def test_lazy_without_outer_where(self, method, case):
+        query, nested = self.NESTED[case]
+        result = extend_query_with_partition_keys_lazy(query, "SELECT k FROM cache_k", "k", method=method, p0_alias="p")
+        assert nested in result
+        assert result.rstrip().split(" WHERE ")[-1].startswith("p.k IN (")
+
+    def test_cte_with_outer_where(self):
+        query, nested = self.NESTED["cte"]
+        result = extend_query_with_partition_keys(query, {1, 2}, "k", method="IN", p0_alias="p")
+        assert nested in result
+        assert result.endswith("WHERE TRUE AND p.k IN (1, 2)")
+
+    def test_p0_rewrite_without_where_joins_the_mv(self):
+        """Without any WHERE the p0 join conditions were dropped, leaving a cross join with the MV."""
+        result = rewrite_query_with_p0_table("SELECT COUNT(*) FROM pois AS p", "k")
+        assert result == "SELECT COUNT(*) FROM pois AS p, k_mv AS p0 WHERE p.k = p0.k"
+
+    def test_p0_rewrite_keeps_a_nested_where(self):
+        result = rewrite_query_with_p0_table("SELECT COUNT(*) FILTER (WHERE p.x > 1) FROM pois AS p", "k")
+        assert result == "SELECT COUNT(*) FILTER(WHERE p.x > 1) FROM pois AS p, k_mv AS p0 WHERE p.k = p0.k"

@@ -504,7 +504,11 @@ def rewrite_query_with_p0_table( # TODO: Check duplication with query_processor
     from_clause.set("this", exp.Table(this=f"{current_table.sql()}, {mv_table_name} AS {p0_alias}"))
 
     # Remove existing partition_key join conditions and replace with star-schema joins
-    where_clause = parsed_query.find(exp.Where)
+    where_clause = _outer_where(parsed_query)
+    if where_clause is None:
+        # Without a WHERE the star joins were dropped and p0 was cross-joined with every row
+        where_clause = exp.Where()
+        parsed_query.set("where", where_clause)
     if where_clause:
         # Collect all conditions
         conditions = []
@@ -513,7 +517,7 @@ def rewrite_query_with_p0_table( # TODO: Check duplication with query_processor
             if isinstance(node, exp.And):
                 collect_conditions(node.left)
                 collect_conditions(node.right)
-            else:
+            elif node is not None:
                 conditions.append(node)
 
         collect_conditions(where_clause.this)
@@ -609,9 +613,20 @@ def _splice_key_list(rendered_sql: str, sentinel: str, key_list: str) -> str:
     return rendered_sql.replace(sentinel, key_list, 1)
 
 
+def _outer_where(parsed_query: exp.Expr) -> exp.Where | None:
+    """Return the WHERE clause of the outermost SELECT, not one of a FILTER, subquery or CTE.
+
+    ``find(exp.Where)`` returns the first WHERE anywhere in the tree, so a query without an outer WHERE got the
+    condition in a nested one. Set operations have no WHERE of their own; they keep the first nested one.
+    """
+    if isinstance(parsed_query, exp.Select):
+        return parsed_query.args.get("where")
+    return parsed_query.find(exp.Where)
+
+
 def _add_where_condition(parsed_query: exp.Expr, condition_expr: exp.Expr) -> None:
-    """Add a WHERE condition to a parsed query, creating WHERE clause if needed."""
-    existing_where: exp.Where | None = parsed_query.find(exp.Where)
+    """Add a WHERE condition to the outermost SELECT of a parsed query, creating the WHERE clause if needed."""
+    existing_where: exp.Where | None = _outer_where(parsed_query)
     if existing_where is None:
         new_where = exp.Where(this=condition_expr)
         parsed_query.args["where"] = new_where
