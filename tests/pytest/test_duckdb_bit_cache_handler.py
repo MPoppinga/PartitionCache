@@ -233,6 +233,7 @@ class TestDuckDBBitCacheHandler:
         3. Filters positions WHERE get_bit(...) = 1
         Returns the set of positions with bits set.
         """
+        cache_handler.conn.execute.return_value.fetchone.return_value = (False,)  # row exists, not NULL
         cache_handler.conn.execute.return_value.fetchall.return_value = [
             (5,), (10,), (99,)  # Positions where bits are set
         ]
@@ -255,8 +256,9 @@ class TestDuckDBBitCacheHandler:
     def test_get_cache_not_found(self, cache_handler):
         """Test retrieving non-existent cache entry returns None.
 
-        When fetchall returns empty list, get() returns None.
+        No row means not cached (None); a row with all-zero bits would be the empty set.
         """
+        cache_handler.conn.execute.return_value.fetchone.return_value = None
         cache_handler.conn.execute.return_value.fetchall.return_value = []
 
         result = cache_handler.get("nonexistent", "zipcode")
@@ -268,7 +270,8 @@ class TestDuckDBBitCacheHandler:
         get_sql = get_sql_from_call(get_call)
         assert CACHE_TABLE in get_sql, f"GET query should reference {CACHE_TABLE}"
         get_params = get_params_from_call(get_call)
-        assert get_params == ("nonexistent", "nonexistent"), "GET should pass 'nonexistent' key"
+        # The row check returns early, so the position query does not run
+        assert get_params == ("nonexistent",), "GET should pass 'nonexistent' key"
 
     def test_get_cache_null_value(self, cache_handler):
         """Test retrieving null/missing cache value returns None.

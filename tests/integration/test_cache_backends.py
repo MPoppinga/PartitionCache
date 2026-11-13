@@ -206,25 +206,41 @@ class TestCacheLifecycle:
             assert key in all_keys
 
     def test_empty_set_handling(self, cache_client: AbstractCacheHandler):
-        """Test handling of empty sets."""
+        """An empty result is stored and read back as an empty set, never as None (not cached / null marker)."""
         partition_key = "zipcode"
-        cache_key = "empty_set_hash"
-        empty_set: set[int] = set()
+        cache_client.register_partition_key(partition_key, "integer")
 
-        # Some backends might handle empty sets differently
-        try:
-            success = cache_client.set_cache(cache_key, empty_set, partition_key)
-            if success:
-                retrieved = cache_client.get(cache_key, partition_key)
+        assert cache_client.set_cache("empty_set_hash", set(), partition_key) is True
+        retrieved = cache_client.get("empty_set_hash", partition_key)
+        assert retrieved is not None and len(retrieved) == 0
+        assert cache_client.exists("empty_set_hash", partition_key) is True
+        assert cache_client.is_null("empty_set_hash", partition_key) is False
 
-                # Convert BitMap to set for comparison if necessary
-                if isinstance(retrieved, BitMap):
-                    retrieved = set(retrieved)
+        cache_client.set_cache("non_empty_hash", {1001, 1002}, partition_key)
+        intersected, hits = cache_client.get_intersected({"empty_set_hash", "non_empty_hash"}, partition_key)
+        assert intersected is not None and len(intersected) == 0
+        assert hits == 2
 
-                assert retrieved == empty_set or retrieved is None
-        except Exception:
-            # Some backends might not support empty sets
-            pytest.skip("Backend does not support empty sets")
+        cache_client.set_null("null_hash", partition_key)
+        assert cache_client.get("null_hash", partition_key) is None
+        intersected, hits = cache_client.get_intersected({"null_hash", "non_empty_hash"}, partition_key)
+        assert set(intersected) == {1001, 1002}
+        assert hits == 1
+
+    def test_lazy_insertion_of_zero_rows_stores_an_empty_set(self, cache_client: AbstractCacheHandler):
+        """A lazily inserted query without rows is an empty set, distinct from the set_null marker."""
+        if not hasattr(cache_client, "set_cache_lazy") or not repr(cache_client).startswith("postgresql"):
+            pytest.skip("lazy insertion from SQL is specific to the PostgreSQL handlers")
+        partition_key = "zipcode"
+        cache_client.register_partition_key(partition_key, "integer")
+
+        assert cache_client.set_cache_lazy("lazy_empty_hash", "SELECT 1 AS zipcode WHERE false", partition_key) is True
+        retrieved = cache_client.get("lazy_empty_hash", partition_key)
+        assert retrieved is not None and len(retrieved) == 0
+        assert cache_client.is_null("lazy_empty_hash", partition_key) is False
+
+        assert cache_client.set_cache_lazy("lazy_full_hash", "SELECT 1001 AS zipcode UNION ALL SELECT NULL", partition_key) is True
+        assert set(cache_client.get("lazy_full_hash", partition_key)) == {1001}
 
 
 class TestCacheIntegration:

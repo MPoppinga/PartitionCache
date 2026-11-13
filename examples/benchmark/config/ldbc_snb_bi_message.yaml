@@ -1,0 +1,105 @@
+# LDBC SNB Business Intelligence -- message-anchored queries.
+#
+# Partition keys must participate in an attachment join (<fact>.<pk> = <dim>.<col>)
+# inside the query, otherwise the fragment generator synthesises a pairwise
+# <a>.<pk> = <b>.<pk> clique across tables that do not carry the column. That is why
+# each query below is registered only for the key(s) it actually joins on:
+#   q3  -> containerforumid  (f.id = m.containerforumid)
+#   q9  -> creatorpersonid   (p.id = m.creatorpersonid)
+#   q17 -> creatorpersonid + containerforumid (both are joined)
+#
+# q16 (bi-16) is deliberately absent: only 4 of 40 official bindings return rows against the
+# initial snapshot, and its baseline is planner-unstable (278 ms before the dense-id remap,
+# >170 s after, from cascading rows=1 misestimates across its two correlated branches).
+# A speedup measured against an unstable baseline is meaningless in either direction.
+name: "LDBC SNB BI (message-anchored)"
+fact_table: "message"
+p0_alias: "m"
+
+env_file: "examples/ldbc_snb_bi/.env"
+query_dir: "examples/ldbc_snb_bi/queries"
+
+data_setup:
+  script: "examples/ldbc_snb_bi/generate_ldbc_data.py"
+  docker_compose: null
+  example_command: "python examples/ldbc_snb_bi/generate_ldbc_data.py --data-dir /path/to/ldbc-data"
+  required_tables: ["message", "person", "city", "country", "tag", "tagclass",
+                    "message_hastag_tag", "forum", "forum_hasmember_person"]
+
+executors:
+  duckdb:
+    enabled: false
+    default_path_template: "examples/ldbc_snb_bi/ldbc_sf{scale_factor}.duckdb"
+  postgresql:
+    enabled: true
+
+# LDBC ids are sparse 64-bit values, so bit-based backends are not usable here.
+partition_keys:
+  creatorpersonid: { datatype: integer }
+  containerforumid: { datatype: integer }
+
+query_partition_keys:
+  q3_1: [containerforumid]
+  q3_2: [containerforumid]
+  q3_3: [containerforumid]
+  q3_4: [containerforumid]
+  q3_5: [containerforumid]
+  q3_6: [containerforumid]
+  q9_1: [creatorpersonid]
+  q9_2: [creatorpersonid]
+  q9_3: [creatorpersonid]
+  q9_4: [creatorpersonid]
+  q9_5: [creatorpersonid]
+  q9_6: [creatorpersonid]
+  q17_1: [creatorpersonid, containerforumid]
+  q17_2: [creatorpersonid, containerforumid]
+  q17_3: [creatorpersonid, containerforumid]
+  q17_4: [creatorpersonid, containerforumid]
+  q17_5: [creatorpersonid, containerforumid]
+  q17_6: [creatorpersonid, containerforumid]
+
+query_flights:
+  3: [q3_1, q3_2, q3_3, q3_4, q3_5, q3_6]
+  9: [q9_1, q9_2, q9_3, q9_4, q9_5, q9_6]
+  17: [q17_1, q17_2, q17_3, q17_4, q17_5, q17_6]
+
+hierarchy_labels: {}
+spatial_queries: []
+
+query_processing:
+  keep_all_attributes: false
+  follow_graph: true
+  strip_select: true
+  auto_detect_partition_join: true
+  skip_partition_key_joins: false
+  population:
+    max_conditions_removed: 1
+  lookup:
+    max_conditions_removed: 2
+
+fragment_filter:
+  require_in_from: []
+  exclude_from_from: []
+
+cache:
+  table_prefix: "ldbc_msg_cache"
+  bitsize_strategy: auto
+  min_bitsize: 200000
+
+backends:
+  duckdb: [duckdb_bit]
+  postgresql: [postgresql_array]
+
+fact_stats:
+  strategy: count_distinct
+  table: "message"
+
+modes:
+  cross_dimension:
+    phase1_flights: [3]
+    phase2_flights: [17]
+  hierarchy:
+    flights: []
+  cold_warm:
+    flight: 9
+  representative_queries: [q3_1, q9_1, q17_1]

@@ -55,6 +55,14 @@ pcache-manage setup {all,queue,cache} [OPTIONS]
   - Creates partition metadata tables
   - **Options:**
     - `--cache BACKEND` - Cache backend to setup (defaults to CACHE_BACKEND env var)
+- `grid` - Set up grid-cell spatial keys for a fact table (see `docs/spatial_grid_keys.md`)
+  - Installs `partitioncache_grid_cell(geometry, float8)`, checks that the table's extent fits the cell packing, and
+    optionally creates the expression indexes the rewritten queries use (connection from `DB_*`)
+  - **Options:**
+    - `--table TABLE` (required), `--geometry-column COL` (default `geom`)
+    - `--cell-size SIZE` (required, repeatable) - one grid key per size, in the SRID's units
+    - `--max-distance D` (required) - largest `ST_DWithin` diameter of the queries (packing margin)
+    - `--create-indexes`, `--index-prefix-column COL` - create `(cell)` and `(COL, cell)` indexes per size
 
 **Examples:**
 ```bash
@@ -250,10 +258,20 @@ pcache-add [options] --partition-key PARTITION_KEY {--direct|--queue|--queue-ori
 Advanced options for controlling how query variants are generated for better cache coverage:
 
 #### Distance Normalization
-- `--bucket-steps FLOAT` - Step size for normalizing distance conditions
+- `--bucket-steps STEPS` - Step size for normalizing distance conditions (number, JSON dict or JSON list)
   - **Default**: `1.0` (or `PARTITION_CACHE_BUCKET_STEPS` environment variable)
   - **Purpose**: Controls bucketing of distance ranges for better cache hits
   - **Example**: With `--bucket-steps 0.5`, distance `BETWEEN 1.6 AND 3.6` becomes `BETWEEN 1.5 AND 4.0`
+  - The radius of `ST_DWithin`/`ST_DFullyWithin` is rounded up the same way: with `--bucket-steps 50`, `ST_DWithin(a.geom, b.geom, 120)` becomes `ST_DWithin(a.geom, b.geom, 150)`
+  - **Per attribute**: a JSON dict `{pattern: step}` buckets every numeric comparison whose expression contains the pattern, also plain columns and negative bounds: `--bucket-steps '{"alt_max": 500, "vrate": 1}'` turns `alt_max <= 650` into `alt_max <= 1000` and `vrate <= -1.5` into `vrate <= -1`
+  - **Levels**: a JSON list adds one bucketed variant set per entry, e.g. `--bucket-steps '[{"alt_max": 500}, {"alt_max": 2000}]'`
+  - Lookups must use the same `bucket_steps`, or the bucketed variants are never hit
+  - Choose the step in the unit of the distances: with geometries in degrees (SRID 4326) the default `1.0` turns `ST_DWithin(a.geom, b.geom, 0.001)` into a radius of 1, a variant that is expensive to fill and hardly filters
+
+#### Partition Key Joins
+- `--skip-partition-key-joins KEYS` - Comma-separated partition keys whose variants get no equality on the partition key between tables
+  - **Default**: none (or `PARTITION_CACHE_SKIP_PARTITION_KEY_JOINS`); geometry keys always skip it
+  - **Purpose**: Time-bucket keys used with temporal dilation; lookups skip these joins for them, so population must too or the hashes differ (see the API reference, "Temporal dilation")
 
 #### Constraint Modification
 - `--add-constraints JSON` - Add constraints to specific tables
@@ -289,6 +307,15 @@ Advanced options for controlling how query variants are generated for better cac
   - **Required when**: `--partition-datatype geometry` is used
   - **Note**: Buffer distance is not needed for cache population (only for cache application)
 
+### Grid-Cell Spatial Keys
+- `--grid-cell-size KEY=SIZE[,KEY=SIZE]` - Partition keys that hold grid cells of `--geometry-column` (default `geom`), with
+  their cell size
+  - **Default**: none (or `PARTITION_CACHE_GRID_CELL_SIZES`)
+  - **Requires**: `--partition-datatype integer` and a sparse-set backend (array, roaringbit, set handlers; not `*_bit`)
+  - **Effect**: Fragments select the distinct cells of their geometry columns. The variant flags the grid lookup uses are
+    forced (no partition-key joins, no join auto-detection). `--no-recompose` is rejected.
+  - Lookups go through `apply_cache(..., geometry_column=..., grid_cell_size=...)`; see `docs/spatial_grid_keys.md`
+
 ### Execution Mode (Mutually Exclusive - Required)
 
 #### Direct Execution
@@ -298,6 +325,8 @@ Advanced options for controlling how query variants are generated for better cac
 - Executes query immediately and stores results in cache
 - **Best for**: Development, testing, small queries
 - **Warning**: Can be slow for complex queries with many fragments
+- `--restrict-variants`: executes the variants smallest first and restricts each to the intersection of the keys of its already populated relaxations, kept in memory (no cache lookup per variant). An empty intersection is stored as an empty result without executing the variant. See `populate_query_variants` in the [API reference](api_reference.md).
+- `--max-restriction-keys N`: only restrict when the intersection has at most N keys (implies `--restrict-variants`); a restriction to most of the keys filters little and costs a long key list
 
 #### Queue Processing
 ```bash
@@ -416,6 +445,9 @@ pcache-read --query QUERY [options]
 ### Required Parameters
 - `--query QUERY` - SQL query to look up in cache (**Required**)
 
+**Note:** `pcache-read` returns the plain intersection of cached sets. For grid-cell keys that intersection is not a
+sound restriction (the sets must be widened first), so read them through `apply_cache` instead.
+
 ### Cache Configuration
 - `--cache-backend CACHE_BACKEND` - Cache backend to query
   - **Default**: From `CACHE_BACKEND` environment variable
@@ -502,6 +534,8 @@ pcache-monitor [options]
 ### Output Control
 - `--limit LIMIT` - Limit number of returned partition keys per query
   - **Purpose**: Control memory usage for large result sets
+  - A result with at least LIMIT partition keys is not stored; the variant gets the status `limit` and is not run again (unless `--force-recalculate`)
+  - With `--limit`, lazy insertion is not used, because it stores results without counting them (spatial datatypes, which need lazy insertion, are populated without the limit)
 - `--status-log-interval STATUS_LOG_INTERVAL` - Status logging interval when idle
   - **Default**: 10 seconds
   - **Purpose**: Reduce log noise during quiet periods
@@ -517,11 +551,12 @@ pcache-monitor [options]
 
 Cache-aware optimization leverages existing cache entries to restrict the search space of new queries before execution. When enabled, the monitor analyzes incoming fragment queries to identify potential cache matches, checks existing cache entries for overlapping conditions, applies restrictions to queries using cached partition keys, and preserves original queries in the cache while executing optimized versions. This approach significantly reduces database load by constraining queries to known partition key sets.
 
-- `--enable-cache-optimization` - Enable cache-aware optimization for fragment queries
-  - **Default**: Disabled
+- `--enable-cache-optimization` / `--disable-cache-optimization` - Enable or disable cache-aware optimization for fragment queries
+  - **Default**: Enabled
   - **Purpose**: Check existing cache entries to restrict search space before execution
   - **Benefit**: Reduces database load by applying IN/subquery restrictions
   - **Algorithm**: Generates subquery variants, checks cache for existing entries, applies restrictions if cache hits meet threshold
+  - **Variant order**: `pcache-monitor` and `pcache-add --queue` push the variants of a query smallest first (fewest tables, then fewest conditions), so the relaxations of a variant are usually cached before it runs. With several `--max-processes` workers a variant can still start before all of its relaxations finish.
 - `--force-recalculate` - Force recalculation of cache entries even if they already exist
   - **Default**: Disabled
   - **Purpose**: Refresh existing cache entries with updated data from the source database
@@ -539,6 +574,11 @@ Cache-aware optimization leverages existing cache entries to restrict the search
   - **Default**: 1
   - **Note**: Only applies to non-lazy methods (IN, VALUES)
   - **Purpose**: Avoid optimization overhead for minimal cache hits
+- `--max-restriction-keys N` - Only restrict a variant when the cached intersection has at most N keys
+  - **Default**: no limit
+  - **Purpose**: Skip restrictions that filter little; a restriction to most of the keys costs a long key list or temp table and saves almost nothing
+  - **Sizing**: a fraction of the number of distinct partition keys, e.g. a quarter
+  - **Note**: The lazy path never materializes the keys, so setting a limit uses the standard (materializing) path; `IN_SUBQUERY` is then applied as `IN`
 - `--prefer-lazy-optimization` / `--no-prefer-lazy-optimization` - Prefer lazy methods when available
   - **Default**: `--prefer-lazy-optimization` (enabled)
   - **Purpose**: Use more efficient lazy subqueries with PostgreSQL backends
@@ -549,8 +589,18 @@ Cache-aware optimization leverages existing cache entries to restrict the search
 Controls how query variants are generated when processing original queries from the queue:
 
 #### Distance Normalization
-- `--bucket-steps FLOAT` - Step size for normalizing distance conditions
+- `--bucket-steps STEPS` - Step size for normalizing distance conditions (number, JSON dict or JSON list)
   - **Default**: `1.0` (or `PARTITION_CACHE_BUCKET_STEPS` environment variable)
+
+#### Partition Key Joins
+- `--skip-partition-key-joins KEYS` - Comma-separated partition keys whose variants get no equality on the partition key between tables
+  - **Default**: none (or `PARTITION_CACHE_SKIP_PARTITION_KEY_JOINS`); geometry keys always skip it
+  - **Purpose**: Time-bucket keys used with temporal dilation; lookups skip these joins for them, so population must too or the hashes differ (see the API reference, "Temporal dilation")
+
+#### Grid-Cell Spatial Keys
+- `--grid-cell-size KEY=SIZE[,KEY=SIZE]` and `--geometry-column COL` - as for `pcache-add`. Fragments of the listed keys
+  are generated with the cell projection and the grid lookup's flags, and always run without cache optimization (the
+  plain integer lookup would not widen the sets). Entries whose backend is a bit handler are skipped with an error.
 
 #### Constraint Modification
 - `--add-constraints JSON` - Add constraints to specific tables
@@ -717,7 +767,7 @@ pcache-postgresql-queue-processor disable
 ```bash
 pcache-postgresql-queue-processor update-config [--frequency DURATION] [--timeout DURATION] [--max-jobs COUNT]
 ```
-- `--frequency DURATION` - Processing frequency (accepts seconds or duration format: `30`, `30s`, `5m`, `2h`, `1d`)
+- `--frequency DURATION` - Processing frequency (accepts seconds or duration format: `30`, `30s`, `5m`, `2h`, `1d`). pg_cron can schedule 1-59 seconds, whole minutes up to 59, whole hours up to 23 and one day; other values (e.g. `90`) are rejected. A step that does not divide the hour or the day restarts at each full hour or midnight (e.g. `7m` runs at :56 and again at :00, `23h` at 23:00 and 00:00)
 - `--timeout DURATION` - Job timeout (accepts seconds or duration format: `30`, `30s`, `5m`, `2h`, `1d`)
 - `--max-jobs COUNT` - Maximum concurrent jobs
 - **Purpose**: Tune performance for your workload

@@ -38,7 +38,8 @@ class RocksDBCacheHandler(RocksDBAbstractCacheHandler):
             return None
 
         if datatype == "text":
-            return set(search_space_list.decode().split(","))
+            # b"" is the empty set; "".split(",") would read it back as {""}
+            return set(search_space_list.decode().split(",")) if search_space_list else set()
         elif datatype == "integer":
             return set(struct.unpack(f"!{(len(search_space_list) // 4)}I", search_space_list))
         else:
@@ -78,7 +79,13 @@ class RocksDBCacheHandler(RocksDBAbstractCacheHandler):
     def _format_str_set(self, values: set[str]) -> bytes:
         """
         Format a set of strings into a byte string.
+
+        Comma-joined, so a key containing "," would read back as several keys, "" as the empty set and
+        "\x00" as the null marker; such keys are rejected instead of being stored wrongly.
         """
+        for value in values:
+            if value == "" or value == "\x00" or "," in value:
+                raise ValueError(f"rocksdb_set cannot store the text partition key {value!r}")
         return b",".join(i.encode() for i in values)
 
     def set_cache(self, key: str, partition_key_identifiers: set[int] | set[str] | set[float] | set[datetime], partition_key: str = "partition_key") -> bool:
@@ -89,11 +96,18 @@ class RocksDBCacheHandler(RocksDBAbstractCacheHandler):
             if existing_datatype == "integer":
                 struct_value = self._format_int_set(partition_key_identifiers)  # type: ignore
             elif existing_datatype == "text":
-                struct_value = self._format_str_set(partition_key_identifiers)  # type: ignore
+                try:
+                    struct_value = self._format_str_set(partition_key_identifiers)  # type: ignore
+                except ValueError as e:
+                    logger.error(f"Failed to store key {key}: {e}")
+                    return False
             else:
                 raise ValueError(f"Unsupported datatype in metadata: {existing_datatype}")
             datatype = existing_datatype
         else:
+            if not partition_key_identifiers:
+                logger.error(f"Cannot store an empty set for unregistered partition key '{partition_key}': its datatype is unknown")
+                return False
             # Infer from partition key identifiers type
             sample = next(iter(partition_key_identifiers))
             if isinstance(sample, int):
@@ -101,7 +115,11 @@ class RocksDBCacheHandler(RocksDBAbstractCacheHandler):
                 struct_value = self._format_int_set(partition_key_identifiers)  # type: ignore
             elif isinstance(sample, str):
                 datatype = "text"
-                struct_value = self._format_str_set(partition_key_identifiers)  # type: ignore
+                try:
+                    struct_value = self._format_str_set(partition_key_identifiers)  # type: ignore
+                except ValueError as e:
+                    logger.error(f"Failed to store key {key}: {e}")
+                    return False
             else:
                 raise ValueError(f"Unsupported partition key identifier type: {type(sample)}")
             self._set_partition_datatype(partition_key, datatype)

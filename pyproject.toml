@@ -6,10 +6,11 @@ build-backend = "setuptools.build_meta"
 name = "partitioncache"
 version = "0.7.0"
 description = "A partition cache implementation"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = { text = "LGPL-3.0-or-later" }
 dependencies = [
     "networkx",
+    "numpy",
     "sqlglot[c]>=30.24.0,<31.0.0",
     "bitarray",
     "pyroaring",
@@ -34,7 +35,7 @@ db = [
     "psycopg",
     "rocksdict",
     "redis",
-    "duckdb",
+    "duckdb>=2.0",
     "mysql-connector-python",
 ]
 
@@ -44,7 +45,7 @@ rocksdb = [
 
 benchmark = [
     "pyyaml",
-    "duckdb",
+    "duckdb>=2.0",
     "psycopg",
     "python-dotenv",
 ]
@@ -87,7 +88,7 @@ warn_return_any = true
 
 [tool.ruff]
 line-length = 160
-target-version = "py312"
+target-version = "py311"
 
 [tool.ruff.lint]
 select = [

@@ -301,6 +301,82 @@ def setup_h3_cells(
         conn.close()
 
 
+def setup_grid(
+    table: str,
+    geometry_column: str,
+    cell_sizes: list[float],
+    max_distance: float,
+    create_indexes: bool = False,
+    index_prefix_column: str | None = None,
+) -> None:
+    """
+    Set up grid-cell spatial keys (``partitioncache.spatial_grid``) for a fact table.
+
+    Installs the cell function, checks for every cell size that the table's extent fits the cell packing
+    with room for the stencil of ``max_distance``, and optionally creates the expression indexes the
+    rewritten queries use, written exactly as the rewrite writes the predicate.
+
+    Args:
+        table: Fact table (optionally schema-qualified).
+        geometry_column: Point geometry column in a metric SRID.
+        cell_sizes: Cell sizes in the SRID's units, one grid key each.
+        max_distance: Largest ST_DWithin diameter the queries will use (sets the packing margin).
+        create_indexes: Create ``(cell)`` and, with ``index_prefix_column``, ``(prefix, cell)`` indexes.
+        index_prefix_column: Typed column to lead the composite index, e.g. ``subtype``.
+    """
+    import psycopg
+    from psycopg import sql
+
+    from partitioncache import spatial_grid
+
+    if not cell_sizes or any(size <= 0 for size in cell_sizes):
+        raise ValueError(f"cell sizes must be positive, got {cell_sizes}")
+    db_host, db_user, db_name = (os.getenv(v) for v in ("DB_HOST", "DB_USER", "DB_NAME"))
+    if not all([db_host, db_user, db_name]):
+        raise ValueError(
+            "PostgreSQL connection not configured. Set DB_HOST, DB_USER, DB_NAME (and DB_PASSWORD unless trust/peer/.pgpass) environment variables."
+        )
+    # An empty DB_PASSWORD is left out, so trust/peer authentication, PGPASSWORD and .pgpass work
+    conn = psycopg.connect(
+        dbname=db_name, host=db_host, user=db_user, password=os.getenv("DB_PASSWORD") or None, port=int(os.getenv("DB_PORT") or "5432"), autocommit=True
+    )
+    source = sql.Identifier(*table.split("."))
+    base = table.split(".")[-1]
+    try:
+        cursor = conn.cursor()
+        cursor.execute(spatial_grid.CELL_FUNCTION_DDL)
+        logger.info(f"Installed {spatial_grid.CELL_FUNCTION}(geometry, float8)")
+        for size in cell_sizes:
+            spatial_grid.check_extent(cursor, table, geometry_column, size, max_distance)
+            logger.info(f"{table}.{geometry_column} fits the grid packing at cell size {size}")
+            if not create_indexes:
+                continue
+            # The literal must be spelled like spatial_grid.cell_sql() spells it, or queries do not match the index
+            cell = sql.SQL("{fn}({geom}, {size})").format(
+                fn=sql.Identifier(spatial_grid.CELL_FUNCTION), geom=sql.Identifier(geometry_column), size=sql.SQL(spatial_grid._num(size))
+            )
+            tag = spatial_grid._num(size).replace(".", "_")
+            cursor.execute(
+                sql.SQL("CREATE INDEX IF NOT EXISTS {idx} ON {table} ({cell})").format(idx=sql.Identifier(f"{base}_grid{tag}_idx"), table=source, cell=cell)
+            )
+            if index_prefix_column:
+                cursor.execute(
+                    sql.SQL("CREATE INDEX IF NOT EXISTS {idx} ON {table} ({prefix}, {cell})").format(
+                        idx=sql.Identifier(f"{base}_{index_prefix_column}_grid{tag}_idx"),
+                        table=source,
+                        prefix=sql.Identifier(index_prefix_column),
+                        cell=cell,
+                    )
+                )
+            logger.info(f"Created grid indexes for cell size {size}")
+        if create_indexes:
+            cursor.execute(sql.SQL("ANALYZE {table}").format(table=source))
+        sizes = ",".join(f"cell{spatial_grid._num(size).replace('.', '_')}={spatial_grid._num(size)}" for size in cell_sizes)
+        logger.info(f"Set environment for pcache-add / pcache-monitor, e.g.: PARTITION_CACHE_GRID_CELL_SIZES={sizes}")
+    finally:
+        conn.close()
+
+
 def validate_environment() -> bool:
     """
     Validate that the environment is properly configured for PartitionCache.
@@ -709,7 +785,7 @@ def restore_cache(cache_type: str, archive_file: str, target_partition_key: str 
                                     existing_bitsize = cache._get_partition_bitsize(effective_partition_key)  # type: ignore[attr-defined]
                                     if bitsize is not None:
                                         kwargs['bitsize'] = bitsize
-                                        if existing_bitsize is not None and existing_bitsize != bitsize:
+                                        if existing_bitsize is not None and existing_bitsize < bitsize:  # never shrink: stored bit arrays would lose keys
                                             logger.info(f"Updating bitsize from {existing_bitsize} to {bitsize} for partition '{effective_partition_key}'")
                                             cache._set_partition_bitsize(effective_partition_key, bitsize)  # type: ignore[attr-defined]
                                     elif existing_bitsize is not None:
@@ -1689,6 +1765,15 @@ valid environment variables. Use --env to load configuration from a custom file.
     setup_h3.add_argument("--mv-name", help="Materialized view name (default: {table}_h3_cells)")
     setup_h3.add_argument("--column-name", help="H3 cell column name (default: h3_cell_{resolution})")
 
+    # Setup grid command
+    setup_grid_parser = setup_subparsers.add_parser("grid", help="Install the grid-cell function, check the extent, create grid indexes")
+    setup_grid_parser.add_argument("--table", required=True, help="Fact table name")
+    setup_grid_parser.add_argument("--geometry-column", default="geom", help="Point geometry column in a metric SRID (default: geom)")
+    setup_grid_parser.add_argument("--cell-size", type=float, action="append", required=True, help="Cell size in SRID units; repeat for several keys")
+    setup_grid_parser.add_argument("--max-distance", type=float, required=True, help="Largest ST_DWithin diameter of the queries (packing margin)")
+    setup_grid_parser.add_argument("--create-indexes", action="store_true", help="Create the expression indexes the rewritten queries use")
+    setup_grid_parser.add_argument("--index-prefix-column", help="Typed column leading a composite (column, cell) index, e.g. subtype")
+
     # Status commands
     status_parser = subparsers.add_parser("status", help="Check PartitionCache status and configuration")
     status_subparsers = status_parser.add_subparsers(dest="status_command", help="Status operations")
@@ -1801,6 +1886,15 @@ valid environment variables. Use --env to load configuration from a custom file.
                 setup_queue_tables(queue_provider=getattr(args, "queue", None))
             elif args.setup_command == "cache":
                 setup_cache_metadata_tables(cache_backend=getattr(args, "cache", None))
+            elif args.setup_command == "grid":
+                setup_grid(
+                    table=args.table,
+                    geometry_column=args.geometry_column,
+                    cell_sizes=args.cell_size,
+                    max_distance=args.max_distance,
+                    create_indexes=args.create_indexes,
+                    index_prefix_column=getattr(args, "index_prefix_column", None),
+                )
             elif args.setup_command == "h3-cells":
                 setup_h3_cells(
                     mode=args.mode,

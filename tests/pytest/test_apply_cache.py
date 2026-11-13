@@ -2,6 +2,7 @@
 Tests for the apply_cache module, specifically extend_query_with_partition_keys function.
 """
 
+import logging
 import warnings
 from datetime import datetime
 from unittest.mock import Mock
@@ -17,7 +18,7 @@ from partitioncache.apply_cache import (
     find_p0_alias,
     rewrite_query_with_p0_table,
 )
-from partitioncache.cache_handler.abstract import AbstractCacheHandler_Lazy
+from partitioncache.cache_handler.abstract import AbstractCacheHandler, AbstractCacheHandler_Lazy
 
 
 class TestFindP0Alias:
@@ -46,6 +47,22 @@ class TestFindP0Alias:
         query = "SELECT * FROM users AS u JOIN orders AS o ON u.id = o.user_id"
         result = find_p0_alias(query, "partition_key")
         assert result == "u"
+
+    def test_partition_key_on_later_table(self):
+        """A generated variant can list a dimension first; the restriction belongs to the table with the key."""
+        query = (
+            "SELECT DISTINCT t2.lo_orderdate FROM date_dim AS t1, lineorder AS t2 "
+            "WHERE t1.d_datekey = t2.lo_orderdate AND t1.d_year = 1993"
+        )
+        assert find_p0_alias(query, "lo_orderdate") == "t2"
+
+    def test_first_table_kept_when_it_carries_the_key(self):
+        query = "SELECT DISTINCT t1.pk FROM a AS t1, b AS t2 WHERE t1.pk = t2.pk"
+        assert find_p0_alias(query, "pk") == "t1"
+
+    def test_subquery_columns_ignored(self):
+        query = "SELECT DISTINCT t1.x FROM a AS t1 WHERE t1.x IN (SELECT s.pk FROM b AS s)"
+        assert find_p0_alias(query, "pk") == "t1"
 
     def test_no_table_raises_error(self):
         """Test that ValueError is raised when no table is found."""
@@ -1104,3 +1121,37 @@ class TestTempTableSqlDialect:
         )
         assert "ON COMMIT DROP" in pg and "DROP TABLE IF EXISTS" not in pg
         assert "ON COMMIT DROP" not in duck and "DROP TABLE IF EXISTS" in duck
+
+
+class TestSqlTheCacheCannotProcess:
+    """SQL the cache cannot parse or rewrite makes the query run without the cache, it never fails it."""
+
+    BROKEN = "SELECT a.pk FROM points AS a WHERE a.x = ("
+
+    def test_apply_cache_lazy_returns_the_query_unchanged(self, caplog):
+        handler = Mock(spec=AbstractCacheHandler_Lazy)
+        with caplog.at_level(logging.WARNING, logger="PartitionCache"):
+            enhanced, stats = apply_cache_lazy(self.BROKEN, handler, "pk")
+        assert enhanced == self.BROKEN
+        assert stats["sql_error"] == 1 and stats["enhanced"] == 0
+        assert "runs without the cache" in caplog.text
+        handler.get_intersected_lazy.assert_not_called()
+
+    def test_apply_cache_returns_the_query_unchanged(self):
+        handler = Mock(spec=AbstractCacheHandler)
+        enhanced, stats = apply_cache(query=self.BROKEN, cache_handler=handler, partition_key="pk")
+        assert enhanced == self.BROKEN
+        assert stats["sql_error"] == 1
+
+    @pytest.mark.parametrize(
+        "query", ["SELECT 1", "SELECT a.pk FROM points AS a WHERE " + " AND ".join(f"a.c{i} = {i}" for i in range(1200))], ids=["no_from", "deep_and"]
+    )
+    def test_shapes_the_variant_generator_cannot_handle(self, query):
+        handler = Mock(spec=AbstractCacheHandler_Lazy)
+        enhanced, stats = apply_cache_lazy(query, handler, "pk")
+        assert enhanced == query
+        assert stats["sql_error"] == 1
+
+    def test_configuration_errors_still_raise(self):
+        with pytest.raises(ValueError, match="does not support lazy intersection"):
+            apply_cache_lazy("SELECT a.pk FROM points AS a WHERE a.x = 1", Mock(), "pk")

@@ -130,6 +130,53 @@ def add_spatial_args(parser: argparse.ArgumentParser, include_buffer_distance: b
         )
 
 
+def parse_grid_cell_sizes(value: str) -> dict[str, float]:
+    """Parse --grid-cell-size: comma-separated KEY=SIZE pairs, e.g. ``cell200=200,cell400=400``."""
+    sizes: dict[str, float] = {}
+    for part in (p.strip() for p in value.split(",") if p.strip()):
+        key, sep, raw = part.partition("=")
+        try:
+            size = float(raw)
+        except ValueError:
+            size = -1.0
+        if not sep or not key.strip() or size <= 0:
+            raise argparse.ArgumentTypeError(f"expected KEY=SIZE with a positive size, got {part!r}")
+        sizes[key.strip()] = size
+    return sizes
+
+
+def add_grid_args(parser: argparse.ArgumentParser) -> None:
+    """Add --grid-cell-size: which partition keys are grid-cell spatial keys (``partitioncache.spatial_grid``)."""
+    env = os.getenv("PARTITION_CACHE_GRID_CELL_SIZES", "")
+    parser.add_argument_group("grid-cell spatial keys").add_argument(
+        "--grid-cell-size",
+        type=parse_grid_cell_sizes,
+        default=parse_grid_cell_sizes(env) if env else {},
+        metavar="KEY=SIZE[,KEY=SIZE]",
+        help="Partition keys that hold grid cells of the geometry column, with their cell size in the SRID's units. "
+        "Fragments then select cells (integer datatype, sparse-set backends only); lookups must use the same size "
+        "(default: none or PARTITION_CACHE_GRID_CELL_SIZES)",
+    )
+
+
+def grid_cell_size_for(args: argparse.Namespace, partition_key: str) -> float | None:
+    """The grid cell size configured for ``partition_key``, or None if it is not a grid key."""
+    sizes = getattr(args, "grid_cell_size", None)
+    if not isinstance(sizes, dict):
+        return None
+    size = sizes.get(partition_key)
+    return float(size) if size is not None else None
+
+
+def check_grid_key(partition_key: str, datatype: str, cache_backend: str | None) -> str | None:
+    """Why a grid key cannot use this datatype or backend, or None if it can."""
+    if datatype != "integer":
+        return f"grid key '{partition_key}' needs --partition-datatype integer, got '{datatype}'"
+    if cache_backend and cache_backend.endswith("_bit"):
+        return f"grid key '{partition_key}' cannot use the bit backend '{cache_backend}': cells exceed any useful bitsize"
+    return None
+
+
 def add_environment_args(parser: argparse.ArgumentParser) -> None:
     """
     Add environment file loading arguments to an ArgumentParser.
@@ -335,6 +382,31 @@ def parse_variant_generation_json_args(args: argparse.Namespace) -> tuple[dict[s
     return add_constraints, remove_constraints_all, remove_constraints_add
 
 
+def parse_bucket_steps(value: str) -> float | dict[str, float] | list[float | dict[str, float]]:
+    """Parse --bucket-steps: a number, a JSON dict {pattern: step}, or a JSON list of numbers and such dicts."""
+    try:
+        return float(value)
+    except ValueError:
+        pass
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as e:
+        raise argparse.ArgumentTypeError(f"bucket steps must be a number, a JSON dict or a JSON list: {value!r}") from e
+
+    def level(item: Any) -> float | dict[str, float]:
+        if isinstance(item, bool):
+            raise argparse.ArgumentTypeError(f"invalid bucket step: {item!r}")
+        if isinstance(item, int | float):
+            return float(item)
+        if isinstance(item, dict) and all(isinstance(k, str) and isinstance(v, int | float) and not isinstance(v, bool) for k, v in item.items()):
+            return {k: float(v) for k, v in item.items()}
+        raise argparse.ArgumentTypeError(f"invalid bucket step: {item!r}")
+
+    if isinstance(parsed, list):
+        return [level(item) for item in parsed]
+    return level(parsed)
+
+
 def add_variant_generation_args(parser: argparse.ArgumentParser) -> None:
     """
     Add common variant generation arguments to an ArgumentParser.
@@ -381,9 +453,10 @@ def add_variant_generation_args(parser: argparse.ArgumentParser) -> None:
     )
     variant_group.add_argument(
         "--bucket-steps",
-        type=float,
-        default=float(os.getenv("PARTITION_CACHE_BUCKET_STEPS", "1.0")),
-        help="Step size for normalizing distance conditions (e.g., 1.0, 0.5, etc.) (default: 1.0 or PARTITION_CACHE_BUCKET_STEPS)",
+        type=parse_bucket_steps,
+        default=parse_bucket_steps(os.getenv("PARTITION_CACHE_BUCKET_STEPS", "1.0")),
+        help="Step size for normalizing distance conditions (e.g., 1.0, 0.5), a JSON dict of per-attribute steps "
+        '(e.g. \'{"alt": 500, "vrate": 1}\'), or a JSON list of such levels (default: 1.0 or PARTITION_CACHE_BUCKET_STEPS)',
     )
     variant_group.add_argument(
         "--add-constraints",
@@ -410,6 +483,14 @@ def add_variant_generation_args(parser: argparse.ArgumentParser) -> None:
         help="Maximum number of conditions to remove per table when generating attribute variants. "
         "Default: 1 (remove one condition at a time). Higher values generate more variants via C(n,k) combinations. "
         "(default: 1 or PARTITION_CACHE_MAX_CONDITIONS_REMOVED)",
+    )
+    variant_group.add_argument(
+        "--skip-partition-key-joins",
+        type=lambda value: [key.strip() for key in value.split(",") if key.strip()],
+        default=[key.strip() for key in os.getenv("PARTITION_CACHE_SKIP_PARTITION_KEY_JOINS", "").split(",") if key.strip()],
+        help="Comma-separated partition keys whose variants get no equality on the partition key between tables, as needed for "
+        "time buckets used with temporal dilation (geometry keys always skip it). Lookups must use the same setting "
+        "(default: none or PARTITION_CACHE_SKIP_PARTITION_KEY_JOINS)",
     )
 
 
@@ -478,6 +559,11 @@ def validate_mutual_exclusivity(args: argparse.Namespace, groups: list[tuple[str
         elif len(specified_args) > 1:
             print(f"Error: Only one of {', '.join(f'--{arg}' for arg in specified_args)} can be specified")
             sys.exit(1)
+
+
+def sql_dialect_for_backend(db_backend: str | None) -> str:
+    """The sqlglot dialect for a --db-backend value (postgresql, mysql, sqlite); PostgreSQL by default."""
+    return {"postgresql": "postgres", "mysql": "mysql", "sqlite": "sqlite"}.get(db_backend or "", "postgres")
 
 
 def get_database_connection_params(args: argparse.Namespace, backend_type: str | None = None) -> dict[str, Any]:

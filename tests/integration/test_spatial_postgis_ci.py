@@ -652,3 +652,43 @@ class TestSpatialBBoxBufferRegression:
         finally:
             _cleanup_cache_tables(handler, config["partition_key"])
             handler.close()
+
+    @pytest.mark.parametrize("buffer_distance", [None, 0.0])
+    @pytest.mark.parametrize("lazy", [False, True])
+    def test_bbox_single_table_point_radius_query_needs_no_buffer(self, ci_db_connection, lazy, buffer_distance):
+        """A query over one table is restricted to the cached points themselves (buffer 0).
+
+        Widening by the point radius would let the filter cover the whole radius again, and
+        ST_Buffer of the points by 0 would be empty and drop every row.
+        """
+        config = BACKEND_CONFIGS["postgis_bbox"]
+        partition_key, geometry_column = config["partition_key"], config["geometry_column"]
+        sql_query = "SELECT p1.name FROM pois AS p1 WHERE p1.subtype = 'pharmacy' AND ST_DWithin(p1.geom, ST_SetSRID(ST_MakePoint(549100, 5802050), 25832), 60)"
+        handler = partitioncache.get_cache_handler("postgis_bbox", singleton=False)
+        try:
+            handler.register_partition_key(partition_key, "geometry")
+            pairs = generate_all_query_hash_pairs(
+                sql_query, partition_key=partition_key, min_component_size=1, skip_partition_key_joins=True, geometry_column=geometry_column
+            )
+            for fragment_query, query_hash in pairs:
+                handler.set_cache_lazy(query_hash, fragment_query, partition_key)
+
+            rows_baseline = sorted(_run_query(ci_db_connection, sql_query))
+            assert rows_baseline, "the point radius should contain pharmacies"
+            apply = partitioncache.apply_cache_lazy if lazy else partitioncache.apply_cache
+            enhanced_query, stats = apply(
+                query=sql_query,
+                cache_handler=handler,
+                partition_key=partition_key,
+                geometry_column=geometry_column,
+                buffer_distance=buffer_distance,
+                min_component_size=1,
+            )
+
+            assert stats["enhanced"] == 1, stats
+            assert sorted(_run_multi_statement(ci_db_connection, enhanced_query)) == rows_baseline
+            if lazy:
+                assert "ST_Buffer" not in enhanced_query
+        finally:
+            _cleanup_cache_tables(handler, partition_key)
+            handler.close()

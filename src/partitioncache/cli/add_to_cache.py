@@ -5,26 +5,68 @@ CLI tool to add queries to the cache either directly or via the queue.
 import argparse
 import os
 from logging import getLogger
+from typing import Any
 
 import partitioncache
 from partitioncache.cli.common_args import (
     add_cache_args,
     add_database_args,
     add_environment_args,
+    add_grid_args,
     add_queue_args,
     add_spatial_args,
     add_variant_generation_args,
     add_verbosity_args,
+    check_grid_key,
     configure_logging,
     get_database_connection_params,
+    grid_cell_size_for,
     load_environment_with_validation,
     parse_variant_generation_json_args,
     resolve_cache_backend,
+    sql_dialect_for_backend,
 )
 from partitioncache.db_handler import get_db_handler
-from partitioncache.query_processor import clean_query, generate_all_query_hash_pairs, hash_query, query_contains_top_level_outer_join
+from partitioncache.population import populate_query_variants
+from partitioncache.query_processor import (
+    clean_query,
+    generate_all_query_hash_pairs,
+    hash_query,
+    order_variants_for_population,
+    query_contains_top_level_outer_join,
+)
+from partitioncache.spatial_grid import GRID_GENERATION_KWARGS
 
 logger = getLogger("PartitionCache")
+
+
+def _grid_kwargs(grid_size: float | None) -> dict[str, Any]:
+    """``grid_cell_size`` only for grid keys, so the variant generation of every other key is called unchanged."""
+    return {"grid_cell_size": grid_size} if grid_size is not None else {}
+
+
+def _generation_settings(args: argparse.Namespace) -> tuple[float | None, bool, bool]:
+    """(grid cell size, auto_detect_partition_join, skip_partition_key_joins) for variant generation.
+
+    A grid key forces the flags its lookup uses (spatial_grid.GRID_GENERATION_KWARGS), otherwise the
+    population would generate other fragments than the lookup searches for.
+    """
+    grid_size = grid_cell_size_for(args, args.partition_key)
+    if grid_size is None:
+        is_spatial = args.partition_datatype == "geometry"
+        return None, not args.no_auto_detect_partition_join, is_spatial or args.partition_key in args.skip_partition_key_joins
+    return grid_size, GRID_GENERATION_KWARGS["auto_detect_partition_join"], GRID_GENERATION_KWARGS["skip_partition_key_joins"]
+
+
+def _exit_if_grid_key_invalid(args: argparse.Namespace, grid_size: float | None) -> None:
+    if grid_size is None:
+        return
+    problem = check_grid_key(args.partition_key, args.partition_datatype, resolve_cache_backend(args))
+    if problem is None and args.no_recompose:
+        problem = f"grid key '{args.partition_key}' needs recomposition: --no-recompose would store the query's own rows, not cells"
+    if problem is not None:
+        logger.error(problem)
+        exit(1)
 
 
 def main():
@@ -46,17 +88,33 @@ def main():
     mode_group.add_argument("--queue", action="store_true", help="Add query variants to the variant queue instead of executing directly")
     mode_group.add_argument("--queue-original", action="store_true", help="Add query to original query queue instead of the variant queue")
     mode_group.add_argument("--direct", action="store_true", help="Calculate query variants directly instead of using the incoming queue")
+    mode_group.add_argument(
+        "--restrict-variants",
+        action="store_true",
+        help="With --direct: execute variants smallest first and restrict each to the keys of its already populated relaxations",
+    )
+    mode_group.add_argument(
+        "--max-restriction-keys",
+        type=int,
+        default=None,
+        help="With --direct: only restrict a variant when the intersection has at most this many keys (implies --restrict-variants)",
+    )
 
     # Add common argument groups
     add_cache_args(parser, require_partition_key=True)
     add_database_args(parser)
     add_queue_args(parser)
     add_spatial_args(parser, include_buffer_distance=False)
+    add_grid_args(parser)
     add_variant_generation_args(parser)
     add_environment_args(parser)
     add_verbosity_args(parser)
 
     args = parser.parse_args()
+    if args.max_restriction_keys is not None and args.max_restriction_keys < 0:
+        parser.error("--max-restriction-keys must not be negative")
+    if (args.restrict_variants or args.max_restriction_keys is not None) and not args.direct:
+        parser.error("--restrict-variants and --max-restriction-keys require --direct")
 
     # Configure logging based on verbosity
     configure_logging(args)
@@ -108,6 +166,8 @@ def main():
 
     elif args.queue:  # Add to queue for async processing
         is_spatial = args.partition_datatype == "geometry"
+        grid_size, auto_detect, skip_pk_joins = _generation_settings(args)
+        _exit_if_grid_key_invalid(args, grid_size)
 
         # Resolve cache backend to store with queue item (important for spatial routing)
         queue_cache_backend = resolve_cache_backend(args) if is_spatial else None
@@ -125,6 +185,8 @@ def main():
                     except Exception as e:
                         logger.debug("Could not resolve geometry column from cache handler, using default 'geom': %s", e)
                         geometry_column = "geom"
+            elif grid_size is not None:
+                geometry_column = args.geometry_column or "geom"
 
             query_hash_pairs = generate_all_query_hash_pairs(
                 query,
@@ -132,7 +194,7 @@ def main():
                 min_component_size=args.min_component_size,
                 follow_graph=args.follow_graph,
                 keep_all_attributes=True,
-                auto_detect_partition_join=not args.no_auto_detect_partition_join,
+                auto_detect_partition_join=auto_detect,
                 max_component_size=args.max_component_size,
                 partition_join_table=args.partition_join_table,
                 warn_no_partition_key=not args.no_warn_partition_key,
@@ -140,10 +202,13 @@ def main():
                 add_constraints=add_constraints,
                 remove_constraints_all=remove_constraints_all,
                 remove_constraints_add=remove_constraints_add,
-                skip_partition_key_joins=is_spatial,
+                skip_partition_key_joins=skip_pk_joins,
                 geometry_column=geometry_column,
                 max_conditions_removed=args.max_conditions_removed,
+                **_grid_kwargs(grid_size),
             )
+            # Smallest variants first, so the monitor's cache optimization can restrict the larger ones with them
+            query_hash_pairs = order_variants_for_population(query_hash_pairs)
             success = partitioncache.push_to_query_fragment_queue(query_hash_pairs, args.partition_key, args.partition_datatype, queue_provider, cache_backend=queue_cache_backend)
         else:  # Push the cleaned query as a single variant (no recomposition)
             query = clean_query(query)
@@ -157,6 +222,8 @@ def main():
 
     elif args.direct:  # Execute directly
         is_spatial = args.partition_datatype == "geometry"
+        grid_size, auto_detect, skip_pk_joins = _generation_settings(args)
+        _exit_if_grid_key_invalid(args, grid_size)
 
         if not args.no_recompose:
             logger.warning("Direct mode with recomposing may take a long time on large queries, consider using the queue instead")
@@ -172,7 +239,7 @@ def main():
                 existing_bitsize = cache_handler._get_partition_bitsize(args.partition_key)  # type: ignore[attr-defined]
                 if args.bitsize is not None:
                     kwargs['bitsize'] = args.bitsize
-                    if existing_bitsize is not None and existing_bitsize != args.bitsize:
+                    if existing_bitsize is not None and existing_bitsize < args.bitsize:  # never shrink: stored bit arrays would lose keys
                         logger.info(f"Updating bitsize from {existing_bitsize} to {args.bitsize} for partition '{args.partition_key}'")
                         cache_handler._set_partition_bitsize(args.partition_key, args.bitsize)  # type: ignore[attr-defined]
                 elif existing_bitsize is not None:
@@ -185,6 +252,8 @@ def main():
             geometry_column = None
             if is_spatial:
                 geometry_column = args.geometry_column or getattr(cache_handler, "geometry_column", "geom")
+            elif grid_size is not None:
+                geometry_column = args.geometry_column or "geom"
 
             if not args.no_recompose:
                 logger.debug("Recomposing query")
@@ -196,7 +265,7 @@ def main():
                     min_component_size=args.min_component_size,
                     follow_graph=args.follow_graph,
                     keep_all_attributes=True,
-                    auto_detect_partition_join=not args.no_auto_detect_partition_join,
+                    auto_detect_partition_join=auto_detect,
                     max_component_size=args.max_component_size,
                     partition_join_table=args.partition_join_table,
                     warn_no_partition_key=not args.no_warn_partition_key,
@@ -204,9 +273,10 @@ def main():
                     add_constraints=add_constraints,
                     remove_constraints_all=remove_constraints_all,
                     remove_constraints_add=remove_constraints_add,
-                    skip_partition_key_joins=is_spatial,
+                    skip_partition_key_joins=skip_pk_joins,
                     geometry_column=geometry_column,
                     max_conditions_removed=args.max_conditions_removed,
+                    **_grid_kwargs(grid_size),
                 )
 
             else:
@@ -248,24 +318,40 @@ def main():
                 else:
                     raise ValueError(f"Unsupported database backend: {args.db_backend}")
 
-                # Process each query-hash pair
-                for fragment_query, hash_value in query_hash_pairs:
-                    if cache.exists(hash_value):
-                        logger.debug(f"Query {hash_value} already in cache")
-                        cache.set_query(hash_value, fragment_query)
-                        continue
+                population_failed = False
+                if args.restrict_variants or args.max_restriction_keys is not None:
+                    stats = populate_query_variants(
+                        query_hash_pairs,
+                        args.partition_key,
+                        cache_handler,
+                        db_handler,
+                        max_restriction_keys=args.max_restriction_keys,
+                        sql_dialect=sql_dialect_for_backend(args.db_backend),
+                    )
+                    logger.info(f"Populated query variants: {stats}")
+                    population_failed = bool(stats.failed or stats.store_failed)
+                else:
+                    # Process each query-hash pair
+                    for fragment_query, hash_value in query_hash_pairs:
+                        if cache.exists(hash_value):
+                            logger.debug(f"Query {hash_value} already in cache")
+                            cache.set_query(hash_value, fragment_query)
+                            continue
 
-                    # Execute query and store results
-                    result = set(db_handler.execute(fragment_query))
-                    if result:
-                        cache.set_cache(hash_value, result)
-                        cache.set_query(hash_value, fragment_query)
-                        logger.debug(f"Stored query {hash_value} with {len(result)} results")
-                    else:
-                        logger.warning(f"Query {hash_value} returned no results")
+                        # Execute query and store results. An empty result is stored too: the variant has no
+                        # rows, which restricts later queries to nothing. Execution errors raise instead.
+                        result = set(db_handler.execute(fragment_query))
+                        if cache.set_cache(hash_value, result) and cache.set_query(hash_value, fragment_query):
+                            logger.debug(f"Stored query {hash_value} with {len(result)} results")
+                        else:
+                            logger.error(f"Failed to store query {hash_value} with {len(result)} results")
 
                 db_handler.close()
                 cache.close()
+                if population_failed:
+                    # Same outcome as the plain loop, where a failing variant aborts with an error
+                    logger.error(f"{stats.failed} variants failed to execute and {stats.store_failed} failed to store")
+                    exit(1)
 
         except Exception as e:
             logger.error(f"Error processing query: {str(e)}")

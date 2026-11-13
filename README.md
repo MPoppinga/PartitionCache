@@ -1,7 +1,7 @@
 # PartitionCache
 
 [![License: LGPL v3](https://img.shields.io/badge/License-LGPL%20v3-blue.svg)](LICENSE)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![Research Paper](https://img.shields.io/badge/Paper-10.18420/BTW2025--23-blue)](https://doi.org/10.18420/BTW2025-23)
 
 Partition-based query optimization middleware for heavily partitioned datasets. PartitionCache automatically decomposes complex queries into variants, caches which partitions contain results for each variant, and uses this knowledge to dramatically reduce search space for future queries by skipping partitions that won't contain results.

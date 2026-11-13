@@ -45,9 +45,10 @@ PartitionCache supports multiple cache backends with different performance chara
 
 #### Redis Bit Handler
 - **Type**: `redis_bit`
-- **Storage**: Redis bit arrays
+- **Storage**: Redis bit arrays, one bit per partition key (`ceil(bitsize / 8)` bytes per entry)
 - **Datatypes**: `integer` only  
 - **Best for**: Large integer datasets in distributed setup
+- **Format note**: Earlier versions stored one ASCII character per partition key. Such entries are converted to packed bits in place when they are first read, so existing caches keep working and shrink as they are used.
 - **Memory**: Efficient for integers
 - **Scalability**: Excellent (network-distributed)
 
@@ -91,12 +92,60 @@ PartitionCache supports multiple cache backends with different performance chara
 
 #### PostGIS BBox Handler
 - **Type**: `postgis_bbox`
-- **Storage**: PostGIS geometry (MultiPolygon of grid cell envelopes)
+- **Storage**: PostGIS geometry, the collection (`ST_Collect`) of each variant's result geometries
 - **Datatypes**: `geometry`
 - **Requirements**: PostgreSQL + PostGIS extension
 - **Best for**: Grid-based spatial partitioning, bounding box intersection
-- **Spatial filtering**: Geometric `ST_Intersection` of cached bounding boxes
+- **Spatial filtering**: `ST_Intersection` of the cached collections, each widened by `ST_Buffer` with the query's buffer distance. Unbuffered for a buffer of 0, which a query over a single table gets when no `buffer_distance` is given.
 - **Scalability**: Excellent (database-native)
+
+#### Grid-cell keys (any integer handler)
+
+A grid-cell key is not a handler. It is an **integer partition key** whose values are the cells
+`floor(x/s) << 16 | floor(y/s)` of a geometry column in a metric SRID. Integer handlers that store sparse
+sets hold it: `postgresql_array`, `postgresql_roaringbit`, `redis_set`, `rocksdict` and `rocksdb_set`.
+The bit handlers do not fit, because cells are large numbers (around 10^8), far beyond any useful bitsize.
+See `docs/spatial_grid_keys.md`.
+
+- **Setup**: install the cell function `spatial_grid.CELL_FUNCTION_DDL` (`public.partitioncache_grid_cell(geometry, float8)`)
+  manually.
+  - Then check the packing range once with `spatial_grid.check_extent(cursor, table, "geom", s, max_distance)`. The packing
+    needs a metric SRID, 0 ≤ x/s < 2^15 and 0 ≤ y/s < 2^16. At lookup, cells outside the range make the query run uncached.
+  Create expression indexes on the fact table for each cell size in use, for example
+  `CREATE INDEX ON pois (partitioncache_grid_cell(geom, 200))` and `CREATE INDEX ON pois (subtype, partitioncache_grid_cell(geom, 200))`.
+- **Population**: `generate_all_query_hash_pairs(..., geometry_column="geom", grid_cell_size=200)` yields the spatial fragments.
+  Each fragment's SQL selects the distinct cells of all its geometry columns; the hash covers this projection, so keys
+  of different cell sizes never share an entry.
+- **Lookup and soundness**:
+  - `apply_cache(..., geometry_column="geom", grid_cell_size=200, grid_method=...)` fetches the cached cell sets.
+  - Each set is widened by the disk stencil of the diameter D of the query's `ST_DWithin` graph. That is the Chebyshev
+    bound, exact in the SRID the query measures in.
+  - The widened sets are intersected: widen the smallest, probe the rest.
+  - The lookup is always eager. An empty intersection yields a `FALSE` condition.
+- **Methods (`grid_method`)**:
+  - `CELL_AUTO` (default): `CELL_ARRAY_ANCHOR` when a non-anchor alias has no equality or IN predicate against literals,
+    else `CELL_STAR`.
+  - `CELL_STAR`: a star join through per-distance neighbour pair tables `(c, nc)`, so every alias is restricted to the
+    cells next to *its* anchor's cell. There is no separate hub join, because it misleads the planner's estimates.
+  - `CELL_ARRAY`: `cell(alias) = ANY('{…}'::int[])` on every alias of the fact table.
+  - `CELL_ARRAY_ANCHOR`: the same on the anchor (`p0_alias`) only.
+- **Not offered**: temp-table or CTE forms of the key set. The planner estimates their semi-join at its default of 200 groups
+  and misplans.
+- **PostgreSQL 17+**: CREATE INDEX and ANALYZE run with `search_path = pg_catalog, pg_temp`. The cell function is therefore
+  schema-qualified and has no `SET search_path` clause, which would stop PostgreSQL from inlining it, so every row
+  would pay a function call (see the next section).
+
+#### Functions in Index Expressions and Materialized Views (PostgreSQL 17+)
+
+PostgreSQL 17 and later run the following maintenance operations with `search_path = pg_catalog, pg_temp`: `CREATE INDEX`, `REINDEX`, `CREATE` / `REFRESH MATERIALIZED VIEW`, `ANALYZE`, `VACUUM` and `CLUSTER`.
+
+- **Where it matters:** in the bodies of SQL-language functions. They are parsed when they are inlined during the operation, so any name in them without a schema fails with `function ... does not exist`. The names in the `CREATE INDEX` statement itself are unaffected: they are resolved when the statement is parsed.
+- **h3_postgis:** its geometry overload `h3_lat_lng_to_cell(geometry, integer)` is such a function (h3-pg 4.2.3, body `SELECT h3_lat_lng_to_cell($1::point, $2)`). An expression index or a materialized view on it fails with `SQL function "h3_lat_lng_to_cell" during inlining`.
+- **Fix for H3:** cast to `point` and call the core overload instead. This is what `pcache-manage setup h3-cells` does:
+  ```sql
+  CREATE INDEX pois_h3_9_idx ON pois (h3_lat_lng_to_cell(ST_Transform(ST_Centroid(geom), 4326)::point, 9));
+  ```
+- **Your own SQL functions** used in an index: schema-qualify every name in the body, e.g. `public.ST_X(g)`. A `SET search_path` clause on the function works too, but it stops PostgreSQL from inlining the function, so every row then pays a function call.
 
 ## Multi-Partition Support
 
@@ -301,7 +350,12 @@ The PostgreSQL bit handler requires a mandatory bitsize configuration:
 ```bash
 # Required environment variable
 export PG_BIT_CACHE_BITSIZE=10000  # Must be set
+# Optional: extra bits when the bit arrays grow (default 0)
+export PG_BIT_CACHE_BITSIZE_BUFFER=1000
 ```
+
+**Keys outside the bit array:**
+A key beyond the bitsize grows the partition's bit arrays to `max key + 1 + buffer`, eager and lazy alike, and logs a warning. Stored entries are zero-padded and keep their keys. Each growth rewrites the cache table, so a buffer avoids growing for every slightly larger key. The pg_cron processor grows the same way and reads its buffer from the setting `partitioncache.bitsize_buffer` of the database it runs in (`ALTER DATABASE <db> SET partitioncache.bitsize_buffer = 1000`). Negative keys cannot be stored in a bit array and fail the insert. The bitsize never shrinks: a smaller `--bitsize` or `PG_BIT_CACHE_BITSIZE` keeps the current one, and the bitsize trigger refuses to lower it, since that would cut the stored bit arrays. Growth alters the cache table (an `ACCESS EXCLUSIVE` lock until the transaction commits, which waits for open transactions on that table), and PostgreSQL limits `BIT(n)` to 83,886,080 bits, so choose the initial bitsize for the expected key range. `duckdb_bit`, `redis_bit` and `rocksdb_bit` do not grow: a key outside the bitsize fails the insert, it is never dropped.
 
 **Fixed-Length Bit Arrays:**
 All cache tables use fixed-length `BIT(n)` columns for consistent BIT_AND operations:
@@ -317,12 +371,12 @@ bitsize = cache._get_partition_bitsize("large_dataset")
 ```
 
 **Automatic Schema Updates:**
-Database triggers automatically update cache table schemas when bitsize changes:
+Database triggers automatically update cache table schemas when the bitsize grows:
 
 ```python
-# Changing bitsize triggers schema update
+# Growing the bitsize triggers a schema update; a smaller value keeps the current bitsize
 cache._set_partition_bitsize("large_dataset", 75000)
-# Automatically runs: ALTER TABLE cache_large_dataset ALTER COLUMN partition_keys TYPE BIT(75000)
+# Automatically runs: ALTER TABLE cache_large_dataset ALTER COLUMN partition_keys TYPE BIT(75000) USING partition_keys::BIT(75000)
 ```
 
 ### Variable Bit Sizes

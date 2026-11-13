@@ -134,7 +134,11 @@ def test_set_cache_int(cache_handler, mock_redis):
     cache_handler._get_partition_datatype = Mock(return_value="integer")
 
     cache_handler.set_cache("int_set_key", {1, 2, 3})
-    mock_redis.sadd.assert_called_with(cache_key, "1", "2", "3")
+    # The new set replaces the old value in one transaction
+    pipe = mock_redis.pipeline.return_value
+    pipe.delete.assert_called_with(cache_key)
+    pipe.sadd.assert_called_with(cache_key, "1", "2", "3")
+    pipe.execute.assert_called_once()
 
 
 def test_set_cache_invalid_type(cache_handler, mock_redis):
@@ -182,6 +186,7 @@ def test_get_intersected_no_valid_keys(cache_handler, mock_redis):
     mock_redis.pipeline.return_value = pipe = Mock()
     pipe.type.side_effect = [b"hash", b"string"]
     pipe.execute.return_value = [b"hash", b"string"]
+    mock_redis.mget.return_value = [b"\x00"]  # the string key is a null marker, not an empty result
     result, count = cache_handler.get_intersected(keys)
     assert result is None
     assert count == 0

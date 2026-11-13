@@ -116,21 +116,24 @@ This script will:
 - Extract POIs (amenities, shops, tourism, leisure)
 - Assign zipcode and administrative boundaries to each POI
 
-### 5. Run Example Queries
+### 5. Run Benchmark (Unified Runner)
 
-Test queries with both partition strategies:
+Test queries with all partition strategies using the unified benchmark runner:
 
 ```bash
-python run_poi_queries.py
+# Run all queries
+python examples/benchmark/run_benchmark.py --config config/osm_poi.yaml --db-backend postgresql --mode all
+
+# Run a specific flight
+python examples/benchmark/run_benchmark.py --config config/osm_poi.yaml --db-backend postgresql --mode flight 1
 ```
 
 This will:
 - Run the same queries against zipcode, landkreis, and spatial partition keys
 - Show performance comparisons between strategies
 - Demonstrate cache hit/miss scenarios
-- Provide helpful hints for adding queries to cache
 
-Expected output shows timing comparisons and cache effectiveness for each partition strategy.
+> **Note:** The benchmark runner has moved to `examples/benchmark/run_benchmark.py`. See [examples/benchmark/README.md](../benchmark/README.md) for full documentation.
 
 ## Working with the Cache
 
@@ -243,6 +246,46 @@ enhanced_query, stats = partitioncache.apply_cache(
 )
 ```
 
+#### For Grid-Cell Keys (Integer Cells of the Geometry)
+
+A grid-cell key is an integer partition key whose fragments store the cells `floor(x/s) << 16 | floor(y/s)` of
+their geometries, in the metric SRID of the data (25832 here). The lookup widens each fragment's cell set by
+the query's `ST_DWithin` diameter before intersecting, so no match is lost. The cell set then restricts the
+query as a star join of neighbour pair tables or as a constant cell array. Use the cell size s ≤ D/2 for a
+query with `ST_DWithin` diameter D (at least two rings of cells).
+
+```bash
+# Once: cell function, packing check, cell expression indexes
+pcache-manage --env-file .env setup grid --table pois --geometry-column geom --cell-size 200 --max-distance 2000 \
+  --create-indexes --index-prefix-column subtype
+
+# Populate (integer datatype, a sparse-set backend; the geometry column defaults to geom)
+pcache-add --direct \
+  --query-file testqueries_examples/spatial/q1.sql \
+  --partition-key cell200 \
+  --partition-datatype integer \
+  --grid-cell-size cell200=200 \
+  --cache-backend postgresql_array \
+  --env .env
+```
+
+```python
+enhanced_query, stats = partitioncache.apply_cache(
+    query=sql_query,
+    cache_handler=handler,
+    partition_key="cell200",
+    geometry_column="geom",
+    grid_cell_size=200,          # must equal the size the key was populated with
+    grid_method="CELL_AUTO",     # or CELL_STAR, CELL_ARRAY, CELL_ARRAY_ANCHOR
+    p0_alias="p1",
+)
+# CELL_STAR returns "CREATE TEMPORARY TABLE ... ON COMMIT DROP; ...; SELECT ...": run it in one execute() call
+```
+
+Bit backends cannot hold cells (they are around 10^8), and `pcache-read` does not apply to grid keys: their
+cell sets are only sound after the widening of `apply_cache`. The benchmark config
+`examples/benchmark/config/osm_poi_grid.yaml` runs the spatial test queries this way.
+
 ### Reading from Cache
 
 ```bash
@@ -298,6 +341,27 @@ Each partition strategy (`zipcode`, `landkreis`, `spatial`) has three test queri
 
 The `zipcode` and `landkreis` variants include partition key join conditions (e.g. `p2.zipcode = p1.zipcode`), while the `spatial` variants use only `ST_DWithin` spatial joins without partition key joins.
 
+### Flight 4: Harder Spatial Queries (spatial_benchmark/)
+
+Flight 4 contains 7 stress-test queries organized in 4 categories. All use only the `pois` table with `ST_DWithin` spatial joins, but exercise patterns that standard queries don't cover:
+
+| Query | Category | Pattern | Challenge |
+|-------|----------|---------|-----------|
+| qa1 | A: Index-defeating | Double leading-wildcard LIKE (`%Pizza%`, `%Apotheke%`) | Forces sequential scans; only GiST spatial index helps |
+| qa2 | A: Index-defeating | `LOWER()` + multi-pattern OR with 4 LIKE conditions | No btree usable; OR pattern may generate many fragments |
+| qb1 | B: High-cardinality | restaurant (95k) × cafe (29k) cross-product | Enormous cross-product before spatial filter |
+| qb2 | B: High-cardinality | Same-subtype self-join (restaurant × restaurant) with wildcards | 95k × 95k with leading wildcards = worst case for planner |
+| qb3 | B: High-cardinality | Triple join: restaurant × pharmacy × supermarket (500m) | 3-way spatial join creates very large search space |
+| qc1 | C: Chain topology | 4-table chain: pizza→pharmacy→supermarket→bakery (300m each) | Chain topology (not star); no single index covers it |
+| qd1 | D: Expression filter | `LENGTH()` + `LOWER()` on columns | Computed expressions defeat all indexes |
+
+```bash
+# Run Flight 4 (harder spatial queries)
+python examples/benchmark/run_benchmark.py \
+  --config config/osm_poi.yaml --db-backend postgresql \
+  --mode flight 4 --api lazy --repeat 3
+```
+
 ## Performance Comparison
 
 The example demonstrates how different partition strategies affect query performance:
@@ -306,7 +370,7 @@ The example demonstrates how different partition strategies affect query perform
 - **Landkreis partitioning**: Broader regions, good for administrative queries
 - **Spatial partitioning** (H3/BBox): Geometry-based, good for spatial proximity queries without explicit partition key columns
 
-Run `python run_poi_queries.py` to see performance comparisons between:
+Run the benchmark to see performance comparisons between:
 - Queries without cache
 - Queries with zipcode partitioning
 - Queries with landkreis partitioning
