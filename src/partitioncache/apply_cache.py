@@ -506,7 +506,11 @@ def rewrite_query_with_p0_table( # TODO: Check duplication with query_processor
     from_clause.set("this", exp.Table(this=f"{current_table.sql(dialect=sql_dialect)}, {mv_table_name} AS {p0_alias}"))
 
     # Remove existing partition_key join conditions and replace with star-schema joins
-    where_clause = parsed_query.find(exp.Where)
+    where_clause = _outer_where(parsed_query)
+    if where_clause is None:
+        # Without a WHERE the star joins were dropped and p0 was cross-joined with every row
+        where_clause = exp.Where()
+        parsed_query.set("where", where_clause)
     if where_clause:
         # Collect all conditions
         conditions = []
@@ -515,7 +519,7 @@ def rewrite_query_with_p0_table( # TODO: Check duplication with query_processor
             if isinstance(node, exp.And):
                 collect_conditions(node.left)
                 collect_conditions(node.right)
-            else:
+            elif node is not None:
                 conditions.append(node)
 
         collect_conditions(where_clause.this)
@@ -611,9 +615,20 @@ def _splice_key_list(rendered_sql: str, sentinel: str, key_list: str) -> str:
     return rendered_sql.replace(sentinel, key_list, 1)
 
 
+def _outer_where(parsed_query: exp.Expr) -> exp.Where | None:
+    """Return the WHERE clause of the outermost SELECT, not one of a FILTER, subquery or CTE.
+
+    ``find(exp.Where)`` returns the first WHERE anywhere in the tree, so a query without an outer WHERE got the
+    condition in a nested one. Set operations have no WHERE of their own; they keep the first nested one.
+    """
+    if isinstance(parsed_query, exp.Select):
+        return parsed_query.args.get("where")
+    return parsed_query.find(exp.Where)
+
+
 def _add_where_condition(parsed_query: exp.Expr, condition_expr: exp.Expr) -> None:
-    """Add a WHERE condition to a parsed query, creating WHERE clause if needed."""
-    existing_where: exp.Where | None = parsed_query.find(exp.Where)
+    """Add a WHERE condition to the outermost SELECT of a parsed query, creating the WHERE clause if needed."""
+    existing_where: exp.Where | None = _outer_where(parsed_query)
     if existing_where is None:
         new_where = exp.Where(this=condition_expr)
         parsed_query.args["where"] = new_where
@@ -2043,6 +2058,8 @@ def apply_cache(
     grid_method: str = "CELL_AUTO",
     min_query_cost: float | None = None,
     keep_all_attributes: bool = False,
+    max_conditions_removed: int | None = None,
+    protected_patterns: list[str] | None = None,
     sql_dialect: str = "postgres",
     **kwargs: Any,
 ) -> tuple[str, dict[str, int]]:
@@ -2078,6 +2095,9 @@ def apply_cache(
         add_constraints: Dict mapping table names to constraints to add (e.g., {"table": "col = val"})
         remove_constraints_all: List of attribute names to remove from all query variants
         remove_constraints_add: List of attribute names to remove, creating additional variants
+        max_conditions_removed: Most attribute conditions a lookup variant may drop (None: no limit). Use the value
+            the cache was populated with, as in apply_cache_lazy.
+        protected_patterns: Conditions matching these patterns are never removed during variant generation.
         skip_partition_key_joins (bool): If True, skip partition key joins in variant generation.
         temporal_bucket_width: Width of one bucket of a time-bucket partition key, in the unit of ``temporal_column``;
             enables temporal dilation: each cached set is widened by ceil(window / width) buckets before the
@@ -2170,7 +2190,7 @@ def apply_cache(
              "fix_attributes": keep_all_attributes, "canonicalize_queries": canonicalize_queries, "follow_graph": True,
              "partition_join_table": partition_join_table, "bucket_steps": bucket_steps, "add_constraints": add_constraints,
              "remove_constraints_all": remove_constraints_all, "remove_constraints_add": remove_constraints_add,
-             "max_conditions_removed": kwargs.get("max_conditions_removed"), "protected_patterns": kwargs.get("protected_patterns")},
+             "max_conditions_removed": max_conditions_removed, "protected_patterns": protected_patterns},
         )
 
     # Spatial mode is selected by passing a geometry column
@@ -2193,6 +2213,8 @@ def apply_cache(
             add_constraints=add_constraints,
             remove_constraints_all=remove_constraints_all,
             remove_constraints_add=remove_constraints_add,
+            max_conditions_removed=max_conditions_removed,
+            protected_patterns=protected_patterns,
             skip_partition_key_joins=True,
             geometry_column=geometry_column,
         )
@@ -2299,6 +2321,8 @@ def apply_cache(
         remove_constraints_all=remove_constraints_all,
         remove_constraints_add=remove_constraints_add,
         skip_partition_key_joins=skip_partition_key_joins,
+        max_conditions_removed=max_conditions_removed,
+        protected_patterns=protected_patterns,
         temporal_bucket_width=temporal_bucket_width,
         dilation_buckets=dilation_buckets,
         temporal_column=temporal_column,
