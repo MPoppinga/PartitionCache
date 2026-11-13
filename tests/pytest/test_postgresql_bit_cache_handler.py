@@ -222,6 +222,16 @@ def test_get_intersected_lazy(cache_handler):
     cache_handler.get_intersected_sql_wk.assert_called_with({"key1", "key2"}, "partition_key")
 
 
+@pytest.mark.parametrize("keys", [{"key1"}, {"key1", "key2"}], ids=["one_entry", "two_entries"])
+def test_lazy_intersection_copies_the_bit_and_result_before_get_bit(cache_handler, keys):
+    """Over one entry BIT_AND returns the stored TOAST pointer; without a copy every get_bit detoasts the value again."""
+    cache_handler.filter_existing_keys = Mock(return_value=keys)
+    query, count = cache_handler.get_intersected_lazy(keys)
+    assert count == len(keys)
+    assert "SELECT BIT_AND(partition_keys) || B'' AS bit_result FROM" in query
+    assert "get_bit(bit_result, bit_index) = 1" in query
+
+
 def test_get_all_keys(cache_handler):
     # Mock partition datatype and fetchall
     cache_handler.cursor.fetchone.return_value = ("integer",)

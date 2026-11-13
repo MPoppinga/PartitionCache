@@ -432,8 +432,10 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
         # Use sql.Literal for each key to properly escape them and build array
         escaped_keys = [sql.Literal(key) for key in keys]
         keys_part = sql.SQL("ARRAY[{}]").format(sql.SQL(", ").join(escaped_keys))
+        # || B'' forces an in-memory copy: over a single entry BIT_AND returns the stored TOAST pointer
+        # unchanged, and every get_bit call on it (_set_bits_array_sql) would detoast the whole value again
         return (
-            sql.SQL("SELECT BIT_AND(partition_keys) AS bit_result FROM (SELECT partition_keys FROM {0} WHERE query_hash = ANY({1})) AS selected")
+            sql.SQL("SELECT BIT_AND(partition_keys) || B'' AS bit_result FROM (SELECT partition_keys FROM {0} WHERE query_hash = ANY({1})) AS selected")
             .format(
                 sql.Identifier(table_name),
                 keys_part,
