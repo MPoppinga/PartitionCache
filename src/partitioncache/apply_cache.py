@@ -712,6 +712,7 @@ def extend_query_with_partition_keys(
         analyze_tmp_table (bool): Whether to create index and analyze. (only for temporary table methods)
         auto_detect_partition_join: Whether to auto-detect partition-join tables.
         partition_join_table: Explicitly specified partition-join table alias or name.
+        sql_dialect: sqlglot dialect used to parse and render the query. Defaults to PostgreSQL.
 
     Returns:
         str: The extended SQL query as string. An empty ``partition_keys`` set is a valid cache result
@@ -725,23 +726,24 @@ def extend_query_with_partition_keys(
         # No alias provided, try to find it (TMP_TABLE_JOIN does join on all tables)
         p0_alias = find_p0_alias(query, partition_key, auto_detect_partition_join, partition_join_table)
 
-    parsed_query = sqlglot.parse_one(query)
+    # Parsed and rendered in the query's dialect: the generic writer turns ARRAY['a'] into ARRAY('a'), which PostgreSQL rejects
+    parsed_query = sqlglot.parse_one(query, read=sql_dialect)
 
     if method == "IN":
         # The key list is not parsed: a placeholder identifier goes through sqlglot and the
         # formatted list is spliced into the rendered SQL afterwards (see _splice_key_list).
         sentinel = _key_list_sentinel()
-        partition_expr = sqlglot.parse_one(f"{p0_alias}.{partition_key} IN ({sentinel})")
+        partition_expr = sqlglot.parse_one(f"{p0_alias}.{partition_key} IN ({sentinel})", read=sql_dialect)
         _add_where_condition(parsed_query, partition_expr)
         key_list = ", ".join(_format_spliced_partition_key(pk, sql_dialect) for pk in partition_keys)
-        return _splice_key_list(parsed_query.sql(), sentinel, key_list)
+        return _splice_key_list(parsed_query.sql(dialect=sql_dialect), sentinel, key_list)
 
     elif method == "VALUES":
         sentinel = _key_list_sentinel()
-        partition_expr = sqlglot.parse_one(f"{p0_alias}.{partition_key} IN (VALUES({sentinel}))")
+        partition_expr = sqlglot.parse_one(f"{p0_alias}.{partition_key} IN (VALUES({sentinel}))", read=sql_dialect)
         _add_where_condition(parsed_query, partition_expr)
         key_list = "), (".join(_format_spliced_partition_key(pk, sql_dialect) for pk in partition_keys)
-        return _splice_key_list(parsed_query.sql(), sentinel, key_list)
+        return _splice_key_list(parsed_query.sql(dialect=sql_dialect), sentinel, key_list)
 
     elif method == "TMP_TABLE_JOIN":
         tmp_table_setup, table_name = _create_tmp_table_setup(partition_keys, analyze_tmp_table, sql_dialect)
@@ -763,7 +765,7 @@ def extend_query_with_partition_keys(
 
             # Create the new join expression using sqlglot
             join_expr = (
-                from_clause.this.sql()  # Original table
+                from_clause.this.sql(dialect=sql_dialect)  # Original table
                 + " "  # Space between tables
                 + exp.Join(
                     this=exp.Identifier(this=f"{table_name} AS tmp_{table_alias}"),
@@ -772,19 +774,19 @@ def extend_query_with_partition_keys(
                         expression=exp.Identifier(this=f"{table_alias}.{partition_key}"),
                     ),
                     kind="INNER",
-                ).sql()  # New join expression
+                ).sql(dialect=sql_dialect)  # New join expression
             )
 
             # Replace the old join expression with the new one
             from_clause.this.replace(join_expr)
 
-        return tmp_table_setup + parsed_query.sql()
+        return tmp_table_setup + parsed_query.sql(dialect=sql_dialect)
 
     elif method == "TMP_TABLE_IN":
         tmp_table_setup, table_name = _create_tmp_table_setup(partition_keys, analyze_tmp_table, sql_dialect)
-        partition_expr = sqlglot.parse_one(f"{p0_alias}.{partition_key} IN (SELECT partition_key FROM {table_name})")
+        partition_expr = sqlglot.parse_one(f"{p0_alias}.{partition_key} IN (SELECT partition_key FROM {table_name})", read=sql_dialect)
         _add_where_condition(parsed_query, partition_expr)
-        return tmp_table_setup + parsed_query.sql()
+        return tmp_table_setup + parsed_query.sql(dialect=sql_dialect)
 
 
 def _create_tmp_table_setup_from_subquery(

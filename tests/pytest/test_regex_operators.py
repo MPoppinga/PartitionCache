@@ -73,7 +73,8 @@ def test_apply_cache_accepts_regex_operators() -> None:
     query = "SELECT * FROM t AS p1 WHERE p1.name ~ '^Bio' AND p1.zipcode > 0"
     sql, stats = apply_cache(query, handler, "zipcode", min_component_size=1)
     assert stats["enhanced"] == 1
-    assert "REGEXP_LIKE(p1.name, '^Bio')" in sql and "IN (1, 2)" in sql
+    # Rendered for PostgreSQL like the lazy paths: the operator again, not REGEXP_LIKE (PostgreSQL 15+)
+    assert "p1.name ~ '^Bio'" in sql and "IN (1, 2)" in sql
 
 
 def test_apply_cache_returns_the_callers_text_when_it_changes_nothing() -> None:
