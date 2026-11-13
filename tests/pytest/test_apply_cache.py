@@ -1174,3 +1174,30 @@ class TestSqlTheCacheCannotProcess:
     def test_configuration_errors_still_raise(self):
         with pytest.raises(ValueError, match="does not support lazy intersection"):
             apply_cache_lazy("SELECT a.pk FROM points AS a WHERE a.x = 1", Mock(), "pk")
+
+
+class TestApplyCacheSqlDialect:
+    """apply_cache renders the enhanced query in sql_dialect, like apply_cache_lazy (default: PostgreSQL)."""
+
+    QUERY = "SELECT * FROM t AS p WHERE p.name ~ '^Bio' AND p.x > 0"
+
+    @staticmethod
+    def _handler(keys):
+        handler = Mock(spec=AbstractCacheHandler)
+        handler.get_intersected.return_value = (keys, 1)
+        return handler
+
+    def test_default_is_postgres(self):
+        enhanced, stats = apply_cache(self.QUERY, self._handler({1, 2}), "k", p0_alias="p")
+        assert stats["enhanced"] == 1
+        assert "p.name ~ '^Bio'" in enhanced and enhanced.endswith("p.k IN (1, 2)")
+
+    def test_duckdb(self):
+        enhanced, stats = apply_cache(self.QUERY, self._handler({1, 2}), "k", p0_alias="p", sql_dialect="duckdb")
+        assert stats["enhanced"] == 1
+        assert "REGEXP_MATCHES(p.name, '^Bio')" in enhanced and enhanced.endswith("p.k IN (1, 2)")
+
+    def test_empty_intersection_in_the_dialect(self):
+        enhanced, stats = apply_cache(self.QUERY, self._handler(set()), "k", p0_alias="p", sql_dialect="duckdb")
+        assert stats["enhanced"] == 1
+        assert "REGEXP_MATCHES(p.name, '^Bio')" in enhanced and "FALSE" in enhanced

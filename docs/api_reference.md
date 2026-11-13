@@ -360,7 +360,7 @@ enhanced_query, stats = partitioncache.apply_cache_lazy(
 
 #### `apply_cache(query, cache_handler, partition_key, ..., geometry_column=None, buffer_distance=None)`
 
-Applies partition cache to a query using regular (non-lazy) cache handlers. Supports spatial mode. Accepts the same `cost_estimator` / `min_query_cost` gate as `apply_cache_lazy`.
+Applies partition cache to a query using regular (non-lazy) cache handlers. Supports spatial mode. Accepts the same `cost_estimator` / `min_query_cost` gate as `apply_cache_lazy`. Like `apply_cache_lazy`, it takes `sql_dialect` (default `"postgres"`), the sqlglot dialect the enhanced non-spatial query is parsed and rendered in.
 
 **Spatial Parameters** (in addition to standard parameters):
 - `geometry_column` (str | None, optional): Enables spatial mode. Requires a spatial cache handler with `get_spatial_filter()` method.

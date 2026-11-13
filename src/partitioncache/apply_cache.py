@@ -2040,6 +2040,7 @@ def apply_cache(
     grid_method: str = "CELL_AUTO",
     min_query_cost: float | None = None,
     keep_all_attributes: bool = False,
+    sql_dialect: str = "postgres",
     **kwargs: Any,
 ) -> tuple[str, dict[str, int]]:
     """
@@ -2085,6 +2086,7 @@ def apply_cache(
         keep_all_attributes: If False (default), lookup also probes variants with single-table attribute
             conditions removed (more hits, more variant-generation cost). True probes exactly the variants
             that generate_all_query_hash_pairs produces with its defaults.
+        sql_dialect: sqlglot dialect used to parse and render non-spatial queries. Defaults to PostgreSQL.
         geometry_column: If set, enables spatial cache mode. Uses this geometry column for variant
             SELECT clauses and spatial filter application. Requires a spatial cache handler with
             get_spatial_filter() method.
@@ -2334,7 +2336,7 @@ def apply_cache(
     if not partition_keys:
         stats["enhanced"] = 1
         logger.info(f"Cache intersection of {used_hashes} cache hits is empty, restricting query to no rows")
-        return _add_empty_intersection_condition(working_query), stats
+        return _add_empty_intersection_condition(working_query, sql_dialect), stats
 
     # Step 3: Apply the partition keys to the working query
     # Determine the correct alias for cache restrictions
@@ -2355,6 +2357,7 @@ def apply_cache(
         analyze_tmp_table=analyze_tmp_table,
         auto_detect_partition_join=auto_detect_partition_join,
         partition_join_table=partition_join_table,
+        sql_dialect=sql_dialect,
     )
 
     stats["enhanced"] = 1
