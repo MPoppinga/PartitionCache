@@ -6,7 +6,6 @@ from logging import getLogger
 
 import psycopg
 
-from partitioncache.apply_cache import get_unlogged_cleanup_sql
 from partitioncache.db_handler.abstract import AbstractDBHandler
 
 logger = getLogger("PartitionCache")
@@ -17,7 +16,8 @@ def fetch_final_result_set(cursor: psycopg.Cursor) -> list:
 
     The temp-table integration methods (``TMP_TABLE_IN`` / ``TMP_TABLE_JOIN``) and the spatial filters emit
     multi-statement scripts of the form
-    ``CREATE TEMPORARY TABLE ... ON COMMIT DROP; INSERT/ANALYZE ...; SELECT ...``.
+    ``CREATE TEMPORARY TABLE ... ON COMMIT DROP; INSERT/ANALYZE ...; SELECT ...``; an ``UNLOGGED_TABLE_JOIN``
+    script ends with ``DROP TABLE IF EXISTS ...`` after its SELECT, which produces no result set.
     After ``cursor.execute(script)`` psycopg positions the cursor on the FIRST statement's result, so a plain
     ``fetchall()`` would read the ``CREATE TABLE`` (which produces no rows). This walks ``nextset()`` to the
     final result-producing statement and returns its rows. Works for single-statement queries too (one set).
@@ -62,11 +62,6 @@ class PostgresDBHandler(AbstractDBHandler):
         # emit `CREATE TEMPORARY TABLE ... ON COMMIT DROP; ...; SELECT`, where the rows are in the LAST
         # result set, not the first. Returns first column of all rows if not empty.
         rows = fetch_final_result_set(self.cur)
-        # UNLOGGED_TABLE_JOIN: the key table is a regular table, dropped here after the fetch and in the
-        # transaction of the script, so the commit below never leaves it behind
-        cleanup_sql = get_unlogged_cleanup_sql(query)
-        if cleanup_sql is not None:
-            self.cur.execute(cleanup_sql)
         # Only NULL is dropped: a truthiness test also dropped key 0 (and '' / 0.0), so its partition was
         # missing from the cached set and cache restrictions excluded it
         result = [row[0] for row in rows if row[0] is not None]

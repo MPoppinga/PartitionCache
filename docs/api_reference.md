@@ -197,14 +197,14 @@ print(optimized)
 
 > **`UNLOGGED_TABLE_JOIN` (PostgreSQL only).** Like `TMP_TABLE_JOIN`, but the key table is an unlogged table
 > (`partitioncache_unl_<hex>`, always with index and `ANALYZE`), which parallel workers can read; they cannot
-> read temporary tables. The last statement is still the `SELECT`. Nothing drops the table automatically:
-> after fetching, run `get_unlogged_cleanup_sql(script)` (`DROP TABLE IF EXISTS ...`, `None` for any other SQL)
-> in the same transaction and commit, so that an error rolls the `CREATE` back. `PostgresDBHandler.execute`
-> does this. The eager and the lazy function both offer the method.
+> read temporary tables. The script drops the table itself: it ends with `DROP TABLE IF EXISTS ...` after the
+> `SELECT`, so the rows are in the last result set that has rows (`fetch_final_result_set`). Execute the script
+> as ONE string, as for the temporary-table methods: it then runs in one transaction, also under autocommit, and
+> an error before the `DROP` rolls the `CREATE` back, so no table is left behind. The eager and the lazy
+> function both offer the method.
 > Privileges: `CREATE UNLOGGED TABLE` needs `CREATE` on the first schema of the `search_path` (since
 > PostgreSQL 15, `public` no longer grants it to every role), while temporary tables only need `TEMP`.
-> Without it the enhanced script fails when it runs. Other executors than `PostgresDBHandler` must call
-> `get_unlogged_cleanup_sql` themselves; leftover tables are found by the prefix `partitioncache_unl_`.
+> Without it the enhanced script fails when it runs.
 
 #### `extend_query_with_partition_keys_lazy(query: str, lazy_subquery: str, partition_key: str, method: Literal["IN_SUBQUERY", "TMP_TABLE_IN", "TMP_TABLE_JOIN", "UNLOGGED_TABLE_JOIN"] = "IN_SUBQUERY", p0_alias: str | None = None, analyze_tmp_table: bool = True, auto_detect_partition_join: bool = True, partition_join_table: str | None = None, sql_dialect: str = "postgres")`
 

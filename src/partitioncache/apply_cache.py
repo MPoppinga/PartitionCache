@@ -10,7 +10,6 @@ import functools
 import math
 import numbers
 import random
-import re
 import secrets
 from collections.abc import Callable
 from datetime import datetime
@@ -703,7 +702,6 @@ def _create_tmp_table_setup(
 
 
 UNLOGGED_TABLE_PREFIX = "partitioncache_unl_"
-_UNLOGGED_SETUP_RE = re.compile(rf"CREATE UNLOGGED TABLE ({UNLOGGED_TABLE_PREFIX}[0-9a-f]+) AS ")
 # The key table is joined to every table of the query unless an alias is given
 _TABLE_JOIN_METHODS = ("TMP_TABLE_JOIN", "UNLOGGED_TABLE_JOIN")
 
@@ -712,8 +710,9 @@ def _create_unlogged_table_setup(keys_sql: str, key_column: str, sql_dialect: st
     """Create the setup SQL of ``UNLOGGED_TABLE_JOIN``: an unlogged key table with index and statistics.
 
     PostgreSQL does not let parallel workers read temporary tables; an unlogged table can be read inside the
-    parallel part of the plan. It is a regular table of the current schema, so nothing drops it automatically:
-    the caller runs ``get_unlogged_cleanup_sql`` after fetching the rows, in the transaction of the script.
+    parallel part of the plan. It is a regular table of the current schema, so the script drops it itself after
+    the SELECT (``_unlogged_table_teardown``). Sent as ONE string, the script is one transaction: an error before
+    the DROP rolls the CREATE back, so no table is left behind, also under autocommit.
 
     Returns:
         tuple[str, str]: (setup_sql, table_name).
@@ -729,17 +728,9 @@ def _create_unlogged_table_setup(keys_sql: str, key_column: str, sql_dialect: st
     return setup_sql, table_name
 
 
-def get_unlogged_cleanup_sql(enhanced_sql: str) -> str | None:
-    """Return the ``DROP TABLE IF EXISTS`` statement for a script built with ``UNLOGGED_TABLE_JOIN``, else None.
-
-    The script's last statement is the SELECT, like for the temporary-table methods; the key table has to be
-    dropped after its rows are fetched. Run the script, the fetch and this statement in ONE transaction and
-    commit afterwards (``PostgresDBHandler.execute`` does): an error or a lost connection then rolls the
-    CREATE back and leaves no table behind. With autocommit the table is committed first and stays in the
-    database when the DROP is not reached; such tables are found by their name prefix ``partitioncache_unl_``.
-    """
-    match = _UNLOGGED_SETUP_RE.match(enhanced_sql)
-    return f"DROP TABLE IF EXISTS {match.group(1)}" if match else None
+def _unlogged_table_teardown(table_name: str) -> str:
+    """Return the statement that ends an ``UNLOGGED_TABLE_JOIN`` script, after its SELECT: the DROP of the key table."""
+    return f";\nDROP TABLE IF EXISTS {table_name}"
 
 
 def extend_query_with_partition_keys(
@@ -765,8 +756,8 @@ def extend_query_with_partition_keys(
         partition_key (str): The identifier for the partition.
         method (Literal["IN", "VALUES", "TMP_TABLE_IN", "TMP_TABLE_JOIN", "UNLOGGED_TABLE_JOIN"]): The method to use to
             extend the query. ``UNLOGGED_TABLE_JOIN`` (PostgreSQL only) is ``TMP_TABLE_JOIN`` with an unlogged
-            table, always with index and ANALYZE; the caller drops the table after the fetch, see
-            ``get_unlogged_cleanup_sql``.
+            table, always with index and ANALYZE; the script ends with its DROP, after the SELECT. Execute it as
+            ONE string so that it runs in one transaction.
         p0_alias (str | None): The alias of the table to use for the partition key.
         analyze_tmp_table (bool): Whether to create index and analyze. (only for temporary table methods)
         auto_detect_partition_join: Whether to auto-detect partition-join tables.
@@ -844,7 +835,10 @@ def extend_query_with_partition_keys(
             # Replace the old join expression with the new one
             from_clause.this.replace(join_expr)
 
-        return tmp_table_setup + parsed_query.sql(dialect=sql_dialect)
+        script = tmp_table_setup + parsed_query.sql(dialect=sql_dialect)
+        if method == "UNLOGGED_TABLE_JOIN":
+            script += _unlogged_table_teardown(table_name)
+        return script
 
     elif method == "TMP_TABLE_IN":
         tmp_table_setup, table_name = _create_tmp_table_setup(partition_keys, analyze_tmp_table, sql_dialect)
@@ -924,8 +918,8 @@ def extend_query_with_partition_keys_lazy(
         partition_key (str): The identifier for the partition.
         method (Literal["IN_SUBQUERY", "TMP_TABLE_IN", "TMP_TABLE_JOIN", "UNLOGGED_TABLE_JOIN"]): The method to use to
             extend the query. ``UNLOGGED_TABLE_JOIN`` (PostgreSQL only) is ``TMP_TABLE_JOIN`` with an unlogged
-            table, always with index and ANALYZE; the caller drops the table after the fetch, see
-            ``get_unlogged_cleanup_sql``.
+            table, always with index and ANALYZE; the script ends with its DROP, after the SELECT. Execute it as
+            ONE string so that it runs in one transaction.
         p0_alias (str | None): The alias of the table to use for the partition key. If None, will be auto-detected.
             When use_p0_table=True, cache restrictions automatically target the p0 table regardless of this parameter.
         analyze_tmp_table (bool): Whether to create index and analyze. (only for temporary table methods)
@@ -1009,7 +1003,10 @@ def extend_query_with_partition_keys_lazy(
             # Replace the old join expression with the new one
             from_clause.this.replace(join_expr)
 
-        return tmp_table_setup + parsed_query.sql(dialect=sql_dialect)
+        script = tmp_table_setup + parsed_query.sql(dialect=sql_dialect)
+        if method == "UNLOGGED_TABLE_JOIN":
+            script += _unlogged_table_teardown(table_name)
+        return script
 
 
 def extend_query_with_spatial_filter_lazy(
@@ -1812,7 +1809,7 @@ def apply_cache_lazy(
         cache_handler (AbstractCacheHandler_Lazy): The lazy cache handler instance.
         partition_key (str): The identifier for the partition.
         method (Literal["IN_SUBQUERY", "TMP_TABLE_IN", "TMP_TABLE_JOIN", "UNLOGGED_TABLE_JOIN"]): The method to use for
-            query extension. After ``UNLOGGED_TABLE_JOIN`` the caller drops the key table, see ``get_unlogged_cleanup_sql``.
+            query extension. An ``UNLOGGED_TABLE_JOIN`` script ends with the DROP of its key table; execute it as ONE string.
         p0_alias (str | None): For regular queries: table alias for cache restrictions.
                                For p0 queries: alias name for the p0 table (defaults to "p0").
         min_component_size (int): Minimum size of query components to consider for cache lookup.
@@ -2133,7 +2130,7 @@ def apply_cache(
         cache_handler (AbstractCacheHandler): The cache handler instance.
         partition_key (str): The identifier for the partition.
         method (Literal["IN", "VALUES", "TMP_TABLE_JOIN", "TMP_TABLE_IN", "UNLOGGED_TABLE_JOIN"]): The method to use for
-            query extension. After ``UNLOGGED_TABLE_JOIN`` the caller drops the key table, see ``get_unlogged_cleanup_sql``.
+            query extension. An ``UNLOGGED_TABLE_JOIN`` script ends with the DROP of its key table; execute it as ONE string.
         p0_alias (str | None): The alias of the table to use for cache restrictions in regular queries.
             Ignored when use_p0_table=True (cache targets p0 table automatically).
         min_component_size (int): Minimum size of query components to consider for cache lookup.
