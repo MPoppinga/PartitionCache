@@ -725,6 +725,18 @@ class TestApplyCacheLazy:
         assert stats["cache_hits"] == 0
         assert stats["generated_variants"] > 0  # Should have generated some subqueries
 
+    @pytest.mark.parametrize("method", ["IN_SUBQUERY", "TMP_TABLE_IN", "TMP_TABLE_JOIN", "UNLOGGED_TABLE_JOIN"])
+    @pytest.mark.parametrize("p0_alias", ["u", None])
+    def test_complete_miss_leaves_the_query_unrestricted(self, method, p0_alias):
+        """No matching cache entry: the handler returns (None, 0) and no method builds a table of all keys."""
+        query = "SELECT * FROM users AS u JOIN orders AS o ON u.id = o.user_id WHERE u.active = true"
+        mock_handler = self.create_mock_cache_handler(lazy_subquery=None, used_hashes=0)
+
+        enhanced_query, stats = apply_cache_lazy(query, mock_handler, "zipcode", method=method, p0_alias=p0_alias)
+
+        assert enhanced_query == query
+        assert stats["enhanced"] == 0 and stats["cache_hits"] == 0
+
     def test_empty_lazy_subquery_returns_original(self):
         """Test that function returns original query when lazy subquery is empty."""
         query = "SELECT * FROM users AS u WHERE u.active = true"
@@ -1128,7 +1140,7 @@ class TestEagerPathKeepsTheQueryDialect:
 
     QUERY = "SELECT p.pocket_key FROM pocket_properties AS p WHERE prop_value LIKE ANY(ARRAY['%4BXA%', '%1UNL%'])"
 
-    @pytest.mark.parametrize("method", ["IN", "VALUES", "TMP_TABLE_IN", "TMP_TABLE_JOIN"])
+    @pytest.mark.parametrize("method", ["IN", "VALUES", "TMP_TABLE_IN", "TMP_TABLE_JOIN", "UNLOGGED_TABLE_JOIN"])
     def test_postgres_array_literal_survives(self, method):
         result = extend_query_with_partition_keys(self.QUERY, {1, 2}, "pocket_key", method=method, p0_alias="p")
         assert "LIKE ANY(ARRAY['%4BXA%', '%1UNL%'])" in result
@@ -1174,6 +1186,58 @@ class TestSqlTheCacheCannotProcess:
     def test_configuration_errors_still_raise(self):
         with pytest.raises(ValueError, match="does not support lazy intersection"):
             apply_cache_lazy("SELECT a.pk FROM points AS a WHERE a.x = 1", Mock(), "pk")
+
+
+class TestApplyCacheSqlDialect:
+    """apply_cache renders the enhanced query in sql_dialect, like apply_cache_lazy (default: PostgreSQL)."""
+
+    QUERY = "SELECT * FROM t AS p WHERE p.name ~ '^Bio' AND p.x > 0"
+
+    @staticmethod
+    def _handler(keys):
+        handler = Mock(spec=AbstractCacheHandler)
+        handler.get_intersected.return_value = (keys, 1)
+        return handler
+
+    def test_default_is_postgres(self):
+        enhanced, stats = apply_cache(self.QUERY, self._handler({1, 2}), "k", p0_alias="p")
+        assert stats["enhanced"] == 1
+        assert "p.name ~ '^Bio'" in enhanced and enhanced.endswith("p.k IN (1, 2)")
+
+    def test_duckdb(self):
+        enhanced, stats = apply_cache(self.QUERY, self._handler({1, 2}), "k", p0_alias="p", sql_dialect="duckdb")
+        assert stats["enhanced"] == 1
+        assert "REGEXP_MATCHES(p.name, '^Bio')" in enhanced and enhanced.endswith("p.k IN (1, 2)")
+
+    def test_empty_intersection_in_the_dialect(self):
+        enhanced, stats = apply_cache(self.QUERY, self._handler(set()), "k", p0_alias="p", sql_dialect="duckdb")
+        assert stats["enhanced"] == 1
+        assert "REGEXP_MATCHES(p.name, '^Bio')" in enhanced and "FALSE" in enhanced
+
+    LIKE_ANY = "SELECT * FROM t AS p WHERE p.name LIKE ANY(ARRAY['a%', 'b%'])"
+
+    def test_p0_rewrite_keeps_postgres_syntax(self):
+        """The p0 rewrite parsed and rendered without a dialect: ARRAY['a'] became ARRAY('a'), && did not parse."""
+        assert rewrite_query_with_p0_table(self.LIKE_ANY, "k") == (
+            "SELECT * FROM t AS p, k_mv AS p0 WHERE p.name LIKE ANY(ARRAY['a%', 'b%']) AND p.k = p0.k"
+        )
+        assert "p.tags && ARRAY['a', 'b']" in rewrite_query_with_p0_table("SELECT * FROM t AS p WHERE p.tags && ARRAY['a', 'b']", "k")
+
+    @pytest.mark.parametrize("sql_dialect", ["postgres", "duckdb"])
+    def test_use_p0_table_keeps_the_predicate(self, sql_dialect):
+        """With use_p0_table the predicate is rendered as without it, in the same dialect."""
+        plain, _ = apply_cache(self.LIKE_ANY, self._handler({1, 2}), "k", p0_alias="p", sql_dialect=sql_dialect)
+        with_p0, stats = apply_cache(self.LIKE_ANY, self._handler({1, 2}), "k", use_p0_table=True, sql_dialect=sql_dialect)
+        assert stats["p0_rewritten"] == 1 and with_p0.endswith("p0.k IN (1, 2)")
+        predicate = plain.split(" WHERE ")[1].split(" AND p.k IN")[0]
+        assert predicate in with_p0
+
+    def test_use_p0_table_lazy(self):
+        handler = Mock(spec=AbstractCacheHandler_Lazy)
+        handler.get_intersected_lazy.return_value = ("SELECT k FROM cache_k", 1)
+        enhanced, stats = apply_cache_lazy(self.LIKE_ANY, handler, "k", use_p0_table=True)
+        assert stats["p0_rewritten"] == 1
+        assert "LIKE ANY(ARRAY['a%', 'b%'])" in enhanced
 
 
 class TestRestrictionGoesToTheOuterWhere:

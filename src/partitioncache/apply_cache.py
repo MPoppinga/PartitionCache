@@ -455,6 +455,7 @@ def rewrite_query_with_p0_table( # TODO: Check duplication with query_processor
     partition_key: str,
     mv_table_name: str | None = None,
     p0_alias: str = "p0",
+    sql_dialect: str = "postgres",
 ) -> str:
     """
     Rewrite a query to use a star-schema pattern with a p0 table for better optimizer decisions.
@@ -471,6 +472,7 @@ def rewrite_query_with_p0_table( # TODO: Check duplication with query_processor
         partition_key (str): The identifier for the partition.
         mv_table_name (str | None): Name of the materialized view table. Defaults to {partition_key}_mv.
         p0_alias (str): Alias name for the p0 table. Defaults to "p0".
+        sql_dialect (str): sqlglot dialect used to parse and render the query. Defaults to PostgreSQL.
 
     Returns:
         str: The rewritten query with star-schema p0 table integration.
@@ -478,7 +480,7 @@ def rewrite_query_with_p0_table( # TODO: Check duplication with query_processor
     if mv_table_name is None:
         mv_table_name = f"{partition_key}_mv"
 
-    parsed_query = sqlglot.parse_one(query)
+    parsed_query = sqlglot.parse_one(query, read=sql_dialect)
 
     # Check if p0 table already exists
     existing_tables = [table.name for table in parsed_query.find_all(exp.Table)]
@@ -501,7 +503,7 @@ def rewrite_query_with_p0_table( # TODO: Check duplication with query_processor
 
     # Convert to comma-separated tables format including p0
     current_table = from_clause.this
-    from_clause.set("this", exp.Table(this=f"{current_table.sql()}, {mv_table_name} AS {p0_alias}"))
+    from_clause.set("this", exp.Table(this=f"{current_table.sql(dialect=sql_dialect)}, {mv_table_name} AS {p0_alias}"))
 
     # Remove existing partition_key join conditions and replace with star-schema joins
     where_clause = _outer_where(parsed_query)
@@ -552,7 +554,7 @@ def rewrite_query_with_p0_table( # TODO: Check duplication with query_processor
                 new_where = exp.And(this=new_where, expression=condition)
             where_clause.set("this", new_where)
 
-    return parsed_query.sql()
+    return parsed_query.sql(dialect=sql_dialect)
 
 
 def _format_partition_key_for_sql(pk: int | str | float | datetime) -> str:
@@ -701,11 +703,43 @@ def _create_tmp_table_setup(
     return setup_sql, table_name
 
 
+UNLOGGED_TABLE_PREFIX = "partitioncache_unl_"
+# The key table is joined to every table of the query unless an alias is given
+_TABLE_JOIN_METHODS = ("TMP_TABLE_JOIN", "UNLOGGED_TABLE_JOIN")
+
+
+def _create_unlogged_table_setup(keys_sql: str, key_column: str, sql_dialect: str) -> tuple[str, str]:
+    """Create the setup SQL of ``UNLOGGED_TABLE_JOIN``: an unlogged key table with index and statistics.
+
+    PostgreSQL does not let parallel workers read temporary tables; an unlogged table can be read inside the
+    parallel part of the plan. It is a regular table of the current schema, so the script drops it itself after
+    the SELECT (``_unlogged_table_teardown``). Sent as ONE string, the script is one transaction: an error before
+    the DROP rolls the CREATE back, so no table is left behind, also under autocommit.
+
+    Returns:
+        tuple[str, str]: (setup_sql, table_name).
+    """
+    if sql_dialect != "postgres":
+        raise ValueError(f"UNLOGGED_TABLE_JOIN is only supported for PostgreSQL, not for SQL dialect {sql_dialect!r}")
+    table_name = f"{UNLOGGED_TABLE_PREFIX}{secrets.token_hex(8)}"
+    setup_sql = (
+        f"CREATE UNLOGGED TABLE {table_name} AS ({keys_sql});\n"
+        f"CREATE INDEX {table_name}_idx ON {table_name} ({key_column});\n"
+        f"ANALYZE {table_name};\n"
+    )
+    return setup_sql, table_name
+
+
+def _unlogged_table_teardown(table_name: str) -> str:
+    """Return the statement that ends an ``UNLOGGED_TABLE_JOIN`` script, after its SELECT: the DROP of the key table."""
+    return f";\nDROP TABLE IF EXISTS {table_name}"
+
+
 def extend_query_with_partition_keys(
     query: str,
     partition_keys: set[int] | set[str] | set[float] | set[datetime],
     partition_key: str,
-    method: Literal["IN", "VALUES", "TMP_TABLE_JOIN", "TMP_TABLE_IN"] = "IN",
+    method: Literal["IN", "VALUES", "TMP_TABLE_JOIN", "TMP_TABLE_IN", "UNLOGGED_TABLE_JOIN"] = "IN",
     p0_alias: str | None = None,
     analyze_tmp_table: bool = True,
     auto_detect_partition_join: bool = True,
@@ -722,7 +756,10 @@ def extend_query_with_partition_keys(
         query (str): The SQL query to be extended.
         partition_keys (set[int] | set[str]| set[float] | set[datetime]): The set of partition keys to extend the query with.
         partition_key (str): The identifier for the partition.
-        method (Literal["IN", "VALUES", "TMP_TABLE_IN", "TMP_TABLE_JOIN"]): The method to use to extend the query.
+        method (Literal["IN", "VALUES", "TMP_TABLE_IN", "TMP_TABLE_JOIN", "UNLOGGED_TABLE_JOIN"]): The method to use to
+            extend the query. ``UNLOGGED_TABLE_JOIN`` (PostgreSQL only) is ``TMP_TABLE_JOIN`` with an unlogged
+            table, always with index and ANALYZE; the script ends with its DROP, after the SELECT. Execute it as
+            ONE string so that it runs in one transaction.
         p0_alias (str | None): The alias of the table to use for the partition key.
         analyze_tmp_table (bool): Whether to create index and analyze. (only for temporary table methods)
         auto_detect_partition_join: Whether to auto-detect partition-join tables.
@@ -737,8 +774,8 @@ def extend_query_with_partition_keys(
     if not partition_keys:
         return _add_empty_intersection_condition(query, sql_dialect)
 
-    if p0_alias is None and method != "TMP_TABLE_JOIN":
-        # No alias provided, try to find it (TMP_TABLE_JOIN does join on all tables)
+    if p0_alias is None and method not in _TABLE_JOIN_METHODS:
+        # No alias provided, try to find it (the table join methods join on all tables)
         p0_alias = find_p0_alias(query, partition_key, auto_detect_partition_join, partition_join_table)
 
     # Parsed and rendered in the query's dialect: the generic writer turns ARRAY['a'] into ARRAY('a'), which PostgreSQL rejects
@@ -760,8 +797,13 @@ def extend_query_with_partition_keys(
         key_list = "), (".join(_format_spliced_partition_key(pk, sql_dialect) for pk in partition_keys)
         return _splice_key_list(parsed_query.sql(dialect=sql_dialect), sentinel, key_list)
 
-    elif method == "TMP_TABLE_JOIN":
-        tmp_table_setup, table_name = _create_tmp_table_setup(partition_keys, analyze_tmp_table, sql_dialect)
+    elif method == "TMP_TABLE_JOIN" or method == "UNLOGGED_TABLE_JOIN":
+        if method == "UNLOGGED_TABLE_JOIN":
+            key_rows = "), (".join(_format_spliced_partition_key(pk, sql_dialect) for pk in partition_keys)
+            keys_sql = f"SELECT partition_key FROM (VALUES ({key_rows})) AS pcache_keys(partition_key)"
+            tmp_table_setup, table_name = _create_unlogged_table_setup(keys_sql, "partition_key", sql_dialect)
+        else:
+            tmp_table_setup, table_name = _create_tmp_table_setup(partition_keys, analyze_tmp_table, sql_dialect)
 
         # Add as inner join to all tables
         from_clauses: list[exp.Join | exp.From] = list(parsed_query.find_all(exp.Join))
@@ -795,7 +837,10 @@ def extend_query_with_partition_keys(
             # Replace the old join expression with the new one
             from_clause.this.replace(join_expr)
 
-        return tmp_table_setup + parsed_query.sql(dialect=sql_dialect)
+        script = tmp_table_setup + parsed_query.sql(dialect=sql_dialect)
+        if method == "UNLOGGED_TABLE_JOIN":
+            script += _unlogged_table_teardown(table_name)
+        return script
 
     elif method == "TMP_TABLE_IN":
         tmp_table_setup, table_name = _create_tmp_table_setup(partition_keys, analyze_tmp_table, sql_dialect)
@@ -856,7 +901,7 @@ def extend_query_with_partition_keys_lazy(
     query: str,
     lazy_subquery: str,
     partition_key: str,
-    method: Literal["IN_SUBQUERY", "TMP_TABLE_IN", "TMP_TABLE_JOIN"] = "IN_SUBQUERY",
+    method: Literal["IN_SUBQUERY", "TMP_TABLE_IN", "TMP_TABLE_JOIN", "UNLOGGED_TABLE_JOIN"] = "IN_SUBQUERY",
     p0_alias: str | None = None,
     analyze_tmp_table: bool = True,
     auto_detect_partition_join: bool = True,
@@ -873,7 +918,10 @@ def extend_query_with_partition_keys_lazy(
         query (str): The SQL query to be extended.
         lazy_subquery (str): The SQL subquery that returns partition keys.
         partition_key (str): The identifier for the partition.
-        method (Literal["IN_SUBQUERY", "TMP_TABLE_IN", "TMP_TABLE_JOIN"]): The method to use to extend the query.
+        method (Literal["IN_SUBQUERY", "TMP_TABLE_IN", "TMP_TABLE_JOIN", "UNLOGGED_TABLE_JOIN"]): The method to use to
+            extend the query. ``UNLOGGED_TABLE_JOIN`` (PostgreSQL only) is ``TMP_TABLE_JOIN`` with an unlogged
+            table, always with index and ANALYZE; the script ends with its DROP, after the SELECT. Execute it as
+            ONE string so that it runs in one transaction.
         p0_alias (str | None): The alias of the table to use for the partition key. If None, will be auto-detected.
             When use_p0_table=True, cache restrictions automatically target the p0 table regardless of this parameter.
         analyze_tmp_table (bool): Whether to create index and analyze. (only for temporary table methods)
@@ -887,8 +935,8 @@ def extend_query_with_partition_keys_lazy(
     if not lazy_subquery or not lazy_subquery.strip():
         return query
 
-    if p0_alias is None and method != "TMP_TABLE_JOIN":
-        # No alias provided, try to find it (TMP_TABLE_JOIN does join on all tables)
+    if p0_alias is None and method not in _TABLE_JOIN_METHODS:
+        # No alias provided, try to find it (the table join methods join on all tables)
         p0_alias = find_p0_alias(query, partition_key, auto_detect_partition_join, partition_join_table)
 
     parsed_query = sqlglot.parse_one(query, read=sql_dialect)
@@ -918,9 +966,12 @@ def extend_query_with_partition_keys_lazy(
         _add_where_condition(parsed_query, partition_expr)
         return tmp_table_setup + parsed_query.sql(dialect=sql_dialect)
 
-    elif method == "TMP_TABLE_JOIN":
-        # Create temporary table from lazy subquery, then JOIN
-        tmp_table_setup, table_name = _create_tmp_table_setup_from_subquery(lazy_subquery, partition_key, analyze_tmp_table, sql_dialect)
+    elif method == "TMP_TABLE_JOIN" or method == "UNLOGGED_TABLE_JOIN":
+        # Create the key table (temporary or unlogged) from the lazy subquery, then JOIN
+        if method == "UNLOGGED_TABLE_JOIN":
+            tmp_table_setup, table_name = _create_unlogged_table_setup(lazy_subquery, partition_key, sql_dialect)
+        else:
+            tmp_table_setup, table_name = _create_tmp_table_setup_from_subquery(lazy_subquery, partition_key, analyze_tmp_table, sql_dialect)
 
         # Add as inner join to all tables
         from_clauses: list[exp.Join | exp.From] = list(parsed_query.find_all(exp.Join))
@@ -954,7 +1005,10 @@ def extend_query_with_partition_keys_lazy(
             # Replace the old join expression with the new one
             from_clause.this.replace(join_expr)
 
-        return tmp_table_setup + parsed_query.sql(dialect=sql_dialect)
+        script = tmp_table_setup + parsed_query.sql(dialect=sql_dialect)
+        if method == "UNLOGGED_TABLE_JOIN":
+            script += _unlogged_table_teardown(table_name)
+        return script
 
 
 def extend_query_with_spatial_filter_lazy(
@@ -1716,7 +1770,7 @@ def apply_cache_lazy(
     query: str,
     cache_handler: AbstractCacheHandler_Lazy,
     partition_key: str,
-    method: Literal["IN_SUBQUERY", "TMP_TABLE_IN", "TMP_TABLE_JOIN"] = "IN_SUBQUERY",
+    method: Literal["IN_SUBQUERY", "TMP_TABLE_IN", "TMP_TABLE_JOIN", "UNLOGGED_TABLE_JOIN"] = "IN_SUBQUERY",
     p0_alias: str | None = None,
     min_component_size: int = 2,
     canonicalize_queries: bool = False,
@@ -1756,7 +1810,8 @@ def apply_cache_lazy(
         query (str): The original SQL query to be enhanced with cache functionality.
         cache_handler (AbstractCacheHandler_Lazy): The lazy cache handler instance.
         partition_key (str): The identifier for the partition.
-        method (Literal["IN_SUBQUERY", "TMP_TABLE_IN", "TMP_TABLE_JOIN"]): The method to use for query extension.
+        method (Literal["IN_SUBQUERY", "TMP_TABLE_IN", "TMP_TABLE_JOIN", "UNLOGGED_TABLE_JOIN"]): The method to use for
+            query extension. An ``UNLOGGED_TABLE_JOIN`` script ends with the DROP of its key table; execute it as ONE string.
         p0_alias (str | None): For regular queries: table alias for cache restrictions.
                                For p0 queries: alias name for the p0 table (defaults to "p0").
         min_component_size (int): Minimum size of query components to consider for cache lookup.
@@ -1988,6 +2043,7 @@ def apply_cache_lazy(
             partition_key=partition_key,
             mv_table_name=p0_table_name,
             p0_alias=p0_table_alias,
+            sql_dialect=sql_dialect,
         )
         p0_rewritten = 1 if working_query != query else 0
 
@@ -2027,7 +2083,7 @@ def apply_cache(
     query: str,
     cache_handler: AbstractCacheHandler,
     partition_key: str,
-    method: Literal["IN", "VALUES", "TMP_TABLE_JOIN", "TMP_TABLE_IN"] = "IN",
+    method: Literal["IN", "VALUES", "TMP_TABLE_JOIN", "TMP_TABLE_IN", "UNLOGGED_TABLE_JOIN"] = "IN",
     p0_alias: str | None = None,
     min_component_size: int = 2,
     canonicalize_queries: bool = False,
@@ -2057,6 +2113,7 @@ def apply_cache(
     keep_all_attributes: bool = False,
     max_conditions_removed: int | None = None,
     protected_patterns: list[str] | None = None,
+    sql_dialect: str = "postgres",
     **kwargs: Any,
 ) -> tuple[str, dict[str, int]]:
     """
@@ -2076,7 +2133,8 @@ def apply_cache(
         query (str): The original SQL query to be enhanced with cache functionality.
         cache_handler (AbstractCacheHandler): The cache handler instance.
         partition_key (str): The identifier for the partition.
-        method (Literal["IN", "VALUES", "TMP_TABLE_JOIN", "TMP_TABLE_IN"]): The method to use for query extension.
+        method (Literal["IN", "VALUES", "TMP_TABLE_JOIN", "TMP_TABLE_IN", "UNLOGGED_TABLE_JOIN"]): The method to use for
+            query extension. An ``UNLOGGED_TABLE_JOIN`` script ends with the DROP of its key table; execute it as ONE string.
         p0_alias (str | None): The alias of the table to use for cache restrictions in regular queries.
             Ignored when use_p0_table=True (cache targets p0 table automatically).
         min_component_size (int): Minimum size of query components to consider for cache lookup.
@@ -2105,6 +2163,7 @@ def apply_cache(
         keep_all_attributes: If False (default), lookup also probes variants with single-table attribute
             conditions removed (more hits, more variant-generation cost). True probes exactly the variants
             that generate_all_query_hash_pairs produces with its defaults.
+        sql_dialect: sqlglot dialect used to parse and render non-spatial queries. Defaults to PostgreSQL.
         geometry_column: If set, enables spatial cache mode. Uses this geometry column for variant
             SELECT clauses and spatial filter application. Requires a spatial cache handler with
             get_spatial_filter() method.
@@ -2342,6 +2401,7 @@ def apply_cache(
             partition_key=partition_key,
             mv_table_name=p0_table_name,
             p0_alias=p0_table_alias,
+            sql_dialect=sql_dialect,
         )
         p0_rewritten = 1 if working_query != query else 0
 
@@ -2358,7 +2418,7 @@ def apply_cache(
     if not partition_keys:
         stats["enhanced"] = 1
         logger.info(f"Cache intersection of {used_hashes} cache hits is empty, restricting query to no rows")
-        return _add_empty_intersection_condition(working_query), stats
+        return _add_empty_intersection_condition(working_query, sql_dialect), stats
 
     # Step 3: Apply the partition keys to the working query
     # Determine the correct alias for cache restrictions
@@ -2379,6 +2439,7 @@ def apply_cache(
         analyze_tmp_table=analyze_tmp_table,
         auto_detect_partition_join=auto_detect_partition_join,
         partition_join_table=partition_join_table,
+        sql_dialect=sql_dialect,
     )
 
     stats["enhanced"] = 1

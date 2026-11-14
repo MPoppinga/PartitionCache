@@ -15,7 +15,7 @@ from partitioncache.apply_cache import extend_query_with_partition_keys_lazy
 
 CITIES = 100
 ROWS_PER_CITY = 10
-METHODS = ["IN_SUBQUERY", "TMP_TABLE_IN", "TMP_TABLE_JOIN"]
+METHODS = ["IN_SUBQUERY", "TMP_TABLE_IN", "TMP_TABLE_JOIN", "UNLOGGED_TABLE_JOIN"]  # _run rolls back, which removes the unlogged table
 HANDLERS = ["array_aggregate", "array_join", "bit", "roaringbit"]
 
 
