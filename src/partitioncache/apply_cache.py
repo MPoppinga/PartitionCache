@@ -562,11 +562,29 @@ def _format_partition_key_for_sql(pk: int | str | float | datetime, sql_dialect:
     return _format_spliced_partition_key(pk, sql_dialect)
 
 
-def _get_partition_key_sql_type(partition_keys: set[int] | set[str] | set[float] | set[datetime], sql_dialect: str = "postgres") -> str:
-    """The column type of a key table for ``partition_keys``: integer, floating point, timestamp, or text.
+# Methods whose keys are typed by a VALUES list or a key table, not by the partition key column
+_TYPED_KEY_METHODS = ("VALUES", "TMP_TABLE_IN", "TMP_TABLE_JOIN", "UNLOGGED_TABLE_IN", "UNLOGGED_TABLE_JOIN")
 
-    Float and timestamp keys need their own type: a TEXT key column does not compare with a numeric or timestamp
-    partition key column (PostgreSQL has no ``text = double precision`` operator).
+
+def _refuse_float_keys(partition_keys: set[int] | set[str] | set[float] | set[datetime], method: str) -> None:
+    """Raise ValueError for float keys with a method whose key list is not typed by the partition key column.
+
+    A float key read back from a ``real`` (float4) column is the double nearest to its text (0.1); a VALUES list or
+    key table of such keys is double precision, and ``real = double precision`` compares 0.100000001490116 with
+    0.1, so every key would be missed without an error. The literals of ``IN`` take the column's type instead.
+    """
+    if method in _TYPED_KEY_METHODS and any(isinstance(k, float) for k in partition_keys):
+        raise ValueError(
+            f"{method} cannot restrict float partition keys exactly (a real column would silently match none); use method IN"
+        )
+
+
+def _get_partition_key_sql_type(partition_keys: set[int] | set[str] | set[float] | set[datetime], sql_dialect: str = "postgres") -> str:
+    """The column type of a key table for ``partition_keys``: integer, numeric, timestamp, or text.
+
+    Decimal and timestamp keys need their own type: a TEXT key column does not compare with a numeric or timestamp
+    partition key column (PostgreSQL has no ``text = numeric`` operator). Float keys are refused before
+    (``_refuse_float_keys``).
     """
     if not partition_keys:
         return "TEXT"
@@ -576,8 +594,8 @@ def _get_partition_key_sql_type(partition_keys: set[int] | set[str] | set[float]
         if any(abs(k) > max_int32 for k in partition_keys):  # type: ignore[arg-type]
             return "BIGINT"
         return "INT"
-    if all(isinstance(k, int | float) for k in partition_keys):
-        return "DOUBLE PRECISION"
+    if all(isinstance(k, int | Decimal) for k in partition_keys):
+        return "NUMERIC"
     if all(isinstance(k, datetime) for k in partition_keys):
         if sql_dialect != "mysql" and any(k.tzinfo is not None for k in partition_keys):  # type: ignore[union-attr]
             return "TIMESTAMPTZ"
@@ -595,30 +613,27 @@ def _key_list_sentinel() -> str:
     return f"__pcache_keys_{secrets.token_hex(8)}__"
 
 
-# Dialects with typed literals for timestamps and non-finite floats; SQLite stores timestamps as text
+# Dialects with typed timestamp literals; SQLite stores timestamps as text
 _TYPED_LITERAL_DIALECTS = ("postgres", "duckdb")
 
 
 def _format_spliced_partition_key(pk: int | str | float | datetime, sql_dialect: str = "postgres") -> str:
-    """Format one key as a literal of its type, for a spliced (unparsed) key list or a key table.
+    """Format one key as a literal for a spliced (unparsed) key list or a key table.
 
-    Integers and finite floats as numbers. Strings as string literals rendered by sqlglot for ``sql_dialect``, so
-    quotes and backslashes are escaped the way that dialect expects (MySQL treats a backslash as an escape
-    character); the former parse-based path rejected such keys with a sqlglot TokenError. Timestamps and
-    non-finite floats as ``CAST('...' AS TIMESTAMP|TIMESTAMPTZ|DOUBLE PRECISION)`` in PostgreSQL and DuckDB: as
-    bare string literals they made ``IN (VALUES ...)`` a text column, which neither compares with a timestamp or
-    float column. SQLite keeps timestamps as string literals (it stores them as text) and writes infinity as 9e999.
+    Integers and finite decimals (psycopg's type for numeric columns) as numbers. Strings as string literals rendered
+    by sqlglot for ``sql_dialect``, so quotes and backslashes are escaped the way that dialect expects (MySQL treats a
+    backslash as an escape character); the former parse-based path rejected such keys with a sqlglot TokenError.
+    Timestamps as ``CAST('...' AS TIMESTAMP|TIMESTAMPTZ)`` in PostgreSQL and DuckDB: as bare string literals they made
+    ``IN (VALUES ...)`` a text column, which neither compares with a timestamp column. Float keys stay string
+    literals, which ``IN`` converts to the column's type exactly (VALUES and the key tables refuse them,
+    ``_refuse_float_keys``); SQLite writes infinity as 9e999, since the string 'inf' matches no REAL value.
     """
     if isinstance(pk, int):
         return str(pk)
-    if isinstance(pk, float):
-        if math.isfinite(pk):
-            return repr(pk)
-        if sql_dialect == "sqlite" and not math.isnan(pk):
-            return "9e999" if pk > 0 else "-9e999"
-        if sql_dialect in _TYPED_LITERAL_DIALECTS:
-            text = "NaN" if math.isnan(pk) else ("Infinity" if pk > 0 else "-Infinity")
-            return f"CAST('{text}' AS DOUBLE PRECISION)"
+    if isinstance(pk, Decimal) and pk.is_finite():
+        return str(pk)
+    if isinstance(pk, float) and sql_dialect == "sqlite" and math.isinf(pk):
+        return "9e999" if pk > 0 else "-9e999"
     if isinstance(pk, datetime) and sql_dialect in _TYPED_LITERAL_DIALECTS:
         literal = exp.Literal.string(pk.isoformat(sep=" ")).sql(dialect=sql_dialect)
         return f"CAST({literal} AS {'TIMESTAMPTZ' if pk.tzinfo is not None else 'TIMESTAMP'})"
@@ -929,10 +944,15 @@ def extend_query_with_partition_keys(
         str: The extended SQL query as string. An empty ``partition_keys`` set is a valid cache result
         (the intersection proved that no partition matches); the query is then restricted with a
         commented ``AND FALSE`` regardless of ``method``.
+
+    Raises:
+        ValueError: For float keys with VALUES or a key-table method: typed as double precision, they would silently
+            miss a ``real`` column; ``IN`` restricts them exactly.
     """
     _check_planner_collapse_limit(planner_collapse_limit, method, sql_dialect)
     if not partition_keys:
         return _add_empty_intersection_condition(query, sql_dialect)
+    _refuse_float_keys(partition_keys, method)
 
     # Parsed and rendered in the query's dialect: the generic writer turns ARRAY['a'] into ARRAY('a'), which PostgreSQL rejects
     parsed_query = sqlglot.parse_one(query, read=sql_dialect)
