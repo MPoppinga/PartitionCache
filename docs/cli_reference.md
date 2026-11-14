@@ -327,6 +327,8 @@ Advanced options for controlling how query variants are generated for better cac
 - **Warning**: Can be slow for complex queries with many fragments
 - `--restrict-variants`: executes the variants smallest first and restricts each to the cached keys of its relaxations, found by the cache lookup of a query with the same variant generation flags. An empty intersection is stored as an empty result without executing the variant. Spatial and grid keys are populated unrestricted. See `populate_query_variants` in the [API reference](api_reference.md).
 - `--max-restriction-keys N`: only restrict when the intersection has at most N keys (implies `--restrict-variants`); a restriction to most of the keys filters little and costs a long key list
+- `--restriction-method {IN,VALUES,TMP_TABLE_IN,TMP_TABLE_JOIN}`: how the keys restrict a variant (default: `IN`)
+- `--join-every-table`: with `--restriction-method TMP_TABLE_JOIN`, join the key table to every table of a variant instead of its key table; only for keys whose tables are all joined on the partition key
 
 #### Queue Processing
 ```bash
@@ -571,7 +573,10 @@ Cache-aware optimization leverages existing cache entries to restrict the search
   - **`VALUES`**: IN clause with VALUES construct
   - **`IN_SUBQUERY`**: IN clause with lazy subquery (recommended for large result sets)
   - **`TMP_TABLE_IN`**: Create temp table and use IN subquery
-  - **`TMP_TABLE_JOIN`**: Create temp table and JOIN
+  - **`TMP_TABLE_JOIN`**: Create temp table and JOIN it to the fragment's key table
+- `--join-every-table` - With `TMP_TABLE_JOIN`: join the key table to every table of a fragment instead of its key table
+  - **Default**: off. Before 2026-11 the monitor joined every table; pass this flag to reproduce such runs
+  - **Only for keys whose tables are all joined on the partition key**: a fragment whose tables are not (keys in `--skip-partition-key-joins`, dimension joins) is refused and runs unrestricted, counted as a failed lookup
 - `--min-cache-hits MIN_CACHE_HITS` - Minimum cache hits required for non-lazy optimization
   - **Default**: 1
   - **Note**: Only applies to non-lazy methods (IN, VALUES)

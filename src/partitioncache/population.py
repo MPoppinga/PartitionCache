@@ -99,14 +99,15 @@ def restrict_with_cache(
     max_restriction_keys: int | None = None,
     min_cache_hits: int = 1,
     sql_dialect: str = "postgres",
+    join_every_table: bool = False,
 ) -> Restriction:
     """Restrict a query variant to the cached keys of its relaxations, with the lookup and extension functions of a query.
 
     The restricted variant returns the same keys as the variant, as long as every cached entry holds the keys of its
     query and ``variant_settings`` are those the variants were generated with (see ``lookup_settings``).
     For a key generated without partition key joins (skip_partition_key_joins), the tables of a variant are not all
-    joined on the key; then only the table whose key the variant selects is restricted, as restricting every table
-    (TMP_TABLE_JOIN without an alias) would drop result rows. Other keys are restricted as a query is.
+    joined on the key; then the restriction goes on the table whose key the variant selects. Other keys are
+    restricted as a query is (the p0 table, ``find_p0_alias``).
 
     Args:
         query: The query variant.
@@ -118,15 +119,20 @@ def restrict_with_cache(
         max_restriction_keys: Eager only: do not restrict when the intersection has more keys.
         min_cache_hits: Eager only: do not restrict with fewer cached relaxations.
         sql_dialect: Dialect of the database the variant runs on.
+        join_every_table: JOIN methods only: join the key table to every table of the variant instead of its key
+            table; refused (ValueError) unless every table is joined on the partition key.
 
     Raises:
-        ValueError: For an unknown method, a key limit with lazy, or a spatial or grid key.
+        ValueError: For an unknown method, a key limit with lazy, a spatial or grid key, or join_every_table with
+            another method, a key without partition key joins, or a variant whose tables are not all joined on it.
     """
     kwargs = lookup_settings(variant_settings)
     if method not in (LAZY_METHODS if lazy else EAGER_METHODS):
         raise ValueError(f"Unknown {'lazy' if lazy else 'eager'} restriction method {method!r}")
     if lazy and max_restriction_keys is not None:
         raise ValueError("A key limit needs the key count, which only the eager lookup fetches")
+    if join_every_table and kwargs["skip_partition_key_joins"]:
+        raise ValueError("join_every_table needs every table joined on the partition key; variants without partition key joins are not")
 
     p0_alias = None
     if kwargs["skip_partition_key_joins"]:
@@ -146,6 +152,7 @@ def restrict_with_cache(
             p0_alias=p0_alias,
             analyze_tmp_table=True,
             sql_dialect=sql_dialect,
+            join_every_table=join_every_table,
         )
         return Restriction(restricted, restricted=True, generated=generated, hits=hits, method=method)
 
@@ -165,6 +172,7 @@ def restrict_with_cache(
         p0_alias=p0_alias,
         analyze_tmp_table=True,
         sql_dialect=sql_dialect,
+        join_every_table=join_every_table,
     )
     return Restriction(restricted, restricted=True, empty=not keys, generated=generated, hits=hits, keys=len(keys), method=method)
 
@@ -224,6 +232,7 @@ def populate_query_variants(
     sql_dialect: str = "postgres",
     variant_settings: Mapping[str, Any] | None = None,
     lazy: bool = False,
+    join_every_table: bool = False,
 ) -> PopulationStats:
     """Execute and cache the variants of one query, smallest first, each restricted to the cached keys of its relaxations.
 
@@ -247,6 +256,9 @@ def populate_query_variants(
             it can hit entries that are not relaxations.
         lazy: Restrict with a subquery on the cache instead of the fetched keys; needs an AbstractCacheHandler_Lazy
             whose cache the database can read, and no key limit.
+        join_every_table: TMP_TABLE_JOIN only: join the key table to every table of a variant instead of its key
+            table; only for keys whose tables are all joined on the partition key (a variant whose tables are not
+            is counted as a failed lookup and runs unrestricted).
 
     Returns:
         PopulationStats. An empty eager intersection means the variant has no rows; it is stored as an empty set
@@ -264,6 +276,8 @@ def populate_query_variants(
             raise ValueError("lazy restriction needs a cache handler with lazy intersection")
         if lazy and max_restriction_keys is not None:
             raise ValueError("A key limit needs the key count, which only the eager lookup fetches")
+        if join_every_table and lookup_settings(variant_settings)["skip_partition_key_joins"]:
+            raise ValueError("join_every_table needs every table joined on the partition key; variants without partition key joins are not")
 
     stats = PopulationStats()
     for variant, variant_hash in order_variants_for_population(query_hash_pairs):
@@ -284,6 +298,7 @@ def populate_query_variants(
                     method=method,
                     max_restriction_keys=max_restriction_keys,
                     sql_dialect=sql_dialect,
+                    join_every_table=join_every_table,
                 )
             except Exception as e:
                 logger.warning(f"Cache lookup failed for variant {variant_hash}, it runs unrestricted: {e}")

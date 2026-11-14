@@ -702,8 +702,87 @@ def _create_tmp_table_setup(
 
 
 UNLOGGED_TABLE_PREFIX = "partitioncache_unl_"
-# The key table is joined to every table of the query unless an alias is given
+# The key table is joined to the p0 table (as the IN methods restrict it), or with join_every_table to every table
 _TABLE_JOIN_METHODS = ("TMP_TABLE_JOIN", "UNLOGGED_TABLE_JOIN")
+
+
+def _every_table_joined_on_partition_key(parsed_query: exp.Expr, partition_key: str) -> bool:
+    """Whether the tables the JOIN methods join to are connected by equalities ``a.<key> = b.<key>``.
+
+    Only then is joining every table to the keys equivalent to joining the p0 table: through the equalities, every
+    table's key equals the p0 table's. Equalities under OR or NOT do not hold for every row and do not count.
+    """
+    clauses: list[exp.Join | exp.From] = list(parsed_query.find_all(exp.Join))
+    from_1st = parsed_query.find(exp.From)
+    if from_1st is not None:
+        clauses.append(from_1st)
+    aliases = {clause.alias_or_name for clause in clauses}
+    if len(aliases) <= 1:
+        return True
+
+    conjuncts: list[exp.Expr] = []
+
+    def collect(condition: exp.Expr | None) -> None:
+        if condition is None:
+            return
+        condition = condition.unnest()
+        if isinstance(condition, exp.And):
+            for operand in condition.flatten():
+                collect(operand)
+        else:
+            conjuncts.append(condition)
+
+    where = _outer_where(parsed_query)
+    collect(where.this if where is not None else None)
+    for join in parsed_query.find_all(exp.Join):
+        collect(join.args.get("on"))
+
+    component = {alias: alias for alias in aliases}
+
+    def root(alias: str) -> str:
+        while component[alias] != alias:
+            alias = component[alias]
+        return alias
+
+    for condition in conjuncts:
+        left, right = (condition.this, condition.expression) if isinstance(condition, exp.EQ) else (None, None)
+        if isinstance(left, exp.Column) and isinstance(right, exp.Column) and left.name == right.name == partition_key:
+            if left.table in aliases and right.table in aliases:
+                component[root(left.table)] = root(right.table)
+    return len({root(alias) for alias in aliases}) == 1
+
+
+def _restriction_target(
+    query: str,
+    parsed_query: exp.Expr,
+    partition_key: str,
+    method: str,
+    p0_alias: str | None,
+    join_every_table: bool,
+    auto_detect_partition_join: bool,
+    partition_join_table: str | None,
+) -> str | None:
+    """The alias the restriction goes on, or None when a JOIN method joins every table (``join_every_table``).
+
+    Raises:
+        ValueError: For join_every_table with another method or a p0_alias, or when not every table is joined on the
+            partition key: joined to the keys, the rows of a table related to the p0 table otherwise (a time window,
+            a distance) outside the key set would be dropped, and with them result rows.
+    """
+    if not join_every_table:
+        if p0_alias is None:
+            p0_alias = find_p0_alias(query, partition_key, auto_detect_partition_join, partition_join_table)
+        return p0_alias
+    if method not in _TABLE_JOIN_METHODS:
+        raise ValueError(f"join_every_table applies to {' and '.join(_TABLE_JOIN_METHODS)}, not to {method}")
+    if p0_alias is not None:
+        raise ValueError("join_every_table joins every table to the keys; it takes no p0_alias")
+    if not _every_table_joined_on_partition_key(parsed_query, partition_key):
+        raise ValueError(
+            f"join_every_table needs every table joined on {partition_key} (a.{partition_key} = b.{partition_key}); "
+            "otherwise it drops result rows. Join the p0 table only (the default)."
+        )
+    return None
 
 
 def _create_unlogged_table_setup(keys_sql: str, key_column: str, sql_dialect: str) -> tuple[str, str]:
@@ -743,6 +822,7 @@ def extend_query_with_partition_keys(
     auto_detect_partition_join: bool = True,
     partition_join_table: str | None = None,
     sql_dialect: str = "postgres",
+    join_every_table: bool = False,
 ) -> str:
     """
     Extend a given SQL query with the cache functionality.
@@ -758,11 +838,15 @@ def extend_query_with_partition_keys(
             extend the query. ``UNLOGGED_TABLE_JOIN`` (PostgreSQL only) is ``TMP_TABLE_JOIN`` with an unlogged
             table, always with index and ANALYZE; the script ends with its DROP, after the SELECT. Execute it as
             ONE string so that it runs in one transaction.
-        p0_alias (str | None): The alias of the table to use for the partition key.
+        p0_alias (str | None): The alias of the table to use for the partition key; None detects it (``find_p0_alias``).
+            The JOIN methods join the key table to this table only.
         analyze_tmp_table (bool): Whether to create index and analyze. (only for temporary table methods)
         auto_detect_partition_join: Whether to auto-detect partition-join tables.
         partition_join_table: Explicitly specified partition-join table alias or name.
         sql_dialect: sqlglot dialect used to parse and render the query. Defaults to PostgreSQL.
+        join_every_table: JOIN methods only: join the key table to every table of the query instead of the p0 table,
+            as they did without p0_alias before 2026-11. Raises ValueError unless every table is joined on the
+            partition key, where it is equivalent; it gives the planner the key table at every table.
 
     Returns:
         str: The extended SQL query as string. An empty ``partition_keys`` set is a valid cache result
@@ -772,12 +856,9 @@ def extend_query_with_partition_keys(
     if not partition_keys:
         return _add_empty_intersection_condition(query, sql_dialect)
 
-    if p0_alias is None and method not in _TABLE_JOIN_METHODS:
-        # No alias provided, try to find it (the table join methods join on all tables)
-        p0_alias = find_p0_alias(query, partition_key, auto_detect_partition_join, partition_join_table)
-
     # Parsed and rendered in the query's dialect: the generic writer turns ARRAY['a'] into ARRAY('a'), which PostgreSQL rejects
     parsed_query = sqlglot.parse_one(query, read=sql_dialect)
+    p0_alias = _restriction_target(query, parsed_query, partition_key, method, p0_alias, join_every_table, auto_detect_partition_join, partition_join_table)
 
     if method == "IN":
         # The key list is not parsed: a placeholder identifier goes through sqlglot and the
@@ -803,7 +884,7 @@ def extend_query_with_partition_keys(
         else:
             tmp_table_setup, table_name = _create_tmp_table_setup(partition_keys, analyze_tmp_table, sql_dialect)
 
-        # Add as inner join to all tables
+        # Add as inner join to the p0 table, or with join_every_table to every table
         from_clauses: list[exp.Join | exp.From] = list(parsed_query.find_all(exp.Join))
 
         # Add first table from FROM as not present in JOINs
@@ -868,8 +949,8 @@ def _all_partition_keys_sql(parsed_query: exp.Expr, p0_alias: str | None, partit
     """Return an SQL array of all partition keys of the tables the lazy restriction applies to.
 
     It replaces LAZY_ALL_KEYS_PLACEHOLDER, so that a lazy intersection whose cache entries are gone at execution
-    time does not restrict the query. The restriction targets the table with alias ``p0_alias``, or with
-    TMP_TABLE_JOIN and no alias every table of the FROM and JOIN clauses. Returns None when a target is not a
+    time does not restrict the query. The restriction targets the table with alias ``p0_alias``, or with a JOIN
+    method and join_every_table (no alias) every table of the FROM and JOIN clauses. Returns None when a target is not a
     plain table (a subquery or a CTE, whose rows a separate statement could not read).
     """
     targets: list[exp.Expr]
@@ -905,6 +986,7 @@ def extend_query_with_partition_keys_lazy(
     auto_detect_partition_join: bool = True,
     partition_join_table: str | None = None,
     sql_dialect: str = "postgres",
+    join_every_table: bool = False,
 ) -> str:
     """
     Extend a given SQL query with the cache functionality using a lazy SQL subquery.
@@ -926,6 +1008,8 @@ def extend_query_with_partition_keys_lazy(
         auto_detect_partition_join: Whether to auto-detect partition-join tables.
         partition_join_table: Explicitly specified partition-join table alias or name.
         sql_dialect: sqlglot dialect used to parse and render the query. Defaults to PostgreSQL.
+        join_every_table: JOIN methods only: join the key table to every table instead of the p0 table; see
+            ``extend_query_with_partition_keys``.
 
     Returns:
         str: The extended SQL query as string.
@@ -933,11 +1017,8 @@ def extend_query_with_partition_keys_lazy(
     if not lazy_subquery or not lazy_subquery.strip():
         return query
 
-    if p0_alias is None and method not in _TABLE_JOIN_METHODS:
-        # No alias provided, try to find it (the table join methods join on all tables)
-        p0_alias = find_p0_alias(query, partition_key, auto_detect_partition_join, partition_join_table)
-
     parsed_query = sqlglot.parse_one(query, read=sql_dialect)
+    p0_alias = _restriction_target(query, parsed_query, partition_key, method, p0_alias, join_every_table, auto_detect_partition_join, partition_join_table)
 
     if LAZY_ALL_KEYS_PLACEHOLDER in lazy_subquery:
         # The handler's subquery reads cache entries that may be evicted before it runs; it then falls back to all keys
@@ -971,7 +1052,7 @@ def extend_query_with_partition_keys_lazy(
         else:
             tmp_table_setup, table_name = _create_tmp_table_setup_from_subquery(lazy_subquery, partition_key, analyze_tmp_table, sql_dialect)
 
-        # Add as inner join to all tables
+        # Add as inner join to the p0 table, or with join_every_table to every table
         from_clauses: list[exp.Join | exp.From] = list(parsed_query.find_all(exp.Join))
 
         # Add first table from FROM as not present in JOINs
@@ -1799,6 +1880,7 @@ def apply_cache_lazy(
     grid_method: str = "CELL_AUTO",
     min_query_cost: float | None = None,
     keep_all_attributes: bool = False,
+    join_every_table: bool = False,
     **kwargs: Any,
 ) -> tuple[str, dict[str, int]]:
     """
@@ -1835,6 +1917,9 @@ def apply_cache_lazy(
         keep_all_attributes: If False (default), lookup also probes variants with single-table attribute
             conditions removed (more hits, more variant-generation cost). True probes exactly the variants
             that generate_all_query_hash_pairs produces with its defaults.
+        join_every_table: TMP_TABLE_JOIN and UNLOGGED_TABLE_JOIN only: join the key table to every table instead of
+            the p0 table; raises ValueError unless every table is joined on the partition key. See
+            extend_query_with_partition_keys.
         sql_dialect: sqlglot dialect used to parse and render non-spatial queries. Defaults to PostgreSQL.
         geometry_column: If set, enables spatial cache mode. Uses this geometry column for variant
             SELECT clauses and spatial filter application. Requires a spatial cache handler with
@@ -2068,6 +2153,7 @@ def apply_cache_lazy(
         auto_detect_partition_join=auto_detect_partition_join,
         partition_join_table=partition_join_table,
         sql_dialect=sql_dialect,
+        join_every_table=join_every_table,
     )
 
     stats["enhanced"] = 1
@@ -2110,6 +2196,7 @@ def apply_cache(
     keep_all_attributes: bool = False,
     max_conditions_removed: int | None = None,
     protected_patterns: list[str] | None = None,
+    join_every_table: bool = False,
     **kwargs: Any,
 ) -> tuple[str, dict[str, int]]:
     """
@@ -2159,6 +2246,9 @@ def apply_cache(
         keep_all_attributes: If False (default), lookup also probes variants with single-table attribute
             conditions removed (more hits, more variant-generation cost). True probes exactly the variants
             that generate_all_query_hash_pairs produces with its defaults.
+        join_every_table: TMP_TABLE_JOIN and UNLOGGED_TABLE_JOIN only: join the key table to every table instead of
+            the p0 table; raises ValueError unless every table is joined on the partition key. See
+            extend_query_with_partition_keys.
         geometry_column: If set, enables spatial cache mode. Uses this geometry column for variant
             SELECT clauses and spatial filter application. Requires a spatial cache handler with
             get_spatial_filter() method.
@@ -2433,6 +2523,7 @@ def apply_cache(
         analyze_tmp_table=analyze_tmp_table,
         auto_detect_partition_join=auto_detect_partition_join,
         partition_join_table=partition_join_table,
+        join_every_table=join_every_table,
     )
 
     stats["enhanced"] = 1

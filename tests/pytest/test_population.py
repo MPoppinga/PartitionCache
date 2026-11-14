@@ -291,18 +291,32 @@ class TestWithoutPartitionKeyJoins:
         assert cache.entries == reference.entries
         assert {1, 2} in cache.entries.values()
 
-    @pytest.mark.parametrize(("skip", "joined"), [(True, {"t1"}), (False, {"t1", "t2"})])
-    def test_join_methods_restrict_the_key_table_only_without_key_joins(self, skip, joined):
+    @pytest.mark.parametrize("skip", [True, False])
+    def test_join_methods_restrict_the_key_table(self, skip):
         import re
 
         from partitioncache.population import restrict_with_cache
 
         variant = "SELECT DISTINCT t1.pk FROM a AS t1, b AS t2 WHERE t1.t <= t2.t AND t2.t <= t1.t + 10"
-        cache = FakeCache({"relaxation": {1, 2}})
+        cache = FakeCache()
         cache.get_intersected = lambda keys, partition_key="pk": ({1, 2}, 1)  # type: ignore[method-assign]
         restriction = restrict_with_cache(variant, cache, "pk", {"skip_partition_key_joins": skip}, method="TMP_TABLE_JOIN")
         assert restriction.restricted
-        assert set(re.findall(r"AS tmp_(\w+) ON", restriction.query)) == joined
+        assert set(re.findall(r"AS tmp_(\w+) ON", restriction.query)) == {"t1"}
+
+    def test_join_every_table_is_refused_for_tables_not_joined_on_the_key(self):
+        from partitioncache.population import restrict_with_cache
+
+        cache = FakeCache()
+        cache.get_intersected = lambda keys, partition_key="pk": ({1, 2}, 1)  # type: ignore[method-assign]
+        variant = "SELECT DISTINCT t1.pk FROM a AS t1, b AS t2 WHERE t1.t <= t2.t AND t2.t <= t1.t + 10"
+        with pytest.raises(ValueError, match="join_every_table"):
+            restrict_with_cache(variant, cache, "pk", {"skip_partition_key_joins": True}, method="TMP_TABLE_JOIN", join_every_table=True)
+        with pytest.raises(ValueError, match="every table joined on pk"):
+            restrict_with_cache(variant, cache, "pk", {"skip_partition_key_joins": False}, method="TMP_TABLE_JOIN", join_every_table=True)
+        joined = "SELECT DISTINCT t1.pk FROM a AS t1, b AS t2 WHERE t1.pk = t2.pk AND t2.y = 1"
+        restriction = restrict_with_cache(joined, cache, "pk", {}, method="TMP_TABLE_JOIN", join_every_table=True)
+        assert "tmp_t1" in restriction.query and "tmp_t2" in restriction.query
 
 
 class TestAddedConstraints:
