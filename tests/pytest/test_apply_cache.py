@@ -265,7 +265,7 @@ class TestExtendQueryWithPartitionKeys:
         # Temp table must be dropped at transaction end, not leaked for the whole session
         assert "ON COMMIT DROP" in result
         assert "INSERT INTO tmp_cache_keys_" in result
-        assert "VALUES(1),(2),(3)" in result or "VALUES(1,2,3)" in result
+        assert "VALUES (1),(2),(3)" in result
         assert "u.region_id IN (SELECT partition_key FROM tmp_cache_keys_" in result
 
     def test_tmp_table_in_with_strings(self):
@@ -314,8 +314,8 @@ class TestExtendQueryWithPartitionKeys:
         partition_keys = {1.5, 2.7, 3.14}
         result = extend_query_with_partition_keys(query, partition_keys, "measurement_value", method="IN", p0_alias="m")
 
-        # Should treat floats as strings (quoted)
-        assert "'1.5'" in result or "'2.7'" in result or "'3.14'" in result
+        # Floats are numbers, so that a VALUES list or key table has a numeric column
+        assert "m.measurement_value IN (" in result and "1.5" in result and "'1.5'" not in result
 
     def test_datetime_partition_keys(self):
         """Test with datetime partition keys."""

@@ -186,11 +186,11 @@ class TestTypedKeyTables:
 
     def test_temporary_key_table_escapes_string_keys(self):
         script = extend_query_with_partition_keys(QUERY, {"o'brien"}, "region_id", method="TMP_TABLE_JOIN", p0_alias="u")
-        assert "(VALUES('o''brien'))" in script
+        assert "VALUES ('o''brien');" in script
 
     def test_float_keys_are_numbers(self):
         script = extend_query_with_partition_keys(QUERY, {1.5}, "region_id", method="TMP_TABLE_IN", p0_alias="u")
-        assert "(VALUES(1.5))" in script
+        assert "VALUES (1.5);" in script
 
     @pytest.mark.parametrize(("keys", "cast"), [({1.5}, "DOUBLE PRECISION"), ({datetime(2024, 1, 1)}, "TIMESTAMP")])
     def test_unlogged_key_table_casts_to_the_key_type(self, keys, cast):
