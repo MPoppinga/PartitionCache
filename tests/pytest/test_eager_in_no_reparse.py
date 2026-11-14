@@ -37,12 +37,12 @@ QUERIES = [QUERY_NO_WHERE, QUERY_WITH_WHERE, QUERY_WITH_OR]
 
 
 def _format_partition_key_for_sql(pk) -> str:
-    """The key literals of the old implementation, typed as now: integers and floats bare, timestamps cast, strings quoted.
+    """The key literals of the old implementation, typed as now: integers bare, timestamps cast, floats and strings quoted.
 
     The reference parses the literals with sqlglot; the new implementation splices the same text unparsed.
     """
-    if isinstance(pk, int | float):
-        return repr(pk) if isinstance(pk, float) else str(pk)
+    if isinstance(pk, int):
+        return str(pk)
     if isinstance(pk, datetime):
         return f"CAST('{pk.isoformat(sep=' ')}' AS TIMESTAMP)"
     return f"'{pk}'"
