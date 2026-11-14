@@ -245,6 +245,7 @@ class TestDuckDBQueryAccelerator:
         mock_cursor_context.__exit__ = Mock(return_value=None)
         mock_pg_conn.cursor.return_value = mock_cursor_context
         mock_pg_cursor.fetchall.return_value = [(4,), (5,), (6,)]
+        mock_pg_cursor.nextset.return_value = None  # one result set, as a single SELECT gives
 
         postgresql_params = {"host": "localhost", "port": 5432, "user": "test", "password": "test", "dbname": "test"}
 
@@ -435,6 +436,7 @@ class TestDuckDBQueryAccelerator:
         mock_cursor_context.__exit__ = Mock(return_value=None)
         mock_pg_conn.cursor.return_value = mock_cursor_context
         mock_pg_cursor.fetchall.return_value = [(7,), (8,), (9,)]
+        mock_pg_cursor.nextset.return_value = None  # one result set, as a single SELECT gives
 
         # Mock Thread to simulate timeout
         mock_thread = Mock()
@@ -499,6 +501,7 @@ class TestDuckDBQueryAccelerator:
         mock_cursor_context.__exit__ = Mock(return_value=None)
         mock_pg_conn.cursor.return_value = mock_cursor_context
         mock_pg_cursor.fetchall.return_value = [(10,), (11,), (12,)]
+        mock_pg_cursor.nextset.return_value = None  # one result set, as a single SELECT gives
 
         postgresql_params = {"host": "localhost", "port": 5432, "user": "test", "password": "test", "dbname": "test"}
 
