@@ -310,3 +310,21 @@ def test_restriction_renders_keys_for_the_given_dialect():
     assert stats.restricted == 1
     assert "'a\\\\'" in db.executed[0]
     assert cache.entries["large"] == {"b"}
+
+
+@pytest.mark.parametrize(
+    "query, alias",
+    [
+        ("SELECT DISTINCT t1.pk FROM a AS t1, b AS t2 WHERE t1.x = t2.x", "t1"),
+        ("SELECT DISTINCT p1.pk FROM a AS t1, list AS p1 WHERE t1.pk = p1.pk", "p1"),
+        ("SELECT DISTINCT t2.pk AS pk FROM a AS t1, b AS t2", "t2"),
+        ("SELECT DISTINCT pk FROM a", None),
+        ("SELECT DISTINCT t1.other FROM a AS t1", None),
+        ("SELECT t1.pk, t1.x FROM a AS t1", None),
+        ("not sql at all (", None),
+    ],
+)
+def test_variant_key_alias(query, alias):
+    from partitioncache.query_processor import variant_key_alias
+
+    assert variant_key_alias(query, "pk") == alias

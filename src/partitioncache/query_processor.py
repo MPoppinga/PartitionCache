@@ -2416,6 +2416,27 @@ def order_variants_for_population(query_hash_pairs: list[tuple[str, str]]) -> li
     return sorted(query_hash_pairs, key=lambda pair: (*size(pair), pair[1]))
 
 
+def variant_key_alias(query: str, partition_key: str, sql_dialect: str = "postgres") -> str | None:
+    """The alias of the table whose partition key a query variant selects, or None if it selects no qualified key.
+
+    Variants select ``DISTINCT <alias>.<partition_key>``. Restricting only this table to a superset of the variant's
+    keys keeps every row of its result, however its other tables are related to it; restricting the other tables too
+    is equivalent only when they are all joined on the partition key.
+    """
+    try:
+        select = sqlglot.parse_one(query, read=sql_dialect)
+    except sqlglot.ParseError:
+        return None
+    if not isinstance(select, exp.Select) or len(select.expressions) != 1:
+        return None
+    column = select.expressions[0]
+    if isinstance(column, exp.Alias):
+        column = column.this
+    if isinstance(column, exp.Column) and column.name == partition_key and column.table:
+        return column.table
+    return None
+
+
 VariantSignature = tuple[frozenset[str], frozenset[str], str]
 
 # Results that can differ between two executions make conditions incomparable across variants. Functions

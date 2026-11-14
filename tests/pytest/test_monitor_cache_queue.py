@@ -773,6 +773,7 @@ class TestCacheOptimization:
             lazy_subquery=lazy_subquery,
             partition_key=partition_key,
             method="IN_SUBQUERY",
+            p0_alias=None,  # the key is joined on every table
             analyze_tmp_table=True,
         )
 
@@ -814,6 +815,7 @@ class TestCacheOptimization:
             partition_keys=partition_keys,
             partition_key=partition_key,
             method="IN",
+            p0_alias=None,  # the key is joined on every table
             analyze_tmp_table=True,
             sql_dialect="sqlite",  # from --db-backend
         )
@@ -1165,9 +1167,9 @@ class TestLookupUsesDecompositionSettings:
         constraints = ({"a": "a.z = 1"}, ["w"], None)
         with patch.object(mcq_module, "constraint_args", constraints):
             expected = mcq_module.lookup_settings(mcq_module.variant_settings(args, constraints, "pk", "integer"))
-            apply_cache_optimization("SELECT 1", "h", "pk", "integer", Mock(), args)
+            apply_cache_optimization(TestRestrictionTarget.FRAGMENT, "h", "pk", "integer", Mock(), args)
             args.prefer_lazy_optimization = True
-            apply_cache_optimization("SELECT 1", "h", "pk", "integer", Mock(spec=AbstractCacheHandler_Lazy), args)
+            apply_cache_optimization(TestRestrictionTarget.FRAGMENT, "h", "pk", "integer", Mock(spec=AbstractCacheHandler_Lazy), args)
 
         for mock in (mock_get_keys, mock_get_lazy):
             kwargs = mock.call_args.kwargs
@@ -1175,3 +1177,66 @@ class TestLookupUsesDecompositionSettings:
             assert kwargs["skip_partition_key_joins"] is True and kwargs["bucket_steps"] == {"interpoint_coord": 1.0}
             assert kwargs["add_constraints"] == {"a": "a.z = 1"} and kwargs["keep_all_attributes"] is True
             assert "max_component_size" not in kwargs
+
+
+class TestRestrictionTarget:
+    """Without key joins only the table whose key a fragment selects is restricted; with them nothing changes."""
+
+    FRAGMENT = "SELECT DISTINCT t1.pk FROM a AS t1, b AS t2 WHERE t1.t <= t2.t AND t1.x = 1 AND t2.t <= t1.t + 10 AND t2.y = 1"
+
+    @pytest.fixture
+    def args(self, mock_args):
+        mock_args.enable_cache_optimization = True
+        mock_args.disable_cache_optimization = False
+        mock_args.prefer_lazy_optimization = False
+        mock_args.cache_optimization_method = "TMP_TABLE_JOIN"
+        mock_args.max_conditions_removed = None
+        mock_args.grid_cell_size = None
+        mock_args.db_backend = "postgresql"
+        return mock_args
+
+    def test_tmp_table_join_keeps_the_keys_of_a_fragment_without_key_joins(self, args):
+        """Joined to b as well, the keys {1, 2} (correct) removed b's row of bucket 3, and with it key 2."""
+        import re
+        import sqlite3
+
+        args.skip_partition_key_joins = ["pk"]
+        cache = DictIntersectCache()
+        with patch("partitioncache.cli.monitor_cache_queue.get_partition_keys", return_value=({1, 2}, 3, 2)):
+            restricted, was_optimized, _ = apply_cache_optimization(self.FRAGMENT, "h", "pk", "integer", cache, args)
+
+        assert was_optimized and "tmp_t2" not in restricted
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(
+            "CREATE TABLE a (pk INTEGER, t INTEGER, x INTEGER); CREATE TABLE b (pk INTEGER, t INTEGER, y INTEGER);"
+            "INSERT INTO a VALUES (1, 0, 1), (2, 100, 1); INSERT INTO b VALUES (2, 5, 1), (3, 105, 1);"
+        )
+        table = re.search(r"tmp_cache_keys_\d+", restricted).group(0)  # type: ignore[union-attr]
+        conn.execute(f"CREATE TEMP TABLE {table} (partition_key INTEGER)")
+        conn.executemany(f"INSERT INTO {table} VALUES (?)", [(1,), (2,)])
+        select = restricted[restricted.rindex("SELECT DISTINCT") :]
+        assert {row[0] for row in conn.execute(select)} == {row[0] for row in conn.execute(self.FRAGMENT)} == {1, 2}
+
+    @patch("partitioncache.cli.monitor_cache_queue.extend_query_with_partition_keys_lazy", return_value="restricted")
+    @patch("partitioncache.cli.monitor_cache_queue.get_partition_keys_lazy", return_value=("SELECT 1", 3, 2))
+    def test_lazy_path_restricts_the_key_alias_too(self, mock_get_lazy, mock_extend, args):
+        from partitioncache.cache_handler.abstract import AbstractCacheHandler_Lazy
+
+        args.skip_partition_key_joins = ["pk"]
+        args.prefer_lazy_optimization = True
+        apply_cache_optimization(self.FRAGMENT, "h", "pk", "integer", Mock(spec=AbstractCacheHandler_Lazy), args)
+        assert mock_extend.call_args.kwargs["p0_alias"] == "t1"
+
+    @patch("partitioncache.cli.monitor_cache_queue.extend_query_with_partition_keys", return_value="restricted")
+    @patch("partitioncache.cli.monitor_cache_queue.get_partition_keys", return_value=({1, 2}, 3, 2))
+    def test_keys_joined_on_every_table_keep_the_previous_restriction(self, mock_get_keys, mock_extend, args):
+        args.skip_partition_key_joins = []
+        apply_cache_optimization(self.FRAGMENT, "h", "pk", "integer", Mock(), args)
+        assert mock_extend.call_args.kwargs["p0_alias"] is None
+
+    @patch("partitioncache.cli.monitor_cache_queue.get_partition_keys")
+    def test_fragment_without_a_qualified_key_is_not_restricted(self, mock_get_keys, args):
+        args.skip_partition_key_joins = ["pk"]
+        query, was_optimized, _ = apply_cache_optimization("SELECT DISTINCT pk FROM a WHERE x = 1", "h", "pk", "integer", Mock(), args)
+        assert (query, was_optimized) == ("SELECT DISTINCT pk FROM a WHERE x = 1", False)
+        mock_get_keys.assert_not_called()

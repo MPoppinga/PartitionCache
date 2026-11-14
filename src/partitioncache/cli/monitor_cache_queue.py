@@ -38,7 +38,7 @@ from partitioncache.cli.common_args import (
 from partitioncache.db_handler import get_db_handler
 from partitioncache.logging_utils import configure_enhanced_logging, get_thread_aware_logger
 from partitioncache.query_accelerator import create_query_accelerator
-from partitioncache.query_processor import generate_all_query_hash_pairs, order_variants_for_population
+from partitioncache.query_processor import generate_all_query_hash_pairs, order_variants_for_population, variant_key_alias
 from partitioncache.queue import (
     get_queue_lengths,
     pop_from_original_query_queue,
@@ -294,7 +294,16 @@ def apply_cache_optimization(query: str, query_hash: str, partition_key: str, pa
         # Check if we should use lazy optimization; a key limit needs the key count, which only the standard path materializes
         use_lazy = args.prefer_lazy_optimization and isinstance(cache_handler, AbstractCacheHandler_Lazy) and max_keys is None
         # The sub-variants of the fragment must be generated as the decomposition generated the cached variants
-        lookup_kwargs = lookup_settings(variant_settings(args, constraint_args, partition_key, partition_datatype))
+        settings = variant_settings(args, constraint_args, partition_key, partition_datatype)
+        lookup_kwargs = lookup_settings(settings)
+        # Without key joins, the other tables of a fragment are not joined on the key: only the table whose key the
+        # fragment selects may be restricted (without an alias, TMP_TABLE_JOIN joins every table to the keys)
+        p0_alias = None
+        if settings["skip_partition_key_joins"]:
+            p0_alias = variant_key_alias(query, partition_key)
+            if p0_alias is None:
+                logger.debug(f"No cache optimization for {query_hash}: it selects no qualified {partition_key}")
+                return query, False, stats
 
         if use_lazy:
             # Use lazy intersection - no min-hits check needed
@@ -324,6 +333,7 @@ def apply_cache_optimization(query: str, query_hash: str, partition_key: str, pa
                     lazy_subquery=lazy_subquery,
                     partition_key=partition_key,
                     method=method,  # type: ignore[arg-type]
+                    p0_alias=p0_alias,
                     analyze_tmp_table=True,
                 )
 
@@ -358,6 +368,7 @@ def apply_cache_optimization(query: str, query_hash: str, partition_key: str, pa
                     partition_keys=partition_keys,
                     partition_key=partition_key,
                     method=extend_method,
+                    p0_alias=p0_alias,
                     analyze_tmp_table=True,
                     sql_dialect=sql_dialect_for_backend(args.db_backend),
                 )
