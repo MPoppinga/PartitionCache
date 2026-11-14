@@ -733,7 +733,7 @@ class TestCacheOptimization:
         assert stats["cache_hits"] == 0
         assert stats["method_used"] is None
 
-    @patch("partitioncache.cli.monitor_cache_queue.get_partition_keys_lazy")
+    @patch("partitioncache.population.get_partition_keys_lazy")
     def test_apply_cache_optimization_lazy_with_hits(self, mock_get_lazy, mock_args):
         """Test lazy optimization when cache hits are found."""
         mock_args.enable_cache_optimization = True
@@ -756,7 +756,7 @@ class TestCacheOptimization:
         partition_key = "test_partition"
         partition_datatype = "integer"
 
-        with patch("partitioncache.cli.monitor_cache_queue.extend_query_with_partition_keys_lazy") as mock_extend:
+        with patch("partitioncache.population.extend_query_with_partition_keys_lazy") as mock_extend:
             mock_extend.return_value = "SELECT * FROM test WHERE id = 1 AND test_partition IN (SELECT ...)"
 
             optimized_query, was_optimized, stats = apply_cache_optimization(
@@ -775,9 +775,10 @@ class TestCacheOptimization:
             method="IN_SUBQUERY",
             p0_alias=None,  # the key is joined on every table
             analyze_tmp_table=True,
+            sql_dialect="sqlite",  # from --db-backend
         )
 
-    @patch("partitioncache.cli.monitor_cache_queue.get_partition_keys")
+    @patch("partitioncache.population.get_partition_keys")
     def test_apply_cache_optimization_standard_with_hits(self, mock_get_keys, mock_args):
         """Test standard optimization when cache hits are found."""
         mock_args.enable_cache_optimization = True
@@ -798,7 +799,7 @@ class TestCacheOptimization:
         partition_key = "test_partition"
         partition_datatype = "integer"
 
-        with patch("partitioncache.cli.monitor_cache_queue.extend_query_with_partition_keys") as mock_extend:
+        with patch("partitioncache.population.extend_query_with_partition_keys") as mock_extend:
             mock_extend.return_value = "SELECT * FROM test WHERE id = 1 AND test_partition IN (100, 200, 300)"
 
             optimized_query, was_optimized, stats = apply_cache_optimization(
@@ -820,7 +821,7 @@ class TestCacheOptimization:
             sql_dialect="sqlite",  # from --db-backend
         )
 
-    @patch("partitioncache.cli.monitor_cache_queue.get_partition_keys")
+    @patch("partitioncache.population.get_partition_keys")
     def test_apply_cache_optimization_below_threshold(self, mock_get_keys, mock_args):
         """Test that optimization is not applied when hits are below threshold."""
         mock_args.enable_cache_optimization = True
@@ -850,7 +851,7 @@ class TestCacheOptimization:
         assert stats["cache_hits"] == 2
         assert stats["method_used"] is None
 
-    @patch("partitioncache.cli.monitor_cache_queue.get_partition_keys_lazy")
+    @patch("partitioncache.population.get_partition_keys_lazy")
     def test_apply_cache_optimization_exception_handling(self, mock_get_lazy, mock_args):
         """Test that exceptions are handled gracefully."""
         mock_args.enable_cache_optimization = True
@@ -889,8 +890,8 @@ class TestCacheOptimization:
         mock_args.cache_optimization_method = "IN"
         return mock_args
 
-    @patch("partitioncache.cli.monitor_cache_queue.extend_query_with_partition_keys")
-    @patch("partitioncache.cli.monitor_cache_queue.get_partition_keys")
+    @patch("partitioncache.population.extend_query_with_partition_keys")
+    @patch("partitioncache.population.get_partition_keys")
     def test_key_limit_skips_large_intersection(self, mock_get_keys, mock_extend, standard_args):
         standard_args.max_restriction_keys = 3
         mock_get_keys.return_value = ({1, 2, 3, 4}, 6, 2)
@@ -903,8 +904,8 @@ class TestCacheOptimization:
         assert stats["method_used"] is None
         mock_extend.assert_not_called()
 
-    @patch("partitioncache.cli.monitor_cache_queue.extend_query_with_partition_keys")
-    @patch("partitioncache.cli.monitor_cache_queue.get_partition_keys")
+    @patch("partitioncache.population.extend_query_with_partition_keys")
+    @patch("partitioncache.population.get_partition_keys")
     def test_key_limit_allows_small_intersection(self, mock_get_keys, mock_extend, standard_args):
         standard_args.max_restriction_keys = 3
         mock_get_keys.return_value = ({1, 2, 3}, 6, 2)
@@ -915,9 +916,9 @@ class TestCacheOptimization:
         assert was_optimized is True
         assert optimized_query == "SELECT 1 AND pk IN (1, 2, 3)"
 
-    @patch("partitioncache.cli.monitor_cache_queue.extend_query_with_partition_keys")
-    @patch("partitioncache.cli.monitor_cache_queue.get_partition_keys_lazy")
-    @patch("partitioncache.cli.monitor_cache_queue.get_partition_keys")
+    @patch("partitioncache.population.extend_query_with_partition_keys")
+    @patch("partitioncache.population.get_partition_keys_lazy")
+    @patch("partitioncache.population.get_partition_keys")
     def test_key_limit_uses_standard_path_for_lazy_handlers(self, mock_get_keys, mock_get_lazy, mock_extend, standard_args):
         """The lazy path never sees the key count, so a key limit switches to the materializing path."""
         from partitioncache.cache_handler.abstract import AbstractCacheHandler_Lazy
@@ -966,8 +967,8 @@ class TestVariantOrder:
 
         assert mock_push.call_args.args[0] == [small, large]
 
-    @patch("partitioncache.cli.monitor_cache_queue.extend_query_with_partition_keys")
-    @patch("partitioncache.cli.monitor_cache_queue.get_partition_keys")
+    @patch("partitioncache.population.extend_query_with_partition_keys")
+    @patch("partitioncache.population.get_partition_keys")
     def test_restriction_uses_the_dialect_of_the_db_backend(self, mock_get_keys, mock_extend, mock_args):
         mock_args.enable_cache_optimization = True
         mock_args.disable_cache_optimization = False
@@ -1179,11 +1180,12 @@ class TestLookupUsesDecompositionSettings:
         for variant, variant_hash in pairs:
             assert cache.entries[variant_hash] == {row[0] for row in conn.execute(variant)}, variant
 
-    @patch("partitioncache.cli.monitor_cache_queue.get_partition_keys_lazy")
-    @patch("partitioncache.cli.monitor_cache_queue.get_partition_keys")
+    @patch("partitioncache.population.get_partition_keys_lazy")
+    @patch("partitioncache.population.get_partition_keys")
     def test_both_lookups_get_the_decomposition_settings(self, mock_get_keys, mock_get_lazy, args):
         import partitioncache.cli.monitor_cache_queue as mcq_module
         from partitioncache.cache_handler.abstract import AbstractCacheHandler_Lazy
+        from partitioncache.population import lookup_settings
 
         args.bucket_steps = {"interpoint_coord": 1.0}
         args.max_component_size = 5
@@ -1191,7 +1193,7 @@ class TestLookupUsesDecompositionSettings:
         mock_get_lazy.return_value = (None, 3, 0)
         constraints = ({"a": "a.z = 1"}, ["w"], None)
         with patch.object(mcq_module, "constraint_args", constraints):
-            expected = mcq_module.lookup_settings(mcq_module.variant_settings(args, constraints, "pk", "integer"))
+            expected = lookup_settings(mcq_module.variant_settings(args, constraints, "pk", "integer"))
             apply_cache_optimization(TestRestrictionTarget.FRAGMENT, "h", "pk", "integer", Mock(), args)
             args.prefer_lazy_optimization = True
             apply_cache_optimization(TestRestrictionTarget.FRAGMENT, "h", "pk", "integer", Mock(spec=AbstractCacheHandler_Lazy), args)
@@ -1227,7 +1229,7 @@ class TestRestrictionTarget:
 
         args.skip_partition_key_joins = ["pk"]
         cache = DictIntersectCache()
-        with patch("partitioncache.cli.monitor_cache_queue.get_partition_keys", return_value=({1, 2}, 3, 2)):
+        with patch("partitioncache.population.get_partition_keys", return_value=({1, 2}, 3, 2)):
             restricted, was_optimized, _ = apply_cache_optimization(self.FRAGMENT, "h", "pk", "integer", cache, args)
 
         assert was_optimized and "tmp_t2" not in restricted
@@ -1242,8 +1244,8 @@ class TestRestrictionTarget:
         select = restricted[restricted.rindex("SELECT DISTINCT") :]
         assert {row[0] for row in conn.execute(select)} == {row[0] for row in conn.execute(self.FRAGMENT)} == {1, 2}
 
-    @patch("partitioncache.cli.monitor_cache_queue.extend_query_with_partition_keys_lazy", return_value="restricted")
-    @patch("partitioncache.cli.monitor_cache_queue.get_partition_keys_lazy", return_value=("SELECT 1", 3, 2))
+    @patch("partitioncache.population.extend_query_with_partition_keys_lazy", return_value="restricted")
+    @patch("partitioncache.population.get_partition_keys_lazy", return_value=("SELECT 1", 3, 2))
     def test_lazy_path_restricts_the_key_alias_too(self, mock_get_lazy, mock_extend, args):
         from partitioncache.cache_handler.abstract import AbstractCacheHandler_Lazy
 
@@ -1252,14 +1254,14 @@ class TestRestrictionTarget:
         apply_cache_optimization(self.FRAGMENT, "h", "pk", "integer", Mock(spec=AbstractCacheHandler_Lazy), args)
         assert mock_extend.call_args.kwargs["p0_alias"] == "t1"
 
-    @patch("partitioncache.cli.monitor_cache_queue.extend_query_with_partition_keys", return_value="restricted")
-    @patch("partitioncache.cli.monitor_cache_queue.get_partition_keys", return_value=({1, 2}, 3, 2))
+    @patch("partitioncache.population.extend_query_with_partition_keys", return_value="restricted")
+    @patch("partitioncache.population.get_partition_keys", return_value=({1, 2}, 3, 2))
     def test_keys_joined_on_every_table_keep_the_previous_restriction(self, mock_get_keys, mock_extend, args):
         args.skip_partition_key_joins = []
         apply_cache_optimization(self.FRAGMENT, "h", "pk", "integer", Mock(), args)
         assert mock_extend.call_args.kwargs["p0_alias"] is None
 
-    @patch("partitioncache.cli.monitor_cache_queue.get_partition_keys")
+    @patch("partitioncache.population.get_partition_keys")
     def test_fragment_without_a_qualified_key_is_not_restricted(self, mock_get_keys, args):
         args.skip_partition_key_joins = ["pk"]
         query, was_optimized, _ = apply_cache_optimization("SELECT DISTINCT pk FROM a WHERE x = 1", "h", "pk", "integer", Mock(), args)

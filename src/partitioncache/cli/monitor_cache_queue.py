@@ -8,16 +8,10 @@ import datetime
 import os
 import threading
 import time
-from typing import Any, Literal
+from typing import Any
 
 import psycopg
 
-from partitioncache.apply_cache import (
-    extend_query_with_partition_keys,
-    extend_query_with_partition_keys_lazy,
-    get_partition_keys,
-    get_partition_keys_lazy,
-)
 from partitioncache.cache_handler import get_cache_handler
 from partitioncache.cache_handler.abstract import AbstractCacheHandler_Lazy
 from partitioncache.cli.common_args import (
@@ -37,8 +31,9 @@ from partitioncache.cli.common_args import (
 )
 from partitioncache.db_handler import get_db_handler
 from partitioncache.logging_utils import configure_enhanced_logging, get_thread_aware_logger
+from partitioncache.population import RestrictionCounts, restrict_with_cache
 from partitioncache.query_accelerator import create_query_accelerator
-from partitioncache.query_processor import generate_all_query_hash_pairs, order_variants_for_population, variant_key_alias
+from partitioncache.query_processor import generate_all_query_hash_pairs, order_variants_for_population
 from partitioncache.queue import (
     get_queue_lengths,
     pop_from_original_query_queue,
@@ -96,18 +91,6 @@ def variant_settings(args, constraint_args: tuple, partition_key: str, partition
         "max_conditions_removed": args.max_conditions_removed,
         **_grid_kwargs(grid_size),
     }
-
-
-# Shape only the decomposition of the original query: a fragment is no larger than max_component_size, and the
-# lookup does not run for grid keys. add_constraints adds conditions: the decomposition yields the variants with and
-# without them, but looked up, the constrained "sub-variants" of an unconstrained fragment are stricter than it, not
-# relaxations. A constrained fragment keeps its constraint as a condition, so its relaxations are still found.
-_DECOMPOSITION_ONLY_SETTINGS = ("max_component_size", "grid_cell_size", "add_constraints")
-
-
-def lookup_settings(settings: dict[str, Any]) -> dict[str, Any]:
-    """The keyword arguments of get_partition_keys(_lazy) for a fragment decomposed with ``settings``."""
-    return {name: value for name, value in settings.items() if name not in _DECOMPOSITION_ONLY_SETTINGS}
 
 
 args: argparse.Namespace
@@ -268,9 +251,22 @@ def query_fragment_processor(args, constraint_args):
     logger.info("Query fragment processor thread exiting")
 
 
+# Cache optimization method of the CLI -> method of the lazy path (IN means IN_SUBQUERY there) and of the eager path
+LAZY_METHOD_MAP = {"IN": "IN_SUBQUERY", "IN_SUBQUERY": "IN_SUBQUERY", "TMP_TABLE_IN": "TMP_TABLE_IN", "TMP_TABLE_JOIN": "TMP_TABLE_JOIN"}
+EAGER_METHOD_MAP = {"IN": "IN", "VALUES": "VALUES", "IN_SUBQUERY": "IN", "TMP_TABLE_IN": "TMP_TABLE_IN", "TMP_TABLE_JOIN": "TMP_TABLE_JOIN"}
+
+# Fragments by the outcome of their cache optimization in this run
+restriction_counts = RestrictionCounts()
+restriction_counts_lock = threading.Lock()
+
+
 def apply_cache_optimization(query: str, query_hash: str, partition_key: str, partition_datatype: str | None, cache_handler, args) -> tuple[str, bool, dict]:
     """
-    Apply cache-aware optimization to a query before execution.
+    Restrict a fragment to the cached keys of its relaxations before it runs (``restrict_with_cache``).
+
+    The lookup generates the fragment's sub-variants with the settings of the decomposition (``variant_settings``).
+    Fragments pushed by another client are looked up with this monitor's settings, so it must run with the
+    client's variant generation flags.
 
     Args:
         query: SQL query to potentially optimize
@@ -290,104 +286,62 @@ def apply_cache_optimization(query: str, query_hash: str, partition_key: str, pa
 
     if not args.enable_cache_optimization or args.disable_cache_optimization:
         return query, False, stats
+    if partition_datatype == "geometry":
+        # A spatial fragment would need the buffered spatial filter of a query, not a key list
+        logger.debug(f"No cache optimization for {query_hash}: spatial key '{partition_key}'")
+        return query, False, stats
 
+    max_keys = args.max_restriction_keys
+    # A key limit needs the key count, which only the eager path fetches
+    use_lazy = args.prefer_lazy_optimization and isinstance(cache_handler, AbstractCacheHandler_Lazy) and max_keys is None
+    method = (LAZY_METHOD_MAP if use_lazy else EAGER_METHOD_MAP).get(args.cache_optimization_method, "IN_SUBQUERY" if use_lazy else "IN")
     try:
-        max_keys = args.max_restriction_keys
-        # Check if we should use lazy optimization; a key limit needs the key count, which only the standard path materializes
-        use_lazy = args.prefer_lazy_optimization and isinstance(cache_handler, AbstractCacheHandler_Lazy) and max_keys is None
-        # The sub-variants of the fragment must be generated as the decomposition generated the cached variants
-        settings = variant_settings(args, constraint_args, partition_key, partition_datatype)
-        lookup_kwargs = lookup_settings(settings)
-        # Without key joins, the other tables of a fragment are not joined on the key: only the table whose key the
-        # fragment selects may be restricted (without an alias, TMP_TABLE_JOIN joins every table to the keys)
-        p0_alias = None
-        if settings["skip_partition_key_joins"]:
-            p0_alias = variant_key_alias(query, partition_key)
-            if p0_alias is None:
-                logger.debug(f"No cache optimization for {query_hash}: it selects no qualified {partition_key}")
-                return query, False, stats
-
-        if use_lazy:
-            # Use lazy intersection - no min-hits check needed
-            lazy_subquery, total_hashes, hits = get_partition_keys_lazy(
-                query=query,
-                cache_handler=cache_handler,
-                partition_key=partition_key,
-                **lookup_kwargs,
-            )
-
-            stats["total_hashes"] = total_hashes
-            stats["cache_hits"] = hits
-
-            if hits > 0 and lazy_subquery:
-                # Map method names for lazy optimization
-                lazy_method_map = {
-                    "IN": "IN_SUBQUERY",
-                    "IN_SUBQUERY": "IN_SUBQUERY",
-                    "TMP_TABLE_IN": "TMP_TABLE_IN",
-                    "TMP_TABLE_JOIN": "TMP_TABLE_JOIN",
-                }
-                method = lazy_method_map.get(args.cache_optimization_method, "IN_SUBQUERY")
-                stats["method_used"] = method
-
-                optimized_query = extend_query_with_partition_keys_lazy(
-                    query=query,
-                    lazy_subquery=lazy_subquery,
-                    partition_key=partition_key,
-                    method=method,  # type: ignore[arg-type]
-                    p0_alias=p0_alias,
-                    analyze_tmp_table=True,
-                )
-
-                logger.info(f"Applied lazy cache optimization to {query_hash}: {hits}/{total_hashes} cache hits, method={method}")
-                return optimized_query, True, stats
-        else:
-            # Use standard intersection with min-hits check
-            partition_keys, total_hashes, hits = get_partition_keys(
-                query=query,
-                cache_handler=cache_handler,
-                partition_key=partition_key,
-                **lookup_kwargs,
-            )
-
-            stats["total_hashes"] = total_hashes
-            stats["cache_hits"] = hits
-
-            # An empty set is a valid result (the query has no rows); extend_query_with_partition_keys handles it
-            if hits >= args.min_cache_hits and partition_keys is not None:
-                if max_keys is not None and len(partition_keys) > max_keys:
-                    # A restriction to most of the keys filters little and costs a long key list
-                    logger.debug(f"Skipped cache optimization for {query_hash}: {len(partition_keys)} keys exceed --max-restriction-keys {max_keys}")
-                    return query, False, stats
-                # IN_SUBQUERY exists only for the lazy path
-                extend_method: Literal["IN", "VALUES", "TMP_TABLE_JOIN", "TMP_TABLE_IN"] = (
-                    "IN" if args.cache_optimization_method == "IN_SUBQUERY" else args.cache_optimization_method
-                )
-                stats["method_used"] = extend_method
-
-                optimized_query = extend_query_with_partition_keys(
-                    query=query,
-                    partition_keys=partition_keys,
-                    partition_key=partition_key,
-                    method=extend_method,
-                    p0_alias=p0_alias,
-                    analyze_tmp_table=True,
-                    sql_dialect=sql_dialect_for_backend(args.db_backend),
-                )
-
-                logger.info(
-                    f"Applied cache optimization to {query_hash}: {hits}/{total_hashes} cache hits, {len(partition_keys)} keys, method={extend_method}"
-                )
-                return optimized_query, True, stats
-
-        # No optimization applied
-        if stats["cache_hits"] > 0:
-            logger.debug(f"Cache hits below threshold for {query_hash}: {stats['cache_hits']}/{stats['total_hashes']} (min={args.min_cache_hits})")
-
+        restriction = restrict_with_cache(
+            query,
+            cache_handler,
+            partition_key,
+            variant_settings(args, constraint_args, partition_key, partition_datatype),
+            lazy=use_lazy,
+            method=method,
+            max_restriction_keys=max_keys,
+            min_cache_hits=args.min_cache_hits,
+            sql_dialect=sql_dialect_for_backend(args.db_backend),
+        )
     except Exception as e:
         logger.warning(f"Failed to apply cache optimization to {query_hash}: {e}")
+        with restriction_counts_lock:
+            restriction_counts.lookup_failed += 1
+        return query, False, stats
 
-    return query, False, stats
+    stats["total_hashes"] = restriction.generated
+    stats["cache_hits"] = restriction.hits
+    with restriction_counts_lock:
+        if restriction.restricted:
+            restriction_counts.restricted += 1
+        else:
+            restriction_counts.count_unrestricted(restriction.reason or "no_relaxation")
+    if not restriction.restricted:
+        logger.debug(f"No cache optimization for {query_hash}: {restriction.reason} ({restriction.hits}/{restriction.generated} cache hits)")
+        return query, False, stats
+
+    stats["method_used"] = restriction.method
+    keys = "" if restriction.keys is None else f", {restriction.keys} keys"
+    logger.info(f"Applied cache optimization to {query_hash}: {restriction.hits}/{restriction.generated} cache hits{keys}, method={restriction.method}")
+    return restriction.query, True, stats
+
+
+def _cache_optimization_enabled() -> bool:
+    return bool(args.enable_cache_optimization and not args.disable_cache_optimization)
+
+
+def log_restriction_counts(final: bool = False) -> None:
+    """Log the restriction outcomes of this run; warn if fragments had relaxations but none was restricted."""
+    with restriction_counts_lock:
+        counts = RestrictionCounts(**vars(restriction_counts))
+    logger.info(f"Cache optimization so far: {counts}")
+    warning = counts.unrestricted_warning()
+    if warning is not None and final:
+        logger.warning(warning)
 
 
 TERMINAL_STATUSES = frozenset({"timeout", "failed", "limit"})
@@ -704,6 +658,8 @@ def fragment_executor():
 
                 if should_log_status:
                     print_enhanced_status(active, lengths, waiting_reason)
+                    if _cache_optimization_enabled():
+                        log_restriction_counts()
 
                 # Submit new jobs if we have capacity
                 while len(active_futures) < args.max_processes:
@@ -802,6 +758,8 @@ def fragment_executor():
                 logger.info(f"Retrying in {error_sleep}s...")
                 time.sleep(error_sleep)
 
+    if _cache_optimization_enabled():
+        log_restriction_counts(final=True)
     logger.info("Fragment executor exiting")
 
 
@@ -1018,6 +976,12 @@ def main():
         logger.info(f"  - Min cache hits: {args.min_cache_hits}")
         logger.info(f"  - Max restriction keys: {args.max_restriction_keys if args.max_restriction_keys is not None else 'no limit'}")
         logger.info(f"  - Prefer lazy: {args.prefer_lazy_optimization}")
+        # The lookup generates each fragment's sub-variants with these settings, also for fragments that another
+        # client generated and pushed; generated with other settings, they find fewer cached relaxations
+        settings = variant_settings(args, constraint_args, "<partition key>", None)
+        settings.pop("geometry_column", None)
+        settings["skip_partition_key_joins"] = f"for {sorted(args.skip_partition_key_joins)} and geometry keys"
+        logger.info(f"  - Variant settings of decomposition and lookup: {settings}")
 
     # Log lazy insertion configuration
     logger.info(f"- Lazy insertion: {'DISABLED' if args.disable_lazy_insertion else 'ENABLED (when conditions met)'}")

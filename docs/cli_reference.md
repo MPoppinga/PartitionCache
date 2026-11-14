@@ -325,7 +325,7 @@ Advanced options for controlling how query variants are generated for better cac
 - Executes query immediately and stores results in cache
 - **Best for**: Development, testing, small queries
 - **Warning**: Can be slow for complex queries with many fragments
-- `--restrict-variants`: executes the variants smallest first and restricts each to the intersection of the keys of its already populated relaxations, kept in memory (no cache lookup per variant). An empty intersection is stored as an empty result without executing the variant. See `populate_query_variants` in the [API reference](api_reference.md).
+- `--restrict-variants`: executes the variants smallest first and restricts each to the cached keys of its relaxations, found by the cache lookup of a query with the same variant generation flags. An empty intersection is stored as an empty result without executing the variant. Spatial and grid keys are populated unrestricted. See `populate_query_variants` in the [API reference](api_reference.md).
 - `--max-restriction-keys N`: only restrict when the intersection has at most N keys (implies `--restrict-variants`); a restriction to most of the keys filters little and costs a long key list
 
 #### Queue Processing
@@ -556,6 +556,8 @@ Cache-aware optimization leverages existing cache entries to restrict the search
   - **Purpose**: Check existing cache entries to restrict search space before execution
   - **Benefit**: Reduces database load by applying IN/subquery restrictions
   - **Algorithm**: Generates subquery variants, checks cache for existing entries, applies restrictions if cache hits meet threshold
+  - **Lookup settings**: the sub-variants of a fragment are generated with the monitor's variant generation flags (`--min-component-size`, `--bucket-steps`, `--skip-partition-key-joins`, the constraint flags, ...), the settings its decomposition uses; the monitor logs them at start. Fragments another client pushed (e.g. `pcache-add --queue`) are looked up with them too, so start the monitor with the client's flags: otherwise it finds fewer cached relaxations. For a key in `--skip-partition-key-joins` only the table whose key a fragment selects is restricted. Geometry and grid keys run unrestricted.
+  - **Counts**: with the status log and at exit the monitor logs how many fragments were restricted and why the others were not; it warns at exit when fragments had relaxations but none was restricted.
   - **Variant order**: `pcache-monitor` and `pcache-add --queue` push the variants of a query smallest first (fewest tables, then fewest conditions), so the relaxations of a variant are usually cached before it runs. With several `--max-processes` workers a variant can still start before all of its relaxations finish.
 - `--force-recalculate` - Force recalculation of cache entries even if they already exist
   - **Default**: Disabled
