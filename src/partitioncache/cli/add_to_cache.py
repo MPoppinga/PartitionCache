@@ -255,29 +255,28 @@ def main():
             elif grid_size is not None:
                 geometry_column = args.geometry_column or "geom"
 
+            # Generate the variants with these settings; restricted population looks up each variant with them too
+            variant_settings = {
+                "min_component_size": args.min_component_size,
+                "follow_graph": args.follow_graph,
+                "keep_all_attributes": True,
+                "auto_detect_partition_join": auto_detect,
+                "max_component_size": args.max_component_size,
+                "partition_join_table": args.partition_join_table,
+                "bucket_steps": args.bucket_steps,
+                "add_constraints": add_constraints,
+                "remove_constraints_all": remove_constraints_all,
+                "remove_constraints_add": remove_constraints_add,
+                "skip_partition_key_joins": skip_pk_joins,
+                "geometry_column": geometry_column,
+                "max_conditions_removed": args.max_conditions_removed,
+                **_grid_kwargs(grid_size),
+            }
             if not args.no_recompose:
                 logger.debug("Recomposing query")
 
                 # Generate query-hash pairs
-                query_hash_pairs = generate_all_query_hash_pairs(
-                    query,
-                    args.partition_key,
-                    min_component_size=args.min_component_size,
-                    follow_graph=args.follow_graph,
-                    keep_all_attributes=True,
-                    auto_detect_partition_join=auto_detect,
-                    max_component_size=args.max_component_size,
-                    partition_join_table=args.partition_join_table,
-                    warn_no_partition_key=not args.no_warn_partition_key,
-                    bucket_steps=args.bucket_steps,
-                    add_constraints=add_constraints,
-                    remove_constraints_all=remove_constraints_all,
-                    remove_constraints_add=remove_constraints_add,
-                    skip_partition_key_joins=skip_pk_joins,
-                    geometry_column=geometry_column,
-                    max_conditions_removed=args.max_conditions_removed,
-                    **_grid_kwargs(grid_size),
-                )
+                query_hash_pairs = generate_all_query_hash_pairs(query, args.partition_key, warn_no_partition_key=not args.no_warn_partition_key, **variant_settings)
 
             else:
                 query = clean_query(query)
@@ -327,6 +326,7 @@ def main():
                         db_handler,
                         max_restriction_keys=args.max_restriction_keys,
                         sql_dialect=sql_dialect_for_backend(args.db_backend),
+                        variant_settings=variant_settings,
                     )
                     logger.info(f"Populated query variants: {stats}")
                     population_failed = bool(stats.failed or stats.store_failed)
