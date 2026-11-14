@@ -771,22 +771,28 @@ for variant, variant_hash in order_variants_for_population(generate_all_query_ha
     ...  # execute variant and store its keys under variant_hash
 ```
 
-### `populate_query_variants(query_hash_pairs, partition_key, cache_handler, db_handler, restrict=True, max_restriction_keys=None, method="IN")`
+### `populate_query_variants(query_hash_pairs, partition_key, cache_handler, db_handler, restrict=True, max_restriction_keys=None, method="IN", sql_dialect="postgres", variant_settings=None, lazy=False)`
 
-Executes and caches the variants of one query sequentially, smallest first. Each variant is restricted to the intersection of the keys of its already populated relaxations, which stay in memory, so no cache lookup or hash generation is needed per variant. A relaxation is recognised structurally by `variant_signature`/`is_relaxation_of` in `partitioncache.query_processor`: its tables and conditions (aliases replaced by table names) are a subset of the variant's, so its keys are a superset. Variants the subset test cannot judge soundly (a table used twice, explicit JOIN syntax, unqualified columns, grouping) are executed unrestricted.
+Executes and caches the variants of one query sequentially, smallest first. Each variant is restricted with the cache the way a query is (`partitioncache.population.restrict_with_cache`): `get_partition_keys` (or `get_partition_keys_lazy` with `lazy=True`) generates the variant's sub-variants, hashes them and intersects the cached entries among them. A sub-variant joins a subset of the variant's tables and keeps a subset of its conditions (distance bounds possibly widened by `bucket_steps`), so its keys are a superset of the variant's keys; restricted to the intersection, the variant returns the same keys. Variants that use a table several times are restricted like any other.
 
-- Variants already in the cache are not executed; their keys are read once and restrict the others.
-- An empty intersection means the variant has no rows; it is stored as an empty set without executing it.
-- `max_restriction_keys`: restrict only when the intersection has at most this many keys.
+- `variant_settings`: the keyword arguments of `generate_all_query_hash_pairs` the pairs were generated with. The lookup generates the sub-variants with the same settings; missing ones take the defaults of `generate_all_query_hash_pairs` (those of `get_partition_keys` differ). With other settings the lookup finds fewer relaxations, and with another `skip_partition_key_joins` it can hit entries that are not relaxations of the variant.
+- For a key generated with `skip_partition_key_joins=True` the tables of a variant are not all joined on the key, so only the table whose key the variant selects is restricted.
+- Variants already in the cache are not executed; their entries restrict the others through the lookup, as do entries of other queries.
+- An empty eager intersection means the variant has no rows; it is stored as an empty set without executing it.
+- `max_restriction_keys` (eager only): restrict only when the intersection has at most this many keys.
+- `lazy=True` restricts with a subquery on the cache (`IN_SUBQUERY`, `TMP_TABLE_IN` or `TMP_TABLE_JOIN`); it needs an `AbstractCacheHandler_Lazy` whose tables the database can read, and no key limit.
+- Spatial and grid variants (`geometry_column`, `grid_cell_size` in `variant_settings`) are populated unrestricted with a warning.
+- Relaxations that failed, timed out or are still running have no entry and do not restrict.
 - `db_handler.execute` must raise on errors. A failure returned as an empty result would be cached as "no rows" and empty every variant it restricts; `SQLiteDBHandler` logs errors and returns `[]`.
 
-**Returns:** `PopulationStats` with `executed`, `restricted`, `empty_without_execution`, `already_cached`, `failed`.
+**Returns:** `PopulationStats` with `executed`, `restricted`, `empty_without_execution`, `already_cached`, `failed`, `store_failed`, and why variants were not restricted: `no_relaxation` (the smallest variants), `no_cached_relaxation`, `over_key_limit`, `no_key_alias`, `lookup_failed`. When restriction is on and variants had relaxations but none was restricted, a warning is logged.
 
 ```python
 from partitioncache import generate_all_query_hash_pairs, populate_query_variants
 
-pairs = generate_all_query_hash_pairs(query, "flight_id", partition_key_source_table="flights")
-stats = populate_query_variants(pairs, "flight_id", cache_handler, db_handler, max_restriction_keys=flight_count // 4)
+settings = {"min_component_size": 1, "keep_all_attributes": True, "bucket_steps": 0, "partition_key_source_table": "flights"}
+pairs = generate_all_query_hash_pairs(query, "flight_id", **settings)
+stats = populate_query_variants(pairs, "flight_id", cache_handler, db_handler, variant_settings=settings, max_restriction_keys=flight_count // 4)
 ```
 
 ### `generate_all_hashes(query: str, partition_key: str, min_component_size=1, follow_graph=True, fix_attributes=True, canonicalize_queries=False)`

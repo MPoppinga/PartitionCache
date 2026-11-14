@@ -1,5 +1,5 @@
 """
-Tests for structural relaxation detection and sequential, locally restricted cache population.
+Tests for cache population restricted through the cache lookup of a query.
 """
 
 import sqlite3
@@ -8,135 +8,11 @@ import pytest
 
 from partitioncache.db_handler.sqlite import SQLiteDBHandler
 from partitioncache.population import populate_query_variants
-from partitioncache.query_processor import generate_all_hashes, generate_all_query_hash_pairs, is_relaxation_of, variant_signature
-
-
-class TestVariantSignature:
-    def test_relaxation_independent_of_alias_numbering(self):
-        small = "SELECT DISTINCT t1.pk FROM f AS t1, d AS t2 WHERE t1.k = t2.k AND t2.x = 1"
-        large = "SELECT DISTINCT t2.pk FROM d AS t1, f AS t2, e AS t3 WHERE t2.k = t1.k AND t1.x = 1 AND t2.j = t3.j"
-        assert is_relaxation_of(variant_signature(small, "pk"), variant_signature(large, "pk"))
-        assert not is_relaxation_of(variant_signature(large, "pk"), variant_signature(small, "pk"))
-
-    def test_same_text_on_different_tables_is_not_a_relaxation(self):
-        """t1.x = 1 filters d in one variant and f in the other."""
-        on_d = "SELECT DISTINCT t2.pk FROM d AS t1, f AS t2 WHERE t1.k = t2.k AND t1.x = 1"
-        on_f = "SELECT DISTINCT t1.pk FROM f AS t1, d AS t2 WHERE t1.k = t2.k AND t1.x = 1"
-        assert not is_relaxation_of(variant_signature(on_d, "pk"), variant_signature(on_f, "pk"))
-
-    def test_different_key_table_is_not_a_relaxation(self):
-        a = "SELECT DISTINCT t1.pk FROM f AS t1"
-        b = "SELECT DISTINCT t2.pk FROM f AS t1, g AS t2 WHERE t1.k = t2.k"
-        assert not is_relaxation_of(variant_signature(a, "pk"), variant_signature(b, "pk"))
-
-    def test_correlated_subquery_mapped(self):
-        a = "SELECT DISTINCT t1.pk FROM f AS t1 WHERE t1.k IN (SELECT s.k FROM s WHERE s.v = t1.v)"
-        b = "SELECT DISTINCT t2.pk FROM d AS t1, f AS t2 WHERE t1.k = t2.k AND t2.k IN (SELECT s.k FROM s WHERE s.v = t2.v)"
-        assert is_relaxation_of(variant_signature(a, "pk"), variant_signature(b, "pk"))
-
-    def test_quoted_table_names_stay_distinct(self):
-        a = 'SELECT DISTINCT a.pk FROM "LO" AS a WHERE a.y = 2'
-        b = "SELECT DISTINCT b.pk FROM lo AS b WHERE b.x = 1 AND b.y = 2"
-        assert not is_relaxation_of(variant_signature(a, "pk"), variant_signature(b, "pk"))
-
-    def test_unquoted_names_are_case_folded(self):
-        a = "SELECT DISTINCT a.PK FROM LO AS a WHERE a.y = 2"
-        b = "SELECT DISTINCT b.pk FROM lo AS b WHERE b.x = 1 AND b.Y = 2"
-        assert is_relaxation_of(variant_signature(a, "pk"), variant_signature(b, "pk"))
-
-    def test_unknown_dialect_raises(self):
-        with pytest.raises(ValueError):
-            variant_signature("SELECT DISTINCT t1.pk FROM f AS t1", "pk", "postgresql")
-
-    def test_age_of_two_timestamps_is_deterministic(self):
-        assert variant_signature("SELECT DISTINCT t1.pk FROM f AS t1 WHERE age(t1.a, t1.b) < INTERVAL '1 day'", "pk") is not None
-
-    def test_sqlite_folds_quoted_names_too(self):
-        a = 'SELECT DISTINCT a.pk FROM "LO" AS a WHERE a.y = 2'
-        b = "SELECT DISTINCT b.pk FROM lo AS b WHERE b.x = 1 AND b.y = 2"
-        assert is_relaxation_of(variant_signature(a, "pk", "sqlite"), variant_signature(b, "pk", "sqlite"))
-
-    def test_schemas_distinguish_tables(self):
-        """s1.lo and s2.lo are different tables, also when their conditions look alike."""
-        a = "SELECT DISTINCT a.pk FROM s1.lo AS a WHERE a.y = 2"
-        b = "SELECT DISTINCT b.pk FROM s2.lo AS b WHERE b.x = 1 AND b.y = 2"
-        assert not is_relaxation_of(variant_signature(a, "pk"), variant_signature(b, "pk"))
-        assert is_relaxation_of(variant_signature(a, "pk"), variant_signature(a.replace("a.y = 2", "a.y = 2 AND a.x = 1"), "pk"))
-
-    def test_generated_variants_keep_schemas_apart(self):
-        query = "SELECT a.pk FROM s1.lo a, s2.lo b WHERE a.pk = b.pk AND a.y = 2 AND b.y = 2 AND b.x = 1"
-        pairs = generate_all_query_hash_pairs(query, "pk", min_component_size=1, warn_no_partition_key=False)
-        signatures = [variant_signature(v, "pk") for v, _ in pairs]
-        for sig in signatures:
-            assert sig is not None and all(name.startswith(('"s1".', '"s2".')) for name in sig[0])
-        for a in signatures:
-            for b in signatures:
-                if a is not b and is_relaxation_of(a, b):
-                    assert a[0] <= b[0]
-
-    @pytest.mark.parametrize(
-        "query",
-        [
-            "SELECT DISTINCT t1.pk FROM f AS t1, (SELECT * FROM d WHERE FALSE) AS s",
-            "SELECT DISTINCT t1.pk FROM f AS t1, UNNEST(ARRAY[1]) AS u",
-            "SELECT DISTINCT t1.pk FROM f AS t1, LATERAL (SELECT 1) AS s",
-            "SELECT DISTINCT t1.pk FROM f AS t1 NATURAL JOIN d AS t2",
-            "SELECT DISTINCT t1.pk FROM f AS t1 TABLESAMPLE SYSTEM (10)",
-            "SELECT DISTINCT ON (t1.pk) t1.pk FROM f AS t1",
-            "SELECT MAX(t1.pk) FROM f AS t1",
-            "SELECT DISTINCT t1.pk + 1 FROM f AS t1",
-            "SELECT DISTINCT t1.pk, t1.k FROM f AS t1",
-            "SELECT DISTINCT t1.pk FROM f AS t1 WHERE random() < 0.5",
-            "SELECT DISTINCT t1.pk FROM f AS t1 WHERE t1.ts < now()",
-            "WITH a AS (SELECT * FROM f WHERE 1 = 0) SELECT a.pk FROM a",
-            "SELECT DISTINCT t1.pk FROM f AS t1 CONNECT BY PRIOR t1.pk = t1.k",
-            "SELECT DISTINCT t1.pk FROM f AS t1 WHERE t1.ts < LOCALTIMESTAMP",
-            "SELECT DISTINCT t1.pk FROM f AS t1 WHERE t1.ts < 'now'::timestamp",
-            "SELECT DISTINCT t1.pk FROM f AS t1 WHERE random_normal() > 0",
-            "SELECT DISTINCT t1.pk FROM f AS t1 WHERE t1.k IN (SELECT s.k FROM s TABLESAMPLE BERNOULLI (10))",
-            "SELECT DISTINCT t1.pk FROM f AS t1 WHERE t1.k IN (SELECT s.k FROM s LIMIT 5)",
-            "SELECT DISTINCT t1.pk FROM f AS t1 WHERE t1.k IN (SELECT s.k FROM s ORDER BY s.k LIMIT 5)",
-            "SELECT DISTINCT t1.pk FROM f AS t1 WHERE t1.k IN (SELECT s.k FROM s ORDER BY s.k OFFSET 5)",
-            "SELECT DISTINCT t1.pk FROM f AS t1 WHERE t1.k IN (SELECT DISTINCT ON (s.g) s.k FROM s ORDER BY s.g)",
-            "SELECT DISTINCT t1.pk FROM f AS t1 WHERE t1.ts < 'now'",
-            "SELECT DISTINCT t1.pk FROM f AS t1 WHERE t1.xid = txid_current()",
-            "SELECT DISTINCT t1.pk FROM f AS t1 WHERE t1.owner = CURRENT_USER",
-            "SELECT DISTINCT t1.pk FROM f AS t1 WHERE t1.owner = SESSION_USER",
-            "SELECT DISTINCT t1.pk FROM f AS t1 WHERE t1.k = current_setting('app.k')::int",
-            "SELECT DISTINCT t1.pk FROM f AS t1 WHERE age(t1.ts) < INTERVAL '1 day'",
-            "SELECT DISTINCT t1.pk FROM f AS t1 WHERE t1.s = current_schema()",
-            "SELECT DISTINCT t1.pk FROM f AS t1 WHERE t1.ip = inet_client_addr()",
-            "SELECT DISTINCT t1.pk FROM f AS t1 JOIN d AS t2 ON t1.k = t2.k",
-            "SELECT DISTINCT t1.pk FROM f AS t1 LEFT JOIN d AS t2 ON t1.k = t2.k",
-            "SELECT DISTINCT t1.pk FROM f AS t1, f AS t2 WHERE t1.k = t2.k",
-            "SELECT DISTINCT t1.pk FROM f AS t1, d AS t2 WHERE x = 1",
-            "SELECT DISTINCT t1.pk FROM f AS t1 WHERE t1.k IN (SELECT t1.k FROM s AS t1)",
-            "SELECT DISTINCT t1.pk FROM f AS t1 GROUP BY t1.pk",
-            "SELECT DISTINCT t1.pk FROM (SELECT * FROM f) AS t1",
-            "SELECT t1.pk FROM f AS t1 UNION SELECT t2.pk FROM g AS t2",
-        ],
-    )
-    def test_ambiguous_variants_have_no_signature(self, query):
-        assert variant_signature(query, "pk") is None
-
-    def test_finds_every_relaxation_the_cache_lookup_finds(self):
-        query = (
-            "SELECT lo.lo_orderkey FROM lineorder lo, customer c, supplier s, date d "
-            "WHERE lo.lo_custkey = c.c_custkey AND lo.lo_suppkey = s.s_suppkey AND lo.lo_orderdate = d.d_datekey "
-            "AND (c.c_region = 'ASIA' OR c.c_region = 'EUROPE') AND s.s_region = 'ASIA' AND d.d_year = 1997"
-        )
-        pairs = generate_all_query_hash_pairs(query, "lo_custkey", min_component_size=1, warn_no_partition_key=False)
-        hashes = {h for _, h in pairs}
-        signatures = {h: variant_signature(v, "lo_custkey") for v, h in pairs}
-        assert all(s is not None for s in signatures.values())
-        for variant, h in pairs:
-            lookup = (set(generate_all_hashes(variant, "lo_custkey", min_component_size=1)) & hashes) - {h}
-            structural = {o for o in hashes - {h} if is_relaxation_of(signatures[o], signatures[h])}
-            assert lookup <= structural, variant
+from partitioncache.query_processor import generate_all_query_hash_pairs
 
 
 class FakeCache:
-    """The three handler methods populate_query_variants uses, backed by a dict."""
+    """The handler methods populate_query_variants and its lookup use, backed by a dict."""
 
     def __init__(self, preset: dict | None = None):
         self.entries: dict[str, set] = dict(preset or {})
@@ -145,8 +21,11 @@ class FakeCache:
     def exists(self, key, partition_key="partition_key"):
         return key in self.entries
 
-    def get(self, key, partition_key="partition_key"):
-        return self.entries.get(key)
+    def get_intersected(self, keys, partition_key="partition_key"):
+        present = [self.entries[k] for k in keys if k in self.entries]
+        if not present:
+            return None, 0
+        return set.intersection(*present), len(present)
 
     def set_query(self, key, query_text, partition_key="partition_key"):
         self.queries[key] = query_text
@@ -187,18 +66,24 @@ def star_db(tmp_path):
     return path
 
 
+# A star join as in SSB and TPC-H: the fact table f holds the key, the dimensions filter it
 STAR_QUERY = "SELECT f.pk FROM f, d, e WHERE f.k = d.k AND f.j = e.j AND d.x = 1 AND e.y = 0"
+STAR_SETTINGS = {"min_component_size": 1, "partition_key_source_table": "f"}
 
 
-def _pairs(query=STAR_QUERY):
-    return generate_all_query_hash_pairs(query, "pk", min_component_size=1, partition_key_source_table="f", warn_no_partition_key=False)
+def _pairs(query=STAR_QUERY, settings=STAR_SETTINGS):
+    return generate_all_query_hash_pairs(query, "pk", warn_no_partition_key=False, **settings)
+
+
+def _populate(pairs, cache, db, settings=STAR_SETTINGS, **kwargs):
+    return populate_query_variants(pairs, "pk", cache, db, variant_settings=settings, **kwargs)
 
 
 class TestPopulateQueryVariants:
     def test_restricted_population_stores_the_same_keys(self, star_db):
         plain, restricted = FakeCache(), FakeCache()
-        plain_stats = populate_query_variants(_pairs(), "pk", plain, CountingDB(star_db), restrict=False)
-        stats = populate_query_variants(_pairs(), "pk", restricted, CountingDB(star_db))
+        plain_stats = _populate(_pairs(), plain, CountingDB(star_db), restrict=False)
+        stats = _populate(_pairs(), restricted, CountingDB(star_db))
 
         assert plain_stats.failed == 0
         assert len(plain.entries) == len(_pairs())
@@ -208,32 +93,34 @@ class TestPopulateQueryVariants:
 
     def test_key_limit_skips_large_intersections(self, star_db):
         db = CountingDB(star_db)
-        stats = populate_query_variants(_pairs(), "pk", FakeCache(), db, max_restriction_keys=0)
+        stats = _populate(_pairs(), FakeCache(), db, max_restriction_keys=0)
         assert stats.restricted == 0
+        assert stats.over_key_limit > 0
         assert not any(" IN (" in q for q in db.executed)
 
     def test_empty_intersection_is_stored_without_execution(self, star_db):
         query = "SELECT f.pk FROM f, d, e WHERE f.k = d.k AND f.j = e.j AND d.x = 7 AND e.y = 0"
         cache, db = FakeCache(), CountingDB(star_db)
-        stats = populate_query_variants(_pairs(query), "pk", cache, db)
+        stats = _populate(_pairs(query), cache, db)
 
         assert stats.empty_without_execution > 0
         assert stats.executed + stats.empty_without_execution == len(_pairs(query))
         assert len(db.executed) == stats.executed
         reference = FakeCache()
-        populate_query_variants(_pairs(query), "pk", reference, CountingDB(star_db), restrict=False)
+        _populate(_pairs(query), reference, CountingDB(star_db), restrict=False)
         assert cache.entries == reference.entries
 
     def test_cached_variants_are_not_executed_but_restrict(self, star_db):
         pairs = _pairs()
         full = FakeCache()
-        populate_query_variants(pairs, "pk", full, CountingDB(star_db), restrict=False)
+        _populate(pairs, full, CountingDB(star_db), restrict=False)
         smallest = min(pairs, key=lambda p: len(p[0]))
         cache, db = FakeCache({smallest[1]: full.entries[smallest[1]]}), CountingDB(star_db)
 
-        stats = populate_query_variants(pairs, "pk", cache, db)
+        stats = _populate(pairs, cache, db)
 
         assert stats.already_cached == 1
+        assert stats.restricted > 0
         assert smallest[0] not in db.executed
         assert cache.entries == full.entries
 
@@ -241,7 +128,7 @@ class TestPopulateQueryVariants:
         # The real SQLiteDBHandler error path: it raises, so the failure is not mistaken for "no rows"
         pairs = _pairs() + [("SELECT DISTINCT t1.pk FROM missing_table AS t1", "broken")]
         cache = FakeCache()
-        stats = populate_query_variants(pairs, "pk", cache, CountingDB(star_db))
+        stats = _populate(pairs, cache, CountingDB(star_db))
         assert stats.failed == 1
         assert "broken" not in cache.entries
         assert len(cache.entries) == len(pairs) - 1
@@ -249,38 +136,246 @@ class TestPopulateQueryVariants:
     def test_failed_relaxation_does_not_empty_the_variants_it_would_restrict(self, star_db):
         """A relaxation whose query fails is neither cached nor used; the larger variants keep their true results."""
         reference = FakeCache()
-        populate_query_variants(_pairs(), "pk", reference, CountingDB(star_db), restrict=False)
+        _populate(_pairs(), reference, CountingDB(star_db), restrict=False)
         pairs = _pairs()
         smallest = min(pairs, key=lambda p: len(p[0]))
         broken = [("SELECT DISTINCT t1.pk FROM missing_table AS t1", h) if h == smallest[1] else (v, h) for v, h in pairs]
 
         cache = FakeCache()
-        stats = populate_query_variants(broken, "pk", cache, CountingDB(star_db))
+        stats = _populate(broken, cache, CountingDB(star_db))
 
         assert stats.failed == 1
         assert smallest[1] not in cache.entries
         assert cache.entries == {h: keys for h, keys in reference.entries.items() if h != smallest[1]}
-
-    @pytest.mark.parametrize(("sql_dialect", "restricted"), [("sqlite", 1), ("postgres", 0)])
-    def test_dialect_decides_whether_quoted_names_are_the_same_table(self, star_db, sql_dialect, restricted):
-        """In SQLite "F" is table f, so the first variant restricts the second; in PostgreSQL they differ."""
-        pairs = [
-            ('SELECT DISTINCT t1.pk FROM "F" AS t1 WHERE t1.k = 1', "small"),
-            ("SELECT DISTINCT t1.pk FROM f AS t1 WHERE t1.k = 1 AND t1.j = 0", "large"),
-        ]
-        cache = FakeCache()
-        stats = populate_query_variants(pairs, "pk", cache, CountingDB(star_db), sql_dialect=sql_dialect)
-        assert stats.restricted == restricted
-        assert stats.failed == 0
-        assert cache.entries["large"] == {pk for pk in range(1, 201) if pk % 7 == 1 and pk % 5 == 0}
 
     def test_store_failures_are_counted(self, star_db):
         class FailingCache(FakeCache):
             def set_entry(self, *args, **kwargs):
                 return False
 
-        stats = populate_query_variants(_pairs(), "pk", FailingCache(), CountingDB(star_db))
+        stats = _populate(_pairs(), FailingCache(), CountingDB(star_db))
         assert stats.store_failed == stats.executed + stats.empty_without_execution > 0
+
+    def test_restriction_renders_keys_for_the_given_dialect(self):
+        """A key ending in a backslash must be escaped the MySQL way when the database is MySQL."""
+        pairs = _pairs("SELECT f.pk FROM f, d WHERE f.k = d.k AND f.x = 1")
+        small, large = sorted(pairs, key=lambda p: len(p[0]))
+        cache = FakeCache({small[1]: {"a\\", "b"}})
+
+        class RecordingDB:
+            def __init__(self):
+                self.executed = []
+
+            def execute(self, query):
+                self.executed.append(query)
+                return ["b"]
+
+        db = RecordingDB()
+        stats = _populate(pairs, cache, db, sql_dialect="mysql")
+
+        assert stats.restricted == 1
+        assert "'a\\\\'" in db.executed[0]
+        assert cache.entries[large[1]] == {"b"}
+
+
+@pytest.fixture
+def points_db(tmp_path):
+    """GeoMine-like: interaction points of pockets, every point of a pattern an alias of the same table."""
+    path = str(tmp_path / "points.db")
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE pts (pocket INTEGER, kind TEXT, x REAL, y REAL)")
+    rows = [(pocket, "ABC"[(pocket * 7 + i) % 3], (pocket * 13 + i * 5) % 11, (pocket * 3 + i * 7) % 9) for pocket in range(1, 61) for i in range(6)]
+    conn.executemany("INSERT INTO pts VALUES (?, ?, ?, ?)", rows)
+    conn.commit()
+    conn.close()
+    return path
+
+
+@pytest.fixture
+def flights_db(tmp_path):
+    """OpenSky-like: flight phases and segments, a pattern is a sequence of elements of the same flight."""
+    path = str(tmp_path / "flights.db")
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE phases (flight_id INTEGER, phase TEXT, t0 INTEGER, t1 INTEGER, alt INTEGER);
+        CREATE TABLE segments (flight_id INTEGER, scale INTEGER, t0 INTEGER, vrate INTEGER);
+        """
+    )
+    phases = [(f, ["CL", "CR", "DE"][(f + i) % 3], 100 * i + f % 17, 100 * i + 40 + f % 23, (f * 37 + i * 11) % 900) for f in range(1, 81) for i in range(5)]
+    segments = [(f, 60, 100 * i + (f * 7) % 90, (f + i * 3) % 9) for f in range(1, 81) for i in range(5)]
+    conn.executemany("INSERT INTO phases VALUES (?, ?, ?, ?, ?)", phases)
+    conn.executemany("INSERT INTO segments VALUES (?, ?, ?, ?)", segments)
+    conn.commit()
+    conn.close()
+    return path
+
+
+GEOMINE_LIKE = (
+    "SELECT p1.pocket FROM pts p1, pts p2, pts p3, pts p4 "
+    "WHERE p1.pocket = p2.pocket AND p1.pocket = p3.pocket AND p1.pocket = p4.pocket "
+    "AND p1.kind = 'A' AND p2.kind = 'B' AND p3.kind = 'C' AND p4.kind = 'A' "
+    "AND (p1.x - p2.x) * (p1.x - p2.x) + (p1.y - p2.y) * (p1.y - p2.y) <= 30.5 "
+    "AND (p2.x - p3.x) * (p2.x - p3.x) + (p2.y - p3.y) * (p2.y - p3.y) <= 40.25 "
+    "AND (p3.x - p4.x) * (p3.x - p4.x) + (p3.y - p4.y) * (p3.y - p4.y) <= 25.75 "
+    "AND (p1.x - p4.x) * (p1.x - p4.x) + (p1.y - p4.y) * (p1.y - p4.y) >= 1.5"
+)
+GEOMINE_SETTINGS = {"min_component_size": 2, "max_component_size": 5, "follow_graph": True, "keep_all_attributes": True, "bucket_steps": {"x": 1.0}}
+OPENSKY_LIKE = (
+    "SELECT DISTINCT e1.flight_id FROM phases e1, phases e2, segments e3 "
+    "WHERE e1.flight_id = e2.flight_id AND e1.flight_id = e3.flight_id "
+    "AND e1.phase = 'DE' AND e1.alt <= 700 AND e2.phase = 'CL' AND e3.scale = 60 AND e3.vrate >= 4 "
+    "AND e2.t0 >= e1.t1 + 0 AND e2.t0 <= e1.t1 + 160 AND e3.t0 >= e1.t1 + 0 AND e3.t0 <= e1.t1 + 260"
+)
+OPENSKY_SETTINGS = {"min_component_size": 1, "follow_graph": True, "keep_all_attributes": True, "bucket_steps": 0}
+
+
+class TestSelfJoins:
+    """Variants that use a table several times are restricted like any other (identified by hash, not by names)."""
+
+    @pytest.mark.parametrize(
+        ("db_fixture", "query", "key", "settings"),
+        [("points_db", GEOMINE_LIKE, "pocket", GEOMINE_SETTINGS), ("flights_db", OPENSKY_LIKE, "flight_id", OPENSKY_SETTINGS)],
+        ids=["geomine_like", "opensky_like"],
+    )
+    def test_restricted_population_stores_the_same_keys(self, request, db_fixture, query, key, settings):
+        path = request.getfixturevalue(db_fixture)
+        pairs = generate_all_query_hash_pairs(query, key, **settings)
+        plain, restricted = FakeCache(), FakeCache()
+        populate_query_variants(pairs, key, plain, CountingDB(path), restrict=False)
+        stats = populate_query_variants(pairs, key, restricted, CountingDB(path), variant_settings=settings)
+
+        assert len(plain.entries) == len(pairs) and any(plain.entries.values())
+        assert restricted.entries == plain.entries
+        # Most variants with relaxations are restricted (the smallest have none); a signature by table names restricted none
+        assert stats.restricted + stats.empty_without_execution > (len(pairs) - stats.no_relaxation) // 2
+        assert stats.failed == stats.lookup_failed == 0
+
+    def test_lookup_with_other_settings_finds_fewer_relaxations_but_stays_correct(self, points_db):
+        pairs = generate_all_query_hash_pairs(GEOMINE_LIKE, "pocket", **GEOMINE_SETTINGS)
+        plain, matching, defaults = FakeCache(), FakeCache(), FakeCache()
+        populate_query_variants(pairs, "pocket", plain, CountingDB(points_db), restrict=False)
+        good = populate_query_variants(pairs, "pocket", matching, CountingDB(points_db), variant_settings=GEOMINE_SETTINGS)
+        other = populate_query_variants(pairs, "pocket", defaults, CountingDB(points_db), variant_settings={"min_component_size": 2})
+
+        assert matching.entries == defaults.entries == plain.entries
+        assert other.restricted + other.empty_without_execution < good.restricted + good.empty_without_execution
+
+
+class TestWithoutPartitionKeyJoins:
+    """A key whose tables are related by time, not joined on it, as with skip_partition_key_joins."""
+
+    SETTINGS = {"min_component_size": 1, "keep_all_attributes": True, "skip_partition_key_joins": True}
+    TIME_JOIN = "SELECT a.pk FROM a, b WHERE a.x = 1 AND b.y = 1 AND b.t >= a.t AND b.t <= a.t + 10"
+    B_ONLY = "SELECT b.pk FROM b WHERE b.y = 1"
+
+    @pytest.fixture
+    def db(self, tmp_path):
+        path = str(tmp_path / "buckets.db")
+        conn = sqlite3.connect(path)
+        conn.executescript(
+            "CREATE TABLE a (pk INTEGER, t INTEGER, x INTEGER); CREATE TABLE b (pk INTEGER, t INTEGER, y INTEGER);"
+            "INSERT INTO a VALUES (1, 0, 1), (2, 100, 1); INSERT INTO b VALUES (2, 5, 1), (3, 105, 1);"
+        )
+        conn.commit()
+        conn.close()
+        return path
+
+    def test_entries_of_other_queries_do_not_drop_keys(self, db):
+        """With the settings of the variants, the lookup never generates 'b alone', whose keys are b's."""
+        cache, reference = FakeCache(), FakeCache()
+        for query in (self.B_ONLY, self.TIME_JOIN):
+            pairs = generate_all_query_hash_pairs(query, "pk", warn_no_partition_key=False, **self.SETTINGS)
+            populate_query_variants(pairs, "pk", cache, CountingDB(db), variant_settings=self.SETTINGS)
+            populate_query_variants(pairs, "pk", reference, CountingDB(db), restrict=False)
+        assert cache.entries == reference.entries
+        assert {1, 2} in cache.entries.values()
+
+    @pytest.mark.parametrize(("skip", "joined"), [(True, {"t1"}), (False, {"t1", "t2"})])
+    def test_join_methods_restrict_the_key_table_only_without_key_joins(self, skip, joined):
+        import re
+
+        from partitioncache.population import restrict_with_cache
+
+        variant = "SELECT DISTINCT t1.pk FROM a AS t1, b AS t2 WHERE t1.t <= t2.t AND t2.t <= t1.t + 10"
+        cache = FakeCache({"relaxation": {1, 2}})
+        cache.get_intersected = lambda keys, partition_key="pk": ({1, 2}, 1)  # type: ignore[method-assign]
+        restriction = restrict_with_cache(variant, cache, "pk", {"skip_partition_key_joins": skip}, method="TMP_TABLE_JOIN")
+        assert restriction.restricted
+        assert set(re.findall(r"AS tmp_(\w+) ON", restriction.query)) == joined
+
+
+class TestLookupSettings:
+    def test_missing_settings_take_the_generator_defaults(self):
+        from partitioncache.population import lookup_settings
+
+        settings = lookup_settings(None)
+        assert settings["min_component_size"] == 1 and settings["keep_all_attributes"] is True  # get_partition_keys: 2, False
+        assert "max_component_size" not in settings and "warn_no_partition_key" not in settings
+
+    def test_unknown_setting_raises(self):
+        with pytest.raises(TypeError, match="min_component"):
+            populate_query_variants([], "pk", FakeCache(), None, variant_settings={"min_component": 1})  # type: ignore[arg-type]
+
+    def test_spatial_and_grid_variants_run_unrestricted(self, star_db, caplog):
+        cache = FakeCache()
+        with caplog.at_level("WARNING", logger="PartitionCache"):
+            stats = populate_query_variants(_pairs(), "pk", cache, CountingDB(star_db), variant_settings={**STAR_SETTINGS, "grid_cell_size": 100.0})
+        assert stats.restricted == 0 and stats.executed == len(_pairs())
+        assert "populated unrestricted" in caplog.text
+
+    def test_lazy_needs_a_lazy_handler_and_no_key_limit(self):
+        from unittest.mock import Mock
+
+        from partitioncache.cache_handler.abstract import AbstractCacheHandler_Lazy
+
+        with pytest.raises(ValueError, match="lazy intersection"):
+            populate_query_variants([], "pk", FakeCache(), None, lazy=True, method="IN_SUBQUERY")  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="key limit"):
+            populate_query_variants([], "pk", Mock(spec=AbstractCacheHandler_Lazy), None, lazy=True, method="IN_SUBQUERY", max_restriction_keys=5)  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="method"):
+            populate_query_variants([], "pk", FakeCache(), None, method="IN_SUBQUERY")  # type: ignore[arg-type]
+
+    def test_lazy_restriction_uses_the_cache_subquery(self):
+        from unittest.mock import Mock
+
+        from partitioncache.cache_handler.abstract import AbstractCacheHandler_Lazy
+
+        pairs = _pairs("SELECT f.pk FROM f, d WHERE f.k = d.k AND f.x = 1")
+        cache = Mock(spec=AbstractCacheHandler_Lazy)
+        cache.exists.return_value = False
+        cache.set_entry.return_value = True
+        cache.get_intersected_lazy.return_value = ("SELECT pk FROM cached_keys", 1)
+        db = Mock()
+        db.execute.return_value = [1]
+
+        stats = _populate(pairs, cache, db, lazy=True, method="IN_SUBQUERY")
+
+        assert stats.restricted == len(pairs) == 2  # the mock reports a hit for every lookup
+        assert all("IN (SELECT pk FROM cached_keys)" in call.args[0] for call in db.execute.call_args_list)
+
+
+class TestNoSilentNoOp:
+    def test_warning_when_variants_have_relaxations_but_none_is_restricted(self, star_db, caplog):
+        class NothingCached(FakeCache):
+            def get_intersected(self, keys, partition_key="partition_key"):
+                return None, 0
+
+        with caplog.at_level("WARNING", logger="PartitionCache"):
+            stats = _populate(_pairs(), NothingCached(), CountingDB(star_db))
+        assert stats.restricted == 0 and stats.no_cached_relaxation > 0
+        assert "no variant was restricted" in caplog.text
+
+    def test_no_warning_for_a_query_without_relaxations(self, star_db, caplog):
+        pairs = _pairs("SELECT f.pk FROM f WHERE f.k = 1")
+        with caplog.at_level("WARNING", logger="PartitionCache"):
+            stats = _populate(pairs, FakeCache(), CountingDB(star_db))
+        assert stats.no_relaxation == len(pairs) and "restricted" not in caplog.text
+
+    def test_no_warning_when_restriction_is_off(self, star_db, caplog):
+        with caplog.at_level("WARNING", logger="PartitionCache"):
+            _populate(_pairs(), FakeCache(), CountingDB(star_db), restrict=False)
+        assert "restricted" not in caplog.text
 
 
 def test_order_is_reproducible_for_variants_of_the_same_size():
@@ -290,23 +385,19 @@ def test_order_is_reproducible_for_variants_of_the_same_size():
     assert order_variants_for_population(pairs) == order_variants_for_population(list(reversed(pairs)))
 
 
-def test_restriction_renders_keys_for_the_given_dialect():
-    """A key ending in a backslash must be escaped the MySQL way when the database is MySQL."""
-    small = ("SELECT DISTINCT t1.pk FROM f AS t1 WHERE t1.x = 1", "small")
-    large = ("SELECT DISTINCT t1.pk FROM f AS t1, d AS t2 WHERE t1.k = t2.k AND t1.x = 1", "large")
-    cache = FakeCache({"small": {"a\\", "b"}})
+@pytest.mark.parametrize(
+    "query, alias",
+    [
+        ("SELECT DISTINCT t1.pk FROM a AS t1, b AS t2 WHERE t1.x = t2.x", "t1"),
+        ("SELECT DISTINCT p1.pk FROM a AS t1, list AS p1 WHERE t1.pk = p1.pk", "p1"),
+        ("SELECT DISTINCT t2.pk AS pk FROM a AS t1, b AS t2", "t2"),
+        ("SELECT DISTINCT pk FROM a", None),
+        ("SELECT DISTINCT t1.other FROM a AS t1", None),
+        ("SELECT t1.pk, t1.x FROM a AS t1", None),
+        ("not sql at all (", None),
+    ],
+)
+def test_variant_key_alias(query, alias):
+    from partitioncache.query_processor import variant_key_alias
 
-    class RecordingDB:
-        def __init__(self):
-            self.executed = []
-
-        def execute(self, query):
-            self.executed.append(query)
-            return ["b"]
-
-    db = RecordingDB()
-    stats = populate_query_variants([small, large], "pk", cache, db, sql_dialect="mysql")
-
-    assert stats.restricted == 1
-    assert "'a\\\\'" in db.executed[0]
-    assert cache.entries["large"] == {"b"}
+    assert variant_key_alias(query, "pk") == alias

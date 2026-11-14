@@ -23,7 +23,6 @@ import sqlglot.optimizer.simplify
 from sqlglot import tokens
 from sqlglot.dialects.dialect import Dialect
 from sqlglot.errors import ParseError
-from sqlglot.optimizer.normalize_identifiers import normalize_identifiers
 from sqlglot.tokens import TokenType
 
 import partitioncache.sqlglot_compat  # noqa: F401 -- keeps ST_Point/ST_MakePoint as parsed before sqlglot 26
@@ -2416,157 +2415,25 @@ def order_variants_for_population(query_hash_pairs: list[tuple[str, str]]) -> li
     return sorted(query_hash_pairs, key=lambda pair: (*size(pair), pair[1]))
 
 
-VariantSignature = tuple[frozenset[str], frozenset[str], str]
+def variant_key_alias(query: str, partition_key: str, sql_dialect: str = "postgres") -> str | None:
+    """The alias of the table whose partition key a query variant selects, or None if it selects no qualified key.
 
-# Results that can differ between two executions make conditions incomparable across variants. Functions
-# not listed here (including user-defined ones) are assumed to be deterministic.
-_VOLATILE_EXPRESSIONS = (
-    exp.Rand, exp.CurrentTimestamp, exp.CurrentDate, exp.CurrentTime, exp.CurrentDatetime, exp.Localtimestamp, exp.Uuid, exp.TableSample,
-    exp.CurrentUser, exp.SessionUser, exp.CurrentSchema,
-)
-_VOLATILE_FUNCTION_NAMES = {
-    "random", "rand", "random_normal", "now", "clock_timestamp", "statement_timestamp", "transaction_timestamp", "timeofday",
-    "localtime", "localtimestamp", "nextval", "currval", "setval", "setseed", "gen_random_uuid", "uuid_generate_v4",
-    "txid_current", "txid_current_if_assigned", "pg_current_xact_id", "pg_backend_pid", "current_setting",
-    "inet_client_addr", "inet_client_port",
-}
-_VOLATILE_DATETIME_LITERALS = {"now", "today", "tomorrow", "yesterday"}
-_PLAIN_TABLE_ARGS = {"this", "db", "catalog", "alias"}
-# A variant is SELECT [DISTINCT] key FROM tables WHERE conditions; any other clause makes it ungradable
-_ALLOWED_SELECT_ARGS = {"expressions", "distinct", "from_", "joins", "where", "order"}
-
-
-def _plain_table(source: exp.Expr | None) -> exp.Table | None:
-    """The source if it is a bare table reference (optionally schema-qualified and aliased), else None."""
-    if not isinstance(source, exp.Table):
-        return None
-    if any(value for key, value in source.args.items() if key not in _PLAIN_TABLE_ARGS):
-        return None  # TABLESAMPLE, pivots, hints, ...
-    alias = source.args.get("alias")
-    if alias is not None and alias.args.get("columns"):
-        return None  # column aliases rename columns
-    return source
-
-
-def _is_volatile(expression: exp.Expr) -> bool:
-    """True if the expression can give different results in two executions, so its rows are not a fixed set.
-
-    Covers volatile functions, 'now'-style datetime literals (with or without a cast; any string literal
-    'now', 'today', ... counts, which at worst leaves a variant unrestricted), sampling, and subqueries whose
-    rows are arbitrary: LIMIT/OFFSET (ties make even an ordered LIMIT arbitrary) and DISTINCT ON.
-    """
-    if any(True for _ in expression.find_all(*_VOLATILE_EXPRESSIONS)):
-        return True
-    for func in expression.find_all(exp.Anonymous):
-        # age(x) is measured from the current date; age(x, y) is deterministic
-        if func.name.lower() in _VOLATILE_FUNCTION_NAMES or (func.name.lower() == "age" and len(func.expressions) == 1):
-            return True
-    if any(lit.is_string and lit.this.strip().lower() in _VOLATILE_DATETIME_LITERALS for lit in expression.find_all(exp.Literal)):
-        return True
-    for sub in expression.find_all(exp.Select):
-        distinct = sub.args.get("distinct")
-        if sub.args.get("limit") is not None or sub.args.get("offset") is not None or sub.args.get("fetch") is not None:
-            return True
-        if distinct is not None and distinct.args.get("on") is not None:
-            return True
-    return False
-
-
-def variant_signature(query: str, partition_key: str, sql_dialect: str = "postgres") -> VariantSignature | None:
-    """Describe a query variant by its tables, its conditions and the table that provides the partition key.
-
-    Aliases are replaced by table names (with schema and catalog), so the signature does not depend on how a
-    variant numbers its aliases. Variant A is a relaxation of variant B when ``is_relaxation_of(sig_a, sig_b)``:
-    B joins the tables of A and keeps all conditions of A, so B's partition keys are a subset of A's.
-
-    Only the shape the variant generator produces is judged: ``SELECT [DISTINCT] alias.key FROM t1 AS a, t2 AS b
-    WHERE cond AND cond ...`` with bare tables. Anything else returns None: a table used twice, explicit or
-    NATURAL joins, subqueries/UNNEST/LATERAL in FROM, TABLESAMPLE, DISTINCT ON, a select list other than the
-    bare key column, grouping/limits/set operations, unqualified columns, and volatile functions.
-
-    Args:
-        query: A query variant as produced by ``generate_all_query_hash_pairs``.
-        partition_key: The partition key column the variant selects.
-        sql_dialect: Dialect of the database, which decides whether identifiers are case-folded (unquoted
-            ``LO`` and ``lo`` are one table in PostgreSQL, quoted ``"LO"`` is another).
-
-    Returns:
-        (table names, conditions with aliases replaced by table names, partition key table) or None.
-
-    Raises:
-        ValueError: sql_dialect is not a dialect sqlglot knows (e.g. "postgresql" instead of "postgres").
+    Variants select ``DISTINCT <alias>.<partition_key>``. Restricting only this table to a superset of the variant's
+    keys keeps every row of its result, however its other tables are related to it; restricting the other tables too
+    is equivalent only when they are all joined on the partition key.
     """
     try:
-        select = normalize_identifiers(sqlglot.parse_one(query), dialect=sql_dialect)
+        select = sqlglot.parse_one(query, read=sql_dialect)
     except sqlglot.ParseError:
         return None
-    if not isinstance(select, exp.Select) or any(value for key, value in select.args.items() if key not in _ALLOWED_SELECT_ARGS):
+    if not isinstance(select, exp.Select) or len(select.expressions) != 1:
         return None
-    distinct = select.args.get("distinct")
-    if distinct is not None and distinct.args.get("on") is not None:
-        return None
-
-    from_clause = select.args.get("from_")
-    sources = [from_clause.this if from_clause is not None else None]
-    for join in select.args.get("joins") or []:
-        if join.args.get("on") or join.args.get("using") or join.side or join.kind or join.args.get("method"):
-            return None
-        sources.append(join.this)
-    plain_tables = [_plain_table(source) for source in sources]
-    tables = [table for table in plain_tables if table is not None]
-    if len(tables) != len(plain_tables):
-        return None
-    # Quoted after normalization, so "LO" and lo (different tables in PostgreSQL) stay apart
-    names = [exp.table_name(table, identify=True) for table in tables]
-    if len(set(names)) != len(names):
-        return None
-    alias_to_table = {table.alias_or_name: exp.table_name(table, identify=True) for table in tables}
-
-    if len(select.expressions) != 1:
-        return None
-    key_column = select.expressions[0]
-    key_names = {partition_key, normalize_identifiers(exp.to_identifier(partition_key), dialect=sql_dialect).name}
-    if not isinstance(key_column, exp.Column) or key_column.name not in key_names or key_column.table not in alias_to_table:
-        return None
-    key_table = alias_to_table[key_column.table]
-
-    where = select.args.get("where")
-    if where is None:
-        conditions = []
-    elif isinstance(where.this, exp.And):
-        conditions = list(where.this.flatten())
-    else:
-        conditions = [where.this]
-
-    normalized = set()
-    for condition in conditions:
-        if _is_volatile(condition):
-            return None
-        condition = condition.copy()
-        # Aliases introduced inside the condition (IN/EXISTS subqueries) must not shadow outer ones
-        inner_tables = list(condition.find_all(exp.Table))
-        inner_aliases = {table.alias_or_name for table in inner_tables}
-        inner_names = {exp.table_name(table) for table in inner_tables} | {exp.table_name(table, identify=True) for table in inner_tables}
-        if (inner_aliases | inner_names) & (alias_to_table.keys() | set(names)):
-            return None
-        for col in condition.find_all(exp.Column):
-            if not col.table or col.args.get("db") or col.args.get("catalog"):
-                return None
-            if col.table in alias_to_table:
-                col.set("table", exp.to_identifier(alias_to_table[col.table]))
-            elif col.table not in inner_aliases:
-                return None
-        normalized.add(condition.sql())
-    return frozenset(names), frozenset(normalized), key_table
-
-
-def is_relaxation_of(candidate: VariantSignature, variant: VariantSignature) -> bool:
-    """True if the variant joins all tables and keeps all conditions of the candidate, with the same key table.
-
-    Then every partition key of the variant is also one of the candidate, so the candidate's cached
-    keys can restrict the variant.
-    """
-    return candidate[2] == variant[2] and candidate[0] <= variant[0] and candidate[1] <= variant[1]
+    column = select.expressions[0]
+    if isinstance(column, exp.Alias):
+        column = column.this
+    if isinstance(column, exp.Column) and column.name == partition_key and column.table:
+        return column.table
+    return None
 
 
 def hash_query(query: str) -> str:
