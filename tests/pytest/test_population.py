@@ -305,7 +305,42 @@ class TestWithoutPartitionKeyJoins:
         assert set(re.findall(r"AS tmp_(\w+) ON", restriction.query)) == joined
 
 
+class TestAddedConstraints:
+    """add_constraints yields variants with and without the added condition; the lookup must not add it."""
+
+    QUERY = "SELECT a.id FROM pts AS a, pts AS b WHERE a.pk = b.pk AND a.kind = 'a' AND b.kind = 'b' AND a.size >= 2 AND ABS(a.x - b.x) < 1.6"
+    SETTINGS = {"min_component_size": 1, "add_constraints": {"pts": "size = 4"}}
+
+    def test_restricted_population_stores_the_same_keys(self, tmp_path):
+        path = str(tmp_path / "pts.db")
+        conn = sqlite3.connect(path)
+        conn.execute("CREATE TABLE pts (id INTEGER, pk INTEGER, kind TEXT, size INTEGER, x REAL)")
+        conn.executemany("INSERT INTO pts VALUES (?, ?, ?, ?, ?)", [(i, i % 9, "ab"[i % 2], 1 + i % 5, (i * 7 % 13) / 2) for i in range(120)])
+        conn.commit()
+        conn.close()
+        pairs = generate_all_query_hash_pairs(self.QUERY, "id", warn_no_partition_key=False, **self.SETTINGS)
+        assert any("size = 4" in variant for variant, _ in pairs) and any("size = 4" not in variant for variant, _ in pairs)
+
+        plain, restricted = FakeCache(), FakeCache()
+        populate_query_variants(pairs, "id", plain, CountingDB(path), restrict=False)
+        stats = populate_query_variants(pairs, "id", restricted, CountingDB(path), variant_settings=self.SETTINGS)
+
+        assert restricted.entries == plain.entries
+        assert stats.restricted + stats.empty_without_execution > 0
+
+
 class TestLookupSettings:
+    def test_lookup_settings_are_named_parameters_of_both_lookups(self):
+        """A generator setting the lookups do not name would fail every lookup (they take **kwargs only for old names)."""
+        import inspect
+
+        from partitioncache.apply_cache import get_partition_keys, get_partition_keys_lazy
+        from partitioncache.population import lookup_settings
+
+        for lookup in (get_partition_keys, get_partition_keys_lazy):
+            named = {name for name, p in inspect.signature(lookup).parameters.items() if p.kind is not p.VAR_KEYWORD}
+            assert set(lookup_settings(None)) <= named, lookup.__name__
+
     def test_missing_settings_take_the_generator_defaults(self):
         from partitioncache.population import lookup_settings
 
