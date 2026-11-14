@@ -725,6 +725,18 @@ class TestApplyCacheLazy:
         assert stats["cache_hits"] == 0
         assert stats["generated_variants"] > 0  # Should have generated some subqueries
 
+    @pytest.mark.parametrize("method", ["IN_SUBQUERY", "TMP_TABLE_IN", "TMP_TABLE_JOIN", "UNLOGGED_TABLE_JOIN"])
+    @pytest.mark.parametrize("p0_alias", ["u", None])
+    def test_complete_miss_leaves_the_query_unrestricted(self, method, p0_alias):
+        """No matching cache entry: the handler returns (None, 0) and no method builds a table of all keys."""
+        query = "SELECT * FROM users AS u JOIN orders AS o ON u.id = o.user_id WHERE u.active = true"
+        mock_handler = self.create_mock_cache_handler(lazy_subquery=None, used_hashes=0)
+
+        enhanced_query, stats = apply_cache_lazy(query, mock_handler, "zipcode", method=method, p0_alias=p0_alias)
+
+        assert enhanced_query == query
+        assert stats["enhanced"] == 0 and stats["cache_hits"] == 0
+
     def test_empty_lazy_subquery_returns_original(self):
         """Test that function returns original query when lazy subquery is empty."""
         query = "SELECT * FROM users AS u WHERE u.active = true"
@@ -1128,7 +1140,7 @@ class TestEagerPathKeepsTheQueryDialect:
 
     QUERY = "SELECT p.pocket_key FROM pocket_properties AS p WHERE prop_value LIKE ANY(ARRAY['%4BXA%', '%1UNL%'])"
 
-    @pytest.mark.parametrize("method", ["IN", "VALUES", "TMP_TABLE_IN", "TMP_TABLE_JOIN"])
+    @pytest.mark.parametrize("method", ["IN", "VALUES", "TMP_TABLE_IN", "TMP_TABLE_JOIN", "UNLOGGED_TABLE_JOIN"])
     def test_postgres_array_literal_survives(self, method):
         result = extend_query_with_partition_keys(self.QUERY, {1, 2}, "pocket_key", method=method, p0_alias="p")
         assert "LIKE ANY(ARRAY['%4BXA%', '%1UNL%'])" in result
