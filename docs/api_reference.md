@@ -219,8 +219,12 @@ print(optimized)
 > `ValueError`; an empty key set (a single statement) gets no settings.
 
 > **Key table types.** The temporary and unlogged key tables take the type of the keys: `INT`/`BIGINT`,
-> `DOUBLE PRECISION` for float keys, `TIMESTAMP`/`TIMESTAMPTZ` for datetimes, otherwise `TEXT`. String keys are
-> escaped literals.
+> `NUMERIC` for `Decimal` keys (psycopg's type for numeric columns), `TIMESTAMP`/`TIMESTAMPTZ` for datetimes,
+> otherwise `TEXT`. String keys are escaped literals. **Float keys** are refused (`ValueError`) by `VALUES` and the
+> key-table methods: a float read back from a `real` (float4) column is the double nearest to its text, and a
+> double precision key list compares `real = double precision`, so it would silently match none. Use `IN`, whose
+> literals take the column's type. Population and `pcache-monitor` run such variants unrestricted and count them
+> (`float_keys`).
 
 #### `extend_query_with_partition_keys_lazy(query: str, lazy_subquery: str, partition_key: str, method: Literal["IN_SUBQUERY", "TMP_TABLE_IN", "TMP_TABLE_JOIN", "UNLOGGED_TABLE_JOIN"] = "IN_SUBQUERY", p0_alias: str | None = None, analyze_tmp_table: bool = True, auto_detect_partition_join: bool = True, partition_join_table: str | None = None, sql_dialect: str = "postgres")`
 

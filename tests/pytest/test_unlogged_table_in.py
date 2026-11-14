@@ -11,6 +11,7 @@ import os
 import re
 import uuid
 from datetime import UTC, datetime
+from decimal import Decimal
 from unittest.mock import Mock
 
 import pytest
@@ -166,15 +167,15 @@ class TestPlannerCollapseLimit:
 
 
 class TestTypedKeyTables:
-    """A TEXT key column does not compare with a numeric or timestamp partition key column."""
+    """A TEXT key column does not compare with a numeric or timestamp partition key column; float keys are refused."""
 
     @pytest.mark.parametrize(
         ("keys", "sql_type"),
         [
             ({1, 2}, "INT"),
             ({1, 2**40}, "BIGINT"),
-            ({1.5, 2.25}, "DOUBLE PRECISION"),
-            ({1, 2.5}, "DOUBLE PRECISION"),
+            ({Decimal("1.50"), Decimal("2.25")}, "NUMERIC"),
+            ({1, Decimal("2.5")}, "NUMERIC"),
             ({datetime(2024, 1, 1, 12, 30)}, "TIMESTAMP"),
             ({datetime(2024, 1, 1, tzinfo=UTC)}, "TIMESTAMPTZ"),
             ({"a", "b"}, "TEXT"),
@@ -188,11 +189,21 @@ class TestTypedKeyTables:
         script = extend_query_with_partition_keys(QUERY, {"o'brien"}, "region_id", method="TMP_TABLE_JOIN", p0_alias="u")
         assert "(VALUES('o''brien'))" in script
 
-    def test_float_keys_are_numbers(self):
-        script = extend_query_with_partition_keys(QUERY, {1.5}, "region_id", method="TMP_TABLE_IN", p0_alias="u")
-        assert "(VALUES(1.5))" in script
+    def test_decimal_keys_are_numbers(self):
+        script = extend_query_with_partition_keys(QUERY, {Decimal("1.50")}, "region_id", method="TMP_TABLE_IN", p0_alias="u")
+        assert "(VALUES(1.50))" in script
 
-    @pytest.mark.parametrize(("keys", "cast"), [({1.5}, "DOUBLE PRECISION"), ({datetime(2024, 1, 1)}, "TIMESTAMP")])
+    @pytest.mark.parametrize("method", ["VALUES", *SCRIPT_METHODS])
+    def test_float_keys_are_refused_for_typed_key_lists(self, method):
+        """As double precision they would silently miss a real (float4) column."""
+        with pytest.raises(ValueError, match="use method IN"):
+            extend_query_with_partition_keys(QUERY, {1.5, 2}, "region_id", method=method, p0_alias="u")
+
+    def test_float_keys_stay_untyped_in_in(self):
+        script = extend_query_with_partition_keys(QUERY, {1.5}, "region_id", method="IN", p0_alias="u")
+        assert "u.region_id IN ('1.5')" in script
+
+    @pytest.mark.parametrize(("keys", "cast"), [({Decimal("1.5")}, "NUMERIC"), ({datetime(2024, 1, 1)}, "TIMESTAMP")])
     def test_unlogged_key_table_casts_to_the_key_type(self, keys, cast):
         script = extend_query_with_partition_keys(QUERY, keys, "region_id", method="UNLOGGED_TABLE_IN", p0_alias="u")
         assert f"SELECT CAST(partition_key AS {cast}) AS partition_key FROM (VALUES (" in script
@@ -251,7 +262,8 @@ class TestAgainstPostgreSQL:
         table = f"unl_in_points_{uuid.uuid4().hex[:8]}"
         with psycopg.connect(**params, autocommit=True) as conn:
             conn.execute(
-                f"CREATE TABLE {table} AS SELECT g AS id, g % 10 AS region_id, (g % 10) + 0.5 AS score, "
+                f"CREATE TABLE {table} AS SELECT g AS id, g % 10 AS region_id, CAST((g % 10) + 0.5 AS numeric(10, 2)) AS score, "
+                f"CAST((g % 10) / 10.0 AS real) AS k4, "
                 f"TIMESTAMP '2024-01-01' + (g % 10) * INTERVAL '1 day' AS day, 'r' || (g % 10) AS label FROM generate_series(1, 100) g"
             )
         yield params, table
@@ -297,17 +309,33 @@ class TestAgainstPostgreSQL:
     @pytest.mark.parametrize(
         ("column", "keys"),
         [
-            ("score", {1.5, 2.5}),
+            ("score", {Decimal("1.50"), Decimal("2.50")}),
             ("day", {datetime(2024, 1, 2), datetime(2024, 1, 3)}),
             ("label", {"r1", "r2"}),
         ],
-        ids=["float", "timestamp", "text"],
+        ids=["decimal", "timestamp", "text"],
     )
     def test_typed_keys_restrict_typed_columns(self, db, method, column, keys):
         params, table = db
         script = extend_query_with_partition_keys(f"SELECT count(*) FROM {table} AS p", keys, column, method=method, p0_alias="p")
         assert self._run(params, script) == [(20,)]
         assert self._leftover_tables(params) == 0
+
+    @pytest.mark.parametrize("method", ["IN", "VALUES", *SCRIPT_METHODS])
+    def test_float_keys_of_a_real_column(self, db, method):
+        """Read back from a real column, 0.1 is the double nearest to its text: only IN matches it in the column's type."""
+        import psycopg
+
+        params, table = db
+        with psycopg.connect(**params, autocommit=True) as conn:
+            keys = {row[0] for row in conn.execute(f"SELECT DISTINCT k4 FROM {table} WHERE region_id IN (1, 2)")}
+        assert keys == {0.1, 0.2}
+        query = f"SELECT count(*) FROM {table} AS p"
+        if method != "IN":
+            with pytest.raises(ValueError, match="use method IN"):
+                extend_query_with_partition_keys(query, keys, "k4", method=method, p0_alias="p")
+            return
+        assert self._run(params, extend_query_with_partition_keys(query, keys, "k4", method=method, p0_alias="p")) == [(20,)]
 
     @pytest.mark.parametrize("method", SCRIPT_METHODS)
     def test_string_key_with_a_quote(self, db, method):

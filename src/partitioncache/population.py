@@ -16,6 +16,7 @@ from logging import getLogger
 from typing import Any, Literal
 
 from partitioncache.apply_cache import (
+    _TYPED_KEY_METHODS,
     _check_planner_collapse_limit,
     extend_query_with_partition_keys,
     extend_query_with_partition_keys_lazy,
@@ -85,7 +86,8 @@ class Restriction:
     hits: int = 0
     keys: int | None = None  # size of the eager intersection
     method: str | None = None
-    # Why the variant is not restricted: no_relaxation, no_cached_relaxation, below_min_hits, over_key_limit, no_key_alias
+    # Why the variant is not restricted: no_relaxation, no_cached_relaxation, below_min_hits, over_key_limit, no_key_alias,
+    # float_keys
     reason: str | None = None
 
 
@@ -169,6 +171,10 @@ def restrict_with_cache(
     if max_restriction_keys is not None and len(keys) > max_restriction_keys:
         # A restriction to most of the keys filters little and costs a long key list
         return Restriction(query, generated=generated, hits=hits, keys=len(keys), reason="over_key_limit")
+    if method in _TYPED_KEY_METHODS and any(isinstance(k, float) for k in keys):
+        # Typed as double precision, float keys would silently miss a real (float4) column; only IN takes the column's type
+        logger.warning(f"{method} does not restrict float partition keys (a real column would match none); the variant runs unrestricted, use IN")
+        return Restriction(query, generated=generated, hits=hits, keys=len(keys), reason="float_keys")
     restricted = extend_query_with_partition_keys(
         query=query,
         partition_keys=keys,
@@ -199,6 +205,7 @@ class RestrictionCounts:
     below_min_hits: int = 0
     over_key_limit: int = 0
     no_key_alias: int = 0  # no key joins, and the variant selects no qualified key column
+    float_keys: int = 0  # float keys with VALUES or a key-table method, which cannot restrict them exactly
     lookup_failed: int = 0
 
     def count_unrestricted(self, reason: str) -> None:
@@ -206,14 +213,15 @@ class RestrictionCounts:
 
     def unrestricted_warning(self) -> str | None:
         """A warning if variants had relaxation candidates but none was restricted, else None."""
-        candidates = self.no_cached_relaxation + self.below_min_hits + self.over_key_limit + self.no_key_alias + self.lookup_failed
+        candidates = self.no_cached_relaxation + self.below_min_hits + self.over_key_limit + self.no_key_alias + self.float_keys + self.lookup_failed
         if self.restricted or self.empty_without_execution or not candidates:
             return None
         return (
             f"Restriction is on, but no variant was restricted: {self.no_cached_relaxation} found no cached relaxation, "
             f"{self.below_min_hits} too few, {self.over_key_limit} too many keys, {self.no_key_alias} no qualified key "
-            f"column, {self.lookup_failed} lookups failed. Relaxations that failed, timed out or are still running are "
-            "not cached; otherwise check that the lookup uses the settings the variants were generated with."
+            f"column, {self.float_keys} float keys for a typed key list (use IN), {self.lookup_failed} lookups failed. "
+            "Relaxations that failed, timed out or are still running are not cached; otherwise check that the lookup "
+            "uses the settings the variants were generated with."
         )
 
 
