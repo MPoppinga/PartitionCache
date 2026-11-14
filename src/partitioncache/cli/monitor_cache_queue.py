@@ -56,7 +56,61 @@ def _grid_kwargs(grid_size: float | None) -> dict[str, Any]:
     """``grid_cell_size`` only for grid keys, so the variant generation of every other key is called unchanged."""
     return {"grid_cell_size": grid_size} if grid_size is not None else {}
 
+
+def variant_settings(args, constraint_args: tuple, partition_key: str, partition_datatype: str | None, geometry_column: str | None = None) -> dict[str, Any]:
+    """The variant generation settings of a partition key, for the decomposition and the cache lookup alike.
+
+    A fragment is restricted with the cached entries of the sub-variants the lookup generates from it. Generated
+    with the settings of the decomposition, they are relaxations of the fragment. With other settings they need not
+    be: a fragment of a key decomposed with skip_partition_key_joins=True, looked up with False, gets single-table
+    variants of its other tables and variants with an added key join, whose entries can lack keys of the fragment.
+
+    Args:
+        args: Command line arguments.
+        constraint_args: (add_constraints, remove_constraints_all, remove_constraints_add) as parsed from args.
+        partition_key: The partition key of the query.
+        partition_datatype: Its datatype; geometry keys are decomposed without partition key joins.
+        geometry_column: The geometry column of spatial and grid keys.
+    """
+    add_constraints, remove_constraints_all, remove_constraints_add = constraint_args
+    grid_size = grid_cell_size_for(args, partition_key)
+    if grid_size is not None:
+        auto_detect = GRID_GENERATION_KWARGS["auto_detect_partition_join"]
+        skip_pk_joins = GRID_GENERATION_KWARGS["skip_partition_key_joins"]
+    else:
+        auto_detect = not args.no_auto_detect_partition_join
+        skip_pk_joins = partition_datatype == "geometry" or partition_key in args.skip_partition_key_joins
+    return {
+        "min_component_size": args.min_component_size,
+        "follow_graph": args.follow_graph,
+        "keep_all_attributes": True,
+        "auto_detect_partition_join": auto_detect,
+        "max_component_size": args.max_component_size,
+        "partition_join_table": args.partition_join_table,
+        "bucket_steps": args.bucket_steps,
+        "add_constraints": add_constraints,
+        "remove_constraints_all": remove_constraints_all,
+        "remove_constraints_add": remove_constraints_add,
+        "skip_partition_key_joins": skip_pk_joins,
+        "geometry_column": geometry_column,
+        "max_conditions_removed": args.max_conditions_removed,
+        **_grid_kwargs(grid_size),
+    }
+
+
+# Shape only the decomposition of the original query: a fragment is no larger than max_component_size, and the
+# lookup does not run for grid keys
+_DECOMPOSITION_ONLY_SETTINGS = ("max_component_size", "grid_cell_size")
+
+
+def lookup_settings(settings: dict[str, Any]) -> dict[str, Any]:
+    """The keyword arguments of get_partition_keys(_lazy) for a fragment decomposed with ``settings``."""
+    return {name: value for name, value in settings.items() if name not in _DECOMPOSITION_ONLY_SETTINGS}
+
+
 args: argparse.Namespace
+# Parsed --add-constraints, --remove-constraints-all and --remove-constraints-add of this run; set in main()
+constraint_args: tuple = (None, None, None)
 
 # Global query accelerator instance
 query_accelerator = None
@@ -144,7 +198,6 @@ def query_fragment_processor(args, constraint_args):
         args: Command line arguments
         constraint_args: Tuple of (add_constraints, remove_constraints_all, remove_constraints_add)
     """
-    add_constraints, remove_constraints_all, remove_constraints_add = constraint_args
     logger.info("Starting query fragment processor thread")
 
     while not exit_event.is_set():
@@ -185,32 +238,13 @@ def query_fragment_processor(args, constraint_args):
                     geometry_column = "geom"
             elif grid_size is not None:
                 geometry_column = getattr(args, "geometry_column", None) or "geom"
-            if grid_size is not None:
-                auto_detect = GRID_GENERATION_KWARGS["auto_detect_partition_join"]
-                skip_pk_joins = GRID_GENERATION_KWARGS["skip_partition_key_joins"]
-            else:
-                auto_detect = not args.no_auto_detect_partition_join
-                skip_pk_joins = is_spatial or partition_key in args.skip_partition_key_joins
 
             # Process the query into query variants using the partition_key from queue
             query_hash_pairs = generate_all_query_hash_pairs(
                 query,
                 partition_key,
-                min_component_size=args.min_component_size,
-                follow_graph=args.follow_graph,
-                keep_all_attributes=True,
-                auto_detect_partition_join=auto_detect,
-                max_component_size=args.max_component_size,
-                partition_join_table=args.partition_join_table,
                 warn_no_partition_key=not args.no_warn_partition_key,
-                bucket_steps=args.bucket_steps,
-                add_constraints=add_constraints,
-                remove_constraints_all=remove_constraints_all,
-                remove_constraints_add=remove_constraints_add,
-                skip_partition_key_joins=skip_pk_joins,
-                geometry_column=geometry_column,
-                max_conditions_removed=args.max_conditions_removed,
-                **_grid_kwargs(grid_size),
+                **variant_settings(args, constraint_args, partition_key, partition_datatype, geometry_column),
             )
             # Smallest variants first, so cache optimization can restrict the larger ones with them
             query_hash_pairs = order_variants_for_population(query_hash_pairs)
@@ -259,6 +293,8 @@ def apply_cache_optimization(query: str, query_hash: str, partition_key: str, pa
         max_keys = args.max_restriction_keys
         # Check if we should use lazy optimization; a key limit needs the key count, which only the standard path materializes
         use_lazy = args.prefer_lazy_optimization and isinstance(cache_handler, AbstractCacheHandler_Lazy) and max_keys is None
+        # The sub-variants of the fragment must be generated as the decomposition generated the cached variants
+        lookup_kwargs = lookup_settings(variant_settings(args, constraint_args, partition_key, partition_datatype))
 
         if use_lazy:
             # Use lazy intersection - no min-hits check needed
@@ -266,9 +302,7 @@ def apply_cache_optimization(query: str, query_hash: str, partition_key: str, pa
                 query=query,
                 cache_handler=cache_handler,
                 partition_key=partition_key,
-                min_component_size=args.min_component_size,
-                canonicalize_queries=False,
-                follow_graph=args.follow_graph,
+                **lookup_kwargs,
             )
 
             stats["total_hashes"] = total_hashes
@@ -301,8 +335,7 @@ def apply_cache_optimization(query: str, query_hash: str, partition_key: str, pa
                 query=query,
                 cache_handler=cache_handler,
                 partition_key=partition_key,
-                min_component_size=args.min_component_size,
-                canonicalize_queries=False,
+                **lookup_kwargs,
             )
 
             stats["total_hashes"] = total_hashes
@@ -855,7 +888,7 @@ def main():
         help="Let DuckDB read tables that were not preloaded directly from PostgreSQL, instead of running such queries on PostgreSQL",
     )
 
-    global args
+    global args, constraint_args
     args = parser.parse_args()
     if args.max_restriction_keys is not None and args.max_restriction_keys < 0:
         parser.error("--max-restriction-keys must not be negative")

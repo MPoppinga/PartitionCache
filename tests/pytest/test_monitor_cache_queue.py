@@ -1093,3 +1093,85 @@ class TestTerminalStatusOfNewVariants:
         mock_cache.set_entry_lazy.assert_not_called()
         mock_cache.set_cache.assert_not_called()
         mock_cache.set_query_status.assert_called_once_with("new_variant", "pk", "limit", query="SELECT x FROM t")
+
+
+class DictIntersectCache:
+    """The handler methods get_partition_keys uses, backed by a dict of key sets."""
+
+    def __init__(self):
+        self.entries: dict[str, set] = {}
+
+    def get_intersected(self, keys, partition_key="partition_key"):
+        present = [self.entries[k] for k in keys if k in self.entries]
+        if not present:
+            return None, 0
+        return set.intersection(*present), len(present)
+
+
+class TestLookupUsesDecompositionSettings:
+    """The lookup of a fragment generates its sub-variants with the settings the decomposition used."""
+
+    TIME_JOIN = "SELECT a.pk FROM a, b WHERE a.x = 1 AND b.y = 1 AND b.t >= a.t AND b.t <= a.t + 10"
+    B_ONLY = "SELECT b.pk FROM b WHERE b.y = 1"
+
+    @pytest.fixture
+    def args(self, mock_args):
+        mock_args.enable_cache_optimization = True
+        mock_args.disable_cache_optimization = False
+        mock_args.prefer_lazy_optimization = False
+        mock_args.no_warn_partition_key = True
+        mock_args.max_conditions_removed = None
+        mock_args.grid_cell_size = None
+        mock_args.skip_partition_key_joins = ["pk"]  # rows of a and b are related by time, not by the key
+        return mock_args
+
+    @pytest.fixture
+    def conn(self):
+        import sqlite3
+
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(
+            "CREATE TABLE a (pk INTEGER, t INTEGER, x INTEGER); CREATE TABLE b (pk INTEGER, t INTEGER, y INTEGER);"
+            "INSERT INTO a VALUES (1, 0, 1), (2, 100, 1); INSERT INTO b VALUES (2, 5, 1), (3, 105, 1);"
+        )
+        yield conn
+        conn.close()
+
+    def test_restriction_keeps_the_keys_of_a_fragment_without_key_joins(self, args, conn):
+        """Looked up with skip_partition_key_joins=False, the fragment hit the entry of 'b alone', keyed by b.pk."""
+        from partitioncache.cli.monitor_cache_queue import variant_settings
+        from partitioncache.query_processor import generate_all_query_hash_pairs, order_variants_for_population
+
+        settings = variant_settings(args, (None, None, None), "pk", "integer")
+        cache = DictIntersectCache()
+        for query in (self.B_ONLY, self.TIME_JOIN):
+            for variant, variant_hash in order_variants_for_population(generate_all_query_hash_pairs(query, "pk", warn_no_partition_key=False, **settings)):
+                if variant_hash in cache.entries:
+                    continue
+                to_run, _, _ = apply_cache_optimization(variant, variant_hash, "pk", "integer", cache, args)
+                cache.entries[variant_hash] = {row[0] for row in conn.execute(to_run)}
+                assert cache.entries[variant_hash] == {row[0] for row in conn.execute(variant)}, variant
+
+    @patch("partitioncache.cli.monitor_cache_queue.get_partition_keys_lazy")
+    @patch("partitioncache.cli.monitor_cache_queue.get_partition_keys")
+    def test_both_lookups_get_the_decomposition_settings(self, mock_get_keys, mock_get_lazy, args):
+        import partitioncache.cli.monitor_cache_queue as mcq_module
+        from partitioncache.cache_handler.abstract import AbstractCacheHandler_Lazy
+
+        args.bucket_steps = {"interpoint_coord": 1.0}
+        args.max_component_size = 5
+        mock_get_keys.return_value = (None, 3, 0)
+        mock_get_lazy.return_value = (None, 3, 0)
+        constraints = ({"a": "a.z = 1"}, ["w"], None)
+        with patch.object(mcq_module, "constraint_args", constraints):
+            expected = mcq_module.lookup_settings(mcq_module.variant_settings(args, constraints, "pk", "integer"))
+            apply_cache_optimization("SELECT 1", "h", "pk", "integer", Mock(), args)
+            args.prefer_lazy_optimization = True
+            apply_cache_optimization("SELECT 1", "h", "pk", "integer", Mock(spec=AbstractCacheHandler_Lazy), args)
+
+        for mock in (mock_get_keys, mock_get_lazy):
+            kwargs = mock.call_args.kwargs
+            assert {name: kwargs[name] for name in expected} == expected
+            assert kwargs["skip_partition_key_joins"] is True and kwargs["bucket_steps"] == {"interpoint_coord": 1.0}
+            assert kwargs["add_constraints"] == {"a": "a.z = 1"} and kwargs["keep_all_attributes"] is True
+            assert "max_component_size" not in kwargs
