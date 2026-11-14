@@ -99,8 +99,10 @@ def variant_settings(args, constraint_args: tuple, partition_key: str, partition
 
 
 # Shape only the decomposition of the original query: a fragment is no larger than max_component_size, and the
-# lookup does not run for grid keys
-_DECOMPOSITION_ONLY_SETTINGS = ("max_component_size", "grid_cell_size")
+# lookup does not run for grid keys. add_constraints adds conditions: the decomposition yields the variants with and
+# without them, but looked up, the constrained "sub-variants" of an unconstrained fragment are stricter than it, not
+# relaxations. A constrained fragment keeps its constraint as a condition, so its relaxations are still found.
+_DECOMPOSITION_ONLY_SETTINGS = ("max_component_size", "grid_cell_size", "add_constraints")
 
 
 def lookup_settings(settings: dict[str, Any]) -> dict[str, Any]:

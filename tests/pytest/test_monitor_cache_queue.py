@@ -1154,6 +1154,31 @@ class TestLookupUsesDecompositionSettings:
                 cache.entries[variant_hash] = {row[0] for row in conn.execute(to_run)}
                 assert cache.entries[variant_hash] == {row[0] for row in conn.execute(variant)}, variant
 
+    def test_added_constraints_do_not_restrict_unconstrained_fragments(self, args):
+        """Looked up with add_constraints, a fragment hit its own constrained variant, a subset of its keys."""
+        import sqlite3
+
+        import partitioncache.cli.monitor_cache_queue as mcq_module
+        from partitioncache.query_processor import generate_all_query_hash_pairs, order_variants_for_population
+
+        args.skip_partition_key_joins = []
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE pts (id INTEGER, pk INTEGER, kind TEXT, size INTEGER, x REAL)")
+        rows = [(i, i % 9, "ab"[i % 2], 1 + i % 5, (i * 7 % 13) / 2) for i in range(120)]
+        conn.executemany("INSERT INTO pts VALUES (?, ?, ?, ?, ?)", rows)
+        query = "SELECT a.id FROM pts AS a, pts AS b WHERE a.pk = b.pk AND a.kind = 'a' AND b.kind = 'b' AND a.size >= 2 AND ABS(a.x - b.x) < 1.6"
+        constraints = ({"pts": "size = 4"}, None, None)
+        cache = DictIntersectCache()
+        with patch.object(mcq_module, "constraint_args", constraints):
+            settings = mcq_module.variant_settings(args, constraints, "id", "integer")
+            pairs = order_variants_for_population(generate_all_query_hash_pairs(query, "id", warn_no_partition_key=False, **settings))
+            for variant, variant_hash in pairs:
+                to_run, _, _ = apply_cache_optimization(variant, variant_hash, "id", "integer", cache, args)
+                cache.entries[variant_hash] = {row[0] for row in conn.execute(to_run)}
+        assert any("size = 4" in variant for variant, _ in pairs)
+        for variant, variant_hash in pairs:
+            assert cache.entries[variant_hash] == {row[0] for row in conn.execute(variant)}, variant
+
     @patch("partitioncache.cli.monitor_cache_queue.get_partition_keys_lazy")
     @patch("partitioncache.cli.monitor_cache_queue.get_partition_keys")
     def test_both_lookups_get_the_decomposition_settings(self, mock_get_keys, mock_get_lazy, args):
@@ -1175,8 +1200,8 @@ class TestLookupUsesDecompositionSettings:
             kwargs = mock.call_args.kwargs
             assert {name: kwargs[name] for name in expected} == expected
             assert kwargs["skip_partition_key_joins"] is True and kwargs["bucket_steps"] == {"interpoint_coord": 1.0}
-            assert kwargs["add_constraints"] == {"a": "a.z = 1"} and kwargs["keep_all_attributes"] is True
-            assert "max_component_size" not in kwargs
+            assert kwargs["remove_constraints_all"] == ["w"] and kwargs["keep_all_attributes"] is True
+            assert "max_component_size" not in kwargs and "add_constraints" not in kwargs
 
 
 class TestRestrictionTarget:
