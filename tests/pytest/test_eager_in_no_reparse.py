@@ -26,7 +26,6 @@ import sqlglot.expressions as exp
 
 from partitioncache.apply_cache import (
     _add_where_condition,
-    _format_partition_key_for_sql,
     _splice_key_list,
     extend_query_with_partition_keys,
 )
@@ -35,6 +34,11 @@ QUERY_NO_WHERE = "SELECT p.id FROM pockets AS p JOIN atoms AS a ON a.pocket_key 
 QUERY_WITH_WHERE = QUERY_NO_WHERE + " WHERE a.element = 'C' AND a.x > 1.5"
 QUERY_WITH_OR = QUERY_NO_WHERE + " WHERE a.element = 'C' OR a.element = 'N'"
 QUERIES = [QUERY_NO_WHERE, QUERY_WITH_WHERE, QUERY_WITH_OR]
+
+
+def _format_partition_key_for_sql(pk) -> str:
+    """The key formatting of the old implementation (integers bare, everything else quoted)."""
+    return str(pk) if isinstance(pk, int) else f"'{pk}'"
 
 
 def _reference_old_implementation(query: str, partition_keys, partition_key: str, method: str, p0_alias: str) -> str:

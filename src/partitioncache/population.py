@@ -16,6 +16,7 @@ from logging import getLogger
 from typing import Any, Literal
 
 from partitioncache.apply_cache import (
+    _check_planner_collapse_limit,
     extend_query_with_partition_keys,
     extend_query_with_partition_keys_lazy,
     get_partition_keys,
@@ -27,8 +28,8 @@ from partitioncache.query_processor import generate_all_query_hash_pairs, order_
 
 logger = getLogger("PartitionCache")
 
-EAGER_METHODS = ("IN", "VALUES", "TMP_TABLE_IN", "TMP_TABLE_JOIN")
-LAZY_METHODS = ("IN_SUBQUERY", "TMP_TABLE_IN", "TMP_TABLE_JOIN")
+EAGER_METHODS = ("IN", "VALUES", "TMP_TABLE_IN", "TMP_TABLE_JOIN", "UNLOGGED_TABLE_JOIN", "UNLOGGED_TABLE_IN")
+LAZY_METHODS = ("IN_SUBQUERY", "TMP_TABLE_IN", "TMP_TABLE_JOIN", "UNLOGGED_TABLE_JOIN", "UNLOGGED_TABLE_IN")
 
 # The defaults of generate_all_query_hash_pairs; those of get_partition_keys differ (min_component_size,
 # keep_all_attributes), so a lookup that relied on them would generate other sub-variants than the variants
@@ -100,6 +101,7 @@ def restrict_with_cache(
     min_cache_hits: int = 1,
     sql_dialect: str = "postgres",
     join_every_table: bool = False,
+    planner_collapse_limit: int | None = None,
 ) -> Restriction:
     """Restrict a query variant to the cached keys of its relaxations, with the lookup and extension functions of a query.
 
@@ -121,6 +123,8 @@ def restrict_with_cache(
         sql_dialect: Dialect of the database the variant runs on.
         join_every_table: JOIN methods only: join the key table to every table of the variant instead of its key
             table; refused (ValueError) unless every table is joined on the partition key.
+        planner_collapse_limit: Script methods and PostgreSQL only: the script begins with SET LOCAL
+            join_collapse_limit / from_collapse_limit = N.
 
     Raises:
         ValueError: For an unknown method, a key limit with lazy, a spatial or grid key, or join_every_table with
@@ -153,6 +157,7 @@ def restrict_with_cache(
             analyze_tmp_table=True,
             sql_dialect=sql_dialect,
             join_every_table=join_every_table,
+            planner_collapse_limit=planner_collapse_limit,
         )
         return Restriction(restricted, restricted=True, generated=generated, hits=hits, method=method)
 
@@ -173,6 +178,7 @@ def restrict_with_cache(
         analyze_tmp_table=True,
         sql_dialect=sql_dialect,
         join_every_table=join_every_table,
+        planner_collapse_limit=planner_collapse_limit,
     )
     return Restriction(restricted, restricted=True, empty=not keys, generated=generated, hits=hits, keys=len(keys), method=method)
 
@@ -228,11 +234,12 @@ def populate_query_variants(
     db_handler: AbstractDBHandler,
     restrict: bool = True,
     max_restriction_keys: int | None = None,
-    method: Literal["IN", "VALUES", "TMP_TABLE_IN", "TMP_TABLE_JOIN", "IN_SUBQUERY"] = "IN",
+    method: Literal["IN", "VALUES", "TMP_TABLE_IN", "TMP_TABLE_JOIN", "UNLOGGED_TABLE_JOIN", "UNLOGGED_TABLE_IN", "IN_SUBQUERY"] = "IN",
     sql_dialect: str = "postgres",
     variant_settings: Mapping[str, Any] | None = None,
     lazy: bool = False,
     join_every_table: bool = False,
+    planner_collapse_limit: int | None = None,
 ) -> PopulationStats:
     """Execute and cache the variants of one query, smallest first, each restricted to the cached keys of its relaxations.
 
@@ -246,8 +253,9 @@ def populate_query_variants(
         restrict: Restrict each variant with the cache, see ``restrict_with_cache``.
         max_restriction_keys: Eager only: restrict only when the intersection has at most this many keys; a
             restriction to most of the keys filters little and costs a long key list. None means no limit.
-        method: How the keys are attached: IN, VALUES, TMP_TABLE_IN or TMP_TABLE_JOIN; with lazy IN_SUBQUERY,
-            TMP_TABLE_IN or TMP_TABLE_JOIN.
+        method: How the keys are attached: IN, VALUES, TMP_TABLE_IN, TMP_TABLE_JOIN, UNLOGGED_TABLE_JOIN or
+            UNLOGGED_TABLE_IN; with lazy IN_SUBQUERY or one of the table methods. An UNLOGGED_TABLE_* script drops its
+            key table itself; db_handler must send it as one string (PostgresDBHandler.execute does).
         sql_dialect: Dialect of the database, used to render the restriction (e.g. "mysql").
         variant_settings: The keyword arguments of generate_all_query_hash_pairs the pairs were generated with,
             e.g. ``{"min_component_size": 1, "bucket_steps": 0}``. The lookup of each variant generates its
@@ -256,9 +264,11 @@ def populate_query_variants(
             it can hit entries that are not relaxations.
         lazy: Restrict with a subquery on the cache instead of the fetched keys; needs an AbstractCacheHandler_Lazy
             whose cache the database can read, and no key limit.
-        join_every_table: TMP_TABLE_JOIN only: join the key table to every table of a variant instead of its key
+        join_every_table: JOIN methods only: join the key table to every table of a variant instead of its key
             table; only for keys whose tables are all joined on the partition key (a variant whose tables are not
             is counted as a failed lookup and runs unrestricted).
+        planner_collapse_limit: Script methods and PostgreSQL only: restricted variants begin with SET LOCAL
+            join_collapse_limit / from_collapse_limit = N. None (default) is off.
 
     Returns:
         PopulationStats. An empty eager intersection means the variant has no rows; it is stored as an empty set
@@ -276,6 +286,7 @@ def populate_query_variants(
             raise ValueError("lazy restriction needs a cache handler with lazy intersection")
         if lazy and max_restriction_keys is not None:
             raise ValueError("A key limit needs the key count, which only the eager lookup fetches")
+        _check_planner_collapse_limit(planner_collapse_limit, method, sql_dialect)
         if join_every_table and lookup_settings(variant_settings)["skip_partition_key_joins"]:
             raise ValueError("join_every_table needs every table joined on the partition key; variants without partition key joins are not")
 
@@ -299,6 +310,7 @@ def populate_query_variants(
                     max_restriction_keys=max_restriction_keys,
                     sql_dialect=sql_dialect,
                     join_every_table=join_every_table,
+                    planner_collapse_limit=planner_collapse_limit,
                 )
             except Exception as e:
                 logger.warning(f"Cache lookup failed for variant {variant_hash}, it runs unrestricted: {e}")

@@ -63,6 +63,7 @@ def mock_args():
     args.cache_optimization_method = "IN"
     args.prefer_lazy_optimization = True
     args.join_every_table = False
+    args.planner_collapse_limit = None
     # Add DuckDB acceleration args
     args.enable_duckdb_acceleration = False
     # Add bitsize arg
@@ -778,6 +779,7 @@ class TestCacheOptimization:
             analyze_tmp_table=True,
             sql_dialect="sqlite",  # from --db-backend
             join_every_table=False,
+            planner_collapse_limit=None,
         )
 
     @patch("partitioncache.population.get_partition_keys")
@@ -822,6 +824,7 @@ class TestCacheOptimization:
             analyze_tmp_table=True,
             sql_dialect="sqlite",  # from --db-backend
             join_every_table=False,
+            planner_collapse_limit=None,
         )
 
     @patch("partitioncache.population.get_partition_keys")

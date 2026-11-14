@@ -555,24 +555,37 @@ def rewrite_query_with_p0_table( # TODO: Check duplication with query_processor
     return parsed_query.sql()
 
 
-def _format_partition_key_for_sql(pk: int | str | float | datetime) -> str:
-    """Format a single partition key for SQL representation."""
-    if isinstance(pk, int):
-        return str(pk)
-    return f"'{pk}'"
+def _format_partition_key_for_sql(pk: int | str | float | datetime, sql_dialect: str = "postgres") -> str:
+    """Format a single partition key as a literal for a key table of ``_get_partition_key_sql_type``'s type.
+
+    Integers and finite floats as numbers; everything else (strings, timestamps, non-finite floats) as a string
+    literal with quotes and backslashes escaped for ``sql_dialect``, which the key table's column type converts.
+    """
+    if isinstance(pk, int) or (isinstance(pk, float) and math.isfinite(pk)):
+        return repr(pk) if isinstance(pk, float) else str(pk)
+    return _format_spliced_partition_key(pk, sql_dialect)
 
 
-def _get_partition_key_sql_type(partition_keys: set[int] | set[str] | set[float] | set[datetime]) -> str:
-    """Determine the SQL type for partition keys."""
+def _get_partition_key_sql_type(partition_keys: set[int] | set[str] | set[float] | set[datetime], sql_dialect: str = "postgres") -> str:
+    """The column type of a key table for ``partition_keys``: integer, floating point, timestamp, or text.
+
+    Float and timestamp keys need their own type: a TEXT key column does not compare with a numeric or timestamp
+    partition key column (PostgreSQL has no ``text = double precision`` operator).
+    """
     if not partition_keys:
         return "TEXT"
-    sample_key = next(iter(partition_keys))
-    if isinstance(sample_key, int):
+    if all(isinstance(k, int) for k in partition_keys):
         # Use BIGINT if any value exceeds 32-bit integer range (e.g. H3 cell IDs)
         max_int32 = 2**31 - 1
-        if any(abs(k) > max_int32 for k in partition_keys if isinstance(k, int)):  # type: ignore[arg-type]
+        if any(abs(k) > max_int32 for k in partition_keys):  # type: ignore[arg-type]
             return "BIGINT"
         return "INT"
+    if all(isinstance(k, int | float) for k in partition_keys):
+        return "DOUBLE PRECISION"
+    if all(isinstance(k, datetime) for k in partition_keys):
+        if sql_dialect != "mysql" and any(k.tzinfo is not None for k in partition_keys):  # type: ignore[union-attr]
+            return "TIMESTAMPTZ"
+        return "TIMESTAMP"
     return "TEXT"
 
 
@@ -683,8 +696,8 @@ def _create_tmp_table_setup(
         tuple[str, str]: (setup_sql, table_name) where table_name is a random temporary table name.
     """
     table_name = f"tmp_cache_keys_{random.randint(100000, 999999)}"
-    partition_keys_str = "),(".join(_format_partition_key_for_sql(pk) for pk in partition_keys)
-    partition_key_type = _get_partition_key_sql_type(partition_keys)
+    partition_keys_str = "),(".join(_format_partition_key_for_sql(pk, sql_dialect) for pk in partition_keys)
+    partition_key_type = _get_partition_key_sql_type(partition_keys, sql_dialect)
 
     # ON COMMIT DROP: the temp table is dropped at the end of the surrounding transaction instead of
     # persisting for the whole session. The full setup+query script must therefore run in ONE transaction
@@ -704,6 +717,51 @@ def _create_tmp_table_setup(
 UNLOGGED_TABLE_PREFIX = "partitioncache_unl_"
 # The key table is joined to the p0 table (as the IN methods restrict it), or with join_every_table to every table
 _TABLE_JOIN_METHODS = ("TMP_TABLE_JOIN", "UNLOGGED_TABLE_JOIN")
+# Methods whose rewrite is a script (key table setup, then the SELECT); only these take planner_collapse_limit
+_SCRIPT_METHODS = ("TMP_TABLE_IN", "TMP_TABLE_JOIN", "UNLOGGED_TABLE_JOIN", "UNLOGGED_TABLE_IN")
+# The planner settings of planner_collapse_limit, emitted in this order as the first statements of the script
+COLLAPSE_LIMIT_SETTINGS = ("join_collapse_limit", "from_collapse_limit")
+
+
+def _check_planner_collapse_limit(planner_collapse_limit: int | None, method: str, sql_dialect: str) -> None:
+    """Raise ValueError unless ``planner_collapse_limit`` is None or a positive int usable with ``method`` and ``sql_dialect``.
+
+    The limit is set with ``SET LOCAL`` statements in front of the script, so it needs a method that emits a
+    script (``_SCRIPT_METHODS``) and PostgreSQL. The single-statement methods (``IN``, ``VALUES``, ``IN_SUBQUERY``)
+    raise instead of silently ignoring the option.
+    """
+    if planner_collapse_limit is None:
+        return
+    if isinstance(planner_collapse_limit, bool) or not isinstance(planner_collapse_limit, int) or planner_collapse_limit < 1:
+        raise ValueError(f"planner_collapse_limit must be a positive integer or None, got {planner_collapse_limit!r}")
+    if method not in _SCRIPT_METHODS:
+        raise ValueError(f"planner_collapse_limit needs a method that emits a script {_SCRIPT_METHODS}, not {method!r}")
+    if sql_dialect != "postgres":
+        raise ValueError(f"planner_collapse_limit is only supported for PostgreSQL, not for SQL dialect {sql_dialect!r}")
+
+
+def _planner_collapse_limit_sql(planner_collapse_limit: int | None) -> str:
+    """Return the ``SET LOCAL`` statements that open a script for ``planner_collapse_limit``; '' when it is None.
+
+    ``SET LOCAL`` lasts until the end of the transaction. Sent as ONE string, the script is one transaction (also
+    under autocommit, as an implicit transaction block), so the settings cover exactly the script's SELECT and
+    are reset afterwards. ``geqo`` is not touched.
+    """
+    if planner_collapse_limit is None:
+        return ""
+    return "".join(f"SET LOCAL {setting} = {planner_collapse_limit};\n" for setting in COLLAPSE_LIMIT_SETTINGS)
+
+
+def _unlogged_keys_sql(partition_keys: set[int] | set[str] | set[float] | set[datetime], sql_dialect: str) -> str:
+    """Return the SELECT over a VALUES list of the keys that fills an eager unlogged key table (column ``partition_key``).
+
+    String keys are escaped string literals; float and timestamp keys are cast to their type, as in the temporary
+    key table (``_get_partition_key_sql_type``).
+    """
+    key_rows = "), (".join(_format_partition_key_for_sql(pk, sql_dialect) for pk in partition_keys)
+    key_type = _get_partition_key_sql_type(partition_keys, sql_dialect)
+    column = "partition_key" if key_type in ("INT", "BIGINT", "TEXT") else f"CAST(partition_key AS {key_type}) AS partition_key"
+    return f"SELECT {column} FROM (VALUES ({key_rows})) AS pcache_keys(partition_key)"
 
 
 def _every_table_joined_on_partition_key(parsed_query: exp.Expr, partition_key: str) -> bool:
@@ -785,8 +843,8 @@ def _restriction_target(
     return None
 
 
-def _create_unlogged_table_setup(keys_sql: str, key_column: str, sql_dialect: str) -> tuple[str, str]:
-    """Create the setup SQL of ``UNLOGGED_TABLE_JOIN``: an unlogged key table with index and statistics.
+def _create_unlogged_table_setup(keys_sql: str, key_column: str, sql_dialect: str, method: str = "UNLOGGED_TABLE_JOIN") -> tuple[str, str]:
+    """Create the setup SQL of ``UNLOGGED_TABLE_JOIN`` / ``UNLOGGED_TABLE_IN``: an unlogged key table with index and statistics.
 
     PostgreSQL does not let parallel workers read temporary tables; an unlogged table can be read inside the
     parallel part of the plan. It is a regular table of the current schema, so the script drops it itself after
@@ -797,7 +855,7 @@ def _create_unlogged_table_setup(keys_sql: str, key_column: str, sql_dialect: st
         tuple[str, str]: (setup_sql, table_name).
     """
     if sql_dialect != "postgres":
-        raise ValueError(f"UNLOGGED_TABLE_JOIN is only supported for PostgreSQL, not for SQL dialect {sql_dialect!r}")
+        raise ValueError(f"{method} is only supported for PostgreSQL, not for SQL dialect {sql_dialect!r}")
     table_name = f"{UNLOGGED_TABLE_PREFIX}{secrets.token_hex(8)}"
     setup_sql = (
         f"CREATE UNLOGGED TABLE {table_name} AS ({keys_sql});\n"
@@ -808,7 +866,7 @@ def _create_unlogged_table_setup(keys_sql: str, key_column: str, sql_dialect: st
 
 
 def _unlogged_table_teardown(table_name: str) -> str:
-    """Return the statement that ends an ``UNLOGGED_TABLE_JOIN`` script, after its SELECT: the DROP of the key table."""
+    """Return the statement that ends an unlogged method's script, after its SELECT: the DROP of the key table."""
     return f";\nDROP TABLE IF EXISTS {table_name}"
 
 
@@ -816,13 +874,14 @@ def extend_query_with_partition_keys(
     query: str,
     partition_keys: set[int] | set[str] | set[float] | set[datetime],
     partition_key: str,
-    method: Literal["IN", "VALUES", "TMP_TABLE_JOIN", "TMP_TABLE_IN", "UNLOGGED_TABLE_JOIN"] = "IN",
+    method: Literal["IN", "VALUES", "TMP_TABLE_JOIN", "TMP_TABLE_IN", "UNLOGGED_TABLE_JOIN", "UNLOGGED_TABLE_IN"] = "IN",
     p0_alias: str | None = None,
     analyze_tmp_table: bool = True,
     auto_detect_partition_join: bool = True,
     partition_join_table: str | None = None,
     sql_dialect: str = "postgres",
     join_every_table: bool = False,
+    planner_collapse_limit: int | None = None,
 ) -> str:
     """
     Extend a given SQL query with the cache functionality.
@@ -834,10 +893,10 @@ def extend_query_with_partition_keys(
         query (str): The SQL query to be extended.
         partition_keys (set[int] | set[str]| set[float] | set[datetime]): The set of partition keys to extend the query with.
         partition_key (str): The identifier for the partition.
-        method (Literal["IN", "VALUES", "TMP_TABLE_IN", "TMP_TABLE_JOIN", "UNLOGGED_TABLE_JOIN"]): The method to use to
-            extend the query. ``UNLOGGED_TABLE_JOIN`` (PostgreSQL only) is ``TMP_TABLE_JOIN`` with an unlogged
-            table, always with index and ANALYZE; the script ends with its DROP, after the SELECT. Execute it as
-            ONE string so that it runs in one transaction.
+        method (Literal["IN", "VALUES", "TMP_TABLE_IN", "TMP_TABLE_JOIN", "UNLOGGED_TABLE_JOIN", "UNLOGGED_TABLE_IN"]): The
+            method to use to extend the query. ``UNLOGGED_TABLE_JOIN`` / ``UNLOGGED_TABLE_IN`` (PostgreSQL only) are
+            ``TMP_TABLE_JOIN`` / ``TMP_TABLE_IN`` with an unlogged table, always with index and ANALYZE; the script
+            ends with its DROP, after the SELECT. Execute it as ONE string so that it runs in one transaction.
         p0_alias (str | None): The alias of the table to use for the partition key; None detects it (``find_p0_alias``).
             The JOIN methods join the key table to this table only.
         analyze_tmp_table (bool): Whether to create index and analyze. (only for temporary table methods)
@@ -847,12 +906,17 @@ def extend_query_with_partition_keys(
         join_every_table: JOIN methods only: join the key table to every table of the query instead of the p0 table,
             as they did without p0_alias before 2026-11. Raises ValueError unless every table is joined on the
             partition key, where it is equivalent; it gives the planner the key table at every table.
+        planner_collapse_limit: If set to N, the script begins with ``SET LOCAL join_collapse_limit = N;`` and
+            ``SET LOCAL from_collapse_limit = N;`` (``geqo`` is not touched). PostgreSQL and the script methods
+            (TMP_TABLE_*, UNLOGGED_TABLE_*) only; other methods raise ValueError. Not applied to an empty
+            ``partition_keys`` set, whose rewrite is a single statement. None (default) is off.
 
     Returns:
         str: The extended SQL query as string. An empty ``partition_keys`` set is a valid cache result
         (the intersection proved that no partition matches); the query is then restricted with a
         commented ``AND FALSE`` regardless of ``method``.
     """
+    _check_planner_collapse_limit(planner_collapse_limit, method, sql_dialect)
     if not partition_keys:
         return _add_empty_intersection_condition(query, sql_dialect)
 
@@ -878,9 +942,8 @@ def extend_query_with_partition_keys(
 
     elif method == "TMP_TABLE_JOIN" or method == "UNLOGGED_TABLE_JOIN":
         if method == "UNLOGGED_TABLE_JOIN":
-            key_rows = "), (".join(_format_spliced_partition_key(pk, sql_dialect) for pk in partition_keys)
-            keys_sql = f"SELECT partition_key FROM (VALUES ({key_rows})) AS pcache_keys(partition_key)"
-            tmp_table_setup, table_name = _create_unlogged_table_setup(keys_sql, "partition_key", sql_dialect)
+            keys_sql = _unlogged_keys_sql(partition_keys, sql_dialect)
+            tmp_table_setup, table_name = _create_unlogged_table_setup(keys_sql, "partition_key", sql_dialect, method)
         else:
             tmp_table_setup, table_name = _create_tmp_table_setup(partition_keys, analyze_tmp_table, sql_dialect)
 
@@ -916,16 +979,25 @@ def extend_query_with_partition_keys(
             # Replace the old join expression with the new one
             from_clause.this.replace(join_expr)
 
-        script = tmp_table_setup + parsed_query.sql(dialect=sql_dialect)
+        script = _planner_collapse_limit_sql(planner_collapse_limit) + tmp_table_setup + parsed_query.sql(dialect=sql_dialect)
         if method == "UNLOGGED_TABLE_JOIN":
             script += _unlogged_table_teardown(table_name)
         return script
 
-    elif method == "TMP_TABLE_IN":
-        tmp_table_setup, table_name = _create_tmp_table_setup(partition_keys, analyze_tmp_table, sql_dialect)
+    elif method == "TMP_TABLE_IN" or method == "UNLOGGED_TABLE_IN":
+        if method == "UNLOGGED_TABLE_IN":
+            keys_sql = _unlogged_keys_sql(partition_keys, sql_dialect)
+            tmp_table_setup, table_name = _create_unlogged_table_setup(keys_sql, "partition_key", sql_dialect, method)
+        else:
+            tmp_table_setup, table_name = _create_tmp_table_setup(partition_keys, analyze_tmp_table, sql_dialect)
         partition_expr = sqlglot.parse_one(f"{p0_alias}.{partition_key} IN (SELECT partition_key FROM {table_name})", read=sql_dialect)
         _add_where_condition(parsed_query, partition_expr)
-        return tmp_table_setup + parsed_query.sql(dialect=sql_dialect)
+        script = _planner_collapse_limit_sql(planner_collapse_limit) + tmp_table_setup + parsed_query.sql(dialect=sql_dialect)
+        if method == "UNLOGGED_TABLE_IN":
+            script += _unlogged_table_teardown(table_name)
+        return script
+
+    raise ValueError(f"Unknown method {method!r}")
 
 
 def _create_tmp_table_setup_from_subquery(
@@ -980,13 +1052,14 @@ def extend_query_with_partition_keys_lazy(
     query: str,
     lazy_subquery: str,
     partition_key: str,
-    method: Literal["IN_SUBQUERY", "TMP_TABLE_IN", "TMP_TABLE_JOIN", "UNLOGGED_TABLE_JOIN"] = "IN_SUBQUERY",
+    method: Literal["IN_SUBQUERY", "TMP_TABLE_IN", "TMP_TABLE_JOIN", "UNLOGGED_TABLE_JOIN", "UNLOGGED_TABLE_IN"] = "IN_SUBQUERY",
     p0_alias: str | None = None,
     analyze_tmp_table: bool = True,
     auto_detect_partition_join: bool = True,
     partition_join_table: str | None = None,
     sql_dialect: str = "postgres",
     join_every_table: bool = False,
+    planner_collapse_limit: int | None = None,
 ) -> str:
     """
     Extend a given SQL query with the cache functionality using a lazy SQL subquery.
@@ -998,10 +1071,10 @@ def extend_query_with_partition_keys_lazy(
         query (str): The SQL query to be extended.
         lazy_subquery (str): The SQL subquery that returns partition keys.
         partition_key (str): The identifier for the partition.
-        method (Literal["IN_SUBQUERY", "TMP_TABLE_IN", "TMP_TABLE_JOIN", "UNLOGGED_TABLE_JOIN"]): The method to use to
-            extend the query. ``UNLOGGED_TABLE_JOIN`` (PostgreSQL only) is ``TMP_TABLE_JOIN`` with an unlogged
-            table, always with index and ANALYZE; the script ends with its DROP, after the SELECT. Execute it as
-            ONE string so that it runs in one transaction.
+        method (Literal["IN_SUBQUERY", "TMP_TABLE_IN", "TMP_TABLE_JOIN", "UNLOGGED_TABLE_JOIN", "UNLOGGED_TABLE_IN"]): The
+            method to use to extend the query. ``UNLOGGED_TABLE_JOIN`` / ``UNLOGGED_TABLE_IN`` (PostgreSQL only) are
+            ``TMP_TABLE_JOIN`` / ``TMP_TABLE_IN`` with an unlogged table, always with index and ANALYZE; the script
+            ends with its DROP, after the SELECT. Execute it as ONE string so that it runs in one transaction.
         p0_alias (str | None): The alias of the table to use for the partition key. If None, will be auto-detected.
             When use_p0_table=True, cache restrictions automatically target the p0 table regardless of this parameter.
         analyze_tmp_table (bool): Whether to create index and analyze. (only for temporary table methods)
@@ -1010,10 +1083,13 @@ def extend_query_with_partition_keys_lazy(
         sql_dialect: sqlglot dialect used to parse and render the query. Defaults to PostgreSQL.
         join_every_table: JOIN methods only: join the key table to every table instead of the p0 table; see
             ``extend_query_with_partition_keys``.
+        planner_collapse_limit: If set to N, the script begins with ``SET LOCAL join_collapse_limit = N;`` and
+            ``SET LOCAL from_collapse_limit = N;``; see ``extend_query_with_partition_keys``. None (default) is off.
 
     Returns:
         str: The extended SQL query as string.
     """
+    _check_planner_collapse_limit(planner_collapse_limit, method, sql_dialect)
     if not lazy_subquery or not lazy_subquery.strip():
         return query
 
@@ -1036,19 +1112,25 @@ def extend_query_with_partition_keys_lazy(
         _add_where_condition(parsed_query, partition_expr)
         return parsed_query.sql(dialect=sql_dialect)
 
-    elif method == "TMP_TABLE_IN":
-        # Create temporary table from lazy subquery, then use IN with SELECT
-        tmp_table_setup, table_name = _create_tmp_table_setup_from_subquery(lazy_subquery, partition_key, analyze_tmp_table, sql_dialect)
+    elif method == "TMP_TABLE_IN" or method == "UNLOGGED_TABLE_IN":
+        # Create the key table (temporary or unlogged) from the lazy subquery, then use IN with SELECT
+        if method == "UNLOGGED_TABLE_IN":
+            tmp_table_setup, table_name = _create_unlogged_table_setup(lazy_subquery, partition_key, sql_dialect, method)
+        else:
+            tmp_table_setup, table_name = _create_tmp_table_setup_from_subquery(lazy_subquery, partition_key, analyze_tmp_table, sql_dialect)
         partition_expr = sqlglot.parse_one(
             f"{p0_alias}.{partition_key} IN (SELECT {partition_key} FROM {table_name})", read=sql_dialect
         )
         _add_where_condition(parsed_query, partition_expr)
-        return tmp_table_setup + parsed_query.sql(dialect=sql_dialect)
+        script = _planner_collapse_limit_sql(planner_collapse_limit) + tmp_table_setup + parsed_query.sql(dialect=sql_dialect)
+        if method == "UNLOGGED_TABLE_IN":
+            script += _unlogged_table_teardown(table_name)
+        return script
 
     elif method == "TMP_TABLE_JOIN" or method == "UNLOGGED_TABLE_JOIN":
         # Create the key table (temporary or unlogged) from the lazy subquery, then JOIN
         if method == "UNLOGGED_TABLE_JOIN":
-            tmp_table_setup, table_name = _create_unlogged_table_setup(lazy_subquery, partition_key, sql_dialect)
+            tmp_table_setup, table_name = _create_unlogged_table_setup(lazy_subquery, partition_key, sql_dialect, method)
         else:
             tmp_table_setup, table_name = _create_tmp_table_setup_from_subquery(lazy_subquery, partition_key, analyze_tmp_table, sql_dialect)
 
@@ -1084,10 +1166,12 @@ def extend_query_with_partition_keys_lazy(
             # Replace the old join expression with the new one
             from_clause.this.replace(join_expr)
 
-        script = tmp_table_setup + parsed_query.sql(dialect=sql_dialect)
+        script = _planner_collapse_limit_sql(planner_collapse_limit) + tmp_table_setup + parsed_query.sql(dialect=sql_dialect)
         if method == "UNLOGGED_TABLE_JOIN":
             script += _unlogged_table_teardown(table_name)
         return script
+
+    raise ValueError(f"Unknown method {method!r}")
 
 
 def extend_query_with_spatial_filter_lazy(
@@ -1849,7 +1933,7 @@ def apply_cache_lazy(
     query: str,
     cache_handler: AbstractCacheHandler_Lazy,
     partition_key: str,
-    method: Literal["IN_SUBQUERY", "TMP_TABLE_IN", "TMP_TABLE_JOIN", "UNLOGGED_TABLE_JOIN"] = "IN_SUBQUERY",
+    method: Literal["IN_SUBQUERY", "TMP_TABLE_IN", "TMP_TABLE_JOIN", "UNLOGGED_TABLE_JOIN", "UNLOGGED_TABLE_IN"] = "IN_SUBQUERY",
     p0_alias: str | None = None,
     min_component_size: int = 2,
     canonicalize_queries: bool = False,
@@ -1881,6 +1965,7 @@ def apply_cache_lazy(
     min_query_cost: float | None = None,
     keep_all_attributes: bool = False,
     join_every_table: bool = False,
+    planner_collapse_limit: int | None = None,
     **kwargs: Any,
 ) -> tuple[str, dict[str, int]]:
     """
@@ -1890,8 +1975,8 @@ def apply_cache_lazy(
         query (str): The original SQL query to be enhanced with cache functionality.
         cache_handler (AbstractCacheHandler_Lazy): The lazy cache handler instance.
         partition_key (str): The identifier for the partition.
-        method (Literal["IN_SUBQUERY", "TMP_TABLE_IN", "TMP_TABLE_JOIN", "UNLOGGED_TABLE_JOIN"]): The method to use for
-            query extension. An ``UNLOGGED_TABLE_JOIN`` script ends with the DROP of its key table; execute it as ONE string.
+        method (Literal["IN_SUBQUERY", "TMP_TABLE_IN", "TMP_TABLE_JOIN", "UNLOGGED_TABLE_JOIN", "UNLOGGED_TABLE_IN"]): The method to
+            use for query extension. An ``UNLOGGED_TABLE_*`` script ends with the DROP of its key table; execute it as ONE string.
         p0_alias (str | None): For regular queries: table alias for cache restrictions.
                                For p0 queries: alias name for the p0 table (defaults to "p0").
         min_component_size (int): Minimum size of query components to consider for cache lookup.
@@ -1920,6 +2005,10 @@ def apply_cache_lazy(
         join_every_table: TMP_TABLE_JOIN and UNLOGGED_TABLE_JOIN only: join the key table to every table instead of
             the p0 table; raises ValueError unless every table is joined on the partition key. See
             extend_query_with_partition_keys.
+        planner_collapse_limit: If set to N, a rewritten script begins with ``SET LOCAL join_collapse_limit = N;`` and
+            ``SET LOCAL from_collapse_limit = N;`` (``geqo`` is not touched). Needs a script method (TMP_TABLE_*,
+            UNLOGGED_TABLE_*) and PostgreSQL, else ValueError (checked before the lookup). Not applied when the query
+            is returned unchanged, nor to the spatial and grid paths. None (default) is off.
         sql_dialect: sqlglot dialect used to parse and render non-spatial queries. Defaults to PostgreSQL.
         geometry_column: If set, enables spatial cache mode. Uses this geometry column for variant
             SELECT clauses and spatial filter application. Requires a spatial cache handler with
@@ -1951,6 +2040,7 @@ def apply_cache_lazy(
         partition_join_table = deprecated["partition_join_table"]
     if "auto_detect_partition_join" in deprecated:
         auto_detect_partition_join = deprecated["auto_detect_partition_join"]
+    _check_planner_collapse_limit(planner_collapse_limit, method, sql_dialect)
 
     gated, gate_stats = _check_cost_gate(query, cost_estimator, min_query_cost)
     if gated:
@@ -2154,6 +2244,7 @@ def apply_cache_lazy(
         partition_join_table=partition_join_table,
         sql_dialect=sql_dialect,
         join_every_table=join_every_table,
+        planner_collapse_limit=planner_collapse_limit,
     )
 
     stats["enhanced"] = 1
@@ -2166,7 +2257,7 @@ def apply_cache(
     query: str,
     cache_handler: AbstractCacheHandler,
     partition_key: str,
-    method: Literal["IN", "VALUES", "TMP_TABLE_JOIN", "TMP_TABLE_IN", "UNLOGGED_TABLE_JOIN"] = "IN",
+    method: Literal["IN", "VALUES", "TMP_TABLE_JOIN", "TMP_TABLE_IN", "UNLOGGED_TABLE_JOIN", "UNLOGGED_TABLE_IN"] = "IN",
     p0_alias: str | None = None,
     min_component_size: int = 2,
     canonicalize_queries: bool = False,
@@ -2197,6 +2288,7 @@ def apply_cache(
     max_conditions_removed: int | None = None,
     protected_patterns: list[str] | None = None,
     join_every_table: bool = False,
+    planner_collapse_limit: int | None = None,
     **kwargs: Any,
 ) -> tuple[str, dict[str, int]]:
     """
@@ -2216,8 +2308,8 @@ def apply_cache(
         query (str): The original SQL query to be enhanced with cache functionality.
         cache_handler (AbstractCacheHandler): The cache handler instance.
         partition_key (str): The identifier for the partition.
-        method (Literal["IN", "VALUES", "TMP_TABLE_JOIN", "TMP_TABLE_IN", "UNLOGGED_TABLE_JOIN"]): The method to use for
-            query extension. An ``UNLOGGED_TABLE_JOIN`` script ends with the DROP of its key table; execute it as ONE string.
+        method (Literal["IN", "VALUES", "TMP_TABLE_JOIN", "TMP_TABLE_IN", "UNLOGGED_TABLE_JOIN", "UNLOGGED_TABLE_IN"]): The method to
+            use for query extension. An ``UNLOGGED_TABLE_*`` script ends with the DROP of its key table; execute it as ONE string.
         p0_alias (str | None): The alias of the table to use for cache restrictions in regular queries.
             Ignored when use_p0_table=True (cache targets p0 table automatically).
         min_component_size (int): Minimum size of query components to consider for cache lookup.
@@ -2249,6 +2341,8 @@ def apply_cache(
         join_every_table: TMP_TABLE_JOIN and UNLOGGED_TABLE_JOIN only: join the key table to every table instead of
             the p0 table; raises ValueError unless every table is joined on the partition key. See
             extend_query_with_partition_keys.
+        planner_collapse_limit: If set to N, a rewritten script begins with ``SET LOCAL join_collapse_limit = N;`` and
+            ``SET LOCAL from_collapse_limit = N;``; see ``apply_cache_lazy``. None (default) is off.
         geometry_column: If set, enables spatial cache mode. Uses this geometry column for variant
             SELECT clauses and spatial filter application. Requires a spatial cache handler with
             get_spatial_filter() method.
@@ -2308,6 +2402,7 @@ def apply_cache(
         partition_join_table = deprecated["partition_join_table"]
     if "auto_detect_partition_join" in deprecated:
         auto_detect_partition_join = deprecated["auto_detect_partition_join"]
+    _check_planner_collapse_limit(planner_collapse_limit, method, "postgres")  # the eager rewrite below renders PostgreSQL
 
     gated, gate_stats = _check_cost_gate(query, cost_estimator, min_query_cost)
     if gated:
@@ -2524,6 +2619,7 @@ def apply_cache(
         auto_detect_partition_join=auto_detect_partition_join,
         partition_join_table=partition_join_table,
         join_every_table=join_every_table,
+        planner_collapse_limit=planner_collapse_limit,
     )
 
     stats["enhanced"] = 1
