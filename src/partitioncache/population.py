@@ -38,8 +38,10 @@ _GENERATION_DEFAULTS = {
     if parameter.default is not inspect.Parameter.empty
 }
 # Shape only the decomposition of the original query: a variant is no larger than max_component_size, and it
-# already selects the partition key
-_DECOMPOSITION_ONLY_SETTINGS = frozenset({"max_component_size", "warn_no_partition_key", "strip_select"})
+# already selects the partition key. add_constraints adds conditions: the decomposition yields the variants with and
+# without them, but looked up, the constrained "sub-variants" of an unconstrained variant are stricter than it, not
+# relaxations. A constrained variant keeps its constraint as a condition, so its relaxations are still found.
+_DECOMPOSITION_ONLY_SETTINGS = frozenset({"max_component_size", "warn_no_partition_key", "strip_select", "add_constraints"})
 # Keys whose restriction is not a key list (spatial filter, widened grid cells); their variants run unrestricted
 _KEY_LIST_LESS_SETTINGS = ("geometry_column", "grid_cell_size")
 
@@ -49,7 +51,8 @@ def lookup_settings(variant_settings: Mapping[str, Any] | None) -> dict[str, Any
 
     A lookup with other settings can generate sub-variants that are not relaxations of the variant: with
     skip_partition_key_joins=False, a variant of a key generated with True gets single-table variants of its other
-    tables and variants with an added key join, and their cached entries can lack keys of the variant.
+    tables and variants with an added key join, and their cached entries can lack keys of the variant. The added
+    conditions of add_constraints are left out for the same reason.
 
     Args:
         variant_settings: The keyword arguments of generate_all_query_hash_pairs the variants were generated with;
