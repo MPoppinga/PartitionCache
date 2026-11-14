@@ -152,8 +152,9 @@ Optimizes a query by adding partition key restrictions.
 - `partition_keys` (set[int] | set[str] | set[float] | set[datetime]): Partition keys to restrict to
 - `partition_key` (str): Partition column name
 - `method` (Literal["IN", "VALUES", "TMP_TABLE_JOIN", "TMP_TABLE_IN", "UNLOGGED_TABLE_JOIN"]): Optimization method
-- `p0_alias` (str | None): The alias of the table to use for the partition key.
+- `p0_alias` (str | None): The alias of the table to use for the partition key. `None` detects it (`find_p0_alias`); the JOIN methods join the key table to this table only.
 - `analyze_tmp_table` (bool): Whether to create index and analyze. (only for temporary table methods)
+- `join_every_table` (bool, default `False`): `TMP_TABLE_JOIN` and `UNLOGGED_TABLE_JOIN` only. Joins the key table to every table of the `FROM`/`JOIN` list instead of the p0 table. Raises `ValueError` unless every table is connected to the others by equalities on the partition key (`a.key = b.key`, not under `OR`); only then is it equivalent to joining the p0 table.
 - `auto_detect_partition_join` (bool): Whether to auto-detect partition-join tables when resolving the target alias (default: True)
 - `partition_join_table` (str | None): Explicitly specified partition-join table alias or name
 
@@ -208,7 +209,7 @@ print(optimized)
 
 #### `extend_query_with_partition_keys_lazy(query: str, lazy_subquery: str, partition_key: str, method: Literal["IN_SUBQUERY", "TMP_TABLE_IN", "TMP_TABLE_JOIN", "UNLOGGED_TABLE_JOIN"] = "IN_SUBQUERY", p0_alias: str | None = None, analyze_tmp_table: bool = True, auto_detect_partition_join: bool = True, partition_join_table: str | None = None, sql_dialect: str = "postgres")`
 
-Lazy counterpart to `extend_query_with_partition_keys`: integrates a lazy SQL subquery (as returned by `get_partition_keys_lazy()`) into the query instead of a materialized key set.
+Lazy counterpart to `extend_query_with_partition_keys`: integrates a lazy SQL subquery (as returned by `get_partition_keys_lazy()`) into the query instead of a materialized key set. `p0_alias` and `join_every_table` behave as there.
 
 **Returns:**
 - `str`: Extended SQL query
@@ -223,6 +224,7 @@ Lazy counterpart to `extend_query_with_partition_keys`: integrates a lazy SQL su
 - `partition_key` (str): Partition column name
 - `method` (Literal["IN_SUBQUERY", "TMP_TABLE_IN", "TMP_TABLE_JOIN", "UNLOGGED_TABLE_JOIN"]): Integration method
 - `p0_alias` (str | None, optional): Table alias for cache restrictions
+- `join_every_table` (bool, optional): JOIN methods only: join the key table to every table instead of the p0 table; see `extend_query_with_partition_keys` (default: False)
 - `min_component_size` (int, optional): Minimum size of query components to consider for cache lookup (default: 2)
 - `canonicalize_queries` (bool, optional): Whether to canonicalize queries before hashing (default: False)
 - `follow_graph` (bool, optional): Whether to follow the query graph for generating variants (default: True)
@@ -371,7 +373,7 @@ enhanced_query, stats = partitioncache.apply_cache_lazy(
 
 #### `apply_cache(query, cache_handler, partition_key, ..., geometry_column=None, buffer_distance=None)`
 
-Applies partition cache to a query using regular (non-lazy) cache handlers. Supports spatial mode. Accepts the same `cost_estimator` / `min_query_cost` gate as `apply_cache_lazy`. Like `apply_cache_lazy`, it takes `sql_dialect` (default `"postgres"`), the sqlglot dialect the enhanced non-spatial query is parsed and rendered in.
+Applies partition cache to a query using regular (non-lazy) cache handlers. Supports spatial mode. Accepts the same `cost_estimator` / `min_query_cost` gate and `join_every_table` option as `apply_cache_lazy`. Like `apply_cache_lazy`, it takes `sql_dialect` (default `"postgres"`), the sqlglot dialect the enhanced non-spatial query is parsed and rendered in.
 
 **Spatial Parameters** (in addition to standard parameters):
 - `geometry_column` (str | None, optional): Enables spatial mode. Requires a spatial cache handler with `get_spatial_filter()` method.
@@ -780,6 +782,7 @@ Executes and caches the variants of one query sequentially, smallest first. Each
 - Variants already in the cache are not executed; their entries restrict the others through the lookup, as do entries of other queries.
 - An empty eager intersection means the variant has no rows; it is stored as an empty set without executing it.
 - `max_restriction_keys` (eager only): restrict only when the intersection has at most this many keys.
+- `join_every_table=True` (`TMP_TABLE_JOIN` only) joins the key table to every table of a variant; refused for keys without partition key joins.
 - `lazy=True` restricts with a subquery on the cache (`IN_SUBQUERY`, `TMP_TABLE_IN` or `TMP_TABLE_JOIN`); it needs an `AbstractCacheHandler_Lazy` whose tables the database can read, and no key limit.
 - Spatial and grid variants (`geometry_column`, `grid_cell_size` in `variant_settings`) are populated unrestricted with a warning.
 - Relaxations that failed, timed out or are still running have no entry and do not restrict.

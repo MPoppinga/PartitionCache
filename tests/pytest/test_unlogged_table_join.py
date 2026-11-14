@@ -55,9 +55,16 @@ class TestEager:
         assert "tmp_o" not in select
         assert "TEMPORARY" not in script
 
-    def test_without_alias_joins_every_table(self):
+    def test_without_alias_joins_the_p0_table(self):
         script = extend_query_with_partition_keys(QUERY, {1}, "region_id", method="UNLOGGED_TABLE_JOIN")
+        assert "tmp_u.partition_key = u.region_id" in script and "tmp_o" not in script
+
+    def test_join_every_table(self):
+        joined = "SELECT * FROM users AS u JOIN orders AS o ON u.region_id = o.region_id WHERE u.active = TRUE"
+        script = extend_query_with_partition_keys(joined, {1}, "region_id", method="UNLOGGED_TABLE_JOIN", join_every_table=True)
         assert "tmp_u.partition_key = u.region_id" in script and "tmp_o.partition_key = o.region_id" in script
+        with pytest.raises(ValueError, match="every table joined on region_id"):
+            extend_query_with_partition_keys(QUERY, {1}, "region_id", method="UNLOGGED_TABLE_JOIN", join_every_table=True)
 
     def test_index_and_analyze_do_not_depend_on_analyze_tmp_table(self):
         script = extend_query_with_partition_keys(QUERY, {1}, "region_id", method="UNLOGGED_TABLE_JOIN", p0_alias="u", analyze_tmp_table=False)

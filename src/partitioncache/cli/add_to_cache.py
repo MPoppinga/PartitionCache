@@ -99,6 +99,19 @@ def main():
         default=None,
         help="With --direct: only restrict a variant when the intersection has at most this many keys (implies --restrict-variants)",
     )
+    mode_group.add_argument(
+        "--restriction-method",
+        default="IN",
+        choices=["IN", "VALUES", "TMP_TABLE_IN", "TMP_TABLE_JOIN"],
+        help="With --restrict-variants: how the keys restrict a variant (default: IN)",
+    )
+    mode_group.add_argument(
+        "--join-every-table",
+        action="store_true",
+        default=False,
+        help="With --restriction-method TMP_TABLE_JOIN: join the key table to every table of a variant instead of its key "
+        "table; only for keys whose tables are all joined on the partition key",
+    )
 
     # Add common argument groups
     add_cache_args(parser, require_partition_key=True)
@@ -115,6 +128,8 @@ def main():
         parser.error("--max-restriction-keys must not be negative")
     if (args.restrict_variants or args.max_restriction_keys is not None) and not args.direct:
         parser.error("--restrict-variants and --max-restriction-keys require --direct")
+    if args.join_every_table and args.restriction_method != "TMP_TABLE_JOIN":
+        parser.error("--join-every-table needs --restriction-method TMP_TABLE_JOIN")
 
     # Configure logging based on verbosity
     configure_logging(args)
@@ -325,8 +340,10 @@ def main():
                         cache_handler,
                         db_handler,
                         max_restriction_keys=args.max_restriction_keys,
+                        method=args.restriction_method,
                         sql_dialect=sql_dialect_for_backend(args.db_backend),
                         variant_settings=variant_settings,
+                        join_every_table=args.join_every_table,
                     )
                     logger.info(f"Populated query variants: {stats}")
                     population_failed = bool(stats.failed or stats.store_failed)

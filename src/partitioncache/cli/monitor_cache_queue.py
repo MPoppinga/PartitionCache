@@ -305,6 +305,7 @@ def apply_cache_optimization(query: str, query_hash: str, partition_key: str, pa
             method=method,
             max_restriction_keys=max_keys,
             min_cache_hits=args.min_cache_hits,
+            join_every_table=args.join_every_table,
             sql_dialect=sql_dialect_for_backend(args.db_backend),
         )
     except Exception as e:
@@ -806,6 +807,13 @@ def main():
         choices=["IN", "VALUES", "IN_SUBQUERY", "TMP_TABLE_IN", "TMP_TABLE_JOIN"],
         help="Method for applying cache restrictions (default: IN)",
     )
+    optimization_group.add_argument(
+        "--join-every-table",
+        action="store_true",
+        default=False,
+        help="With TMP_TABLE_JOIN: join the key table to every table of a fragment instead of its key table (the monitor's "
+        "behavior before 2026-11). Only for keys whose tables are all joined on the partition key; other fragments run unrestricted",
+    )
     optimization_group.add_argument("--min-cache-hits", type=int, default=1, help="Minimum cache hits required for non-lazy optimization (default: 1)")
     optimization_group.add_argument(
         "--max-restriction-keys",
@@ -863,6 +871,8 @@ def main():
     args = parser.parse_args()
     if args.max_restriction_keys is not None and args.max_restriction_keys < 0:
         parser.error("--max-restriction-keys must not be negative")
+    if args.join_every_table and args.cache_optimization_method != "TMP_TABLE_JOIN":
+        parser.error("--join-every-table needs --cache-optimization-method TMP_TABLE_JOIN")
 
     # Configure enhanced logging with thread-aware formatting
     configure_enhanced_logging(verbose=getattr(args, "verbose", False), quiet=getattr(args, "quiet", False), logger_name="PartitionCache")
@@ -976,6 +986,8 @@ def main():
         logger.info(f"  - Min cache hits: {args.min_cache_hits}")
         logger.info(f"  - Max restriction keys: {args.max_restriction_keys if args.max_restriction_keys is not None else 'no limit'}")
         logger.info(f"  - Prefer lazy: {args.prefer_lazy_optimization}")
+        if args.cache_optimization_method == "TMP_TABLE_JOIN":
+            logger.info(f"  - Joined tables: {'every table (--join-every-table)' if args.join_every_table else 'the key table of each fragment'}")
         # The lookup generates each fragment's sub-variants with these settings, also for fragments that another
         # client generated and pushed; generated with other settings, they find fewer cached relaxations
         settings = variant_settings(args, constraint_args, "<partition key>", None)
