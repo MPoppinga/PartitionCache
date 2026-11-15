@@ -137,7 +137,7 @@ def restrict_with_cache(
             another method, a key without partition key joins, or a variant whose tables are not all joined on it.
     """
     kwargs = lookup_settings(variant_settings)
-    _check_fold_key_subqueries(fold_key_subqueries, method)
+    _check_fold_key_subqueries(fold_key_subqueries, method, sql_dialect)
     if method not in (LAZY_METHODS if lazy else EAGER_METHODS):
         raise ValueError(f"Unknown {'lazy' if lazy else 'eager'} restriction method {method!r}")
     if lazy and max_restriction_keys is not None:
@@ -306,7 +306,7 @@ def populate_query_variants(
         if lazy and max_restriction_keys is not None:
             raise ValueError("A key limit needs the key count, which only the eager lookup fetches")
         _check_planner_collapse_limit(planner_collapse_limit, method, sql_dialect)
-        _check_fold_key_subqueries(fold_key_subqueries, method)
+        _check_fold_key_subqueries(fold_key_subqueries, method, sql_dialect)
         if join_every_table and lookup_settings(variant_settings)["skip_partition_key_joins"]:
             raise ValueError("join_every_table needs every table joined on the partition key; variants without partition key joins are not")
 
