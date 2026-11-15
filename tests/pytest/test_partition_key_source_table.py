@@ -471,3 +471,81 @@ class TestPartitionKeyWarningDowngrade:
         # Should have WARNING-level messages (no source table to downgrade)
         pk_warn = [r for r in caplog.records if "does not use partition key" in r.message and r.levelno == logging.WARNING]
         assert len(pk_warn) > 0, "Should have WARNING-level partition key messages when no source table context"
+
+
+# -- Auto-detection keeps the key of the alias the query selects (gap 37) --
+
+# Two tables without key joins: a(pk, t, x), b(pk, t, y); rows within 10 time units of each other pair up
+_KEY_TABLES = {
+    "a": [(1, 0, 1), (2, 50, 1), (3, 100, 2), (4, 150, 1), (5, 200, 2)],
+    "b": [(11, 5, 1), (12, 300, 1), (13, 95, 1), (16, 145, 2), (17, 205, 1)],
+}
+
+SELF_JOIN_FIRST = "SELECT p1.pk FROM a AS p1, a AS p2 WHERE p1.x = 1 AND p2.x = 2 AND p2.t BETWEEN p1.t AND p1.t + 60"
+SELF_JOIN_SECOND = "SELECT p2.pk FROM a AS p1, a AS p2 WHERE p1.x = 1 AND p2.x = 2 AND p2.t BETWEEN p1.t AND p1.t + 60"
+LATER_TABLE = "SELECT b.pk FROM a, b WHERE a.x = 1 AND b.y = 1 AND b.t BETWEEN a.t AND a.t + 10"
+FIRST_TABLE = "SELECT a.pk FROM a, b WHERE a.x = 1 AND b.y = 1 AND b.t BETWEEN a.t AND a.t + 10"
+JOINED_TABLE = "SELECT b.pk FROM a JOIN b ON b.t BETWEEN a.t AND a.t + 10 WHERE a.x = 1 AND b.y = 1"
+
+
+def _keys(connection, sql: str) -> set[int]:
+    distinct = sql if sql.upper().startswith("SELECT DISTINCT") else sql.replace("SELECT ", "SELECT DISTINCT ", 1)
+    return {row[0] for row in connection.execute(distinct)}
+
+
+def _key_connection():
+    import sqlite3
+
+    connection = sqlite3.connect(":memory:")
+    for table, rows in _KEY_TABLES.items():
+        connection.execute(f"CREATE TABLE {table} (pk INTEGER, t INTEGER, {'x' if table == 'a' else 'y'} INTEGER)")
+        connection.executemany(f"INSERT INTO {table} VALUES (?, ?, ?)", rows)
+    return connection
+
+
+class TestAutoDetectKeepsTheSelectedAlias:
+    """Without key joins, every variant must select the key of the alias the query selects.
+
+    The auto-detected source used to be the table name of the first FROM table only: a self-join
+    then also stored the other alias's variants (they hold that alias's keys), and a query selecting a
+    later table's key got variants that select the first table's key. Restricting the query with such a
+    variant's cached keys drops rows.
+    """
+
+    @staticmethod
+    def _variants(query: str, **settings):
+        return generate_all_query_hash_pairs(
+            query, "pk", min_component_size=1, skip_partition_key_joins=True, warn_no_partition_key=False, **settings
+        )
+
+    def test_the_data_tells_the_aliases_apart(self):
+        """The other alias's single-table variant misses keys of the query here, so the tests below can fail."""
+        connection = _key_connection()
+        assert not _keys(connection, SELF_JOIN_FIRST) <= _keys(connection, "SELECT pk FROM a WHERE x = 2")
+        assert not _keys(connection, LATER_TABLE) <= _keys(connection, "SELECT pk FROM a WHERE x = 1")
+
+    def test_every_variant_holds_the_keys_of_the_query(self):
+        connection = _key_connection()
+        for query in (SELF_JOIN_FIRST, SELF_JOIN_SECOND, LATER_TABLE, JOINED_TABLE, FIRST_TABLE):
+            query_keys = _keys(connection, query)
+            assert query_keys, f"the data must give the query rows: {query}"
+            for variant, _ in self._variants(query):
+                missing = query_keys - _keys(connection, variant)
+                assert not missing, f"{variant} misses keys {sorted(missing)} of {query}"
+
+    def test_self_join_variants_keep_the_selected_alias(self):
+        """Both directions: every variant keeps the selected alias's condition (x = 1 for p1, x = 2 for p2)."""
+        for query, selected_condition in ((SELF_JOIN_FIRST, ".x = 1"), (SELF_JOIN_SECOND, ".x = 2")):
+            for variant, _ in self._variants(query):
+                assert selected_condition in variant, f"{variant} lacks the selected alias of {query}"
+
+    def test_the_same_as_passing_the_alias(self):
+        for query, alias in ((SELF_JOIN_FIRST, "p1"), (SELF_JOIN_SECOND, "p2"), (LATER_TABLE, "b"), (JOINED_TABLE, "b")):
+            assert sorted(self._variants(query)) == sorted(self._variants(query, partition_key_source_table=alias))
+
+    def test_a_table_under_one_alias_is_unchanged(self):
+        """The first FROM table under one alias keeps the table name as its source: the variants are those of passing it."""
+        assert sorted(self._variants(FIRST_TABLE)) == sorted(self._variants(FIRST_TABLE, partition_key_source_table="a"))
+        assert sorted(self._variants(FACT_DIM_QUERY.replace("trip_id", "pk"))) == sorted(
+            self._variants(FACT_DIM_QUERY.replace("trip_id", "pk"), partition_key_source_table="taxi_trips")
+        )
