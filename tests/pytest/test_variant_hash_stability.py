@@ -2,9 +2,9 @@
 Variant hashes stay byte-identical: cache entries are found by them, so a change to variant generation that alters
 one hash loses its entries.
 
-The statements have the shape of 09g's KLIFS fragment (a long IN list, an inline metadata subquery), the case a
+The statements are a self-join with a long IN list and an inline subquery on the partition key, the case a
 performance change to generate_partial_queries targets; the digests were computed with main before that change
-(8c45168) and do not depend on PYTHONHASHSEED. scripts/compare_variant_hashes.py compares two trees over a larger
+(79a2f60) and do not depend on PYTHONHASHSEED. scripts/compare_variant_hashes.py compares two trees over a larger
 corpus.
 """
 
@@ -15,13 +15,13 @@ import pytest
 import partitioncache.query_processor as query_processor
 from partitioncache.query_processor import generate_all_hashes, generate_all_query_hash_pairs
 
-PDBS = ", ".join(f"'{chr(65 + i % 26)}{i:03d}'" for i in range(300))
-BASE = ("SELECT DISTINCT p1.pocket_key FROM interactiondb_inter_points AS t1, interactiondb_inter_points AS t2, interactiondb_pockets AS p1 "
-        "WHERE t1.pocket_key = p1.pocket_key AND t2.pocket_key = p1.pocket_key AND t1.type = 'HBD' AND t2.type = 'AR' "
-        f"AND p1.pdb_code IN ({PDBS})")
+CODES = ", ".join(f"'{chr(65 + i % 26)}{i:03d}'" for i in range(300))
+BASE = ("SELECT DISTINCT r.region_id FROM pois AS t1, pois AS t2, regions AS r "
+        "WHERE t1.region_id = r.region_id AND t2.region_id = r.region_id AND t1.subtype = 'cafe' AND t2.subtype = 'pharmacy' "
+        f"AND r.region_code IN ({CODES})")
 STATEMENTS = {
-    "inline_with_distance": BASE + " AND ST_DWithin(t1.geom, t2.geom, 4.7) AND p1.pocket_key IN (SELECT unnest(m.pocket_key) FROM meta AS m WHERE m.prop_key = 39 AND m.prop_value >= 2.5)",
-    "inline_without_distance": BASE + " AND p1.pocket_key IN (SELECT unnest(m.pocket_key) FROM meta AS m WHERE m.prop_key = 39)",
+    "inline_with_distance": BASE + " AND ST_DWithin(t1.geom, t2.geom, 4.7) AND r.region_id IN (SELECT unnest(s.region_ids) FROM region_stats AS s WHERE s.stat_key = 39 AND s.stat_value >= 2.5)",
+    "inline_without_distance": BASE + " AND r.region_id IN (SELECT unnest(s.region_ids) FROM region_stats AS s WHERE s.stat_key = 39)",
     "plain_with_distance": BASE + " AND ST_DWithin(t1.geom, t2.geom, 3.2)",
 }
 SETTINGS = {
@@ -32,25 +32,25 @@ SETTINGS = {
         "min_component_size": 1,
         "follow_graph": True,
         "keep_all_attributes": True,
-        "add_constraints": {"interactiondb_pockets": "size = 4"},
-        "remove_constraints_add": ["type"],
+        "add_constraints": {"regions": "area_class = 4"},
+        "remove_constraints_add": ["subtype"],
     },
 }
 
-# (number of hashes, sha256 of the sorted hashes, first 16 hex digits), computed at 8c45168
+# (number of hashes, sha256 of the sorted hashes, first 16 hex digits), computed at main 79a2f60
 EXPECTED = {
-    "inline_with_distance/population": (5, "0c56fa6d9825777a"),
-    "inline_with_distance/lookup": (11, "1c10e4644750b1bc"),
-    "inline_with_distance/lookup_canonical": (11, "1c10e4644750b1bc"),
-    "inline_with_distance/constraints": (19, "2af1e7231007c96f"),
-    "inline_without_distance/population": (1, "5cd2d85bb973f2cd"),
-    "inline_without_distance/lookup": (7, "9df0050536d1c699"),
-    "inline_without_distance/lookup_canonical": (7, "9df0050536d1c699"),
-    "inline_without_distance/constraints": (11, "41921b4a85375678"),
-    "plain_with_distance/population": (2, "13ca02e1ba6e4d94"),
-    "plain_with_distance/lookup": (5, "f89d9122fe551a15"),
-    "plain_with_distance/lookup_canonical": (5, "f89d9122fe551a15"),
-    "plain_with_distance/constraints": (9, "f0dc32ae0503f035"),
+    "inline_with_distance/population": (5, "5b3ad4bc77ea4721"),
+    "inline_with_distance/lookup": (11, "0010b678ee5b2fc5"),
+    "inline_with_distance/lookup_canonical": (11, "0010b678ee5b2fc5"),
+    "inline_with_distance/constraints": (19, "8c7c82c8f2428d4e"),
+    "inline_without_distance/population": (1, "773cf7952cfbf2e4"),
+    "inline_without_distance/lookup": (7, "2dfa01a53657c59f"),
+    "inline_without_distance/lookup_canonical": (7, "2dfa01a53657c59f"),
+    "inline_without_distance/constraints": (11, "55f606f8800f063b"),
+    "plain_with_distance/population": (2, "0345bb28284961bc"),
+    "plain_with_distance/lookup": (5, "5c8006eecf262d5f"),
+    "plain_with_distance/lookup_canonical": (5, "5c8006eecf262d5f"),
+    "plain_with_distance/constraints": (9, "1f5bf4c48e754e2b"),
 }
 
 
@@ -59,9 +59,9 @@ def test_hashes_are_unchanged(case):
     name, label = case.split("/")
     settings = SETTINGS[label]
     if label in ("population", "constraints"):
-        hashes = sorted(h for _, h in generate_all_query_hash_pairs(STATEMENTS[name], "pocket_key", **settings))
+        hashes = sorted(h for _, h in generate_all_query_hash_pairs(STATEMENTS[name], "region_id", **settings))
     else:
-        hashes = sorted(generate_all_hashes(STATEMENTS[name], "pocket_key", **settings))
+        hashes = sorted(generate_all_hashes(STATEMENTS[name], "region_id", **settings))
     assert (len(hashes), hashlib.sha256("\n".join(hashes).encode()).hexdigest()[:16]) == EXPECTED[case]
 
 
@@ -76,5 +76,5 @@ def test_variants_are_generated_once_when_bucketing_changes_nothing(monkeypatch,
         return original(*args, **kwargs)
 
     monkeypatch.setattr(query_processor, "generate_partial_queries", counting)
-    generate_all_hashes(STATEMENTS[name], "pocket_key", **SETTINGS["lookup"])
+    generate_all_hashes(STATEMENTS[name], "region_id", **SETTINGS["lookup"])
     assert len(calls) == generations
