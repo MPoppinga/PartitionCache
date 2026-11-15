@@ -171,13 +171,12 @@ class TestCacheConcurrency:
             futures = [executor.submit(write_worker, i) for i in range(num_threads)]
             results = [future.result() for future in as_completed(futures)]
 
-        # Verify all operations succeeded
-        total_successful = sum(len(result) for result in results)
-        expected_total = num_threads * operations_per_thread
-
-        # Allow for some failures in concurrent scenarios
-        success_rate = total_successful / expected_total
-        assert success_rate > 0.95, f"Too many concurrent write failures: {success_rate:.2%}"
+        # Every write succeeds, and every write that returned True is stored (a shared instance once lost about
+        # 40 % of them silently, see test_shared_handler_threads.py)
+        successful = [key for result in results for key in result]
+        assert len(successful) == num_threads * operations_per_thread
+        lost = [key for key in successful if not cache_client.get(key, partition_key)]
+        assert lost == [], f"{len(lost)} writes returned True but are not stored"
 
     @pytest.mark.slow
     def test_concurrent_read_write(self, cache_client: AbstractCacheHandler):

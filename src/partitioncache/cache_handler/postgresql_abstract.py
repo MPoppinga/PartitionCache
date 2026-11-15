@@ -13,6 +13,7 @@ from psycopg import sql
 from psycopg.pq import TransactionStatus
 
 from partitioncache.cache_handler.abstract import LAZY_ALL_KEYS_PLACEHOLDER, AbstractCacheHandler_Lazy
+from partitioncache.cache_handler.thread_safety import ThreadSafeHandler
 
 logger = getLogger("PartitionCache")
 
@@ -31,7 +32,7 @@ def _ends_read_transaction(fn: Callable[P, R]) -> Callable[P, R]:  # ParamSpec i
     return wrapper
 
 
-class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
+class PostgreSQLAbstractCacheHandler(ThreadSafeHandler, AbstractCacheHandler_Lazy):
     _instance = None
     _refcount = 0
     _cached_datatype: dict[str, str] = {}
@@ -205,6 +206,21 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
             except Exception:
                 logger.debug("rollback after SQL function load failed", exc_info=True)
 
+    def _has_pending_write(self) -> bool:
+        """Whether the connection's open transaction has written (ThreadSafeHandler.check_pending_writes).
+
+        A transaction that has only read has no transaction id assigned. False for a mock or a closed connection.
+        """
+        status = getattr(getattr(getattr(self, "db", None), "info", None), "transaction_status", None)
+        if not isinstance(status, TransactionStatus) or status in (TransactionStatus.IDLE, TransactionStatus.UNKNOWN):
+            return False
+        if status == TransactionStatus.INERROR:
+            return True  # an aborted transaction: its writes are pending until someone rolls back
+        with self.db.cursor() as cur:
+            cur.execute("SELECT txid_current_if_assigned() IS NOT NULL")
+            row = cur.fetchone()
+        return bool(row and row[0])
+
     @contextmanager
     def _read_txn(self):
         """End a transaction that a read opened.
@@ -217,6 +233,11 @@ class PostgreSQLAbstractCacheHandler(AbstractCacheHandler_Lazy):
 
         Only a transaction opened inside the block is ended. If the caller was already in
         one it owns the pending work, so ending it here could discard a write.
+
+        "Opened inside the block" is judged by the connection's status at entry, which is right only while no other
+        thread uses the connection: a rollback here discarded another thread's pending INSERT, whose set_cache then
+        returned True (#24 up to the instance lock). The lock of ThreadSafeHandler makes every public method exclusive,
+        and no public method returns with a write pending (``check_pending_writes``), so the rule holds again.
         """
         owns = self.db.info.transaction_status == TransactionStatus.IDLE
         try:
