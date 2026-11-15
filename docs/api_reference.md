@@ -232,6 +232,8 @@ print(optimized)
 > - Also in `restrict_with_cache` / `populate_query_variants` and as `pcache-monitor --fold-key-subqueries` /
 >   `pcache-add --fold-key-subqueries`: a restricted variant returns the same keys with and without folding, so the
 >   stored entries do not change.
+> - The key table is `<keys> INTERSECT <subquery> ...` on PostgreSQL, with the keys as a MATERIALIZED CTE and the
+>   table in the keys' type; SQLite and DuckDB filter with IN; other dialects raise `ValueError`.
 > - Design and equivalence argument: [fold_key_subqueries.md](fold_key_subqueries.md).
 
 > **Key table types.** The temporary and unlogged key tables take the type of the keys: `INT`/`BIGINT`,
