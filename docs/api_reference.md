@@ -807,8 +807,8 @@ Executes and caches the variants of one query sequentially, smallest first. Each
 - Variants already in the cache are not executed; their entries restrict the others through the lookup, as do entries of other queries.
 - An empty eager intersection means the variant has no rows; it is stored as an empty set without executing it.
 - `max_restriction_keys` (eager only): restrict only when the intersection has at most this many keys.
-- `join_every_table=True` (`TMP_TABLE_JOIN` only) joins the key table to every table of a variant; refused for keys without partition key joins.
-- `lazy=True` restricts with a subquery on the cache (`IN_SUBQUERY`, `TMP_TABLE_IN` or `TMP_TABLE_JOIN`); it needs an `AbstractCacheHandler_Lazy` whose tables the database can read, and no key limit.
+- `join_every_table=True` (`TMP_TABLE_JOIN` and `UNLOGGED_TABLE_JOIN` only) joins the key table to every table of a variant; refused for keys without partition key joins. Without it, the JOIN methods join the key table to the variant's key table (p0).
+- `lazy=True` restricts with a subquery on the cache (`IN_SUBQUERY`, `TMP_TABLE_IN`, `TMP_TABLE_JOIN`, `UNLOGGED_TABLE_IN` or `UNLOGGED_TABLE_JOIN`); it needs an `AbstractCacheHandler_Lazy` whose tables the database can read, and no key limit.
 - Spatial and grid variants (`geometry_column`, `grid_cell_size` in `variant_settings`) are populated unrestricted with a warning.
 - Relaxations that failed, timed out or are still running have no entry and do not restrict.
 - `db_handler.execute` must raise on errors. A failure returned as an empty result would be cached as "no rows" and empty every variant it restricts; `SQLiteDBHandler` logs errors and returns `[]`.
