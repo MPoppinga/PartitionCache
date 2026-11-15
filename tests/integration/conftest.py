@@ -8,8 +8,13 @@ import psycopg
 import pytest
 
 from partitioncache.cache_handler import get_cache_handler
+from partitioncache.cache_handler.thread_safety import ThreadSafeHandler
 
 logger = logging.getLogger("PartitionCache")
+
+# No public handler call may return with a write pending: on a shared instance another thread's commit or rollback
+# would act on it (cache_handler/thread_safety.py)
+ThreadSafeHandler.check_pending_writes = True
 
 
 # Configure pytest markers

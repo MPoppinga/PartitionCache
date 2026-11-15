@@ -639,6 +639,20 @@ Validation happens eagerly at construction time: the helper reads the partition 
 
 Each handler family implements a class-level singleton with reference counting. `PostgreSQLAbstractCacheHandler.get_instance` returns the shared `_instance` and increments `_refcount`; `close` decrements and only tears down the connection when the count reaches zero. The PostgreSQL variant additionally bypasses the singleton entirely when `threading.active_count() > 1`, returning a fresh connection per call, because psycopg connections are not safely shareable across threads. `RocksDBAbstractCacheHandler.get_instance` uses double-checked locking with a class `_lock` (RocksDB permits only one writer process per database directory); `RedisAbstractCacheHandler` and `RocksDictAbstractCacheHandler` follow the same `_instance`/`_refcount` pattern. The helper facade cooperates with this lifecycle: its context-manager `__exit__` skips `close()` for singleton-managed handlers.
 
+
+**One handler instance shared by threads.** The singleton bypass covers callers that ask `get_instance` from each thread, as pcache-monitor's workers do. A caller can still hand one instance to several threads.
+- Before 2026-11, the PostgreSQL handlers then lost writes silently.
+  - From #24 on, `_read_txn` rolls back the read transaction it opened, judged by the connection's status when the read began.
+  - With another thread writing in between, that rollback discarded the other thread's pending cache INSERT. The other thread then committed its queries row alone, and its `set_cache` returned True.
+  - Measured on one shared instance: about 40 % of `postgresql_bit` writes; about 25 % of `set_entry` writes for array and roaringbit.
+- DuckDB's shared connection crashed the process.
+- Now `src/partitioncache/cache_handler/thread_safety.py::ThreadSafeHandler` gives each PostgreSQL and DuckDB handler instance a re-entrant lock.
+  - The lock is held for every public method, inherited ones included. Wrapping happens in `__init_subclass__`, so a new method cannot miss it.
+  - A call therefore runs from its first statement to its commit or rollback while no other thread uses the instance.
+  - This holds because no public method returns with a write pending. The tests turn on `ThreadSafeHandler.check_pending_writes`, which raises if one does (`txid_current_if_assigned()`). A read may leave its read-only transaction open, as `get` always has.
+- Threads that share an instance wait for each other, including during `set_cache_lazy`'s query. Instances of their own, as pcache-monitor's, do not.
+- Redis and the RocksDB/RocksDict handlers need no lock: they hold no shared transaction, and the shared-instance tests store every write.
+
 Datatype lookups are cached per handler *instance* (`self._cached_datatype = {}` in `PostgreSQLAbstractCacheHandler.__init__`) rather than per class: different table prefixes may reuse the same partition key name with different datatypes, so a class-level cache would leak state across logically separate caches (a defect class previously observed in integration tests).
 
 ## 7. Queue System & Asynchronous Cache Population
