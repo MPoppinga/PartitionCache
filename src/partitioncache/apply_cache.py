@@ -1207,15 +1207,18 @@ def _fold_key_subqueries(
             column, subquery = condition.this, condition.args["query"].this
         elif isinstance(condition, exp.EQ) and isinstance(condition.expression, exp.Any) and isinstance(condition.expression.this, exp.Subquery):
             column, subquery = condition.this, condition.expression.this.this
-        if (
-            isinstance(column, exp.Column)
-            and column.name == partition_key
-            and column.table in component
-            and subquery is not None
-            and _unfoldable_reason(subquery, outer_ctes, column_resolver, assume_inner_columns, sql_dialect) is None
-        ):
+        candidate = isinstance(column, exp.Column) and column.name == partition_key and subquery is not None
+        reason = None
+        if candidate and column.table not in component:
+            reason = f"alias {column.table} not tied to the restricted alias by key equalities"
+        elif candidate:
+            reason = _unfoldable_reason(subquery, outer_ctes, column_resolver, assume_inner_columns, sql_dialect)
+        if candidate and reason is None:
             folded.append(subquery.sql(dialect=sql_dialect))
+            logger.info(f"fold_key_subqueries: folded {column.sql()} IN ({_abbreviated(subquery)})")
         else:
+            if candidate:
+                logger.info(f"fold_key_subqueries: not folded ({reason}): {column.sql()} IN ({_abbreviated(subquery)})")
             kept.append(condition)
     if folded:
         if kept:
@@ -1223,6 +1226,12 @@ def _fold_key_subqueries(
         else:
             parsed_query.set("where", None)
     return folded
+
+
+def _abbreviated(expression: exp.Expr, limit: int = 120) -> str:
+    """An expression's SQL for a log line, cut to ``limit`` characters."""
+    text = expression.sql()
+    return text if len(text) <= limit else text[: limit - 3] + "..."
 
 
 # The key column's name around the folded conditions of a key table's defining query

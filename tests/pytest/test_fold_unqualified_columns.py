@@ -278,3 +278,13 @@ class TestPostgreSQL:
             assert catalog_column_resolver(execute)("shadowed") == {"temporary_col"}  # the session's temporary table shadows it
         finally:
             conn.execute("DROP TABLE pg_temp.shadowed")
+
+
+def test_each_decision_is_logged(caplog):
+    """pcache-monitor's runs record per fragment whether its key subquery folded, and if not, why."""
+    with caplog.at_level("INFO", logger="PartitionCache"):
+        _folds(GEOMINE_NUM)
+        _folds(GEOMINE_NUM, fold_column_resolver=GEOMINE_COLUMNS.get)
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("fold_key_subqueries:")]
+    assert lines[0].startswith("fold_key_subqueries: not folded (unqualified column prop_value)")
+    assert lines[1].startswith("fold_key_subqueries: folded t1.pocket_key IN (")
