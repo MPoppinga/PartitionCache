@@ -16,7 +16,8 @@ from logging import getLogger
 from typing import Any, Literal
 
 from partitioncache.apply_cache import (
-    _TYPED_KEY_METHODS,
+    FLOAT_KEY_REFUSING_METHODS,
+    _cache_datatype,
     _check_fold_key_subqueries,
     _check_planner_collapse_limit,
     extend_query_with_partition_keys,
@@ -166,7 +167,7 @@ def restrict_with_cache(
             join_every_table=join_every_table,
             planner_collapse_limit=planner_collapse_limit,
             fold_key_subqueries=fold_key_subqueries,
-            partition_datatype=cache_handler.get_datatype(partition_key) if fold_key_subqueries else None,
+            partition_datatype=_cache_datatype(cache_handler, partition_key),
         )
         return Restriction(restricted, restricted=True, generated=generated, hits=hits, method=method)
 
@@ -178,8 +179,8 @@ def restrict_with_cache(
     if max_restriction_keys is not None and len(keys) > max_restriction_keys:
         # A restriction to most of the keys filters little and costs a long key list
         return Restriction(query, generated=generated, hits=hits, keys=len(keys), reason="over_key_limit")
-    if method in _TYPED_KEY_METHODS and any(isinstance(k, float) for k in keys):
-        # Typed as double precision, float keys would silently miss a real (float4) column; only IN takes the column's type
+    if method in FLOAT_KEY_REFUSING_METHODS and any(isinstance(k, float) for k in keys):
+        # Typed as double precision, a VALUES list would silently miss a real (float4) column; IN and the key tables take the column's type
         logger.warning(f"{method} does not restrict float partition keys (a real column would match none); the variant runs unrestricted, use IN")
         return Restriction(query, generated=generated, hits=hits, keys=len(keys), reason="float_keys")
     restricted = extend_query_with_partition_keys(
@@ -213,7 +214,7 @@ class RestrictionCounts:
     below_min_hits: int = 0
     over_key_limit: int = 0
     no_key_alias: int = 0  # no key joins, and the variant selects no qualified key column
-    float_keys: int = 0  # float keys with VALUES or a key-table method, which cannot restrict them exactly
+    float_keys: int = 0  # float keys with VALUES, whose double precision list cannot restrict them exactly
     lookup_failed: int = 0
 
     def count_unrestricted(self, reason: str) -> None:

@@ -236,13 +236,26 @@ print(optimized)
 >   table in the keys' type; SQLite and DuckDB filter with IN; other dialects raise `ValueError`.
 > - Design and equivalence argument: [fold_key_subqueries.md](fold_key_subqueries.md).
 
-> **Key table types.** The temporary and unlogged key tables take the type of the keys: `INT`/`BIGINT`,
-> `NUMERIC` for `Decimal` keys (psycopg's type for numeric columns), `TIMESTAMP`/`TIMESTAMPTZ` for datetimes,
-> otherwise `TEXT`. String keys are escaped literals. **Float keys** are refused (`ValueError`) by `VALUES` and the
-> key-table methods: a float read back from a `real` (float4) column is the double nearest to its text, and a
-> double precision key list compares `real = double precision`, so it would silently match none. Use `IN`, whose
-> literals take the column's type. Population and `pcache-monitor` run such variants unrestricted and count them
-> (`float_keys`).
+> **Key table types.** Key tables for integer keys are `INT`/`BIGINT`, as before. Key tables for all other keys
+> (decimal, float, text, timestamp; on the lazy path: a cache datatype other than `integer`) are created in the
+> type of the key column and filled with untyped literals (eager) or the lazy keys. On PostgreSQL the type has no
+> length or precision modifier (`CREATE ... AS SELECT (array_agg(p0.<key>))[1] ... WHERE false HAVING false`:
+> `varchar(4)` becomes `varchar`, `char(5)` `bpchar`, `numeric(10,2)` `numeric`), so a key the column could not hold
+> (too long, out of range) matches no row instead of failing the script; a domain keeps its own constraints, and a
+> key it rejects fails the script. SQLite and DuckDB use `SELECT p0.<key> ... LIMIT 0`. The INSERT converts the keys as the column's own comparison with an `IN` literal would.
+> A typed key list compares differently: a `char(n)` column reads back padded keys (`'k1   '`) that matched no row
+> as text, and a `real` (float4) column reads back the double nearest to its text, which matched no row in double
+> precision.
+> - The p0 alias must name a plain table for these methods (not a subquery or CTE); otherwise they raise
+>   `ValueError` and `IN` is the way. `extend_query_with_partition_keys_lazy` without `partition_datatype` keeps the
+>   integer scripts; `apply_cache_lazy` and population pass the cache's datatype.
+> - **`VALUES`** cannot take the column's type. It refuses float keys (`ValueError`), and on PostgreSQL a list of
+>   string keys raises at execution for a `char(n)` column (`... needs method IN or a key-table method`) instead
+>   of returning no rows. The lazy **`IN_SUBQUERY`** raises the same way for a `char(n)` column (text datatype) and
+>   a `real` column (float datatype). Text and double precision columns are not affected.
+>   Population and `pcache-monitor` run float-key variants unrestricted with `VALUES` and count them (`float_keys`).
+> - With folded subqueries (`fold_key_subqueries`), the keys go through a staging table of the column's type first,
+>   so the folded `INTERSECT` compares in that type too.
 > The keys of `IN` and `VALUES` are literals of their type as well: integers and decimals as numbers, timestamps as
 > `CAST('...' AS TIMESTAMP|TIMESTAMPTZ)` in PostgreSQL and DuckDB (as string literals they made a `VALUES` list a
 > text column), strings as escaped string literals. Float keys stay string literals, which `IN` converts to the

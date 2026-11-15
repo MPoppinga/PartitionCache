@@ -453,7 +453,7 @@ def test_variant_key_alias(query, alias):
 
 
 class TestFloatKeys:
-    """Float keys restrict only with IN: as a typed key list they would silently miss a real (float4) column."""
+    """VALUES does not restrict float keys (as double precision it would miss a real column); IN and the key tables do."""
 
     VARIANT = "SELECT DISTINCT t1.pk FROM f AS t1, d AS t2 WHERE t1.k = t2.k AND t2.x = 1"
 
@@ -463,14 +463,20 @@ class TestFloatKeys:
         cache.get_intersected = lambda hashes, partition_key="pk": (set(keys), 1)  # type: ignore[method-assign]
         return cache
 
-    @pytest.mark.parametrize("method", ["VALUES", "TMP_TABLE_IN", "TMP_TABLE_JOIN", "UNLOGGED_TABLE_IN", "UNLOGGED_TABLE_JOIN"])
-    def test_typed_key_methods_leave_the_variant_unrestricted(self, method, caplog):
+    def test_values_leaves_the_variant_unrestricted(self, caplog):
         from partitioncache.population import restrict_with_cache
 
         with caplog.at_level("WARNING", logger="PartitionCache"):
-            restriction = restrict_with_cache(self.VARIANT, self._cache({0.1, 0.2}), "pk", {}, method=method)
+            restriction = restrict_with_cache(self.VARIANT, self._cache({0.1, 0.2}), "pk", {}, method="VALUES")
         assert (restriction.restricted, restriction.reason, restriction.query) == (False, "float_keys", self.VARIANT)
         assert "use IN" in caplog.text
+
+    @pytest.mark.parametrize("method", ["TMP_TABLE_IN", "TMP_TABLE_JOIN", "UNLOGGED_TABLE_IN", "UNLOGGED_TABLE_JOIN"])
+    def test_key_tables_restrict_them_in_the_column_type(self, method):
+        from partitioncache.population import restrict_with_cache
+
+        restriction = restrict_with_cache(self.VARIANT, self._cache({0.1, 0.2}), "pk", {}, method=method)
+        assert restriction.restricted and "AS SELECT (array_agg(pcache_src.pk))[1] AS partition_key FROM f AS pcache_src WHERE false HAVING false" in restriction.query
 
     def test_in_restricts_them(self):
         from partitioncache.population import restrict_with_cache
@@ -482,6 +488,6 @@ class TestFloatKeys:
     def test_population_counts_the_refusal(self, star_db):
         cache = self._cache({1.5})
         db = CountingDB(star_db)
-        stats = _populate(_pairs(), cache, db, method="TMP_TABLE_IN")
+        stats = _populate(_pairs(), cache, db, method="VALUES")
         assert stats.restricted == 0 and stats.float_keys > 0 and stats.failed == 0
-        assert not any("CREATE TEMPORARY TABLE" in q for q in db.executed)
+        assert not any("VALUES" in q for q in db.executed)

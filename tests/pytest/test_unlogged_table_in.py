@@ -64,7 +64,7 @@ class TestEager:
         assert "u.region_id IN (SELECT partition_key FROM partitioncache_unl_" in script
 
     def test_string_keys_are_escaped(self):
-        assert "(VALUES ('o''brien'))" in _eager(keys={"o'brien"})
+        assert "VALUES ('o''brien');" in _eager(keys={"o'brien"})
 
     def test_other_dialects_are_rejected(self):
         with pytest.raises(ValueError, match="UNLOGGED_TABLE_IN is only supported for PostgreSQL"):
@@ -167,46 +167,41 @@ class TestPlannerCollapseLimit:
 
 
 class TestTypedKeyTables:
-    """A TEXT key column does not compare with a numeric or timestamp partition key column; float keys are refused."""
+    """Integer keys keep their typed key table; other keys get a key table in the key column's own type."""
+
+    TYPED = "AS SELECT (array_agg(pcache_src.region_id))[1] AS partition_key FROM users WHERE false HAVING false;"
+
+    @pytest.mark.parametrize(("keys", "sql_type"), [({1, 2}, "INT"), ({1, 2**40}, "BIGINT")])
+    def test_integer_keys_keep_the_typed_table(self, keys, sql_type):
+        script = extend_query_with_partition_keys(QUERY, keys, "region_id", method="TMP_TABLE_IN", p0_alias="u")
+        assert f"(partition_key {sql_type} PRIMARY KEY)" in script and "pcache_src" not in script
 
     @pytest.mark.parametrize(
-        ("keys", "sql_type"),
-        [
-            ({1, 2}, "INT"),
-            ({1, 2**40}, "BIGINT"),
-            ({Decimal("1.50"), Decimal("2.25")}, "NUMERIC"),
-            ({1, Decimal("2.5")}, "NUMERIC"),
-            ({datetime(2024, 1, 1, 12, 30)}, "TIMESTAMP"),
-            ({datetime(2024, 1, 1, tzinfo=UTC)}, "TIMESTAMPTZ"),
-            ({"a", "b"}, "TEXT"),
-        ],
+        "keys",
+        [{Decimal("1.50"), Decimal("2.25")}, {1, Decimal("2.5")}, {1.5, 2}, {datetime(2024, 1, 1, 12, 30)}, {datetime(2024, 1, 1, tzinfo=UTC)}, {"a", "b"}],
     )
-    def test_temporary_key_table_type(self, keys, sql_type):
-        script = extend_query_with_partition_keys(QUERY, keys, "region_id", method="TMP_TABLE_IN", p0_alias="u")
-        assert f"(partition_key {sql_type} PRIMARY KEY)" in script
+    @pytest.mark.parametrize("method", SCRIPT_METHODS)
+    def test_other_keys_take_the_column_type(self, keys, method):
+        script = extend_query_with_partition_keys(QUERY, keys, "region_id", method=method, p0_alias="u")
+        assert self.TYPED.replace("FROM users", "FROM users AS pcache_src") in script.replace("\n", " ")
 
-    def test_temporary_key_table_escapes_string_keys(self):
+    def test_string_keys_are_escaped_untyped_literals(self):
         script = extend_query_with_partition_keys(QUERY, {"o'brien"}, "region_id", method="TMP_TABLE_JOIN", p0_alias="u")
         assert "VALUES ('o''brien');" in script
 
-    def test_decimal_keys_are_numbers(self):
-        script = extend_query_with_partition_keys(QUERY, {Decimal("1.50")}, "region_id", method="TMP_TABLE_IN", p0_alias="u")
-        assert "VALUES (1.50);" in script
-
-    @pytest.mark.parametrize("method", ["VALUES", *SCRIPT_METHODS])
-    def test_float_keys_are_refused_for_typed_key_lists(self, method):
-        """As double precision they would silently miss a real (float4) column."""
+    def test_values_refuses_float_keys(self):
         with pytest.raises(ValueError, match="use method IN"):
-            extend_query_with_partition_keys(QUERY, {1.5, 2}, "region_id", method=method, p0_alias="u")
+            extend_query_with_partition_keys(QUERY, {1.5, 2}, "region_id", method="VALUES", p0_alias="u")
 
     def test_float_keys_stay_untyped_in_in(self):
         script = extend_query_with_partition_keys(QUERY, {1.5}, "region_id", method="IN", p0_alias="u")
         assert "u.region_id IN ('1.5')" in script
 
-    @pytest.mark.parametrize(("keys", "cast"), [({Decimal("1.5")}, "NUMERIC"), ({datetime(2024, 1, 1)}, "TIMESTAMP")])
-    def test_unlogged_key_table_casts_to_the_key_type(self, keys, cast):
-        script = extend_query_with_partition_keys(QUERY, keys, "region_id", method="UNLOGGED_TABLE_IN", p0_alias="u")
-        assert f"SELECT CAST(partition_key AS {cast}) AS partition_key FROM (VALUES (" in script
+    @pytest.mark.parametrize("method", SCRIPT_METHODS)
+    def test_a_p0_subquery_cannot_type_the_table(self, method):
+        query = "SELECT * FROM (SELECT * FROM users) AS u WHERE u.active = TRUE"
+        with pytest.raises(ValueError, match="must be a plain table"):
+            extend_query_with_partition_keys(query, {"a"}, "region_id", method=method, p0_alias="u")
 
 
 class TestMonitor:
@@ -324,7 +319,8 @@ class TestAgainstPostgreSQL:
 
     @pytest.mark.parametrize("method", ["IN", "VALUES", *SCRIPT_METHODS])
     def test_float_keys_of_a_real_column(self, db, method):
-        """Read back from a real column, 0.1 is the double nearest to its text: only IN matches it in the column's type."""
+        """Read back from a real column, 0.1 is the double nearest to its text. IN (untyped literals) and the key tables
+        (built in the column's type) match it; a VALUES list would be double precision and is refused."""
         import psycopg
 
         params, table = db
@@ -332,7 +328,7 @@ class TestAgainstPostgreSQL:
             keys = {row[0] for row in conn.execute(f"SELECT DISTINCT k4 FROM {table} WHERE region_id IN (1, 2)")}
         assert keys == {0.1, 0.2}
         query = f"SELECT count(*) FROM {table} AS p"
-        if method != "IN":
+        if method == "VALUES":
             with pytest.raises(ValueError, match="use method IN"):
                 extend_query_with_partition_keys(query, keys, "k4", method=method, p0_alias="p")
             return

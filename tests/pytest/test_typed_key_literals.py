@@ -104,7 +104,7 @@ def test_restriction_selects_the_rows_of_the_keys(dialect, case, method):
 
 def _check(run, keys, column, method, expected, dialect="postgres"):
     query = "SELECT p.i FROM probe AS p"
-    if method != "IN" and any(isinstance(k, float) for k in keys):
+    if method == "VALUES" and any(isinstance(k, float) for k in keys):
         with pytest.raises(ValueError, match="use method IN"):
             extend_query_with_partition_keys(query, keys, column, method=method, p0_alias="p", sql_dialect=dialect)
         return

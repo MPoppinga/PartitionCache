@@ -274,7 +274,7 @@ class TestExtendQueryWithPartitionKeys:
         partition_keys = {"a", "b"}
         result = extend_query_with_partition_keys(query, partition_keys, "region", method="TMP_TABLE_IN", p0_alias="u")
 
-        assert "partition_key TEXT PRIMARY KEY" in result
+        assert "AS SELECT (array_agg(pcache_src.region))[1] AS partition_key FROM users AS pcache_src WHERE false HAVING false" in result
         assert "'a'" in result
         assert "'b'" in result
 
@@ -427,7 +427,8 @@ class TestExtendQueryWithPartitionKeys:
         # Test with strings
         str_keys = {"a", "b", "c"}
         str_result = extend_query_with_partition_keys(query, str_keys, "region_id", method="TMP_TABLE_IN", p0_alias="u")
-        assert "partition_key TEXT PRIMARY KEY" in str_result
+        # Other keys get a key table in the key column's own type
+        assert "AS SELECT (array_agg(pcache_src.region_id))[1] AS partition_key FROM users AS pcache_src WHERE false HAVING false" in str_result
 
     def test_large_partition_key_set(self):
         """Test with a large set of partition keys."""

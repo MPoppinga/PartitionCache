@@ -93,6 +93,8 @@ def test_byte_equal_to_old_implementation(method, key_type, n_keys, query):
     keys = KEY_FACTORIES[key_type](n_keys)
     if method == "VALUES" and key_type == "float" and n_keys > 0:
         pytest.skip("VALUES refuses float keys, see test_values_refuses_float_keys")
+    if method == "VALUES" and key_type == "str" and n_keys > 0:
+        pytest.skip("VALUES guards string keys against a char(n) column, see test_values_guards_string_keys")
     new = extend_query_with_partition_keys(query, keys, "pocket_key", method=method, p0_alias="p")
     if n_keys == 0:
         # An empty key set never reaches the IN/VALUES branches: the query is restricted to no rows.
@@ -128,11 +130,22 @@ def test_single_quote_in_key_is_escaped_where_old_path_raised(method):
     new = extend_query_with_partition_keys(QUERY_WITH_WHERE, keys, "pocket_key", method=method, p0_alias="p")
     assert "'it''s'" in new
     assert "'o''neil'" in new
-    parsed = sqlglot.parse_one(new)
-    literals = {lit.this for lit in parsed.find(exp.In).find_all(exp.Literal) if lit.is_string}
+    parsed = sqlglot.parse_one(new, read="postgres")
+    restriction = next(node for node in parsed.find_all(exp.In) if node.this.sql() == "p.pocket_key")
+    literals = {lit.this for lit in restriction.find_all(exp.Literal) if lit.is_string}
     assert literals == keys
     # Rendering the parsed result reproduces the spliced output: the escaping is what sqlglot would emit.
-    assert parsed.sql() == new
+    assert parsed.sql(dialect="postgres") == new
+
+
+def test_values_guards_string_keys():
+    """String keys in a VALUES list are text; against a char(n) column the guard raises instead of matching no row."""
+    new = extend_query_with_partition_keys(QUERY_WITH_WHERE, {"a", "b"}, "pocket_key", method="VALUES", p0_alias="p")
+    assert "PG_TYPEOF(p.pocket_key) IN (CAST('character' AS REGTYPE))" in new
+    assert "needs method IN or a key-table method" in new
+    for keys in ({1, 2}, {datetime(2024, 1, 1)}):
+        assert "pg_typeof" not in extend_query_with_partition_keys(QUERY_WITH_WHERE, keys, "pocket_key", method="VALUES", p0_alias="p")
+    assert "pg_typeof" not in extend_query_with_partition_keys(QUERY_WITH_WHERE, {"a"}, "pocket_key", method="VALUES", p0_alias="p", sql_dialect="duckdb")
 
 
 def test_placeholder_must_occur_exactly_once():
