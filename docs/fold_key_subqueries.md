@@ -67,7 +67,7 @@ An empty T restricts the query to no rows, which is what the folded conditions t
 | volatile function (`random`, `clock_timestamp`, `statement_timestamp`, `nextval`, ...) | the subquery runs in another statement. The list is best effort, so a user-defined volatile function is not recognised. A truly volatile subquery is nondeterministic unfolded too. `now()`, `current_timestamp` and the other transaction-stable functions are allowed, because the script is one transaction |
 | `LIMIT` / `OFFSET` / `FETCH` / `TABLESAMPLE` | the rows the subquery picks need not be the same |
 | more than one output column, or `*` | not an IN list |
-| any **unqualified column** in the subquery | it may bind to an outer table (an implicitly correlated subquery, which runs today). Moved, it either fails (`UndefinedColumn`, a working query turned into an error) or binds to the key table. Without the schema this cannot be decided, so v1 is strict |
+| an **unqualified column** that does not bind inside the subquery, or cannot be decided | see "Unqualified columns" below: with a column resolver it folds when it binds inside; without one it is refused, unless the caller states it with `fold_assume_inner_columns` |
 | a **bind parameter** (`%s`, `?`, `%(name)s`, `$n`) anywhere in the query | the folded subquery moves in front of the main statement, and with it the positions of its parameters: found in review, all rows lost |
 | alias not tied to p0 by key equalities, including ties only through an outer join | condition 2 above |
 | methods without a key table (`IN`, `VALUES`, `IN_SUBQUERY`) | nothing to fold into; the option raises `ValueError` |
@@ -107,7 +107,7 @@ On the lazy path the keys are not known, so `extend_query_with_partition_keys_la
   - The variants are generated SQL. The generator keeps a `key IN (subquery)` condition with its subquery text, re-aliased to the variant's key alias, and also caches the subquery itself as a variant.
   - The equivalence argument above does not depend on where the query comes from. A restricted variant returns the same keys with and without folding, so the stored entry is the same (test: `TestPopulation`).
   - The subquery's own variant has no such condition, so nothing folds there.
-- **The konrad statement.** As quoted (`SELECT unnest(pocket_key) FROM ... WHERE prop_key = 39`), it has unqualified columns, so v1 leaves it inline. To fold it, the bench or the SQL generator must qualify the subquery's columns (`SELECT unnest(v.pocket_key) FROM view AS v WHERE v.prop_key = 39`). The alternative, a relaxed opt-in in which a misbinding makes the script fail but never loses rows silently, is for the author to decide.
+- **The konrad statement and GeoMine's SQL** have unqualified columns (`SELECT unnest(pocket_key) FROM ... WHERE prop_key = 39`). Until 2026-11-15 they were never folded; C2/C2b measured alias-qualified subqueries (the bench harness qualified them), so their folded numbers are for a statement text GeoMine does not send. Unqualified columns are now resolved by scoping (next section).
 
 ## On a cache miss
 
@@ -129,6 +129,56 @@ Folding without hits would mean that PartitionCache rewrites queries it otherwis
   - It also keeps the earlier runs comparable.
   - After the comparison runs it could become the default for the key-table methods.
 - The `IN` and `VALUES` methods leave such subqueries alone; with the option they raise `ValueError`.
+
+## Unqualified columns
+
+GeoMine writes its metadata subqueries with bare columns. On 09g's GeoMine queue, all 56 inline fragments have this form:
+
+```sql
+... t1.pocket_key IN (SELECT ..._pocket_ligands.pocket_key FROM ..._pocket_ligands
+                      INTERSECT SELECT UNNEST(..._pockets_num.pocket_key) AS pocket_key FROM ..._pockets_num
+                      WHERE prop_key = 84 AND prop_value <= 100 AND prop_value >= 1)
+```
+
+Moved out of the query, such a column must bind as it did in the query.
+
+**The rule.** SQL binds an unqualified name to the innermost query level whose FROM items have a column of that name. Each unqualified column of a candidate subquery is walked from its own SELECT outward, up to the subquery's root (each branch of a set operation is such a SELECT).
+- **Inside:** some level's FROM items have the column. It folds.
+- **Outside:** no level has it, so the subquery is correlated. It stays in the statement.
+- **Undecidable:** a FROM item on the way has unknown columns. It stays.
+
+Names that are no FROM column end up as "outside or undecidable", which is the safe side:
+- a SELECT-list alias in ORDER BY or GROUP BY;
+- a system column such as `ctid` (the catalog lookup leaves out `attnum <= 0`);
+- a whole-row reference;
+- a keyword-like value that sqlglot parses as a column.
+
+LATERAL inside the subquery is refused.
+
+**Where the columns come from:**
+
+| FROM item | columns |
+|---|---|
+| table, view, materialized view, foreign or temporary table (also schema-qualified or quoted) | `fold_column_resolver(<relation as written>)` |
+| CTE defined in the subquery | the names of its SELECT list or its column alias list (an unnamed output, or `*`: unknown) |
+| derived table | its column alias list, else its SELECT list's names (`*`: unknown) |
+| function, `unnest`, `VALUES` | only its column alias list (`unnest(x) AS u(v)`) |
+
+**The resolver.** `catalog_column_resolver(execute, sql_dialect)` reads the catalog, and caches each relation for the resolver's life:
+- **PostgreSQL:** `pg_attribute` via `to_regclass` of the name as written, so quotes, schema and the search_path count.
+- **SQLite:** `pragma_table_info`.
+- **DuckDB:** `information_schema.columns`.
+
+It must run on the connection that executes the query, before the script runs: there the search_path and the session's temporary tables (which shadow permanent ones) are those of the query. A resolver from another connection, or from a schema dictionary, is the caller's statement that the names resolve the same way.
+
+Who builds one:
+- `populate_query_variants` builds one per run from its db_handler.
+- `pcache-monitor` builds one per fragment, on a connection of its own to the queried database.
+- `extend_query_with_partition_keys(_lazy)` and `apply_cache(_lazy)` take it as `fold_column_resolver`. Without it, unqualified columns stay refused.
+
+**The caller's word.** `fold_assume_inner_columns=True` (default False, API only, not in population, the monitor or pcache-add) takes every unqualified column as inside.
+- **PostgreSQL:** every fold form puts the subquery as a derived table into an INTERSECT of the key table's statement, with no query level around it. A column that really bound outward then fails with "column does not exist"; it cannot bind elsewhere. The tests check this for the eager and lazy temporary and unlogged tables, and the typed staging table, with columns named `partition_key`, `pcache_key` and the key column's name.
+- **SQLite and DuckDB:** they put the subquery into a statement over the key table (`DELETE ... WHERE partition_key IN (S)`, `pcache_folded.pcache_key IN (S)`), so those two names stay refused there.
 
 ## The key table's defining query
 

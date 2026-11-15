@@ -4,6 +4,7 @@ Monitor the cache queue and add queries to the cache as they are added to the qu
 
 import argparse
 import concurrent.futures
+import contextlib
 import datetime
 import os
 import threading
@@ -12,6 +13,7 @@ from typing import Any
 
 import psycopg
 
+from partitioncache.apply_cache import catalog_column_resolver
 from partitioncache.cache_handler import get_cache_handler
 from partitioncache.cache_handler.abstract import AbstractCacheHandler_Lazy
 from partitioncache.cli.common_args import (
@@ -298,20 +300,23 @@ def apply_cache_optimization(query: str, query_hash: str, partition_key: str, pa
     use_lazy = args.prefer_lazy_optimization and isinstance(cache_handler, AbstractCacheHandler_Lazy) and max_keys is None
     method = (LAZY_METHOD_MAP if use_lazy else EAGER_METHOD_MAP).get(args.cache_optimization_method, "IN_SUBQUERY" if use_lazy else "IN")
     try:
-        restriction = restrict_with_cache(
-            query,
-            cache_handler,
-            partition_key,
-            variant_settings(args, constraint_args, partition_key, partition_datatype),
-            lazy=use_lazy,
-            method=method,
-            max_restriction_keys=max_keys,
-            min_cache_hits=args.min_cache_hits,
-            join_every_table=args.join_every_table,
-            planner_collapse_limit=args.planner_collapse_limit,
-            fold_key_subqueries=_fold_mode(args.fold_key_subqueries),
-            sql_dialect=sql_dialect_for_backend(args.db_backend),
-        )
+        fold = _fold_mode(args.fold_key_subqueries)
+        with _fold_column_resolver(fold, args) as column_resolver:
+            restriction = restrict_with_cache(
+                query,
+                cache_handler,
+                partition_key,
+                variant_settings(args, constraint_args, partition_key, partition_datatype),
+                lazy=use_lazy,
+                method=method,
+                max_restriction_keys=max_keys,
+                min_cache_hits=args.min_cache_hits,
+                join_every_table=args.join_every_table,
+                planner_collapse_limit=args.planner_collapse_limit,
+                fold_key_subqueries=fold,
+                fold_column_resolver=column_resolver,
+                sql_dialect=sql_dialect_for_backend(args.db_backend),
+            )
     except Exception as e:
         logger.warning(f"Failed to apply cache optimization to {query_hash}: {e}")
         with restriction_counts_lock:
@@ -338,6 +343,28 @@ def apply_cache_optimization(query: str, query_hash: str, partition_key: str, pa
 def _fold_mode(flag: str | None) -> bool | str:
     """The fold_key_subqueries value of a --fold-key-subqueries flag: off, True (integer) or "any_key_type"."""
     return {None: False, "integer": True}.get(flag, flag)  # type: ignore[return-value]
+
+
+@contextlib.contextmanager
+def _fold_column_resolver(fold: bool | str, args: argparse.Namespace):
+    """A catalog resolver for folding, on a connection of its own to the queried database; None without folding.
+
+    The fragment runs later on another connection (the db_handler or, with lazy insertion, the cache handler's), to
+    the same database: its tables and views resolve alike. A new resolver per fragment, so that a schema change
+    during a long run is not answered from a cache.
+    """
+    if not fold:
+        yield None
+        return
+    backend = {"postgresql": "postgres", "mysql": "mysql", "sqlite": "sqlite"}.get(args.db_backend)
+    if backend is None:
+        yield None
+        return
+    handler = get_db_handler(backend, **get_database_connection_params(args))
+    try:
+        yield catalog_column_resolver(handler.execute, sql_dialect_for_backend(args.db_backend))
+    finally:
+        handler.close()
 
 
 def _cache_optimization_enabled() -> bool:
