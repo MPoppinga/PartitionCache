@@ -1,5 +1,11 @@
 """Shared pytest configuration for the unit tests."""
 
+from partitioncache.cache_handler.thread_safety import ThreadSafeHandler
+
+# No public handler call may return with a write pending: on a shared instance another thread's commit or rollback
+# would act on it (cache_handler/thread_safety.py)
+ThreadSafeHandler.check_pending_writes = True
+
 try:
     import rocksdict  # noqa: F401
 except ImportError:

@@ -21,6 +21,7 @@ from logging import getLogger
 import duckdb
 
 from partitioncache.cache_handler.abstract import AbstractCacheHandler_Lazy
+from partitioncache.cache_handler.thread_safety import ThreadSafeHandler
 
 logger = getLogger("PartitionCache")
 
@@ -47,7 +48,7 @@ def validate_identifier(identifier: str, identifier_type: str = "identifier") ->
         raise ValueError(msg)
 
 
-class DuckDBBitCacheHandler(AbstractCacheHandler_Lazy):
+class DuckDBBitCacheHandler(ThreadSafeHandler, AbstractCacheHandler_Lazy):
     """
     DuckDB-based bit cache handler using native BITSTRING types.
 
