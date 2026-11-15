@@ -327,7 +327,8 @@ Advanced options for controlling how query variants are generated for better cac
 - **Warning**: Can be slow for complex queries with many fragments
 - `--restrict-variants`: executes the variants smallest first and restricts each to the cached keys of its relaxations, found by the cache lookup of a query with the same variant generation flags. An empty intersection is stored as an empty result without executing the variant. Spatial and grid keys are populated unrestricted. See `populate_query_variants` in the [API reference](api_reference.md).
 - `--max-restriction-keys N`: only restrict when the intersection has at most N keys (implies `--restrict-variants`); a restriction to most of the keys filters little and costs a long key list
-- `--restriction-method {IN,VALUES,TMP_TABLE_IN,TMP_TABLE_JOIN}`: how the keys restrict a variant (default: `IN`)
+- `--restriction-method {IN,VALUES,TMP_TABLE_IN,TMP_TABLE_JOIN,UNLOGGED_TABLE_JOIN,UNLOGGED_TABLE_IN}`: how the keys restrict a variant (default: `IN`; `UNLOGGED_TABLE_*` needs `--db-backend postgresql`)
+- `--planner-collapse-limit N`: with a `TMP_TABLE_*` or `UNLOGGED_TABLE_*` restriction method, begin each restricted variant with `SET LOCAL join_collapse_limit = N` and `from_collapse_limit = N`
 - `--join-every-table`: with `--restriction-method TMP_TABLE_JOIN`, join the key table to every table of a variant instead of its key table; only for keys whose tables are all joined on the partition key
 
 #### Queue Processing
@@ -567,14 +568,16 @@ Cache-aware optimization leverages existing cache entries to restrict the search
   - **Use case**: When underlying data has changed and cache needs to be updated
   - **Behavior**: Skips cache existence check and always executes queries to populate cache
   - **Performance**: Increases execution time but ensures cache freshness
-- `--cache-optimization-method {IN,VALUES,IN_SUBQUERY,TMP_TABLE_IN,TMP_TABLE_JOIN}` - Method for applying cache restrictions
+- `--cache-optimization-method {IN,VALUES,IN_SUBQUERY,TMP_TABLE_IN,TMP_TABLE_JOIN,UNLOGGED_TABLE_JOIN,UNLOGGED_TABLE_IN}` - Method for applying cache restrictions
+  - **`UNLOGGED_TABLE_JOIN` / `UNLOGGED_TABLE_IN`**: as the `TMP_TABLE_*` methods with an unlogged key table that parallel workers can read; the script drops it. Needs `--db-backend postgresql`
+- `--planner-collapse-limit N` - With a `TMP_TABLE_*` or `UNLOGGED_TABLE_*` method: begin each restricted fragment with `SET LOCAL join_collapse_limit = N` and `SET LOCAL from_collapse_limit = N` (PostgreSQL only; default: off)
   - **Default**: `IN`
   - **`IN`**: Simple IN clause with partition keys
   - **`VALUES`**: IN clause with VALUES construct
   - **`IN_SUBQUERY`**: IN clause with lazy subquery (recommended for large result sets)
   - **`TMP_TABLE_IN`**: Create temp table and use IN subquery
   - **`TMP_TABLE_JOIN`**: Create temp table and JOIN it to the fragment's key table
-- `--join-every-table` - With `TMP_TABLE_JOIN`: join the key table to every table of a fragment instead of its key table
+- `--join-every-table` - With `TMP_TABLE_JOIN` or `UNLOGGED_TABLE_JOIN`: join the key table to every table of a fragment instead of its key table
   - **Default**: off. Before 2026-11 the monitor joined every table; pass this flag to reproduce such runs
   - **Only for keys whose tables are all joined on the partition key**: a fragment whose tables are not (keys in `--skip-partition-key-joins`, dimension joins) is refused and runs unrestricted, counted as a failed lookup
 - `--min-cache-hits MIN_CACHE_HITS` - Minimum cache hits required for non-lazy optimization

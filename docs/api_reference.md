@@ -151,7 +151,7 @@ Optimizes a query by adding partition key restrictions.
 - `query` (str): Original SQL query
 - `partition_keys` (set[int] | set[str] | set[float] | set[datetime]): Partition keys to restrict to
 - `partition_key` (str): Partition column name
-- `method` (Literal["IN", "VALUES", "TMP_TABLE_JOIN", "TMP_TABLE_IN", "UNLOGGED_TABLE_JOIN"]): Optimization method
+- `method` (Literal["IN", "VALUES", "TMP_TABLE_JOIN", "TMP_TABLE_IN", "UNLOGGED_TABLE_JOIN", "UNLOGGED_TABLE_IN"]): Optimization method
 - `p0_alias` (str | None): The alias of the table to use for the partition key. `None` detects it (`find_p0_alias`); the JOIN methods join the key table to this table only.
 - `analyze_tmp_table` (bool): Whether to create index and analyze. (only for temporary table methods)
 - `join_every_table` (bool, default `False`): `TMP_TABLE_JOIN` and `UNLOGGED_TABLE_JOIN` only. Joins the key table to every table of the `FROM`/`JOIN` list instead of the p0 table. Raises `ValueError` unless every table is connected to the others by equalities on the partition key (`a.key = b.key`, not under `OR`); only then is it equivalent to joining the p0 table.
@@ -207,6 +207,25 @@ print(optimized)
 > PostgreSQL 15, `public` no longer grants it to every role), while temporary tables only need `TEMP`.
 > Without it the enhanced script fails when it runs.
 
+> **`UNLOGGED_TABLE_IN` (PostgreSQL only).** `TMP_TABLE_IN` with the same unlogged key table: the restriction is
+> `alias.key IN (SELECT partition_key FROM partitioncache_unl_<hex>)`, and the script ends with the `DROP`, as for
+> `UNLOGGED_TABLE_JOIN`.
+
+> **`planner_collapse_limit=N`** (script methods `TMP_TABLE_*` and `UNLOGGED_TABLE_*`, PostgreSQL only; every
+> extension and apply function, `populate_query_variants`, `pcache-monitor --planner-collapse-limit`,
+> `pcache-add --planner-collapse-limit`). The script begins with `SET LOCAL join_collapse_limit = N;` and
+> `SET LOCAL from_collapse_limit = N;` (`geqo` is not touched). Executed as one string, the settings apply to the
+> script's `SELECT` and end with its transaction, also under autocommit. Other methods and dialects raise
+> `ValueError`; an empty key set (a single statement) gets no settings.
+
+> **Key table types.** The temporary and unlogged key tables take the type of the keys: `INT`/`BIGINT`,
+> `NUMERIC` for `Decimal` keys (psycopg's type for numeric columns), `TIMESTAMP`/`TIMESTAMPTZ` for datetimes,
+> otherwise `TEXT`. String keys are escaped literals. **Float keys** are refused (`ValueError`) by `VALUES` and the
+> key-table methods: a float read back from a `real` (float4) column is the double nearest to its text, and a
+> double precision key list compares `real = double precision`, so it would silently match none. Use `IN`, whose
+> literals take the column's type. Population and `pcache-monitor` run such variants unrestricted and count them
+> (`float_keys`).
+
 #### `extend_query_with_partition_keys_lazy(query: str, lazy_subquery: str, partition_key: str, method: Literal["IN_SUBQUERY", "TMP_TABLE_IN", "TMP_TABLE_JOIN", "UNLOGGED_TABLE_JOIN"] = "IN_SUBQUERY", p0_alias: str | None = None, analyze_tmp_table: bool = True, auto_detect_partition_join: bool = True, partition_join_table: str | None = None, sql_dialect: str = "postgres")`
 
 Lazy counterpart to `extend_query_with_partition_keys`: integrates a lazy SQL subquery (as returned by `get_partition_keys_lazy()`) into the query instead of a materialized key set. `p0_alias` and `join_every_table` behave as there.
@@ -222,7 +241,7 @@ Lazy counterpart to `extend_query_with_partition_keys`: integrates a lazy SQL su
 - `query` (str): SQL query to optimize
 - `cache_handler` (AbstractCacheHandler_Lazy): Cache backend instance
 - `partition_key` (str): Partition column name
-- `method` (Literal["IN_SUBQUERY", "TMP_TABLE_IN", "TMP_TABLE_JOIN", "UNLOGGED_TABLE_JOIN"]): Integration method
+- `method` (Literal["IN_SUBQUERY", "TMP_TABLE_IN", "TMP_TABLE_JOIN", "UNLOGGED_TABLE_JOIN", "UNLOGGED_TABLE_IN"]): Integration method
 - `p0_alias` (str | None, optional): Table alias for cache restrictions
 - `join_every_table` (bool, optional): JOIN methods only: join the key table to every table instead of the p0 table; see `extend_query_with_partition_keys` (default: False)
 - `min_component_size` (int, optional): Minimum size of query components to consider for cache lookup (default: 2)

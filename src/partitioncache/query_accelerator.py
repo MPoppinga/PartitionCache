@@ -22,6 +22,7 @@ from typing import Any
 import duckdb
 import psycopg
 
+from partitioncache.db_handler.postgres import fetch_final_result_set
 from partitioncache.logging_utils import get_thread_aware_logger
 
 logger = get_thread_aware_logger("PartitionCache")
@@ -540,7 +541,9 @@ class DuckDBQueryAccelerator:
 
             with self.postgresql_conn.cursor() as cursor:
                 cursor.execute(query)
-                result = cursor.fetchall()
+                # An integration script (TMP_TABLE_*, UNLOGGED_TABLE_*) has its rows in the result set of its SELECT,
+                # not in the first one; the connection is in autocommit, so the one-string script is one transaction
+                result = fetch_final_result_set(cursor)
 
             # Convert to set for compatibility
             result_set = {row[0] if len(row) == 1 else row for row in result}

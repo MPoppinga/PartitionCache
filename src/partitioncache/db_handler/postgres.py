@@ -16,8 +16,9 @@ def fetch_final_result_set(cursor: psycopg.Cursor) -> list:
 
     The temp-table integration methods (``TMP_TABLE_IN`` / ``TMP_TABLE_JOIN``) and the spatial filters emit
     multi-statement scripts of the form
-    ``CREATE TEMPORARY TABLE ... ON COMMIT DROP; INSERT/ANALYZE ...; SELECT ...``; an ``UNLOGGED_TABLE_JOIN``
-    script ends with ``DROP TABLE IF EXISTS ...`` after its SELECT, which produces no result set.
+    ``CREATE TEMPORARY TABLE ... ON COMMIT DROP; INSERT/ANALYZE ...; SELECT ...``; an ``UNLOGGED_TABLE_*``
+    script ends with ``DROP TABLE IF EXISTS ...`` after its SELECT, which produces no result set, and with
+    ``planner_collapse_limit`` a script begins with ``SET LOCAL`` statements, which produce none either.
     After ``cursor.execute(script)`` psycopg positions the cursor on the FIRST statement's result, so a plain
     ``fetchall()`` would read the ``CREATE TABLE`` (which produces no rows). This walks ``nextset()`` to the
     final result-producing statement and returns its rows. Works for single-statement queries too (one set).

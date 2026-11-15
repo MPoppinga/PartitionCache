@@ -26,7 +26,6 @@ import sqlglot.expressions as exp
 
 from partitioncache.apply_cache import (
     _add_where_condition,
-    _format_partition_key_for_sql,
     _splice_key_list,
     extend_query_with_partition_keys,
 )
@@ -35,6 +34,11 @@ QUERY_NO_WHERE = "SELECT p.id FROM pockets AS p JOIN atoms AS a ON a.pocket_key 
 QUERY_WITH_WHERE = QUERY_NO_WHERE + " WHERE a.element = 'C' AND a.x > 1.5"
 QUERY_WITH_OR = QUERY_NO_WHERE + " WHERE a.element = 'C' OR a.element = 'N'"
 QUERIES = [QUERY_NO_WHERE, QUERY_WITH_WHERE, QUERY_WITH_OR]
+
+
+def _format_partition_key_for_sql(pk) -> str:
+    """The key formatting of the old implementation (integers bare, everything else quoted)."""
+    return str(pk) if isinstance(pk, int) else f"'{pk}'"
 
 
 def _reference_old_implementation(query: str, partition_keys, partition_key: str, method: str, p0_alias: str) -> str:
@@ -80,6 +84,8 @@ KEY_FACTORIES = {"int": _int_keys, "str": _str_keys, "float": _float_keys, "date
 def test_byte_equal_to_old_implementation(method, key_type, n_keys, query):
     # The same set object is passed to both implementations so iteration order is identical.
     keys = KEY_FACTORIES[key_type](n_keys)
+    if method == "VALUES" and key_type == "float" and n_keys > 0:
+        pytest.skip("VALUES refuses float keys, see test_values_refuses_float_keys")
     new = extend_query_with_partition_keys(query, keys, "pocket_key", method=method, p0_alias="p")
     if n_keys == 0:
         # An empty key set never reaches the IN/VALUES branches: the query is restricted to no rows.
@@ -87,6 +93,13 @@ def test_byte_equal_to_old_implementation(method, key_type, n_keys, query):
         return
     old = _reference_old_implementation(query, keys, "pocket_key", method, "p")
     assert new == old
+
+
+@pytest.mark.parametrize("n_keys", [1, 10])
+def test_values_refuses_float_keys(n_keys):
+    """A VALUES list of float keys is double precision and would silently miss a real column; IN keeps them."""
+    with pytest.raises(ValueError, match="use method IN"):
+        extend_query_with_partition_keys(QUERY_WITH_WHERE, _float_keys(n_keys), "pocket_key", method="VALUES", p0_alias="p")
 
 
 @pytest.mark.parametrize("method", ["IN", "VALUES"])

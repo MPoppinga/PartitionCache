@@ -252,8 +252,10 @@ def query_fragment_processor(args, constraint_args):
 
 
 # Cache optimization method of the CLI -> method of the lazy path (IN means IN_SUBQUERY there) and of the eager path
-LAZY_METHOD_MAP = {"IN": "IN_SUBQUERY", "IN_SUBQUERY": "IN_SUBQUERY", "TMP_TABLE_IN": "TMP_TABLE_IN", "TMP_TABLE_JOIN": "TMP_TABLE_JOIN"}
-EAGER_METHOD_MAP = {"IN": "IN", "VALUES": "VALUES", "IN_SUBQUERY": "IN", "TMP_TABLE_IN": "TMP_TABLE_IN", "TMP_TABLE_JOIN": "TMP_TABLE_JOIN"}
+_TABLE_METHODS = ("TMP_TABLE_IN", "TMP_TABLE_JOIN", "UNLOGGED_TABLE_JOIN", "UNLOGGED_TABLE_IN")
+LAZY_METHOD_MAP = {"IN": "IN_SUBQUERY", "IN_SUBQUERY": "IN_SUBQUERY", **{method: method for method in _TABLE_METHODS}}
+EAGER_METHOD_MAP = {"IN": "IN", "VALUES": "VALUES", "IN_SUBQUERY": "IN", **{method: method for method in _TABLE_METHODS}}
+JOIN_METHODS = ("TMP_TABLE_JOIN", "UNLOGGED_TABLE_JOIN")
 
 # Fragments by the outcome of their cache optimization in this run
 restriction_counts = RestrictionCounts()
@@ -306,6 +308,7 @@ def apply_cache_optimization(query: str, query_hash: str, partition_key: str, pa
             max_restriction_keys=max_keys,
             min_cache_hits=args.min_cache_hits,
             join_every_table=args.join_every_table,
+            planner_collapse_limit=args.planner_collapse_limit,
             sql_dialect=sql_dialect_for_backend(args.db_backend),
         )
     except Exception as e:
@@ -804,14 +807,21 @@ def main():
         "--cache-optimization-method",
         type=str,
         default="IN",
-        choices=["IN", "VALUES", "IN_SUBQUERY", "TMP_TABLE_IN", "TMP_TABLE_JOIN"],
-        help="Method for applying cache restrictions (default: IN)",
+        choices=["IN", "VALUES", "IN_SUBQUERY", *_TABLE_METHODS],
+        help="Method for applying cache restrictions (default: IN); the UNLOGGED_TABLE_* methods need --db-backend postgresql",
+    )
+    optimization_group.add_argument(
+        "--planner-collapse-limit",
+        type=int,
+        default=None,
+        help="Begin each restricted fragment with SET LOCAL join_collapse_limit = N and SET LOCAL from_collapse_limit = N "
+        "(PostgreSQL, TMP_TABLE_* and UNLOGGED_TABLE_* methods only; default: off)",
     )
     optimization_group.add_argument(
         "--join-every-table",
         action="store_true",
         default=False,
-        help="With TMP_TABLE_JOIN: join the key table to every table of a fragment instead of its key table (the monitor's "
+        help="With TMP_TABLE_JOIN or UNLOGGED_TABLE_JOIN: join the key table to every table of a fragment instead of its key table (the monitor's "
         "behavior before 2026-11). Only for keys whose tables are all joined on the partition key; other fragments run unrestricted",
     )
     optimization_group.add_argument("--min-cache-hits", type=int, default=1, help="Minimum cache hits required for non-lazy optimization (default: 1)")
@@ -871,8 +881,15 @@ def main():
     args = parser.parse_args()
     if args.max_restriction_keys is not None and args.max_restriction_keys < 0:
         parser.error("--max-restriction-keys must not be negative")
-    if args.join_every_table and args.cache_optimization_method != "TMP_TABLE_JOIN":
-        parser.error("--join-every-table needs --cache-optimization-method TMP_TABLE_JOIN")
+    if args.join_every_table and args.cache_optimization_method not in JOIN_METHODS:
+        parser.error("--join-every-table needs --cache-optimization-method TMP_TABLE_JOIN or UNLOGGED_TABLE_JOIN")
+    if args.planner_collapse_limit is not None:
+        if args.planner_collapse_limit < 1:
+            parser.error("--planner-collapse-limit must be a positive integer")
+        if args.cache_optimization_method not in _TABLE_METHODS or args.db_backend != "postgresql":
+            parser.error("--planner-collapse-limit needs --db-backend postgresql and a TMP_TABLE_* or UNLOGGED_TABLE_* method")
+    if args.cache_optimization_method.startswith("UNLOGGED_TABLE") and args.db_backend != "postgresql":
+        parser.error("the UNLOGGED_TABLE_* methods need --db-backend postgresql")
 
     # Configure enhanced logging with thread-aware formatting
     configure_enhanced_logging(verbose=getattr(args, "verbose", False), quiet=getattr(args, "quiet", False), logger_name="PartitionCache")
@@ -986,7 +1003,9 @@ def main():
         logger.info(f"  - Min cache hits: {args.min_cache_hits}")
         logger.info(f"  - Max restriction keys: {args.max_restriction_keys if args.max_restriction_keys is not None else 'no limit'}")
         logger.info(f"  - Prefer lazy: {args.prefer_lazy_optimization}")
-        if args.cache_optimization_method == "TMP_TABLE_JOIN":
+        if args.planner_collapse_limit is not None:
+            logger.info(f"  - Planner collapse limit: {args.planner_collapse_limit}")
+        if args.cache_optimization_method in JOIN_METHODS:
             logger.info(f"  - Joined tables: {'every table (--join-every-table)' if args.join_every_table else 'the key table of each fragment'}")
         # The lookup generates each fragment's sub-variants with these settings, also for fragments that another
         # client generated and pushed; generated with other settings, they find fewer cached relaxations
