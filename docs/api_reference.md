@@ -218,6 +218,21 @@ print(optimized)
 > script's `SELECT` and end with its transaction, also under autocommit. Other methods and dialects raise
 > `ValueError`; an empty key set (a single statement) gets no settings.
 
+> **`fold_key_subqueries`** (key-table methods `TMP_TABLE_*` and `UNLOGGED_TABLE_*`; the extension and apply
+> functions; default `False`). Conditions `<alias>.<key> IN (<subquery>)` or `= ANY (<subquery>)` on the restricted
+> alias, or on one tied to it by key equalities, move into the key table. The table keeps the keys for which the
+> condition is TRUE, and the condition leaves the statement, so the planner sees one table of measured size instead
+> of the subquery.
+> - Folded only: top-level conjuncts of the outer WHERE (never `NOT IN` or under `OR`), uncorrelated, deterministic
+>   subqueries without `LIMIT`, whose columns are all qualified, in a query without bind parameters.
+> - `True` folds for integer and decimal keys; `"any_key_type"` also for text and timestamp keys, when the key column
+>   compares like the key table (no `char(n)`, special collation, domain); float keys never fold.
+> - `extend_query_with_partition_keys_lazy` needs `partition_datatype` for it (`apply_cache_lazy` reads it from the
+>   cache handler).
+> - The key table is `<keys> INTERSECT <subquery> ...` on PostgreSQL, with the keys as a MATERIALIZED CTE and the
+>   table in the keys' type; SQLite and DuckDB filter with IN; other dialects raise `ValueError`.
+> - Design and equivalence argument: [fold_key_subqueries.md](fold_key_subqueries.md).
+
 > **Key table types.** The temporary and unlogged key tables take the type of the keys: `INT`/`BIGINT`,
 > `NUMERIC` for `Decimal` keys (psycopg's type for numeric columns), `TIMESTAMP`/`TIMESTAMPTZ` for datetimes,
 > otherwise `TEXT`. String keys are escaped literals. **Float keys** are refused (`ValueError`) by `VALUES` and the
