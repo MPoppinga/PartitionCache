@@ -309,6 +309,7 @@ def apply_cache_optimization(query: str, query_hash: str, partition_key: str, pa
             min_cache_hits=args.min_cache_hits,
             join_every_table=args.join_every_table,
             planner_collapse_limit=args.planner_collapse_limit,
+            fold_key_subqueries=_fold_mode(args.fold_key_subqueries),
             sql_dialect=sql_dialect_for_backend(args.db_backend),
         )
     except Exception as e:
@@ -332,6 +333,11 @@ def apply_cache_optimization(query: str, query_hash: str, partition_key: str, pa
     keys = "" if restriction.keys is None else f", {restriction.keys} keys"
     logger.info(f"Applied cache optimization to {query_hash}: {restriction.hits}/{restriction.generated} cache hits{keys}, method={restriction.method}")
     return restriction.query, True, stats
+
+
+def _fold_mode(flag: str | None) -> bool | str:
+    """The fold_key_subqueries value of a --fold-key-subqueries flag: off, True (integer) or "any_key_type"."""
+    return {None: False, "integer": True}.get(flag, flag)  # type: ignore[return-value]
 
 
 def _cache_optimization_enabled() -> bool:
@@ -818,6 +824,14 @@ def main():
         "(PostgreSQL, TMP_TABLE_* and UNLOGGED_TABLE_* methods only; default: off)",
     )
     optimization_group.add_argument(
+        "--fold-key-subqueries",
+        nargs="?",
+        const="integer",
+        default=None,
+        choices=["integer", "any_key_type"],
+        help="Fold partition key subqueries (key IN (subquery)) into the key table of a TMP_TABLE_* or UNLOGGED_TABLE_* method: integer and decimal keys; with any_key_type also text and timestamp keys",
+    )
+    optimization_group.add_argument(
         "--join-every-table",
         action="store_true",
         default=False,
@@ -883,6 +897,8 @@ def main():
         parser.error("--max-restriction-keys must not be negative")
     if args.join_every_table and args.cache_optimization_method not in JOIN_METHODS:
         parser.error("--join-every-table needs --cache-optimization-method TMP_TABLE_JOIN or UNLOGGED_TABLE_JOIN")
+    if args.fold_key_subqueries is not None and args.cache_optimization_method not in _TABLE_METHODS:
+        parser.error("--fold-key-subqueries needs a TMP_TABLE_* or UNLOGGED_TABLE_* --cache-optimization-method")
     if args.planner_collapse_limit is not None:
         if args.planner_collapse_limit < 1:
             parser.error("--planner-collapse-limit must be a positive integer")

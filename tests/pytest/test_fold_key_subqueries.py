@@ -283,3 +283,85 @@ class TestPostgreSQL:
         estimate = int(re.search(rf"Seq Scan on {table}.*?rows=(\d+)", folded).group(1))  # type: ignore[union-attr]
         expected = len(KEYS & (set(range(1, 61, 3)) | set(range(1, 61, 9))))
         assert estimate == expected
+
+
+class TestPopulation:
+    """Folding in population: the restricted variants store the same keys with and without it."""
+
+    class _Cache:
+        def __init__(self):
+            self.entries: dict = {}
+
+        def exists(self, key, partition_key="partition_key"):
+            return key in self.entries
+
+        def get_intersected(self, keys, partition_key="partition_key"):
+            present = [self.entries[k] for k in keys if k in self.entries]
+            return (set.intersection(*present), len(present)) if present else (None, 0)
+
+        def set_query(self, *args, **kwargs):
+            return True
+
+        def set_entry(self, key, keys, query_text, partition_key="partition_key", force_update=False):
+            self.entries[key] = set(keys)
+            return True
+
+    def test_population_stores_the_same_keys(self):
+        from partitioncache.population import populate_query_variants
+        from partitioncache.query_processor import generate_all_query_hash_pairs
+
+        class Recording:
+            """Runs a key-table script (SQLiteDBHandler executes one statement only) and records it."""
+
+            def __init__(self):
+                self.conn = sqlite3.connect(":memory:")
+                _load(self.conn.execute, self.conn.executemany)
+                self.executed: list[str] = []
+
+            def execute(self, script):
+                self.executed.append(script)
+                setup, _, select = script.rpartition(";")
+                if setup.strip():
+                    self.conn.executescript(setup + ";")
+                return [row[0] for row in self.conn.execute(select)]
+
+        settings = {"min_component_size": 1, "keep_all_attributes": True}
+        pairs = generate_all_query_hash_pairs(QUERIES["two_subqueries"], "pocket_key", **settings)
+        stored = {}
+        for fold in (None, False, True):
+            cache, db = self._Cache(), Recording()
+            populate_query_variants(
+                pairs, "pocket_key", cache, db, restrict=fold is not None, method="TMP_TABLE_IN", sql_dialect="sqlite",
+                variant_settings=settings, fold_key_subqueries=bool(fold),
+            )
+            stored[fold] = cache.entries
+            if fold:
+                assert any("IS NOT TRUE" in query for query in db.executed)
+        assert stored[True] == stored[False] == stored[None]
+
+    def test_population_checks_the_method(self):
+        from partitioncache.population import populate_query_variants
+
+        with pytest.raises(ValueError, match="key-table method"):
+            populate_query_variants([], "pocket_key", self._Cache(), None, method="IN", fold_key_subqueries=True)  # type: ignore[arg-type]
+
+
+def test_monitor_passes_the_option():
+    from unittest.mock import Mock, patch
+
+    from partitioncache.cache_handler.abstract import AbstractCacheHandler
+    from partitioncache.cli.monitor_cache_queue import apply_cache_optimization
+
+    args = Mock()
+    args.enable_cache_optimization, args.disable_cache_optimization, args.prefer_lazy_optimization = True, False, False
+    args.max_restriction_keys, args.min_cache_hits, args.db_backend = None, 1, "postgresql"
+    args.cache_optimization_method, args.join_every_table, args.planner_collapse_limit = "TMP_TABLE_IN", False, None
+    args.fold_key_subqueries = "integer"
+    args.min_component_size, args.follow_graph, args.no_auto_detect_partition_join = 1, True, False
+    args.max_component_size, args.partition_join_table, args.bucket_steps = None, None, 1.0
+    args.skip_partition_key_joins, args.max_conditions_removed, args.grid_cell_size = [], None, None
+    handler = Mock(spec=AbstractCacheHandler)
+    handler.get_intersected.return_value = (KEYS, 2)
+    with patch("partitioncache.population.extend_query_with_partition_keys", return_value="restricted") as extend:
+        apply_cache_optimization(QUERIES["geomine_like"], "h", "pocket_key", "integer", handler, args)
+    assert extend.call_args.kwargs["fold_key_subqueries"] is True

@@ -218,6 +218,7 @@ class TestMonitor:
         args.enable_cache_optimization, args.disable_cache_optimization, args.prefer_lazy_optimization = True, False, lazy
         args.max_restriction_keys, args.min_cache_hits, args.db_backend = None, 1, "postgresql"
         args.cache_optimization_method, args.planner_collapse_limit, args.join_every_table = method, limit, False
+        args.fold_key_subqueries = None
         args.min_component_size, args.follow_graph, args.no_auto_detect_partition_join = 1, True, False
         args.max_component_size, args.partition_join_table, args.bucket_steps = None, None, 1.0
         args.skip_partition_key_joins, args.max_conditions_removed, args.grid_cell_size = [], None, None

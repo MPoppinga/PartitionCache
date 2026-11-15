@@ -328,6 +328,7 @@ Advanced options for controlling how query variants are generated for better cac
 - `--restrict-variants`: executes the variants smallest first and restricts each to the cached keys of its relaxations, found by the cache lookup of a query with the same variant generation flags. An empty intersection is stored as an empty result without executing the variant. Spatial and grid keys are populated unrestricted. See `populate_query_variants` in the [API reference](api_reference.md).
 - `--max-restriction-keys N`: only restrict when the intersection has at most N keys (implies `--restrict-variants`); a restriction to most of the keys filters little and costs a long key list
 - `--restriction-method {IN,VALUES,TMP_TABLE_IN,TMP_TABLE_JOIN,UNLOGGED_TABLE_JOIN,UNLOGGED_TABLE_IN}`: how the keys restrict a variant (default: `IN`; `UNLOGGED_TABLE_*` needs `--db-backend postgresql`)
+- `--fold-key-subqueries [integer|any_key_type]`: with a `TMP_TABLE_*` or `UNLOGGED_TABLE_*` restriction method, fold each variant's partition key subqueries into its key table (default: off)
 - `--planner-collapse-limit N`: with a `TMP_TABLE_*` or `UNLOGGED_TABLE_*` restriction method, begin each restricted variant with `SET LOCAL join_collapse_limit = N` and `from_collapse_limit = N`
 - `--join-every-table`: with `--restriction-method TMP_TABLE_JOIN`, join the key table to every table of a variant instead of its key table; only for keys whose tables are all joined on the partition key
 
@@ -570,6 +571,7 @@ Cache-aware optimization leverages existing cache entries to restrict the search
   - **Performance**: Increases execution time but ensures cache freshness
 - `--cache-optimization-method {IN,VALUES,IN_SUBQUERY,TMP_TABLE_IN,TMP_TABLE_JOIN,UNLOGGED_TABLE_JOIN,UNLOGGED_TABLE_IN}` - Method for applying cache restrictions
   - **`UNLOGGED_TABLE_JOIN` / `UNLOGGED_TABLE_IN`**: as the `TMP_TABLE_*` methods with an unlogged key table that parallel workers can read; the script drops it. Needs `--db-backend postgresql`
+- `--fold-key-subqueries [integer|any_key_type]` - With a `TMP_TABLE_*` or `UNLOGGED_TABLE_*` method: fold a fragment's partition key subqueries (`key IN (subquery)`) into its key table, see [fold_key_subqueries.md](fold_key_subqueries.md). Without a value: integer and decimal keys; `any_key_type` also text and timestamp keys. Default: off
 - `--planner-collapse-limit N` - With a `TMP_TABLE_*` or `UNLOGGED_TABLE_*` method: begin each restricted fragment with `SET LOCAL join_collapse_limit = N` and `SET LOCAL from_collapse_limit = N` (PostgreSQL only; default: off)
   - **Default**: `IN`
   - **`IN`**: Simple IN clause with partition keys
