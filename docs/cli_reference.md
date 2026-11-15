@@ -329,7 +329,7 @@ Advanced options for controlling how query variants are generated for better cac
 - `--max-restriction-keys N`: only restrict when the intersection has at most N keys (implies `--restrict-variants`); a restriction to most of the keys filters little and costs a long key list
 - `--restriction-method {IN,VALUES,TMP_TABLE_IN,TMP_TABLE_JOIN,UNLOGGED_TABLE_JOIN,UNLOGGED_TABLE_IN}`: how the keys restrict a variant (default: `IN`; `UNLOGGED_TABLE_*` needs `--db-backend postgresql`)
 - `--planner-collapse-limit N`: with a `TMP_TABLE_*` or `UNLOGGED_TABLE_*` restriction method, begin each restricted variant with `SET LOCAL join_collapse_limit = N` and `from_collapse_limit = N`
-- `--join-every-table`: with `--restriction-method TMP_TABLE_JOIN`, join the key table to every table of a variant instead of its key table; only for keys whose tables are all joined on the partition key
+- `--join-every-table`: with `--restriction-method TMP_TABLE_JOIN` or `UNLOGGED_TABLE_JOIN`, join the key table to every table of a variant instead of its key table; only for keys whose tables are all joined on the partition key
 
 #### Queue Processing
 ```bash
