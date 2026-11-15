@@ -225,6 +225,12 @@ print(optimized)
 > double precision key list compares `real = double precision`, so it would silently match none. Use `IN`, whose
 > literals take the column's type. Population and `pcache-monitor` run such variants unrestricted and count them
 > (`float_keys`).
+> The keys of `IN` and `VALUES` are literals of their type as well: integers and decimals as numbers, timestamps as
+> `CAST('...' AS TIMESTAMP|TIMESTAMPTZ)` in PostgreSQL and DuckDB (as string literals they made a `VALUES` list a
+> text column), strings as escaped string literals. Float keys stay string literals, which `IN` converts to the
+> column's type. A timezone-aware key compared with a `timestamp` column (no time zone) is converted through the
+> session time zone in every method. SQLite keeps timestamps as strings, which it stores as text, and writes
+> infinity as `9e999`.
 
 #### `extend_query_with_partition_keys_lazy(query: str, lazy_subquery: str, partition_key: str, method: Literal["IN_SUBQUERY", "TMP_TABLE_IN", "TMP_TABLE_JOIN", "UNLOGGED_TABLE_JOIN"] = "IN_SUBQUERY", p0_alias: str | None = None, analyze_tmp_table: bool = True, auto_detect_partition_join: bool = True, partition_join_table: str | None = None, sql_dialect: str = "postgres")`
 

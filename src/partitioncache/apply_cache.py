@@ -558,11 +558,7 @@ def rewrite_query_with_p0_table( # TODO: Check duplication with query_processor
 
 
 def _format_partition_key_for_sql(pk: int | str | float | datetime, sql_dialect: str = "postgres") -> str:
-    """Format a single partition key as a literal for a key table of ``_get_partition_key_sql_type``'s type.
-
-    Integers and finite decimals as numbers; everything else (strings, timestamps) as a string literal with quotes
-    and backslashes escaped for ``sql_dialect``, which the key table's column type converts.
-    """
+    """Format a single partition key as a literal for a key table of ``_get_partition_key_sql_type``'s type."""
     return _format_spliced_partition_key(pk, sql_dialect)
 
 
@@ -617,18 +613,30 @@ def _key_list_sentinel() -> str:
     return f"__pcache_keys_{secrets.token_hex(8)}__"
 
 
-def _format_spliced_partition_key(pk: int | str | float | datetime, sql_dialect: str = "postgres") -> str:
-    """Format one key for a spliced (unparsed) list.
+# Dialects with typed timestamp literals; SQLite stores timestamps as text
+_TYPED_LITERAL_DIALECTS = ("postgres", "duckdb")
 
-    Integers and finite decimals (psycopg's type for numeric columns) as numbers, everything else as a string literal
-    rendered by sqlglot for ``sql_dialect``, so quotes and backslashes are escaped the way that dialect expects
-    (MySQL treats a backslash as an escape character). The former parse-based path rejected such keys with a sqlglot
-    TokenError. In ``IN`` a string literal takes the column's type, so float keys stay exact there.
+
+def _format_spliced_partition_key(pk: int | str | float | datetime, sql_dialect: str = "postgres") -> str:
+    """Format one key as a literal for a spliced (unparsed) key list or a key table.
+
+    Integers and finite decimals (psycopg's type for numeric columns) as numbers. Strings as string literals rendered
+    by sqlglot for ``sql_dialect``, so quotes and backslashes are escaped the way that dialect expects (MySQL treats a
+    backslash as an escape character); the former parse-based path rejected such keys with a sqlglot TokenError.
+    Timestamps as ``CAST('...' AS TIMESTAMP|TIMESTAMPTZ)`` in PostgreSQL and DuckDB: as bare string literals they made
+    ``IN (VALUES ...)`` a text column, which neither compares with a timestamp column. Float keys stay string
+    literals, which ``IN`` converts to the column's type exactly (VALUES and the key tables refuse them,
+    ``_refuse_float_keys``); SQLite writes infinity as 9e999, since the string 'inf' matches no REAL value.
     """
     if isinstance(pk, int):
         return str(pk)
     if isinstance(pk, Decimal) and pk.is_finite():
         return str(pk)
+    if isinstance(pk, float) and sql_dialect == "sqlite" and math.isinf(pk):
+        return "9e999" if pk > 0 else "-9e999"
+    if isinstance(pk, datetime) and sql_dialect in _TYPED_LITERAL_DIALECTS:
+        literal = exp.Literal.string(pk.isoformat(sep=" ")).sql(dialect=sql_dialect)
+        return f"CAST({literal} AS {'TIMESTAMPTZ' if pk.tzinfo is not None else 'TIMESTAMP'})"
     return exp.Literal.string(str(pk)).sql(dialect=sql_dialect)
 
 
@@ -725,7 +733,7 @@ def _create_tmp_table_setup(
     # (see execute_with_temp_tables / PostgresDBHandler.execute and docs/api_reference.md).
     ddl_prefix, ddl_suffix = _temp_table_ddl(table_name, sql_dialect)
     setup_sql = f"""{ddl_prefix}CREATE TEMPORARY TABLE {table_name} (partition_key {partition_key_type} PRIMARY KEY){ddl_suffix};
-                    INSERT INTO {table_name} (partition_key) (VALUES({partition_keys_str}));
+                    INSERT INTO {table_name} (partition_key) VALUES ({partition_keys_str});
                     """
 
     if analyze_tmp_table:

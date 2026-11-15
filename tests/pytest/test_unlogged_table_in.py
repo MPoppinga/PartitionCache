@@ -187,11 +187,11 @@ class TestTypedKeyTables:
 
     def test_temporary_key_table_escapes_string_keys(self):
         script = extend_query_with_partition_keys(QUERY, {"o'brien"}, "region_id", method="TMP_TABLE_JOIN", p0_alias="u")
-        assert "(VALUES('o''brien'))" in script
+        assert "VALUES ('o''brien');" in script
 
     def test_decimal_keys_are_numbers(self):
         script = extend_query_with_partition_keys(QUERY, {Decimal("1.50")}, "region_id", method="TMP_TABLE_IN", p0_alias="u")
-        assert "(VALUES(1.50))" in script
+        assert "VALUES (1.50);" in script
 
     @pytest.mark.parametrize("method", ["VALUES", *SCRIPT_METHODS])
     def test_float_keys_are_refused_for_typed_key_lists(self, method):
