@@ -1,6 +1,6 @@
 # Design note: folding partition-key subqueries into the key table
 
-Status: **prototype with tests, reviewed by PR-Review, for decision**.
+Status: **implemented as an opt-in (`fold_key_subqueries`, default off); the design was reviewed by PR-Review and approved by the author on 2026-11-15**.
 
 Verdict: **works, with these limits:**
 - integer and decimal keys by default, text and timestamp keys only on the caller's word, float keys never;
@@ -108,7 +108,12 @@ On the lazy path the keys are not known, so `extend_query_with_partition_keys_la
 
 Without cache hits there is no key table, and the query is unchanged. GeoMine, in contrast, applies the method to the metadata set alone.
 
-Folding without hits would mean that PartitionCache rewrites queries it otherwise leaves alone: it would build a key table from the subqueries only. The planner problem exists without the cache too, so that is useful, but it is a separate decision. I propose it as a later option, after the comparison runs; it is not in the first version.
+Folding without hits would mean that PartitionCache rewrites queries it otherwise leaves alone. It would build a key table from the subqueries only. The planner problem exists without the cache too, so that is useful.
+
+**Proposed as a separate PR: `fold_key_subqueries="always"`.** On a cache miss, `apply_cache(_lazy)` builds the key table from the foldable subqueries alone, `T = S1 ∩ S2 ∩ ...`, and restricts the query with it. With hits it behaves as `True`.
+- **Key types.** With no cache keys, T has the subquery's own column type, so `pl.key IN (SELECT k FROM T)` compares exactly as `pl.key IN (S1)` did. The key-type gating is not needed for this case.
+- **Dialects.** The table is built as `CREATE ... AS (SELECT s.v AS <key> FROM (S1) AS s(v) WHERE s.v IN (S2) ...)`, using a column alias list. That works in PostgreSQL and DuckDB, not in SQLite.
+- **Size.** It changes the no-hit returns of both apply functions and the lazy extension's key source, about 40 lines plus tests. That is more than a flag, hence a PR of its own after this one.
 
 ## API
 
@@ -133,9 +138,9 @@ Demo, PostgreSQL 17 (synthetic, not a benchmark): 200,000 pockets, 600,000 point
 | inline | `HashAggregate` over `ProjectSet unnest(...)`, **estimated 10 rows, actual 100,000** | nested loops driven from the subquery, serial |
 | folded | no subquery; key table `Index Only Scan`, estimated 5,952 per worker, actual 4,762 × 3 workers | merge semi join, parallel |
 
-## Prototype and tests
+## Implementation and tests
 
-The prototype is `_fold_key_subqueries`, `_unfoldable_reason`, `_key_component` and `_filtered_keys_sql` in `src/partitioncache/apply_cache.py`. The tests are in `tests/pytest/test_fold_key_subqueries.py`.
+The implementation is `_fold_key_subqueries`, `_unfoldable_reason`, `_key_component` and `_filtered_keys_sql` in `src/partitioncache/apply_cache.py`. The tests are in `tests/pytest/test_fold_key_subqueries.py`.
 
 **Same rows with and without folding, and the same as the query unrestricted:**
 - on SQLite and DuckDB for `TMP_TABLE_IN` / `TMP_TABLE_JOIN`;
@@ -152,4 +157,4 @@ The prototype is `_fold_key_subqueries`, `_unfoldable_reason`, `_key_component` 
 
 **PostgreSQL plan:** `unnest` is in the inline plan and gone from the folded one, and the key table's row estimate equals its true size.
 
-Not yet done: the monitor / pcache-add pass-through.
+The monitor and pcache-add flags, and with them folding in population, follow in a stacked PR with its own soundness note.
