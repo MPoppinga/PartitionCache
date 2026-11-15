@@ -97,7 +97,7 @@ On the lazy path the keys are not known, so `extend_query_with_partition_keys_la
 
 - **Snapshot.** Under READ COMMITTED the subquery is read in the snapshot of the setup statement, not of the main SELECT. That differs only if its tables change during the script.
 - **Types:** see "Key types".
-- **Older, independent gap found on the way.** The key-table methods and VALUES miss a `char(n)` key column whether or not anything is folded: the text key table compares the padded keys as text. Only IN matches. This is listed separately and not fixed here.
+- **Older, independent gap found on the way, fixed since.** The key-table methods and VALUES missed a `char(n)` key column whether or not anything was folded: the text key table compared the padded keys as text. Key tables for non-integer keys are now created in the key column's type (see "Key table types" in the API reference). Folded, the keys go through a staging table of that type, and the INTERSECT compares in it, so a `char(n)` column folded with `"any_key_type"` keeps its rows.
 - **planner_collapse_limit** also applies to the setup statements. The main statement has fewer relations to collapse.
 - **join_every_table:** every table is tied to p0 (its guard checks that), so conditions on any of them fold.
 - **Eviction (#45):** the lazy fallback to "all keys" still gives K ⊇ result, so T stays exact.

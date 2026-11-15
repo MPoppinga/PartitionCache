@@ -986,7 +986,9 @@ def _typed_key_table_setup(
         partition_key: Its key column.
         rows_sql: ``VALUES (...)`` of untyped literals (``_untyped_key_rows``) or the lazy key subquery.
         analyze: ANALYZE the table (always for unlogged tables).
-        key_filters: Folded subqueries (``_fold_key_subqueries``); the keys outside them are deleted.
+        key_filters: Folded subqueries (``_fold_key_subqueries``). PostgreSQL converts the keys in a staging table of the
+            column's type and fills the key table with ``_folded_fill_sql`` (an INTERSECT in that type); the other
+            dialects delete the keys outside them, as ``_create_tmp_table_setup`` does.
 
     Returns:
         tuple[str, str]: (setup_sql, table_name).
@@ -1000,10 +1002,21 @@ def _typed_key_table_setup(
         table_name = f"tmp_cache_keys_{random.randint(100000, 999999)}"
         ddl_prefix, ddl_suffix = _temp_table_ddl(table_name, sql_dialect)
         create = f"{ddl_prefix}CREATE TEMPORARY TABLE {table_name}{ddl_suffix}"
-    setup_sql = f"{create} AS SELECT pcache_src.{partition_key} AS {key_column} FROM {source_table} AS pcache_src LIMIT 0;\n"
-    setup_sql += f"INSERT INTO {table_name} ({key_column}) {rows_sql};\n"
-    for key_filter in key_filters:
-        setup_sql += f"DELETE FROM {table_name} WHERE ({key_column} IN ({key_filter})) IS NOT TRUE;\n"
+    typed_like = f"AS SELECT pcache_src.{partition_key} AS {key_column} FROM {source_table} AS pcache_src LIMIT 0"
+    if key_filters and sql_dialect == "postgres":
+        # The keys are converted to the column's type in a staging table first, so that the INTERSECT compares them
+        # as the column does; untyped literals in the INTERSECT itself would be resolved to text
+        stage = f"pcache_stage_{secrets.token_hex(4)}"
+        setup_sql = f"CREATE TEMPORARY TABLE {stage} ON COMMIT DROP {typed_like};\n"
+        setup_sql += f"INSERT INTO {stage} ({key_column}) {rows_sql};\n"
+        setup_sql += f"{create} {typed_like};\n"
+        setup_sql += _folded_fill_sql(table_name, key_column, key_filters, keys_sql=f"SELECT {stage}.{key_column} FROM {stage}")
+        setup_sql += f"DROP TABLE {stage};\n"
+    else:
+        setup_sql = f"{create} {typed_like};\n"
+        setup_sql += f"INSERT INTO {table_name} ({key_column}) {rows_sql};\n"
+        for key_filter in key_filters:
+            setup_sql += f"DELETE FROM {table_name} WHERE ({key_column} IN ({key_filter})) IS NOT TRUE;\n"
     setup_sql += f"CREATE INDEX {table_name}_idx ON {table_name} ({key_column});\n"
     if analyze or kind == "UNLOGGED":
         setup_sql += f"ANALYZE {table_name};\n"
@@ -1343,8 +1356,9 @@ def extend_query_with_partition_keys(
         commented ``AND FALSE`` regardless of ``method``.
 
     Raises:
-        ValueError: For float keys with VALUES or a key-table method: typed as double precision, they would silently
-            miss a ``real`` column; ``IN`` restricts them exactly.
+        ValueError: For float keys with VALUES: typed as double precision, they would silently miss a ``real``
+            column; ``IN`` and the key-table methods restrict them exactly. For a key-table method with non-integer keys
+            when the p0 alias is not a plain table, whose key column type the key table could not take.
     """
     _check_planner_collapse_limit(planner_collapse_limit, method, sql_dialect)
     _check_fold_key_subqueries(fold_key_subqueries, method, sql_dialect)

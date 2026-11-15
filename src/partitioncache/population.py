@@ -214,7 +214,7 @@ class RestrictionCounts:
     below_min_hits: int = 0
     over_key_limit: int = 0
     no_key_alias: int = 0  # no key joins, and the variant selects no qualified key column
-    float_keys: int = 0  # float keys with VALUES or a key-table method, which cannot restrict them exactly
+    float_keys: int = 0  # float keys with VALUES, whose double precision list cannot restrict them exactly
     lookup_failed: int = 0
 
     def count_unrestricted(self, reason: str) -> None:

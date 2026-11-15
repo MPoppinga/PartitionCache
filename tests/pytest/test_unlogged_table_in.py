@@ -319,7 +319,8 @@ class TestAgainstPostgreSQL:
 
     @pytest.mark.parametrize("method", ["IN", "VALUES", *SCRIPT_METHODS])
     def test_float_keys_of_a_real_column(self, db, method):
-        """Read back from a real column, 0.1 is the double nearest to its text: only IN matches it in the column's type."""
+        """Read back from a real column, 0.1 is the double nearest to its text. IN (untyped literals) and the key tables
+        (built in the column's type) match it; a VALUES list would be double precision and is refused."""
         import psycopg
 
         params, table = db
@@ -327,7 +328,7 @@ class TestAgainstPostgreSQL:
             keys = {row[0] for row in conn.execute(f"SELECT DISTINCT k4 FROM {table} WHERE region_id IN (1, 2)")}
         assert keys == {0.1, 0.2}
         query = f"SELECT count(*) FROM {table} AS p"
-        if method != "IN":
+        if method == "VALUES":
             with pytest.raises(ValueError, match="use method IN"):
                 extend_query_with_partition_keys(query, keys, "k4", method=method, p0_alias="p")
             return
