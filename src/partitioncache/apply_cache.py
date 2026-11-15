@@ -564,16 +564,19 @@ def _format_partition_key_for_sql(pk: int | str | float | datetime, sql_dialect:
 
 # Methods whose keys are typed by a VALUES list or a key table, not by the partition key column
 _TYPED_KEY_METHODS = ("VALUES", "TMP_TABLE_IN", "TMP_TABLE_JOIN", "UNLOGGED_TABLE_IN", "UNLOGGED_TABLE_JOIN")
+# ... of which a VALUES list cannot take the column's type; the key tables of non-integer keys do (_typed_key_table_setup)
+FLOAT_KEY_REFUSING_METHODS = ("VALUES",)
 
 
 def _refuse_float_keys(partition_keys: set[int] | set[str] | set[float] | set[datetime], method: str) -> None:
     """Raise ValueError for float keys with a method whose key list is not typed by the partition key column.
 
-    A float key read back from a ``real`` (float4) column is the double nearest to its text (0.1); a VALUES list or
-    key table of such keys is double precision, and ``real = double precision`` compares 0.100000001490116 with
-    0.1, so every key would be missed without an error. The literals of ``IN`` take the column's type instead.
+    A float key read back from a ``real`` (float4) column is the double nearest to its text (0.1); a VALUES list of
+    such keys is double precision, and ``real = double precision`` compares 0.100000001490116 with 0.1, so every key
+    would be missed without an error. The literals of ``IN`` and the key tables of non-integer keys
+    (``_typed_key_table_setup``) take the column's type instead.
     """
-    if method in _TYPED_KEY_METHODS and any(isinstance(k, float) for k in partition_keys):
+    if method in FLOAT_KEY_REFUSING_METHODS and any(isinstance(k, float) for k in partition_keys):
         raise ValueError(
             f"{method} cannot restrict float partition keys exactly (a real column would silently match none); use method IN"
         )
@@ -904,6 +907,124 @@ def _unlogged_table_teardown(table_name: str) -> str:
     return f";\nDROP TABLE IF EXISTS {table_name}"
 
 
+def _key_source_table(parsed_query: exp.Expr, alias: str | None, sql_dialect: str) -> str | None:
+    """The plain table of ``alias`` in the outer FROM / JOIN clauses, rendered without its alias, or None.
+
+    None for a subquery, a CTE or an alias that is not there: the key table of non-integer keys takes its column type
+    from this table (``_typed_key_table_setup``).
+    """
+    if alias is None:
+        return None
+    with_ = parsed_query.args.get("with") or parsed_query.args.get("with_")
+    ctes = {cte.alias_or_name for cte in with_.expressions} if with_ is not None else set()
+    from_ = parsed_query.args.get("from_") or parsed_query.args.get("from")
+    for clause in [*([from_] if from_ is not None else []), *(parsed_query.args.get("joins") or [])]:
+        if clause.alias_or_name == alias:
+            table = clause.this
+            if not isinstance(table, exp.Table) or table.name in ctes:
+                return None
+            table = table.copy()
+            table.set("alias", None)
+            return table.sql(dialect=sql_dialect)
+    return None
+
+
+def _untyped_key_rows(partition_keys: set[int] | set[str] | set[float] | set[datetime], sql_dialect: str) -> str:
+    """``VALUES ('k1'), ...`` with the keys as string literals, which the key table's column type converts, as IN does."""
+
+    def literal(pk: int | str | float | datetime) -> str:
+        if isinstance(pk, float) and sql_dialect == "sqlite" and math.isinf(pk):
+            return "9e999" if pk > 0 else "-9e999"  # SQLite keeps the string 'inf' as text in a REAL column
+        return exp.Literal.string(str(pk)).sql(dialect=sql_dialect)
+
+    return "VALUES " + ", ".join(f"({literal(pk)})" for pk in partition_keys)
+
+
+def _typed_key_table_setup(
+    kind: str,
+    key_column: str,
+    source_table: str,
+    partition_key: str,
+    rows_sql: str,
+    analyze: bool,
+    sql_dialect: str,
+    key_filters: list[str],
+    method: str,
+) -> tuple[str, str]:
+    """Create a key table in the type of the key column of ``source_table`` and fill it with ``rows_sql``.
+
+    For non-integer keys. A key list typed by its Python values (text, double precision) can compare differently from
+    the key column: a ``char(n)`` column compares without the padding its keys were read back with, and a ``real``
+    column in double precision. Created as ``SELECT <key> ... LIMIT 0`` from the column, the table converts the keys
+    on INSERT exactly as the column's own comparison with an IN literal would.
+
+    Args:
+        kind: "TEMPORARY" or "UNLOGGED".
+        key_column: The key table's column name.
+        source_table: The p0 table (``_key_source_table``).
+        partition_key: Its key column.
+        rows_sql: ``VALUES (...)`` of untyped literals (``_untyped_key_rows``) or the lazy key subquery.
+        analyze: ANALYZE the table (always for unlogged tables).
+        key_filters: Folded subqueries (``_fold_key_subqueries``); the keys outside them are deleted.
+
+    Returns:
+        tuple[str, str]: (setup_sql, table_name).
+    """
+    if kind == "UNLOGGED":
+        if sql_dialect != "postgres":
+            raise ValueError(f"{method} is only supported for PostgreSQL, not for SQL dialect {sql_dialect!r}")
+        table_name = f"{UNLOGGED_TABLE_PREFIX}{secrets.token_hex(8)}"
+        create = f"CREATE UNLOGGED TABLE {table_name}"
+    else:
+        table_name = f"tmp_cache_keys_{random.randint(100000, 999999)}"
+        ddl_prefix, ddl_suffix = _temp_table_ddl(table_name, sql_dialect)
+        create = f"{ddl_prefix}CREATE TEMPORARY TABLE {table_name}{ddl_suffix}"
+    setup_sql = f"{create} AS SELECT pcache_src.{partition_key} AS {key_column} FROM {source_table} AS pcache_src LIMIT 0;\n"
+    setup_sql += f"INSERT INTO {table_name} ({key_column}) {rows_sql};\n"
+    for key_filter in key_filters:
+        setup_sql += f"DELETE FROM {table_name} WHERE ({key_column} IN ({key_filter})) IS NOT TRUE;\n"
+    setup_sql += f"CREATE INDEX {table_name}_idx ON {table_name} ({key_column});\n"
+    if analyze or kind == "UNLOGGED":
+        setup_sql += f"ANALYZE {table_name};\n"
+    return setup_sql, table_name
+
+
+def _key_type_guard_sql(column: str, column_types: tuple[str, ...]) -> str:
+    """A condition that fails the query, with a message, when ``column`` is of one of ``column_types`` (PostgreSQL).
+
+    For the methods whose key list cannot take the column's type (VALUES, the lazy IN_SUBQUERY): a ``char(n)`` or
+    ``real`` column would silently match none of the keys. ``IS NOT NULL`` keeps the planner's estimate of the
+    condition near 1, and the message depends on the column, so the error is not raised at planning time.
+    """
+    types = ", ".join(f"'{column_type}'::regtype" for column_type in column_types)
+    return (
+        f"(CASE WHEN pg_typeof({column}) IN ({types}) THEN CAST('PartitionCache: a key column of type ' || pg_typeof({column})::text || "
+        "' needs method IN or a key-table method' AS INTEGER) ELSE 1 END) IS NOT NULL"
+    )
+
+
+def _cache_datatype(cache_handler: Any, partition_key: str) -> str | None:
+    """The cache's datatype of the partition key, or None if the handler cannot tell."""
+    try:
+        datatype = cache_handler.get_datatype(partition_key)
+    except Exception:  # noqa: BLE001 - a handler without metadata: the scripts are built as for integer keys
+        return None
+    return datatype if isinstance(datatype, str) else None
+
+
+def _typed_source(parsed_query: exp.Expr, query: str, partition_key: str, method: str, p0_alias: str | None,
+                  auto_detect_partition_join: bool, partition_join_table: str | None, sql_dialect: str) -> str:
+    """The p0 table that gives a non-integer key table its column type; ValueError if the p0 alias is no plain table."""
+    alias = p0_alias if p0_alias is not None else find_p0_alias(query, partition_key, auto_detect_partition_join, partition_join_table)
+    source_table = _key_source_table(parsed_query, alias, sql_dialect)
+    if source_table is None:
+        raise ValueError(
+            f"{method} with non-integer keys builds its key table in the type of the key column of {alias!r}, which must be a plain "
+            "table (not a subquery or CTE); use method IN"
+        )
+    return source_table
+
+
 # Functions whose result can differ between two statements of the script, which is one transaction: a folded subquery
 # runs in the key table's statement. Best effort, a user-defined volatile function is not recognised; now() and the
 # other transaction-stable time functions are allowed.
@@ -1153,6 +1274,13 @@ def extend_query_with_partition_keys(
     parsed_query = sqlglot.parse_one(query, read=sql_dialect)
     p0_alias = _restriction_target(query, parsed_query, partition_key, method, p0_alias, join_every_table, auto_detect_partition_join, partition_join_table)
     key_filters = _fold_key_subqueries(parsed_query, partition_key, p0_alias, sql_dialect) if _fold_allowed(fold_key_subqueries, _key_kind(partition_keys)) else []
+    # Non-integer keys: the key tables take the key column's type (char(n), real); a VALUES list cannot and is guarded.
+    # Integer keys keep their scripts.
+    typed_source = None
+    if method in _SCRIPT_METHODS and _key_kind(partition_keys) != "integer":
+        typed_source = _typed_source(parsed_query, query, partition_key, method, p0_alias, auto_detect_partition_join, partition_join_table, sql_dialect)
+    if method == "VALUES" and sql_dialect == "postgres" and any(isinstance(k, str) for k in partition_keys):
+        _add_where_condition(parsed_query, sqlglot.parse_one(_key_type_guard_sql(f"{p0_alias}.{partition_key}", ("character",)), read=sql_dialect))
 
     if method == "IN":
         # The key list is not parsed: a placeholder identifier goes through sqlglot and the
@@ -1171,7 +1299,12 @@ def extend_query_with_partition_keys(
         return _splice_key_list(parsed_query.sql(dialect=sql_dialect), sentinel, key_list)
 
     elif method == "TMP_TABLE_JOIN" or method == "UNLOGGED_TABLE_JOIN":
-        if method == "UNLOGGED_TABLE_JOIN":
+        if typed_source is not None:
+            kind = "UNLOGGED" if method == "UNLOGGED_TABLE_JOIN" else "TEMPORARY"
+            tmp_table_setup, table_name = _typed_key_table_setup(
+                kind, "partition_key", typed_source, partition_key, _untyped_key_rows(partition_keys, sql_dialect), analyze_tmp_table, sql_dialect, key_filters, method
+            )
+        elif method == "UNLOGGED_TABLE_JOIN":
             keys_sql = _filtered_keys_sql(_unlogged_keys_sql(partition_keys, sql_dialect), "partition_key", key_filters)
             tmp_table_setup, table_name = _create_unlogged_table_setup(keys_sql, "partition_key", sql_dialect, method)
         else:
@@ -1215,7 +1348,12 @@ def extend_query_with_partition_keys(
         return script
 
     elif method == "TMP_TABLE_IN" or method == "UNLOGGED_TABLE_IN":
-        if method == "UNLOGGED_TABLE_IN":
+        if typed_source is not None:
+            kind = "UNLOGGED" if method == "UNLOGGED_TABLE_IN" else "TEMPORARY"
+            tmp_table_setup, table_name = _typed_key_table_setup(
+                kind, "partition_key", typed_source, partition_key, _untyped_key_rows(partition_keys, sql_dialect), analyze_tmp_table, sql_dialect, key_filters, method
+            )
+        elif method == "UNLOGGED_TABLE_IN":
             keys_sql = _filtered_keys_sql(_unlogged_keys_sql(partition_keys, sql_dialect), "partition_key", key_filters)
             tmp_table_setup, table_name = _create_unlogged_table_setup(keys_sql, "partition_key", sql_dialect, method)
         else:
@@ -1319,8 +1457,10 @@ def extend_query_with_partition_keys_lazy(
             ``SET LOCAL from_collapse_limit = N;``; see ``extend_query_with_partition_keys``. None (default) is off.
         fold_key_subqueries: Key-table methods only: fold key subqueries into the key table; see
             ``extend_query_with_partition_keys``.
-        partition_datatype: The cache's datatype of the partition key ("integer", "text", ...); folding needs it, as
-            the lazy keys are not known here. None: no folding.
+        partition_datatype: The cache's datatype of the partition key ("integer", "text", "float", ...), as the lazy
+            keys are not known here. For a non-integer datatype the key tables take the key column's type and
+            IN_SUBQUERY is guarded against a char(n) / real column, which it would silently miss; folding needs it too.
+            None (unknown): neither, the script is built as for integer keys.
 
     Returns:
         str: The extended SQL query as string.
@@ -1345,6 +1485,15 @@ def extend_query_with_partition_keys_lazy(
         else:
             lazy_subquery = lazy_subquery.replace(LAZY_ALL_KEYS_PLACEHOLDER, all_keys)
 
+    # Non-integer keys (the cache's datatype): the key tables take the key column's type; IN_SUBQUERY cannot and is
+    # guarded against the column types it would silently miss. Integer keys, and an unknown datatype, keep their scripts.
+    typed_source = None
+    if method in _SCRIPT_METHODS and partition_datatype not in (None, "integer"):
+        typed_source = _typed_source(parsed_query, query, partition_key, method, p0_alias, auto_detect_partition_join, partition_join_table, sql_dialect)
+    guarded_types = {"text": ("character",), "float": ("real",)}.get(partition_datatype or "")
+    if method == "IN_SUBQUERY" and sql_dialect == "postgres" and guarded_types:
+        _add_where_condition(parsed_query, sqlglot.parse_one(_key_type_guard_sql(f"{p0_alias}.{partition_key}", guarded_types), read=sql_dialect))
+
     if method == "IN_SUBQUERY":
         partition_expr = sqlglot.parse_one(f"{p0_alias}.{partition_key} IN ({lazy_subquery})", read=sql_dialect)
         _add_where_condition(parsed_query, partition_expr)
@@ -1352,7 +1501,12 @@ def extend_query_with_partition_keys_lazy(
 
     elif method == "TMP_TABLE_IN" or method == "UNLOGGED_TABLE_IN":
         # Create the key table (temporary or unlogged) from the lazy subquery, then use IN with SELECT
-        if method == "UNLOGGED_TABLE_IN":
+        if typed_source is not None:
+            kind = "UNLOGGED" if method == "UNLOGGED_TABLE_IN" else "TEMPORARY"
+            tmp_table_setup, table_name = _typed_key_table_setup(
+                kind, partition_key, typed_source, partition_key, lazy_subquery, analyze_tmp_table, sql_dialect, key_filters, method
+            )
+        elif method == "UNLOGGED_TABLE_IN":
             tmp_table_setup, table_name = _create_unlogged_table_setup(_filtered_keys_sql(lazy_subquery, partition_key, key_filters), partition_key, sql_dialect, method)
         else:
             tmp_table_setup, table_name = _create_tmp_table_setup_from_subquery(_filtered_keys_sql(lazy_subquery, partition_key, key_filters), partition_key, analyze_tmp_table, sql_dialect)
@@ -1367,7 +1521,12 @@ def extend_query_with_partition_keys_lazy(
 
     elif method == "TMP_TABLE_JOIN" or method == "UNLOGGED_TABLE_JOIN":
         # Create the key table (temporary or unlogged) from the lazy subquery, then JOIN
-        if method == "UNLOGGED_TABLE_JOIN":
+        if typed_source is not None:
+            kind = "UNLOGGED" if method == "UNLOGGED_TABLE_JOIN" else "TEMPORARY"
+            tmp_table_setup, table_name = _typed_key_table_setup(
+                kind, partition_key, typed_source, partition_key, lazy_subquery, analyze_tmp_table, sql_dialect, key_filters, method
+            )
+        elif method == "UNLOGGED_TABLE_JOIN":
             tmp_table_setup, table_name = _create_unlogged_table_setup(_filtered_keys_sql(lazy_subquery, partition_key, key_filters), partition_key, sql_dialect, method)
         else:
             tmp_table_setup, table_name = _create_tmp_table_setup_from_subquery(_filtered_keys_sql(lazy_subquery, partition_key, key_filters), partition_key, analyze_tmp_table, sql_dialect)
@@ -2487,7 +2646,7 @@ def apply_cache_lazy(
         join_every_table=join_every_table,
         planner_collapse_limit=planner_collapse_limit,
         fold_key_subqueries=fold_key_subqueries,
-        partition_datatype=cache_handler.get_datatype(partition_key) if fold_key_subqueries else None,
+        partition_datatype=_cache_datatype(cache_handler, partition_key),
     )
 
     stats["enhanced"] = 1

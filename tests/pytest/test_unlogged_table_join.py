@@ -72,7 +72,7 @@ class TestEager:
 
     def test_string_keys_are_escaped(self):
         script = extend_query_with_partition_keys(QUERY, {"o'brien"}, "region_id", method="UNLOGGED_TABLE_JOIN", p0_alias="u")
-        assert "(VALUES ('o''brien'))" in script
+        assert "VALUES ('o''brien');" in script
 
     def test_empty_key_set_builds_no_table(self):
         script = extend_query_with_partition_keys(QUERY, set(), "region_id", method="UNLOGGED_TABLE_JOIN", p0_alias="u")
