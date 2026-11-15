@@ -721,8 +721,11 @@ def _create_tmp_table_setup(
 ) -> tuple[str, str]:
     """Create the SQL for temporary table setup.
 
-    ``key_filters`` are folded subqueries (``_fold_key_subqueries``): after the INSERT, every key for which
-    ``key IN (<subquery>)`` is not TRUE is deleted, so the table holds exactly the keys the folded conditions keep.
+    ``key_filters`` are folded subqueries (``_fold_key_subqueries``); the table then holds exactly the keys the folded
+    conditions keep. PostgreSQL fills it with ``_folded_fill_sql``. The other dialects delete, after the INSERT, every
+    key for which ``key IN (<subquery>)`` is not TRUE: in PostgreSQL that condition is a subplan that is hashed only
+    when the estimated subquery fits in hash_mem, and otherwise scanned once per key. SQLite compares the IN with the
+    key column's affinity, which a set operation would not.
 
     Returns:
         tuple[str, str]: (setup_sql, table_name) where table_name is a random temporary table name.
@@ -735,11 +738,15 @@ def _create_tmp_table_setup(
     # persisting for the whole session. The full setup+query script must therefore run in ONE transaction
     # (see execute_with_temp_tables / PostgresDBHandler.execute and docs/api_reference.md).
     ddl_prefix, ddl_suffix = _temp_table_ddl(table_name, sql_dialect)
-    setup_sql = f"""{ddl_prefix}CREATE TEMPORARY TABLE {table_name} (partition_key {partition_key_type} PRIMARY KEY){ddl_suffix};
+    if key_filters and sql_dialect == "postgres":
+        setup_sql = f"CREATE TEMPORARY TABLE {table_name} (partition_key {partition_key_type} PRIMARY KEY){ddl_suffix};\n"
+        setup_sql += _folded_fill_sql(table_name, "partition_key", key_filters, partition_keys=partition_keys, sql_dialect=sql_dialect)
+    else:
+        setup_sql = f"""{ddl_prefix}CREATE TEMPORARY TABLE {table_name} (partition_key {partition_key_type} PRIMARY KEY){ddl_suffix};
                     INSERT INTO {table_name} (partition_key) VALUES ({partition_keys_str});
                     """
-    for key_filter in key_filters or ():
-        setup_sql += f"DELETE FROM {table_name} WHERE (partition_key IN ({key_filter})) IS NOT TRUE;\n"
+        for key_filter in key_filters or ():
+            setup_sql += f"DELETE FROM {table_name} WHERE (partition_key IN ({key_filter})) IS NOT TRUE;\n"
 
     if analyze_tmp_table:
         # PRIMARY KEY above already creates a B-tree index; ANALYZE updates statistics for the planner
@@ -877,8 +884,18 @@ def _restriction_target(
     return None
 
 
-def _create_unlogged_table_setup(keys_sql: str, key_column: str, sql_dialect: str, method: str = "UNLOGGED_TABLE_JOIN") -> tuple[str, str]:
+def _create_unlogged_table_setup(
+    keys_sql: str,
+    key_column: str,
+    sql_dialect: str,
+    method: str = "UNLOGGED_TABLE_JOIN",
+    key_filters: list[str] | None = None,
+    partition_keys: set[int] | set[str] | set[float] | set[datetime] | None = None,
+) -> tuple[str, str]:
     """Create the setup SQL of ``UNLOGGED_TABLE_JOIN`` / ``UNLOGGED_TABLE_IN``: an unlogged key table with index and statistics.
+
+    With folded subqueries (``key_filters``) the table is created in the keys' type and filled by ``_folded_fill_sql``:
+    from ``partition_keys`` (eager) or from ``keys_sql`` (lazy).
 
     PostgreSQL does not let parallel workers read temporary tables; an unlogged table can be read inside the
     parallel part of the plan. It is a regular table of the current schema, so the script drops it itself after
@@ -891,11 +908,15 @@ def _create_unlogged_table_setup(keys_sql: str, key_column: str, sql_dialect: st
     if sql_dialect != "postgres":
         raise ValueError(f"{method} is only supported for PostgreSQL, not for SQL dialect {sql_dialect!r}")
     table_name = f"{UNLOGGED_TABLE_PREFIX}{secrets.token_hex(8)}"
-    setup_sql = (
-        f"CREATE UNLOGGED TABLE {table_name} AS ({keys_sql});\n"
-        f"CREATE INDEX {table_name}_idx ON {table_name} ({key_column});\n"
-        f"ANALYZE {table_name};\n"
-    )
+    if not key_filters:
+        setup_sql = f"CREATE UNLOGGED TABLE {table_name} AS ({keys_sql});\n"
+    elif partition_keys is not None:
+        setup_sql = f"CREATE UNLOGGED TABLE {table_name} ({key_column} {_get_partition_key_sql_type(partition_keys, sql_dialect)});\n"
+        setup_sql += _folded_fill_sql(table_name, key_column, key_filters, partition_keys=partition_keys, sql_dialect=sql_dialect)
+    else:
+        setup_sql = f"CREATE UNLOGGED TABLE {table_name} AS ({_typed_like_keys_sql(keys_sql, key_column)});\n"
+        setup_sql += _folded_fill_sql(table_name, key_column, key_filters, keys_sql=keys_sql)
+    setup_sql += f"CREATE INDEX {table_name}_idx ON {table_name} ({key_column});\nANALYZE {table_name};\n"
     return setup_sql, table_name
 
 
@@ -1039,6 +1060,8 @@ _FOLDED_KEY_COLUMN = "pcache_key"
 def _filtered_keys_sql(keys_sql: str, column: str, key_filters: list[str]) -> str:
     """The keys (column ``column``) of ``keys_sql`` for which ``key IN (<subquery>)`` is TRUE for every folded subquery.
 
+    For the dialects other than PostgreSQL, which uses ``_folded_fill_sql`` (see there why).
+
     The WHERE keeps a key only when the condition is TRUE, as the row filter did. The keys are renamed to
     ``_FOLDED_KEY_COLUMN`` around the conditions, so that an unqualified column of a subquery cannot bind to them.
     """
@@ -1052,11 +1075,70 @@ def _filtered_keys_sql(keys_sql: str, column: str, key_filters: list[str]) -> st
     )
 
 
-def _check_fold_key_subqueries(fold_key_subqueries: bool | str, method: str) -> None:
+def _kept_keys_sql(cte: str, column: str, key_filters: list[str]) -> str:
+    """The keys of the common table expression ``cte`` (column ``column``) that every folded subquery contains:
+    K INTERSECT S1 INTERSECT S2 ...
+
+    A set operation has no join for a misestimate to turn into a nested loop or a per-key subplan, which is what
+    ``k IN (S)`` became: a semi join that de-duplicated and hashed all of S, a nested loop when the keys were estimated
+    at a few rows, or (as ``(k IN (S)) IS NOT TRUE``) a subplan rescanned for every key. PostgreSQL's HashSetOp hashes
+    the input with fewer estimated groups and streams the other, a tie keeping the left. ``cte`` is MATERIALIZED, so
+    the keys are estimated at the default number of groups like an unnest or other unanalyzed subquery, and stay the
+    hashed side unless a subquery's statistics show fewer groups; a VALUES list read directly is estimated higher and
+    lost to an unnest of millions of rows. Each subquery is a derived table: a set operation or a set-returning target
+    list inside it stays inside.
+
+    Set operations treat NULL as equal to NULL. The keys hold no NULL, so the result holds none, and the result are
+    the keys for which ``key IN (S)`` is TRUE for every S, as the folded row filter required.
+    """
+    members = "".join(f" INTERSECT SELECT * FROM ({key_filter}) AS pcache_folded_{i}" for i, key_filter in enumerate(key_filters, 1))
+    return f"SELECT {cte}.{column} FROM {cte}{members}"
+
+
+def _typed_like_keys_sql(keys_sql: str, column: str) -> str:
+    """A query of no rows whose column ``column`` has the type of ``keys_sql``'s: a folded key table created from it
+    keeps the keys' type, whatever the common type of the keys and the subqueries is. ``keys_sql`` is not run."""
+    return f"SELECT pcache_keys_inner.{column} FROM ({keys_sql}) AS pcache_keys_inner LIMIT 0"
+
+
+def _folded_fill_sql(
+    table_name: str,
+    column: str,
+    key_filters: list[str],
+    keys_sql: str | None = None,
+    partition_keys: set[int] | set[str] | set[float] | set[datetime] | None = None,
+    sql_dialect: str = "postgres",
+) -> str:
+    """The INSERT (PostgreSQL) that fills a folded key table with the keys every folded subquery contains.
+
+    The keys are the eager ``partition_keys`` (Python values, never NULL) or the lazy ``keys_sql`` without its NULLs,
+    in a MATERIALIZED common table expression (see ``_kept_keys_sql``). The table already has the keys' type; the
+    INSERT assigns the kept keys, a subset of the keys, to it. The CTE's name has a random suffix: a CTE is visible
+    inside the folded subqueries, which must not bind one of their tables to it.
+    """
+    cte = f"pcache_k_{secrets.token_hex(4)}"
+    if partition_keys is not None:
+        rows = "), (".join(_format_partition_key_for_sql(pk, sql_dialect) for pk in partition_keys)
+        definition = f"{cte} ({column}) AS MATERIALIZED (VALUES ({rows}))"
+    else:
+        definition = (
+            f"{cte} AS MATERIALIZED (SELECT pcache_keys_inner.{column} FROM ({keys_sql}) AS pcache_keys_inner "
+            f"WHERE pcache_keys_inner.{column} IS NOT NULL)"
+        )
+    return f"WITH {definition} INSERT INTO {table_name} ({column}) {_kept_keys_sql(cte, column, key_filters)};\n"
+
+
+# The dialects whose folded scripts are tested; MySQL, for one, has INTERSECT only from 8.0.31
+FOLD_DIALECTS = ("postgres", "duckdb", "sqlite")
+
+
+def _check_fold_key_subqueries(fold_key_subqueries: bool | str, method: str, sql_dialect: str = "postgres") -> None:
     if fold_key_subqueries not in (False, True, FOLD_ANY_KEY_TYPE):
         raise ValueError(f"fold_key_subqueries is False, True or {FOLD_ANY_KEY_TYPE!r}, not {fold_key_subqueries!r}")
     if fold_key_subqueries and method not in _SCRIPT_METHODS:
         raise ValueError(f"fold_key_subqueries needs a key-table method {_SCRIPT_METHODS}, not {method!r}")
+    if fold_key_subqueries and sql_dialect not in FOLD_DIALECTS:
+        raise ValueError(f"fold_key_subqueries supports the SQL dialects {FOLD_DIALECTS}, not {sql_dialect!r}")
 
 
 def _fold_allowed(fold_key_subqueries: bool | str, key_kind: str | None) -> bool:
@@ -1144,7 +1226,7 @@ def extend_query_with_partition_keys(
             miss a ``real`` column; ``IN`` restricts them exactly.
     """
     _check_planner_collapse_limit(planner_collapse_limit, method, sql_dialect)
-    _check_fold_key_subqueries(fold_key_subqueries, method)
+    _check_fold_key_subqueries(fold_key_subqueries, method, sql_dialect)
     if not partition_keys:
         return _add_empty_intersection_condition(query, sql_dialect)
     _refuse_float_keys(partition_keys, method)
@@ -1172,8 +1254,9 @@ def extend_query_with_partition_keys(
 
     elif method == "TMP_TABLE_JOIN" or method == "UNLOGGED_TABLE_JOIN":
         if method == "UNLOGGED_TABLE_JOIN":
-            keys_sql = _filtered_keys_sql(_unlogged_keys_sql(partition_keys, sql_dialect), "partition_key", key_filters)
-            tmp_table_setup, table_name = _create_unlogged_table_setup(keys_sql, "partition_key", sql_dialect, method)
+            tmp_table_setup, table_name = _create_unlogged_table_setup(
+                _unlogged_keys_sql(partition_keys, sql_dialect), "partition_key", sql_dialect, method, key_filters, partition_keys
+            )
         else:
             tmp_table_setup, table_name = _create_tmp_table_setup(partition_keys, analyze_tmp_table, sql_dialect, key_filters)
 
@@ -1216,8 +1299,9 @@ def extend_query_with_partition_keys(
 
     elif method == "TMP_TABLE_IN" or method == "UNLOGGED_TABLE_IN":
         if method == "UNLOGGED_TABLE_IN":
-            keys_sql = _filtered_keys_sql(_unlogged_keys_sql(partition_keys, sql_dialect), "partition_key", key_filters)
-            tmp_table_setup, table_name = _create_unlogged_table_setup(keys_sql, "partition_key", sql_dialect, method)
+            tmp_table_setup, table_name = _create_unlogged_table_setup(
+                _unlogged_keys_sql(partition_keys, sql_dialect), "partition_key", sql_dialect, method, key_filters, partition_keys
+            )
         else:
             tmp_table_setup, table_name = _create_tmp_table_setup(partition_keys, analyze_tmp_table, sql_dialect, key_filters)
         partition_expr = sqlglot.parse_one(f"{p0_alias}.{partition_key} IN (SELECT partition_key FROM {table_name})", read=sql_dialect)
@@ -1231,14 +1315,22 @@ def extend_query_with_partition_keys(
 
 
 def _create_tmp_table_setup_from_subquery(
-    lazy_subquery: str, partition_key: str, analyze_tmp_table: bool, sql_dialect: str = "postgres"
+    lazy_subquery: str, partition_key: str, analyze_tmp_table: bool, sql_dialect: str = "postgres", key_filters: list[str] | None = None
 ) -> tuple[str, str]:
-    """Create the SQL for temporary table setup from a lazy subquery."""
+    """Create the SQL for temporary table setup from a lazy subquery.
+
+    With folded subqueries (``key_filters``), PostgreSQL creates the table in the keys' type and fills it with
+    ``_folded_fill_sql``; the other dialects filter the keys with ``_filtered_keys_sql``.
+    """
 
     table_name = f"tmp_cache_keys_{random.randint(100000, 999999)}"
     # ON COMMIT DROP: dropped at transaction end (script must run in one transaction).
     ddl_prefix, ddl_suffix = _temp_table_ddl(table_name, sql_dialect)
-    setup_sql = f"{ddl_prefix}CREATE TEMPORARY TABLE {table_name}{ddl_suffix} AS ({lazy_subquery});\n"
+    if key_filters and sql_dialect == "postgres":
+        setup_sql = f"CREATE TEMPORARY TABLE {table_name}{ddl_suffix} AS ({_typed_like_keys_sql(lazy_subquery, partition_key)});\n"
+        setup_sql += _folded_fill_sql(table_name, partition_key, key_filters, keys_sql=lazy_subquery)
+    else:
+        setup_sql = f"{ddl_prefix}CREATE TEMPORARY TABLE {table_name}{ddl_suffix} AS ({_filtered_keys_sql(lazy_subquery, partition_key, key_filters or [])});\n"
 
     if analyze_tmp_table:
         setup_sql += f"CREATE INDEX {table_name}_idx ON {table_name} ({partition_key});\n"
@@ -1326,7 +1418,7 @@ def extend_query_with_partition_keys_lazy(
         str: The extended SQL query as string.
     """
     _check_planner_collapse_limit(planner_collapse_limit, method, sql_dialect)
-    _check_fold_key_subqueries(fold_key_subqueries, method)
+    _check_fold_key_subqueries(fold_key_subqueries, method, sql_dialect)
     if not lazy_subquery or not lazy_subquery.strip():
         return query
 
@@ -1353,9 +1445,9 @@ def extend_query_with_partition_keys_lazy(
     elif method == "TMP_TABLE_IN" or method == "UNLOGGED_TABLE_IN":
         # Create the key table (temporary or unlogged) from the lazy subquery, then use IN with SELECT
         if method == "UNLOGGED_TABLE_IN":
-            tmp_table_setup, table_name = _create_unlogged_table_setup(_filtered_keys_sql(lazy_subquery, partition_key, key_filters), partition_key, sql_dialect, method)
+            tmp_table_setup, table_name = _create_unlogged_table_setup(lazy_subquery, partition_key, sql_dialect, method, key_filters)
         else:
-            tmp_table_setup, table_name = _create_tmp_table_setup_from_subquery(_filtered_keys_sql(lazy_subquery, partition_key, key_filters), partition_key, analyze_tmp_table, sql_dialect)
+            tmp_table_setup, table_name = _create_tmp_table_setup_from_subquery(lazy_subquery, partition_key, analyze_tmp_table, sql_dialect, key_filters)
         partition_expr = sqlglot.parse_one(
             f"{p0_alias}.{partition_key} IN (SELECT {partition_key} FROM {table_name})", read=sql_dialect
         )
@@ -1368,9 +1460,9 @@ def extend_query_with_partition_keys_lazy(
     elif method == "TMP_TABLE_JOIN" or method == "UNLOGGED_TABLE_JOIN":
         # Create the key table (temporary or unlogged) from the lazy subquery, then JOIN
         if method == "UNLOGGED_TABLE_JOIN":
-            tmp_table_setup, table_name = _create_unlogged_table_setup(_filtered_keys_sql(lazy_subquery, partition_key, key_filters), partition_key, sql_dialect, method)
+            tmp_table_setup, table_name = _create_unlogged_table_setup(lazy_subquery, partition_key, sql_dialect, method, key_filters)
         else:
-            tmp_table_setup, table_name = _create_tmp_table_setup_from_subquery(_filtered_keys_sql(lazy_subquery, partition_key, key_filters), partition_key, analyze_tmp_table, sql_dialect)
+            tmp_table_setup, table_name = _create_tmp_table_setup_from_subquery(lazy_subquery, partition_key, analyze_tmp_table, sql_dialect, key_filters)
 
         # Add as inner join to the p0 table, or with join_every_table to every table
         from_clauses: list[exp.Join | exp.From] = list(parsed_query.find_all(exp.Join))
@@ -2279,7 +2371,7 @@ def apply_cache_lazy(
         partition_join_table = deprecated["partition_join_table"]
     if "auto_detect_partition_join" in deprecated:
         auto_detect_partition_join = deprecated["auto_detect_partition_join"]
-    _check_fold_key_subqueries(fold_key_subqueries, method)
+    _check_fold_key_subqueries(fold_key_subqueries, method, sql_dialect)
     _check_planner_collapse_limit(planner_collapse_limit, method, sql_dialect)
 
     gated, gate_stats = _check_cost_gate(query, cost_estimator, min_query_cost)
@@ -2648,7 +2740,7 @@ def apply_cache(
         partition_join_table = deprecated["partition_join_table"]
     if "auto_detect_partition_join" in deprecated:
         auto_detect_partition_join = deprecated["auto_detect_partition_join"]
-    _check_fold_key_subqueries(fold_key_subqueries, method)
+    _check_fold_key_subqueries(fold_key_subqueries, method, "postgres")
     _check_planner_collapse_limit(planner_collapse_limit, method, "postgres")  # the eager rewrite below renders PostgreSQL
 
     gated, gate_stats = _check_cost_gate(query, cost_estimator, min_query_cost)

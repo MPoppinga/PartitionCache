@@ -1,6 +1,6 @@
 # Design note: folding partition-key subqueries into the key table
 
-Status: **implemented as an opt-in (`fold_key_subqueries`, default off); the design was reviewed by PR-Review and approved by the author on 2026-11-15**.
+Status: **implemented as an opt-in (`fold_key_subqueries`, default off); the design was reviewed by PR-Review and approved by the author on 2026-11-15**. The key table's defining query was changed the same day to the INTERSECT form below, after C2's smoke found the first form's setup up to 50× slower (see "The key table's defining query").
 
 Verdict: **works, with these limits:**
 - integer and decimal keys by default, text and timestamp keys only on the caller's word, float keys never;
@@ -30,12 +30,13 @@ With `fold_key_subqueries=True` and a key-table method, a condition is folded wh
 - the subquery can run on its own (see "Refused" below);
 - the key type allows it (see "Key types").
 
-A folded condition leaves the statement. The key table keeps only the keys for which `key IN (<subquery>)` is TRUE:
+A folded condition leaves the statement. The key table keeps only the keys for which `key IN (<subquery>)` is TRUE, K ∩ S1 ∩ S2 ... for the cache keys K and the subqueries Si:
 
 | Path | Key table built as |
 |---|---|
-| eager `TMP_TABLE_*` | `INSERT ... VALUES (<cache keys>)`, then per subquery `DELETE FROM t WHERE (partition_key IN (<subquery>)) IS NOT TRUE`, then `ANALYZE` |
-| eager `UNLOGGED_TABLE_*` and every lazy table method | `CREATE ... AS (SELECT k FROM (<cache keys>) ... WHERE k IN (<subquery 1>) AND k IN (<subquery 2>))`, then index and `ANALYZE` |
+| PostgreSQL, every key-table method, eager and lazy | created in the keys' type, then `WITH pcache_k_<hex> AS MATERIALIZED (<cache keys without NULLs>) INSERT INTO t SELECT k FROM pcache_k_<hex> INTERSECT SELECT * FROM (<S1>) AS pcache_folded_1 INTERSECT ...`, then index and `ANALYZE` |
+| SQLite, DuckDB: eager `TMP_TABLE_*` | `INSERT ... VALUES (<cache keys>)`, then per subquery `DELETE FROM t WHERE (partition_key IN (<subquery>)) IS NOT TRUE`, then `ANALYZE` |
+| SQLite, DuckDB: lazy `TMP_TABLE_*` | `CREATE ... AS (SELECT k FROM (<cache keys>) ... WHERE k IN (<S1>) AND k IN (<S2>))` |
 
 The restriction itself is unchanged: the key table is joined to p0, or the keys are applied as an IN on it.
 
@@ -52,7 +53,7 @@ The two are equal when:
    - For a key with `skip_partition_key_joins` there are no key equalities, so only conditions on p0 itself fold.
 3. **The comparison `k IN S` has the semantics of `alias.key IN S`.** It runs in the key table's column type, not the key column's. That is the same comparison only for some types (see "Key types").
 
-NULLs and duplicates need no special handling. T is filtered by φ's TRUE exactly as the row filter was, and a NULL key never passes either way. The key tables are already sets.
+NULLs and duplicates: T is filtered by φ's TRUE exactly as the row filter was, and a NULL key never passes either way. The key tables are already sets. For the set-operation form see "The key table's defining query".
 
 An empty T restricts the query to no rows, which is what the folded conditions together with K imply.
 
@@ -70,6 +71,7 @@ An empty T restricts the query to no rows, which is what the folded conditions t
 | a **bind parameter** (`%s`, `?`, `%(name)s`, `$n`) anywhere in the query | the folded subquery moves in front of the main statement, and with it the positions of its parameters: found in review, all rows lost |
 | alias not tied to p0 by key equalities, including ties only through an outer join | condition 2 above |
 | methods without a key table (`IN`, `VALUES`, `IN_SUBQUERY`) | nothing to fold into; the option raises `ValueError` |
+| SQL dialects other than PostgreSQL, DuckDB and SQLite | untested (MySQL has `INTERSECT` only from 8.0.31); the option raises `ValueError` |
 
 Allowed: set-returning functions such as `unnest` (the GeoMine case), aggregates, joins and set operations inside the subquery, and temporary objects of the session (the script runs in the same session).
 
@@ -125,13 +127,68 @@ Folding without hits would mean that PartitionCache rewrites queries it otherwis
   - After the comparison runs it could become the default for the key-table methods.
 - The `IN` and `VALUES` methods leave such subqueries alone; with the option they raise `ValueError`.
 
-## Cost and order of work
+## The key table's defining query
 
-The setup reads the cache keys first (VALUES list or lazy cache subquery), then filters them with `k IN (<subquery>)`. PostgreSQL plans this as a hashed subplan or a semi join, and evaluates the subquery once, completely. For konrad that materialises the 2.1 M metadata keys once, as the inline subquery does today.
+C2's smoke on merapi (2026-11-15) measured the first form, `SELECT k ... WHERE k IN (S)`, against GeoMine's `(K) INTERSECT (S)`. The final SELECTs were identical, but the CREATE took 1.1 s against 0.4 s (konrad_fast), and 8.8 s against 0.17 s (1xkk at 1e4 keys).
 
-GeoMine uses `INTERSECT`, which also evaluates both sides completely. The IN filter keeps the condition's own semantics and lets the planner pick hash or merge. The key table is ANALYZEd after the filter; for the unlogged and lazy paths the index is also built after it. So the main statement sees one table with its measured size.
+**What went wrong in the first form** (reproduced on PostgreSQL 17 with synthetic data):
+1. `k IN (S)` is a semi join. PostgreSQL de-duplicates and hashes all of S, whose output is estimated at the default 200 groups.
+2. The bit handler's lazy keys, `unnest(COALESCE(<array subquery>, ...))`, are estimated at 10 rows. The nested loop over S then costs the planner about the same as the hash plan (within 0.1 %). Forced locally, it takes 8.9 s: the 1xkk case.
+3. The eager `TMP_TABLE_*` path filtered with `DELETE ... WHERE (k IN (S)) IS NOT TRUE`. That is a subplan, hashed only when the estimated S fits in hash_mem; otherwise S is scanned once per key (cancelled after 30 s).
 
-Demo, PostgreSQL 17 (synthetic, not a benchmark): 200,000 pockets, 600,000 points, a 100,000-element property array, 28,572 cache keys, `UNLOGGED_TABLE_IN`, `planner_collapse_limit=20`.
+**The form now.** `WITH pcache_k AS MATERIALIZED (<keys>) SELECT k FROM pcache_k INTERSECT SELECT * FROM (S1) AS pcache_folded_1 INTERSECT ...`
+- A set operation has no join: no nested loop, no subplan. Whatever the estimates, the cost is linear in its inputs; without enough hash memory it becomes a sorted SetOp, O(n log n).
+- HashSetOp hashes the input with fewer estimated groups and streams the other, and a tie keeps the left.
+- The keys are a MATERIALIZED CTE. Without statistics they are estimated at the default number of groups, like an unnest. So they stay the hashed side unless a subquery's statistics show fewer groups, and then that subquery is the small side.
+- A VALUES list read directly is estimated higher and lost to an unnest of millions of rows (1.4 s below; 0.36 s as a CTE).
+
+Defining query alone, ms, medians of 3. S unnests 2.2 M keys ("large"), 26 K ("small"), or is two selective subqueries ("two small").
+
+| keys | S | first form `k IN (S)` | `K EXCEPT (K EXCEPT S)` | INTERSECT, keys as a MATERIALIZED CTE (this form) |
+|---|---|---|---|---|
+| 1e4, generate_series | large | 3,055 | 393 | 358 |
+| 1e4, the bit handler's lazy keys | large | 2,768 | 477 | 483 |
+| 1e4, eager VALUES | large | 2,615 | 337 | 355 |
+| 1e4, the bit handler's | small / two small | 161 / 171 | 159 / 174 | 165 / 172 |
+| 2.1 M, all keys of the table | large | 3,534 | 2,937 | 3,692 |
+| 2.1 M, all keys of the table | small / two small | 303 / 358 | 2,586 / 4,259 | 893 / 739 |
+
+`(K) INTERSECT (S)` with an eager VALUES list read directly took 1,387 ms against the large S.
+
+The EXCEPT pair hashes the keys in every case: good with few keys, slow with many keys and a selective subquery. The first form wins only in that last case, where its semi join hashes the small S (303 against 893 ms). **The choice is robustness, not the minimum in each row**: the set operation has no join or subplan that a misestimate turns into a nested loop or a per-key rescan, and its worst case is linear.
+
+**Why it is the same set as `k IN (S)`.**
+- **Chaining.** K ∩ S1 ∩ S2 is the AND of the folded conditions.
+- **NULL.** Set operations treat NULL as equal to NULL, while `k IN (S)` is never TRUE for a NULL k. So the keys are taken without their NULLs: the lazy keys through `WHERE k IS NOT NULL`, while the eager keys are Python values and never NULL. Then the intersection holds no NULL, and a NULL of a subquery matches nothing.
+- **Types.**
+  - The set operation compares in the common type of the keys and the subquery's column; `k IN (S)` resolved `=` between the same two types. For the kinds that fold, both are the same equality:
+    - int2/int4/int8: the cross-type operators equal the comparison as bigint;
+    - integer with numeric: numeric;
+    - text with varchar: text;
+    - timestamp with timestamptz: both through the session time zone.
+  - Incompatible types (integer with text) are an error in both forms.
+  - With deterministic collations both compare bytewise (checked: a `"C"` column against a default-collation column gives the same rows). Non-deterministic collations are excluded by the `"any_key_type"` statement.
+- **Column type of the key table.** The common type can be wider than the keys' (integer keys, a numeric subquery). A numeric key table would hide the index on the key column from the main statement. So the table is created in the keys' type first:
+  - eager: the declared key type;
+  - lazy: `CREATE ... AS (SELECT k FROM (<lazy keys>) ... LIMIT 0)`, which plans but does not run them (3 ms with the bit handler's keys; a test runs keys that fail when executed). The all-keys fallback of #45 is replaced in both statements;
+  - the INSERT then assigns the kept keys, a subset of the keys, to that type.
+- **Subqueries.**
+  - Each Si is a derived table, `SELECT * FROM (<Si>) AS pcache_folded_i`. A set-returning target list (`SELECT unnest(...)`), a `UNION` or an `ORDER BY` inside Si stay inside it, and precedence cannot change.
+  - A derived table sees nothing of the setup statement except its CTE. The CTE's name has a random suffix, so that a table of Si cannot bind to it.
+
+**Other dialects.**
+- SQLite applies the key column's affinity in `k IN (S)` but not in a set operation, where the integer 1 and the text '1' differ. So SQLite keeps the IN filter, and so does DuckDB.
+- Neither has PostgreSQL's per-key subplan rescans: SQLite builds an index on the IN subquery once, DuckDB a hash join. Checked for DuckDB: 1e4 keys against 2.2 M subquery rows, 233 ms folded against 246 ms unfolded (a unit test runs 2,000 keys against 400,000 rows).
+- No case falls back: the form depends on the dialect only.
+
+**Cost.**
+- **Materialising the keys' CTE** costs about nothing: with 1.05 M lazy keys, 375 ms against 393 ms for creating the unfolded key table; it spills 14 MB to temporary files.
+- **Every folded subquery is evaluated completely in the setup**, once, as GeoMine's `INTERSECT` does.
+- **The key table is ANALYZEd after filling**, so the main statement sees one table with its measured size.
+
+**Versions.** Measured on PostgreSQL 17. The tests assert what holds across versions (CI runs 16): a `SetOp Intersect` node, and no SubPlan, semi join, nested loop or hash join in the setup's plans, with the subquery far above `work_mem`. Which input is hashed is planner behaviour and is not asserted.
+
+**Demo of the planner effect,** PostgreSQL 17 (synthetic, not a benchmark): 200,000 pockets, 600,000 points, a 100,000-element property array, 28,572 cache keys, `UNLOGGED_TABLE_IN`, `planner_collapse_limit=20`.
 
 | | key-subquery node | plan |
 |---|---|---|
@@ -140,7 +197,7 @@ Demo, PostgreSQL 17 (synthetic, not a benchmark): 200,000 pockets, 600,000 point
 
 ## Implementation and tests
 
-The implementation is `_fold_key_subqueries`, `_unfoldable_reason`, `_key_component` and `_filtered_keys_sql` in `src/partitioncache/apply_cache.py`. The tests are in `tests/pytest/test_fold_key_subqueries.py`.
+The implementation is `_fold_key_subqueries`, `_unfoldable_reason`, `_key_component`, `_kept_keys_sql`, `_folded_fill_sql`, `_typed_like_keys_sql` (PostgreSQL) and `_filtered_keys_sql` (the other dialects) in `src/partitioncache/apply_cache.py`. The tests are in `tests/pytest/test_fold_key_subqueries.py`.
 
 **Same rows with and without folding, and the same as the query unrestricted:**
 - on SQLite and DuckDB for `TMP_TABLE_IN` / `TMP_TABLE_JOIN`;
@@ -150,11 +207,14 @@ The implementation is `_fold_key_subqueries`, `_unfoldable_reason`, `_key_compon
   - (b) correlated: left alone;
   - (c) NULLs and duplicates in the subquery and the data;
   - (d) two foldable subqueries, one on an alias tied by key equality;
+  - (e) a subquery with a `UNION` inside, and NULLs among the lazy cache keys;
   - plus `NOT IN` and the `OR` context, both left alone;
 - a `char(5)` key that is not folded by default.
 
 **Shape:** a folded condition leaves the statement. Unit tests cover every refused case (including bind parameters and unqualified columns), the key-type gating eager and lazy, the inner join versus outer join tie, and the option's default and error.
 
-**PostgreSQL plan:** `unnest` is in the inline plan and gone from the folded one, and the key table's row estimate equals its true size.
+**PostgreSQL plan:** `unnest` is in the inline plan and gone from the folded one, and the key table's row estimate equals its true size. The setup's plans hold a `SetOp Intersect` and no SubPlan, semi join, nested loop or hash join, with the subquery far above `work_mem` (the first form failed this). The key table has the unfolded table's column type for integer keys with a numeric subquery, holds no NULL, and a table named `pcache_k` inside a subquery does not bind to the keys' CTE.
+
+**SQLite:** an integer key with a TEXT subquery column keeps its rows (the IN filter's affinity).
 
 The monitor and pcache-add flags, and with them folding in population, follow in a stacked PR with its own soundness note.
