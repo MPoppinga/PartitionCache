@@ -11,7 +11,7 @@ import math
 import numbers
 import random
 import secrets
-from collections.abc import Callable
+from collections.abc import Callable, Collection, Iterable
 from datetime import datetime
 from decimal import Decimal
 from logging import getLogger
@@ -1120,12 +1120,21 @@ def _key_component(parsed_query: exp.Expr, partition_key: str, p0_alias: str | N
     return component
 
 
-def _unfoldable_reason(subquery: exp.Expr, outer_ctes: set[str]) -> str | None:
+_FOLDED_KEY_COLUMN_NAME = "pcache_key"
+
+
+def _unfoldable_reason(
+    subquery: exp.Expr,
+    outer_ctes: set[str],
+    column_resolver: "ColumnResolver | None" = None,
+    assume_inner_columns: bool = False,
+    sql_dialect: str = "postgres",
+) -> str | None:
     """Why an IN subquery cannot be evaluated on its own in the key table's statement, or None if it can.
 
-    It must give the same rows there: every column qualified by a table of the subquery itself (an unqualified one
-    could bind to an outer table, which the key table's statement does not have), no CTE of the outer query, no
-    volatile function, no LIMIT / OFFSET / FETCH / TABLESAMPLE, and one output column.
+    It must give the same rows there: every column bound inside the subquery itself (a qualified one by a table of the
+    subquery, an unqualified one by ``_unqualified_column_reason``), no CTE of the outer query, no volatile function,
+    no LIMIT / OFFSET / FETCH / TABLESAMPLE, no LATERAL, and one output column.
     """
     select = subquery
     while isinstance(select, exp.SetOperation):
@@ -1134,6 +1143,8 @@ def _unfoldable_reason(subquery: exp.Expr, outer_ctes: set[str]) -> str | None:
         return "not a one-column query"
     if any(subquery.find(node_type) for node_type in (exp.Limit, exp.Offset, exp.Fetch, exp.TableSample)):
         return "LIMIT, OFFSET, FETCH or TABLESAMPLE"
+    if subquery.find(exp.Lateral) or any(join.args.get("kind") == "LATERAL" for join in subquery.find_all(exp.Join)):
+        return "LATERAL"
     for function in subquery.find_all(exp.Func):
         name = function.name if isinstance(function, exp.Anonymous) else function.sql_name()
         if name.lower() in _VOLATILE_FUNCTION_NAMES:
@@ -1147,13 +1158,174 @@ def _unfoldable_reason(subquery: exp.Expr, outer_ctes: set[str]) -> str | None:
     defined |= {alias.name for alias in subquery.find_all(exp.TableAlias)}
     for column in subquery.find_all(exp.Column):
         if not column.table:
-            return f"unqualified column {column.name}"
-        if column.table not in defined:
+            reason = _unqualified_column_reason(column, subquery, column_resolver, assume_inner_columns, sql_dialect)
+            if reason is not None:
+                return reason
+        elif column.table not in defined:
             return f"correlated ({column.sql()})"
     return None
 
 
-def _fold_key_subqueries(parsed_query: exp.Expr, partition_key: str, p0_alias: str | None, sql_dialect: str) -> list[str]:
+# Resolves a relation as written in SQL ("t", "s.t", '"S"."T"') to its column names, or None if it is unknown
+ColumnResolver = Callable[[str], Collection[str] | None]
+
+# Columns of the statements the non-PostgreSQL fold forms put a subquery into (DELETE ... WHERE partition_key IN (S),
+# pcache_folded.pcache_key IN (S)): an outward unqualified column of these names would bind to them silently
+_KEY_TABLE_COLUMN_NAMES = frozenset({"partition_key", _FOLDED_KEY_COLUMN_NAME})
+
+
+def _unqualified_column_reason(
+    column: exp.Column, subquery: exp.Expr, column_resolver: "ColumnResolver | None", assume_inner_columns: bool, sql_dialect: str
+) -> str | None:
+    """Why an unqualified column of a candidate subquery may not bind inside it, or None if it binds inside.
+
+    SQL binds an unqualified name to the innermost query level whose FROM items have such a column. The column is
+    walked from its own SELECT outward, up to the subquery's root: it binds inside if a level's FROM items have it,
+    outward (a correlated subquery, which stays in the statement) if none does, and the case is undecidable if a FROM
+    item on the way has unknown columns. A name that is no FROM column (a SELECT-list alias in ORDER BY, a system column
+    such as ctid, a whole-row reference) is thereby refused, which is the safe side.
+
+    With ``assume_inner_columns`` the caller states that every unqualified column binds inside. On PostgreSQL a folded
+    subquery is a derived table in an INTERSECT of the key table's statement, with no query level around it; a column
+    that really bound outward then fails with "column does not exist", it cannot bind elsewhere. The other dialects
+    put the subquery into a statement over the key table, so the key table's column names stay refused there.
+    """
+    name = column.name
+    if assume_inner_columns:
+        if sql_dialect != "postgres" and name.lower() in _KEY_TABLE_COLUMN_NAMES:
+            return f"unqualified column {name} could bind to the key table"
+        return None
+    if column_resolver is None:
+        return f"unqualified column {name}"
+    quoted = bool(column.this.args.get("quoted")) if isinstance(column.this, exp.Identifier) else False
+    inside = {id(select) for select in subquery.find_all(exp.Select)}
+    select = column.find_ancestor(exp.Select)
+    while select is not None and id(select) in inside:
+        columns = _from_item_columns(select, subquery, column_resolver, sql_dialect)
+        if columns is None:
+            return f"unqualified column {name}: the columns of a FROM item are unknown"
+        if _column_matches(name, quoted, columns, sql_dialect):
+            return None
+        select = select.find_ancestor(exp.Select)
+    return f"unqualified column {name} binds outside the subquery"
+
+
+def _column_matches(name: str, quoted: bool, columns: Collection[str], sql_dialect: str) -> bool:
+    """Whether an identifier names one of ``columns``: a quoted one exactly, a bare one as the dialect folds it."""
+    if quoted:
+        return name in columns
+    if sql_dialect == "postgres":
+        return name.lower() in columns
+    return name.lower() in {c.lower() for c in columns}
+
+
+def _from_item_columns(select: exp.Select, subquery: exp.Expr, column_resolver: "ColumnResolver", sql_dialect: str) -> set[str] | None:
+    """The column names of a SELECT's FROM items (FROM and JOINs), or None if one item's columns are unknown."""
+    from_ = select.args.get("from") or select.args.get("from_")
+    items = ([from_.this] if from_ is not None else []) + [join.this for join in select.args.get("joins") or []]
+    inner_ctes = {cte.alias_or_name: cte for cte in subquery.find_all(exp.CTE)}
+    columns: set[str] = set()
+    for item in items:
+        item_columns = _item_columns(item, inner_ctes, column_resolver, sql_dialect)
+        if item_columns is None:
+            return None
+        columns |= item_columns
+    return columns
+
+
+def _alias_columns(item: exp.Expr) -> set[str] | None:
+    alias = item.args.get("alias")
+    names = [col.name for col in alias.columns] if isinstance(alias, exp.TableAlias) else []
+    return set(names) if names else None
+
+
+def _item_columns(item: exp.Expr, inner_ctes: dict[str, exp.CTE], column_resolver: "ColumnResolver", sql_dialect: str) -> set[str] | None:
+    """The columns of one FROM item: a relation through the resolver, a CTE or derived table through its outputs."""
+    listed = _alias_columns(item)
+    if listed is not None:
+        return listed
+    if isinstance(item, exp.Table) and isinstance(item.this, exp.Identifier):
+        if not item.args.get("db") and item.name in inner_ctes:
+            return _select_output_names(inner_ctes[item.name].this, _alias_columns(inner_ctes[item.name]))
+        relation = item.copy()
+        relation.set("alias", None)
+        resolved = column_resolver(relation.sql(dialect=sql_dialect))
+        return set(resolved) if resolved else None
+    if isinstance(item, exp.Subquery):
+        return _select_output_names(item.this, None)
+    return None  # a function, VALUES or UNNEST without a column alias list: unknown
+
+
+def _select_output_names(query: exp.Expr, listed: set[str] | None) -> set[str] | None:
+    """The output column names of a query, or None if one is unnamed or a star."""
+    if listed is not None:
+        return listed
+    while isinstance(query, exp.SetOperation):
+        query = query.this
+    if not isinstance(query, exp.Select):
+        return None
+    names = set()
+    for projection in query.expressions:
+        if isinstance(projection, exp.Star) or (isinstance(projection, exp.Column) and isinstance(projection.this, exp.Star)):
+            return None
+        name = projection.alias_or_name
+        if not name:
+            return None
+        names.add(name)
+    return names
+
+
+def catalog_column_resolver(execute: Callable[[str], Iterable[Any]], sql_dialect: str = "postgres") -> ColumnResolver:
+    """A ``ColumnResolver`` that reads the database catalog through ``execute`` (SQL in, first column of the rows out).
+
+    For ``fold_key_subqueries``: it decides whether an unqualified column of a subquery binds inside it. It must run on
+    the connection that executes the query, before the query's script: the relation is resolved as written, with that
+    connection's search_path, its temporary tables (which shadow permanent ones) and its views. A resolver built from
+    another connection, or from a schema dictionary, is the caller's assertion that the names resolve the same way.
+    Results are cached for the resolver's life: build one per query (or per batch) so that a schema change is seen.
+    ``PostgresDBHandler.execute``, ``SQLiteDBHandler.execute`` and ``DuckDBHandler.execute`` fit as ``execute``.
+    """
+
+    def literal(text: str) -> str:
+        return "'" + text.replace("'", "''") + "'"
+
+    @functools.cache
+    def resolve(relation: str) -> frozenset[str] | None:
+        if sql_dialect == "postgres":
+            # to_regclass parses the name as written (quotes, schema) and is NULL for an unknown relation; attnum > 0
+            # leaves out the system columns (ctid, xmin, ...), which therefore stay refused
+            sql_text = (
+                "SELECT a.attname FROM pg_catalog.pg_attribute AS a "
+                f"WHERE a.attrelid = to_regclass({literal(relation)}) AND a.attnum > 0 AND NOT a.attisdropped"
+            )
+        else:
+            table = exp.to_table(relation, dialect=sql_dialect)
+            if sql_dialect == "sqlite":
+                schema = f", {literal(table.db)}" if table.db else ""
+                sql_text = f"SELECT name FROM pragma_table_info({literal(table.name)}{schema})"
+            elif sql_dialect == "duckdb":
+                schema = f" AND table_schema = {literal(table.db)}" if table.db else ""
+                sql_text = f"SELECT column_name FROM information_schema.columns WHERE table_name = {literal(table.name)}{schema}"
+            else:
+                return None
+        try:
+            names = frozenset(str(row[0] if isinstance(row, tuple | list) else row) for row in execute(sql_text))
+        except Exception:  # noqa: BLE001 - an unreadable catalog leaves the column undecided, i.e. refused
+            logger.debug(f"Catalog lookup of {relation!r} failed", exc_info=True)
+            return None
+        return names or None
+
+    return resolve
+
+
+def _fold_key_subqueries(
+    parsed_query: exp.Expr,
+    partition_key: str,
+    p0_alias: str | None,
+    sql_dialect: str,
+    column_resolver: "ColumnResolver | None" = None,
+    assume_inner_columns: bool = False,
+) -> list[str]:
     """Remove the foldable conditions ``<alias>.<key> IN (<subquery>)`` from the outer WHERE; return their subqueries.
 
     A condition is foldable when it is a top-level conjunct of the outer WHERE (not under OR or NOT, so never NOT IN),
@@ -1178,15 +1350,18 @@ def _fold_key_subqueries(parsed_query: exp.Expr, partition_key: str, p0_alias: s
             column, subquery = condition.this, condition.args["query"].this
         elif isinstance(condition, exp.EQ) and isinstance(condition.expression, exp.Any) and isinstance(condition.expression.this, exp.Subquery):
             column, subquery = condition.this, condition.expression.this.this
-        if (
-            isinstance(column, exp.Column)
-            and column.name == partition_key
-            and column.table in component
-            and subquery is not None
-            and _unfoldable_reason(subquery, outer_ctes) is None
-        ):
+        candidate = isinstance(column, exp.Column) and column.name == partition_key and subquery is not None
+        reason = None
+        if candidate and column.table not in component:
+            reason = f"alias {column.table} not tied to the restricted alias by key equalities"
+        elif candidate:
+            reason = _unfoldable_reason(subquery, outer_ctes, column_resolver, assume_inner_columns, sql_dialect)
+        if candidate and reason is None:
             folded.append(subquery.sql(dialect=sql_dialect))
+            logger.info(f"fold_key_subqueries: folded {column.sql()} IN ({_abbreviated(subquery)})")
         else:
+            if candidate:
+                logger.info(f"fold_key_subqueries: not folded ({reason}): {column.sql()} IN ({_abbreviated(subquery)})")
             kept.append(condition)
     if folded:
         if kept:
@@ -1196,8 +1371,14 @@ def _fold_key_subqueries(parsed_query: exp.Expr, partition_key: str, p0_alias: s
     return folded
 
 
+def _abbreviated(expression: exp.Expr, limit: int = 120) -> str:
+    """An expression's SQL for a log line, cut to ``limit`` characters."""
+    text = expression.sql()
+    return text if len(text) <= limit else text[: limit - 3] + "..."
+
+
 # The key column's name around the folded conditions of a key table's defining query
-_FOLDED_KEY_COLUMN = "pcache_key"
+_FOLDED_KEY_COLUMN = _FOLDED_KEY_COLUMN_NAME
 
 
 def _filtered_keys_sql(keys_sql: str, column: str, key_filters: list[str]) -> str:
@@ -1323,6 +1504,8 @@ def extend_query_with_partition_keys(
     join_every_table: bool = False,
     planner_collapse_limit: int | None = None,
     fold_key_subqueries: bool | str = False,
+    fold_column_resolver: ColumnResolver | None = None,
+    fold_assume_inner_columns: bool = False,
 ) -> str:
     """
     Extend a given SQL query with the cache functionality.
@@ -1357,7 +1540,16 @@ def extend_query_with_partition_keys(
             of known size instead of the subquery. Only uncorrelated, deterministic subqueries without LIMIT that are
             top-level conjuncts of the outer WHERE are folded; others stay. Other methods raise ValueError. True folds
             for integer and decimal keys, ``"any_key_type"`` also for text and timestamp keys (see ``_fold_allowed``);
-            float keys never fold, nor a query with bind parameters, nor a subquery with an unqualified column.
+            float keys never fold, nor a query with bind parameters. An unqualified column of a subquery must bind
+            inside it: decided with ``fold_column_resolver``, or stated by ``fold_assume_inner_columns``; else refused.
+        fold_column_resolver: Resolves a relation of a subquery to its columns (``catalog_column_resolver`` reads the
+            catalog). With it, a subquery whose unqualified columns all bind to its own FROM items folds; one with a
+            column that binds outward (correlated) or to a FROM item of unknown columns stays. Build it on the
+            connection that executes the query, before the script runs.
+        fold_assume_inner_columns: The caller states that every unqualified column of a subquery binds inside it.
+            Default False. On PostgreSQL a wrong statement makes the script fail ("column does not exist"), it cannot
+            change the rows; on the other dialects the key table's column names (partition_key, pcache_key) stay
+            refused.
 
     Returns:
         str: The extended SQL query as string. An empty ``partition_keys`` set is a valid cache result
@@ -1378,7 +1570,11 @@ def extend_query_with_partition_keys(
     # Parsed and rendered in the query's dialect: the generic writer turns ARRAY['a'] into ARRAY('a'), which PostgreSQL rejects
     parsed_query = sqlglot.parse_one(query, read=sql_dialect)
     p0_alias = _restriction_target(query, parsed_query, partition_key, method, p0_alias, join_every_table, auto_detect_partition_join, partition_join_table)
-    key_filters = _fold_key_subqueries(parsed_query, partition_key, p0_alias, sql_dialect) if _fold_allowed(fold_key_subqueries, _key_kind(partition_keys)) else []
+    key_filters = (
+        _fold_key_subqueries(parsed_query, partition_key, p0_alias, sql_dialect, fold_column_resolver, fold_assume_inner_columns)
+        if _fold_allowed(fold_key_subqueries, _key_kind(partition_keys))
+        else []
+    )
     # Non-integer keys: the key tables take the key column's type (char(n), real); a VALUES list cannot and is guarded.
     # Integer keys keep their scripts.
     typed_source = None
@@ -1544,6 +1740,8 @@ def extend_query_with_partition_keys_lazy(
     join_every_table: bool = False,
     planner_collapse_limit: int | None = None,
     fold_key_subqueries: bool | str = False,
+    fold_column_resolver: ColumnResolver | None = None,
+    fold_assume_inner_columns: bool = False,
     partition_datatype: str | None = None,
 ) -> str:
     """
@@ -1571,7 +1769,7 @@ def extend_query_with_partition_keys_lazy(
         planner_collapse_limit: If set to N, the script begins with ``SET LOCAL join_collapse_limit = N;`` and
             ``SET LOCAL from_collapse_limit = N;``; see ``extend_query_with_partition_keys``. None (default) is off.
         fold_key_subqueries: Key-table methods only: fold key subqueries into the key table; see
-            ``extend_query_with_partition_keys``.
+            ``extend_query_with_partition_keys``, also for ``fold_column_resolver`` and ``fold_assume_inner_columns``.
         partition_datatype: The cache's datatype of the partition key ("integer", "text", "float", ...), as the lazy
             keys are not known here. For a non-integer datatype the key tables take the key column's type and
             IN_SUBQUERY is guarded against a char(n) / real column, which it would silently miss; folding needs it too.
@@ -1587,7 +1785,11 @@ def extend_query_with_partition_keys_lazy(
 
     parsed_query = sqlglot.parse_one(query, read=sql_dialect)
     p0_alias = _restriction_target(query, parsed_query, partition_key, method, p0_alias, join_every_table, auto_detect_partition_join, partition_join_table)
-    key_filters = _fold_key_subqueries(parsed_query, partition_key, p0_alias, sql_dialect) if _fold_allowed(fold_key_subqueries, partition_datatype) else []
+    key_filters = (
+        _fold_key_subqueries(parsed_query, partition_key, p0_alias, sql_dialect, fold_column_resolver, fold_assume_inner_columns)
+        if _fold_allowed(fold_key_subqueries, partition_datatype)
+        else []
+    )
 
     if LAZY_ALL_KEYS_PLACEHOLDER in lazy_subquery:
         # The handler's subquery reads cache entries that may be evicted before it runs; it then falls back to all keys
@@ -2479,6 +2681,8 @@ def apply_cache_lazy(
     join_every_table: bool = False,
     planner_collapse_limit: int | None = None,
     fold_key_subqueries: bool | str = False,
+    fold_column_resolver: ColumnResolver | None = None,
+    fold_assume_inner_columns: bool = False,
     **kwargs: Any,
 ) -> tuple[str, dict[str, int]]:
     """
@@ -2761,6 +2965,8 @@ def apply_cache_lazy(
         join_every_table=join_every_table,
         planner_collapse_limit=planner_collapse_limit,
         fold_key_subqueries=fold_key_subqueries,
+        fold_column_resolver=fold_column_resolver,
+        fold_assume_inner_columns=fold_assume_inner_columns,
         partition_datatype=_cache_datatype(cache_handler, partition_key),
     )
 
@@ -2808,6 +3014,8 @@ def apply_cache(
     join_every_table: bool = False,
     planner_collapse_limit: int | None = None,
     fold_key_subqueries: bool | str = False,
+    fold_column_resolver: ColumnResolver | None = None,
+    fold_assume_inner_columns: bool = False,
     **kwargs: Any,
 ) -> tuple[str, dict[str, int]]:
     """
@@ -3144,6 +3352,8 @@ def apply_cache(
         join_every_table=join_every_table,
         planner_collapse_limit=planner_collapse_limit,
         fold_key_subqueries=fold_key_subqueries,
+        fold_column_resolver=fold_column_resolver,
+        fold_assume_inner_columns=fold_assume_inner_columns,
     )
 
     stats["enhanced"] = 1
