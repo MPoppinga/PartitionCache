@@ -976,8 +976,9 @@ def _typed_key_table_setup(
 
     For non-integer keys. A key list typed by its Python values (text, double precision) can compare differently from
     the key column: a ``char(n)`` column compares without the padding its keys were read back with, and a ``real``
-    column in double precision. Created as ``SELECT <key> ... LIMIT 0`` from the column, the table converts the keys
-    on INSERT exactly as the column's own comparison with an IN literal would.
+    column in double precision. Created from the column (PostgreSQL: its type without the length or precision
+    modifier; other dialects: ``LIMIT 0``), the table converts the keys on INSERT exactly as the column's own
+    comparison with an IN literal would. A domain stays the domain, so its own constraints still apply to the keys.
 
     Args:
         kind: "TEMPORARY" or "UNLOGGED".
@@ -1002,7 +1003,15 @@ def _typed_key_table_setup(
         table_name = f"tmp_cache_keys_{random.randint(100000, 999999)}"
         ddl_prefix, ddl_suffix = _temp_table_ddl(table_name, sql_dialect)
         create = f"{ddl_prefix}CREATE TEMPORARY TABLE {table_name}{ddl_suffix}"
-    typed_like = f"AS SELECT pcache_src.{partition_key} AS {key_column} FROM {source_table} AS pcache_src LIMIT 0"
+    if sql_dialect == "postgres":
+        # The column's type without its modifier: varchar(4) as varchar, char(5) as bpchar (still blank-padded),
+        # numeric(10,2) as numeric, timestamp(0) as timestamp. A key the modifier would reject, round or truncate can
+        # match no row of the column; with the modifier, the INSERT failed on it (value too long, numeric overflow) or
+        # rounded it. array_agg keeps the element type (also uuid, boolean) and drops the modifier; WHERE false HAVING
+        # false creates the table empty without reading the source.
+        typed_like = f"AS SELECT (array_agg(pcache_src.{partition_key}))[1] AS {key_column} FROM {source_table} AS pcache_src WHERE false HAVING false"
+    else:
+        typed_like = f"AS SELECT pcache_src.{partition_key} AS {key_column} FROM {source_table} AS pcache_src LIMIT 0"
     if key_filters and sql_dialect == "postgres":
         # The keys are converted to the column's type in a staging table first, so that the INTERSECT compares them
         # as the column does; untyped literals in the INTERSECT itself would be resolved to text

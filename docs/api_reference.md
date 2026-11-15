@@ -238,8 +238,11 @@ print(optimized)
 
 > **Key table types.** Key tables for integer keys are `INT`/`BIGINT`, as before. Key tables for all other keys
 > (decimal, float, text, timestamp; on the lazy path: a cache datatype other than `integer`) are created in the
-> type of the key column, `CREATE ... AS SELECT p0.<key> FROM <p0 table> LIMIT 0`, and filled with untyped literals
-> (eager) or the lazy keys. The INSERT converts the keys as the column's own comparison with an `IN` literal would.
+> type of the key column and filled with untyped literals (eager) or the lazy keys. On PostgreSQL the type has no
+> length or precision modifier (`CREATE ... AS SELECT (array_agg(p0.<key>))[1] ... WHERE false HAVING false`:
+> `varchar(4)` becomes `varchar`, `char(5)` `bpchar`, `numeric(10,2)` `numeric`), so a key the column could not hold
+> (too long, out of range) matches no row instead of failing the script; a domain keeps its own constraints, and a
+> key it rejects fails the script. SQLite and DuckDB use `SELECT p0.<key> ... LIMIT 0`. The INSERT converts the keys as the column's own comparison with an `IN` literal would.
 > A typed key list compares differently: a `char(n)` column reads back padded keys (`'k1   '`) that matched no row
 > as text, and a `real` (float4) column reads back the double nearest to its text, which matched no row in double
 > precision.

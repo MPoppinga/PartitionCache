@@ -476,7 +476,7 @@ class TestFloatKeys:
         from partitioncache.population import restrict_with_cache
 
         restriction = restrict_with_cache(self.VARIANT, self._cache({0.1, 0.2}), "pk", {}, method=method)
-        assert restriction.restricted and "AS SELECT pcache_src.pk AS partition_key FROM f AS pcache_src LIMIT 0" in restriction.query
+        assert restriction.restricted and "AS SELECT (array_agg(pcache_src.pk))[1] AS partition_key FROM f AS pcache_src WHERE false HAVING false" in restriction.query
 
     def test_in_restricts_them(self):
         from partitioncache.population import restrict_with_cache

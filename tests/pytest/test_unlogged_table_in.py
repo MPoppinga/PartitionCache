@@ -169,7 +169,7 @@ class TestPlannerCollapseLimit:
 class TestTypedKeyTables:
     """Integer keys keep their typed key table; other keys get a key table in the key column's own type."""
 
-    TYPED = "AS SELECT pcache_src.region_id AS partition_key FROM users LIMIT 0;"
+    TYPED = "AS SELECT (array_agg(pcache_src.region_id))[1] AS partition_key FROM users WHERE false HAVING false;"
 
     @pytest.mark.parametrize(("keys", "sql_type"), [({1, 2}, "INT"), ({1, 2**40}, "BIGINT")])
     def test_integer_keys_keep_the_typed_table(self, keys, sql_type):
