@@ -33,7 +33,7 @@ This architecture provides better isolation, security, and scalability.
 │                                                                         │
 │  ┌─────────────────┐                    ┌─────────────────────────┐    │
 │  │  pg_cron DB     │                    │     Cache Database      │    │
-│  │  (postgres)     │                    │    (geominedb)          │    │
+│  │  (postgres)     │                    │    (appdb)          │    │
 │  │                 │                    │                         │    │
 │  │ ┌─────────────┐ │ schedule_in_       │ ┌─────────────────────┐ │    │
 │  │ │  pg_cron    │ │ database()         │ │  Queue Tables       │ │    │
@@ -54,14 +54,14 @@ DB_HOST=localhost
 DB_PORT=5432
 DB_USER=your_username
 DB_PASSWORD=your_password
-DB_NAME=geominedb
+DB_NAME=appdb
 
 # Queue Database (must be same as cache database)
 PG_QUEUE_HOST=localhost
 PG_QUEUE_PORT=5432
 PG_QUEUE_USER=your_username
 PG_QUEUE_PASSWORD=your_password
-PG_QUEUE_DB=geominedb
+PG_QUEUE_DB=appdb
 
 # pg_cron Database (can be different from cache database)
 PG_CRON_HOST=localhost                   # Default: same as DB_HOST
@@ -109,14 +109,14 @@ PG_ARRAY_CACHE_TABLE_PREFIX=partitioncache
 
 1. **Setup Phase**: 
    - Script connects to `postgres` database to install pg_cron configuration objects
-   - Creates processor functions and queue tables in `geominedb`
+   - Creates processor functions and queue tables in `appdb`
 
 2. **Job Scheduling**:
    - pg_cron jobs are stored in `postgres` database  
-   - Jobs use `cron.schedule_in_database()` to execute in `geominedb`
+   - Jobs use `cron.schedule_in_database()` to execute in `appdb`
 
 3. **Processing**:
-   - Jobs run in `geominedb` where queues and cache tables exist
+   - Jobs run in `appdb` where queues and cache tables exist
    - Configuration is retrieved from `postgres` database via dblink
    - All business logic executes in the cache database
 

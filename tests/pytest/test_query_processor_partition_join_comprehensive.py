@@ -641,13 +641,13 @@ class TestPartitionJoinAliasDeterminism:
         source query reuses the canonical ``p1`` alias itself.
         """
         queries = [
-            "SELECT * FROM p0_pocket p1, items t WHERE t.pocket_key = p1.pocket_key AND t.color = 'red'",  # hub aliased p1
-            "SELECT * FROM p0_pocket h, items p1 WHERE p1.pocket_key = h.pocket_key AND p1.color = 'red'",  # non-hub aliased p1
-            "SELECT * FROM p0_pocket h, items t WHERE t.pocket_key = h.pocket_key AND t.color = 'red'",  # neutral aliases
+            "SELECT * FROM p0_region p1, items t WHERE t.region_id = p1.region_id AND t.color = 'red'",  # hub aliased p1
+            "SELECT * FROM p0_region h, items p1 WHERE p1.region_id = h.region_id AND p1.color = 'red'",  # non-hub aliased p1
+            "SELECT * FROM p0_region h, items t WHERE t.region_id = h.region_id AND t.color = 'red'",  # neutral aliases
         ]
         hash_sets = []
         for q in queries:
-            pairs = generate_all_query_hash_pairs(q, "pocket_key", auto_detect_partition_join=True, warn_no_partition_key=False)
+            pairs = generate_all_query_hash_pairs(q, "region_id", auto_detect_partition_join=True, warn_no_partition_key=False)
             hash_sets.append(sorted(h for _, h in pairs))
         assert hash_sets[0] == hash_sets[1] == hash_sets[2], (
             f"Fragment hashes must be invariant under source-alias renaming; got {hash_sets}"

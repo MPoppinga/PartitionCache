@@ -1,6 +1,6 @@
 # Design note: folding partition-key subqueries into the key table
 
-Status: **implemented as an opt-in (`fold_key_subqueries`, default off); the design was reviewed by PR-Review and approved by the author on 2026-11-15**. The key table's defining query was changed the same day to the INTERSECT form below, after C2's smoke found the first form's setup up to 50× slower (see "The key table's defining query").
+Status: **implemented as an opt-in (`fold_key_subqueries`, default off)**. The key table is filled with the INTERSECT form below; a first form's setup was up to 50× slower (see "The key table's defining query").
 
 Verdict: **works, with these limits:**
 - integer and decimal keys by default, text and timestamp keys only on the caller's word, float keys never;
@@ -9,17 +9,17 @@ Verdict: **works, with these limits:**
 
 ## Problem
 
-A query can carry its own restriction on the partition key as a subquery. A GeoMine example:
+A query can carry its own restriction on the partition key as a subquery, for example a filter on a metadata view:
 
 ```sql
-... AND pl.pocket_key IN (SELECT unnest(pocket_key) FROM interactiondb_search_view_molecule_property_pockets_num WHERE prop_key = 39 AND ...)
+... AND rl.region_id IN (SELECT unnest(region_ids) FROM region_stats_view WHERE stat_key = 39 AND ...)
 ```
 
-Here `pl` is the p0 alias. The key-table methods (`TMP_TABLE_*`, `UNLOGGED_TABLE_*`) put the cache keys into a key table with an index and statistics, but leave this subquery in the statement. PostgreSQL estimates the output of `unnest()` with a default instead of the true size.
+Here `rl` is the p0 alias. The key-table methods (`TMP_TABLE_*`, `UNLOGGED_TABLE_*`) put the cache keys into a key table with an index and statistics, but leave this subquery in the statement. PostgreSQL estimates the output of `unnest()` with a default instead of the true size.
 
 The demo below shows the effect: 10 estimated rows, 100,000 actual. With `planner_collapse_limit` the planner pulls the subquery into the join order and drives the search from it.
 
-GeoMine's C++ implementation avoids this. It builds the key table as `(cache keys) ∩ (metadata subqueries)` and removes the subqueries from the statement (`combineLazySubqueries`).
+Folding avoids this: it builds the key table as `(cache keys) ∩ (key subqueries)` and removes the subqueries from the statement.
 
 ## The rewrite
 
@@ -73,7 +73,7 @@ An empty T restricts the query to no rows, which is what the folded conditions t
 | methods without a key table (`IN`, `VALUES`, `IN_SUBQUERY`) | nothing to fold into; the option raises `ValueError` |
 | SQL dialects other than PostgreSQL, DuckDB and SQLite | untested (MySQL has `INTERSECT` only from 8.0.31); the option raises `ValueError` |
 
-Allowed: set-returning functions such as `unnest` (the GeoMine case), aggregates, joins and set operations inside the subquery, and temporary objects of the session (the script runs in the same session).
+Allowed: set-returning functions such as `unnest`, aggregates, joins and set operations inside the subquery, and temporary objects of the session (the script runs in the same session).
 
 ## Key types
 
@@ -107,11 +107,11 @@ On the lazy path the keys are not known, so `extend_query_with_partition_keys_la
   - The variants are generated SQL. The generator keeps a `key IN (subquery)` condition with its subquery text, re-aliased to the variant's key alias, and also caches the subquery itself as a variant.
   - The equivalence argument above does not depend on where the query comes from. A restricted variant returns the same keys with and without folding, so the stored entry is the same (test: `TestPopulation`).
   - The subquery's own variant has no such condition, so nothing folds there.
-- **The konrad statement and GeoMine's SQL** have unqualified columns (`SELECT unnest(pocket_key) FROM ... WHERE prop_key = 39`). Until 2026-11-15 they were never folded; C2/C2b measured alias-qualified subqueries (the bench harness qualified them), so their folded numbers are for a statement text GeoMine does not send. Unqualified columns are now resolved by scoping (next section).
+- **Subqueries with unqualified columns** (`SELECT unnest(region_ids) FROM ... WHERE stat_key = 39`) were not folded at first. Their columns are now resolved by scoping (see "Unqualified columns").
 
 ## On a cache miss
 
-Without cache hits there is no key table, and the query is unchanged. GeoMine, in contrast, applies the method to the metadata set alone.
+Without cache hits there is no key table, and the query is unchanged. Another design builds the key table from the subqueries alone in that case.
 
 Folding without hits would mean that PartitionCache rewrites queries it otherwise leaves alone. It would build a key table from the subqueries only. The planner problem exists without the cache too, so that is useful.
 
@@ -132,12 +132,12 @@ Folding without hits would mean that PartitionCache rewrites queries it otherwis
 
 ## Unqualified columns
 
-GeoMine writes its metadata subqueries with bare columns. On 09g's GeoMine queue, all 56 inline fragments have this form:
+Metadata subqueries are often written with bare columns, for example:
 
 ```sql
-... t1.pocket_key IN (SELECT ..._pocket_ligands.pocket_key FROM ..._pocket_ligands
-                      INTERSECT SELECT UNNEST(..._pockets_num.pocket_key) AS pocket_key FROM ..._pockets_num
-                      WHERE prop_key = 84 AND prop_value <= 100 AND prop_value >= 1)
+... t1.region_id IN (SELECT region_list_view.region_id FROM region_list_view
+                     INTERSECT SELECT UNNEST(region_stats_num.region_id) AS region_id FROM region_stats_num
+                     WHERE stat_key = 84 AND stat_value <= 100 AND stat_value >= 1)
 ```
 
 Moved out of the query, such a column must bind as it did in the query.
@@ -182,11 +182,11 @@ Who builds one:
 
 ## The key table's defining query
 
-C2's smoke on merapi (2026-11-15) measured the first form, `SELECT k ... WHERE k IN (S)`, against GeoMine's `(K) INTERSECT (S)`. The final SELECTs were identical, but the CREATE took 1.1 s against 0.4 s (konrad_fast), and 8.8 s against 0.17 s (1xkk at 1e4 keys).
+A measurement compared the first form, `SELECT k ... WHERE k IN (S)`, with `(K) INTERSECT (S)`. The final SELECTs were identical, but the CREATE took 1.1 s against 0.4 s on one statement, and 8.8 s against 0.17 s on a statement with a large subquery at 1e4 keys.
 
 **What went wrong in the first form** (reproduced on PostgreSQL 17 with synthetic data):
 1. `k IN (S)` is a semi join. PostgreSQL de-duplicates and hashes all of S, whose output is estimated at the default 200 groups.
-2. The bit handler's lazy keys, `unnest(COALESCE(<array subquery>, ...))`, are estimated at 10 rows. The nested loop over S then costs the planner about the same as the hash plan (within 0.1 %). Forced locally, it takes 8.9 s: the 1xkk case.
+2. The bit handler's lazy keys, `unnest(COALESCE(<array subquery>, ...))`, are estimated at 10 rows. The nested loop over S then costs the planner about the same as the hash plan (within 0.1 %). Forced locally, it takes 8.9 s: the large-subquery case.
 3. The eager `TMP_TABLE_*` path filtered with `DELETE ... WHERE (k IN (S)) IS NOT TRUE`. That is a subplan, hashed only when the estimated S fits in hash_mem; otherwise S is scanned once per key (cancelled after 30 s).
 
 **The form now.** `WITH pcache_k AS MATERIALIZED (<keys>) SELECT k FROM pcache_k INTERSECT SELECT * FROM (S1) AS pcache_folded_1 INTERSECT ...`
@@ -236,12 +236,12 @@ The EXCEPT pair hashes the keys in every case: good with few keys, slow with man
 
 **Cost.**
 - **Materialising the keys' CTE** costs about nothing: with 1.05 M lazy keys, 375 ms against 393 ms for creating the unfolded key table; it spills 14 MB to temporary files.
-- **Every folded subquery is evaluated completely in the setup**, once, as GeoMine's `INTERSECT` does.
+- **Every folded subquery is evaluated completely in the setup**, once, as any `INTERSECT` of the sets does.
 - **The key table is ANALYZEd after filling**, so the main statement sees one table with its measured size.
 
 **Versions.** Measured on PostgreSQL 17. The tests assert what holds across versions (CI runs 16): a `SetOp Intersect` node, and no SubPlan, semi join, nested loop or hash join in the setup's plans, with the subquery far above `work_mem`. Which input is hashed is planner behaviour and is not asserted.
 
-**Demo of the planner effect,** PostgreSQL 17 (synthetic, not a benchmark): 200,000 pockets, 600,000 points, a 100,000-element property array, 28,572 cache keys, `UNLOGGED_TABLE_IN`, `planner_collapse_limit=20`.
+**Demo of the planner effect,** PostgreSQL 17 (synthetic, not a benchmark): 200,000 regions, 600,000 points, a 100,000-element property array, 28,572 cache keys, `UNLOGGED_TABLE_IN`, `planner_collapse_limit=20`.
 
 | | key-subquery node | plan |
 |---|---|---|
@@ -256,7 +256,7 @@ The implementation is `_fold_key_subqueries`, `_unfoldable_reason`, `_key_compon
 - on SQLite and DuckDB for `TMP_TABLE_IN` / `TMP_TABLE_JOIN`;
 - on PostgreSQL for all four key-table methods, eager and lazy;
 - for these queries:
-  - (a) GeoMine-like, with a metadata subquery and with `unnest` (PostgreSQL), in both forms `IN` and `= ANY`;
+  - (a) a metadata subquery, also with `unnest` (PostgreSQL), in both forms `IN` and `= ANY`;
   - (b) correlated: left alone;
   - (c) NULLs and duplicates in the subquery and the data;
   - (d) two foldable subqueries, one on an alias tied by key equality;

@@ -30,9 +30,9 @@ from partitioncache.apply_cache import (
     extend_query_with_partition_keys,
 )
 
-QUERY_NO_WHERE = "SELECT p.id FROM pockets AS p JOIN atoms AS a ON a.pocket_key = p.pocket_key"
-QUERY_WITH_WHERE = QUERY_NO_WHERE + " WHERE a.element = 'C' AND a.x > 1.5"
-QUERY_WITH_OR = QUERY_NO_WHERE + " WHERE a.element = 'C' OR a.element = 'N'"
+QUERY_NO_WHERE = "SELECT p.id FROM regions AS p JOIN stores AS a ON a.region_id = p.region_id"
+QUERY_WITH_WHERE = QUERY_NO_WHERE + " WHERE a.category = 'C' AND a.x > 1.5"
+QUERY_WITH_OR = QUERY_NO_WHERE + " WHERE a.category = 'C' OR a.category = 'N'"
 QUERIES = [QUERY_NO_WHERE, QUERY_WITH_WHERE, QUERY_WITH_OR]
 
 
@@ -95,12 +95,12 @@ def test_byte_equal_to_old_implementation(method, key_type, n_keys, query):
         pytest.skip("VALUES refuses float keys, see test_values_refuses_float_keys")
     if method == "VALUES" and key_type == "str" and n_keys > 0:
         pytest.skip("VALUES guards string keys against a char(n) column, see test_values_guards_string_keys")
-    new = extend_query_with_partition_keys(query, keys, "pocket_key", method=method, p0_alias="p")
+    new = extend_query_with_partition_keys(query, keys, "region_id", method=method, p0_alias="p")
     if n_keys == 0:
         # An empty key set never reaches the IN/VALUES branches: the query is restricted to no rows.
         assert "FALSE /* PartitionCache: cache intersection is empty" in new and "__pcache_keys_" not in new
         return
-    old = _reference_old_implementation(query, keys, "pocket_key", method, "p")
+    old = _reference_old_implementation(query, keys, "region_id", method, "p")
     assert new == old
 
 
@@ -108,13 +108,13 @@ def test_byte_equal_to_old_implementation(method, key_type, n_keys, query):
 def test_values_refuses_float_keys(n_keys):
     """A VALUES list of float keys is double precision and would silently miss a real column; IN keeps them."""
     with pytest.raises(ValueError, match="use method IN"):
-        extend_query_with_partition_keys(QUERY_WITH_WHERE, _float_keys(n_keys), "pocket_key", method="VALUES", p0_alias="p")
+        extend_query_with_partition_keys(QUERY_WITH_WHERE, _float_keys(n_keys), "region_id", method="VALUES", p0_alias="p")
 
 
 @pytest.mark.parametrize("method", ["IN", "VALUES"])
 def test_output_is_well_formed_and_contains_every_key(method):
     keys = _str_keys(50)
-    new = extend_query_with_partition_keys(QUERY_WITH_WHERE, keys, "pocket_key", method=method, p0_alias="p")
+    new = extend_query_with_partition_keys(QUERY_WITH_WHERE, keys, "region_id", method=method, p0_alias="p")
     parsed = sqlglot.parse_one(new)
     literals = {lit.this for lit in parsed.find(exp.In).find_all(exp.Literal) if lit.is_string}
     assert literals == keys
@@ -126,12 +126,12 @@ def test_single_quote_in_key_is_escaped_where_old_path_raised(method):
     keys = {"it's", "o'neil", "plain"}
     # TokenError or ParseError, depending on where the stray quote lands in the key order.
     with pytest.raises((sqlglot.errors.TokenError, sqlglot.errors.ParseError)):
-        _reference_old_implementation(QUERY_WITH_WHERE, keys, "pocket_key", method, "p")
-    new = extend_query_with_partition_keys(QUERY_WITH_WHERE, keys, "pocket_key", method=method, p0_alias="p")
+        _reference_old_implementation(QUERY_WITH_WHERE, keys, "region_id", method, "p")
+    new = extend_query_with_partition_keys(QUERY_WITH_WHERE, keys, "region_id", method=method, p0_alias="p")
     assert "'it''s'" in new
     assert "'o''neil'" in new
     parsed = sqlglot.parse_one(new, read="postgres")
-    restriction = next(node for node in parsed.find_all(exp.In) if node.this.sql() == "p.pocket_key")
+    restriction = next(node for node in parsed.find_all(exp.In) if node.this.sql() == "p.region_id")
     literals = {lit.this for lit in restriction.find_all(exp.Literal) if lit.is_string}
     assert literals == keys
     # Rendering the parsed result reproduces the spliced output: the escaping is what sqlglot would emit.
@@ -140,12 +140,12 @@ def test_single_quote_in_key_is_escaped_where_old_path_raised(method):
 
 def test_values_guards_string_keys():
     """String keys in a VALUES list are text; against a char(n) column the guard raises instead of matching no row."""
-    new = extend_query_with_partition_keys(QUERY_WITH_WHERE, {"a", "b"}, "pocket_key", method="VALUES", p0_alias="p")
-    assert "PG_TYPEOF(p.pocket_key) IN (CAST('character' AS REGTYPE))" in new
+    new = extend_query_with_partition_keys(QUERY_WITH_WHERE, {"a", "b"}, "region_id", method="VALUES", p0_alias="p")
+    assert "PG_TYPEOF(p.region_id) IN (CAST('character' AS REGTYPE))" in new
     assert "needs method IN or a key-table method" in new
     for keys in ({1, 2}, {datetime(2024, 1, 1)}):
-        assert "pg_typeof" not in extend_query_with_partition_keys(QUERY_WITH_WHERE, keys, "pocket_key", method="VALUES", p0_alias="p")
-    assert "pg_typeof" not in extend_query_with_partition_keys(QUERY_WITH_WHERE, {"a"}, "pocket_key", method="VALUES", p0_alias="p", sql_dialect="duckdb")
+        assert "pg_typeof" not in extend_query_with_partition_keys(QUERY_WITH_WHERE, keys, "region_id", method="VALUES", p0_alias="p")
+    assert "pg_typeof" not in extend_query_with_partition_keys(QUERY_WITH_WHERE, {"a"}, "region_id", method="VALUES", p0_alias="p", sql_dialect="duckdb")
 
 
 def test_placeholder_must_occur_exactly_once():
@@ -163,7 +163,7 @@ def test_placeholder_is_rendered_verbatim_by_sqlglot(method):
 
     sentinel = _key_list_sentinel()
     inner = sentinel if method == "IN" else f"VALUES({sentinel})"
-    rendered = sqlglot.parse_one(f"p.pocket_key IN ({inner})").sql()
+    rendered = sqlglot.parse_one(f"p.region_id IN ({inner})").sql()
     assert rendered.count(sentinel) == 1
     assert f'"{sentinel}"' not in rendered
 
@@ -172,7 +172,7 @@ def test_placeholder_is_rendered_verbatim_by_sqlglot(method):
 def test_rewrite_of_100k_int_keys_is_fast(method):
     keys = _int_keys(100_000)
     t0 = time.perf_counter()
-    new = extend_query_with_partition_keys(QUERY_WITH_WHERE, keys, "pocket_key", method=method, p0_alias="p")
+    new = extend_query_with_partition_keys(QUERY_WITH_WHERE, keys, "region_id", method=method, p0_alias="p")
     elapsed = time.perf_counter() - t0
     assert new.count(",") >= 99_999
     assert elapsed < 2.0, f"{method}: rewrite of 100k keys took {elapsed:.2f} s"
@@ -181,9 +181,9 @@ def test_rewrite_of_100k_int_keys_is_fast(method):
 def test_backslash_keys_are_escaped_for_mysql():
     """MySQL treats a backslash as an escape character; a key ending in one must not swallow the next key."""
     keys = {"a\\", "b"}
-    new = extend_query_with_partition_keys(QUERY_WITH_WHERE, keys, "pocket_key", method="IN", p0_alias="p", sql_dialect="mysql")
+    new = extend_query_with_partition_keys(QUERY_WITH_WHERE, keys, "region_id", method="IN", p0_alias="p", sql_dialect="mysql")
     parsed = sqlglot.parse_one(new, read="mysql")
     literals = {lit.this for lit in parsed.find(exp.In).find_all(exp.Literal) if lit.is_string}
     assert literals == keys
-    values = extend_query_with_partition_keys(QUERY_WITH_WHERE, keys, "pocket_key", method="VALUES", p0_alias="p", sql_dialect="mysql")
+    values = extend_query_with_partition_keys(QUERY_WITH_WHERE, keys, "region_id", method="VALUES", p0_alias="p", sql_dialect="mysql")
     assert "('a\\\\')" in values
