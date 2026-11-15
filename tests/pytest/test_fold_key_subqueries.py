@@ -10,6 +10,8 @@ import os
 import re
 import sqlite3
 import uuid
+from datetime import datetime
+from decimal import Decimal
 
 import pytest
 
@@ -111,6 +113,9 @@ class TestWhatFolds:
             ("pl.pocket_key IN (SELECT pr.pocket_key, pr.prop_key FROM props AS pr)", "two columns"),
             ("pl.pocket_key IN (SELECT c.pocket_key FROM keys_cte AS c)", "outer CTE"),
             ("pl.pocket_key IN (SELECT partition_key FROM props)", "unqualified key-table column"),
+            ("pl.pocket_key IN (SELECT pr.pocket_key FROM props AS pr WHERE prop_key = 39)", "unqualified column"),
+            ("pl.pocket_key IN (SELECT pr.pocket_key FROM props AS pr WHERE pr.prop_key = %s)", "bind parameter"),
+            ("pl.pocket_key IN (SELECT pr.pocket_key FROM props AS pr WHERE pr.prop_key = $1)", "numbered parameter"),
             ("t9.pocket_key IN (SELECT pr.pocket_key FROM props AS pr)", "alias not tied by key equality"),
         ],
         ids=lambda value: value if len(value) < 30 else None,
@@ -119,6 +124,44 @@ class TestWhatFolds:
         query = f"WITH keys_cte AS (SELECT 1 AS pocket_key) {BASE.replace('pts AS t1', 'pts AS t1, pts AS t9')} AND {condition}"
         script = extend_query_with_partition_keys(query, KEYS, "pocket_key", method="TMP_TABLE_IN", p0_alias="pl", fold_key_subqueries=True)
         assert "IS NOT TRUE" not in script, reason
+
+    def test_a_bind_parameter_anywhere_stops_folding(self):
+        """A folded subquery moves in front of the main statement, and with it its parameters' positions."""
+        query = f"{BASE} AND t1.rnk = %s AND {META}"
+        script = extend_query_with_partition_keys(query, KEYS, "pocket_key", method="TMP_TABLE_IN", p0_alias="pl", fold_key_subqueries=True)
+        assert "IS NOT TRUE" not in script
+
+    def test_transaction_stable_time_functions_fold(self):
+        query = f"{BASE} AND pl.pocket_key IN (SELECT pr.pocket_key FROM props AS pr WHERE pr.prop_key = 39 AND now() IS NOT NULL)"
+        script = extend_query_with_partition_keys(query, KEYS, "pocket_key", method="TMP_TABLE_IN", p0_alias="pl", fold_key_subqueries=True)
+        assert script.count("IS NOT TRUE") == 1
+
+    @pytest.mark.parametrize(
+        ("keys", "mode", "folds"),
+        [
+            ({1, 2}, True, True),
+            ({Decimal("1.5"), 2}, True, True),
+            ({"a", "b"}, True, False),
+            ({"a", "b"}, "any_key_type", True),
+            ({datetime(2024, 1, 1)}, True, False),
+            ({datetime(2024, 1, 1)}, "any_key_type", True),
+        ],
+    )
+    def test_key_types(self, keys, mode, folds):
+        """In the key table the condition compares in the table's type; text and timestamp keys need the caller's word."""
+        script = extend_query_with_partition_keys(QUERIES["geomine_like"], keys, "pocket_key", method="TMP_TABLE_IN", p0_alias="pl", fold_key_subqueries=mode)
+        assert ("IS NOT TRUE" in script) == folds
+
+    @pytest.mark.parametrize(("datatype", "folds"), [("integer", True), ("text", False), ("float", False), (None, False)])
+    def test_lazy_needs_the_datatype(self, datatype, folds):
+        script = extend_query_with_partition_keys_lazy(
+            QUERIES["geomine_like"], "SELECT 1 AS pocket_key", "pocket_key", method="TMP_TABLE_IN", p0_alias="pl", fold_key_subqueries=True, partition_datatype=datatype
+        )
+        assert ("pcache_folded" in script) == folds
+
+    def test_unknown_mode_raises(self):
+        with pytest.raises(ValueError, match="fold_key_subqueries is False, True or"):
+            extend_query_with_partition_keys(QUERIES["geomine_like"], KEYS, "pocket_key", method="TMP_TABLE_IN", p0_alias="pl", fold_key_subqueries="yes")
 
     def test_outer_join_does_not_tie_the_alias(self):
         query = (
@@ -160,7 +203,7 @@ def _pg_params() -> dict:
 
 class TestPostgreSQL:
     # The metadata subquery of GeoMine: keys come from unnest() over an array column of a property view
-    UNNEST_META = "pl.pocket_key IN (SELECT unnest(pocket_keys) FROM props_arrays WHERE prop_key = 39)"
+    UNNEST_META = "pl.pocket_key IN (SELECT unnest(pa.pocket_keys) FROM props_arrays AS pa WHERE pa.prop_key = 39)"
     LAZY_KEYS = "SELECT g AS pocket_key FROM generate_series(2, 60, 2) AS g"
 
     @pytest.fixture(scope="class")
@@ -204,11 +247,29 @@ class TestPostgreSQL:
         query = f"{BASE} AND {self.UNNEST_META}" if name == "unnest" else QUERIES[name]
         if lazy:
             def extend(fold):
-                return extend_query_with_partition_keys_lazy(query, self.LAZY_KEYS, "pocket_key", method=method, p0_alias="pl", fold_key_subqueries=fold)
+                return extend_query_with_partition_keys_lazy(
+                    query, self.LAZY_KEYS, "pocket_key", method=method, p0_alias="pl", fold_key_subqueries=fold, partition_datatype="integer"
+                )
         else:
             def extend(fold):
                 return extend_query_with_partition_keys(query, KEYS, "pocket_key", method=method, p0_alias="pl", fold_key_subqueries=fold)
         assert run(extend(False)) == run(extend(True)) == run(query)
+
+    @pytest.mark.parametrize("method", PG_METHODS)
+    def test_char_keys_are_not_folded_by_default(self, pg, method):
+        """char(n) compares without padding, text with it: folded, the padded keys read back matched no subquery row.
+
+        (The text key table itself already misses a char(n) column, folded or not; that is a separate, older gap.)
+        """
+        run, _ = pg
+        run("CREATE TABLE IF NOT EXISTS charkeys AS SELECT CAST('k' || g AS char(5)) AS kc, g AS id FROM generate_series(1, 9) g")
+        run("CREATE TABLE IF NOT EXISTS charmeta AS SELECT CAST('k' || g AS varchar) AS kv, g % 3 AS prop FROM generate_series(1, 9) g")
+        keys = set(run("SELECT kc FROM charkeys"))  # padded: 'k1   '
+        query = "SELECT a.id FROM charkeys AS a WHERE a.kc IN (SELECT m.kv FROM charmeta AS m WHERE m.prop = 1)"
+        option = extend_query_with_partition_keys(query, keys, "kc", method=method, p0_alias="a", fold_key_subqueries=True)
+        plain = extend_query_with_partition_keys(query, keys, "kc", method=method, p0_alias="a")
+        assert "pcache_folded" not in option and "IS NOT TRUE" not in option
+        assert run(option) == run(plain)
 
     def test_unnest_leaves_the_plan_and_the_key_table_is_estimated_exactly(self, pg):
         run, explain = pg
