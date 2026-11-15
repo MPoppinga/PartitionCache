@@ -1139,7 +1139,7 @@ class TestTempTableSqlDialect:
 class TestEagerPathKeepsTheQueryDialect:
     """The eager rewrite parses and renders in sql_dialect; sqlglot's generic writer emitted ARRAY('a', 'b')."""
 
-    QUERY = "SELECT p.region_id FROM region_properties AS p WHERE prop_value LIKE ANY(ARRAY['%Cafe%', '%Bakery%'])"
+    QUERY = "SELECT p.region_id FROM region_labels AS p WHERE label LIKE ANY(ARRAY['%Cafe%', '%Bakery%'])"
 
     @pytest.mark.parametrize("method", ["IN", "VALUES", "TMP_TABLE_IN", "TMP_TABLE_JOIN", "UNLOGGED_TABLE_JOIN"])
     def test_postgres_array_literal_survives(self, method):
