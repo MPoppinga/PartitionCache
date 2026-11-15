@@ -1,6 +1,6 @@
 """Inequalities between aliases (``p1.id <> p2.id``) must not connect the join graph.
 
-Self-join workloads such as GeoMine add ``<>`` for every pair of aliases so that no two
+Self-join workloads often add ``<>`` for every pair of aliases so that no two
 aliases bind the same row. If those conditions counted as edges, the join graph became
 complete and fragment generation emitted subsets connected only by ``<>``, e.g.
 

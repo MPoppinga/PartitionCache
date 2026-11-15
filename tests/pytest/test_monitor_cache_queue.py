@@ -1199,7 +1199,7 @@ class TestLookupUsesDecompositionSettings:
         from partitioncache.cache_handler.abstract import AbstractCacheHandler_Lazy
         from partitioncache.population import lookup_settings
 
-        args.bucket_steps = {"interpoint_coord": 1.0}
+        args.bucket_steps = {"distance": 1.0}
         args.max_component_size = 5
         mock_get_keys.return_value = (None, 3, 0)
         mock_get_lazy.return_value = (None, 3, 0)
@@ -1213,7 +1213,7 @@ class TestLookupUsesDecompositionSettings:
         for mock in (mock_get_keys, mock_get_lazy):
             kwargs = mock.call_args.kwargs
             assert {name: kwargs[name] for name in expected} == expected
-            assert kwargs["skip_partition_key_joins"] is True and kwargs["bucket_steps"] == {"interpoint_coord": 1.0}
+            assert kwargs["skip_partition_key_joins"] is True and kwargs["bucket_steps"] == {"distance": 1.0}
             assert kwargs["remove_constraints_all"] == ["w"] and kwargs["keep_all_attributes"] is True
             assert "max_component_size" not in kwargs and "add_constraints" not in kwargs
 

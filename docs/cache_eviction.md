@@ -40,7 +40,7 @@ This architecture provides better isolation, security, and scalability by separa
 │                                                                         │
 │  ┌─────────────────┐                    ┌─────────────────────────┐    │
 │  │  pg_cron DB     │                    │     Cache Database      │    │
-│  │  (postgres)     │                    │    (geominedb)          │    │
+│  │  (postgres)     │                    │    (appdb)          │    │
 │  │                 │                    │                         │    │
 │  │ ┌─────────────┐ │ schedule_in_       │ ┌─────────────────────┐ │    │
 │  │ │  pg_cron    │ │ database()         │ │  Cache Tables       │ │    │

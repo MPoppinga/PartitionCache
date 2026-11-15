@@ -18,41 +18,41 @@ import pytest
 
 from partitioncache.apply_cache import extend_query_with_partition_keys, extend_query_with_partition_keys_lazy
 
-BASE = "SELECT DISTINCT pl.pocket_key FROM pocketkey_list AS pl, pts AS t1 WHERE t1.pocket_key = pl.pocket_key AND t1.kind = 'A'"
-META = "pl.pocket_key IN (SELECT pr.pocket_key FROM props AS pr WHERE pr.prop_key = 39)"
+BASE = "SELECT DISTINCT rl.region_id FROM region_list AS rl, pois AS t1 WHERE t1.region_id = rl.region_id AND t1.kind = 'A'"
+META = "rl.region_id IN (SELECT pr.region_id FROM stats AS pr WHERE pr.stat_key = 39)"
 QUERIES = {
-    "geomine_like": f"{BASE} AND {META}",
-    "any_form": f"{BASE} AND pl.pocket_key = ANY (SELECT pr.pocket_key FROM props AS pr WHERE pr.prop_key = 39)",
-    "two_subqueries": f"{BASE} AND {META} AND t1.pocket_key IN (SELECT o.k FROM other AS o WHERE o.z = 1)",
-    "correlated": f"{BASE} AND pl.pocket_key IN (SELECT pr.pocket_key FROM props AS pr WHERE pr.prop_key = t1.rnk)",
-    "not_in": f"{BASE} AND pl.pocket_key NOT IN (SELECT pr.pocket_key FROM props AS pr WHERE pr.prop_key = 39 AND pr.pocket_key IS NOT NULL)",
+    "metadata_subquery": f"{BASE} AND {META}",
+    "any_form": f"{BASE} AND rl.region_id = ANY (SELECT pr.region_id FROM stats AS pr WHERE pr.stat_key = 39)",
+    "two_subqueries": f"{BASE} AND {META} AND t1.region_id IN (SELECT o.k FROM other AS o WHERE o.z = 1)",
+    "correlated": f"{BASE} AND rl.region_id IN (SELECT pr.region_id FROM stats AS pr WHERE pr.stat_key = t1.rnk)",
+    "not_in": f"{BASE} AND rl.region_id NOT IN (SELECT pr.region_id FROM stats AS pr WHERE pr.stat_key = 39 AND pr.region_id IS NOT NULL)",
     "or_context": f"{BASE} AND ({META} OR t1.rnk = 3)",
 }
-FOLDED = {"geomine_like": 1, "any_form": 1, "two_subqueries": 2, "correlated": 0, "not_in": 0, "or_context": 0}
-# The cache keys: the keys of the query without its metadata conditions (pockets with an 'A' point), a relaxation
+FOLDED = {"metadata_subquery": 1, "any_form": 1, "two_subqueries": 2, "correlated": 0, "not_in": 0, "or_context": 0}
+# The cache keys: the keys of the query without its metadata conditions (regions with an 'A' point), a relaxation
 KEYS = set(range(2, 61, 2))
 TABLE_METHODS = ["TMP_TABLE_IN", "TMP_TABLE_JOIN"]
 PG_METHODS = TABLE_METHODS + ["UNLOGGED_TABLE_IN", "UNLOGGED_TABLE_JOIN"]
 
 
 def _rows():
-    pockets = [(k,) for k in range(1, 61)]
-    pts = [(k, "AB"[k % 2], k % 7) for k in range(1, 61) for _ in range(2)]
-    # props of prop 39: duplicates and NULLs, keys inside and outside the cache keys
-    props = [(39, k) for k in range(1, 61, 3)] + [(39, k) for k in range(1, 61, 9)] + [(39, None), (40, 5), (3, 7)]
+    regions = [(k,) for k in range(1, 61)]
+    pois = [(k, "AB"[k % 2], k % 7) for k in range(1, 61) for _ in range(2)]
+    # stats of stat 39: duplicates and NULLs, keys inside and outside the cache keys
+    stats = [(39, k) for k in range(1, 61, 3)] + [(39, k) for k in range(1, 61, 9)] + [(39, None), (40, 5), (3, 7)]
     other = [(k, 1 if k % 4 else 0) for k in range(1, 61)] + [(None, 1)]
-    return pockets, pts, props, other
+    return regions, pois, stats, other
 
 
 def _load(execute, executemany):
-    pockets, pts, props, other = _rows()
-    execute("CREATE TABLE pocketkey_list (pocket_key INTEGER)")
-    execute("CREATE TABLE pts (pocket_key INTEGER, kind TEXT, rnk INTEGER)")
-    execute("CREATE TABLE props (prop_key INTEGER, pocket_key INTEGER)")
+    regions, pois, stats, other = _rows()
+    execute("CREATE TABLE region_list (region_id INTEGER)")
+    execute("CREATE TABLE pois (region_id INTEGER, kind TEXT, rnk INTEGER)")
+    execute("CREATE TABLE stats (stat_key INTEGER, region_id INTEGER)")
     execute("CREATE TABLE other (k INTEGER, z INTEGER)")
-    executemany("INSERT INTO pocketkey_list VALUES (?)", pockets)
-    executemany("INSERT INTO pts VALUES (?, ?, ?)", pts)
-    executemany("INSERT INTO props VALUES (?, ?)", props)
+    executemany("INSERT INTO region_list VALUES (?)", regions)
+    executemany("INSERT INTO pois VALUES (?, ?, ?)", pois)
+    executemany("INSERT INTO stats VALUES (?, ?)", stats)
     executemany("INSERT INTO other VALUES (?, ?)", other)
 
 
@@ -92,8 +92,8 @@ def test_folding_keeps_the_rows(dialect, name, method):
     query = QUERIES[name]
     reference = run(query)
     assert set(reference) <= KEYS  # the cache keys are a superset of the result
-    plain = extend_query_with_partition_keys(query, KEYS, "pocket_key", method=method, p0_alias="pl", sql_dialect=dialect)
-    folded = extend_query_with_partition_keys(query, KEYS, "pocket_key", method=method, p0_alias="pl", sql_dialect=dialect, fold_key_subqueries=True)
+    plain = extend_query_with_partition_keys(query, KEYS, "region_id", method=method, p0_alias="rl", sql_dialect=dialect)
+    folded = extend_query_with_partition_keys(query, KEYS, "region_id", method=method, p0_alias="rl", sql_dialect=dialect, fold_key_subqueries=True)
     assert _number_of_filters(folded) == FOLDED[name]
     assert run(plain) == run(folded) == reference
 
@@ -104,39 +104,39 @@ class TestWhatFolds:
         return script.rpartition(";")[2]
 
     def test_folded_condition_leaves_the_statement(self):
-        script = extend_query_with_partition_keys(QUERIES["two_subqueries"], KEYS, "pocket_key", method="TMP_TABLE_IN", p0_alias="pl", fold_key_subqueries=True)
+        script = extend_query_with_partition_keys(QUERIES["two_subqueries"], KEYS, "region_id", method="TMP_TABLE_IN", p0_alias="rl", fold_key_subqueries=True)
         main = self._main_statement(script)
-        assert "props" not in main and "other" not in main and "t1.kind = 'A'" in main
+        assert "stats" not in main and "other" not in main and "t1.kind = 'A'" in main
 
     @pytest.mark.parametrize(
         ("condition", "reason"),
         [
-            ("pl.pocket_key IN (SELECT pr.pocket_key FROM props AS pr ORDER BY pr.pocket_key LIMIT 3)", "limit"),
-            ("pl.pocket_key IN (SELECT pr.pocket_key FROM props AS pr WHERE random() < 0.5)", "volatile"),
-            ("pl.pocket_key IN (SELECT pr.pocket_key, pr.prop_key FROM props AS pr)", "two columns"),
-            ("pl.pocket_key IN (SELECT c.pocket_key FROM keys_cte AS c)", "outer CTE"),
-            ("pl.pocket_key IN (SELECT partition_key FROM props)", "unqualified key-table column"),
-            ("pl.pocket_key IN (SELECT pr.pocket_key FROM props AS pr WHERE prop_key = 39)", "unqualified column"),
-            ("pl.pocket_key IN (SELECT pr.pocket_key FROM props AS pr WHERE pr.prop_key = %s)", "bind parameter"),
-            ("pl.pocket_key IN (SELECT pr.pocket_key FROM props AS pr WHERE pr.prop_key = $1)", "numbered parameter"),
-            ("t9.pocket_key IN (SELECT pr.pocket_key FROM props AS pr)", "alias not tied by key equality"),
+            ("rl.region_id IN (SELECT pr.region_id FROM stats AS pr ORDER BY pr.region_id LIMIT 3)", "limit"),
+            ("rl.region_id IN (SELECT pr.region_id FROM stats AS pr WHERE random() < 0.5)", "volatile"),
+            ("rl.region_id IN (SELECT pr.region_id, pr.stat_key FROM stats AS pr)", "two columns"),
+            ("rl.region_id IN (SELECT c.region_id FROM keys_cte AS c)", "outer CTE"),
+            ("rl.region_id IN (SELECT partition_key FROM stats)", "unqualified key-table column"),
+            ("rl.region_id IN (SELECT pr.region_id FROM stats AS pr WHERE stat_key = 39)", "unqualified column"),
+            ("rl.region_id IN (SELECT pr.region_id FROM stats AS pr WHERE pr.stat_key = %s)", "bind parameter"),
+            ("rl.region_id IN (SELECT pr.region_id FROM stats AS pr WHERE pr.stat_key = $1)", "numbered parameter"),
+            ("t9.region_id IN (SELECT pr.region_id FROM stats AS pr)", "alias not tied by key equality"),
         ],
         ids=lambda value: value if len(value) < 30 else None,
     )
     def test_left_alone(self, condition, reason):
-        query = f"WITH keys_cte AS (SELECT 1 AS pocket_key) {BASE.replace('pts AS t1', 'pts AS t1, pts AS t9')} AND {condition}"
-        script = extend_query_with_partition_keys(query, KEYS, "pocket_key", method="TMP_TABLE_IN", p0_alias="pl", fold_key_subqueries=True)
+        query = f"WITH keys_cte AS (SELECT 1 AS region_id) {BASE.replace('pois AS t1', 'pois AS t1, pois AS t9')} AND {condition}"
+        script = extend_query_with_partition_keys(query, KEYS, "region_id", method="TMP_TABLE_IN", p0_alias="rl", fold_key_subqueries=True)
         assert _number_of_filters(script) == 0, reason
 
     def test_a_bind_parameter_anywhere_stops_folding(self):
         """A folded subquery moves in front of the main statement, and with it its parameters' positions."""
         query = f"{BASE} AND t1.rnk = %s AND {META}"
-        script = extend_query_with_partition_keys(query, KEYS, "pocket_key", method="TMP_TABLE_IN", p0_alias="pl", fold_key_subqueries=True)
+        script = extend_query_with_partition_keys(query, KEYS, "region_id", method="TMP_TABLE_IN", p0_alias="rl", fold_key_subqueries=True)
         assert _number_of_filters(script) == 0
 
     def test_transaction_stable_time_functions_fold(self):
-        query = f"{BASE} AND pl.pocket_key IN (SELECT pr.pocket_key FROM props AS pr WHERE pr.prop_key = 39 AND now() IS NOT NULL)"
-        script = extend_query_with_partition_keys(query, KEYS, "pocket_key", method="TMP_TABLE_IN", p0_alias="pl", fold_key_subqueries=True)
+        query = f"{BASE} AND rl.region_id IN (SELECT pr.region_id FROM stats AS pr WHERE pr.stat_key = 39 AND now() IS NOT NULL)"
+        script = extend_query_with_partition_keys(query, KEYS, "region_id", method="TMP_TABLE_IN", p0_alias="rl", fold_key_subqueries=True)
         assert _number_of_filters(script) == 1
 
     @pytest.mark.parametrize(
@@ -152,44 +152,44 @@ class TestWhatFolds:
     )
     def test_key_types(self, keys, mode, folds):
         """In the key table the condition compares in the table's type; text and timestamp keys need the caller's word."""
-        script = extend_query_with_partition_keys(QUERIES["geomine_like"], keys, "pocket_key", method="TMP_TABLE_IN", p0_alias="pl", fold_key_subqueries=mode)
+        script = extend_query_with_partition_keys(QUERIES["metadata_subquery"], keys, "region_id", method="TMP_TABLE_IN", p0_alias="rl", fold_key_subqueries=mode)
         assert (_number_of_filters(script) == 1) == folds
 
     @pytest.mark.parametrize(("datatype", "folds"), [("integer", True), ("text", False), ("float", False), (None, False)])
     def test_lazy_needs_the_datatype(self, datatype, folds):
         script = extend_query_with_partition_keys_lazy(
-            QUERIES["geomine_like"], "SELECT 1 AS pocket_key", "pocket_key", method="TMP_TABLE_IN", p0_alias="pl", fold_key_subqueries=True, partition_datatype=datatype
+            QUERIES["metadata_subquery"], "SELECT 1 AS region_id", "region_id", method="TMP_TABLE_IN", p0_alias="rl", fold_key_subqueries=True, partition_datatype=datatype
         )
         assert (_number_of_filters(script) == 1) == folds
 
     def test_unknown_mode_raises(self):
         with pytest.raises(ValueError, match="fold_key_subqueries is False, True or"):
-            extend_query_with_partition_keys(QUERIES["geomine_like"], KEYS, "pocket_key", method="TMP_TABLE_IN", p0_alias="pl", fold_key_subqueries="yes")
+            extend_query_with_partition_keys(QUERIES["metadata_subquery"], KEYS, "region_id", method="TMP_TABLE_IN", p0_alias="rl", fold_key_subqueries="yes")
 
     def test_outer_join_does_not_tie_the_alias(self):
         query = (
-            "SELECT DISTINCT pl.pocket_key FROM pocketkey_list AS pl LEFT JOIN pts AS t1 ON t1.pocket_key = pl.pocket_key "
-            "WHERE t1.pocket_key IN (SELECT pr.pocket_key FROM props AS pr)"
+            "SELECT DISTINCT rl.region_id FROM region_list AS rl LEFT JOIN pois AS t1 ON t1.region_id = rl.region_id "
+            "WHERE t1.region_id IN (SELECT pr.region_id FROM stats AS pr)"
         )
-        script = extend_query_with_partition_keys(query, KEYS, "pocket_key", method="TMP_TABLE_IN", p0_alias="pl", fold_key_subqueries=True)
+        script = extend_query_with_partition_keys(query, KEYS, "region_id", method="TMP_TABLE_IN", p0_alias="rl", fold_key_subqueries=True)
         assert _number_of_filters(script) == 0
 
     def test_inner_join_ties_the_alias(self):
         query = (
-            "SELECT DISTINCT pl.pocket_key FROM pocketkey_list AS pl JOIN pts AS t1 ON t1.pocket_key = pl.pocket_key "
-            "WHERE t1.pocket_key IN (SELECT pr.pocket_key FROM props AS pr)"
+            "SELECT DISTINCT rl.region_id FROM region_list AS rl JOIN pois AS t1 ON t1.region_id = rl.region_id "
+            "WHERE t1.region_id IN (SELECT pr.region_id FROM stats AS pr)"
         )
-        script = extend_query_with_partition_keys(query, KEYS, "pocket_key", method="TMP_TABLE_IN", p0_alias="pl", fold_key_subqueries=True)
+        script = extend_query_with_partition_keys(query, KEYS, "region_id", method="TMP_TABLE_IN", p0_alias="rl", fold_key_subqueries=True)
         assert _number_of_filters(script) == 1
 
     @pytest.mark.parametrize("method", ["IN", "VALUES"])
     def test_methods_without_a_key_table_raise(self, method):
         with pytest.raises(ValueError, match="key-table method"):
-            extend_query_with_partition_keys(QUERIES["geomine_like"], KEYS, "pocket_key", method=method, p0_alias="pl", fold_key_subqueries=True)
+            extend_query_with_partition_keys(QUERIES["metadata_subquery"], KEYS, "region_id", method=method, p0_alias="rl", fold_key_subqueries=True)
 
     def test_mysql_is_refused(self):
         with pytest.raises(ValueError, match="supports the SQL dialects"):
-            extend_query_with_partition_keys(QUERIES["geomine_like"], KEYS, "pocket_key", method="TMP_TABLE_IN", p0_alias="pl", sql_dialect="mysql", fold_key_subqueries=True)
+            extend_query_with_partition_keys(QUERIES["metadata_subquery"], KEYS, "region_id", method="TMP_TABLE_IN", p0_alias="rl", sql_dialect="mysql", fold_key_subqueries=True)
 
     @pytest.mark.parametrize("method", PG_METHODS)
     @pytest.mark.parametrize("lazy", [False, True], ids=["eager", "lazy"])
@@ -197,27 +197,27 @@ class TestWhatFolds:
         """No IN filter or DELETE in a PostgreSQL setup; the keys' CTE has a random name (it is visible in the subqueries)."""
         if lazy:
             script = extend_query_with_partition_keys_lazy(
-                QUERIES["two_subqueries"], "SELECT 2 AS pocket_key", "pocket_key", method=method, p0_alias="pl", fold_key_subqueries=True, partition_datatype="integer"
+                QUERIES["two_subqueries"], "SELECT 2 AS region_id", "region_id", method=method, p0_alias="rl", fold_key_subqueries=True, partition_datatype="integer"
             )
         else:
-            script = extend_query_with_partition_keys(QUERIES["two_subqueries"], KEYS, "pocket_key", method=method, p0_alias="pl", fold_key_subqueries=True)
+            script = extend_query_with_partition_keys(QUERIES["two_subqueries"], KEYS, "region_id", method=method, p0_alias="rl", fold_key_subqueries=True)
         assert _number_of_filters(script) == 2
         assert "DELETE" not in script and "IS NOT TRUE" not in script and " IN (SELECT pr." not in script
         assert re.search(r"WITH pcache_k_[0-9a-f]{8}\b[^;]* AS MATERIALIZED \(", script)
 
     def test_off_by_default(self):
-        script = extend_query_with_partition_keys(QUERIES["geomine_like"], KEYS, "pocket_key", method="TMP_TABLE_IN", p0_alias="pl")
-        assert _number_of_filters(script) == 0 and "props" in self._main_statement(script)
+        script = extend_query_with_partition_keys(QUERIES["metadata_subquery"], KEYS, "region_id", method="TMP_TABLE_IN", p0_alias="rl")
+        assert _number_of_filters(script) == 0 and "stats" in self._main_statement(script)
 
 
 def test_sqlite_compares_with_the_key_column_affinity():
     """SQLite keeps the IN filter: it applies the key column's affinity, a set operation would compare 1 with '1' as unequal."""
     conn = sqlite3.connect(":memory:")
-    conn.execute("CREATE TABLE pl (pocket_key INTEGER)")
+    conn.execute("CREATE TABLE rl (region_id INTEGER)")
     conn.execute("CREATE TABLE textmeta (k TEXT)")
-    conn.executemany("INSERT INTO pl VALUES (?)", [(k,) for k in range(1, 7)])
+    conn.executemany("INSERT INTO rl VALUES (?)", [(k,) for k in range(1, 7)])
     conn.executemany("INSERT INTO textmeta VALUES (?)", [("2",), ("4",), ("9",)])
-    query = "SELECT pl.pocket_key FROM pl WHERE pl.pocket_key IN (SELECT tm.k FROM textmeta AS tm)"
+    query = "SELECT rl.region_id FROM rl WHERE rl.region_id IN (SELECT tm.k FROM textmeta AS tm)"
 
     def run(script):
         setup, _, select = script.rpartition(";")
@@ -225,7 +225,7 @@ def test_sqlite_compares_with_the_key_column_affinity():
             conn.executescript(setup + ";")
         return sorted(row[0] for row in conn.execute(select))
 
-    folded = extend_query_with_partition_keys(query, {1, 2, 3, 4}, "pocket_key", method="TMP_TABLE_IN", p0_alias="pl", sql_dialect="sqlite", fold_key_subqueries=True)
+    folded = extend_query_with_partition_keys(query, {1, 2, 3, 4}, "region_id", method="TMP_TABLE_IN", p0_alias="rl", sql_dialect="sqlite", fold_key_subqueries=True)
     assert _number_of_filters(folded) == 1 and "INTERSECT" not in folded
     assert run(folded) == run(query) == [2, 4]
 
@@ -237,10 +237,10 @@ def test_duckdb_filters_a_large_subquery_without_rescans():
     """
     duckdb = pytest.importorskip("duckdb")
     conn = duckdb.connect()
-    conn.execute("CREATE TABLE pl AS SELECT g AS pocket_key FROM range(1, 400001) AS r(g)")
-    conn.execute("CREATE TABLE meta AS SELECT (g * 7) % 400000 + 1 AS pocket_key, g AS id FROM range(1, 400001) AS r(g)")
-    query = "SELECT pl.pocket_key FROM pl WHERE pl.pocket_key IN (SELECT m.pocket_key FROM meta AS m WHERE m.id > 0)"
-    script = extend_query_with_partition_keys(query, set(range(1, 400001, 200)), "pocket_key", method="TMP_TABLE_IN", p0_alias="pl", sql_dialect="duckdb", fold_key_subqueries=True)
+    conn.execute("CREATE TABLE rl AS SELECT g AS region_id FROM range(1, 400001) AS r(g)")
+    conn.execute("CREATE TABLE meta AS SELECT (g * 7) % 400000 + 1 AS region_id, g AS id FROM range(1, 400001) AS r(g)")
+    query = "SELECT rl.region_id FROM rl WHERE rl.region_id IN (SELECT m.region_id FROM meta AS m WHERE m.id > 0)"
+    script = extend_query_with_partition_keys(query, set(range(1, 400001, 200)), "region_id", method="TMP_TABLE_IN", p0_alias="rl", sql_dialect="duckdb", fold_key_subqueries=True)
     assert _number_of_filters(script) == 1
     start = time.perf_counter()
     rows = conn.execute(script).fetchall()
@@ -253,13 +253,13 @@ def test_lazy_keys_are_read_once_and_the_fallback_stays():
     which plans but does not run them, and in the INSERT. LAZY_ALL_KEYS_PLACEHOLDER (#45) is replaced in both."""
     from partitioncache.cache_handler.abstract import LAZY_ALL_KEYS_PLACEHOLDER
 
-    lazy = f"SELECT unnest(COALESCE((SELECT array_agg(c.k) FROM cache_rows AS c), {LAZY_ALL_KEYS_PLACEHOLDER})) AS pocket_key"
+    lazy = f"SELECT unnest(COALESCE((SELECT array_agg(c.k) FROM cache_rows AS c), {LAZY_ALL_KEYS_PLACEHOLDER})) AS region_id"
     for method in PG_METHODS:
-        script = extend_query_with_partition_keys_lazy(QUERIES["geomine_like"], lazy, "pocket_key", method=method, p0_alias="pl", fold_key_subqueries=True, partition_datatype="integer")
+        script = extend_query_with_partition_keys_lazy(QUERIES["metadata_subquery"], lazy, "region_id", method=method, p0_alias="rl", fold_key_subqueries=True, partition_datatype="integer")
         create, insert = script.split(";\n")[:2]
         assert create.endswith("LIMIT 0)") and "INSERT INTO" in insert
         assert LAZY_ALL_KEYS_PLACEHOLDER not in script
-        assert "pocketkey_list" in create and "pocketkey_list" in insert.split(" INTERSECT ")[0]
+        assert "region_list" in create and "region_list" in insert.split(" INTERSECT ")[0]
 
 
 def _setup_statements(script: str) -> tuple[list[str], str]:
@@ -282,10 +282,10 @@ def _pg_params() -> dict:
 
 
 class TestPostgreSQL:
-    # The metadata subquery of GeoMine: keys come from unnest() over an array column of a property view
-    UNNEST_META = "pl.pocket_key IN (SELECT unnest(pa.pocket_keys) FROM props_arrays AS pa WHERE pa.prop_key = 39)"
-    LAZY_KEYS = "SELECT g AS pocket_key FROM generate_series(2, 60, 2) AS g"
-    UNION_META = "pl.pocket_key IN (SELECT pr.pocket_key FROM props AS pr WHERE pr.prop_key = 39 UNION SELECT o.k FROM other AS o WHERE o.z = 0)"
+    # A metadata subquery whose keys come from unnest() over an array column of a property view
+    UNNEST_META = "rl.region_id IN (SELECT unnest(pa.region_ids) FROM stats_arrays AS pa WHERE pa.stat_key = 39)"
+    LAZY_KEYS = "SELECT g AS region_id FROM generate_series(2, 60, 2) AS g"
+    UNION_META = "rl.region_id IN (SELECT pr.region_id FROM stats AS pr WHERE pr.stat_key = 39 UNION SELECT o.k FROM other AS o WHERE o.z = 0)"
 
     @pytest.fixture(scope="class")
     def pg(self):
@@ -298,7 +298,7 @@ class TestPostgreSQL:
         conn.execute(f"SET search_path TO {schema}")
         with conn.cursor() as cur:
             _load(cur.execute, lambda sql, rows: cur.executemany(sql.replace("?", "%s"), rows))
-            cur.execute("CREATE TABLE props_arrays AS SELECT prop_key, array_agg(pocket_key) AS pocket_keys FROM props GROUP BY prop_key")
+            cur.execute("CREATE TABLE stats_arrays AS SELECT stat_key, array_agg(region_id) AS region_ids FROM stats GROUP BY stat_key")
             cur.execute("ANALYZE")
 
         def run(script):
@@ -348,11 +348,11 @@ class TestPostgreSQL:
         if lazy:
             def extend(fold):
                 return extend_query_with_partition_keys_lazy(
-                    query, self.LAZY_KEYS, "pocket_key", method=method, p0_alias="pl", fold_key_subqueries=fold, partition_datatype="integer"
+                    query, self.LAZY_KEYS, "region_id", method=method, p0_alias="rl", fold_key_subqueries=fold, partition_datatype="integer"
                 )
         else:
             def extend(fold):
-                return extend_query_with_partition_keys(query, KEYS, "pocket_key", method=method, p0_alias="pl", fold_key_subqueries=fold)
+                return extend_query_with_partition_keys(query, KEYS, "region_id", method=method, p0_alias="rl", fold_key_subqueries=fold)
         assert run(extend(False)) == run(extend(True)) == run(query)
 
     @pytest.mark.parametrize("method", PG_METHODS)
@@ -374,9 +374,9 @@ class TestPostgreSQL:
     def test_unnest_leaves_the_plan_and_the_key_table_is_estimated_exactly(self, pg):
         _, explain, _ = pg
         query = f"{BASE} AND {self.UNNEST_META}"
-        kwargs = {"method": "UNLOGGED_TABLE_IN", "p0_alias": "pl", "planner_collapse_limit": 20}
-        plain = explain(extend_query_with_partition_keys(query, KEYS, "pocket_key", **kwargs))
-        folded_script = extend_query_with_partition_keys(query, KEYS, "pocket_key", fold_key_subqueries=True, **kwargs)
+        kwargs = {"method": "UNLOGGED_TABLE_IN", "p0_alias": "rl", "planner_collapse_limit": 20}
+        plain = explain(extend_query_with_partition_keys(query, KEYS, "region_id", **kwargs))
+        folded_script = extend_query_with_partition_keys(query, KEYS, "region_id", fold_key_subqueries=True, **kwargs)
         folded = explain(folded_script)
         assert "unnest" in plain.lower() and "unnest" not in folded.lower()
         table = re.search(r"partitioncache_unl_[0-9a-f]+", folded_script).group(0)  # type: ignore[union-attr]
@@ -385,19 +385,19 @@ class TestPostgreSQL:
         assert estimate == expected
 
     @staticmethod
-    def _extend(query, method, lazy, fold, lazy_keys="SELECT g AS pocket_key FROM generate_series(2, 60, 2) AS g"):
+    def _extend(query, method, lazy, fold, lazy_keys="SELECT g AS region_id FROM generate_series(2, 60, 2) AS g"):
         if lazy:
-            return extend_query_with_partition_keys_lazy(query, lazy_keys, "pocket_key", method=method, p0_alias="pl", fold_key_subqueries=fold, partition_datatype="integer")
-        return extend_query_with_partition_keys(query, KEYS, "pocket_key", method=method, p0_alias="pl", fold_key_subqueries=fold)
+            return extend_query_with_partition_keys_lazy(query, lazy_keys, "region_id", method=method, p0_alias="rl", fold_key_subqueries=fold, partition_datatype="integer")
+        return extend_query_with_partition_keys(query, KEYS, "region_id", method=method, p0_alias="rl", fold_key_subqueries=fold)
 
     @pytest.mark.parametrize("lazy", [False, True], ids=["eager", "lazy"])
     @pytest.mark.parametrize("method", PG_METHODS)
     def test_the_setup_has_no_join_or_subplan_over_the_subquery(self, pg, method, lazy):
         """With the subquery far above hash_mem: before, the eager DELETE ... IS NOT TRUE rescanned it for every key."""
         run, _, setup_plans = pg
-        run("CREATE TABLE IF NOT EXISTS bigmeta AS SELECT g % 90 AS pocket_key, g AS id FROM generate_series(1, 40000) AS g")
+        run("CREATE TABLE IF NOT EXISTS bigmeta AS SELECT g % 90 AS region_id, g AS id FROM generate_series(1, 40000) AS g")
         run("ANALYZE bigmeta")
-        query = f"{BASE} AND pl.pocket_key IN (SELECT bm.pocket_key FROM bigmeta AS bm WHERE bm.id > 0)"
+        query = f"{BASE} AND rl.region_id IN (SELECT bm.region_id FROM bigmeta AS bm WHERE bm.id > 0)"
         script = self._extend(query, method, lazy, True)
         plans, _, _ = setup_plans(script, settings=("work_mem = '64kB'", "hash_mem_multiplier = 1"))
         assert "SetOp Intersect" in plans
@@ -410,7 +410,7 @@ class TestPostgreSQL:
     def test_the_key_table_keeps_the_keys_type(self, pg, method, lazy):
         """An integer key with a numeric subquery: a numeric key table would hide the index on the key column."""
         _, _, setup_plans = pg
-        query = f"{BASE} AND pl.pocket_key IN (SELECT CAST(pr.pocket_key AS numeric) FROM props AS pr WHERE pr.prop_key = 39)"
+        query = f"{BASE} AND rl.region_id IN (SELECT CAST(pr.region_id AS numeric) FROM stats AS pr WHERE pr.stat_key = 39)"
         _, folded_type, _ = setup_plans(self._extend(query, method, lazy, True))
         _, plain_type, _ = setup_plans(self._extend(query, method, lazy, False))
         assert folded_type == plain_type and folded_type in ("integer", "bigint")
@@ -420,7 +420,7 @@ class TestPostgreSQL:
         """Set operations treat NULL as equal to NULL: a NULL key and a NULL of the subquery must not make a NULL key row."""
         run, _, setup_plans = pg
         keys = f"{self.LAZY_KEYS} UNION ALL SELECT NULL"
-        for name in ("geomine_like", "two_subqueries"):  # props and other hold NULLs
+        for name in ("metadata_subquery", "two_subqueries"):  # stats and other hold NULLs
             folded = self._extend(QUERIES[name], method, True, True, lazy_keys=keys)
             assert setup_plans(folded)[2] == 0
             assert run(folded) == run(self._extend(QUERIES[name], method, True, False, lazy_keys=keys)) == run(QUERIES[name])
@@ -430,9 +430,9 @@ class TestPostgreSQL:
         """Keys that fail when they run: the LIMIT 0 statement still succeeds, the INSERT (which runs them) fails."""
         _, _, _ = pg
         psycopg = pytest.importorskip("psycopg")
-        lazy = "SELECT g AS pocket_key FROM generate_series(1, 3) AS g WHERE 1 / (g - g) = 1"
-        query = "SELECT pl.pocket_key FROM pocketkey_list AS pl WHERE pl.pocket_key IN (SELECT gs.v FROM generate_series(1, 5) AS gs(v))"
-        script = extend_query_with_partition_keys_lazy(query, lazy, "pocket_key", method=method, p0_alias="pl", fold_key_subqueries=True, partition_datatype="integer")
+        lazy = "SELECT g AS region_id FROM generate_series(1, 3) AS g WHERE 1 / (g - g) = 1"
+        query = "SELECT rl.region_id FROM region_list AS rl WHERE rl.region_id IN (SELECT gs.v FROM generate_series(1, 5) AS gs(v))"
+        script = extend_query_with_partition_keys_lazy(query, lazy, "region_id", method=method, p0_alias="rl", fold_key_subqueries=True, partition_datatype="integer")
         assert _number_of_filters(script) == 1
         create, insert = script.split(";\n")[:2]
         with psycopg.connect(**_pg_params()) as conn, conn.transaction(force_rollback=True):
@@ -443,8 +443,8 @@ class TestPostgreSQL:
     def test_a_table_named_like_the_keys_cte(self, pg):
         """The keys' CTE is visible inside the folded subqueries; its random suffix keeps a table named pcache_k apart."""
         run, _, _ = pg
-        run("CREATE TABLE IF NOT EXISTS pcache_k AS SELECT pocket_key FROM props WHERE prop_key = 39")
-        query = f"{BASE} AND pl.pocket_key IN (SELECT pk.pocket_key FROM pcache_k AS pk)"
+        run("CREATE TABLE IF NOT EXISTS pcache_k AS SELECT region_id FROM stats WHERE stat_key = 39")
+        query = f"{BASE} AND rl.region_id IN (SELECT pk.region_id FROM pcache_k AS pk)"
         for method in PG_METHODS:
             assert run(self._extend(query, method, False, True)) == run(query)
 
@@ -490,12 +490,12 @@ class TestPopulation:
                 return [row[0] for row in self.conn.execute(select)]
 
         settings = {"min_component_size": 1, "keep_all_attributes": True}
-        pairs = generate_all_query_hash_pairs(QUERIES["two_subqueries"], "pocket_key", **settings)
+        pairs = generate_all_query_hash_pairs(QUERIES["two_subqueries"], "region_id", **settings)
         stored = {}
         for fold in (None, False, True):
             cache, db = self._Cache(), Recording()
             populate_query_variants(
-                pairs, "pocket_key", cache, db, restrict=fold is not None, method="TMP_TABLE_IN", sql_dialect="sqlite",
+                pairs, "region_id", cache, db, restrict=fold is not None, method="TMP_TABLE_IN", sql_dialect="sqlite",
                 variant_settings=settings, fold_key_subqueries=bool(fold),
             )
             stored[fold] = cache.entries
@@ -504,7 +504,7 @@ class TestPopulation:
         assert stored[True] == stored[False] == stored[None]
 
     def test_population_resolves_unqualified_columns_through_its_db_handler(self):
-        """GeoMine's subqueries have bare columns: population folds them with a catalog resolver on its db_handler."""
+        """Subqueries with bare columns: population folds them with a catalog resolver on its db_handler."""
         from partitioncache.population import populate_query_variants
         from partitioncache.query_processor import generate_all_query_hash_pairs
 
@@ -521,19 +521,19 @@ class TestPopulation:
                     self.conn.executescript(setup + ";")
                 return [row[0] for row in self.conn.execute(select)]
 
-        query = f"{BASE} AND pl.pocket_key IN (SELECT pocket_key FROM props WHERE prop_key = 39)"
+        query = f"{BASE} AND rl.region_id IN (SELECT region_id FROM stats WHERE stat_key = 39)"
         settings = {"min_component_size": 1, "keep_all_attributes": True}
-        pairs = generate_all_query_hash_pairs(query, "pocket_key", **settings)
+        pairs = generate_all_query_hash_pairs(query, "region_id", **settings)
         stored = {}
         for fold in (None, True):
             cache, db = self._Cache(), Recording()
             populate_query_variants(
-                pairs, "pocket_key", cache, db, restrict=fold is not None, method="TMP_TABLE_IN", sql_dialect="sqlite",
+                pairs, "region_id", cache, db, restrict=fold is not None, method="TMP_TABLE_IN", sql_dialect="sqlite",
                 variant_settings=settings, fold_key_subqueries=bool(fold),
             )
             stored[fold] = cache.entries
             if fold:
-                assert any("pragma_table_info('props')" in q for q in db.executed)
+                assert any("pragma_table_info('stats')" in q for q in db.executed)
                 assert any("IS NOT TRUE" in q for q in db.executed)
         assert stored[True] == stored[None]
 
@@ -541,7 +541,7 @@ class TestPopulation:
         from partitioncache.population import populate_query_variants
 
         with pytest.raises(ValueError, match="key-table method"):
-            populate_query_variants([], "pocket_key", self._Cache(), None, method="IN", fold_key_subqueries=True)  # type: ignore[arg-type]
+            populate_query_variants([], "region_id", self._Cache(), None, method="IN", fold_key_subqueries=True)  # type: ignore[arg-type]
 
 
 def test_monitor_passes_the_option():
@@ -561,17 +561,17 @@ def test_monitor_passes_the_option():
     handler = Mock(spec=AbstractCacheHandler)
     handler.get_intersected.return_value = (KEYS, 2)
     catalog = Mock()
-    catalog.execute.return_value = ["pocket_key", "prop_key"]
+    catalog.execute.return_value = ["region_id", "stat_key"]
     with (
         patch("partitioncache.population.extend_query_with_partition_keys", return_value="restricted") as extend,
         patch("partitioncache.cli.monitor_cache_queue.get_db_handler", return_value=catalog) as get_db,
         patch("partitioncache.cli.monitor_cache_queue.get_database_connection_params", return_value={}),
     ):
-        apply_cache_optimization(QUERIES["geomine_like"], "h", "pocket_key", "integer", handler, args)
+        apply_cache_optimization(QUERIES["metadata_subquery"], "h", "region_id", "integer", handler, args)
     assert extend.call_args.kwargs["fold_key_subqueries"] is True
     # a catalog resolver on a connection of its own to the queried database, closed after the fragment's restriction
     resolver = extend.call_args.kwargs["fold_column_resolver"]
-    assert get_db.call_args.args[0] == "postgres" and resolver("props") == {"pocket_key", "prop_key"}
+    assert get_db.call_args.args[0] == "postgres" and resolver("stats") == {"region_id", "stat_key"}
     catalog.close.assert_called_once()
 
 

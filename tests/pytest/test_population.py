@@ -180,12 +180,12 @@ class TestPopulateQueryVariants:
 
 @pytest.fixture
 def points_db(tmp_path):
-    """GeoMine-like: interaction points of pockets, every point of a pattern an alias of the same table."""
+    """Sensor readings: every reading of a pattern is an alias of the same table, joined on the site."""
     path = str(tmp_path / "points.db")
     conn = sqlite3.connect(path)
-    conn.execute("CREATE TABLE pts (pocket INTEGER, kind TEXT, x REAL, y REAL)")
-    rows = [(pocket, "ABC"[(pocket * 7 + i) % 3], (pocket * 13 + i * 5) % 11, (pocket * 3 + i * 7) % 9) for pocket in range(1, 61) for i in range(6)]
-    conn.executemany("INSERT INTO pts VALUES (?, ?, ?, ?)", rows)
+    conn.execute("CREATE TABLE readings (site INTEGER, kind TEXT, x REAL, y REAL)")
+    rows = [(site, "ABC"[(site * 7 + i) % 3], (site * 13 + i * 5) % 11, (site * 3 + i * 7) % 9) for site in range(1, 61) for i in range(6)]
+    conn.executemany("INSERT INTO readings VALUES (?, ?, ?, ?)", rows)
     conn.commit()
     conn.close()
     return path
@@ -211,16 +211,16 @@ def flights_db(tmp_path):
     return path
 
 
-GEOMINE_LIKE = (
-    "SELECT p1.pocket FROM pts p1, pts p2, pts p3, pts p4 "
-    "WHERE p1.pocket = p2.pocket AND p1.pocket = p3.pocket AND p1.pocket = p4.pocket "
+READINGS_LIKE = (
+    "SELECT p1.site FROM readings p1, readings p2, readings p3, readings p4 "
+    "WHERE p1.site = p2.site AND p1.site = p3.site AND p1.site = p4.site "
     "AND p1.kind = 'A' AND p2.kind = 'B' AND p3.kind = 'C' AND p4.kind = 'A' "
     "AND (p1.x - p2.x) * (p1.x - p2.x) + (p1.y - p2.y) * (p1.y - p2.y) <= 30.5 "
     "AND (p2.x - p3.x) * (p2.x - p3.x) + (p2.y - p3.y) * (p2.y - p3.y) <= 40.25 "
     "AND (p3.x - p4.x) * (p3.x - p4.x) + (p3.y - p4.y) * (p3.y - p4.y) <= 25.75 "
     "AND (p1.x - p4.x) * (p1.x - p4.x) + (p1.y - p4.y) * (p1.y - p4.y) >= 1.5"
 )
-GEOMINE_SETTINGS = {"min_component_size": 2, "max_component_size": 5, "follow_graph": True, "keep_all_attributes": True, "bucket_steps": {"x": 1.0}}
+READINGS_SETTINGS = {"min_component_size": 2, "max_component_size": 5, "follow_graph": True, "keep_all_attributes": True, "bucket_steps": {"x": 1.0}}
 OPENSKY_LIKE = (
     "SELECT DISTINCT e1.flight_id FROM phases e1, phases e2, segments e3 "
     "WHERE e1.flight_id = e2.flight_id AND e1.flight_id = e3.flight_id "
@@ -235,8 +235,8 @@ class TestSelfJoins:
 
     @pytest.mark.parametrize(
         ("db_fixture", "query", "key", "settings"),
-        [("points_db", GEOMINE_LIKE, "pocket", GEOMINE_SETTINGS), ("flights_db", OPENSKY_LIKE, "flight_id", OPENSKY_SETTINGS)],
-        ids=["geomine_like", "opensky_like"],
+        [("points_db", READINGS_LIKE, "site", READINGS_SETTINGS), ("flights_db", OPENSKY_LIKE, "flight_id", OPENSKY_SETTINGS)],
+        ids=["readings_like", "opensky_like"],
     )
     def test_restricted_population_stores_the_same_keys(self, request, db_fixture, query, key, settings):
         path = request.getfixturevalue(db_fixture)
@@ -252,11 +252,11 @@ class TestSelfJoins:
         assert stats.failed == stats.lookup_failed == 0
 
     def test_lookup_with_other_settings_finds_fewer_relaxations_but_stays_correct(self, points_db):
-        pairs = generate_all_query_hash_pairs(GEOMINE_LIKE, "pocket", **GEOMINE_SETTINGS)
+        pairs = generate_all_query_hash_pairs(READINGS_LIKE, "site", **READINGS_SETTINGS)
         plain, matching, defaults = FakeCache(), FakeCache(), FakeCache()
-        populate_query_variants(pairs, "pocket", plain, CountingDB(points_db), restrict=False)
-        good = populate_query_variants(pairs, "pocket", matching, CountingDB(points_db), variant_settings=GEOMINE_SETTINGS)
-        other = populate_query_variants(pairs, "pocket", defaults, CountingDB(points_db), variant_settings={"min_component_size": 2})
+        populate_query_variants(pairs, "site", plain, CountingDB(points_db), restrict=False)
+        good = populate_query_variants(pairs, "site", matching, CountingDB(points_db), variant_settings=READINGS_SETTINGS)
+        other = populate_query_variants(pairs, "site", defaults, CountingDB(points_db), variant_settings={"min_component_size": 2})
 
         assert matching.entries == defaults.entries == plain.entries
         assert other.restricted + other.empty_without_execution < good.restricted + good.empty_without_execution

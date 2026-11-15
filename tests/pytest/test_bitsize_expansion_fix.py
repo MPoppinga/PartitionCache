@@ -88,7 +88,7 @@ class TestBitsizeExpansionFix:
             mock_cursor.execute.return_value = None
             mock_cursor.fetchone.return_value = [True]  # Advisory lock acquired
 
-            success, actual_bitsize = cache_handler._ensure_partition_table("pocket_key", "integer", bitsize=required_bitsize)
+            success, actual_bitsize = cache_handler._ensure_partition_table("region_id", "integer", bitsize=required_bitsize)
 
             assert success is True
             assert actual_bitsize == required_bitsize
@@ -98,7 +98,7 @@ class TestBitsizeExpansionFix:
         """Test the complete set_cache scenario that was failing."""
         # Simulate the exact failing scenario from the original error
         partition_key_identifiers = {1283828}  # The problematic value
-        partition_key = "pocket_key"
+        partition_key = "region_id"
 
         # Verify the calculation logic that caused the original bug
         max_value = max(partition_key_identifiers)
@@ -172,7 +172,7 @@ class TestBitsizeExpansionFix:
             mock_cursor.execute.return_value = None
             mock_cursor.fetchone.return_value = [True]
 
-            success, actual_bitsize = cache_handler._ensure_partition_table("pocket_key", "integer", bitsize=required_bitsize)
+            success, actual_bitsize = cache_handler._ensure_partition_table("region_id", "integer", bitsize=required_bitsize)
 
             # The key assertion: the validation that was failing should now pass
             assert max_value < actual_bitsize  # This is the check that was failing before
@@ -212,7 +212,7 @@ class TestBitsizeExpansionFix:
                 [True],  # Second lock attempt succeeds (for expansion)
             ]
 
-            success, actual_bitsize = cache_handler._ensure_partition_table("pocket_key", "integer", bitsize=required_bitsize)
+            success, actual_bitsize = cache_handler._ensure_partition_table("region_id", "integer", bitsize=required_bitsize)
 
             # Should succeed with expanded bitsize
             assert success is True
