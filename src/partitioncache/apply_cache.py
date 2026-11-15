@@ -717,9 +717,12 @@ def _temp_table_ddl(table_name: str, sql_dialect: str) -> tuple[str, str]:
 
 
 def _create_tmp_table_setup(
-    partition_keys: set[int] | set[str] | set[float] | set[datetime], analyze_tmp_table: bool, sql_dialect: str = "postgres"
+    partition_keys: set[int] | set[str] | set[float] | set[datetime], analyze_tmp_table: bool, sql_dialect: str = "postgres", key_filters: list[str] | None = None
 ) -> tuple[str, str]:
     """Create the SQL for temporary table setup.
+
+    ``key_filters`` are folded subqueries (``_fold_key_subqueries``): after the INSERT, every key for which
+    ``key IN (<subquery>)`` is not TRUE is deleted, so the table holds exactly the keys the folded conditions keep.
 
     Returns:
         tuple[str, str]: (setup_sql, table_name) where table_name is a random temporary table name.
@@ -735,6 +738,8 @@ def _create_tmp_table_setup(
     setup_sql = f"""{ddl_prefix}CREATE TEMPORARY TABLE {table_name} (partition_key {partition_key_type} PRIMARY KEY){ddl_suffix};
                     INSERT INTO {table_name} (partition_key) VALUES ({partition_keys_str});
                     """
+    for key_filter in key_filters or ():
+        setup_sql += f"DELETE FROM {table_name} WHERE (partition_key IN ({key_filter})) IS NOT TRUE;\n"
 
     if analyze_tmp_table:
         # PRIMARY KEY above already creates a B-tree index; ANALYZE updates statistics for the planner
@@ -899,6 +904,157 @@ def _unlogged_table_teardown(table_name: str) -> str:
     return f";\nDROP TABLE IF EXISTS {table_name}"
 
 
+# Functions whose result can differ between two evaluations: a folded subquery runs in another statement of the script
+_VOLATILE_FUNCTION_NAMES = frozenset(
+    {
+        "random", "rand", "random_normal", "setseed", "now", "current_timestamp", "current_time", "current_date", "localtime",
+        "localtimestamp", "clock_timestamp", "statement_timestamp", "transaction_timestamp", "timeofday", "nextval", "currval",
+        "setval", "lastval", "gen_random_uuid", "uuid", "uuid_generate_v1", "uuid_generate_v4", "txid_current", "pg_backend_pid",
+        "current_setting",
+    }
+)
+
+
+def _outer_conjuncts(condition: exp.Expr | None) -> list[exp.Expr]:
+    """The top-level AND operands of a condition, parentheses removed; an OR or NOT is one operand."""
+    if condition is None:
+        return []
+    condition = condition.unnest()
+    if isinstance(condition, exp.And):
+        return [operand for part in condition.flatten() for operand in _outer_conjuncts(part)]
+    return [condition]
+
+
+def _key_component(parsed_query: exp.Expr, partition_key: str, p0_alias: str | None) -> set[str]:
+    """The aliases whose partition key equals the p0 alias's in every result row.
+
+    Connected to it by equalities ``a.<key> = b.<key>`` among the top-level conjuncts of the outer WHERE and of the
+    ON clauses of inner joins; an outer join's ON does not hold for null-extended rows. With p0_alias None
+    (join_every_table, whose guard checked that every table is connected) every table of the FROM and JOIN clauses.
+    """
+    joins = [join for join in (parsed_query.args.get("joins") or []) if not join.side]
+    from_ = parsed_query.args.get("from_") or parsed_query.args.get("from")
+    aliases = {clause.alias_or_name for clause in [*(parsed_query.args.get("joins") or []), *([from_] if from_ is not None else [])]}
+    if p0_alias is None:
+        return aliases
+    where = _outer_where(parsed_query)
+    conjuncts = _outer_conjuncts(where.this if where is not None else None)
+    for join in joins:
+        conjuncts += _outer_conjuncts(join.args.get("on"))
+    component, changed = {p0_alias}, True
+    while changed:
+        changed = False
+        for condition in conjuncts:
+            if isinstance(condition, exp.EQ) and isinstance(condition.this, exp.Column) and isinstance(condition.expression, exp.Column):
+                left, right = condition.this, condition.expression
+                if left.name == right.name == partition_key and {left.table, right.table} & component and {left.table, right.table} - component:
+                    component |= {left.table, right.table}
+                    changed = True
+    return component
+
+
+def _unfoldable_reason(subquery: exp.Expr, outer_ctes: set[str], key_table_columns: set[str]) -> str | None:
+    """Why an IN subquery cannot be evaluated on its own in the key table's statement, or None if it can.
+
+    It must give the same rows there: no column of an outer query (correlation), no CTE of the outer query, no
+    volatile function, no LIMIT / OFFSET / FETCH / TABLESAMPLE, and one output column. An unqualified column binds to
+    the subquery's own tables first, as in SQL. If it bound to an outer table in the query, it finds no such column in
+    the key table's statement, whose only outer columns are ``key_table_columns``, and that statement fails; so an
+    unqualified column of one of those names is refused, as it could bind there instead.
+    """
+    select = subquery
+    while isinstance(select, exp.SetOperation):
+        select = select.this
+    if not isinstance(select, exp.Select) or len(select.expressions) != 1 or isinstance(select.expressions[0], exp.Star):
+        return "not a one-column query"
+    if any(subquery.find(node_type) for node_type in (exp.Limit, exp.Offset, exp.Fetch, exp.TableSample)):
+        return "LIMIT, OFFSET, FETCH or TABLESAMPLE"
+    for function in subquery.find_all(exp.Func):
+        name = function.name if isinstance(function, exp.Anonymous) else function.sql_name()
+        if name.lower() in _VOLATILE_FUNCTION_NAMES:
+            return f"volatile function {name}"
+    inner_ctes = {cte.alias_or_name for cte in subquery.find_all(exp.CTE)}
+    defined = set(inner_ctes)
+    for table in subquery.find_all(exp.Table):
+        if table.name in outer_ctes and table.name not in inner_ctes:
+            return f"reference to the CTE {table.name} of the query"
+        defined |= {table.name, table.alias_or_name}
+    defined |= {alias.name for alias in subquery.find_all(exp.TableAlias)}
+    for column in subquery.find_all(exp.Column):
+        if column.table and column.table not in defined:
+            return f"correlated ({column.sql()})"
+        if not column.table and column.name in key_table_columns:
+            return f"unqualified column {column.name}, which the key table's statement would bind"
+    return None
+
+
+def _fold_key_subqueries(parsed_query: exp.Expr, partition_key: str, p0_alias: str | None, sql_dialect: str, key_table_columns: set[str]) -> list[str]:
+    """Remove the foldable conditions ``<alias>.<key> IN (<subquery>)`` from the outer WHERE; return their subqueries.
+
+    A condition is foldable when it is a top-level conjunct of the outer WHERE (not under OR or NOT, so never NOT IN),
+    written as ``IN (<subquery>)`` or ``= ANY (<subquery>)``, on the partition key of the p0 alias or of an alias tied to
+    it by key equalities (``_key_component``), and its subquery can run on its own (``_unfoldable_reason``). The key
+    table then keeps only the keys for which ``key IN (<subquery>)`` is TRUE, the condition the row filter applied.
+    """
+    where = _outer_where(parsed_query)
+    if where is None or not isinstance(parsed_query, exp.Select):
+        return []
+    with_ = parsed_query.args.get("with") or parsed_query.args.get("with_")
+    outer_ctes = {cte.alias_or_name for cte in with_.expressions} if with_ is not None else set()
+    component = _key_component(parsed_query, partition_key, p0_alias)
+    kept: list[exp.Expr] = []
+    folded: list[str] = []
+    for condition in _outer_conjuncts(where.this):
+        column, subquery = None, None
+        if isinstance(condition, exp.In) and isinstance(condition.args.get("query"), exp.Subquery):
+            column, subquery = condition.this, condition.args["query"].this
+        elif isinstance(condition, exp.EQ) and isinstance(condition.expression, exp.Any) and isinstance(condition.expression.this, exp.Subquery):
+            column, subquery = condition.this, condition.expression.this.this
+        if (
+            isinstance(column, exp.Column)
+            and column.name == partition_key
+            and column.table in component
+            and subquery is not None
+            and _unfoldable_reason(subquery, outer_ctes, key_table_columns) is None
+        ):
+            folded.append(subquery.sql(dialect=sql_dialect))
+        else:
+            kept.append(condition)
+    if folded:
+        if kept:
+            where.set("this", exp.and_(*kept))
+        else:
+            parsed_query.set("where", None)
+    return folded
+
+
+# The only column a folded subquery can see outside itself in a key table's defining query (see _unfoldable_reason)
+_FOLDED_KEY_COLUMN = "pcache_key"
+# ... and in the DELETE that filters a temporary key table of the eager path
+_TMP_KEY_COLUMN = "partition_key"
+
+
+def _filtered_keys_sql(keys_sql: str, column: str, key_filters: list[str]) -> str:
+    """The keys (column ``column``) of ``keys_sql`` for which ``key IN (<subquery>)`` is TRUE for every folded subquery.
+
+    The WHERE keeps a key only when the condition is TRUE, as the row filter did. The keys are renamed to
+    ``_FOLDED_KEY_COLUMN`` around the conditions, so that an unqualified column of a subquery cannot bind to them.
+    """
+    if not key_filters:
+        return keys_sql
+    key = f"pcache_folded.{_FOLDED_KEY_COLUMN}"
+    conditions = " AND ".join(f"{key} IN ({key_filter})" for key_filter in key_filters)
+    return (
+        f"SELECT {key} AS {column} FROM (SELECT pcache_keys_inner.{column} AS {_FOLDED_KEY_COLUMN} FROM ({keys_sql}) AS pcache_keys_inner) "
+        f"AS pcache_folded WHERE {conditions}"
+    )
+
+
+def _check_fold_key_subqueries(fold_key_subqueries: bool, method: str) -> None:
+    if fold_key_subqueries and method not in _SCRIPT_METHODS:
+        raise ValueError(f"fold_key_subqueries needs a key-table method {_SCRIPT_METHODS}, not {method!r}")
+
+
 def extend_query_with_partition_keys(
     query: str,
     partition_keys: set[int] | set[str] | set[float] | set[datetime],
@@ -911,6 +1067,7 @@ def extend_query_with_partition_keys(
     sql_dialect: str = "postgres",
     join_every_table: bool = False,
     planner_collapse_limit: int | None = None,
+    fold_key_subqueries: bool = False,
 ) -> str:
     """
     Extend a given SQL query with the cache functionality.
@@ -939,6 +1096,11 @@ def extend_query_with_partition_keys(
             ``SET LOCAL from_collapse_limit = N;`` (``geqo`` is not touched). PostgreSQL and the script methods
             (TMP_TABLE_*, UNLOGGED_TABLE_*) only; other methods raise ValueError. Not applied to an empty
             ``partition_keys`` set, whose rewrite is a single statement. None (default) is off.
+        fold_key_subqueries: Key-table methods only: move the conditions ``<alias>.<key> IN (<subquery>)`` (also
+            ``= ANY``) on the restricted alias, or on one tied to it by key equalities, into the key table: it keeps the
+            keys for which the condition is TRUE, and the condition leaves the statement, so the planner sees one table
+            of known size instead of the subquery. Only uncorrelated, deterministic subqueries without LIMIT that are
+            top-level conjuncts of the outer WHERE are folded; others stay. Other methods raise ValueError.
 
     Returns:
         str: The extended SQL query as string. An empty ``partition_keys`` set is a valid cache result
@@ -950,6 +1112,7 @@ def extend_query_with_partition_keys(
             miss a ``real`` column; ``IN`` restricts them exactly.
     """
     _check_planner_collapse_limit(planner_collapse_limit, method, sql_dialect)
+    _check_fold_key_subqueries(fold_key_subqueries, method)
     if not partition_keys:
         return _add_empty_intersection_condition(query, sql_dialect)
     _refuse_float_keys(partition_keys, method)
@@ -957,6 +1120,9 @@ def extend_query_with_partition_keys(
     # Parsed and rendered in the query's dialect: the generic writer turns ARRAY['a'] into ARRAY('a'), which PostgreSQL rejects
     parsed_query = sqlglot.parse_one(query, read=sql_dialect)
     p0_alias = _restriction_target(query, parsed_query, partition_key, method, p0_alias, join_every_table, auto_detect_partition_join, partition_join_table)
+    # The eager temporary key table is filtered by a DELETE on it, the other key tables by their defining query
+    key_table_columns = {_TMP_KEY_COLUMN} if method in ("TMP_TABLE_IN", "TMP_TABLE_JOIN") else {_FOLDED_KEY_COLUMN}
+    key_filters = _fold_key_subqueries(parsed_query, partition_key, p0_alias, sql_dialect, key_table_columns) if fold_key_subqueries else []
 
     if method == "IN":
         # The key list is not parsed: a placeholder identifier goes through sqlglot and the
@@ -976,10 +1142,10 @@ def extend_query_with_partition_keys(
 
     elif method == "TMP_TABLE_JOIN" or method == "UNLOGGED_TABLE_JOIN":
         if method == "UNLOGGED_TABLE_JOIN":
-            keys_sql = _unlogged_keys_sql(partition_keys, sql_dialect)
+            keys_sql = _filtered_keys_sql(_unlogged_keys_sql(partition_keys, sql_dialect), "partition_key", key_filters)
             tmp_table_setup, table_name = _create_unlogged_table_setup(keys_sql, "partition_key", sql_dialect, method)
         else:
-            tmp_table_setup, table_name = _create_tmp_table_setup(partition_keys, analyze_tmp_table, sql_dialect)
+            tmp_table_setup, table_name = _create_tmp_table_setup(partition_keys, analyze_tmp_table, sql_dialect, key_filters)
 
         # Add as inner join to the p0 table, or with join_every_table to every table
         from_clauses: list[exp.Join | exp.From] = list(parsed_query.find_all(exp.Join))
@@ -1020,10 +1186,10 @@ def extend_query_with_partition_keys(
 
     elif method == "TMP_TABLE_IN" or method == "UNLOGGED_TABLE_IN":
         if method == "UNLOGGED_TABLE_IN":
-            keys_sql = _unlogged_keys_sql(partition_keys, sql_dialect)
+            keys_sql = _filtered_keys_sql(_unlogged_keys_sql(partition_keys, sql_dialect), "partition_key", key_filters)
             tmp_table_setup, table_name = _create_unlogged_table_setup(keys_sql, "partition_key", sql_dialect, method)
         else:
-            tmp_table_setup, table_name = _create_tmp_table_setup(partition_keys, analyze_tmp_table, sql_dialect)
+            tmp_table_setup, table_name = _create_tmp_table_setup(partition_keys, analyze_tmp_table, sql_dialect, key_filters)
         partition_expr = sqlglot.parse_one(f"{p0_alias}.{partition_key} IN (SELECT partition_key FROM {table_name})", read=sql_dialect)
         _add_where_condition(parsed_query, partition_expr)
         script = _planner_collapse_limit_sql(planner_collapse_limit) + tmp_table_setup + parsed_query.sql(dialect=sql_dialect)
@@ -1094,6 +1260,7 @@ def extend_query_with_partition_keys_lazy(
     sql_dialect: str = "postgres",
     join_every_table: bool = False,
     planner_collapse_limit: int | None = None,
+    fold_key_subqueries: bool = False,
 ) -> str:
     """
     Extend a given SQL query with the cache functionality using a lazy SQL subquery.
@@ -1119,16 +1286,20 @@ def extend_query_with_partition_keys_lazy(
             ``extend_query_with_partition_keys``.
         planner_collapse_limit: If set to N, the script begins with ``SET LOCAL join_collapse_limit = N;`` and
             ``SET LOCAL from_collapse_limit = N;``; see ``extend_query_with_partition_keys``. None (default) is off.
+        fold_key_subqueries: Key-table methods only: fold key subqueries into the key table; see
+            ``extend_query_with_partition_keys``.
 
     Returns:
         str: The extended SQL query as string.
     """
     _check_planner_collapse_limit(planner_collapse_limit, method, sql_dialect)
+    _check_fold_key_subqueries(fold_key_subqueries, method)
     if not lazy_subquery or not lazy_subquery.strip():
         return query
 
     parsed_query = sqlglot.parse_one(query, read=sql_dialect)
     p0_alias = _restriction_target(query, parsed_query, partition_key, method, p0_alias, join_every_table, auto_detect_partition_join, partition_join_table)
+    key_filters = _fold_key_subqueries(parsed_query, partition_key, p0_alias, sql_dialect, {_FOLDED_KEY_COLUMN}) if fold_key_subqueries else []
 
     if LAZY_ALL_KEYS_PLACEHOLDER in lazy_subquery:
         # The handler's subquery reads cache entries that may be evicted before it runs; it then falls back to all keys
@@ -1149,9 +1320,9 @@ def extend_query_with_partition_keys_lazy(
     elif method == "TMP_TABLE_IN" or method == "UNLOGGED_TABLE_IN":
         # Create the key table (temporary or unlogged) from the lazy subquery, then use IN with SELECT
         if method == "UNLOGGED_TABLE_IN":
-            tmp_table_setup, table_name = _create_unlogged_table_setup(lazy_subquery, partition_key, sql_dialect, method)
+            tmp_table_setup, table_name = _create_unlogged_table_setup(_filtered_keys_sql(lazy_subquery, partition_key, key_filters), partition_key, sql_dialect, method)
         else:
-            tmp_table_setup, table_name = _create_tmp_table_setup_from_subquery(lazy_subquery, partition_key, analyze_tmp_table, sql_dialect)
+            tmp_table_setup, table_name = _create_tmp_table_setup_from_subquery(_filtered_keys_sql(lazy_subquery, partition_key, key_filters), partition_key, analyze_tmp_table, sql_dialect)
         partition_expr = sqlglot.parse_one(
             f"{p0_alias}.{partition_key} IN (SELECT {partition_key} FROM {table_name})", read=sql_dialect
         )
@@ -1164,9 +1335,9 @@ def extend_query_with_partition_keys_lazy(
     elif method == "TMP_TABLE_JOIN" or method == "UNLOGGED_TABLE_JOIN":
         # Create the key table (temporary or unlogged) from the lazy subquery, then JOIN
         if method == "UNLOGGED_TABLE_JOIN":
-            tmp_table_setup, table_name = _create_unlogged_table_setup(lazy_subquery, partition_key, sql_dialect, method)
+            tmp_table_setup, table_name = _create_unlogged_table_setup(_filtered_keys_sql(lazy_subquery, partition_key, key_filters), partition_key, sql_dialect, method)
         else:
-            tmp_table_setup, table_name = _create_tmp_table_setup_from_subquery(lazy_subquery, partition_key, analyze_tmp_table, sql_dialect)
+            tmp_table_setup, table_name = _create_tmp_table_setup_from_subquery(_filtered_keys_sql(lazy_subquery, partition_key, key_filters), partition_key, analyze_tmp_table, sql_dialect)
 
         # Add as inner join to the p0 table, or with join_every_table to every table
         from_clauses: list[exp.Join | exp.From] = list(parsed_query.find_all(exp.Join))
@@ -2000,6 +2171,7 @@ def apply_cache_lazy(
     keep_all_attributes: bool = False,
     join_every_table: bool = False,
     planner_collapse_limit: int | None = None,
+    fold_key_subqueries: bool = False,
     **kwargs: Any,
 ) -> tuple[str, dict[str, int]]:
     """
@@ -2074,6 +2246,7 @@ def apply_cache_lazy(
         partition_join_table = deprecated["partition_join_table"]
     if "auto_detect_partition_join" in deprecated:
         auto_detect_partition_join = deprecated["auto_detect_partition_join"]
+    _check_fold_key_subqueries(fold_key_subqueries, method)
     _check_planner_collapse_limit(planner_collapse_limit, method, sql_dialect)
 
     gated, gate_stats = _check_cost_gate(query, cost_estimator, min_query_cost)
@@ -2280,6 +2453,7 @@ def apply_cache_lazy(
         sql_dialect=sql_dialect,
         join_every_table=join_every_table,
         planner_collapse_limit=planner_collapse_limit,
+        fold_key_subqueries=fold_key_subqueries,
     )
 
     stats["enhanced"] = 1
@@ -2325,6 +2499,7 @@ def apply_cache(
     sql_dialect: str = "postgres",
     join_every_table: bool = False,
     planner_collapse_limit: int | None = None,
+    fold_key_subqueries: bool = False,
     **kwargs: Any,
 ) -> tuple[str, dict[str, int]]:
     """
@@ -2439,6 +2614,7 @@ def apply_cache(
         partition_join_table = deprecated["partition_join_table"]
     if "auto_detect_partition_join" in deprecated:
         auto_detect_partition_join = deprecated["auto_detect_partition_join"]
+    _check_fold_key_subqueries(fold_key_subqueries, method)
     _check_planner_collapse_limit(planner_collapse_limit, method, "postgres")  # the eager rewrite below renders PostgreSQL
 
     gated, gate_stats = _check_cost_gate(query, cost_estimator, min_query_cost)
@@ -2659,6 +2835,7 @@ def apply_cache(
         sql_dialect=sql_dialect,
         join_every_table=join_every_table,
         planner_collapse_limit=planner_collapse_limit,
+        fold_key_subqueries=fold_key_subqueries,
     )
 
     stats["enhanced"] = 1
