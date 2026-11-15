@@ -1655,7 +1655,10 @@ def generate_partial_queries(
         try:
             parsed = sqlglot.parse_one(q)
             simplified = sqlglot.optimizer.simplify.simplify(parsed)
-            sql_result = simplified.sql()
+            # The tree is discarded after rendering: without copy=False the generator deep-copies it first, which for
+            # a statement with a long IN list was most of a lookup's time (copy only protects the caller's tree, the
+            # text is the same)
+            sql_result = simplified.sql(copy=False)
             result.append(sql_result)
         except Exception:
             # If parsing fails, skip this variant
@@ -2313,7 +2316,13 @@ def generate_all_query_hash_pairs(
     bucket_levels = bucket_steps if isinstance(bucket_steps, list) else [bucket_steps]
     nor_dist_queries = [normalize_distance_conditions(query, bucket_steps=b) for b in bucket_levels]
 
+    generated_from = {query}
     for nor_dist_query in nor_dist_queries:
+        if nor_dist_query in generated_from:
+            # Bucketing changed nothing (no distance condition to round): the same statement gives the same variants,
+            # which for a long statement cost as much as the first generation again
+            continue
+        generated_from.add(nor_dist_query)
         query_set.update(
             set(
                 generate_partial_queries(
@@ -2362,7 +2371,7 @@ def generate_all_query_hash_pairs(
         for baseq in query_set:  # TODO Performance needs to be improved
             sqlglot_query = sqlglot.parse_one(baseq)
             nquery = sqlglot.optimizer.canonicalize.canonicalize(sqlglot_query)
-            q = nquery.sql()
+            q = nquery.sql(copy=False)
             can_query_set.add(q)
         pairs = [(q, hash_query(q)) for q in can_query_set]
     else:
