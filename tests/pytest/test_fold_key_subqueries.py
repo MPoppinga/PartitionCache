@@ -503,6 +503,40 @@ class TestPopulation:
                 assert any("IS NOT TRUE" in query for query in db.executed)
         assert stored[True] == stored[False] == stored[None]
 
+    def test_population_resolves_unqualified_columns_through_its_db_handler(self):
+        """GeoMine's subqueries have bare columns: population folds them with a catalog resolver on its db_handler."""
+        from partitioncache.population import populate_query_variants
+        from partitioncache.query_processor import generate_all_query_hash_pairs
+
+        class Recording:
+            def __init__(self):
+                self.conn = sqlite3.connect(":memory:")
+                _load(self.conn.execute, self.conn.executemany)
+                self.executed: list[str] = []
+
+            def execute(self, script):
+                self.executed.append(script)
+                setup, _, select = script.rpartition(";")
+                if setup.strip():
+                    self.conn.executescript(setup + ";")
+                return [row[0] for row in self.conn.execute(select)]
+
+        query = f"{BASE} AND pl.pocket_key IN (SELECT pocket_key FROM props WHERE prop_key = 39)"
+        settings = {"min_component_size": 1, "keep_all_attributes": True}
+        pairs = generate_all_query_hash_pairs(query, "pocket_key", **settings)
+        stored = {}
+        for fold in (None, True):
+            cache, db = self._Cache(), Recording()
+            populate_query_variants(
+                pairs, "pocket_key", cache, db, restrict=fold is not None, method="TMP_TABLE_IN", sql_dialect="sqlite",
+                variant_settings=settings, fold_key_subqueries=bool(fold),
+            )
+            stored[fold] = cache.entries
+            if fold:
+                assert any("pragma_table_info('props')" in q for q in db.executed)
+                assert any("IS NOT TRUE" in q for q in db.executed)
+        assert stored[True] == stored[None]
+
     def test_population_checks_the_method(self):
         from partitioncache.population import populate_query_variants
 
@@ -526,6 +560,26 @@ def test_monitor_passes_the_option():
     args.skip_partition_key_joins, args.max_conditions_removed, args.grid_cell_size = [], None, None
     handler = Mock(spec=AbstractCacheHandler)
     handler.get_intersected.return_value = (KEYS, 2)
-    with patch("partitioncache.population.extend_query_with_partition_keys", return_value="restricted") as extend:
+    catalog = Mock()
+    catalog.execute.return_value = ["pocket_key", "prop_key"]
+    with (
+        patch("partitioncache.population.extend_query_with_partition_keys", return_value="restricted") as extend,
+        patch("partitioncache.cli.monitor_cache_queue.get_db_handler", return_value=catalog) as get_db,
+        patch("partitioncache.cli.monitor_cache_queue.get_database_connection_params", return_value={}),
+    ):
         apply_cache_optimization(QUERIES["geomine_like"], "h", "pocket_key", "integer", handler, args)
     assert extend.call_args.kwargs["fold_key_subqueries"] is True
+    # a catalog resolver on a connection of its own to the queried database, closed after the fragment's restriction
+    resolver = extend.call_args.kwargs["fold_column_resolver"]
+    assert get_db.call_args.args[0] == "postgres" and resolver("props") == {"pocket_key", "prop_key"}
+    catalog.close.assert_called_once()
+
+
+def test_monitor_without_folding_opens_no_catalog_connection():
+    from unittest.mock import Mock, patch
+
+    from partitioncache.cli.monitor_cache_queue import _fold_column_resolver
+
+    with patch("partitioncache.cli.monitor_cache_queue.get_db_handler") as get_db, _fold_column_resolver(False, Mock()) as resolver:
+        assert resolver is None
+    get_db.assert_not_called()

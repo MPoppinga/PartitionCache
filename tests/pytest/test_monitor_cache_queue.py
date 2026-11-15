@@ -782,6 +782,7 @@ class TestCacheOptimization:
             join_every_table=False,
             planner_collapse_limit=None,
             fold_key_subqueries=False,
+            fold_column_resolver=None,
             partition_datatype=None,
         )
 
@@ -829,6 +830,7 @@ class TestCacheOptimization:
             join_every_table=False,
             planner_collapse_limit=None,
             fold_key_subqueries=False,
+            fold_column_resolver=None,
         )
 
     @patch("partitioncache.population.get_partition_keys")

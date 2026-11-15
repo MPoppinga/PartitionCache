@@ -224,7 +224,11 @@ print(optimized)
 > condition is TRUE, and the condition leaves the statement, so the planner sees one table of measured size instead
 > of the subquery.
 > - Folded only: top-level conjuncts of the outer WHERE (never `NOT IN` or under `OR`), uncorrelated, deterministic
->   subqueries without `LIMIT`, whose columns are all qualified, in a query without bind parameters.
+>   subqueries without `LIMIT`, in a query without bind parameters. An unqualified column of the subquery must bind
+>   inside it: decided with `fold_column_resolver` (`catalog_column_resolver(execute, sql_dialect)` reads the
+>   catalog; population and pcache-monitor build one on the queried database), or stated with
+>   `fold_assume_inner_columns=True` (on PostgreSQL a wrong statement fails the script, it does not change the rows);
+>   else the condition stays.
 > - `True` folds for integer and decimal keys; `"any_key_type"` also for text and timestamp keys, when the key column
 >   compares like the key table (no `char(n)`, special collation, domain); float keys never fold.
 > - `extend_query_with_partition_keys_lazy` needs `partition_datatype` for it (`apply_cache_lazy` reads it from the

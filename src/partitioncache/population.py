@@ -17,8 +17,10 @@ from typing import Any, Literal
 
 from partitioncache.apply_cache import (
     _TYPED_KEY_METHODS,
+    ColumnResolver,
     _check_fold_key_subqueries,
     _check_planner_collapse_limit,
+    catalog_column_resolver,
     extend_query_with_partition_keys,
     extend_query_with_partition_keys_lazy,
     get_partition_keys,
@@ -106,6 +108,7 @@ def restrict_with_cache(
     join_every_table: bool = False,
     planner_collapse_limit: int | None = None,
     fold_key_subqueries: bool | str = False,
+    fold_column_resolver: ColumnResolver | None = None,
 ) -> Restriction:
     """Restrict a query variant to the cached keys of its relaxations, with the lookup and extension functions of a query.
 
@@ -131,6 +134,9 @@ def restrict_with_cache(
             join_collapse_limit / from_collapse_limit = N.
         fold_key_subqueries: Key-table methods only: fold the variant's partition key subqueries into the key table
             (see ``extend_query_with_partition_keys``). The restricted variant returns the same keys either way.
+        fold_column_resolver: Decides whether an unqualified column of such a subquery binds inside it (see
+            ``catalog_column_resolver``); without it, such subqueries are not folded. pcache-monitor builds one per
+            variant on the queried database; populate_query_variants builds one from its db_handler.
 
     Raises:
         ValueError: For an unknown method, a key limit with lazy, a spatial or grid key, or join_every_table with
@@ -166,6 +172,7 @@ def restrict_with_cache(
             join_every_table=join_every_table,
             planner_collapse_limit=planner_collapse_limit,
             fold_key_subqueries=fold_key_subqueries,
+            fold_column_resolver=fold_column_resolver,
             partition_datatype=cache_handler.get_datatype(partition_key) if fold_key_subqueries else None,
         )
         return Restriction(restricted, restricted=True, generated=generated, hits=hits, method=method)
@@ -193,6 +200,7 @@ def restrict_with_cache(
         join_every_table=join_every_table,
         planner_collapse_limit=planner_collapse_limit,
         fold_key_subqueries=fold_key_subqueries,
+        fold_column_resolver=fold_column_resolver,
     )
     return Restriction(restricted, restricted=True, empty=not keys, generated=generated, hits=hits, keys=len(keys), method=method)
 
@@ -287,7 +295,8 @@ def populate_query_variants(
         planner_collapse_limit: Script methods and PostgreSQL only: restricted variants begin with SET LOCAL
             join_collapse_limit / from_collapse_limit = N. None (default) is off.
         fold_key_subqueries: Key-table methods only: fold each variant's partition key subqueries into its key table,
-            see ``extend_query_with_partition_keys``. The stored keys are the same either way.
+            see ``extend_query_with_partition_keys``. The stored keys are the same either way. Unqualified columns of
+            such subqueries are resolved through the catalog of ``db_handler`` (``catalog_column_resolver``).
 
     Returns:
         PopulationStats. An empty eager intersection means the variant has no rows; it is stored as an empty set
@@ -309,6 +318,8 @@ def populate_query_variants(
         _check_fold_key_subqueries(fold_key_subqueries, method, sql_dialect)
         if join_every_table and lookup_settings(variant_settings)["skip_partition_key_joins"]:
             raise ValueError("join_every_table needs every table joined on the partition key; variants without partition key joins are not")
+    # One resolver for the run, on the connection that executes the variants (its catalog, search_path, temporary tables)
+    fold_column_resolver = catalog_column_resolver(db_handler.execute, sql_dialect) if restrict and fold_key_subqueries else None
 
     stats = PopulationStats()
     for variant, variant_hash in order_variants_for_population(query_hash_pairs):
@@ -332,6 +343,7 @@ def populate_query_variants(
                     join_every_table=join_every_table,
                     planner_collapse_limit=planner_collapse_limit,
                     fold_key_subqueries=fold_key_subqueries,
+                    fold_column_resolver=fold_column_resolver,
                 )
             except Exception as e:
                 logger.warning(f"Cache lookup failed for variant {variant_hash}, it runs unrestricted: {e}")
