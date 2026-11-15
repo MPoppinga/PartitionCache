@@ -229,6 +229,9 @@ print(optimized)
 >   compares like the key table (no `char(n)`, special collation, domain); float keys never fold.
 > - `extend_query_with_partition_keys_lazy` needs `partition_datatype` for it (`apply_cache_lazy` reads it from the
 >   cache handler).
+> - Also in `restrict_with_cache` / `populate_query_variants` and as `pcache-monitor --fold-key-subqueries` /
+>   `pcache-add --fold-key-subqueries`: a restricted variant returns the same keys with and without folding, so the
+>   stored entries do not change.
 > - The key table is `<keys> INTERSECT <subquery> ...` on PostgreSQL, with the keys as a MATERIALIZED CTE and the
 >   table in the keys' type; SQLite and DuckDB filter with IN; other dialects raise `ValueError`.
 > - Design and equivalence argument: [fold_key_subqueries.md](fold_key_subqueries.md).

@@ -103,7 +103,10 @@ On the lazy path the keys are not known, so `extend_query_with_partition_keys_la
 - **Eviction (#45):** the lazy fallback to "all keys" still gives K ⊇ result, so T stays exact.
 
 - **Cost.** The folded subquery is evaluated completely in the setup, even when the main query would not have needed it (e.g. a cheap outer filter makes the result empty).
-- **Population.** `restrict_with_cache` / `populate_query_variants` stay without folding in v1. Their variants are generated SQL whose `key IN (subquery)` conditions the generator handles itself; folding there needs its own design.
+- **Population.** `restrict_with_cache` / `populate_query_variants` fold when asked (`pcache-monitor` / `pcache-add --fold-key-subqueries`).
+  - The variants are generated SQL. The generator keeps a `key IN (subquery)` condition with its subquery text, re-aliased to the variant's key alias, and also caches the subquery itself as a variant.
+  - The equivalence argument above does not depend on where the query comes from. A restricted variant returns the same keys with and without folding, so the stored entry is the same (test: `TestPopulation`).
+  - The subquery's own variant has no such condition, so nothing folds there.
 - **The konrad statement.** As quoted (`SELECT unnest(pocket_key) FROM ... WHERE prop_key = 39`), it has unqualified columns, so v1 leaves it inline. To fold it, the bench or the SQL generator must qualify the subquery's columns (`SELECT unnest(v.pocket_key) FROM view AS v WHERE v.prop_key = 39`). The alternative, a relaxed opt-in in which a misbinding makes the script fail but never loses rows silently, is for the author to decide.
 
 ## On a cache miss
@@ -217,4 +220,4 @@ The implementation is `_fold_key_subqueries`, `_unfoldable_reason`, `_key_compon
 
 **SQLite:** an integer key with a TEXT subquery column keeps its rows (the IN filter's affinity).
 
-The monitor and pcache-add flags, and with them folding in population, follow in a stacked PR with its own soundness note.
+The monitor and pcache-add flags and folding in population (`restrict_with_cache`, `populate_query_variants`) are in the stacked PR.

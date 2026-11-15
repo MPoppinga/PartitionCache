@@ -113,6 +113,14 @@ def main():
         "join_collapse_limit = N and from_collapse_limit = N (PostgreSQL only)",
     )
     mode_group.add_argument(
+        "--fold-key-subqueries",
+        nargs="?",
+        const="integer",
+        default=None,
+        choices=["integer", "any_key_type"],
+        help="With a TMP_TABLE_* or UNLOGGED_TABLE_* --restriction-method: fold partition key subqueries (key IN (subquery)) into the key table of a TMP_TABLE_* or UNLOGGED_TABLE_* method: integer and decimal keys; with any_key_type also text and timestamp keys",
+    )
+    mode_group.add_argument(
         "--join-every-table",
         action="store_true",
         default=False,
@@ -135,6 +143,8 @@ def main():
         parser.error("--max-restriction-keys must not be negative")
     if (args.restrict_variants or args.max_restriction_keys is not None) and not args.direct:
         parser.error("--restrict-variants and --max-restriction-keys require --direct")
+    if args.fold_key_subqueries is not None and not args.restriction_method.startswith(("TMP_TABLE", "UNLOGGED_TABLE")):
+        parser.error("--fold-key-subqueries needs a TMP_TABLE_* or UNLOGGED_TABLE_* --restriction-method")
     if args.join_every_table and args.restriction_method not in ("TMP_TABLE_JOIN", "UNLOGGED_TABLE_JOIN"):
         parser.error("--join-every-table needs --restriction-method TMP_TABLE_JOIN or UNLOGGED_TABLE_JOIN")
     if args.planner_collapse_limit is not None and (args.planner_collapse_limit < 1 or not args.restriction_method.startswith(("TMP_TABLE", "UNLOGGED_TABLE"))):
@@ -354,6 +364,7 @@ def main():
                         variant_settings=variant_settings,
                         join_every_table=args.join_every_table,
                         planner_collapse_limit=args.planner_collapse_limit,
+                        fold_key_subqueries={None: False, "integer": True}.get(args.fold_key_subqueries, args.fold_key_subqueries),
                     )
                     logger.info(f"Populated query variants: {stats}")
                     population_failed = bool(stats.failed or stats.store_failed)
