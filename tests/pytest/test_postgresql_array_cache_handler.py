@@ -598,3 +598,18 @@ def test_set_cache_lazy_keeps_the_keys_in_the_database(cache_handler):
     assert len(statement) == 1, "the DO block takes no parameters, so % in the query is not interpreted"
     assert "INTO v_keys" in statement[0] and "SELECT pk FROM t WHERE x = ''a''''b''" in statement[0]
     assert not any(event[0] in ("fetchone", "fetchall") for event in events[blocks[0]:]), "lazy insertion must not fetch keys"
+
+
+def test_prune_old_queries_binds_the_window_outside_a_literal(cache_handler):
+    """``interval '%s days'`` reached PostgreSQL as ``interval '$1 days'``, a literal read as 1 day; days_old went unused."""
+    import re
+
+    cache_handler.cursor.fetchall.return_value = []
+    cache_handler.prune_old_queries(days_old=30)
+
+    windowed = [c[0] for c in cache_handler.cursor.execute.call_args_list if len(c[0]) > 1 and c[0][1] == (30,)]
+    assert len(windowed) == 2
+    for statement, _ in windowed:
+        text = statement.as_string(None)
+        assert not re.search(r"'[^']*%s[^']*'", text), text
+        assert "make_interval(days => %s)" in text

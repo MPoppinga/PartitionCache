@@ -659,7 +659,7 @@ class PostgreSQLAbstractCacheHandler(ThreadSafeHandler, AbstractCacheHandler_Laz
         try:
             # Get queries older than specified days
             self.cursor.execute(
-                sql.SQL("SELECT partition_key, query_hash FROM {0} WHERE last_seen < now() - interval '%s days'").format(
+                sql.SQL("SELECT partition_key, query_hash FROM {0} WHERE last_seen < now() - make_interval(days => %s)").format(
                     sql.Identifier(self.tableprefix + "_queries")
                 ),
                 (days_old,),
@@ -678,7 +678,7 @@ class PostgreSQLAbstractCacheHandler(ThreadSafeHandler, AbstractCacheHandler_Laz
 
             # Delete from queries table
             self.cursor.execute(
-                sql.SQL("DELETE FROM {0} WHERE last_seen < now() - interval '%s days'").format(sql.Identifier(self.tableprefix + "_queries")), (days_old,)
+                sql.SQL("DELETE FROM {0} WHERE last_seen < now() - make_interval(days => %s)").format(sql.Identifier(self.tableprefix + "_queries")), (days_old,)
             )
 
             self.db.commit()
