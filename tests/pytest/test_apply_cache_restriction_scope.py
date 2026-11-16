@@ -1,0 +1,210 @@
+"""
+The restriction of apply_cache / apply_cache_lazy acts on the SELECT whose variants produced the keys, and only on it.
+
+Every test runs the original and the rewritten SQL on DuckDB and compares the rows. The cache is a fake handler that
+stores, for every variant the lookup generates, the keys of running that variant on the same DuckDB database, so a
+cache hit holds exactly what population would have stored.
+"""
+
+import re
+
+import pytest
+
+from partitioncache import query_processor
+from partitioncache.apply_cache import apply_cache, apply_cache_lazy
+from partitioncache.cache_handler.abstract import AbstractCacheHandler_Lazy
+
+duckdb = pytest.importorskip("duckdb")
+
+EAGER_METHODS = ["IN", "VALUES", "TMP_TABLE_IN", "TMP_TABLE_JOIN"]
+LAZY_METHODS = ["IN_SUBQUERY", "TMP_TABLE_IN", "TMP_TABLE_JOIN"]
+
+
+def _load(conn) -> None:
+    conn.execute("CREATE TABLE t (id INTEGER, pk INTEGER, x INTEGER, y INTEGER)")
+    conn.execute("INSERT INTO t SELECT i, i % 20, i % 7, i % 5 FROM range(1, 201) AS r(i)")
+    conn.execute("CREATE TABLE d (id INTEGER, z INTEGER)")
+    conn.execute("INSERT INTO d SELECT i, i % 3 FROM range(1, 201, 4) AS r(i)")
+    # Events in hour buckets (w); a pair's events are up to 30 minutes apart, so a pair can cross a bucket boundary
+    conn.execute("CREATE TABLE events (id INTEGER, w INTEGER, ts INTEGER, kind TEXT)")
+    conn.execute(
+        "INSERT INTO events VALUES (1, 0, 3500, 'login'), (2, 1, 3700, 'fail'), (3, 2, 7300, 'login'), (4, 2, 7400, 'fail'), "
+        "(5, 3, 11000, 'login'), (6, 4, 14500, 'fail'), (7, 5, 18100, 'login'), (8, 5, 18200, 'fail'), (9, 6, 21590, 'login'), "
+        "(10, 6, 21620, 'fail'), (11, 8, 28790, 'login'), (12, 8, 29000, 'fail')"
+    )
+
+
+class DuckCache(AbstractCacheHandler_Lazy):
+    """A cache whose entries are the keys of running each variant the lookup generates (see ``recording``)."""
+
+    def __init__(self, conn, variants: dict[str, str]):
+        self.conn = conn
+        self.variants = variants
+        self.entries: dict[str, set] = {}
+        conn.execute("CREATE TABLE IF NOT EXISTS pcache_entries (h TEXT, k INTEGER)")
+
+    def _entry(self, key: str) -> set | None:
+        if key not in self.entries and key in self.variants:
+            try:
+                rows = self.conn.execute(self.variants[key]).fetchall()
+            except duckdb.Error:
+                return None  # a variant DuckDB cannot run is not cached
+            self.entries[key] = {row[0] for row in rows if row[0] is not None}
+            self.conn.executemany("INSERT INTO pcache_entries VALUES (?, ?)", [(key, k) for k in self.entries[key]])
+        return self.entries.get(key)
+
+    def filter_existing_keys(self, keys, partition_key="partition_key"):
+        return {k for k in keys if self._entry(k) is not None}
+
+    def get(self, key, partition_key="partition_key"):
+        return self._entry(key)
+
+    def get_datatype(self, partition_key):
+        return "integer"
+
+    def get_intersected(self, keys, partition_key="partition_key"):
+        present = [self._entry(k) for k in sorted(self.filter_existing_keys(keys))]
+        return (set.intersection(*present), len(present)) if present else (None, 0)
+
+    def get_intersected_lazy(self, keys, partition_key="partition_key"):
+        present = sorted(self.filter_existing_keys(keys))
+        if not present:
+            return None, 0
+        members = " INTERSECT ".join(f"SELECT k AS {partition_key} FROM pcache_entries WHERE h = '{h}'" for h in present)
+        return f"SELECT * FROM ({members}) AS pcache_lazy", len(present)
+
+
+DuckCache.__abstractmethods__ = frozenset()
+
+
+@pytest.fixture
+def db(monkeypatch):
+    """(run, cache): run executes SQL on DuckDB and returns the sorted rows; the cache knows every generated variant."""
+    conn = duckdb.connect()
+    _load(conn)
+    variants: dict[str, str] = {}
+    generate = query_processor.generate_all_query_hash_pairs
+
+    def recording(*args, **kwargs):
+        pairs = generate(*args, **kwargs)
+        variants.update({h: q for q, h in pairs})
+        return pairs
+
+    monkeypatch.setattr(query_processor, "generate_all_query_hash_pairs", recording)
+
+    def run(sql: str) -> list[tuple]:
+        return sorted(conn.execute(sql).fetchall(), key=repr)
+
+    return run, DuckCache(conn, variants)
+
+
+def _eager(run, cache, query, method, **kwargs):
+    kwargs.setdefault("min_component_size", 1)  # single-table variants, so that the small queries get cache hits
+    rewritten, stats = apply_cache(query, cache, "pk", method=method, sql_dialect="duckdb", **kwargs)
+    return run(rewritten), stats, rewritten
+
+
+def _lazy(run, cache, query, method, **kwargs):
+    kwargs.setdefault("min_component_size", 1)
+    rewritten, stats = apply_cache_lazy(query, cache, "pk", method=method, sql_dialect="duckdb", **kwargs)
+    return run(rewritten), stats, rewritten
+
+
+SET_OPERATIONS = {
+    "union_first_branch_without_where": (
+        "SELECT p1.id FROM t AS p1 JOIN t AS p2 ON p1.pk = p2.pk AND p1.x = 3 AND p2.y = 1 UNION SELECT p1.id FROM t AS p1 WHERE p1.y = 2"
+    ),
+    "union_all": "SELECT p1.id FROM t AS p1 JOIN t AS p2 ON p1.pk = p2.pk AND p1.x = 3 AND p2.y = 1 UNION ALL SELECT p1.id FROM t AS p1 WHERE p1.y = 2",
+    # x is no function of the key: a restriction of the second branch removes the x the first branch has
+    "intersect": "SELECT p1.x FROM t AS p1 JOIN t AS p2 ON p1.pk = p2.pk AND p1.x = 3 AND p2.y = 1 INTERSECT SELECT p1.x FROM t AS p1 WHERE p1.y = 2",
+    "except": "SELECT p1.x FROM t AS p1 JOIN t AS p2 ON p1.pk = p2.pk AND p1.x = 3 AND p2.y = 1 EXCEPT SELECT p1.x FROM t AS p1 WHERE p1.y = 4",
+    "parenthesised_branches": (
+        "(SELECT p1.id FROM t AS p1 JOIN t AS p2 ON p1.pk = p2.pk AND p1.x = 3 AND p2.y = 1) UNION (SELECT p1.id FROM t AS p1 WHERE p1.y = 2)"
+    ),
+    "parenthesised_with_where": "(SELECT p1.id FROM t AS p1 WHERE p1.x = 3 AND p1.y = 1) UNION ALL (SELECT p1.id FROM t AS p1 WHERE p1.y = 2) ORDER BY 1",
+    "parenthesised_first_branch": (
+        "(SELECT p1.id FROM t AS p1 JOIN t AS p2 ON p1.pk = p2.pk AND p1.x = 3 AND p2.y = 1) UNION SELECT p1.id FROM t AS p1 WHERE p1.y = 2"
+    ),
+    "order_by_limit": (
+        "SELECT p1.id FROM t AS p1 JOIN t AS p2 ON p1.pk = p2.pk AND p1.x = 3 AND p2.y = 1 UNION SELECT p1.id FROM t AS p1 WHERE p1.y = 2 "
+        "ORDER BY 1 LIMIT 30"
+    ),
+    "three_branches": (
+        "SELECT p1.id FROM t AS p1 WHERE p1.x = 3 UNION SELECT p1.id FROM t AS p1 WHERE p1.y = 2 UNION SELECT p1.id FROM t AS p1 WHERE p1.y = 4"
+    ),
+    "except_with_where_in_both": "SELECT p1.pk FROM t AS p1 WHERE p1.x = 3 EXCEPT SELECT p1.pk FROM t AS p1 WHERE p1.y = 2",
+}
+# Variant generation reads these from another branch than the first (the first WHERE in breadth-first order): they run
+# without the cache
+UNCACHED_SET_OPERATIONS = {"parenthesised_branches", "parenthesised_first_branch", "three_branches"}
+
+
+@pytest.mark.parametrize("name", list(SET_OPERATIONS))
+class TestSetOperations:
+    @pytest.mark.parametrize("method", EAGER_METHODS)
+    def test_eager(self, db, name, method):
+        run, cache = db
+        query = SET_OPERATIONS[name]
+        rows, stats, rewritten = _eager(run, cache, query, method)
+        assert rows == run(query), rewritten
+        assert stats["enhanced"] == (name not in UNCACHED_SET_OPERATIONS)
+
+    @pytest.mark.parametrize("method", LAZY_METHODS)
+    def test_lazy(self, db, name, method):
+        run, cache = db
+        query = SET_OPERATIONS[name]
+        rows, stats, rewritten = _lazy(run, cache, query, method)
+        assert rows == run(query), rewritten
+        assert stats["enhanced"] == (name not in UNCACHED_SET_OPERATIONS)
+
+
+def test_the_restriction_goes_into_the_first_branch(db):
+    run, cache = db
+    query = SET_OPERATIONS["union_first_branch_without_where"]
+    _, stats, rewritten = _eager(run, cache, query, "IN")
+    assert stats["enhanced"] == 1
+    first, _, second = rewritten.partition(" UNION ")
+    assert "p1.pk IN (" in first and "p1.pk IN (" not in second
+
+
+def test_an_empty_intersection_restricts_the_first_branch_only(db):
+    run, cache = db
+    # y = pk % 5: no key has a row with y = 1 and one with y = 2, the intersection is empty
+    query = "SELECT p1.id FROM t AS p1 JOIN t AS p2 ON p1.pk = p2.pk AND p1.y = 1 AND p2.y = 2 UNION SELECT p1.id FROM t AS p1 WHERE p1.y = 2"
+    rows, stats, rewritten = _eager(run, cache, query, "IN")
+    assert stats["enhanced"] == 1
+    first, _, second = rewritten.partition(" UNION ")
+    assert "FALSE" in first.upper() and "FALSE" not in second.upper()
+    assert rows == run(query)
+
+
+SUBQUERY_REUSING_P1 = (
+    "SELECT p1.id FROM t AS p1 JOIN t AS p2 ON p1.pk = p2.pk WHERE p1.x = 3 AND p2.y = 1 "
+    "AND p1.y NOT IN (SELECT p1.y FROM d AS d1 JOIN t AS p1 ON d1.id = p1.id WHERE p1.pk = 4)"
+)
+UNION_REUSING_P1 = (
+    "SELECT p1.pk, p1.id FROM t AS p2 JOIN t AS p1 ON p1.pk = p2.pk WHERE p1.x = 3 AND p2.y = 1 "
+    "UNION ALL SELECT p1.pk, p1.id FROM d AS d1 JOIN t AS p1 ON d1.id = p1.id WHERE p1.y = 2"
+)
+EXISTS_REUSING_P1 = (
+    "SELECT p1.id FROM t AS p1 JOIN t AS p2 ON p1.pk = p2.pk WHERE p1.x = 3 AND p2.y = 1 "
+    "AND NOT EXISTS (SELECT 1 FROM d AS d1 JOIN t AS p1 ON d1.id = p1.id WHERE p1.id = p2.id + 1 AND p1.pk = 4)"
+)
+
+
+@pytest.mark.parametrize("query", [SUBQUERY_REUSING_P1, UNION_REUSING_P1, EXISTS_REUSING_P1], ids=["not_in", "union", "not_exists"])
+class TestJoinMethodsJoinOnlyTheRestrictedSelect:
+    def test_eager(self, db, query):
+        run, cache = db
+        for join_every_table in (False, True):
+            rows, _, rewritten = _eager(run, cache, query, "TMP_TABLE_JOIN", join_every_table=join_every_table)
+            assert rows == run(query), rewritten
+            assert len(re.findall(r"AS tmp_\w+ ON", rewritten)) == (2 if join_every_table else 1)
+
+    def test_lazy(self, db, query):
+        run, cache = db
+        for join_every_table in (False, True):
+            rows, _, rewritten = _lazy(run, cache, query, "TMP_TABLE_JOIN", join_every_table=join_every_table)
+            assert rows == run(query), rewritten
+            assert len(re.findall(r"AS tmp_\w+ ON", rewritten)) == (2 if join_every_table else 1)
+

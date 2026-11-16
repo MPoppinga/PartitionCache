@@ -177,6 +177,39 @@ def _intersect_dilated_fallback(
     return intersection, len(existing)
 
 
+def _first_branch_query(parsed: exp.Expr) -> str | None:
+    """The first SELECT of a set operation as a query of its own, with the statement's WITH clause; None if there is none."""
+    select = _restricted_select(parsed)
+    if select is None:
+        return None
+    branch = select.copy()
+    with_ = parsed.args.get("with_")
+    if with_ is not None and branch.args.get("with_") is None:
+        branch.set("with_", with_.copy())
+    return branch.sql()
+
+
+def _variants_of_first_branch(query: str, hashes: list[str], generate: Callable[[str], list[str]]) -> bool:
+    """Whether the variants of a set operation are variants of its first SELECT, the one the cache restricts; True for other queries.
+
+    Variant generation reads a set operation's tables from its first FROM and its conditions from the first WHERE in
+    breadth-first order, which is another branch's when the first branch is parenthesised or the operation chains three
+    branches. Such variants are no relaxations of the first branch, and their keys must not restrict it: the query then
+    runs without the cache. ``generate`` returns the hashes of a query with the lookup's settings.
+    """
+    try:
+        parsed = sqlglot.parse_one(query)
+    except sqlglot.errors.ParseError:
+        return True  # the variant generation parsed it; a parse error here leaves the decision to it
+    if not isinstance(parsed, exp.SetOperation) or not hashes:
+        return True
+    branch = _first_branch_query(parsed)
+    if branch is not None and set(hashes) <= set(generate(branch)):
+        return True
+    logger.warning("The variants of the set operation are not all variants of its first SELECT, which the cache restricts; the query runs without the cache")
+    return False
+
+
 def get_partition_keys(
     query: str,
     cache_handler: AbstractCacheHandler,
@@ -252,25 +285,27 @@ def get_partition_keys(
         skip_partition_key_joins = True
 
     # Generate all hashes for the given query (Only consider subqueries with two ore more components that are connected, allow modifying attributes)
-    cache_entry_hashes = generate_all_hashes(
-        partition_key_source_table=partition_key_source_table,
-        query=query,
-        partition_key=partition_key,
-        min_component_size=min_component_size,
-        follow_graph=follow_graph,
-        fix_attributes=keep_all_attributes,
-        canonicalize_queries=canonicalize_queries,
-        auto_detect_partition_join=auto_detect_partition_join,
-        partition_join_table=partition_join_table,
-        bucket_steps=bucket_steps,
-        add_constraints=add_constraints,
-        remove_constraints_all=remove_constraints_all,
-        remove_constraints_add=remove_constraints_add,
-        skip_partition_key_joins=skip_partition_key_joins,
-        geometry_column=geometry_column,
-        max_conditions_removed=max_conditions_removed,
-        protected_patterns=protected_patterns,
-    )
+    generation: dict[str, Any] = {
+        "partition_key_source_table": partition_key_source_table,
+        "partition_key": partition_key,
+        "min_component_size": min_component_size,
+        "follow_graph": follow_graph,
+        "fix_attributes": keep_all_attributes,
+        "canonicalize_queries": canonicalize_queries,
+        "auto_detect_partition_join": auto_detect_partition_join,
+        "partition_join_table": partition_join_table,
+        "bucket_steps": bucket_steps,
+        "add_constraints": add_constraints,
+        "remove_constraints_all": remove_constraints_all,
+        "remove_constraints_add": remove_constraints_add,
+        "skip_partition_key_joins": skip_partition_key_joins,
+        "geometry_column": geometry_column,
+        "max_conditions_removed": max_conditions_removed,
+        "protected_patterns": protected_patterns,
+    }
+    cache_entry_hashes = generate_all_hashes(query=query, **generation)
+    if not _variants_of_first_branch(query, cache_entry_hashes, lambda branch: generate_all_hashes(query=branch, **generation)):
+        return None, 0, 0
 
     logger.info(f"Found {len(cache_entry_hashes)} subqueries in query")
 
@@ -371,25 +406,27 @@ def get_partition_keys_lazy(
     if _is_temporal(temporal_bucket_width, dilation_buckets):
         skip_partition_key_joins = True
 
-    hashes = generate_all_hashes(
-        partition_key_source_table=partition_key_source_table,
-        query=query,
-        partition_key=partition_key,
-        min_component_size=min_component_size,
-        fix_attributes=keep_all_attributes,
-        canonicalize_queries=canonicalize_queries,
-        follow_graph=follow_graph,
-        auto_detect_partition_join=auto_detect_partition_join,
-        partition_join_table=partition_join_table,
-        bucket_steps=bucket_steps,
-        add_constraints=add_constraints,
-        remove_constraints_all=remove_constraints_all,
-        remove_constraints_add=remove_constraints_add,
-        skip_partition_key_joins=skip_partition_key_joins,
-        geometry_column=geometry_column,
-        max_conditions_removed=max_conditions_removed,
-        protected_patterns=protected_patterns,
-    )
+    generation: dict[str, Any] = {
+        "partition_key_source_table": partition_key_source_table,
+        "partition_key": partition_key,
+        "min_component_size": min_component_size,
+        "fix_attributes": keep_all_attributes,
+        "canonicalize_queries": canonicalize_queries,
+        "follow_graph": follow_graph,
+        "auto_detect_partition_join": auto_detect_partition_join,
+        "partition_join_table": partition_join_table,
+        "bucket_steps": bucket_steps,
+        "add_constraints": add_constraints,
+        "remove_constraints_all": remove_constraints_all,
+        "remove_constraints_add": remove_constraints_add,
+        "skip_partition_key_joins": skip_partition_key_joins,
+        "geometry_column": geometry_column,
+        "max_conditions_removed": max_conditions_removed,
+        "protected_patterns": protected_patterns,
+    }
+    hashes = generate_all_hashes(query=query, **generation)
+    if not _variants_of_first_branch(query, hashes, lambda branch: generate_all_hashes(query=branch, **generation)):
+        return None, 0, 0
 
     if dilation > 0:
         lazy_cache_subquery, used_hashes = cache_handler.get_intersected_dilated_lazy(set(hashes), partition_key, dilation)  # type: ignore[attr-defined]
@@ -658,25 +695,59 @@ def _splice_key_list(rendered_sql: str, sentinel: str, key_list: str) -> str:
     return rendered_sql.replace(sentinel, key_list, 1)
 
 
+def _restricted_select(parsed_query: exp.Expr) -> exp.Select | None:
+    """Return the SELECT the cache restricts: the query itself, or the first branch of a set operation.
+
+    The variants are generated from the first SELECT of a set operation, so their keys restrict that branch only;
+    a restriction in another branch drops rows of a UNION and adds rows to an EXCEPT. Parentheses around a branch
+    are looked through. None when the first branch is not a SELECT (VALUES, for one).
+    """
+    node = parsed_query
+    while not isinstance(node, exp.Select):
+        if isinstance(node, exp.SetOperation | exp.Subquery | exp.Paren):
+            node = node.this
+        else:
+            return None
+    return node
+
+
 def _outer_where(parsed_query: exp.Expr) -> exp.Where | None:
-    """Return the WHERE clause of the outermost SELECT, not one of a FILTER, subquery or CTE.
+    """Return the WHERE clause of the restricted SELECT (``_restricted_select``), not one of a FILTER, subquery or CTE.
 
     ``find(exp.Where)`` returns the first WHERE anywhere in the tree, so a query without an outer WHERE got the
-    condition in a nested one. Set operations have no WHERE of their own; they keep the first nested one.
+    condition in a nested one, and a set operation whose first branch has no WHERE got it in another branch.
     """
-    if isinstance(parsed_query, exp.Select):
-        return parsed_query.args.get("where")
-    return parsed_query.find(exp.Where)
+    select = _restricted_select(parsed_query)
+    return select.args.get("where") if select is not None else None
 
 
 def _add_where_condition(parsed_query: exp.Expr, condition_expr: exp.Expr) -> None:
-    """Add a WHERE condition to the outermost SELECT of a parsed query, creating the WHERE clause if needed."""
-    existing_where: exp.Where | None = _outer_where(parsed_query)
+    """Add a WHERE condition to the restricted SELECT of a parsed query, creating its WHERE clause if needed.
+
+    Raises:
+        ValueError: When the query has no restricted SELECT (``_restricted_select``).
+    """
+    select = _restricted_select(parsed_query)
+    if select is None:
+        raise ValueError(f"The query has no SELECT to restrict (first branch: {type(parsed_query).__name__}); run it without the cache")
+    existing_where: exp.Where | None = select.args.get("where")
     if existing_where is None:
-        new_where = exp.Where(this=condition_expr)
-        parsed_query.args["where"] = new_where
+        select.set("where", exp.Where(this=condition_expr))
     else:
         existing_where.args["this"] = exp.and_(existing_where.args["this"], condition_expr)
+
+
+def _from_clauses(parsed_query: exp.Expr) -> list[exp.Join | exp.From]:
+    """The top-level JOIN clauses and the FROM clause of the restricted SELECT (``_restricted_select``).
+
+    These are the tables the JOIN methods may join the key table to: a table of a subquery, a CTE or another branch of a
+    set operation is not restricted by the cached keys, even when it reuses the p0 alias.
+    """
+    select = _restricted_select(parsed_query)
+    if select is None:
+        return []
+    from_ = select.args.get("from_")
+    return [*(select.args.get("joins") or []), *([from_] if from_ is not None else [])]
 
 
 EMPTY_INTERSECTION_COMMENT = "PartitionCache: cache intersection is empty, query cannot return rows"
@@ -689,16 +760,17 @@ def _add_empty_intersection_condition(query: str, sql_dialect: str = "postgres")
     intersection of valid entries means the query has no result. The empty set itself cannot be
     expressed with the regular methods (``IN ()`` is invalid SQL, ``VALUES`` needs at least one row,
     and an empty temporary table has no known key type), so a commented ``FALSE`` condition is added
-    to the outermost WHERE instead. The query shape is kept, so aggregates still return their
-    empty-input result (e.g. ``COUNT(*) = 0``).
+    to the WHERE of the restricted SELECT (the first branch of a set operation) instead. The query shape
+    is kept, so aggregates still return their empty-input result (e.g. ``COUNT(*) = 0``).
     """
     parsed_query = sqlglot.parse_one(query, read=sql_dialect)
+    select = _restricted_select(parsed_query)
+    if select is None:
+        logger.warning("The query has no SELECT to restrict to no rows; it runs without the cache")
+        return query
     condition = exp.false()
     condition.add_comments([EMPTY_INTERSECTION_COMMENT])
-    if isinstance(parsed_query, exp.Select):
-        parsed_query.where(condition, copy=False)
-    else:
-        _add_where_condition(parsed_query, condition)
+    select.where(condition, copy=False)
     return parsed_query.sql(dialect=sql_dialect)
 
 
@@ -814,10 +886,7 @@ def _every_table_joined_on_partition_key(parsed_query: exp.Expr, partition_key: 
     Only then is joining every table to the keys equivalent to joining the p0 table: through the equalities, every
     table's key equals the p0 table's. Equalities under OR or NOT do not hold for every row and do not count.
     """
-    clauses: list[exp.Join | exp.From] = list(parsed_query.find_all(exp.Join))
-    from_1st = parsed_query.find(exp.From)
-    if from_1st is not None:
-        clauses.append(from_1st)
+    clauses = _from_clauses(parsed_query)
     aliases = {clause.alias_or_name for clause in clauses}
     if len(aliases) <= 1:
         return True
@@ -836,7 +905,7 @@ def _every_table_joined_on_partition_key(parsed_query: exp.Expr, partition_key: 
 
     where = _outer_where(parsed_query)
     collect(where.this if where is not None else None)
-    for join in parsed_query.find_all(exp.Join):
+    for join in clauses:
         collect(join.args.get("on"))
 
     component = {alias: alias for alias in aliases}
@@ -1612,15 +1681,8 @@ def extend_query_with_partition_keys(
         else:
             tmp_table_setup, table_name = _create_tmp_table_setup(partition_keys, analyze_tmp_table, sql_dialect, key_filters)
 
-        # Add as inner join to the p0 table, or with join_every_table to every table
-        from_clauses: list[exp.Join | exp.From] = list(parsed_query.find_all(exp.Join))
-
-        # Add first table from FROM as not present in JOINs
-        from_1st = parsed_query.find(exp.From)
-        if from_1st is not None:
-            from_clauses.append(from_1st)
-
-        for from_clause in from_clauses:
+        # Add as inner join to the p0 table, or with join_every_table to every table, of the restricted SELECT only
+        for from_clause in _from_clauses(parsed_query):
             # Get alias of the table
             table_alias = from_clause.alias_or_name
 
@@ -1704,17 +1766,11 @@ def _all_partition_keys_sql(parsed_query: exp.Expr, p0_alias: str | None, partit
     method and join_every_table (no alias) every table of the FROM and JOIN clauses. Returns None when a target is not a
     plain table (a subquery or a CTE, whose rows a separate statement could not read).
     """
-    targets: list[exp.Expr]
+    # The same clauses TMP_TABLE_JOIN joins the key table to
+    clauses = _from_clauses(parsed_query)
     if p0_alias is not None:
-        targets = [table for table in parsed_query.find_all(exp.Table) if table.alias_or_name == p0_alias]
-        del targets[1:]  # the first table with that alias
-    else:
-        # The same clauses TMP_TABLE_JOIN joins the temporary table to
-        clauses: list[exp.Join | exp.From] = list(parsed_query.find_all(exp.Join))
-        from_1st = parsed_query.find(exp.From)
-        if from_1st is not None:
-            clauses.append(from_1st)
-        targets = [clause.this for clause in clauses]
+        clauses = [clause for clause in clauses if clause.alias_or_name == p0_alias][:1]
+    targets: list[exp.Expr] = [clause.this for clause in clauses]
     cte_names = {cte.alias_or_name for cte in parsed_query.find_all(exp.CTE)}
     if not targets or any(not isinstance(target, exp.Table) or target.name in cte_names for target in targets):
         return None
@@ -1848,15 +1904,8 @@ def extend_query_with_partition_keys_lazy(
         else:
             tmp_table_setup, table_name = _create_tmp_table_setup_from_subquery(lazy_subquery, partition_key, analyze_tmp_table, sql_dialect, key_filters)
 
-        # Add as inner join to the p0 table, or with join_every_table to every table
-        from_clauses: list[exp.Join | exp.From] = list(parsed_query.find_all(exp.Join))
-
-        # Add first table from FROM as not present in JOINs
-        from_1st = parsed_query.find(exp.From)
-        if from_1st is not None:
-            from_clauses.append(from_1st)
-
-        for from_clause in from_clauses:
+        # Add as inner join to the p0 table, or with join_every_table to every table, of the restricted SELECT only
+        for from_clause in _from_clauses(parsed_query):
             # Get alias of the table
             table_alias = from_clause.alias_or_name
 
