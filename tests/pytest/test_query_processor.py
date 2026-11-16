@@ -726,16 +726,16 @@ class TestPartitionKeyConditionClassification:
     """Only conditions on <alias>.<partition key> itself hold for every variant; anything else keeps its alias."""
 
     POINTS_QUERY = """
-    SELECT a.pocket_key FROM points AS a, points AS b, points AS c
-    WHERE a.pocket_key = b.pocket_key AND b.pocket_key = c.pocket_key
+    SELECT a.region_id FROM points AS a, points AS b, points AS c
+    WHERE a.region_id = b.region_id AND b.region_id = c.region_id
       AND a.type = 1 AND b.type = 2 AND c.type = 3
       AND DIST(a.x, b.x) <= 2.0 AND DIST(b.x, c.x) <= 2.0
-      AND NOT EXISTS (SELECT 1 FROM points AS x WHERE DIST(x.x, a.x) <= 3.5 AND a.pocket_key = x.pocket_key AND x.type = 9)
+      AND NOT EXISTS (SELECT 1 FROM points AS x WHERE DIST(x.x, a.x) <= 3.5 AND a.region_id = x.region_id AND x.type = 9)
     """
 
     def test_correlated_not_exists_stays_on_its_alias(self):
-        """Attached to b, the NOT EXISTS would drop pockets where b (not a) has a type-9 neighbour: false negatives."""
-        variants = _variants(self.POINTS_QUERY, "pocket_key")
+        """Attached to b, the NOT EXISTS would drop regions where b (not a) has a type-9 neighbour: false negatives."""
+        variants = _variants(self.POINTS_QUERY, "region_id")
         with_not_exists = [v for v in variants if "NOT EXISTS" in v]
         assert with_not_exists
         for variant in with_not_exists:
@@ -746,7 +746,7 @@ class TestPartitionKeyConditionClassification:
             assert correlated == type_1, variant
 
     def test_every_variant_is_a_query_on_its_own_aliases(self):
-        for variant in _variants(self.POINTS_QUERY, "pocket_key"):
+        for variant in _variants(self.POINTS_QUERY, "region_id"):
             assert variant.startswith("SELECT DISTINCT"), variant
             assert _references_only_own_aliases(variant), variant
 
