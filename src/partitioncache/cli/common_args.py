@@ -220,7 +220,7 @@ def add_size_priority_arg(group: argparse.ArgumentParser | argparse._ArgumentGro
         "--size-priority",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="Pop the smaller query variants of all queued queries first: priority 1000 * (10 - tables) + 1 in the PostgreSQL "
+        help="Pop the smaller query variants of all queued queries first: priority 10 - tables in the PostgreSQL "
         "variant queue (default: on, or QUERY_QUEUE_SIZE_PRIORITY). --no-size-priority pushes every variant with priority 1",
     )
 

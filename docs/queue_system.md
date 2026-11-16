@@ -248,13 +248,18 @@ By default the variant queue pops the smaller variants of **all** queued queries
 query. A new variant gets the priority
 
 ```
-1000 * (10 - number of tables in its outer FROM) + 1
+10 - number of tables in its outer FROM
 ```
 
-so a 1-table variant gets 9001, a 3-table variant 7001, and a variant with more than 10 tables a priority of 0 or
-below (the column is a signed INTEGER, so the order still holds). A push of a variant that is already waiting adds 1,
-as without size priority. The size therefore decides first; among variants of one size the more often pushed one
-pops first, then the older one. A re-push lifts a variant past a smaller one only after 999 pushes.
+so a 1-table variant gets 9, a 3-table variant 7, and a variant with more than 10 tables a priority below 0 (the
+column is a signed INTEGER, so the order still holds). A push of a variant that is already waiting adds 1, as without
+size priority. A query that is pushed again pushes all its variants again, its smaller sub-variants included, so they
+all gain 1 and keep their order. The variants of a query that is pushed more often can pop before smaller variants of
+other queries; at equal priority the older variant pops first. The order is not fair across sizes: while small
+variants keep arriving, large ones wait.
+
+Use the same setting for all clients of one queue: variants pushed with it off get priority 1 and wait behind every
+sized variant of up to 9 tables.
 
 Conditions do not enter the priority: `pcache-add --queue` and `pcache-monitor` push each query's variants in
 `order_variants_for_population` order (tables, then conditions), and variants of one size and one query keep that

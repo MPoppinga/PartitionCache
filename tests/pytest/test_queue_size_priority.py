@@ -20,27 +20,23 @@ def _fragment(tables: int, conditions: int = 1) -> str:
 
 class TestPriorityValue:
     def test_size_decides(self):
-        assert fragment_size_priority(_fragment(1)) == 9001
-        assert fragment_size_priority(_fragment(3)) == 7001
-        assert fragment_size_priority(_fragment(10)) == 1
+        assert fragment_size_priority(_fragment(1)) == 9
+        assert fragment_size_priority(_fragment(3)) == 7
+        assert fragment_size_priority(_fragment(10)) == 0
 
     def test_more_than_ten_tables_is_negative_and_still_ordered(self):
-        assert fragment_size_priority(_fragment(11)) == -999
-        assert fragment_size_priority(_fragment(12)) == -1999
+        assert fragment_size_priority(_fragment(11)) == -1
+        assert fragment_size_priority(_fragment(12)) == -2
         assert fragment_size_priority(_fragment(12)) < fragment_size_priority(_fragment(11)) < fragment_size_priority(_fragment(10))
 
     def test_conditions_and_subquery_tables_do_not_count(self):
         assert fragment_size_priority(_fragment(2, conditions=5)) == fragment_size_priority(_fragment(2, conditions=1))
         with_subquery = "SELECT DISTINCT t1.region_id FROM readings AS t1 WHERE t1.region_id IN (SELECT r.region_id FROM regions AS r, stores AS s)"
-        assert fragment_size_priority(with_subquery) == 9001
+        assert fragment_size_priority(with_subquery) == 9
 
     def test_not_a_select_keeps_priority_one(self):
         assert fragment_size_priority("SELECT a FROM x UNION SELECT a FROM y") == 1
         assert fragment_size_priority("this is not sql (") == 1
-
-    def test_repeats_stay_below_one_size_band(self):
-        # 998 re-pushes of a 3-table fragment stay below a new 2-table fragment
-        assert fragment_size_priority(_fragment(3)) + 998 < fragment_size_priority(_fragment(2))
 
 
 class TestSwitch:
@@ -97,8 +93,8 @@ class TestPushStatements:
         assert batch.args[1][4] == [1, 1, 1], "the batch itself is the same as without size priority"
         statement, params = lift.args
         assert "priority = q.priority - 1 + s.priority" in statement.as_string(None)
-        assert "q.created_at = CURRENT_TIMESTAMP" in statement.as_string(None)
-        assert params == (["h3"], [7001], "pk")
+        assert "q.created_at = LOCALTIMESTAMP" in statement.as_string(None)
+        assert params == (["h3"], [7], "pk")
 
     def test_on_is_the_default(self, monkeypatch):
         monkeypatch.delenv(SIZE_PRIORITY_ENV, raising=False)
@@ -108,7 +104,7 @@ class TestPushStatements:
         assert handler.push_to_query_fragment_queue([(_fragment(1), "h1")], "pk", "integer")
 
         assert cursor.execute.call_count == 2
-        assert cursor.execute.call_args.args[1] == (["h1"], [9001], "pk")
+        assert cursor.execute.call_args.args[1] == (["h1"], [9], "pk")
 
     def test_environment_turns_it_off(self, monkeypatch):
         monkeypatch.setenv(SIZE_PRIORITY_ENV, "false")
@@ -119,7 +115,7 @@ class TestPushStatements:
 
         assert cursor.execute.call_count == 1
 
-    @pytest.mark.parametrize("size_priority,expected", [(True, [7001, 9001]), (False, [1, 1])])
+    @pytest.mark.parametrize("size_priority,expected", [(True, [7, 9]), (False, [1, 1])])
     def test_fallback_inserts_with_the_size_priority_and_adds_one_on_conflict(self, size_priority, expected):
         handler, _, cursor = _mocked_handler()
         cursor.execute.side_effect = [RuntimeError("helper unavailable"), None, None]
@@ -271,7 +267,7 @@ class TestAgainstPostgreSQL:
         assert queue.push_to_query_fragment_queue(self.QUERY_A, "region_id", "integer", size_priority=True)
         assert queue.push_to_query_fragment_queue(self.QUERY_B, "region_id", "integer", size_priority=True)
 
-        assert self._priorities(queue) == {"a1": 9001, "b1": 9001, "a2": 8001, "b2": 8001, "a3": 7001}
+        assert self._priorities(queue) == {"a1": 9, "b1": 9, "a2": 8, "b2": 8, "a3": 7}
         assert self._pop_all(queue) == ["a1", "b1", "a2", "b2", "a3"]
 
     def test_off_pops_in_push_order(self, queue, push_path):
@@ -281,32 +277,36 @@ class TestAgainstPostgreSQL:
         assert set(self._priorities(queue).values()) == {1}
         assert self._pop_all(queue) == ["a1", "a2", "a3", "b1", "b2"]
 
-    def test_a_repush_adds_one_and_wins_only_within_its_size(self, queue, push_path):
+    def test_a_query_pushed_again_keeps_its_order_and_gains_one(self, queue, push_path):
         assert queue.push_to_query_fragment_queue(self.QUERY_A, "region_id", "integer", size_priority=True)
         assert queue.push_to_query_fragment_queue(self.QUERY_B, "region_id", "integer", size_priority=True)
-        # Query B again: its fragments are waiting, so each gets +1
-        assert queue.push_to_query_fragment_queue(self.QUERY_B, "region_id", "integer", size_priority=True)
+        # Query A again: all its fragments are waiting, its smaller sub-fragments included, so each gets +1
+        assert queue.push_to_query_fragment_queue(self.QUERY_A, "region_id", "integer", size_priority=True)
 
-        assert self._priorities(queue) == {"a1": 9001, "b1": 9002, "a2": 8001, "b2": 8002, "a3": 7001}
-        assert self._pop_all(queue) == ["b1", "a1", "b2", "a2", "a3"]
+        assert self._priorities(queue) == {"a1": 10, "a2": 9, "a3": 8, "b1": 9, "b2": 8}
+        popped = self._pop_all(queue)
+        assert [h for h in popped if h.startswith("a")] == ["a1", "a2", "a3"]
+        assert [h for h in popped if h.startswith("b")] == ["b1", "b2"]
+        # At equal priority the older fragment pops first: a2 before b1, a3 before b2
+        assert popped == ["a1", "a2", "b1", "a3", "b2"]
 
     def test_a_repush_within_one_push_adds_one(self, queue, push_path):
         assert queue.push_to_query_fragment_queue([(_fragment(2), "x"), (_fragment(2), "x")], "region_id", "integer", size_priority=True)
 
-        assert self._priorities(queue) == {"x": 8002}
+        assert self._priorities(queue) == {"x": 9}
 
     def test_more_than_ten_tables_pops_last(self, queue, push_path):
         large = [(_fragment(12), "t12"), (_fragment(11), "t11")]
         assert queue.push_to_query_fragment_queue(large + self.QUERY_A, "region_id", "integer", size_priority=True)
 
-        assert self._priorities(queue)["t12"] == -1999
+        assert self._priorities(queue)["t12"] == -2
         assert self._pop_all(queue) == ["a1", "a2", "a3", "t11", "t12"]
 
     def test_explicit_priority_is_kept(self, queue, push_path):
         assert queue.push_to_query_fragment_queue(self.QUERY_A, "region_id", "integer", size_priority=True)
-        assert queue.push_to_query_fragment_queue_with_priority([(_fragment(3), "urgent")], "region_id", 20000, "integer")
+        assert queue.push_to_query_fragment_queue_with_priority([(_fragment(3), "urgent")], "region_id", 100, "integer")
 
-        assert self._priorities(queue)["urgent"] == 20000
+        assert self._priorities(queue)["urgent"] == 100
         assert self._pop_all(queue)[0] == "urgent"
 
     def test_a_fragment_another_session_created_is_not_lifted(self, queue):

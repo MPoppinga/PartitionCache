@@ -341,7 +341,7 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
             partition_datatype (str): The datatype of the partition key (default: None).
             cache_backend (str): The cache backend to use for processing (default: None, uses processor config).
             size_priority (bool): Pop the smaller fragments of all queries first (see ``queue_handler.size_priority``): a new
-                fragment gets 1000 * (10 - its tables) + 1. False pushes every fragment with priority 1.
+                fragment gets 10 - its tables. False pushes every fragment with priority 1.
                 Either way a push of a waiting fragment adds 1. None reads QUERY_QUEUE_SIZE_PRIORITY (default on).
 
         Returns:
@@ -427,7 +427,8 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
         the batch runs with priority 1 (+1 per re-push, as without size priority) and the created rows are lifted here.
         Rows created by this transaction are not visible to other sessions yet. A row another session created while
         the helper looked (reported as inserted, but updated through ON CONFLICT) keeps its own created_at, so the
-        created_at test leaves it at +1.
+        created_at test leaves it at +1. The helper stores CURRENT_TIMESTAMP into the TIMESTAMP column, which is
+        LOCALTIMESTAMP; comparing in the column's type avoids converting back in a repeated daylight saving hour.
         """
         created = [query_hash_pairs[idx - 1] for idx, _, _, status in results if status == "inserted"]
         if not created:
@@ -436,7 +437,7 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
             sql.SQL("""
             UPDATE {table} AS q SET priority = q.priority - 1 + s.priority
             FROM unnest(%s::text[], %s::int[]) AS s(hash, priority)
-            WHERE q.hash = s.hash AND q.partition_key = %s AND q.created_at = CURRENT_TIMESTAMP
+            WHERE q.hash = s.hash AND q.partition_key = %s AND q.created_at = LOCALTIMESTAMP
         """).format(table=sql.Identifier(self.fragment_queue_table)),
             ([hash_value for _, hash_value in created], [fragment_size_priority(query) for query, _ in created], partition_key),
         )
