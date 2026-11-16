@@ -289,7 +289,7 @@ Lazy counterpart to `extend_query_with_partition_keys`: integrates a lazy SQL su
 - `canonicalize_queries` (bool, optional): Whether to canonicalize queries before hashing (default: False)
 - `follow_graph` (bool, optional): Whether to follow the query graph for generating variants (default: True)
 - `analyze_tmp_table` (bool, optional): Enable temp table analysis (default: True)
-- `sql_dialect` (str, optional): sqlglot dialect used to parse and render non-spatial queries (default: `"postgres"`; use `"duckdb"` for DuckDB queries)
+- `sql_dialect` (str, optional): sqlglot dialect used to parse and render the query (default: `"postgres"`; use `"duckdb"` for DuckDB queries). The spatial mode (`geometry_column`) supports PostgreSQL only and raises `ValueError` for another dialect
 - `use_p0_table` (bool, optional): Rewrite the query to use a p0 table/star-schema (default: False)
 - `p0_table_name` (str | None, optional): Name of the p0 table. Defaults to `{partition_key}_mv`
 - `auto_detect_partition_join` (bool, optional): Whether to auto-detect partition-join tables (default: True)
@@ -444,7 +444,7 @@ With `geometry_column`, each cached fragment is a region (the geometries of the 
 
 #### `apply_cache(query, cache_handler, partition_key, ..., geometry_column=None, buffer_distance=None)`
 
-Applies partition cache to a query using regular (non-lazy) cache handlers. Supports spatial mode. Accepts the same `cost_estimator` / `min_query_cost` gate and `join_every_table` option as `apply_cache_lazy`. Like `apply_cache_lazy`, it takes `sql_dialect` (default `"postgres"`), the sqlglot dialect the enhanced non-spatial query is parsed and rendered in.
+Applies partition cache to a query using regular (non-lazy) cache handlers. Supports spatial mode. Accepts the same `cost_estimator` / `min_query_cost` gate and `join_every_table` option as `apply_cache_lazy`. Like `apply_cache_lazy`, it takes `sql_dialect` (default `"postgres"`), the sqlglot dialect the enhanced query is parsed and rendered in (spatial mode: PostgreSQL only).
 
 **Spatial Parameters** (in addition to standard parameters):
 - `geometry_column` (str | None, optional): Enables spatial mode. Requires a spatial cache handler with `get_spatial_filter()` method. Sound for point geometries only.
@@ -493,7 +493,7 @@ Extends a SQL query with a spatial filter using a lazy SQL subquery that produce
 **Returns:**
 - `str`: The extended SQL query with spatial filter.
 
-Both spatial extension functions additionally accept `use_intersects`, `spatial_method`, `subdivide_max_vertices`, `auto_detect_partition_join`, and `partition_join_table`.
+Both spatial extension functions additionally accept `use_intersects`, `spatial_method`, `subdivide_max_vertices`, `auto_detect_partition_join`, and `partition_join_table`. All spatial extension functions (also the H3 ones below) take `sql_dialect` (default `"postgres"`), the dialect the query is parsed and rendered in; their output is PostgreSQL/PostGIS SQL.
 
 #### `extend_query_with_h3_cell_filter_lazy(query, cell_sql, geometry_column, srid, resolution, p0_alias=None)`
 

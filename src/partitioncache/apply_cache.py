@@ -176,6 +176,12 @@ def _bounded_spatial_fragments(
     return diameter, usable
 
 
+def _check_spatial_dialect(sql_dialect: str) -> None:
+    """The spatial rewrite emits PostGIS functions and PostgreSQL temporary tables; other dialects are refused."""
+    if sql_dialect != "postgres":
+        raise ValueError(f"the spatial cache (geometry_column) rewrites queries for PostgreSQL/PostGIS, not for SQL dialect {sql_dialect!r}")
+
+
 def _is_temporal(temporal_bucket_width: float | None, dilation_buckets: int | None) -> bool:
     """Whether the partition key is a time bucket; its variants are then generated without partition key joins.
 
@@ -1977,6 +1983,7 @@ def extend_query_with_spatial_filter_lazy(
     use_intersects: bool = False,
     spatial_method: Literal["SUBDIVIDE_INLINE", "SUBDIVIDE_TMP_TABLE", "DUMP_TMP_TABLE", "DUMP_CTE"] = "SUBDIVIDE_TMP_TABLE",
     subdivide_max_vertices: int = 256,
+    sql_dialect: str = "postgres",
 ) -> str:
     """
     Extend a SQL query with a spatial filter using ST_DWithin or ST_Intersects.
@@ -2012,6 +2019,8 @@ def extend_query_with_spatial_filter_lazy(
         subdivide_max_vertices: Maximum vertices per subdivided piece (default 256). Lower values
             create more, smaller pieces with tighter bounding boxes for better GiST selectivity.
             Only used by SUBDIVIDE_* methods.
+        sql_dialect: sqlglot dialect the query is parsed and rendered in, and the condition added to it. Defaults to
+            PostgreSQL, the only database the spatial rewrite supports (it uses PostGIS and PostgreSQL temporary tables).
 
     Returns:
         The extended SQL query with spatial filter.
@@ -2021,7 +2030,7 @@ def extend_query_with_spatial_filter_lazy(
 
     if p0_alias is None:
         # Find the first table in the query as fallback
-        parsed_query = sqlglot.parse_one(query)
+        parsed_query = sqlglot.parse_one(query, read=sql_dialect)
         first_table = parsed_query.find(exp.Table)
         if first_table is None:
             raise ValueError("No table found in query")
@@ -2067,10 +2076,10 @@ def extend_query_with_spatial_filter_lazy(
                 f"WHERE ST_DWithin({p0_alias}.{geometry_column}, sf.geom, {buffer_distance}))"
             )
 
-        parsed_query = sqlglot.parse_one(query)
-        spatial_expr = sqlglot.parse_one(spatial_condition)
+        parsed_query = sqlglot.parse_one(query, read=sql_dialect)
+        spatial_expr = sqlglot.parse_one(spatial_condition, read=sql_dialect)
         _add_where_condition(parsed_query, spatial_expr)
-        return prep_sql + parsed_query.sql()
+        return prep_sql + parsed_query.sql(dialect=sql_dialect)
 
     elif spatial_method == "DUMP_TMP_TABLE":
         # ST_Dump into temp table + GiST index. No ST_Subdivide — preserves original geometry pieces.
@@ -2111,10 +2120,10 @@ def extend_query_with_spatial_filter_lazy(
                 f"WHERE ST_DWithin({p0_alias}.{geometry_column}, sf.geom, {buffer_distance}))"
             )
 
-        parsed_query = sqlglot.parse_one(query)
-        spatial_expr = sqlglot.parse_one(spatial_condition)
+        parsed_query = sqlglot.parse_one(query, read=sql_dialect)
+        spatial_expr = sqlglot.parse_one(spatial_condition, read=sql_dialect)
         _add_where_condition(parsed_query, spatial_expr)
-        return prep_sql + parsed_query.sql()
+        return prep_sql + parsed_query.sql(dialect=sql_dialect)
 
     elif spatial_method == "DUMP_CTE":
         # ST_Dump in CTE MATERIALIZED — no temp table, no GiST index.
@@ -2150,10 +2159,10 @@ def extend_query_with_spatial_filter_lazy(
                 f"WHERE ST_DWithin({p0_alias}.{geometry_column}, sf.geom, {buffer_distance}))"
             )
 
-        parsed_query = sqlglot.parse_one(query)
-        spatial_expr = sqlglot.parse_one(spatial_condition)
+        parsed_query = sqlglot.parse_one(query, read=sql_dialect)
+        spatial_expr = sqlglot.parse_one(spatial_condition, read=sql_dialect)
         _add_where_condition(parsed_query, spatial_expr)
-        return cte_sql + parsed_query.sql()
+        return cte_sql + parsed_query.sql(dialect=sql_dialect)
 
     else:  # SUBDIVIDE_INLINE
         # Use ST_Subdivide directly (handles multi-geometries internally).
@@ -2185,10 +2194,10 @@ def extend_query_with_spatial_filter_lazy(
                 f"WHERE ST_DWithin({p0_alias}.{geometry_column}, _pcache_sf, {buffer_distance}))"
             )
 
-        parsed_query = sqlglot.parse_one(query)
-        spatial_expr = sqlglot.parse_one(spatial_condition)
+        parsed_query = sqlglot.parse_one(query, read=sql_dialect)
+        spatial_expr = sqlglot.parse_one(spatial_condition, read=sql_dialect)
         _add_where_condition(parsed_query, spatial_expr)
-        return parsed_query.sql()
+        return parsed_query.sql(dialect=sql_dialect)
 
 
 def extend_query_with_spatial_filter(
@@ -2203,6 +2212,7 @@ def extend_query_with_spatial_filter(
     use_intersects: bool = False,
     spatial_method: Literal["SUBDIVIDE_INLINE", "SUBDIVIDE_TMP_TABLE", "DUMP_TMP_TABLE", "DUMP_CTE"] = "SUBDIVIDE_TMP_TABLE",
     subdivide_max_vertices: int = 256,
+    sql_dialect: str = "postgres",
 ) -> str:
     """
     Extend a SQL query with a pre-computed spatial filter geometry (WKB bytes).
@@ -2233,6 +2243,8 @@ def extend_query_with_spatial_filter(
             - "SUBDIVIDE_INLINE": Inline ST_Subdivide in an EXISTS subquery (simpler, no temp table).
         subdivide_max_vertices: Maximum vertices per subdivided piece (default 256). Lower values
             create more, smaller pieces with tighter bounding boxes for better GiST selectivity.
+        sql_dialect: sqlglot dialect the query is parsed and rendered in, and the condition added to it. Defaults to
+            PostgreSQL, the only database the spatial rewrite supports (it uses PostGIS and PostgreSQL temporary tables).
 
     Returns:
         The extended SQL query with spatial filter.
@@ -2241,7 +2253,7 @@ def extend_query_with_spatial_filter(
         return query
 
     if p0_alias is None:
-        parsed_query = sqlglot.parse_one(query)
+        parsed_query = sqlglot.parse_one(query, read=sql_dialect)
         first_table = parsed_query.find(exp.Table)
         if first_table is None:
             raise ValueError("No table found in query")
@@ -2289,10 +2301,10 @@ def extend_query_with_spatial_filter(
                 f"WHERE ST_DWithin({p0_alias}.{geometry_column}, sf.geom, {buffer_distance}))"
             )
 
-        parsed_query = sqlglot.parse_one(query)
-        spatial_expr = sqlglot.parse_one(spatial_condition)
+        parsed_query = sqlglot.parse_one(query, read=sql_dialect)
+        spatial_expr = sqlglot.parse_one(spatial_condition, read=sql_dialect)
         _add_where_condition(parsed_query, spatial_expr)
-        return prep_sql + parsed_query.sql()
+        return prep_sql + parsed_query.sql(dialect=sql_dialect)
 
     else:  # SUBDIVIDE_INLINE
         # Use ST_Subdivide directly (handles multi-geometries internally).
@@ -2324,10 +2336,10 @@ def extend_query_with_spatial_filter(
                 f"WHERE ST_DWithin({p0_alias}.{geometry_column}, _pcache_sf, {buffer_distance}))"
             )
 
-        parsed_query = sqlglot.parse_one(query)
-        spatial_expr = sqlglot.parse_one(spatial_condition)
+        parsed_query = sqlglot.parse_one(query, read=sql_dialect)
+        spatial_expr = sqlglot.parse_one(spatial_condition, read=sql_dialect)
         _add_where_condition(parsed_query, spatial_expr)
-        return parsed_query.sql()
+        return parsed_query.sql(dialect=sql_dialect)
 
 
 def extend_query_with_h3_cell_filter_lazy(
@@ -2337,6 +2349,7 @@ def extend_query_with_h3_cell_filter_lazy(
     srid: int,
     resolution: int,
     p0_alias: str | None = None,
+    sql_dialect: str = "postgres",
 ) -> str:
     """
     Extend a SQL query with an H3 cell membership filter (lazy/SQL-based).
@@ -2353,6 +2366,8 @@ def extend_query_with_h3_cell_filter_lazy(
         srid: SRID of the geometry data. If != 4326, ST_Transform is applied before h3_lat_lng_to_cell.
         resolution: H3 resolution level (0-15).
         p0_alias: Table alias to apply the filter to. If None, auto-detected.
+        sql_dialect: sqlglot dialect the query is parsed and rendered in, and the condition added to it. Defaults to
+            PostgreSQL, the only database the spatial rewrite supports (it uses PostGIS and PostgreSQL temporary tables).
 
     Returns:
         The extended SQL query with H3 cell membership filter.
@@ -2361,7 +2376,7 @@ def extend_query_with_h3_cell_filter_lazy(
         return query
 
     if p0_alias is None:
-        parsed_query = sqlglot.parse_one(query)
+        parsed_query = sqlglot.parse_one(query, read=sql_dialect)
         first_table = parsed_query.find(exp.Table)
         if first_table is None:
             raise ValueError("No table found in query")
@@ -2384,10 +2399,10 @@ def extend_query_with_h3_cell_filter_lazy(
 
     spatial_condition = f"h3_lat_lng_to_cell({centroid_expr}, {resolution})::bigint IN (SELECT cell FROM {tmp_table})"
 
-    parsed_query = sqlglot.parse_one(query)
-    spatial_expr = sqlglot.parse_one(spatial_condition)
+    parsed_query = sqlglot.parse_one(query, read=sql_dialect)
+    spatial_expr = sqlglot.parse_one(spatial_condition, read=sql_dialect)
     _add_where_condition(parsed_query, spatial_expr)
-    return prep_sql + parsed_query.sql()
+    return prep_sql + parsed_query.sql(dialect=sql_dialect)
 
 
 def extend_query_with_h3_cell_filter(
@@ -2397,6 +2412,7 @@ def extend_query_with_h3_cell_filter(
     srid: int,
     resolution: int,
     p0_alias: str | None = None,
+    sql_dialect: str = "postgres",
 ) -> str:
     """
     Extend a SQL query with an H3 cell membership filter (non-lazy/pre-computed).
@@ -2411,6 +2427,8 @@ def extend_query_with_h3_cell_filter(
         srid: SRID of the geometry data. If != 4326, ST_Transform is applied before h3_lat_lng_to_cell.
         resolution: H3 resolution level (0-15).
         p0_alias: Table alias to apply the filter to. If None, auto-detected.
+        sql_dialect: sqlglot dialect the query is parsed and rendered in, and the condition added to it. Defaults to
+            PostgreSQL, the only database the spatial rewrite supports (it uses PostGIS and PostgreSQL temporary tables).
 
     Returns:
         The extended SQL query with H3 cell membership filter.
@@ -2419,7 +2437,7 @@ def extend_query_with_h3_cell_filter(
         return query
 
     if p0_alias is None:
-        parsed_query = sqlglot.parse_one(query)
+        parsed_query = sqlglot.parse_one(query, read=sql_dialect)
         first_table = parsed_query.find(exp.Table)
         if first_table is None:
             raise ValueError("No table found in query")
@@ -2445,10 +2463,10 @@ def extend_query_with_h3_cell_filter(
 
     spatial_condition = f"h3_lat_lng_to_cell({centroid_expr}, {resolution})::bigint IN (SELECT cell FROM {tmp_table})"
 
-    parsed_query = sqlglot.parse_one(query)
-    spatial_expr = sqlglot.parse_one(spatial_condition)
+    parsed_query = sqlglot.parse_one(query, read=sql_dialect)
+    spatial_expr = sqlglot.parse_one(spatial_condition, read=sql_dialect)
     _add_where_condition(parsed_query, spatial_expr)
-    return prep_sql + parsed_query.sql()
+    return prep_sql + parsed_query.sql(dialect=sql_dialect)
 
 
 def extend_query_with_h3_cell_lookup(
@@ -2463,6 +2481,7 @@ def extend_query_with_h3_cell_lookup(
     srid: int = 4326,
     resolution: int = 9,
     filter_all_tables: bool = True,
+    sql_dialect: str = "postgres",
 ) -> str:
     """
     Filter query via H3 cell ID lookup. Supports MV, direct column, and inline modes.
@@ -2487,6 +2506,8 @@ def extend_query_with_h3_cell_lookup(
         resolution: H3 resolution level.
         filter_all_tables: If True (default), apply H3 cell filter to ALL table aliases
             that reference the same base table as p0. Critical for cross-join performance.
+        sql_dialect: sqlglot dialect the query is parsed and rendered in, and the condition added to it. Defaults to
+            PostgreSQL, the only database the spatial rewrite supports (it uses PostGIS and PostgreSQL temporary tables).
 
     Returns:
         The extended SQL query with H3 cell filtering.
@@ -2504,9 +2525,10 @@ def extend_query_with_h3_cell_lookup(
             srid=srid,
             resolution=resolution,
             p0_alias=p0_alias,
+            sql_dialect=sql_dialect,
         )
 
-    parsed_query = sqlglot.parse_one(query)
+    parsed_query = sqlglot.parse_one(query, read=sql_dialect)
 
     if p0_alias is None:
         first_table = parsed_query.find(exp.Table)
@@ -2565,10 +2587,10 @@ def extend_query_with_h3_cell_lookup(
         else:
             raise ValueError(f"Unsupported H3 cell mode: {cell_mode}. Use 'mv', 'column', or 'inline'.")
 
-        spatial_expr = sqlglot.parse_one(spatial_condition)
+        spatial_expr = sqlglot.parse_one(spatial_condition, read=sql_dialect)
         _add_where_condition(parsed_query, spatial_expr)
 
-    return prep_sql + parsed_query.sql()
+    return prep_sql + parsed_query.sql(dialect=sql_dialect)
 
 
 def _check_cost_gate(query: str, cost_estimator: Callable[[str], float | None] | None, min_query_cost: float | None) -> tuple[bool, dict[str, int]]:
@@ -2803,7 +2825,8 @@ def apply_cache_lazy(
             ``SET LOCAL from_collapse_limit = N;`` (``geqo`` is not touched). Needs a script method (TMP_TABLE_*,
             UNLOGGED_TABLE_*) and PostgreSQL, else ValueError (checked before the lookup). Not applied when the query
             is returned unchanged, nor to the spatial and grid paths. None (default) is off.
-        sql_dialect: sqlglot dialect used to parse and render non-spatial queries. Defaults to PostgreSQL.
+        sql_dialect: sqlglot dialect used to parse and render the query. Defaults to PostgreSQL. The spatial path
+            (``geometry_column``) supports PostgreSQL only and raises ValueError for another dialect.
         geometry_column: If set, enables spatial cache mode. Uses this geometry column for variant
             SELECT clauses and spatial filter application. Requires a spatial cache handler with
             get_spatial_filter_lazy() method.
@@ -2872,6 +2895,7 @@ def apply_cache_lazy(
         # Unlike the non-spatial path, we skip get_partition_keys_lazy() / get_intersected_lazy()
         # because spatial handlers need get_spatial_filter_lazy() (buffered geometric intersection),
         # not partition key intersection (cell ID / bbox intersection).
+        _check_spatial_dialect(sql_dialect)
 
         def variant_hashes(q: str) -> list[str]:
             return generate_all_hashes(
@@ -2945,6 +2969,7 @@ def apply_cache_lazy(
                 geometry_column=geometry_column,
                 srid=srid,
                 resolution=getattr(cache_handler, "resolution", 9),
+                sql_dialect=sql_dialect,
             )
         else:
             # Existing paths: geometry or h3_cell (inline)
@@ -2969,6 +2994,7 @@ def apply_cache_lazy(
                     srid=srid,
                     resolution=resolution,
                     p0_alias=p0_alias,
+                    sql_dialect=sql_dialect,
                 )
             else:
                 use_intersects = getattr(cache_handler, "spatial_filter_includes_buffer", False)
@@ -2984,6 +3010,7 @@ def apply_cache_lazy(
                     use_intersects=use_intersects,
                     spatial_method=spatial_method,
                     subdivide_max_vertices=subdivide_max_vertices,
+                    sql_dialect=sql_dialect,
                 )
 
         stats["enhanced"] = 1
@@ -3162,7 +3189,8 @@ def apply_cache(
         keep_all_attributes: If False (default), lookup also probes variants with single-table attribute
             conditions removed (more hits, more variant-generation cost). True probes exactly the variants
             that generate_all_query_hash_pairs produces with its defaults.
-        sql_dialect: sqlglot dialect used to parse and render non-spatial queries. Defaults to PostgreSQL.
+        sql_dialect: sqlglot dialect used to parse and render the query. Defaults to PostgreSQL. The spatial path
+            (``geometry_column``) supports PostgreSQL only and raises ValueError for another dialect.
         join_every_table: TMP_TABLE_JOIN and UNLOGGED_TABLE_JOIN only: join the key table to every table instead of
             the p0 table; raises ValueError unless every table is joined on the partition key. See
             extend_query_with_partition_keys.
@@ -3262,6 +3290,7 @@ def apply_cache(
     # Spatial mode is selected by passing a geometry column
     if geometry_column is not None:
         # Spatial path: generate hashes with spatial params, apply spatial filter
+        _check_spatial_dialect(sql_dialect)
         resolved_buffer = _resolve_buffer_distance(query, buffer_distance, sql_dialect)
 
         def variant_hashes(q: str) -> list[str]:
@@ -3341,6 +3370,7 @@ def apply_cache(
                 geometry_column=geometry_column,
                 srid=srid,
                 resolution=getattr(cache_handler, "resolution", 9),
+                sql_dialect=sql_dialect,
             )
         else:
             # Existing paths: geometry or h3_cell (inline)
@@ -3365,6 +3395,7 @@ def apply_cache(
                     srid=srid,
                     resolution=resolution,
                     p0_alias=p0_alias,
+                    sql_dialect=sql_dialect,
                 )
             else:
                 # Geometry path: spatial_result is (WKB bytes, SRID)
@@ -3382,6 +3413,7 @@ def apply_cache(
                     use_intersects=use_intersects,
                     spatial_method=spatial_method,
                     subdivide_max_vertices=subdivide_max_vertices,
+                    sql_dialect=sql_dialect,
                 )
 
         stats["enhanced"] = 1
