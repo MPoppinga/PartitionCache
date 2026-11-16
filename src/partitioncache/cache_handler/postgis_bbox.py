@@ -66,6 +66,9 @@ class PostGISBBoxCacheHandler(PostGISSpatialAbstractCacheHandler):
     def _ensure_partition_table(self, partition_key: str, datatype: str, **kwargs) -> bool:
         """Create cache table with geometry column and GiST index for bounding boxes."""
         try:
+            # Under the prefix's DDL lock, so that two keys sharing one table cannot both be registered
+            self._take_ddl_lock()
+            self._refuse_shared_cache_table(partition_key)
             table_name = f"{self.tableprefix}_cache_{partition_key}"
 
             # Create the cache table with geometry column

@@ -90,9 +90,9 @@ PG_ARRAY_CACHE_TABLE_PREFIX=partitioncache
    ```sql
    -- Grant necessary permissions to your user
    GRANT USAGE ON SCHEMA cron TO your_username;
-   GRANT EXECUTE ON FUNCTION cron.schedule_in_database TO your_username;
-   GRANT EXECUTE ON FUNCTION cron.unschedule TO your_username;
-   GRANT EXECUTE ON FUNCTION cron.alter_job TO your_username;
+   GRANT EXECUTE ON FUNCTION cron.schedule_in_database(text, text, text, text, text, boolean) TO your_username;
+   GRANT EXECUTE ON FUNCTION cron.unschedule(bigint), cron.unschedule(text) TO your_username;
+   GRANT EXECUTE ON FUNCTION cron.alter_job(bigint, text, text, text, text, boolean) TO your_username;
    GRANT SELECT ON cron.job TO your_username;
    ```
 
@@ -346,18 +346,21 @@ SELECT partitioncache_update_processor_config_cron(
 
 **Result limit:** with `result_limit` set (also `pcache-postgresql-queue-processor update-config --result-limit N`), a variant whose result has at least that many partition keys is not stored: its cache entry is removed and the query is recorded with the status `limit` in `{table_prefix}_queries`, so it is not computed again, and lookups leave it out. Processors set up before this fix ignored the setting; run `setup` again after upgrading. The cache handlers extend the status constraint of existing queries tables on startup.
 
-#### `partitioncache_manual_process_queue(p_count, p_job_name)`
+#### `partitioncache_manual_process_queue(p_count, p_job_name, p_queue_prefix)`
 Manually process queue items:
 
 ```sql
--- Simple usage (job name automatically constructed from current database)
+-- One installation in this database: its configuration is found without arguments
 SELECT partitioncache_manual_process_queue(5);
 
--- Advanced usage with explicit job name
-SELECT partitioncache_manual_process_queue(10, 'partitioncache_process_queue_<db_name>');
+-- Explicit configuration row and queue prefix (what `pcache-postgresql-queue-processor manual-process` passes,
+-- from --table-prefix / the table prefix variable and PG_QUEUE_TABLE_PREFIX)
+SELECT partitioncache_manual_process_queue(10, 'partitioncache_process_queue_<db_name>_<suffix>', 'partitioncache_queue');
 ```
 
-**Note**: Job names are automatically constructed from the current database when not explicitly provided, enabling multi-database deployments.
+The configuration table is `{p_queue_prefix}_processor_config`; without `p_queue_prefix` the setting `partitioncache.queue_prefix` is used, else the only `*_processor_config` table of the schema. The row is `p_job_name`, else the only `partitioncache_process_queue_<current database>*` row. If more than one table or row qualifies, the function raises an error instead of choosing one; an unknown job name returns 0 with a message.
+
+**Timeout:** the batch runs as one statement in the calling session, so the configured `timeout_seconds` does not apply. The session's `statement_timeout` (none unless set, e.g. `PGOPTIONS='-c statement_timeout=10min' pcache-postgresql-queue-processor manual-process 100`) bounds the whole batch: the fragment it cancels is recorded as `timeout`, and the rest of the batch then runs without a limit.
 
 ## Processing State Machine
 
@@ -397,7 +400,7 @@ SELECT partitioncache_manual_process_queue(10, 'partitioncache_process_queue_<db
 
 ### Prerequisites
 
-1. **PostgreSQL 12+** with `pg_cron` extension available (see [pg_cron installation](https://github.com/citusdata/pg_cron#installation))
+1. **PostgreSQL 13+** with `pg_cron` extension available (see [pg_cron installation](https://github.com/citusdata/pg_cron#installation))
 2. **pg_cron Extension Configurateion**:
    ```
    shared_preload_libraries=pg_cron // Load pg_cron extension
@@ -427,6 +430,16 @@ pcache-postgresql-queue-processor setup \
 #### Upgrading
 
 The processor functions live in the database and are only replaced by `setup`. After upgrading PartitionCache, run `pcache-postgresql-queue-processor setup` again; until then the jobs keep running the old functions. In particular, processors installed before bit arrays grew automatically drop keys at or beyond the bitsize from `postgresql_bit` entries instead of growing the bit arrays (see the PostgreSQL bit handler in [Cache Handlers](cache_handlers.md)).
+
+**Role-wide statement timeout.** Earlier versions enforced `timeout_seconds` with `ALTER ROLE <job_owner> SET statement_timeout`, which applied to every new session of that role in every database (by default the role the application connects with). The timeout is now set by the job command itself (see [Timeouts](#timeouts)), and no role setting is changed. `setup` and `remove` reset a role-wide `statement_timeout` of the job owner (and of the current user) only if it still has the value an earlier version set (`timeout_seconds * 1000` ms); any other value is kept, with a warning that names the role, the value and the command to remove it: `ALTER ROLE <role> RESET statement_timeout;`. A reset that lacks the privilege is reported the same way.
+
+**`postgis_bbox`.** The SQL processor does not support the `postgis_bbox` backend: it wrote a different format than the Python handler reads. `setup` refuses it; populate bbox caches with `pcache-monitor`. A processor installed for bbox by an earlier version keeps its old functions until it is removed with `pcache-postgresql-queue-processor remove`; after a `setup` of the new functions, bbox queue items are recorded as `failed`. Entries that the SQL processor wrote into a bbox cache before this change are in the old format, under the same hashes as entries of the Python handler; delete them and populate the cache again with `pcache-monitor`.
+
+**`partitioncache_manual_process_queue`.** The function now takes `(p_count, p_job_name, p_queue_prefix)`, all with defaults, and `setup` drops the former two-argument version. A client that installs its own older copy of the processor SQL recreates that version, and calls with one or two arguments then become ambiguous; install the functions with `setup` only.
+
+#### Timeouts
+
+Each scheduled job runs `SET statement_timeout = '<timeout_seconds * 1000>ms'; SELECT * FROM partitioncache_run_single_job_with_params(...)`. pg_cron runs a job over its own libpq connection (the default), in one transaction, and arms the timeout for each statement, so the setting applies to that job run only; a fragment that exceeds it is cancelled and recorded with the status `timeout`. This needs PostgreSQL 13 or later: earlier versions applied `statement_timeout` to the whole command string, where the `SET` comes too late. With `cron.use_background_workers = on`, pg_cron does not arm a timeout set inside the command, so `timeout_seconds` is not enforced and `setup` warns. In that mode, use a dedicated `--job-owner` role and set the timeout on it (`ALTER ROLE <job_owner> SET statement_timeout = '30min'`); do not set it on a role that other clients use.
 
 ## Configuration
 
@@ -546,6 +559,8 @@ END IF;
 - ✅ **PostgreSQL Array**: Full support with automatic detection
 - ✅ **PostgreSQL Bit**: Full support with automatic detection
 - ✅ **PostgreSQL Roaring Bit**: Full support with automatic detection
+
+**Not supported:** `postgis_bbox` (setup refuses it; queue items for it are recorded as `failed`). Populate it with `pcache-monitor`.
 
 
 

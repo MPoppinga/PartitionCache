@@ -1,6 +1,9 @@
 import time
+import uuid
 
+import psycopg
 import pytest
+from psycopg import sql
 
 
 class TestPgCronIntegration:
@@ -251,3 +254,141 @@ class TestPgCronIntegration:
                     except Exception:
                         pass
                 db_session.commit()
+
+    @pytest.mark.slow
+    def test_fragment_timeout_applies_to_the_job_run_only(self, db_session, postgresql_queue_processor):
+        """
+        A fragment that runs longer than timeout_seconds gets the status 'timeout', and the timeout is a setting of the
+        job's own session: no role setting is left behind, and a new session of the job owner has no statement_timeout.
+
+        Uses its own queue prefix, so the fixture's processor jobs cannot take the fragment.
+        """
+        if not postgresql_queue_processor.get("pg_cron_available", False):
+            pytest.skip("pg_cron extension not available")
+
+        suffix = uuid.uuid4().hex[:8]
+        queue_prefix = f"pct_{suffix}"
+        table_prefix = postgresql_queue_processor["table_prefix"]
+        config_table = f"{queue_prefix}_processor_config"
+        fragment_queue = f"{queue_prefix}_query_fragment_queue"
+        query_hash = f"timeout_probe_{suffix}"
+        with db_session.cursor() as cur:
+            cur.execute("SELECT current_database()")
+            db_name = cur.fetchone()[0]
+        job_name = f"{db_name}_pcache_test_{suffix}_timeout"
+        role_timeout = """
+            SELECT cfg FROM pg_db_role_setting s JOIN pg_roles r ON r.oid = s.setrole, unnest(s.setconfig) AS cfg
+            WHERE r.rolname = current_user AND cfg LIKE 'statement_timeout=%%'
+        """
+
+        try:
+            with db_session.cursor() as cur:
+                cur.execute("SELECT partitioncache_initialize_cron_config_table(%s)", (queue_prefix,))
+                cur.execute("SELECT partitioncache_create_cron_config_trigger(%s)", (queue_prefix,))
+                cur.execute("SELECT partitioncache_initialize_cache_processor_tables(%s)", (queue_prefix,))
+                cur.execute(f"CREATE TABLE {fragment_queue} (LIKE {postgresql_queue_processor['queue_prefix']}_query_fragment_queue INCLUDING ALL)")
+                cur.execute(
+                    f"INSERT INTO {fragment_queue} (query, hash, partition_key, partition_datatype) VALUES (%s, %s, 'zipcode', 'integer')",
+                    ("SELECT 1 AS zipcode WHERE pg_sleep(5) IS NOT NULL", query_hash),
+                )
+                cur.execute(
+                    f"""
+                    INSERT INTO {config_table} (job_name, enabled, max_parallel_jobs, frequency_seconds, timeout_seconds,
+                                                table_prefix, queue_prefix, cache_backend, target_database)
+                    VALUES (%s, true, 1, 1, 1, %s, %s, 'array', %s)
+                    """,
+                    (job_name, table_prefix, queue_prefix, db_name),
+                )
+                cur.execute("SELECT command FROM cron.job WHERE jobname = %s", (f"{job_name}_1",))
+                assert cur.fetchone()[0].startswith("SET statement_timeout = '1000ms'; SELECT * FROM partitioncache_run_single_job_with_params(")
+                cur.execute(role_timeout)
+                assert cur.fetchall() == [], "scheduling the processor must not set statement_timeout on the job owner role"
+            db_session.commit()
+
+            status = None
+            deadline = time.time() + 60
+            while status is None and time.time() < deadline:
+                time.sleep(1)
+                with db_session.cursor() as cur:
+                    cur.execute(
+                        f"SELECT status, error_message FROM {queue_prefix}_processor_log WHERE query_hash = %s AND status <> 'started'",
+                        (query_hash,),
+                    )
+                    status = cur.fetchone()
+                db_session.commit()
+            assert status is not None, "pg_cron did not process the fragment within 60 s"
+            assert status[0] == "timeout", status
+
+            with db_session.cursor() as cur:
+                cur.execute("SELECT partitioncache_get_queries_table_name(%s)", (table_prefix,))
+                queries_table = cur.fetchone()[0]
+                cur.execute(f"SELECT status FROM {queries_table} WHERE query_hash = %s AND partition_key = 'zipcode'", (query_hash,))
+                assert cur.fetchone() == ("timeout",)
+                cur.execute(role_timeout)
+                assert cur.fetchall() == []
+            db_session.commit()
+
+            info = db_session.info
+            for dbname in (db_name, "postgres"):
+                with psycopg.connect(host=info.host, port=info.port, user=info.user, password=info.password, dbname=dbname) as new_session:
+                    assert new_session.execute("SHOW statement_timeout").fetchone() == ("0",), dbname
+        finally:
+            db_session.rollback()
+            with db_session.cursor() as cur:
+                cur.execute(f"DELETE FROM {config_table}")  # unschedules the job through the trigger
+                cur.execute("DELETE FROM cron.job WHERE jobname LIKE %s", (f"{job_name}%",))
+                for suffix_table in ("processor_config", "processor_log", "active_jobs", "query_fragment_queue"):
+                    cur.execute(f"DROP TABLE IF EXISTS {queue_prefix}_{suffix_table}")
+            db_session.commit()
+
+    def test_legacy_role_statement_timeout_is_reset_only_where_it_matches(self, db_session, postgresql_queue_processor):
+        """
+        Processors of earlier versions set statement_timeout on their job owner role. Setup and remove reset it where it
+        still has the value such a processor set, and keep any other value.
+        """
+        from partitioncache.cli.postgresql_queue_processor import processor_job_owners, release_legacy_role_statement_timeout
+
+        suffix = uuid.uuid4().hex[:8]
+        queue_prefix = f"pct_{suffix}"
+        config_table = f"{queue_prefix}_processor_config"
+        legacy_role, own_role = f"pct_legacy_{suffix}", f"pct_own_{suffix}"
+        role_timeout = """
+            SELECT cfg FROM pg_db_role_setting s JOIN pg_roles r ON r.oid = s.setrole, unnest(s.setconfig) AS cfg
+            WHERE r.rolname = %s AND s.setdatabase = 0 AND cfg LIKE 'statement_timeout=%%'
+        """
+        with db_session.cursor() as cur:
+            cur.execute("SELECT rolsuper OR rolcreaterole FROM pg_roles WHERE rolname = current_user")
+            if not cur.fetchone()[0]:
+                pytest.skip("creating roles needs CREATEROLE")
+        try:
+            with db_session.cursor() as cur:
+                for role, value in ((legacy_role, "7000ms"), (own_role, "5min")):
+                    cur.execute(f"CREATE ROLE {role} NOLOGIN")
+                    cur.execute(sql.SQL("ALTER ROLE {} SET statement_timeout = {}").format(sql.Identifier(role), sql.Literal(value)))
+                # Configuration rows as an earlier version left them; no trigger, so nothing is scheduled
+                cur.execute("SELECT partitioncache_initialize_cron_config_table(%s)", (queue_prefix,))
+                for role in (legacy_role, own_role):
+                    cur.execute(
+                        f"""
+                        INSERT INTO {config_table} (job_name, timeout_seconds, table_prefix, queue_prefix, cache_backend, target_database, job_owner)
+                        VALUES (%s, 7, 'unused', %s, 'array', current_database(), %s)
+                        """,
+                        (f"{queue_prefix}_{role}", queue_prefix, role),
+                    )
+            db_session.commit()
+
+            release_legacy_role_statement_timeout(db_session, processor_job_owners(db_session, queue_prefix))
+
+            with db_session.cursor() as cur:
+                cur.execute(role_timeout, (legacy_role,))
+                assert cur.fetchall() == []
+                cur.execute(role_timeout, (own_role,))
+                assert cur.fetchall() == [("statement_timeout=5min",)]
+            db_session.commit()
+        finally:
+            db_session.rollback()
+            with db_session.cursor() as cur:
+                cur.execute(f"DROP TABLE IF EXISTS {config_table}")
+                cur.execute(f"DROP ROLE IF EXISTS {legacy_role}")
+                cur.execute(f"DROP ROLE IF EXISTS {own_role}")
+            db_session.commit()

@@ -156,7 +156,7 @@ PostgreSQL 17 and later run the following maintenance operations with `search_pa
 All cache handlers support multiple partition keys with independent datatypes:
 
 **PostgreSQL Handlers:**
-- Separate tables per partition: `{table_name}_cache_{partition_key}`
+- Separate tables per partition: `{table_name}_cache_{partition_key}`. PostgreSQL truncates a name longer than 63 bytes; such a name works, but a new partition key whose truncated table name is that of another registered key would share its table, so registering it raises a `ValueError` naming both keys (the PL/pgSQL queue processor's bootstrap refuses it as well). Two keys that were registered by an earlier version and already share a table keep sharing it and read each other's entries; find such pairs with `SELECT a.partition_key, b.partition_key FROM <prefix>_partition_metadata a JOIN <prefix>_partition_metadata b ON a.partition_key < b.partition_key AND ('<prefix>_cache_' || a.partition_key)::name = ('<prefix>_cache_' || b.partition_key)::name`, and delete the cache of one of them
 - Metadata table: `{table_name}_partition_metadata` 
 - Shared queries table: `{table_name}_queries`
 - Queue integration: Dual-strategy operations for optimal performance
@@ -373,7 +373,16 @@ bitsize = cache._get_partition_bitsize("large_dataset")
 ```
 
 **Automatic Schema Updates:**
-Database triggers automatically update cache table schemas when the bitsize grows:
+Database triggers automatically update cache table schemas when the bitsize grows. Every bit cache's metadata table
+has the trigger `<prefix>_bitsize_trigger`, which calls the shared function `partitioncache_bit_widen_trigger()` with
+its prefix as the argument. Dropping a cache's tables drops its trigger and leaves no function behind. A cache created
+before the shared function has its own `<prefix>_bitsize_trigger_func()`. The first time a bit handler of this version
+starts for that prefix, it switches the trigger to the shared function and drops the prefix's own function, unless
+another trigger still uses it. The switch runs in a short transaction of its own with a 2 s lock timeout: `DROP
+TRIGGER` waits for open transactions that have read the metadata table. On a timeout the old trigger stays and keeps
+working, and the next start tries again. The pg_cron processor's bootstrap never switches a trigger (inside a job the
+lock would be held until the job commits); it only replaces a prefix's own function from before the `USING` fix in
+place, as before. Other prefixes are not touched.
 
 ```python
 # Growing the bitsize triggers a schema update; a smaller value keeps the current bitsize
