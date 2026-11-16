@@ -133,7 +133,7 @@ enhanced_query, stats = partitioncache.apply_cache_lazy(
 
 | Backend | Datatypes | Use Case |
 |---------|-----------|----------|
-| **postgresql_array** | Integer, text, timestamp; float rounded (see below) | Production, full features |
+| **postgresql_array** | Integer, text, timestamp; float experimental (see below) | Production, full features |
 | **postgresql_bit** | Integer only | efficient integers |
 | **postgresql_roaringbit** | Integer only | Memory-efficient integers (roaring bitmaps) |
 | **redis_set** | Int, Text | High-throughput, distributed |
@@ -145,7 +145,7 @@ enhanced_query, stats = partitioncache.apply_cache_lazy(
 | **duckdb_bit** | Integer only | Analytical workloads, DuckDB BITSTRING |
 | **postgis_bbox**, **rocksdict_h3_grouped** | Geometry (points) | Spatial filters, see [Cache Handlers](docs/cache_handlers.md) |
 
-Float keys are stored as NUMERIC, with 15 significant digits for double precision and 6 for real; a key with more
+Float partition keys are experimental: they are stored as NUMERIC, with 15 significant digits for double precision and 6 for real; a key with more
 digits is stored rounded and its rows are missing from restricted queries ([datatype support](docs/datatype_support.md)).
 
 ## Processing Models

@@ -99,7 +99,7 @@ Requirements on the data and the queries:
 
 - **NULL partition keys.** The partition key column must not be NULL in rows a query can return; the cache
   restriction removes such rows.
-- **Float partition keys** in `postgresql_array` are stored as NUMERIC with 15 significant digits for double
+- **Float partition keys are experimental.** In `postgresql_array` they are stored as NUMERIC with 15 significant digits for double
   precision and 6 for real values; keys with more digits are stored rounded and their rows are missing from
   restricted queries (see `docs/datatype_support.md`). Use integer, text or timestamp keys where exactness matters.
 - **Spatial handlers.** `postgis_bbox` and `rocksdict_h3_grouped` are sound for point geometries only, and

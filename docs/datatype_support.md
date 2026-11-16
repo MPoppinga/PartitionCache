@@ -5,7 +5,7 @@ PartitionCache now supports multiple datatypes for partition keys, allowing you 
 ## Supported Datatypes
 
 - **integer**: Standard integer values (Python `int`)
-- **float**: Floating-point numbers (Python `float`)
+- **float** (experimental): Floating-point numbers (Python `float`); see the note on rounding below
 - **text**: String values (Python `str`)
 - **timestamp**: Date and time values (Python `datetime`)
 - **geometry**: Spatial geometry values (PostGIS geometry/WKB bytes) — used by spatial cache handlers
@@ -29,7 +29,7 @@ Different cache handlers support different datatypes:
 
 **Note**: Bit-based handlers (postgresql_bit, postgresql_roaringbit, redis_bit, rocksdb_bit) only support integers due to their underlying storage mechanism.
 
-**Note (float keys in postgresql_array)**: float keys are stored in a `NUMERIC[]` column, and PostgreSQL's cast to `numeric` keeps 15 significant digits of a `double precision` value and 6 of a `real` value (`(0.1::float8 + 0.2::float8)::numeric` is `0.3`, `1.2345678::real::numeric` is `1.23457`). A key with more significant digits is stored rounded, no longer equals the column value, and its rows are missing from restricted queries. Use float partition keys only for values with at most that many significant digits; otherwise use an integer or text key.
+**Note (float keys are experimental)**: in `postgresql_array`, float keys are stored in a `NUMERIC[]` column, and PostgreSQL's cast to `numeric` keeps 15 significant digits of a `double precision` value and 6 of a `real` value (`(0.1::float8 + 0.2::float8)::numeric` is `0.3`, `1.2345678::real::numeric` is `1.23457`). A key with more significant digits is stored rounded, no longer equals the column value, and its rows are missing from restricted queries. Use float partition keys only for values with at most that many significant digits; otherwise use an integer or text key.
 
 **Note**: postgresql_roaringbit stores keys from 0 to 2147483647; a negative key is refused (`set_cache` raises `ValueError`, `set_cache_lazy` returns False).
 
