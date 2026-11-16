@@ -258,8 +258,9 @@ all gain 1 and keep their order. The variants of a query that is pushed more oft
 other queries; at equal priority the older variant pops first. The order is not fair across sizes: while small
 variants keep arriving, large ones wait.
 
-Use the same setting for all clients of one queue: variants pushed with it off get priority 1 and wait behind every
-sized variant of up to 9 tables.
+Use the same setting for all clients of one queue: variants pushed with it off get priority 1, which a sized variant
+of 9 tables also gets, so they wait behind every sized variant of up to 8 tables. A variant that is not a single
+SELECT gets priority 1 as well.
 
 Conditions do not enter the priority: `pcache-add --queue` and `pcache-monitor` push each query's variants in
 `order_variants_for_population` order (tables, then conditions), and variants of one size and one query keep that
