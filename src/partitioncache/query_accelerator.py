@@ -23,6 +23,7 @@ import duckdb
 import psycopg
 
 from partitioncache.db_handler.postgres import fetch_final_result_set
+from partitioncache.key_table_script import statement_spans
 from partitioncache.logging_utils import get_thread_aware_logger
 
 logger = get_thread_aware_logger("PartitionCache")
@@ -61,6 +62,27 @@ def _quote(identifier: str) -> str:
 def _conninfo_value(value: Any) -> str:
     """Quote a libpq connection string value, so spaces, quotes and backslashes survive."""
     return "'" + str(value).replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
+def _key_set(rows: list) -> set[Any]:
+    """The keys of a result (its first column, or whole rows if it has several), without NULL keys.
+
+    PostgresDBHandler.execute and the PL/pgSQL queue processor drop NULL keys too; a None would count toward the
+    monitor's --limit, could make set_cache reject the set, or be stored as a NULL element.
+    """
+    return {row[0] if len(row) == 1 else row for row in rows if row[0] is not None}
+
+
+# PostgreSQL's LIKE (also ILIKE, ~~, ~~*) has the backslash as default escape character, DuckDB's has none
+_LIKE_OPERATOR = re.compile(r"like|~~", re.IGNORECASE)
+
+
+def _like_escape_differs(query: str) -> bool:
+    """Whether a LIKE pattern may contain a backslash, which escapes in PostgreSQL but is a plain character in DuckDB.
+
+    Over-approximated on the text: a backslash anywhere and a LIKE, ILIKE or ~~ operator anywhere.
+    """
+    return "\\" in query and _LIKE_OPERATOR.search(query) is not None
 
 
 class DuckDBQueryAccelerator:
@@ -422,6 +444,21 @@ class DuckDBQueryAccelerator:
             self._update_stats(queries_fallback=1)
             return self._execute_fallback(query)
 
+        if _like_escape_differs(query):
+            logger.debug("Query has LIKE and a backslash; DuckDB's LIKE has no escape character, running it on PostgreSQL")
+            self._update_stats(queries_fallback=1)
+            return self._execute_fallback(query)
+
+        # DuckDB executes every statement of a script and returns the LAST one's result, e.g. the DROP after the SELECT of
+        # an UNLOGGED_TABLE_* script. Counted with the PostgreSQL tokenizer, independent of what DuckDB can parse; a text
+        # it cannot tokenize, or a trailing comment after the semicolon (counted as a statement), also goes to PostgreSQL
+        spans = statement_spans(query)
+        if spans is None or len(spans) != 1:
+            statements = "cannot be tokenized" if spans is None else f"{len(spans)} statements"
+            logger.debug(f"Query is not one statement ({statements}); DuckDB would return the last statement's result, running it on PostgreSQL")
+            self._update_stats(queries_fallback=1)
+            return self._execute_fallback(query)
+
         try:
             # Try DuckDB acceleration first with timeout support
             start_time = time.perf_counter()
@@ -434,9 +471,10 @@ class DuckDBQueryAccelerator:
             else:
                 # Execute query with thread-local cursor
                 cursor = self._cursor()
-                result = cursor.execute(query).fetchall()
-                result_set = {row[0] if len(row) == 1 else row for row in result}
-                cursor.close()
+                try:
+                    result_set = self._execute_on_duckdb(cursor, query)
+                finally:
+                    cursor.close()
 
             duration = time.perf_counter() - start_time
             self._update_stats(queries_accelerated=1, total_acceleration_time=duration)
@@ -454,6 +492,11 @@ class DuckDBQueryAccelerator:
             # Increment fallback counter since we're attempting fallback
             self._update_stats(queries_fallback=1)
             return self._execute_fallback(query)
+
+    @staticmethod
+    def _execute_on_duckdb(cursor: "duckdb.DuckDBPyConnection", query: str) -> set[Any]:
+        """Run a query of one statement (checked by execute_query) on the cursor and return its keys."""
+        return _key_set(cursor.execute(query).fetchall())
 
     def _execute_with_timeout(self, query: str) -> set[Any]:
         """
@@ -477,10 +520,9 @@ class DuckDBQueryAccelerator:
                 # Create thread-local cursor for thread safety
                 cursor = self._cursor()
                 result_container["cursor"] = cursor
-                result = cursor.execute(query).fetchall()
-                result_container["result"] = {row[0] if len(row) == 1 else row for row in result}
+                result_container["result"] = self._execute_on_duckdb(cursor, query)
                 result_container["completed"] = True
-                logger.debug(f"DuckDB query worker completed successfully with {len(result)} rows")
+                logger.debug(f"DuckDB query worker completed successfully with {len(result_container['result'])} keys")
             except Exception as e:
                 logger.debug(f"DuckDB query worker failed: {e}")
                 result_container["exception"] = e
@@ -539,14 +581,15 @@ class DuckDBQueryAccelerator:
 
             logger.debug(f"Executing query with PostgreSQL fallback: {query[:100]}...")
 
+            if self.postgresql_conn is None:
+                raise RuntimeError("PostgreSQL fallback connection is not available; the query is not executed")
             with self.postgresql_conn.cursor() as cursor:
                 cursor.execute(query)
                 # An integration script (TMP_TABLE_*, UNLOGGED_TABLE_*) has its rows in the result set of its SELECT,
                 # not in the first one; the connection is in autocommit, so the one-string script is one transaction
                 result = fetch_final_result_set(cursor)
 
-            # Convert to set for compatibility
-            result_set = {row[0] if len(row) == 1 else row for row in result}
+            result_set = _key_set(result)
 
             duration = time.perf_counter() - start_time
             self._update_stats(total_fallback_time=duration)
