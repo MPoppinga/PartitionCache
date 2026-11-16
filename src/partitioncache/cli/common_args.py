@@ -196,6 +196,38 @@ def add_environment_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+class _EnvFileArgumentError(Exception):
+    pass
+
+
+class _EnvFileParser(argparse.ArgumentParser):
+    """Reads only --env-file; its errors are left to the tool's own parser."""
+
+    def error(self, message: str):  # type: ignore[override]
+        raise _EnvFileArgumentError(message)
+
+
+def load_env_file_before_parsing(argv: list[str] | None = None) -> None:
+    """Load the file of --env-file / --env (default: .env) into the environment before a tool builds its parser.
+
+    Argument defaults such as those of add_variant_generation_args are read from the environment while the parser is
+    built, so a variable that stands only in the env file must be in os.environ by then. Variables that are already
+    set keep their values (python-dotenv's default, as for the connection variables); a command-line flag still wins
+    over both. A missing file is reported later by load_environment_with_validation.
+
+    Args:
+        argv: The command-line arguments without the program name (default: sys.argv[1:]).
+    """
+    pre_parser = _EnvFileParser(add_help=False)
+    add_environment_args(pre_parser)
+    try:
+        known, _ = pre_parser.parse_known_args(sys.argv[1:] if argv is None else argv)
+    except _EnvFileArgumentError:
+        return
+    if Path(known.env_file).exists():
+        dotenv.load_dotenv(known.env_file)
+
+
 def add_queue_args(parser: argparse.ArgumentParser) -> None:
     """
     Add queue-related arguments to an ArgumentParser.

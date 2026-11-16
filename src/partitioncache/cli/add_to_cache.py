@@ -21,6 +21,7 @@ from partitioncache.cli.common_args import (
     configure_logging,
     get_database_connection_params,
     grid_cell_size_for,
+    load_env_file_before_parsing,
     load_environment_with_validation,
     parse_variant_generation_json_args,
     resolve_cache_backend,
@@ -70,6 +71,8 @@ def _exit_if_grid_key_invalid(args: argparse.Namespace, grid_size: float | None)
 
 
 def main():
+    # Argument defaults are read from the environment, so the --env file is loaded first
+    load_env_file_before_parsing()
     parser = argparse.ArgumentParser(description="Add queries to the partition cache either directly or via the queue")
 
     # Query configuration

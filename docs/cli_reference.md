@@ -981,6 +981,7 @@ pcache-postgresql-eviction-manager --table-prefix "app2_cache" setup
 - Use separate `.env` files for different environments (dev, staging, prod)
 - Test environment configuration with `pcache-manage status env`
 - Use `--env` parameter to switch between configurations
+- A setting is taken from, in this order: the command-line flag, a variable already exported in the shell, the `--env` file (which also sets the defaults of flags such as `--bucket-steps`, as an exported `PARTITION_CACHE_*` variable does), the built-in default; the env file never overrides an exported variable
 
 ### Queue Processing
 - **Development**: Use `pcache-monitor` for flexibility and debugging
