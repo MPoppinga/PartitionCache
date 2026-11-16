@@ -166,7 +166,7 @@ partitioncache.push_to_query_variant_queue(
 Retrieve original queries for processing:
 
 ```python
-# Returns (query, partition_key, partition_datatype) tuple or None
+# Returns (query, partition_key, partition_datatype) tuple or None; partition_datatype is None if none was pushed
 result = partitioncache.pop_from_original_query_queue()
 if result:
     query, partition_key, partition_datatype = result
@@ -177,7 +177,7 @@ if result:
 Retrieve query fragments for execution:
 
 ```python
-# Returns (query, hash, partition_key, partition_datatype, cache_backend) tuple or None
+# Returns (query, hash, partition_key, partition_datatype, cache_backend) tuple or None; partition_datatype is None if none was pushed
 result = partitioncache.pop_from_query_fragment_queue()
 if result:
     query, hash_val, partition_key, partition_datatype, cache_backend = result
@@ -211,6 +211,8 @@ The monitor implements a sophisticated two-threaded architecture:
 - Consumes `(query, hash, partition_key, partition_datatype, cache_backend)` from query fragment queue
 - Executes fragments against database
 - Stores results in cache with partition key tracking
+- A fragment queued without a datatype uses the datatype registered for its partition key; for an unregistered key
+  it runs without lazy insertion and the datatype is inferred from the result (an empty result gets the status 'failed')
 
 ### Usage Example
 

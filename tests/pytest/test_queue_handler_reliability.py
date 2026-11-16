@@ -1,5 +1,6 @@
 """Queue handlers: blocking pops honour their timeout, a missing datatype pops as None, a push with failed rows is False."""
 
+import json
 import socket
 import threading
 import time
@@ -8,6 +9,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from partitioncache.queue_handler.postgresql import PostgreSQLQueueHandler
+from partitioncache.queue_handler.redis import RedisQueueHandler
 
 FRAGMENT_ITEM = ("SELECT DISTINCT t1.pk FROM t AS t1", "h1", "pk", "integer", None)
 ORIGINAL_ITEM = ("SELECT * FROM t", "pk", "integer")
@@ -121,3 +123,42 @@ class TestBlockingPopTimeout:
         assert finished
         assert result == item
         assert seconds < 3, "the item was popped on the notification, not after the wait"
+
+
+class TestMissingDatatype:
+    @pytest.mark.parametrize("stored", [None, ""])
+    def test_postgresql_original_pop(self, stored):
+        handler, _, cursor = _handler_with_connection()
+        cursor.fetchone.return_value = (1, "SELECT 1", "pk", stored)
+
+        assert handler.pop_from_original_query_queue() == ("SELECT 1", "pk", None)
+
+    @pytest.mark.parametrize("stored", [None, ""])
+    def test_postgresql_fragment_pop(self, stored):
+        handler, _, cursor = _handler_with_connection()
+        cursor.fetchone.return_value = (1, "SELECT 1", "h1", "pk", stored, None)
+
+        assert handler.pop_from_query_fragment_queue() == ("SELECT 1", "h1", "pk", None, None)
+
+    def test_postgresql_pop_keeps_a_given_datatype(self):
+        handler, _, cursor = _handler_with_connection()
+        cursor.fetchone.return_value = (1, "SELECT 1", "h1", "pk", "text", None)
+
+        assert handler.pop_from_query_fragment_queue() == ("SELECT 1", "h1", "pk", "text", None)
+
+    @pytest.mark.parametrize("payload", [{"partition_datatype": None}, {}, {"partition_datatype": ""}])
+    @pytest.mark.parametrize("blocking", [False, True])
+    def test_redis_pops(self, payload, blocking):
+        handler = RedisQueueHandler("localhost", 6379, 0)
+        client = MagicMock()
+        handler._redis_client = client
+        original = json.dumps({"query": "SELECT 1", "partition_key": "pk", **payload}).encode()
+        fragment = json.dumps({"query": "SELECT 1", "hash": "h1", "partition_key": "pk", "cache_backend": None, **payload}).encode()
+        client.blpop.side_effect = [(b"k", original), (b"k", fragment)]
+
+        if blocking:
+            popped = (handler.pop_from_original_query_queue_blocking(timeout=1), handler.pop_from_query_fragment_queue_blocking(timeout=1))
+        else:
+            popped = (handler.pop_from_original_query_queue(), handler.pop_from_query_fragment_queue())
+
+        assert popped == (("SELECT 1", "pk", None), ("SELECT 1", "h1", "pk", None, None))

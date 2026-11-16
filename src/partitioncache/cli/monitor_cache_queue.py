@@ -412,6 +412,13 @@ def run_and_store_query(query: str, query_hash: str, partition_key: str, partiti
         cache_handler = get_cache_handler(cache_backend, singleton=True)
         logger.info(f"Got cache handler for {query_hash}")
 
+        if not partition_datatype:
+            # Queued without a datatype: use the registered one; for an unregistered key the non-lazy path below
+            # infers it from the result (an empty result cannot be stored and gets the status 'failed')
+            partition_datatype = cache_handler.get_datatype(partition_key)
+            if partition_datatype is None:
+                logger.info(f"No datatype for partition key '{partition_key}' in the queue or the cache: {query_hash} runs without lazy insertion")
+
         query_to_execute = query
         optimization_applied = False
         optimization_stats = {}
@@ -454,6 +461,7 @@ def run_and_store_query(query: str, query_hash: str, partition_key: str, partiti
             and args.long_running_query_timeout == "0"
             and not args.disable_lazy_insertion
             and not limit_applies
+            and partition_datatype is not None
         )
 
         if use_lazy_insertion:

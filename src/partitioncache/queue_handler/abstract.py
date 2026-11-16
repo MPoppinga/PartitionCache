@@ -64,22 +64,24 @@ class AbstractQueueHandler(ABC):
         pass
 
     @abstractmethod
-    def pop_from_original_query_queue(self) -> tuple[str, str, str] | None:
+    def pop_from_original_query_queue(self) -> tuple[str, str, str | None] | None:
         """
         Pop an original query from the original query queue.
 
         Returns:
-            Tuple[str, str, str] or None: (query, partition_key, partition_datatype) tuple if available, None if queue is empty or error occurred.
+            Tuple[str, str, str | None] or None: (query, partition_key, partition_datatype) tuple if available, None if queue is empty or error occurred.
+            partition_datatype is None when the query was pushed without one.
         """
         pass
 
     @abstractmethod
-    def pop_from_query_fragment_queue(self) -> tuple[str, str, str, str, str | None] | None:
+    def pop_from_query_fragment_queue(self) -> tuple[str, str, str, str | None, str | None] | None:
         """
         Pop a query variant from the query variant queue (persisted as ``query_fragment_queue``).
 
         Returns:
-            Tuple[str, str, str, str, str | None] or None: (variant_query, hash, partition_key, partition_datatype, cache_backend) tuple if available, None if queue is empty or error occurred.
+            Tuple[str, str, str, str | None, str | None] or None: (variant_query, hash, partition_key, partition_datatype, cache_backend) tuple if available, None if queue is empty or error occurred.
+            partition_datatype is None when the variant was pushed without one.
         """
         pass
 

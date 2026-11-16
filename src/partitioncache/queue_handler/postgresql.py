@@ -603,13 +603,13 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
                 except Exception:
                     pass
 
-    def pop_from_original_query_queue(self) -> tuple[str, str, str] | None:
+    def pop_from_original_query_queue(self) -> tuple[str, str, str | None] | None:
         """
         Pop an original query from the original query queue.
         Uses PostgreSQL's SELECT FOR UPDATE SKIP LOCKED for atomic operations.
 
         Returns:
-            Tuple[str, str, str] or None: (query, partition_key, partition_datatype) tuple if available, None if queue is empty.
+            Tuple[str, str, str | None] or None: (query, partition_key, partition_datatype) tuple if available, None if queue is empty.
         """
         cursor = None
         try:
@@ -640,7 +640,7 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
             cursor.execute("COMMIT")
 
             logger.debug("Popped query from PostgreSQL original query queue")
-            return (query, partition_key, partition_datatype or "")
+            return (query, partition_key, partition_datatype or None)
 
         except Exception as e:
             logger.error(f"Failed to pop from PostgreSQL original query queue: {e}")
@@ -651,7 +651,7 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
                 pass
             return None
 
-    def pop_from_original_query_queue_blocking(self, timeout: int = 60) -> tuple[str, str, str] | None:
+    def pop_from_original_query_queue_blocking(self, timeout: int = 60) -> tuple[str, str, str | None] | None:
         """
         Pop an original query from the original query queue with blocking wait.
         Uses PostgreSQL LISTEN/NOTIFY for efficient blocking with timeout fallback.
@@ -660,7 +660,7 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
             timeout (int): Maximum time to wait in seconds (default: 60)
 
         Returns:
-            Tuple[str, str, str] or None: (query, partition_key, partition_datatype) tuple if available, None if timeout or error occurred.
+            Tuple[str, str, str | None] or None: (query, partition_key, partition_datatype) tuple if available, None if timeout or error occurred.
         """
 
         # First try to get an item immediately
@@ -729,13 +729,13 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
                 except Exception:
                     pass
 
-    def pop_from_query_fragment_queue(self) -> tuple[str, str, str, str, str | None] | None:
+    def pop_from_query_fragment_queue(self) -> tuple[str, str, str, str | None, str | None] | None:
         """
         Pop a query variant from the variant queue (persisted as ``query_fragment_queue``).
         Uses PostgreSQL's SELECT FOR UPDATE SKIP LOCKED for atomic operations.
 
         Returns:
-            Tuple[str, str, str, str, str | None] or None: (query, hash, partition_key, partition_datatype, cache_backend) tuple if available, None if queue is empty.
+            Tuple[str, str, str, str | None, str | None] or None: (query, hash, partition_key, partition_datatype, cache_backend) tuple if available, None if queue is empty.
         """
         cursor = None
         try:
@@ -766,7 +766,7 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
             cursor.execute("COMMIT")
 
             logger.debug("Popped query fragment from PostgreSQL query fragment queue")
-            return (query, hash_value, partition_key, partition_datatype or "", item_cache_backend)
+            return (query, hash_value, partition_key, partition_datatype or None, item_cache_backend)
 
         except Exception as e:
             logger.error(f"Failed to pop from PostgreSQL query fragment queue: {e}")
@@ -777,7 +777,7 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
                 pass
             return None
 
-    def pop_from_query_fragment_queue_blocking(self, timeout: int = 60) -> tuple[str, str, str, str, str | None] | None:
+    def pop_from_query_fragment_queue_blocking(self, timeout: int = 60) -> tuple[str, str, str, str | None, str | None] | None:
         """
         Pop a query variant from the variant queue with blocking wait.
         Uses PostgreSQL LISTEN/NOTIFY for efficient blocking with timeout fallback.
@@ -786,7 +786,7 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
             timeout (int): Maximum time to wait in seconds (default: 60)
 
         Returns:
-            Tuple[str, str, str, str, str | None] or None: (query, hash, partition_key, partition_datatype, cache_backend) tuple if available, None if timeout or error occurred.
+            Tuple[str, str, str, str | None, str | None] or None: (query, hash, partition_key, partition_datatype, cache_backend) tuple if available, None if timeout or error occurred.
         """
 
         # First try to get an item immediately
