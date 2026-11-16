@@ -303,7 +303,7 @@ Lazy counterpart to `extend_query_with_partition_keys`: integrates a lazy SQL su
 - `protected_patterns` (list[str] | None, optional): Condition substrings that must never be removed (default: None)
 - `skip_partition_key_joins` (bool, optional): Spatial mode — generate query variants without partition-key equijoins (default: False)
 - `temporal_bucket_width`, `temporal_column`, `dilation_buckets` (optional): Temporal dilation for time-bucket partition keys, see below
-- `geometry_column` (str | None, optional): Enables spatial mode. Uses this geometry column for variant SELECT clauses and spatial filter. Requires a spatial cache handler with `get_spatial_filter_lazy()` method.
+- `geometry_column` (str | None, optional): Enables spatial mode. Uses this geometry column for variant SELECT clauses and spatial filter. Requires a spatial cache handler with `get_spatial_filter_lazy()` method. Sound for point geometries only, see [Spatial buffer](#spatial-buffer-buffer_distance).
 - `buffer_distance` (float | None, optional): Buffer distance for the spatial filter, see [Spatial buffer](#spatial-buffer-buffer_distance).
 - `spatial_method` (Literal["SUBDIVIDE_INLINE", "SUBDIVIDE_TMP_TABLE", "DUMP_TMP_TABLE", "DUMP_CTE"], optional): Strategy for applying the spatial filter (default: "SUBDIVIDE_TMP_TABLE")
 - `subdivide_max_vertices` (int, optional): Maximum vertices per subdivided filter geometry (default: 256)
@@ -439,13 +439,15 @@ With `geometry_column`, each cached fragment is a region (the geometries of the 
 - `None` (default): derived by `compute_buffer_distance(query)`, the diameter of the query's distance graph. Only top-level conjuncts of the outer query (its `WHERE` and inner-join `ON`) with a constant distance link two tables: `ST_DWithin(a.geom, b.geom, d)`, `ST_DFullyWithin`, or an upper bound on a distance function in either direction (`ST_Distance(a.geom, b.geom) < d`, `d > ST_Distance(...)`, `... BETWEEN x AND d`). A distance under `NOT`, inside `OR`, in a subquery, or with a non-constant radius links nothing. A query over a single table gets 0.
 - If some table is not linked to p0 (for example joined only on an attribute, `p1.name = p3.name`), only the fragments whose tables are all linked to p0 are used, with the diameter of those tables. If none of them is cached, if the H3 `mv` or `column` cell mode would restrict the other aliases of p0's table too, or if the query is not a single `SELECT` over tables (CTE, set operation, derived table), the query runs without the cache: the statistics contain `uncached_reason: "spatial_unbounded"` and a warning is logged.
 - A query over several tables without any distance predicate raises `ValueError`; pass `buffer_distance`.
+- Points only: the bound adds up distances between rows, which bounds the distance between points, not between extended geometries (two polygons each within 100 m of a third can be far apart at their far ends), and `rocksdict_h3_grouped` stores the cell of each geometry's centroid. With polygons or lines the spatial cache can lose rows.
+- `rocksdict_h3_grouped` converts the buffer into H3 rings assuming metres; the query's distances must be in metres for it (a geometry column in degrees, e.g. SRID 4326 without a `::geography` cast, is not detected).
 
 #### `apply_cache(query, cache_handler, partition_key, ..., geometry_column=None, buffer_distance=None)`
 
 Applies partition cache to a query using regular (non-lazy) cache handlers. Supports spatial mode. Accepts the same `cost_estimator` / `min_query_cost` gate and `join_every_table` option as `apply_cache_lazy`. Like `apply_cache_lazy`, it takes `sql_dialect` (default `"postgres"`), the sqlglot dialect the enhanced non-spatial query is parsed and rendered in.
 
 **Spatial Parameters** (in addition to standard parameters):
-- `geometry_column` (str | None, optional): Enables spatial mode. Requires a spatial cache handler with `get_spatial_filter()` method.
+- `geometry_column` (str | None, optional): Enables spatial mode. Requires a spatial cache handler with `get_spatial_filter()` method. Sound for point geometries only.
 - `buffer_distance` (float | None, optional): Buffer distance for the spatial filter, as for `apply_cache_lazy` (see [Spatial buffer](#spatial-buffer-buffer_distance)).
 
 **Example:**
