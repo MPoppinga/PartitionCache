@@ -62,7 +62,7 @@ This document provides comprehensive guidance for setting up pg_cron with Partit
 ## Prerequisites
 
 ### 1. PostgreSQL Version
-- PostgreSQL 12+ required
+- PostgreSQL 13+ required
 - pg_cron extension 1.4+ (for `schedule_in_database()` function)
 
 ### 2. Extension Installation
