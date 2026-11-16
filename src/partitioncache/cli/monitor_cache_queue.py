@@ -180,6 +180,11 @@ last_status_log_time = 0.0
 status_log_interval = 10  # Log status every 10 seconds when idle
 
 
+# Held by the decomposer from its pop of an original query to the push of the query's fragments. --close counts the
+# queues under it, so no query can be popped between that count and the exit.
+decomposition_lock = threading.Lock()
+
+
 def query_fragment_processor(args, constraint_args):
     """Thread function that decomposes and recomposes original queries into query variants and pushes them to the variant queue.
 
@@ -188,73 +193,88 @@ def query_fragment_processor(args, constraint_args):
         constraint_args: Tuple of (add_constraints, remove_constraints_all, remove_constraints_add)
     """
     logger.info("Starting query fragment processor thread")
+    # Under --close the pop does not wait for new queries while it holds decomposition_lock: that would keep the
+    # close check out; the decomposer waits outside the lock instead
+    waits_in_pop = not getattr(args, "disable_optimized_polling", False) and not getattr(args, "close", False)
 
-    while not exit_event.is_set():
+    while True:
+        query_result = None
         try:
-            # Pop query from original query queue
-            # Use blocking or non-blocking based on settings
-            if not getattr(args, "disable_optimized_polling", False):
-                # Use efficient blocking pop (with LISTEN/NOTIFY for PostgreSQL, native blocking for Redis)
-                query_result = pop_from_original_query_queue_blocking(timeout=60)
-            else:
-                # Use regular pop when optimized polling is disabled
-                query_result = pop_from_original_query_queue()
-
-            if query_result is None:
-                continue  # Timeout occurred, check exit event and try again
-
-            query, partition_key, partition_datatype = query_result
-            logger.debug(f"Processing original query into query variants for partition_key: {partition_key} (datatype: {partition_datatype})")
-
-            # Grid-cell keys: fragments select cells; the forced flags must match the grid lookup's
-            grid_size = grid_cell_size_for(args, partition_key)
-            if grid_size is not None:
-                problem = check_grid_key(partition_key, partition_datatype, resolve_cache_backend(args))
-                if problem is not None:
-                    logger.error(f"Skipping query: {problem}")
-                    continue
-
-            # Detect spatial mode and resolve geometry column from handler
-            is_spatial = partition_datatype == "geometry"
-            resolved_backend = resolve_cache_backend(args) if is_spatial else None
-            geometry_column = None
-            if resolved_backend is not None:
-                try:
-                    spatial_cache_handler = get_cache_handler(resolved_backend, singleton=True)
-                    geometry_column = getattr(spatial_cache_handler, "geometry_column", "geom")
-                except Exception as e:
-                    logger.debug("Could not resolve geometry column from cache handler, using default 'geom': %s", e)
-                    geometry_column = "geom"
-            elif grid_size is not None:
-                geometry_column = getattr(args, "geometry_column", None) or "geom"
-
-            # Process the query into query variants using the partition_key from queue
-            query_hash_pairs = generate_all_query_hash_pairs(
-                query,
-                partition_key,
-                warn_no_partition_key=not args.no_warn_partition_key,
-                **variant_settings(args, constraint_args, partition_key, partition_datatype, geometry_column),
-            )
-            # Smallest variants first, so cache optimization can restrict the larger ones with them
-            query_hash_pairs = order_variants_for_population(query_hash_pairs)
-            logger.debug(f"Generated {len(query_hash_pairs)} query variants from original query")
-
-            # Push variants to the variant queue using the partition_key and datatype from queue
-            # For spatial queries, resolve and pass cache_backend so the processor knows which handler to use
-            queue_cache_backend = resolved_backend
-            success = push_to_query_fragment_queue(
-                query_hash_pairs, partition_key, partition_datatype, cache_backend=queue_cache_backend, size_priority=getattr(args, "size_priority", None)
-            )
-            if success:
-                logger.debug(f"Pushed {len(query_hash_pairs)} query variants to the variant queue")
-            else:
-                logger.error("Error pushing query variants to the variant queue")
-
+            with decomposition_lock:
+                if exit_event.is_set():
+                    break
+                if waits_in_pop:
+                    # Efficient blocking pop (LISTEN/NOTIFY for PostgreSQL, native blocking for Redis)
+                    query_result = pop_from_original_query_queue_blocking(timeout=60)
+                else:
+                    query_result = pop_from_original_query_queue()
+                if query_result is not None:
+                    decompose_original_query(*query_result, args, constraint_args)
         except Exception as e:
             logger.error(f"Error in query fragment processor: {e}")
             time.sleep(1)  # Brief pause before retrying
+            continue
+        if query_result is None and not waits_in_pop:
+            exit_event.wait(0.5)
 
     logger.info("Query fragment processor thread exiting")
+
+
+def decompose_original_query(query: str, partition_key: str, partition_datatype: str | None, args, constraint_args) -> None:
+    """Decompose an original query into query variants and push them to the variant queue.
+
+    Args:
+        query: The original query.
+        partition_key: Its partition key.
+        partition_datatype: The datatype of the partition key, None if the query was queued without one.
+        args: Command line arguments.
+        constraint_args: Tuple of (add_constraints, remove_constraints_all, remove_constraints_add).
+    """
+    logger.debug(f"Processing original query into query variants for partition_key: {partition_key} (datatype: {partition_datatype})")
+
+    # Grid-cell keys: fragments select cells; the forced flags must match the grid lookup's
+    grid_size = grid_cell_size_for(args, partition_key)
+    if grid_size is not None:
+        problem = check_grid_key(partition_key, partition_datatype, resolve_cache_backend(args))  # type: ignore[arg-type]
+        if problem is not None:
+            logger.error(f"Skipping query: {problem}")
+            return
+
+    # Detect spatial mode and resolve geometry column from handler
+    is_spatial = partition_datatype == "geometry"
+    resolved_backend = resolve_cache_backend(args) if is_spatial else None
+    geometry_column = None
+    if resolved_backend is not None:
+        try:
+            spatial_cache_handler = get_cache_handler(resolved_backend, singleton=True)
+            geometry_column = getattr(spatial_cache_handler, "geometry_column", "geom")
+        except Exception as e:
+            logger.debug("Could not resolve geometry column from cache handler, using default 'geom': %s", e)
+            geometry_column = "geom"
+    elif grid_size is not None:
+        geometry_column = getattr(args, "geometry_column", None) or "geom"
+
+    # Process the query into query variants using the partition_key from queue
+    query_hash_pairs = generate_all_query_hash_pairs(
+        query,
+        partition_key,
+        warn_no_partition_key=not args.no_warn_partition_key,
+        **variant_settings(args, constraint_args, partition_key, partition_datatype, geometry_column),
+    )
+    # Smallest variants first, so cache optimization can restrict the larger ones with them
+    query_hash_pairs = order_variants_for_population(query_hash_pairs)
+    logger.debug(f"Generated {len(query_hash_pairs)} query variants from original query")
+
+    # Push variants to the variant queue using the partition_key and datatype from queue
+    # For spatial queries, resolve and pass cache_backend so the processor knows which handler to use
+    queue_cache_backend = resolved_backend
+    success = push_to_query_fragment_queue(
+        query_hash_pairs, partition_key, partition_datatype, cache_backend=queue_cache_backend, size_priority=getattr(args, "size_priority", None)
+    )
+    if success:
+        logger.debug(f"Pushed {len(query_hash_pairs)} query variants to the variant queue")
+    else:
+        logger.error("Error pushing query variants to the variant queue")
 
 
 # Cache optimization method of the CLI -> method of the lazy path (IN means IN_SUBQUERY there) and of the eager path
@@ -618,6 +638,34 @@ def get_timeout_for_state(can_consume, exit_event_set, error_count=0):
         return 0.1  # Short wait when waiting for capacity
 
 
+def close_when_done(active: int) -> bool:
+    """For --close: set exit_event if no worker is active, no decomposition is in flight and both queues are empty.
+
+    Counts the queues while it holds decomposition_lock, which the decomposer holds from its pop of an original query
+    to the push of the query's fragments and under which it checks exit_event before it pops. A failed count is not
+    taken as empty.
+
+    Args:
+        active: The number of fragments the workers run.
+
+    Returns:
+        bool: True if exit_event was set.
+    """
+    if active > 0 or not decomposition_lock.acquire(blocking=False):
+        return False
+    try:
+        lengths = get_queue_lengths()
+        if lengths["original_query_queue"] != 0 or lengths["query_fragment_queue"] != 0:
+            return False
+        exit_event.set()
+        return True
+    except Exception as e:
+        logger.error(f"Error counting the queues for --close: {e}")
+        return False
+    finally:
+        decomposition_lock.release()
+
+
 def fragment_executor():
     """Thread pool function that executes query variants from the variant queue."""
     global pool, last_status_log_time
@@ -691,9 +739,8 @@ def fragment_executor():
                     should_log_status = True
 
                 # Check if we should close
-                if args.close and active == 0 and fragment_count == 0:
+                if args.close and active == 0 and fragment_count == 0 and close_when_done(active):
                     logger.info(f"Closing cache at {datetime.datetime.now()}")
-                    exit_event.set()
                     continue
 
                 # Determine waiting reason for logging
@@ -824,7 +871,12 @@ def main():
 
     # Processing configuration
     processing_group = parser.add_argument_group("processing options")
-    processing_group.add_argument("--close", action="store_true", default=False, help="Close the cache after operation")
+    processing_group.add_argument(
+        "--close",
+        action="store_true",
+        default=False,
+        help="Exit once both queues are empty, no original query is being decomposed and no fragment is running",
+    )
     processing_group.add_argument("--max-processes", type=int, default=12, help="Max number of processes to use")
     processing_group.add_argument("--long-running-query-timeout", type=str, default="0", help="Timeout for long running queries")
     processing_group.add_argument("--limit", type=int, default=None, help="Limit the number of returned partition keys")

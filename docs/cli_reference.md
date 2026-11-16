@@ -642,8 +642,8 @@ Controls how query variants are generated when processing original queries from 
 ### Configuration
 - `--env ENV` - Environment file path
   - **Default**: `.env`
-- `--close` - Close cache connections after operation
-  - **Purpose**: Ensure clean shutdown
+- `--close` - Exit once the work is done: both queues are empty, no original query is being decomposed and no fragment is running
+  - **Purpose**: Batch runs that populate the cache from what was queued and then stop
 
 ### Examples
 

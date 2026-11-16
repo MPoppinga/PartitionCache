@@ -214,6 +214,9 @@ The monitor implements a sophisticated two-threaded architecture:
 - A fragment queued without a datatype uses the datatype registered for its partition key; for an unregistered key
   it runs without lazy insertion and the datatype is inferred from the result (an empty result gets the status 'failed')
 
+With `--close` the monitor exits once both queues are empty, no original query is being decomposed and no fragment
+is running.
+
 ### Usage Example
 
 ```bash

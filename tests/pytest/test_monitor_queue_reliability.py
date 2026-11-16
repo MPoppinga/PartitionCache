@@ -1,5 +1,6 @@
 """pcache-monitor: --close waits for both queues and the decomposer, a missing datatype is resolved, a failed push is not lost silently."""
 
+import threading
 from unittest.mock import Mock, patch
 
 import pytest
@@ -7,6 +8,9 @@ import pytest
 import partitioncache.cli.monitor_cache_queue as mcq
 
 MODULE = "partitioncache.cli.monitor_cache_queue"
+QUERY = "SELECT * FROM orders AS o WHERE o.total > 10"
+PAIRS = [("SELECT DISTINCT o.pk FROM orders AS o WHERE o.total > 10", "h1")]
+
 
 @pytest.fixture
 def args():
@@ -36,6 +40,103 @@ def args():
         mcq.args = original
     else:
         delattr(mcq, "args")
+
+
+@pytest.fixture
+def exit_event():
+    event = threading.Event()
+    with patch(f"{MODULE}.exit_event", event):
+        yield event
+
+
+def _lengths(original: int, fragments: int) -> dict:
+    return {"original_query_queue": original, "query_fragment_queue": fragments}
+
+
+class TestCloseCondition:
+    @pytest.mark.parametrize(
+        "active,lengths,closes",
+        [(0, _lengths(0, 0), True), (1, _lengths(0, 0), False), (0, _lengths(1, 0), False), (0, _lengths(0, 1), False)],
+    )
+    def test_needs_no_worker_and_both_queues_empty(self, exit_event, active, lengths, closes):
+        with patch(f"{MODULE}.get_queue_lengths", return_value=lengths):
+            assert mcq.close_when_done(active) is closes
+        assert exit_event.is_set() is closes
+
+    def test_not_while_a_decomposition_is_in_flight(self, exit_event):
+        """The decomposer holds the lock from its pop to its push: both queues can be empty in between."""
+        with patch(f"{MODULE}.get_queue_lengths", return_value=_lengths(0, 0)) as lengths:
+            with mcq.decomposition_lock:
+                held_elsewhere = threading.Thread(target=lambda: setattr(self, "closed", mcq.close_when_done(0)))
+                held_elsewhere.start()
+                held_elsewhere.join(5)
+        assert self.closed is False
+        assert not exit_event.is_set()
+        lengths.assert_not_called()
+
+    def test_not_when_the_queue_count_fails(self, exit_event):
+        with patch(f"{MODULE}.get_queue_lengths", side_effect=RuntimeError("connection lost")):
+            assert mcq.close_when_done(0) is False
+        assert not exit_event.is_set()
+
+    @pytest.mark.parametrize("lengths,closes", [(_lengths(2, 0), False), (_lengths(0, 0), True)])
+    def test_fragment_executor_waits_for_the_original_queue(self, args, lengths, closes):
+        args.close = True
+        rounds = [0]
+
+        def stop_after_a_few_rounds():
+            rounds[0] += 1
+            return rounds[0] > 3
+
+        with (
+            patch(f"{MODULE}.exit_event") as event,
+            patch(f"{MODULE}.pop_from_query_fragment_queue", return_value=None),
+            patch(f"{MODULE}.pop_from_query_fragment_queue_blocking", return_value=None),
+            patch(f"{MODULE}.get_cache_handler"),
+            patch(f"{MODULE}.get_queue_lengths", return_value=lengths),
+        ):
+            event.is_set.side_effect = stop_after_a_few_rounds
+            mcq.fragment_executor()
+        assert event.set.called is closes
+
+    def test_decomposer_does_not_pop_after_the_exit(self, args, exit_event):
+        args.close = True
+        exit_event.set()
+        with patch(f"{MODULE}.pop_from_original_query_queue") as pop, patch(f"{MODULE}.pop_from_original_query_queue_blocking") as pop_blocking:
+            mcq.query_fragment_processor(args, (None, None, None))
+        pop.assert_not_called()
+        pop_blocking.assert_not_called()
+
+    def test_close_waits_until_the_popped_query_is_pushed(self, args, exit_event):
+        """The original query is popped (both queues read empty) and decomposed; --close exits only after the push."""
+        args.close = True
+        pushing = threading.Event()
+        release = threading.Event()
+
+        def push(*_args, **_kwargs):
+            pushing.set()
+            release.wait(10)
+            return True
+
+        with (
+            patch(f"{MODULE}.pop_from_original_query_queue", side_effect=[(QUERY, "pk", "integer"), None, None, None, None, None]),
+            patch(f"{MODULE}.generate_all_query_hash_pairs", return_value=PAIRS),
+            patch(f"{MODULE}.push_to_query_fragment_queue", side_effect=push) as pushed,
+            patch(f"{MODULE}.get_queue_lengths", return_value=_lengths(0, 0)),
+        ):
+            decomposer = threading.Thread(target=mcq.query_fragment_processor, args=(args, (None, None, None)), daemon=True)
+            decomposer.start()
+            assert pushing.wait(5)
+            assert mcq.close_when_done(0) is False
+            release.set()
+            for _ in range(100):
+                if mcq.close_when_done(0):
+                    break
+                threading.Event().wait(0.05)
+            decomposer.join(5)
+        assert exit_event.is_set()
+        assert not decomposer.is_alive()
+        pushed.assert_called_once()
 
 
 class TestMissingDatatype:
