@@ -135,6 +135,49 @@ def _has_alias_that_needs_quotes(query: str) -> bool:
     )
 
 
+def _has_with_clause(query: str) -> bool:
+    """True if the query has a WITH clause anywhere; False also when it cannot be parsed."""
+    try:
+        return sqlglot.parse_one(query).find(exp.With) is not None
+    except Exception:
+        return False
+
+
+_VARIANT_ALIAS_RE = re.compile(r"t\d+")
+_PARTITION_JOIN_ALIAS_RE = re.compile(r"p1")
+
+
+def _subquery_alias_conflict(query: str, variant_alias_re: re.Pattern[str] = _VARIANT_ALIAS_RE) -> str | None:
+    """Return a name a subquery defines that the alias renaming would capture, or None.
+
+    Variants rename the outer aliases to t1, t2, ... (and a partition-join table to p1) by text, also inside
+    subqueries. That is wrong when a subquery defines a table or alias named like an outer alias (its own
+    references would be renamed too), or defines a name matching ``variant_alias_re`` while referencing an outer
+    alias (the renamed reference would bind to the subquery's table).
+    """
+    try:
+        parsed = sqlglot.parse_one(query)
+    except Exception:
+        return None
+    outermost = parsed if isinstance(parsed, exp.Select) else parsed.find(exp.Select)
+    if outermost is None:
+        return None
+    outer_aliases = {table.alias_or_name for table in outermost.find_all(exp.Table) if table.parent_select is outermost}
+    # Only the outermost SELECT's conditions reach the variants (not the other branches of a set operation)
+    for source in outermost.find_all(exp.Table, exp.Subquery):
+        if source.parent_select is outermost:
+            continue
+        names = {source.alias} | ({source.name} if isinstance(source, exp.Table) else set())
+        names.discard("")
+        if names & outer_aliases:
+            return sorted(names & outer_aliases)[0]
+        scope = source.parent_select
+        variant_names = sorted(name for name in names if variant_alias_re.fullmatch(name))
+        if variant_names and scope is not None and any(column.table in outer_aliases for column in scope.find_all(exp.Column)):
+            return variant_names[0]
+    return None
+
+
 def query_contains_top_level_outer_join(query: str) -> bool:
     """Return True if the query has a LEFT/RIGHT/FULL JOIN at the outermost SELECT scope.
 
@@ -258,6 +301,171 @@ def normalize_joins_to_cross_join(query: str) -> str:
     return parsed.sql()
 
 
+_WIDENING, _SET, _OTHER = "widening", "set", "other"
+
+
+def _aggregates(select: exp.Select) -> bool:
+    """True if the SELECT list computes values over several rows (aggregate or window functions)."""
+    return any(expression.find(exp.AggFunc, exp.Window) is not None for expression in select.expressions)
+
+
+def _distinct_on(select: exp.Select) -> bool:
+    distinct = select.args.get("distinct")
+    return distinct is not None and distinct.args.get("on") is not None
+
+
+def _plain_group(select: exp.Select) -> bool:
+    """True for a GROUP BY of plain expressions; ROLLUP, CUBE and GROUPING SETS add rows of their own."""
+    group = select.args.get("group")
+    if group is None or not group.expressions or any(group.args.get(arg) for arg in ("grouping_sets", "cube", "rollup", "totals")):
+        return False
+    return not any(isinstance(node, exp.Rollup | exp.Cube | exp.GroupingSets | exp.Tuple) for node in group.expressions)
+
+
+def _subquery_contexts(parsed: exp.Expr, outermost: exp.Select | None) -> dict[int, str]:
+    """Classify every nested SELECT by how its rows reach the result of the outermost query.
+
+    ``_WIDENING``: more rows of it can only add rows to the outer result (a positive ``IN``, ``= ANY`` or ``EXISTS``
+    in a WHERE of conjunctions and disjunctions, a branch of a UNION or INTERSECT, the left branch of an EXCEPT,
+    a table of an inner join, each inside a widening SELECT). ``_SET``: only which rows it has matters, not their
+    number or order (the same predicates negated, ``<op> ALL``, or in any other expression). ``_OTHER``: anything
+    else, e.g. a scalar subquery or the table of an outer join.
+
+    Returns:
+        ``id(select)`` -> context for every SELECT except ``outermost``.
+    """
+    contexts: dict[int, str] = {}
+
+    def context(select: exp.Select) -> str:
+        if id(select) not in contexts:
+            contexts[id(select)] = classify(select)
+        return contexts[id(select)]
+
+    def classify(select: exp.Select) -> str:
+        node: exp.Expr = select
+        monotone = True
+        parent = node.parent
+        while isinstance(parent, exp.Subquery | exp.Paren | exp.SetOperation):
+            if isinstance(parent, exp.Intersect | exp.Except) and not parent.args.get("distinct"):
+                return _OTHER  # INTERSECT ALL / EXCEPT ALL count rows
+            if isinstance(parent, exp.Except) and node is not parent.this:
+                monotone = False
+            node, parent = parent, parent.parent
+        if parent is None:  # a branch of a set operation at the top: its rows are result rows
+            return _WIDENING if monotone else _SET
+        if isinstance(parent, exp.From | exp.Join):
+            if node is not parent.this or (isinstance(parent, exp.Join) and (parent.side or parent.kind not in ("", "INNER", "CROSS"))):
+                return _OTHER
+            host = parent.parent
+            if host is outermost:  # its SELECT list becomes * and its row limits go
+                return _WIDENING if monotone else _SET
+            if not isinstance(host, exp.Select) or _aggregates(host) or _distinct_on(host):
+                return _OTHER
+            host_context = context(host)
+            if host_context == _WIDENING:
+                return _WIDENING if monotone else _SET
+            if host_context == _SET and not any(host.args.get(clause) for clause in ("limit", "offset", "having")):
+                return _SET  # the host keeps no clause that counts or orders this table's rows
+            return _OTHER
+        if (isinstance(parent, exp.In) and node is parent.args.get("query")) or isinstance(parent, exp.Exists):
+            predicate: exp.Expr = parent
+        elif isinstance(parent, exp.Any | exp.All) and isinstance(parent.parent, exp.Binary) and parent.parent.expression is parent:
+            predicate = parent.parent
+            monotone = monotone and isinstance(parent, exp.Any)
+        else:
+            return _OTHER
+        # The predicate depends only on which rows exist; it widens with them only in a WHERE of ANDs and ORs
+        while isinstance(predicate.parent, exp.And | exp.Or | exp.Paren):
+            predicate = predicate.parent
+        where = predicate.parent
+        if not monotone or not isinstance(where, exp.Where) or not isinstance(where.parent, exp.Select):
+            return _SET
+        host = where.parent
+        return _WIDENING if host is outermost or context(host) == _WIDENING else _SET
+
+    for select in parsed.find_all(exp.Select):
+        if select is not outermost:
+            context(select)
+    return contexts
+
+
+def _clean_subquery_clauses(select: exp.Select, context: str) -> None:
+    """Remove the clauses of a nested SELECT whose removal cannot remove rows from the outer result."""
+    distinct_on = _distinct_on(select)
+    if context == _WIDENING:
+        for clause in ("limit", "offset", "having"):
+            select.set(clause, None)
+        if not distinct_on:
+            select.set("order", None)
+        if _plain_group(select) and not _aggregates(select) and select.args.get("order") is None:
+            select.set("group", None)
+        return
+    if select.args.get("limit") or select.args.get("offset") or distinct_on:
+        return
+    select.set("order", None)  # without row limits and DISTINCT ON the order of the rows never matters
+    if context == _SET and _plain_group(select) and not _aggregates(select) and select.args.get("having") is None:
+        select.set("group", None)
+
+
+def _ordered_between(node: exp.Expr) -> exp.Expr:
+    """Rewrite ``a BETWEEN SYMMETRIC x AND y`` without SYMMETRIC, which sqlglot's simplification drops.
+
+    With numeric literal bounds the bounds are put in ascending order; otherwise the condition becomes
+    ``(a BETWEEN x AND y OR a BETWEEN y AND x)``, its definition.
+    """
+    if not (isinstance(node, exp.Between) and node.args.get("symmetric")):
+        return node
+    low, high = node.args["low"], node.args["high"]
+    low_value, high_value = _numeric_literal(low, allow_negative=True), _numeric_literal(high, allow_negative=True)
+    if low_value is not None and high_value is not None:
+        if low_value > high_value:
+            low, high = high, low
+        return exp.Between(this=node.this, low=low, high=high)
+    return exp.paren(
+        exp.or_(
+            exp.Between(this=node.this.copy(), low=low.copy(), high=high.copy()),
+            exp.Between(this=node.this.copy(), low=high.copy(), high=low.copy()),
+        )
+    )
+
+
+_FOLDED_IDENTIFIER_RE = re.compile(r"[a-z_][a-z0-9_$]*")
+
+
+def _needs_its_quotes(identifier: exp.Identifier) -> bool:
+    """True for the name (not the alias) of a column, or of a table with an alias, that differs from its folded form.
+
+    A table without an alias is referenced by its name, which the alias handling takes for an alias; it loses
+    its quotes as before.
+    """
+    if _FOLDED_IDENTIFIER_RE.fullmatch(identifier.name):
+        return False
+    parent = identifier.parent
+    if isinstance(parent, exp.Column):
+        return parent.args.get("this") is identifier
+    if isinstance(parent, exp.Table):
+        return bool(parent.alias) and any(parent.args.get(part) is identifier for part in ("this", "db", "catalog"))
+    return False
+
+
+def _unaliased_quoted_table(query: str) -> str | None:
+    """Return a quoted table name that needs its quotes but has no alias, or None (also when unparseable).
+
+    Such a table is referenced by its name, which the alias handling treats as an alias and leaves unquoted.
+    """
+    try:
+        parsed = sqlglot.parse_one(query)
+    except Exception:
+        return None
+    for table in parsed.find_all(exp.Table):
+        if not table.alias and any(
+            isinstance(part, exp.Identifier) and part.quoted and not _FOLDED_IDENTIFIER_RE.fullmatch(part.name)
+            for part in (table.args.get("this"), table.args.get("db"), table.args.get("catalog"))
+        ):
+            return table.sql()
+    return None
+
+
 def clean_query(query: str) -> str:
     """
     Perform query cleaning to ensure stable output for cache variant generation.
@@ -271,10 +479,11 @@ def clean_query(query: str) -> str:
 
     Removes:
     - SELECT expressions (replaced with *, don't affect partition key access patterns)
-    - ORDER BY clauses (don't affect partition key access patterns)
-    - LIMIT clauses (don't affect partition key access patterns)
-    - GROUP BY clauses (don't affect partition key access patterns)
-    - HAVING clauses (don't affect partition key access patterns)
+    - ORDER BY, LIMIT, OFFSET, GROUP BY and HAVING of the outermost SELECT (removing them can only add rows)
+    - The same clauses of a subquery where that cannot remove rows of the outer result: all of them under a
+      positive IN, = ANY or EXISTS (GROUP BY only without aggregates in the SELECT list); under NOT IN,
+      NOT EXISTS, <op> ALL or in a scalar subquery the subquery stays as written, except an ORDER BY without
+      LIMIT, OFFSET or DISTINCT ON
     - Comments
     - Trailing semicolons
     - Unnecessary parentheses in WHERE clauses
@@ -299,45 +508,37 @@ def clean_query(query: str) -> str:
     # Parse the query
     parsed = sqlglot.parse_one(query)
 
+    parsed = parsed.transform(_ordered_between)
+
     # Normalize the query (building CNF)
     parsed = sqlglot.optimizer.normalize.normalize(parsed)
 
     # Simplification e.g. Sort comparison operators to ensure consistent order
     parsed = sqlglot.optimizer.simplify.simplify(parsed)
 
-    # Remove clauses that don't affect which partition keys are accessed
-    for select_stmt in parsed.find_all(exp.Select):
-        # Remove ORDER BY
-        if select_stmt.args.get("order"):
-            select_stmt.set("order", None)
-            logger.debug("Removed ORDER BY clause for cache variant generation")
-
-        # Remove LIMIT
-        if select_stmt.args.get("limit"):
-            select_stmt.set("limit", None)
-            logger.debug("Removed LIMIT clause for cache variant generation")
-
-        # Remove GROUP BY
-        if select_stmt.args.get("group"):
-            select_stmt.set("group", None)
-            logger.debug("Removed GROUP BY clause for cache variant generation")
-
-        # Remove HAVING
-        if select_stmt.args.get("having"):
-            select_stmt.set("having", None)
-            logger.debug("Removed HAVING clause for cache variant generation")
+    # The outermost SELECT's ORDER BY, row limits, GROUP BY and HAVING can only remove result rows. In a subquery
+    # they go only where that cannot remove rows of the outer result (see _subquery_contexts).
+    outermost_select = parsed if isinstance(parsed, exp.Select) else parsed.find(exp.Select)
+    contexts = _subquery_contexts(parsed, outermost_select)
+    for select_stmt in list(parsed.find_all(exp.Select)):
+        if select_stmt is outermost_select:
+            for clause in ("order", "limit", "offset", "group", "having"):
+                select_stmt.set(clause, None)
+        else:
+            _clean_subquery_clauses(select_stmt, contexts[id(select_stmt)])
 
     # Replace only the outermost SELECT expressions with * to avoid confusing
     # downstream regex-based parsing (e.g., aliases containing SQL keywords like FROM)
     # Only the outermost SELECT is replaced; subqueries/CTEs keep their columns
-    outermost_select = parsed if isinstance(parsed, exp.Select) else parsed.find(exp.Select)
     if outermost_select:
         outermost_select.set("expressions", [exp.Star()])
 
-    # Quoted identifiers are not supported downstream, so drop the quotes on the AST,
-    # where string literals are left untouched.
+    # Drop the quotes of identifiers on the AST, where string literals are left untouched: the alias handling
+    # downstream does not support quoted aliases, and "name" is name. A table or column name that is not lower
+    # case keeps its quotes, since PostgreSQL folds the unquoted name to another table or column.
     for identifier in parsed.find_all(exp.Identifier):
-        identifier.set("quoted", False)
+        if not (identifier.quoted and _needs_its_quotes(identifier)):
+            identifier.set("quoted", False)
 
     query = parsed.sql(comments=False)
 
@@ -664,6 +865,38 @@ def _detect_pk_bearing_aliases(
     return pk_bearing
 
 
+def _key_condition_across_unjoined_aliases(
+    table_aliases: list[str],
+    partition_key: str,
+    condition_groups: list[dict],
+    partition_key_joins: dict[tuple[str, str], list[str]],
+) -> str | None:
+    """Return a condition that relates the partition keys of aliases that no key equijoin connects, or None.
+
+    Variants join their tables on the partition key, which is a relaxation only if the query's tables are
+    key-equal. A condition such as ``x.pk = y.pk + 1`` or ``(x.pk = y.pk OR y.flag = 1)`` between aliases that
+    are not connected by ``<alias>.<pk> = <alias>.<pk>`` conditions states that their keys differ.
+    """
+    component = {alias: alias for alias in table_aliases}
+
+    def find(alias: str) -> str:
+        while component[alias] != alias:
+            alias = component[alias]
+        return alias
+
+    for left, right in partition_key_joins:
+        if left in component and right in component:
+            component[find(left)] = find(right)
+    tokens = {alias: re.compile(rf"\b{re.escape(alias)}\.{re.escape(partition_key)}\b") for alias in table_aliases}
+    for group in condition_groups:
+        for conditions in group.values():
+            for condition in conditions:
+                refs = _strip_string_literals(condition)
+                if len({find(alias) for alias, token in tokens.items() if token.search(refs)}) > 1:
+                    return condition
+    return None
+
+
 def extract_and_group_query_conditions(
     query, partition_key
 ) -> tuple[
@@ -688,7 +921,7 @@ def extract_and_group_query_conditions(
     partition_key_joins: dict[tuple[str, str], list[str]] = defaultdict(list)  # Track PK joins for star detection
 
     # get tables
-    tables = re.split("FROM|WHERE", query, flags=re.IGNORECASE)[1]
+    tables = re.split(r"\b(?:FROM|WHERE)\b", query, flags=re.IGNORECASE)[1]
     tables = tables.split(",")
     tables = [x.strip() for x in tables]
 
@@ -726,12 +959,9 @@ def extract_and_group_query_conditions(
         # Alias and column detection ignores string literals ('u.city_id' is not a column reference)
         condition_refs = _strip_string_literals(condition)
 
-        # find partition_key join_conditions and track them
-        if re.match(rf"\w*\.{partition_key}\s=\s\w*\.{partition_key}", condition_refs):
-            # Extract the two aliases involved in the join
-            parts = condition.split("=")
-            left_alias = parts[0].strip().split(".")[0]
-            right_alias = parts[1].strip().split(".")[0]
+        # find partition_key join_conditions (exactly <alias>.<pk> = <alias>.<pk>) and track them
+        if key_join := re.fullmatch(rf"(\w+)\.{re.escape(partition_key)}\s=\s(\w+)\.{re.escape(partition_key)}", condition_refs):
+            left_alias, right_alias = key_join.groups()
             if left_alias in table_aliases and right_alias in table_aliases:
                 partition_key_joins[(min(left_alias, right_alias), max(left_alias, right_alias))].append(condition)
             continue  # Skip adding to other conditions
@@ -1194,6 +1424,15 @@ def generate_partial_queries(
         partition_key_joins,
     ) = extract_and_group_query_conditions(query, partition_key)
 
+    if not skip_partition_key_joins:
+        unjoined = _key_condition_across_unjoined_aliases(table_aliases, partition_key, [distance_conditions, other_functions, or_conditions], partition_key_joins)
+        if unjoined is not None:
+            logger.warning(
+                f"Query relates the partition keys of its tables by '{unjoined}', not by key equality; variants join their tables "
+                "on the partition key and would drop rows. Returning no variants; execute the query unchanged."
+            )
+            return []
+
     # Detect partition-join tables - special tables used for partition key joins
     # These tables are excluded from variant generation and re-added to each variant
     detected_partition_join_alias = detect_partition_join_table(
@@ -1206,6 +1445,14 @@ def generate_partial_queries(
         auto_detect_partition_join,
         partition_join_table,
     )
+
+    # The partition-join table is renamed to p1, which a correlated subquery defining that name would capture
+    if detected_partition_join_alias and (captured := _subquery_alias_conflict(query, _PARTITION_JOIN_ALIAS_RE)) is not None:
+        logger.warning(
+            f"A subquery defines '{captured}', which the renaming of the partition-join table in the variants would capture. "
+            "Returning no variants; execute the query unchanged."
+        )
+        return []
 
     # Dimension-table attachment: when the query joins a dimension table via an
     # attachment join (alias.partition_key = other_alias.other_column), restrict
@@ -1588,7 +1835,13 @@ def generate_partial_queries(
                         for comb in itertools.combinations(all_pk_conditions_pj, i):
                             query_where_comb = combined_where.copy()
                             for orig_alias, subquery in comb:
-                                remapped = _sub_outside_literals(rf'\b{re.escape(orig_alias)}\.', f'{partition_join_new_alias}.', subquery)
+                                pj_target: str | None = partition_join_new_alias
+                                if skip_partition_key_joins and orig_alias != detected_partition_join_alias:
+                                    # Without key joins each alias has its own key: the condition stays on its alias
+                                    pj_target = new_alias_by_key.get(orig_alias)
+                                    if pj_target is None:
+                                        continue
+                                remapped = _sub_outside_literals(rf'\b{re.escape(orig_alias)}\.', f'{pj_target}.', subquery)
                                 query_where_comb.append(remapped)
                             # Build WHERE clause only if conditions exist
                             select_clause = _build_select_clause(
@@ -1615,13 +1868,21 @@ def generate_partial_queries(
 
             # Flatten partition_key_conditions for combinatorial generation
             all_pk_conditions = [(alias, cond) for alias, conds in partition_key_conditions.items() for cond in conds]
-            if all_pk_conditions:  # TODO handle CTE expressions
+            # Without key joins, variants without the partition-join table would select another table's key
+            if all_pk_conditions and not (skip_partition_key_joins and detected_partition_join_alias):
                 # Create variants of the query with partition key conditions
                 for i in range(1, len(all_pk_conditions) + 1):
                     for comb in itertools.combinations(all_pk_conditions, i):
                         query_where_comb = query_where.copy()
                         for orig_alias, subquery in comb:
-                            if restrict_to_pk_bearing:
+                            remap_target: str | None
+                            if skip_partition_key_joins:
+                                # Without key joins each alias has its own key: the condition restricts its own alias
+                                # only, and a variant without that alias does not take it
+                                remap_target = new_alias_by_key.get(orig_alias)
+                                if remap_target is None:
+                                    continue
+                            elif restrict_to_pk_bearing:
                                 # Attach the pk condition to its own alias (or the
                                 # variant's pk-bearing SELECT alias), never to a
                                 # dimension alias that lacks the pk column.
@@ -1644,8 +1905,15 @@ def generate_partial_queries(
                                 q = f"{select_clause} FROM {', '.join(new_table_list_with_alias)}"
                         ret.append(q)
 
-    # Add also the subqueries of `pk IN (SELECT ...)` conditions as variants of their own
-    for pk_conds in partition_key_conditions.values():
+    # Add also the subqueries of `pk IN (SELECT ...)` conditions as variants of their own. Without key joins they list
+    # the keys of their own alias, which are the query's keys only for the alias whose key the variants select.
+    for pk_alias, pk_conds in partition_key_conditions.items():
+        if skip_partition_key_joins and not (
+            len(table_aliases) == 1
+            or pk_alias == detected_partition_join_alias
+            or (not detected_partition_join_alias and partition_key_source_table in (pk_alias, alias_to_table_map.get(pk_alias)))
+        ):
+            continue
         for partition_key_part in pk_conds:
             ret.extend(_partition_key_subqueries(partition_key_part, table_aliases))
 
@@ -2270,6 +2538,15 @@ def generate_all_query_hash_pairs(
         )
         return []
 
+    # Decomposition reads the tables and conditions of the outermost SELECT; a common table expression would be
+    # decomposed from its body or lost from the variants
+    if _has_with_clause(query):
+        logger.warning(
+            "generate_all_query_hash_pairs: query has a WITH clause (common table expression); PartitionCache does not "
+            "generate cache variants for it. Returning no variants; execute the query unchanged."
+        )
+        return []
+
     # The alias handling only recognises identifiers: for an alias such as "1u" or "a$b" its conditions
     # would be lost and the variants would reference aliases that are not in their FROM clause
     if _has_alias_that_needs_quotes(query):
@@ -2277,6 +2554,22 @@ def generate_all_query_hash_pairs(
             "generate_all_query_hash_pairs: query uses a table alias or name that is not a plain identifier "
             "(letters, digits and underscores, not starting with a digit); PartitionCache does not generate "
             "cache variants for it. Returning no variants; execute the query unchanged."
+        )
+        return []
+
+    if (unaliased := _unaliased_quoted_table(query)) is not None:
+        logger.warning(
+            f"generate_all_query_hash_pairs: table {unaliased} has no alias and a name that needs its quotes; the variants "
+            "refer to it unquoted. PartitionCache does not generate cache variants for it (give the table an alias). "
+            "Returning no variants; execute the query unchanged."
+        )
+        return []
+
+    if (captured := _subquery_alias_conflict(query)) is not None:
+        logger.warning(
+            f"generate_all_query_hash_pairs: a subquery defines the table or alias '{captured}', which the renaming of the "
+            "outer aliases in the variants would capture; PartitionCache does not generate cache variants for it. "
+            "Returning no variants; execute the query unchanged."
         )
         return []
 

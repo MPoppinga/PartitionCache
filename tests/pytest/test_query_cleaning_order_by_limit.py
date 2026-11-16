@@ -5,6 +5,8 @@ Tests the query_processor.clean_query function to ensure it properly strips
 ORDER BY and LIMIT clauses to improve cache consistency.
 """
 
+import pytest
+
 from partitioncache.query_processor import clean_query, generate_all_hashes
 
 
@@ -192,3 +194,51 @@ class TestOrderByLimitCleaning:
         # Even with fallback, should remove ORDER BY and LIMIT
         assert ("ORDER BY" not in result) or ("LIMIT" not in result), "At least one clause should be removed"
         assert "city_id = 10" in result
+
+
+class TestSubqueryClausesStayWhereTheyLimitTheResult:
+    """A subquery loses ORDER BY, LIMIT, OFFSET, GROUP BY and HAVING only where that cannot remove rows of the query."""
+
+    def test_positive_in_loses_all_of_them(self):
+        query = "SELECT * FROM a WHERE a.id IN (SELECT id FROM b GROUP BY id HAVING COUNT(*) > 1 ORDER BY id LIMIT 3 OFFSET 2)"
+        assert clean_query(query) == "SELECT * FROM a WHERE a.id IN (SELECT id FROM b)"
+
+    def test_positive_in_keeps_a_group_by_of_aggregates(self):
+        query = "SELECT * FROM a WHERE a.v IN (SELECT MAX(w) FROM b GROUP BY k HAVING COUNT(*) > 1)"
+        assert clean_query(query) == "SELECT * FROM a WHERE a.v IN (SELECT MAX(w) FROM b GROUP BY k)"
+
+    def test_offset_without_order_by_is_not_left_behind(self):
+        query = "SELECT * FROM a WHERE a.id IN (SELECT id FROM b ORDER BY s OFFSET 10) OR a.v = 2"
+        assert clean_query(query) == "SELECT * FROM a WHERE a.id IN (SELECT id FROM b) OR a.v = 2"
+
+    def test_outer_offset_goes(self):
+        assert clean_query("SELECT * FROM a WHERE a.v = 1 OFFSET 5") == "SELECT * FROM a WHERE a.v = 1"
+
+    @pytest.mark.parametrize(
+        "condition",
+        [
+            "NOT a.id IN (SELECT id FROM b ORDER BY score DESC LIMIT 1)",
+            "NOT EXISTS(SELECT k FROM b WHERE a.id = b.id GROUP BY k HAVING COUNT(*) > 1)",
+            "a.v > ALL (SELECT w FROM b ORDER BY w LIMIT 2)",
+            "a.v > (SELECT MAX(w) FROM b GROUP BY k ORDER BY 1 LIMIT 1)",
+            "(a.id IN (SELECT id FROM b LIMIT 1)) = FALSE",
+            "a.id IN (SELECT id FROM b EXCEPT SELECT id FROM c WHERE c.id IN (SELECT id FROM d LIMIT 1))",
+            "NOT a.id IN (SELECT id FROM b WHERE b.z IN (SELECT z FROM c LIMIT 1))",
+            "a.v IN (SELECT MAX(s.w) FROM (SELECT w, k FROM b ORDER BY w LIMIT 3) AS s GROUP BY s.k)",
+            "a.id IN (SELECT id FROM b LEFT JOIN (SELECT id AS cid FROM c LIMIT 1) AS s ON b.id = s.cid)",
+            "EXISTS(SELECT k FROM b WHERE a.id = b.id GROUP BY ROLLUP (k))",
+            "NOT a.k IN (SELECT s.k FROM (SELECT k FROM b GROUP BY k, m) AS s GROUP BY s.k HAVING COUNT(*) > 1)",
+        ],
+    )
+    def test_subquery_stays_as_written(self, condition):
+        query = f"SELECT * FROM a WHERE {condition}"
+        assert clean_query(query) == query
+
+    def test_distinct_on_keeps_its_order_by(self):
+        query = "SELECT * FROM a WHERE a.id IN (SELECT DISTINCT ON (k) id FROM b ORDER BY k, s LIMIT 5)"
+        assert clean_query(query) == "SELECT * FROM a WHERE a.id IN (SELECT DISTINCT ON (k) id FROM b ORDER BY k, s)"
+
+    def test_order_by_without_row_limits_goes_everywhere(self):
+        """The order of rows never matters without LIMIT, OFFSET or DISTINCT ON; GROUP BY without aggregates neither under NOT IN."""
+        query = "SELECT * FROM a WHERE NOT a.id IN (SELECT id FROM b GROUP BY id ORDER BY id) AND a.v > (SELECT MAX(w) FROM b ORDER BY 1)"
+        assert clean_query(query) == "SELECT * FROM a WHERE NOT a.id IN (SELECT id FROM b) AND a.v > (SELECT MAX(w) FROM b)"

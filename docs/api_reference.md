@@ -92,6 +92,16 @@ if 'float' in backends['postgresql_array']:
 
 ### Query Processing
 
+> **Premise of the variants.** Without `skip_partition_key_joins`, the variants of a query over several tables
+> assume that all its tables carry the same partition key value: a variant over two tables gets the key equality
+> (`t1.<key> = t2.<key>`) added, and the keys of a variant over one table restrict the whole query. A query that does
+> not join its tables on the partition key is therefore treated as if it did; this is right only if every match lies
+> within one partition. A table that never relates its key to another table's is reported with the warning
+> `Table '<alias>' (<table>) does not use partition key '<key>'`. A query that states something else about the keys
+> of two tables (`k1.<key> < k2.<key>`, `a.<key> = b.<key> + 1`) contradicts the premise and gets no variants. For
+> queries whose tables have keys of their own (spatial and temporal keys, self-joins across partitions), set
+> `skip_partition_key_joins=True`.
+
 #### `get_partition_keys(query: str, cache_handler: AbstractCacheHandler, partition_key: str, min_component_size=2, canonicalize_queries=False, follow_graph: bool = True, auto_detect_partition_join: bool = True, partition_join_table: str | None = None, bucket_steps: float = 1.0, add_constraints: dict[str, str] | None = None, remove_constraints_all: list[str] | None = None, remove_constraints_add: list[str] | None = None, skip_partition_key_joins: bool = False, geometry_column: str | None = None, max_conditions_removed: int | None = None, protected_patterns: list[str] | None = None)`
 
 Retrieves cached partition keys for a query with comprehensive statistics.

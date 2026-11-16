@@ -11,7 +11,14 @@ import re
 import pytest
 
 from partitioncache import query_processor
-from partitioncache.apply_cache import apply_cache, apply_cache_lazy, get_partition_keys, rewrite_query_with_p0_table
+from partitioncache.apply_cache import (
+    apply_cache,
+    apply_cache_lazy,
+    extend_query_with_partition_keys,
+    extend_query_with_partition_keys_lazy,
+    get_partition_keys,
+    rewrite_query_with_p0_table,
+)
 from partitioncache.cache_handler.abstract import AbstractCacheHandler_Lazy
 
 duckdb = pytest.importorskip("duckdb")
@@ -196,21 +203,55 @@ EXISTS_REUSING_P1 = (
 )
 
 
-@pytest.mark.parametrize("query", [SUBQUERY_REUSING_P1, UNION_REUSING_P1, EXISTS_REUSING_P1], ids=["not_in", "union", "not_exists"])
-class TestJoinMethodsJoinOnlyTheRestrictedSelect:
-    def test_eager(self, db, query):
-        run, cache = db
-        for join_every_table in (False, True):
-            rows, _, rewritten = _eager(run, cache, query, "TMP_TABLE_JOIN", join_every_table=join_every_table)
-            assert rows == run(query), rewritten
-            assert len(re.findall(r"AS tmp_\w+ ON", rewritten)) == (2 if join_every_table else 1)
+# The keys of p1 in the rows of each query (of the first branch for the UNION): the key set a correct cache gives for p1
+P1_KEYS = {
+    "not_in": "SELECT DISTINCT p1.pk AS pk FROM t AS p1 JOIN t AS p2 ON p1.pk = p2.pk WHERE p1.x = 3 AND p2.y = 1",
+    "union": "SELECT DISTINCT p1.pk AS pk FROM t AS p2 JOIN t AS p1 ON p1.pk = p2.pk WHERE p1.x = 3 AND p2.y = 1",
+    "not_exists": "SELECT DISTINCT p1.pk AS pk FROM t AS p1 JOIN t AS p2 ON p1.pk = p2.pk WHERE p1.x = 3 AND p2.y = 1",
+}
+REUSING_P1 = {"not_in": SUBQUERY_REUSING_P1, "union": UNION_REUSING_P1, "not_exists": EXISTS_REUSING_P1}
 
-    def test_lazy(self, db, query):
+
+@pytest.mark.parametrize("name", list(REUSING_P1))
+class TestJoinMethodsJoinOnlyTheRestrictedSelect:
+    """The key table is joined to the restricted SELECT's tables only, not to a subquery's or another branch's p1."""
+
+    @pytest.mark.parametrize("join_every_table", [False, True])
+    def test_direct_eager(self, db, name, join_every_table):
+        run, _ = db
+        query = REUSING_P1[name]
+        keys = {row[0] for row in run(P1_KEYS[name])}
+        target = {"join_every_table": True} if join_every_table else {"p0_alias": "p1"}
+        rewritten = extend_query_with_partition_keys(query, keys, "pk", method="TMP_TABLE_JOIN", sql_dialect="duckdb", **target)
+        assert run(rewritten) == run(query), rewritten
+        assert len(re.findall(r"AS tmp_\w+ ON", rewritten)) == (2 if join_every_table else 1)
+
+    @pytest.mark.parametrize("join_every_table", [False, True])
+    def test_direct_lazy(self, db, name, join_every_table):
+        run, _ = db
+        query = REUSING_P1[name]
+        target = {"join_every_table": True} if join_every_table else {"p0_alias": "p1"}
+        rewritten = extend_query_with_partition_keys_lazy(query, P1_KEYS[name], "pk", method="TMP_TABLE_JOIN", sql_dialect="duckdb", **target)
+        assert run(rewritten) == run(query), rewritten
+        assert len(re.findall(r"AS tmp_\w+ ON", rewritten)) == (2 if join_every_table else 1)
+
+    @pytest.mark.parametrize("lazy", [False, True], ids=["eager", "lazy"])
+    def test_through_the_lookup(self, db, name, lazy):
+        """A subquery that reuses an outer alias gets no variants (the alias renaming would capture it): no cache.
+
+        The other branch of a UNION is not decomposed, so the UNION is restricted, in its first branch only.
+        """
         run, cache = db
+        query = REUSING_P1[name]
+        apply = _lazy if lazy else _eager
         for join_every_table in (False, True):
-            rows, _, rewritten = _lazy(run, cache, query, "TMP_TABLE_JOIN", join_every_table=join_every_table)
+            rows, stats, rewritten = apply(run, cache, query, "TMP_TABLE_JOIN", join_every_table=join_every_table)
             assert rows == run(query), rewritten
-            assert len(re.findall(r"AS tmp_\w+ ON", rewritten)) == (2 if join_every_table else 1)
+            if name == "union":
+                assert stats["enhanced"] == 1
+                assert len(re.findall(r"AS tmp_\w+ ON", rewritten)) == (2 if join_every_table else 1)
+            else:
+                assert stats["enhanced"] == 0 and rewritten == query
 
 
 P0_TABLE_QUERIES = {
@@ -339,7 +380,6 @@ class TestJoinMethodsKeepUnqualifiedKeyColumns:
 @pytest.mark.parametrize("folded", [False, True])
 def test_renamed_key_table_scripts_split_for_lazy_insertion(method, keys, folded):
     """Lazy insertion accepts the PostgreSQL scripts whose key table column is renamed (the unchanged ones are pinned elsewhere)."""
-    from partitioncache.apply_cache import extend_query_with_partition_keys, extend_query_with_partition_keys_lazy
     from partitioncache.key_table_script import lazy_insertion_parts
 
     # An unqualified key column named like the eager and the lazy key table's column
