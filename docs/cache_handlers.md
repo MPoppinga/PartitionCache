@@ -88,6 +88,7 @@ PartitionCache supports multiple cache backends with different performance chara
 - **Best for**: Hexagonal spatial partitioning, uniform spatial distribution
 - **Spatial filtering**: Connected-component intersection of cell groups with k-ring buffer expansion
 - **Population**: `set_cache_lazy()` runs the spatial variant on PostgreSQL and maps every geometry column to an H3 cell in the same statement; each result row becomes one cell group. Used by `pcache-add --direct` and `pcache-monitor`. The pg_cron queue processor cannot populate this backend because its cache lives in RocksDict.
+- **Limits**: Sound for point geometries only: each geometry is mapped to the cell of its centroid, and the buffer bounds distances between points, not between extended geometries. The buffer is converted to rings assuming metres, so the query's distances must be in metres (a degree-valued SRID is not detected).
 - **Scalability**: Good (single-instance)
 
 #### PostGIS BBox Handler
@@ -97,6 +98,7 @@ PartitionCache supports multiple cache backends with different performance chara
 - **Requirements**: PostgreSQL + PostGIS extension
 - **Best for**: Grid-based spatial partitioning, bounding box intersection
 - **Spatial filtering**: `ST_Intersection` of the cached collections, each widened by `ST_Buffer` with the query's buffer distance. Unbuffered for a buffer of 0, which a query over a single table gets when no `buffer_distance` is given.
+- **Limits**: Sound for point geometries only. The buffer adds up the query's distances along a path of tables, which bounds how far two points can be apart; two polygons each within 100 m of a third can be far apart at their far ends, so with extended geometries rows can be lost.
 - **Scalability**: Excellent (database-native)
 
 #### Grid-cell keys (any integer handler)

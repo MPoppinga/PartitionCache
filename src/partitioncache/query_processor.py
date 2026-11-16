@@ -2470,231 +2470,242 @@ def hash_query(query: str) -> str:
     return hashlib.sha1(query.encode()).hexdigest()
 
 
-def extract_distance_constraints(query: str) -> list[tuple[str, str, float]]:
-    """Extract (alias1, alias2, distance) from all distance constraints in the query.
+_RADIUS_DISTANCE_FUNCTIONS = frozenset({"ST_DWITHIN", "ST_DFULLYWITHIN"})
 
-    Handles two kinds of distance constraints:
-      1. ST_DWithin(a.geom, b.geom, distance) function calls
-      2. Comparison-based distance expressions detected by is_distance_function(),
-         e.g. SQRT(POWER(p1.x - p2.x, 2)) < 0.008 or DIST(t1.g, t2.g) BETWEEN 1.6 AND 3.6
 
-    Args:
-        query: SQL query string to parse.
+def _constant_number(node: exp.Expr) -> tuple[Decimal, bool] | None:
+    """Value of a constant numeric expression and whether it is an integer, or None if it is not constant.
 
-    Returns:
-        List of (alias1, alias2, distance) tuples, sorted by alias pair.
+    Literals combined with ``+ - * /`` and parentheses; integer division truncates as in PostgreSQL (``999 / 2`` is 499).
     """
-    try:
-        parsed = sqlglot.parse_one(query)
-    except sqlglot.ParseError:
-        return []
-
-    results: list[tuple[str, str, float]] = []
-    seen_pairs: set[tuple[str, str]] = set()
-
-    # --- Pass 1: ST_DWithin function calls ---
-    for func in parsed.find_all(exp.Anonymous):
-        if func.name.upper() != "ST_DWITHIN":
-            continue
-        args = func.args.get("expressions", [])
-        if len(args) < 3:
-            continue
-
-        alias1 = None
-        alias2 = None
-        for col in args[0].find_all(exp.Column):
-            if col.table:
-                alias1 = col.table
-                break
-        for col in args[1].find_all(exp.Column):
-            if col.table:
-                alias2 = col.table
-                break
-
-        distance_arg = args[2]
-        distance = None
-        literal = distance_arg.find(exp.Literal)
-        if literal is None and isinstance(distance_arg, exp.Literal):
-            literal = distance_arg
-        if literal is not None:
-            try:
-                distance = float(literal.this)
-            except (ValueError, TypeError):
-                pass
-
-        if alias1 is not None and alias2 is not None and distance is not None:
-            a1, a2 = sorted([alias1, alias2])
-            results.append((a1, a2, distance))
-            seen_pairs.add((a1, a2))
-
-    # --- Pass 2: Comparison-based distance functions ---
-    try:
-        conditions = extract_conjunctive_conditions(query)
-    except Exception:
-        conditions = []
-
-    for condition in conditions:
-        if not is_distance_function(condition):
-            continue
-
-        # Extract table aliases from column references in the condition
+    if isinstance(node, exp.Paren):
+        return _constant_number(node.this)
+    if isinstance(node, exp.Literal):
+        if node.is_string:
+            return None
         try:
-            cond_parsed = sqlglot.parse_one(f"SELECT 1 WHERE {condition}")
-        except sqlglot.ParseError:
-            continue
-
-        aliases: set[str] = set()
-        for col in cond_parsed.find_all(exp.Column):
-            if col.table:
-                aliases.add(col.table)
-
-        if len(aliases) != 2:
-            continue
-
-        a1, a2 = sorted(aliases)
-
-        # Skip if already captured by ST_DWithin pass
-        if (a1, a2) in seen_pairs:
-            continue
-
-        # Extract upper-bound distance from the condition
-        distance = None
-        condition_upper = condition.upper()
-
-        if " BETWEEN " in condition_upper:
-            # BETWEEN x AND y → extract y (upper bound)
-            try:
-                between_part = condition.split(" BETWEEN ")[1] if " BETWEEN " in condition else condition.split(" between ")[1]
-                upper_str = between_part.split(" AND ")[1] if " AND " in between_part else between_part.split(" and ")[1]
-                distance = float(upper_str.strip())
-            except (IndexError, ValueError):
-                pass
-        elif "<=" in condition:
-            match = re.search(r"<=\s*([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)", condition)
-            if match:
-                try:
-                    distance = float(match.group(1))
-                except ValueError:
-                    pass
-        elif "<" in condition:
-            match = re.search(r"<\s*([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)", condition)
-            if match:
-                try:
-                    distance = float(match.group(1))
-                except ValueError:
-                    pass
-        elif ">=" in condition or ">" in condition:
-            # Lower bound only — not relevant for buffer distance
-            continue
-
-        if distance is not None:
-            results.append((a1, a2, distance))
-            seen_pairs.add((a1, a2))
-
-    return sorted(results)
+            value = Decimal(node.this)
+        except InvalidOperation:
+            return None
+        return (value, not any(c in node.this for c in ".eE")) if value.is_finite() else None
+    if isinstance(node, exp.Neg):
+        inner = _constant_number(node.this)
+        return None if inner is None else (-inner[0], inner[1])
+    if not isinstance(node, exp.Add | exp.Sub | exp.Mul | exp.Div):
+        return None
+    left, right = _constant_number(node.this), _constant_number(node.expression)
+    if left is None or right is None:
+        return None
+    is_int = left[1] and right[1]
+    if isinstance(node, exp.Add):
+        return left[0] + right[0], is_int
+    if isinstance(node, exp.Sub):
+        return left[0] - right[0], is_int
+    if isinstance(node, exp.Mul):
+        return left[0] * right[0], is_int
+    if right[0] == 0:
+        return None
+    quotient = left[0] / right[0]
+    return (quotient.to_integral_value(rounding="ROUND_DOWN"), True) if is_int else (quotient, False)
 
 
-def _extract_point_radius_distances(query: str) -> list[float]:
-    """Extract distances from point-radius ST_DWithin calls (one fixed geometry argument).
+def _single_alias(node: exp.Expr) -> str | None:
+    """The one table alias every column of ``node`` is qualified with, or None (no column, several, unqualified, subquery)."""
+    if node.find(exp.Select) is not None:
+        return None
+    aliases = {column.table for column in node.find_all(exp.Column)}
+    if len(aliases) != 1 or "" in aliases:
+        return None
+    return aliases.pop()
 
-    These are ST_DWithin calls where one argument is a table column and the other is a
-    constructed geometry expression (e.g., ST_MakePoint, ST_Transform), not a table alias.
 
-    Returns:
-        List of distances from point-radius constraints.
+def _distance_predicate(node: exp.Expr) -> tuple[str, str, float | None] | None:
+    """``(alias1, alias2, radius)`` if ``node`` holds only for rows of two aliases within ``radius`` of each other.
+
+    Recognised: ``ST_DWithin(a.g, b.g, r)`` and ``ST_DFullyWithin``, and an upper bound on a distance expression of two
+    aliases (as :func:`is_distance_function` detects them) in either direction: ``d < r``, ``d <= r``, ``r > d``,
+    ``r >= d``, ``d BETWEEN x AND r``. The radius is None when it is not a constant expression. Anything else,
+    including a lower bound, is None.
     """
-    try:
-        parsed = sqlglot.parse_one(query)
-    except sqlglot.ParseError:
-        return []
-
-    distances: list[float] = []
-    for func in parsed.find_all(exp.Anonymous):
-        if func.name.upper() != "ST_DWITHIN":
-            continue
-        args = func.args.get("expressions", [])
+    while isinstance(node, exp.Paren):
+        node = node.this
+    if isinstance(node, exp.Anonymous) and str(node.name).upper() in _RADIUS_DISTANCE_FUNCTIONS:
+        args = node.expressions
         if len(args) < 3:
-            continue
-
-        aliases = []
-        for arg in args[:2]:
-            alias = None
-            for col in arg.find_all(exp.Column):
-                if col.table:
-                    alias = col.table
-                    break
-            aliases.append(alias)
-
-        # Point-radius: exactly one alias found (the other is a fixed geometry)
-        if sum(1 for a in aliases if a is not None) != 1:
-            continue
-
-        distance_arg = args[2]
-        literal = distance_arg.find(exp.Literal)
-        if literal is None and isinstance(distance_arg, exp.Literal):
-            literal = distance_arg
-        if literal is not None:
-            try:
-                distances.append(float(literal.this))
-            except (ValueError, TypeError):
-                pass
-
-    return distances
+            return None
+        alias1, alias2 = _single_alias(args[0]), _single_alias(args[1])
+        if alias1 is None or alias2 is None or alias1 == alias2:
+            return None
+        radius = _constant_number(args[2])
+        a1, a2 = sorted((alias1, alias2))
+        return a1, a2, None if radius is None else max(float(radius[0]), 0.0)
+    if isinstance(node, exp.LT | exp.LTE):
+        distance, bound = node.this, node.expression
+    elif isinstance(node, exp.GT | exp.GTE):
+        distance, bound = node.expression, node.this
+    elif isinstance(node, exp.Between):
+        distance, bound = node.this, node.args.get("high")
+    else:
+        return None
+    if bound is None or distance.find(exp.Select) is not None or not is_distance_function(distance.sql()):
+        return None
+    aliases = {column.table for column in distance.find_all(exp.Column)}
+    if len(aliases) != 2 or "" in aliases:
+        return None
+    a1, a2 = sorted(aliases)
+    radius = _constant_number(bound)
+    return a1, a2, None if radius is None else max(float(radius[0]), 0.0)
 
 
-def compute_buffer_distance(query: str) -> float:
-    """Compute buffer distance as the weighted graph diameter of distance constraints.
+def _top_level_conjuncts(select: exp.Select) -> list[exp.Expr]:
+    """The conditions every result row of ``select`` satisfies: the AND-ed terms of its WHERE and of its inner-join ONs.
 
-    Builds a weighted graph where nodes are table aliases and edges are distance
-    constraints (ST_DWithin calls and comparison-based distance expressions).
-    Returns the diameter (longest shortest path weight) of the graph.
+    A condition under NOT or OR, in a subquery or in the ON of an outer join is not among them.
+    """
+    conditions = [select.args["where"].this] if select.args.get("where") is not None else []
+    for join in select.args.get("joins") or []:
+        if join.args.get("on") is not None and not join.side and join.kind not in ("CROSS", "SEMI", "ANTI"):
+            conditions.append(join.args["on"])
+    conjuncts: list[exp.Expr] = []
+    while conditions:
+        condition = conditions.pop(0)
+        while isinstance(condition, exp.Paren):
+            condition = condition.this
+        if isinstance(condition, exp.And):
+            conditions[:0] = [condition.left, condition.right]
+        else:
+            conjuncts.append(condition)
+    return conjuncts
 
-    For star patterns (all distances from one hub), the diameter is the sum of the
-    two largest distances through the hub. For chain patterns, it's the sum along
-    the longest path.
 
-    For point-radius queries (ST_DWithin with a fixed point, single alias), returns
-    the maximum point-radius distance as fallback.
+def _outer_table_aliases(parsed: exp.Expr) -> list[str] | None:
+    """Aliases of the outer FROM clause and its joins, or None unless the query is one SELECT over tables only."""
+    if not isinstance(parsed, exp.Select) or parsed.find(exp.With) is not None or parsed.args.get("from_") is None:
+        return None
+    items = [parsed.args["from_"].this] + [join.this for join in parsed.args.get("joins") or []]
+    if not all(isinstance(item, exp.Table) for item in items):
+        return None
+    return [item.alias_or_name for item in items]
+
+
+def extract_distance_constraints(query: str, sql_dialect: str = "postgres") -> list[tuple[str, str, float]]:
+    """Extract ``(alias1, alias2, distance)`` from the distance constraints that bound every result row of the query.
+
+    A constraint counts only as a top-level conjunct of the outer query (its WHERE or the ON of an inner join), not
+    under NOT, inside OR or in a subquery, and only with a constant distance (literals and arithmetic). Two kinds:
+      1. ``ST_DWithin(a.geom, b.geom, distance)`` (and ``ST_DFullyWithin``)
+      2. An upper bound on a distance expression detected by :func:`is_distance_function`, in either direction,
+         e.g. ``SQRT(POWER(p1.x - p2.x, 2)) < 0.008``, ``500 > ST_Distance(a.g, b.g)``,
+         ``DIST(t1.g, t2.g) BETWEEN 1.6 AND 3.6`` (upper bound 3.6). A lower bound alone bounds nothing.
 
     Args:
         query: SQL query string to parse.
+        sql_dialect: sqlglot dialect the query is written in.
 
     Returns:
-        The weighted graph diameter in the same units as the distance constraints.
-        Returns 0.0 if no distance constraints are found.
+        List of (alias1, alias2, distance) tuples with alias1 < alias2, one per constraint, sorted.
     """
-    edges = extract_distance_constraints(query)
+    try:
+        parsed = sqlglot.parse_one(query, read=sql_dialect)
+    except ParseError:
+        return []
+    if not isinstance(parsed, exp.Select):
+        return []
+    results = []
+    for conjunct in _top_level_conjuncts(parsed):
+        bound = _distance_predicate(conjunct)
+        if bound is not None and bound[2] is not None:
+            results.append((bound[0], bound[1], bound[2]))
+    return sorted(results)  # type: ignore[arg-type]
 
-    G = nx.Graph()
-    for alias1, alias2, distance in edges:
-        # If multiple ST_DWithin between same pair, use the max distance
-        if G.has_edge(alias1, alias2):
-            current_weight = G[alias1][alias2]["weight"]
-            G[alias1][alias2]["weight"] = max(current_weight, distance)
-        else:
-            G.add_edge(alias1, alias2, weight=distance)
 
-    if G.number_of_nodes() >= 2:
-        # Compute weighted diameter: longest shortest path across all pairs
-        max_distance = 0.0
-        for component in nx.connected_components(G):
-            subgraph = G.subgraph(component)
-            if subgraph.number_of_nodes() < 2:
-                continue
-            # All-pairs shortest paths (weighted)
-            for source in subgraph.nodes():
-                lengths = nx.single_source_dijkstra_path_length(subgraph, source, weight="weight")
-                for _target, length in lengths.items():
-                    if length > max_distance:
-                        max_distance = length
-        return max_distance
+def has_distance_predicate(query: str, sql_dialect: str = "postgres") -> bool:
+    """Whether the query contains a distance predicate anywhere: also under NOT or OR, in a subquery, or with a variable
+    or point radius.
 
-    # Fallback: check for point-radius constraints (single-alias ST_DWithin)
-    point_radius_distances = _extract_point_radius_distances(query)
-    if point_radius_distances:
-        return max(point_radius_distances)
+    Unlike :func:`extract_distance_constraints` this bounds nothing; it tells a query without any distance predicate
+    from one whose distance predicates do not bound its tables.
+    """
+    try:
+        parsed = sqlglot.parse_one(query, read=sql_dialect)
+    except ParseError:
+        return False
+    for node in parsed.find_all(exp.Anonymous, exp.LT, exp.LTE, exp.GT, exp.GTE, exp.Between):
+        if isinstance(node, exp.Anonymous) and str(node.name).upper() in _RADIUS_DISTANCE_FUNCTIONS:
+            return True
+        if _distance_predicate(node) is not None:
+            return True
+    return False
 
-    return 0.0
+
+def _distance_graph(query: str, sql_dialect: str) -> nx.Graph | None:
+    """The aliases of the outer FROM clause, linked by the distance constraints between them; None if not analysable.
+
+    Several constraints on one pair all hold; the largest distance is used, as before the constraints were checked
+    for being top-level.
+    """
+    try:
+        parsed = sqlglot.parse_one(query, read=sql_dialect)
+    except ParseError:
+        return None
+    aliases = _outer_table_aliases(parsed)
+    if not aliases:
+        return None
+    graph = nx.Graph()
+    graph.add_nodes_from(aliases)
+    for alias1, alias2, distance in extract_distance_constraints(query, sql_dialect):
+        if alias1 not in graph or alias2 not in graph:
+            continue
+        if graph.has_edge(alias1, alias2):
+            distance = max(graph[alias1][alias2]["weight"], distance)
+        graph.add_edge(alias1, alias2, weight=distance)
+    return graph
+
+
+def _weighted_diameter(graph: nx.Graph) -> float:
+    lengths = dict(nx.all_pairs_dijkstra_path_length(graph, weight="weight"))
+    return float(max((length for targets in lengths.values() for length in targets.values()), default=0.0))
+
+
+def compute_buffer_distance(query: str, sql_dialect: str = "postgres") -> float | None:
+    """The largest distance between two rows of the query's tables: a sound buffer for every cached fragment.
+
+    Nodes are the aliases of the outer FROM clause, edges the distance constraints of
+    :func:`extract_distance_constraints` (top-level conjuncts with a constant distance). The result is the weighted
+    graph diameter, the longest shortest path: for a star it is the sum of the two largest distances through the hub,
+    for a chain the sum along the chain.
+
+    Args:
+        query: SQL query string to parse.
+        sql_dialect: sqlglot dialect the query is written in.
+
+    Returns:
+        The diameter in the unit of the distance constraints; 0.0 for a query over one alias. None (unknown) if two
+        aliases are not connected by such constraints, e.g. aliases joined only on an attribute, or a distance under
+        NOT or OR, or with a radius that is not constant; also None for a query that is not a single SELECT over
+        tables (CTE, set operation, derived table).
+    """
+    graph = _distance_graph(query, sql_dialect)
+    if graph is None or not nx.is_connected(graph):
+        return None
+    return _weighted_diameter(graph)
+
+
+def distance_bounded_aliases(query: str, anchor: str, sql_dialect: str = "postgres") -> tuple[set[str], float] | None:
+    """The aliases connected to ``anchor`` by distance constraints, and the diameter of their distance graph.
+
+    A fragment of the query whose aliases are all among them holds, for every result row, geometries within that
+    diameter of the anchor's geometry. Fragments with another alias do not: its distance to the anchor is unbounded.
+
+    Returns:
+        ``(aliases, diameter)``, or None if the query is not analysable (see :func:`compute_buffer_distance`) or
+        ``anchor`` is not an alias of its outer FROM clause.
+    """
+    graph = _distance_graph(query, sql_dialect)
+    if graph is None or anchor not in graph:
+        return None
+    component = nx.node_connected_component(graph, anchor)
+    return set(component), _weighted_diameter(graph.subgraph(component))
 
 def generate_all_hashes(
     query: str,

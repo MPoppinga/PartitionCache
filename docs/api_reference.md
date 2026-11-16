@@ -295,7 +295,7 @@ Lazy counterpart to `extend_query_with_partition_keys`: integrates a lazy SQL su
 - `canonicalize_queries` (bool, optional): Whether to canonicalize queries before hashing (default: False)
 - `follow_graph` (bool, optional): Whether to follow the query graph for generating variants (default: True)
 - `analyze_tmp_table` (bool, optional): Enable temp table analysis (default: True)
-- `sql_dialect` (str, optional): sqlglot dialect used to parse and render non-spatial queries (default: `"postgres"`; use `"duckdb"` for DuckDB queries)
+- `sql_dialect` (str, optional): sqlglot dialect used to parse and render the query (default: `"postgres"`; use `"duckdb"` for DuckDB queries). The spatial mode (`geometry_column`) supports PostgreSQL only and raises `ValueError` for another dialect
 - `use_p0_table` (bool, optional): Rewrite the query to use a p0 table/star-schema (default: False)
 - `p0_table_name` (str | None, optional): Name of the p0 table. Defaults to `{partition_key}_mv`
 - `auto_detect_partition_join` (bool, optional): Whether to auto-detect partition-join tables (default: True)
@@ -309,8 +309,8 @@ Lazy counterpart to `extend_query_with_partition_keys`: integrates a lazy SQL su
 - `protected_patterns` (list[str] | None, optional): Condition substrings that must never be removed (default: None)
 - `skip_partition_key_joins` (bool, optional): Spatial mode — generate query variants without partition-key equijoins (default: False). Without temporal or spatial parameters, only the variants that select the key of the restricted alias (the p0 alias) are looked up, since the other aliases hold their own keys; if that alias is no plain table of the query, the query runs uncached (`uncached_reason: no_key_source`).
 - `temporal_bucket_width`, `temporal_column`, `dilation_buckets` (optional): Temporal dilation for time-bucket partition keys, see below
-- `geometry_column` (str | None, optional): Enables spatial mode. Uses this geometry column for variant SELECT clauses and spatial filter. Requires a spatial cache handler with `get_spatial_filter_lazy()` method.
-- `buffer_distance` (float | None, optional): Buffer distance in meters for spatial filter (required when `geometry_column` is set).
+- `geometry_column` (str | None, optional): Enables spatial mode. Uses this geometry column for variant SELECT clauses and spatial filter. Requires a spatial cache handler with `get_spatial_filter_lazy()` method. Sound for point geometries only, see [Spatial buffer](#spatial-buffer-buffer_distance).
+- `buffer_distance` (float | None, optional): Buffer distance for the spatial filter, see [Spatial buffer](#spatial-buffer-buffer_distance).
 - `spatial_method` (Literal["SUBDIVIDE_INLINE", "SUBDIVIDE_TMP_TABLE", "DUMP_TMP_TABLE", "DUMP_CTE"], optional): Strategy for applying the spatial filter (default: "SUBDIVIDE_TMP_TABLE")
 - `subdivide_max_vertices` (int, optional): Maximum vertices per subdivided filter geometry (default: 256)
 - `cost_estimator` (Callable[[str], float | None] | None, optional): Returns the planner cost of a query without executing it, e.g. `PostgresDBHandler.estimate_cost`. Only used together with `min_query_cost` (default: None)
@@ -437,15 +437,26 @@ enhanced_query, stats = partitioncache.apply_cache_lazy(
 - Dilated intersections are implemented in SQL for `postgresql_array` and `postgresql_bit`; the non-lazy API falls back to a Python intersection for other handlers with integer keys. A lazy call on a handler without a dilated intersection, and non-integer keys, run without the cache.
 - Dilation inflates each cached set by up to `2k + 1` buckets. A bucket width at least as large as the typical window keeps `k` at 1.
 
+#### Spatial buffer (`buffer_distance`)
+
+With `geometry_column`, each cached fragment is a region (the geometries of the rows that satisfy it, or their H3 cells), and p0 is restricted to the rows within `buffer_distance` of the intersection of these regions. The buffer must be at least the distance between p0 and any row of any fragment that is used.
+
+- Explicit `buffer_distance`: used unchecked. The caller guarantees this bound for every fragment of the query (with the default `min_component_size`, fragments may contain any of its tables).
+- `None` (default): derived by `compute_buffer_distance(query)`, the diameter of the query's distance graph. Only top-level conjuncts of the outer query (its `WHERE` and inner-join `ON`) with a constant distance link two tables: `ST_DWithin(a.geom, b.geom, d)`, `ST_DFullyWithin`, or an upper bound on a distance function in either direction (`ST_Distance(a.geom, b.geom) < d`, `d > ST_Distance(...)`, `... BETWEEN x AND d`). A distance under `NOT`, inside `OR`, in a subquery, or with a non-constant radius links nothing. A query over a single table gets 0.
+- If some table is not linked to p0 (for example joined only on an attribute, `p1.name = p3.name`), only the fragments whose tables are all linked to p0 are used, with the diameter of those tables. If none of them is cached, if the H3 `mv` or `column` cell mode would restrict the other aliases of p0's table too, or if the query is not a single `SELECT` over tables (CTE, set operation, derived table), the query runs without the cache: the statistics contain `uncached_reason: "spatial_unbounded"` and a warning is logged.
+- A query over several tables without any distance predicate raises `ValueError`; pass `buffer_distance`.
+- Points only: the bound adds up distances between rows, which bounds the distance between points, not between extended geometries (two polygons each within 100 m of a third can be far apart at their far ends), and `rocksdict_h3_grouped` stores the cell of each geometry's centroid. With polygons or lines the spatial cache can lose rows.
+- `rocksdict_h3_grouped` converts the buffer into H3 rings assuming metres; the query's distances must be in metres for it (a geometry column in degrees, e.g. SRID 4326 without a `::geography` cast, is not detected).
+
 #### `apply_cache(query, cache_handler, partition_key, ..., geometry_column=None, buffer_distance=None)`
 
-Applies partition cache to a query using regular (non-lazy) cache handlers. Supports spatial mode. Accepts the same `cost_estimator` / `min_query_cost` gate and `join_every_table` option as `apply_cache_lazy`. Like `apply_cache_lazy`, it takes `sql_dialect` (default `"postgres"`), the sqlglot dialect the enhanced non-spatial query is parsed and rendered in.
+Applies partition cache to a query using regular (non-lazy) cache handlers. Supports spatial mode. Accepts the same `cost_estimator` / `min_query_cost` gate and `join_every_table` option as `apply_cache_lazy`. Like `apply_cache_lazy`, it takes `sql_dialect` (default `"postgres"`), the sqlglot dialect the enhanced query is parsed and rendered in (spatial mode: PostgreSQL only).
 
 **Requirement (both `apply_cache` and `apply_cache_lazy`):** the partition key column must not be NULL in rows the query can return. Cached key sets never contain NULL, so every restriction (`IN`, a key table, the `FALSE` of an empty intersection) removes the rows of the restricted table whose key is NULL.
 
 **Spatial Parameters** (in addition to standard parameters):
-- `geometry_column` (str | None, optional): Enables spatial mode. Requires a spatial cache handler with `get_spatial_filter()` method.
-- `buffer_distance` (float | None, optional): Buffer distance in meters for spatial filter (required when `geometry_column` is set).
+- `geometry_column` (str | None, optional): Enables spatial mode. Requires a spatial cache handler with `get_spatial_filter()` method. Sound for point geometries only.
+- `buffer_distance` (float | None, optional): Buffer distance for the spatial filter, as for `apply_cache_lazy` (see [Spatial buffer](#spatial-buffer-buffer_distance)).
 
 **Example:**
 ```python
@@ -490,7 +501,7 @@ Extends a SQL query with a spatial filter using a lazy SQL subquery that produce
 **Returns:**
 - `str`: The extended SQL query with spatial filter.
 
-Both spatial extension functions additionally accept `use_intersects`, `spatial_method`, `subdivide_max_vertices`, `auto_detect_partition_join`, and `partition_join_table`.
+Both spatial extension functions additionally accept `use_intersects`, `spatial_method`, `subdivide_max_vertices`, `auto_detect_partition_join`, and `partition_join_table`. All spatial extension functions (also the H3 ones below) take `sql_dialect` (default `"postgres"`), the dialect the query is parsed and rendered in; their output is PostgreSQL/PostGIS SQL.
 
 #### `extend_query_with_h3_cell_filter_lazy(query, cell_sql, geometry_column, srid, resolution, p0_alias=None)`
 
