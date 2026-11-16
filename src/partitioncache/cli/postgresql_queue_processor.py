@@ -104,15 +104,28 @@ DIRECT_PROCESSOR_BACKENDS = {
     "postgresql_array": ("array", "PG_ARRAY_CACHE_TABLE_PREFIX"),
     "postgresql_bit": ("bit", "PG_BIT_CACHE_TABLE_PREFIX"),
     "postgresql_roaringbit": ("roaringbit", "PG_ROARINGBIT_CACHE_TABLE_PREFIX"),
-    "postgis_bbox": ("bbox", "PG_BBOX_CACHE_TABLE_PREFIX"),
+}
+
+# Backends the processor cannot populate, with their table prefix variable: setup refuses them, while the other
+# subcommands still resolve the table prefix so that an installation made by an earlier version can be inspected and removed.
+UNSUPPORTED_PROCESSOR_BACKENDS = {
+    "postgis_bbox": "PG_BBOX_CACHE_TABLE_PREFIX",
 }
 
 
 def get_cache_backend_from_env() -> str:
     """
     Get the cache backend type from environment variables.
+
+    Raises:
+        ValueError: If the processor does not support the backend (for postgis_bbox the message names pcache-monitor).
     """
     cache_backend = os.getenv("CACHE_BACKEND", "postgresql_array")
+    if cache_backend in UNSUPPORTED_PROCESSOR_BACKENDS:
+        raise ValueError(
+            f"The PostgreSQL queue processor does not support the {cache_backend} cache backend; populate it with pcache-monitor "
+            "(or pcache-add --direct) instead."
+        )
     backend_config = DIRECT_PROCESSOR_BACKENDS.get(cache_backend)
     if backend_config is None:
         raise ValueError(f"Unsupported CACHE_BACKEND for direct processor: {cache_backend}")
@@ -128,10 +141,13 @@ def get_table_prefix_from_env() -> str:
     """
     cache_backend = os.getenv("CACHE_BACKEND", "postgresql_array")
     backend_config = DIRECT_PROCESSOR_BACKENDS.get(cache_backend)
-    if backend_config is None:
+    if backend_config is not None:
+        table_prefix_env = backend_config[1]
+    elif cache_backend in UNSUPPORTED_PROCESSOR_BACKENDS:
+        table_prefix_env = UNSUPPORTED_PROCESSOR_BACKENDS[cache_backend]
+    else:
         raise ValueError(f"Unsupported CACHE_BACKEND for direct processor: {cache_backend}")
 
-    table_prefix_env = backend_config[1]
     table_prefix = os.getenv(table_prefix_env)
 
     if not table_prefix:

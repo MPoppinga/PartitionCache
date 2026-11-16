@@ -430,6 +430,8 @@ The processor functions live in the database and are only replaced by `setup`. A
 
 **Role-wide statement timeout.** Earlier versions enforced `timeout_seconds` with `ALTER ROLE <job_owner> SET statement_timeout`, which applied to every new session of that role in every database (by default the role the application connects with). The timeout is now set by the job command itself (see [Timeouts](#timeouts)), and no role setting is changed. `setup` and `remove` reset a role-wide `statement_timeout` of the job owner (and of the current user) only if it still has the value an earlier version set (`timeout_seconds * 1000` ms); any other value is kept, with a warning that names the role, the value and the command to remove it: `ALTER ROLE <role> RESET statement_timeout;`. A reset that lacks the privilege is reported the same way.
 
+**`postgis_bbox`.** The SQL processor does not support the `postgis_bbox` backend: it wrote a different format than the Python handler reads. `setup` refuses it; populate bbox caches with `pcache-monitor`. A processor installed for bbox by an earlier version keeps its old functions until it is removed with `pcache-postgresql-queue-processor remove`; after a `setup` of the new functions, bbox queue items are recorded as `failed`.
+
 #### Timeouts
 
 Each scheduled job runs `SET statement_timeout = '<timeout_seconds * 1000>ms'; SELECT * FROM partitioncache_run_single_job_with_params(...)`. pg_cron runs a job over its own libpq connection (the default), in one transaction, and arms the timeout for each statement, so the setting applies to that job run only; a fragment that exceeds it is cancelled and recorded with the status `timeout`. With `cron.use_background_workers = on`, pg_cron does not arm a timeout set inside the command, so `timeout_seconds` is not enforced and `setup` warns. In that mode, use a dedicated `--job-owner` role and set the timeout on it (`ALTER ROLE <job_owner> SET statement_timeout = '30min'`); do not set it on a role that other clients use.
@@ -552,6 +554,8 @@ END IF;
 - ✅ **PostgreSQL Array**: Full support with automatic detection
 - ✅ **PostgreSQL Bit**: Full support with automatic detection
 - ✅ **PostgreSQL Roaring Bit**: Full support with automatic detection
+
+**Not supported:** `postgis_bbox` (setup refuses it; queue items for it are recorded as `failed`). Populate it with `pcache-monitor`.
 
 
 

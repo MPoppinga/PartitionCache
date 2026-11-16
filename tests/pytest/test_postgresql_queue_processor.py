@@ -26,12 +26,39 @@ class TestBackendEnvMapping:
             ("postgresql_array", "array"),
             ("postgresql_bit", "bit"),
             ("postgresql_roaringbit", "roaringbit"),
-            ("postgis_bbox", "bbox"),
         ],
     )
     def test_get_cache_backend_from_env_supported(self, cache_backend, expected_backend):
         with patch.dict(os.environ, {"CACHE_BACKEND": cache_backend}, clear=True):
             assert get_cache_backend_from_env() == expected_backend
+
+    def test_postgis_bbox_is_refused_with_a_pointer_to_the_monitor(self):
+        """The PL/pgSQL processor does not write the bbox cache format; setup must not install it for that backend."""
+        from partitioncache.cli.postgresql_queue_processor import DIRECT_PROCESSOR_BACKENDS
+
+        assert "postgis_bbox" not in DIRECT_PROCESSOR_BACKENDS
+        with patch.dict(os.environ, {"CACHE_BACKEND": "postgis_bbox"}, clear=True):
+            with pytest.raises(ValueError, match="does not support the postgis_bbox cache backend.*pcache-monitor"):
+                get_cache_backend_from_env()
+
+    @patch("partitioncache.cli.postgresql_queue_processor.handle_setup")
+    @patch("partitioncache.cli.postgresql_queue_processor.load_environment_with_validation")
+    def test_setup_refuses_postgis_bbox(self, mock_load_env, mock_handle_setup, caplog):
+        from partitioncache.cli.postgresql_queue_processor import main
+
+        env = {
+            **{f"PG_QUEUE_{k}": v for k, v in {"HOST": "localhost", "PORT": "5432", "USER": "u", "PASSWORD": "p", "DB": "db"}.items()},
+            **{f"DB_{k}": v for k, v in {"HOST": "localhost", "PORT": "5432", "USER": "u", "PASSWORD": "p", "NAME": "db"}.items()},
+            "CACHE_BACKEND": "postgis_bbox",
+            "PG_BBOX_CACHE_TABLE_PREFIX": "partitioncache_bbox",
+        }
+        with patch.dict(os.environ, env, clear=True), patch("sys.argv", ["postgresql_queue_processor.py", "setup"]):
+            with pytest.raises(SystemExit) as exc_info:
+                main()
+
+        assert exc_info.value.code == 1
+        mock_handle_setup.assert_not_called()
+        assert "pcache-monitor" in caplog.text
 
     @pytest.mark.parametrize(
         ("cache_backend", "prefix_env", "prefix_value"),

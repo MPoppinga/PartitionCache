@@ -248,9 +248,7 @@ DECLARE
     v_default_bitsize INTEGER := p_default_bitsize;
     v_geometry_column TEXT;
     v_h3_resolution INTEGER;
-    v_cell_size FLOAT;
     v_srid INTEGER;
-    v_half_cell FLOAT;
     v_centroid_expr TEXT;
 BEGIN
     v_job_id := 'job_' || p_item_id;
@@ -270,6 +268,12 @@ BEGIN
     v_result_limit := p_result_limit;
     
     BEGIN
+        -- postgis_bbox entries are written by the Python handler only (raw geometries, multi-alias fragments flattened);
+        -- the item is recorded as failed below instead of being stored in another format
+        IF p_cache_backend = 'bbox' THEN
+            RAISE EXCEPTION 'The PostgreSQL queue processor does not support the postgis_bbox cache backend; populate it with pcache-monitor';
+        END IF;
+
         -- Process the item using the same logic as the background processor
         PERFORM partitioncache_ensure_metadata_tables(p_table_prefix);
         
@@ -393,37 +397,6 @@ BEGIN
                 v_cache_table, p_query_hash,
                 v_centroid_expr, v_h3_resolution, p_query,
                 v_centroid_expr, v_h3_resolution, p_query
-            );
-        ELSIF p_cache_backend = 'bbox' THEN
-            -- Read spatial config from config table
-            v_config_table := p_queue_prefix || '_processor_config';
-            BEGIN
-                EXECUTE format('SELECT COALESCE(geometry_column, ''geom''), COALESCE(bbox_cell_size, 0.01), COALESCE(bbox_srid, 4326) FROM %I LIMIT 1', v_config_table)
-                INTO v_geometry_column, v_cell_size, v_srid;
-            EXCEPTION WHEN OTHERS THEN
-                v_geometry_column := 'geom';
-                v_cell_size := 0.01;
-                v_srid := 4326;
-            END;
-
-            v_half_cell := v_cell_size / 2.0;
-
-            v_insert_query := format(
-                'WITH grid_cells AS ('
-                '    SELECT ST_SnapToGrid(ST_Centroid(sub.%I), %s) AS cell_origin'
-                '    FROM (%s) AS sub'
-                '    GROUP BY cell_origin'
-                ') '
-                'INSERT INTO %I (query_hash, partition_keys, partition_keys_count) '
-                'SELECT %L, ST_Collect(ST_MakeEnvelope('
-                '    ST_X(cell_origin) - %s, ST_Y(cell_origin) - %s,'
-                '    ST_X(cell_origin) + %s, ST_Y(cell_origin) + %s, %s'
-                ')), COUNT(*) FROM grid_cells '
-                'ON CONFLICT (query_hash) DO UPDATE SET partition_keys = EXCLUDED.partition_keys, '
-                'partition_keys_count = EXCLUDED.partition_keys_count',
-                v_geometry_column, v_cell_size, p_query,
-                v_cache_table, p_query_hash,
-                v_half_cell, v_half_cell, v_half_cell, v_half_cell, v_srid
             );
         ELSE
             RAISE EXCEPTION 'Unsupported cache_backend type: %', p_cache_backend;

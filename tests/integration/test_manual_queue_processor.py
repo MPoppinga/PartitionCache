@@ -328,6 +328,34 @@ class TestManualProcessingCacheBackend:
             print(f"COALESCE test: processed={result[0]}, message={result[1]}")
 
 
+    def test_bbox_item_is_recorded_as_failed(self, db_session, cache_client, manual_queue_processor):
+        """The SQL processor does not support postgis_bbox: such an item is recorded as failed, nothing is stored."""
+        import uuid
+
+        suffix = uuid.uuid4().hex[:8]
+        partition_key = f"geom_{suffix}"
+        query_hash = f"bbox_item_{suffix}"
+        queue_prefix = manual_queue_processor["queue_prefix"]
+        table_prefix = manual_queue_processor["table_prefix"]
+        assert push_to_query_fragment_queue([(f"SELECT 1 AS {partition_key}", query_hash)], partition_key, "geometry", cache_backend="postgis_bbox")
+
+        with db_session.cursor() as cur:
+            cur.execute("SELECT * FROM partitioncache_manual_process_queue(1)")
+            assert cur.fetchone()[0] == 1
+            cur.execute(f"SELECT status, error_message FROM {queue_prefix}_processor_log WHERE query_hash = %s AND status <> 'started'", (query_hash,))
+            status, error_message = cur.fetchone()
+            assert status == "failed"
+            assert "postgis_bbox" in error_message and "pcache-monitor" in error_message
+            cur.execute("SELECT to_regclass(partitioncache_get_cache_table_name(%s, %s))", (table_prefix, partition_key))
+            assert cur.fetchone() == (None,), "no cache table may be created for a bbox item"
+            cur.execute("SELECT partitioncache_get_queries_table_name(%s)", (table_prefix,))
+            queries_table = cur.fetchone()[0]
+            cur.execute(f"SELECT status FROM {queries_table} WHERE query_hash = %s AND partition_key = %s", (query_hash, partition_key))
+            assert cur.fetchone() == ("failed",)
+            cur.execute(f"DELETE FROM {queries_table} WHERE query_hash = %s", (query_hash,))
+        db_session.commit()
+
+
 class TestManualProcessingIntegration:
     """Integration tests for manual queue processing with other components."""
 
