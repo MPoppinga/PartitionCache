@@ -145,10 +145,10 @@ pcache-postgresql-queue-processor check-permissions
 
 -- Grant pg_cron permissions to your user
 GRANT USAGE ON SCHEMA cron TO your_username;
-GRANT EXECUTE ON FUNCTION cron.schedule TO your_username;
-GRANT EXECUTE ON FUNCTION cron.schedule_in_database TO your_username;
-GRANT EXECUTE ON FUNCTION cron.unschedule TO your_username;
-GRANT EXECUTE ON FUNCTION cron.alter_job TO your_username;
+GRANT EXECUTE ON FUNCTION cron.schedule(text, text), cron.schedule(text, text, text) TO your_username;
+GRANT EXECUTE ON FUNCTION cron.schedule_in_database(text, text, text, text, text, boolean) TO your_username;
+GRANT EXECUTE ON FUNCTION cron.unschedule(bigint), cron.unschedule(text) TO your_username;
+GRANT EXECUTE ON FUNCTION cron.alter_job(bigint, text, text, text, text, boolean) TO your_username;
 
 -- Optional: Grant read access to job status
 GRANT SELECT ON cron.job TO your_username;
@@ -289,8 +289,8 @@ CREATE USER partitioncache_cron WITH PASSWORD 'secure_password';
 
 -- Grant minimal required permissions
 GRANT USAGE ON SCHEMA cron TO partitioncache_cron;
-GRANT EXECUTE ON FUNCTION cron.schedule_in_database TO partitioncache_cron;
-GRANT EXECUTE ON FUNCTION cron.unschedule TO partitioncache_cron;
+GRANT EXECUTE ON FUNCTION cron.schedule_in_database(text, text, text, text, text, boolean) TO partitioncache_cron;
+GRANT EXECUTE ON FUNCTION cron.unschedule(bigint), cron.unschedule(text) TO partitioncache_cron;
 
 -- Use in environment
 PG_CRON_USER=partitioncache_cron

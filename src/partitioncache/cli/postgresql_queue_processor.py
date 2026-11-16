@@ -296,30 +296,33 @@ def check_and_grant_pg_cron_permissions() -> tuple[bool, str]:
                 if schema_usage and schedule_exec and unschedule_exec:
                     return True, "All required permissions are already granted"
 
-                # Try to grant missing permissions (requires superuser privileges)
+                # Try to grant missing permissions (needs a role that may grant them, usually the owner of the cron schema).
+                # The grantee is an identifier: GRANT takes no bound parameters.
+                grantee = sql.Identifier(work_user)
                 missing_perms = []
                 try:
                     if not schema_usage:
-                        cur.execute("GRANT USAGE ON SCHEMA cron TO %s", (work_user,))
+                        cur.execute(sql.SQL("GRANT USAGE ON SCHEMA cron TO {}").format(grantee))
                         missing_perms.append("SCHEMA cron USAGE")
 
                     if not schedule_exec:
-                        cur.execute("GRANT EXECUTE ON FUNCTION cron.schedule_in_database TO %s", (work_user,))
+                        cur.execute(sql.SQL("GRANT EXECUTE ON FUNCTION cron.schedule_in_database(text, text, text, text, text, boolean) TO {}").format(grantee))
                         missing_perms.append("cron.schedule_in_database")
 
                     if not unschedule_exec:
-                        cur.execute("GRANT EXECUTE ON FUNCTION cron.unschedule TO %s", (work_user,))
-                        cur.execute("GRANT EXECUTE ON FUNCTION cron.alter_job TO %s", (work_user,))
+                        cur.execute(sql.SQL("GRANT EXECUTE ON FUNCTION cron.unschedule(bigint), cron.unschedule(text) TO {}").format(grantee))
+                        cur.execute(sql.SQL("GRANT EXECUTE ON FUNCTION cron.alter_job(bigint, text, text, text, text, boolean) TO {}").format(grantee))
                         missing_perms.append("cron.unschedule and cron.alter_job")
 
                     # Also grant SELECT on cron.job for monitoring (optional)
-                    cur.execute("GRANT SELECT ON cron.job TO %s", (work_user,))
+                    cur.execute(sql.SQL("GRANT SELECT ON cron.job TO {}").format(grantee))
 
                     conn.commit()
                     return True, f"Successfully granted permissions: {', '.join(missing_perms)}"
 
-                except Exception as grant_error:
-                    return False, f"Failed to grant permissions (need superuser): {grant_error}"
+                except psycopg.Error as grant_error:
+                    conn.rollback()
+                    return False, f"Failed to grant pg_cron permissions to {work_user}: {grant_error}"
 
     except Exception as e:
         return False, f"Error checking pg_cron permissions: {e}"
@@ -866,8 +869,8 @@ def handle_setup(table_prefix: str, queue_prefix: str, cache_backend: str, frequ
             logger.warning("You may need to manually grant permissions as superuser:")
             work_user = os.getenv("DB_USER")
             logger.warning(f"  GRANT USAGE ON SCHEMA cron TO {work_user};")
-            logger.warning(f"  GRANT EXECUTE ON FUNCTION cron.schedule_in_database TO {work_user};")
-            logger.warning(f"  GRANT EXECUTE ON FUNCTION cron.unschedule TO {work_user};")
+            logger.warning(f"  GRANT EXECUTE ON FUNCTION cron.schedule_in_database(text, text, text, text, text, boolean) TO {work_user};")
+            logger.warning(f"  GRANT EXECUTE ON FUNCTION cron.unschedule(bigint), cron.unschedule(text) TO {work_user};")
 
     # Setup all database objects in both databases
     if get_cron_database_name() == get_cache_database_name():

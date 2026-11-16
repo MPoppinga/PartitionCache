@@ -90,9 +90,9 @@ PG_ARRAY_CACHE_TABLE_PREFIX=partitioncache
    ```sql
    -- Grant necessary permissions to your user
    GRANT USAGE ON SCHEMA cron TO your_username;
-   GRANT EXECUTE ON FUNCTION cron.schedule_in_database TO your_username;
-   GRANT EXECUTE ON FUNCTION cron.unschedule TO your_username;
-   GRANT EXECUTE ON FUNCTION cron.alter_job TO your_username;
+   GRANT EXECUTE ON FUNCTION cron.schedule_in_database(text, text, text, text, text, boolean) TO your_username;
+   GRANT EXECUTE ON FUNCTION cron.unschedule(bigint), cron.unschedule(text) TO your_username;
+   GRANT EXECUTE ON FUNCTION cron.alter_job(bigint, text, text, text, text, boolean) TO your_username;
    GRANT SELECT ON cron.job TO your_username;
    ```
 

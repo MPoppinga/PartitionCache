@@ -264,6 +264,55 @@ class TestPgCronPermissions:
         assert "already granted" in message
 
 
+    @patch.dict(os.environ, {"DB_USER": "app user"})
+    @patch("partitioncache.cli.postgresql_queue_processor.get_pg_cron_connection")
+    def test_missing_permissions_are_granted_with_the_role_as_identifier(self, mock_get_conn):
+        """The grantee is an identifier, not a bound parameter: PostgreSQL rejects 'TO $1'."""
+        from psycopg import sql
+
+        mock_conn = Mock()
+        mock_cursor = Mock()
+        mock_get_conn.return_value.__enter__ = Mock(return_value=mock_conn)
+        mock_get_conn.return_value.__exit__ = Mock(return_value=None)
+        mock_conn.cursor.return_value.__enter__ = Mock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = Mock(return_value=None)
+        mock_cursor.fetchone.return_value = (False, False, False)
+
+        success, message = check_and_grant_pg_cron_permissions()
+
+        role = sql.Identifier("app user")
+        grants = [c.args for c in mock_cursor.execute.call_args_list[1:]]
+        assert grants == [
+            (sql.SQL("GRANT USAGE ON SCHEMA cron TO {}").format(role),),
+            (sql.SQL("GRANT EXECUTE ON FUNCTION cron.schedule_in_database(text, text, text, text, text, boolean) TO {}").format(role),),
+            (sql.SQL("GRANT EXECUTE ON FUNCTION cron.unschedule(bigint), cron.unschedule(text) TO {}").format(role),),
+            (sql.SQL("GRANT EXECUTE ON FUNCTION cron.alter_job(bigint, text, text, text, text, boolean) TO {}").format(role),),
+            (sql.SQL("GRANT SELECT ON cron.job TO {}").format(role),),
+        ]
+        mock_conn.commit.assert_called_once()
+        assert success is True
+
+    @patch.dict(os.environ, {"DB_USER": "app"})
+    @patch("partitioncache.cli.postgresql_queue_processor.get_pg_cron_connection")
+    def test_failed_grant_reports_the_error(self, mock_get_conn):
+        import psycopg
+
+        mock_conn = Mock()
+        mock_cursor = Mock()
+        mock_get_conn.return_value.__enter__ = Mock(return_value=mock_conn)
+        mock_get_conn.return_value.__exit__ = Mock(return_value=None)
+        mock_conn.cursor.return_value.__enter__ = Mock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = Mock(return_value=None)
+        mock_cursor.fetchone.return_value = (False, True, True)
+        mock_cursor.execute.side_effect = [None, psycopg.errors.InsufficientPrivilege("permission denied for schema cron")]
+
+        success, message = check_and_grant_pg_cron_permissions()
+
+        assert success is False
+        assert "permission denied for schema cron" in message
+        assert "superuser" not in message
+
+
 class TestProcessorStatus:
     """Test processor status retrieval."""
 
