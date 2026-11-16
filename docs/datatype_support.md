@@ -29,6 +29,8 @@ Different cache handlers support different datatypes:
 
 **Note**: Bit-based handlers (postgresql_bit, postgresql_roaringbit, redis_bit, rocksdb_bit) only support integers due to their underlying storage mechanism.
 
+**Note**: postgresql_roaringbit stores keys from 0 to 2147483647; a negative key is refused (`set_cache` raises `ValueError`, `set_cache_lazy` returns False).
+
 **Note**: Spatial handlers (postgis_bbox, rocksdict_h3_grouped) exclusively use the `geometry` datatype and require PostGIS. The H3 handler additionally requires the h3-pg extension and the Python `h3` library.
 
 ## CLI Tool Usage
