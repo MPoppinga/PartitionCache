@@ -664,6 +664,38 @@ def _detect_pk_bearing_aliases(
     return pk_bearing
 
 
+def _key_condition_across_unjoined_aliases(
+    table_aliases: list[str],
+    partition_key: str,
+    condition_groups: list[dict],
+    partition_key_joins: dict[tuple[str, str], list[str]],
+) -> str | None:
+    """Return a condition that relates the partition keys of aliases that no key equijoin connects, or None.
+
+    Variants join their tables on the partition key, which is a relaxation only if the query's tables are
+    key-equal. A condition such as ``x.pk = y.pk + 1`` or ``(x.pk = y.pk OR y.flag = 1)`` between aliases that
+    are not connected by ``<alias>.<pk> = <alias>.<pk>`` conditions states that their keys differ.
+    """
+    component = {alias: alias for alias in table_aliases}
+
+    def find(alias: str) -> str:
+        while component[alias] != alias:
+            alias = component[alias]
+        return alias
+
+    for left, right in partition_key_joins:
+        if left in component and right in component:
+            component[find(left)] = find(right)
+    tokens = {alias: re.compile(rf"\b{re.escape(alias)}\.{re.escape(partition_key)}\b") for alias in table_aliases}
+    for group in condition_groups:
+        for conditions in group.values():
+            for condition in conditions:
+                refs = _strip_string_literals(condition)
+                if len({find(alias) for alias, token in tokens.items() if token.search(refs)}) > 1:
+                    return condition
+    return None
+
+
 def extract_and_group_query_conditions(
     query, partition_key
 ) -> tuple[
@@ -726,12 +758,9 @@ def extract_and_group_query_conditions(
         # Alias and column detection ignores string literals ('u.city_id' is not a column reference)
         condition_refs = _strip_string_literals(condition)
 
-        # find partition_key join_conditions and track them
-        if re.match(rf"\w*\.{partition_key}\s=\s\w*\.{partition_key}", condition_refs):
-            # Extract the two aliases involved in the join
-            parts = condition.split("=")
-            left_alias = parts[0].strip().split(".")[0]
-            right_alias = parts[1].strip().split(".")[0]
+        # find partition_key join_conditions (exactly <alias>.<pk> = <alias>.<pk>) and track them
+        if key_join := re.fullmatch(rf"(\w+)\.{re.escape(partition_key)}\s=\s(\w+)\.{re.escape(partition_key)}", condition_refs):
+            left_alias, right_alias = key_join.groups()
             if left_alias in table_aliases and right_alias in table_aliases:
                 partition_key_joins[(min(left_alias, right_alias), max(left_alias, right_alias))].append(condition)
             continue  # Skip adding to other conditions
@@ -1193,6 +1222,15 @@ def generate_partial_queries(
         alias_to_table_map,
         partition_key_joins,
     ) = extract_and_group_query_conditions(query, partition_key)
+
+    if not skip_partition_key_joins:
+        unjoined = _key_condition_across_unjoined_aliases(table_aliases, partition_key, [distance_conditions, other_functions, or_conditions], partition_key_joins)
+        if unjoined is not None:
+            logger.warning(
+                f"Query relates the partition keys of its tables by '{unjoined}', not by key equality; variants join their tables "
+                "on the partition key and would drop rows. Returning no variants; execute the query unchanged."
+            )
+            return []
 
     # Detect partition-join tables - special tables used for partition key joins
     # These tables are excluded from variant generation and re-added to each variant
