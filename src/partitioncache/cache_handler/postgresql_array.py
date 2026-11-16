@@ -61,6 +61,7 @@ class PostgreSQLArrayCacheHandler(PostgreSQLAbstractCacheHandler):
 
     def _ensure_partition_table(self, partition_key: str, datatype: str, **kwargs):
         """Ensure a partition table exists with the correct datatype using SQL bootstrap function."""
+        self._check_cache_table_name(partition_key)
         try:
             with self._serialized_ddl():
                 # Load SQL functions first to ensure they're available

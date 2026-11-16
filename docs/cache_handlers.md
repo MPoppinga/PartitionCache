@@ -154,7 +154,7 @@ PostgreSQL 17 and later run the following maintenance operations with `search_pa
 All cache handlers support multiple partition keys with independent datatypes:
 
 **PostgreSQL Handlers:**
-- Separate tables per partition: `{table_name}_cache_{partition_key}`
+- Separate tables per partition: `{table_name}_cache_{partition_key}`. This name may be at most 63 bytes (PostgreSQL's identifier limit); a partition key with a longer name is refused with a `ValueError`
 - Metadata table: `{table_name}_partition_metadata` 
 - Shared queries table: `{table_name}_queries`
 - Queue integration: Dual-strategy operations for optimal performance

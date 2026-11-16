@@ -205,6 +205,7 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
         Returns:
             tuple: (success, actual_bitsize) - The actual bitsize that was set/retrieved
         """
+        self._check_cache_table_name(partition_key)
         bitsize = kwargs.get("bitsize", self.default_bitsize)
         try:
             # Check if partition already exists with sufficient bitsize

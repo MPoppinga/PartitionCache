@@ -135,6 +135,13 @@ BEGIN
     v_metadata_table := partitioncache_get_metadata_table_name(p_table_prefix);
     v_cache_table := partitioncache_get_cache_table_name(p_table_prefix, p_partition_key);
 
+    -- PostgreSQL truncates longer identifiers without an error: partition keys with a long common beginning
+    -- would share one cache table (the Python handlers refuse them as well)
+    IF octet_length(v_cache_table) > 63 THEN
+        RAISE EXCEPTION 'Cache table name % of partition key % is % bytes; PostgreSQL truncates identifiers longer than 63 bytes',
+            v_cache_table, p_partition_key, octet_length(v_cache_table);
+    END IF;
+
     -- Already exists: nothing to create. Nested rather than one AND -- the row probe below
     -- reads v_metadata_table, and it is the outer test that guarantees the table is there.
     -- A bit partition whose stored bitsize is too small still needs the slow path, because

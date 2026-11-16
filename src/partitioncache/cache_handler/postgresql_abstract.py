@@ -21,6 +21,9 @@ logger = getLogger("PartitionCache")
 P = ParamSpec("P")
 R = TypeVar("R")
 
+# PostgreSQL truncates longer identifiers without an error (NAMEDATALEN - 1)
+MAX_IDENTIFIER_BYTES = 63
+
 
 def _ends_read_transaction(fn: Callable[P, R]) -> Callable[P, R]:  # ParamSpec instead of PEP 695 type parameters: the package supports Python 3.11
     """Mark a read-only handler method so it leaves the connection idle. See _read_txn."""
@@ -271,9 +274,27 @@ class PostgreSQLAbstractCacheHandler(ThreadSafeHandler, AbstractCacheHandler_Laz
             logger.info(f"Creating metadata table: {self.tableprefix}_partition_metadata")
             self._recreate_metadata_table(self.get_supported_datatypes())
 
+    def _check_cache_table_name(self, partition_key: str) -> None:
+        """Refuse a partition key whose cache table name PostgreSQL would truncate.
+
+        Truncated, the names of two partition keys with a long common beginning are the same table, and a hash cached
+        under one key is read for the other. Names derived from the table name (indexes, triggers) are not checked.
+
+        Raises:
+            ValueError: If ``<prefix>_cache_<partition_key>`` is longer than 63 bytes.
+        """
+        table_name = f"{self.tableprefix}_cache_{partition_key}"
+        length = len(table_name.encode())
+        if length > MAX_IDENTIFIER_BYTES:
+            raise ValueError(
+                f"Cache table name '{table_name}' of partition key '{partition_key}' is {length} bytes; PostgreSQL truncates identifiers "
+                f"longer than {MAX_IDENTIFIER_BYTES} bytes, so partition keys could share a table. Use a shorter partition key or table prefix."
+            )
+
     @_ends_read_transaction
     def _get_partition_datatype(self, partition_key: str) -> str | None:
         """Get the datatype for a partition key from metadata."""
+        self._check_cache_table_name(partition_key)
         if partition_key in self._cached_datatype:
             return self._cached_datatype[partition_key]
 
@@ -726,6 +747,7 @@ class PostgreSQLAbstractCacheHandler(ThreadSafeHandler, AbstractCacheHandler_Laz
         """Register a partition key with the cache handler."""
         if datatype not in self.get_supported_datatypes():
             raise ValueError(f"Handler supports only {self.get_supported_datatypes()} datatypes, got: {datatype}")
+        self._check_cache_table_name(partition_key)
         self._ensure_partition_table(partition_key, datatype, **kwargs)
 
     def set_query_status(self, key: str, partition_key: str = "partition_key", status: str = "ok", query: str | None = None) -> bool:

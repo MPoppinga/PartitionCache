@@ -126,6 +126,7 @@ class PostgreSQLRoaringBitCacheHandler(PostgreSQLAbstractCacheHandler):
 
     def _ensure_partition_table(self, partition_key: str, datatype: str, **kwargs) -> bool:
         """Ensure a partition table exists using SQL bootstrap function."""
+        self._check_cache_table_name(partition_key)
         try:
             with self._serialized_ddl():
                 # Load SQL functions first to ensure they're available
