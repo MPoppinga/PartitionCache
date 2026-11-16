@@ -76,6 +76,18 @@ class _NotOneStatementError(Exception):
     """The query text is not exactly one statement; DuckDB would return the result of its last statement."""
 
 
+# PostgreSQL's LIKE (also ILIKE, ~~, ~~*) has the backslash as default escape character, DuckDB's has none
+_LIKE_OPERATOR = re.compile(r"like|~~", re.IGNORECASE)
+
+
+def _like_escape_differs(query: str) -> bool:
+    """Whether a LIKE pattern may contain a backslash, which escapes in PostgreSQL but is a plain character in DuckDB.
+
+    Over-approximated on the text: a backslash anywhere and a LIKE, ILIKE or ~~ operator anywhere.
+    """
+    return "\\" in query and _LIKE_OPERATOR.search(query) is not None
+
+
 class DuckDBQueryAccelerator:
     """
     DuckDB-based query accelerator for PostgreSQL database queries.
@@ -432,6 +444,11 @@ class DuckDBQueryAccelerator:
         """
         if not self._initialized:
             logger.debug("Accelerator not initialized, using fallback")
+            self._update_stats(queries_fallback=1)
+            return self._execute_fallback(query)
+
+        if _like_escape_differs(query):
+            logger.debug("Query has LIKE and a backslash; DuckDB's LIKE has no escape character, running it on PostgreSQL")
             self._update_stats(queries_fallback=1)
             return self._execute_fallback(query)
 

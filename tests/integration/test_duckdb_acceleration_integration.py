@@ -939,3 +939,9 @@ class TestDuckDBAccelerationRobustness:
         with self._accelerator(postgresql_params, ["acc_rb_points"]) as accelerator:
             assert accelerator.execute_query(script) == {2, 3}
             assert accelerator.stats["queries_accelerated"] == 0
+
+    def test_like_pattern_with_backslash_runs_on_postgresql(self, postgresql_params, objects):
+        """'a_b' LIKE 'a\\_b' is true in PostgreSQL (backslash escapes) and false in DuckDB (no escape character)."""
+        with self._accelerator(postgresql_params, ["acc_rb_points"]) as accelerator:
+            assert accelerator.execute_query("SELECT pk FROM acc_rb_points WHERE pk <= 3 AND 'a_b' LIKE 'a\\_b'") == {1, 2, 3}
+            assert accelerator.stats["queries_accelerated"] == 0

@@ -694,3 +694,21 @@ def test_null_keys_are_dropped_on_every_path(path):
 
     assert accelerator.execute_query("SELECT r.region_id FROM readings AS r WHERE r.value > 5") == {1, 3}
     assert len(accelerator.postgresql_conn.cursor_.queries) == (1 if path == "fallback" else 0)
+
+
+def test_like_pattern_with_backslash_runs_on_the_fallback():
+    """DuckDB's LIKE has no default escape character ('a_b' LIKE 'a\\_b' is false), PostgreSQL's is the backslash."""
+    accelerator = _accelerator_on_duckdb()
+    query = "SELECT r.region_id FROM readings AS r WHERE r.label LIKE 'a\\_b'"
+
+    accelerator.execute_query(query)
+
+    assert accelerator.postgresql_conn.cursor_.queries == [query]
+    assert accelerator.stats["queries_accelerated"] == 0
+
+
+def test_like_pattern_without_backslash_runs_in_duckdb():
+    accelerator = _accelerator_on_duckdb()
+
+    assert accelerator.execute_query("SELECT r.region_id FROM readings AS r WHERE r.label LIKE 'a_b'") == {1, 2, 3}
+    assert accelerator.postgresql_conn.cursor_.queries == []
