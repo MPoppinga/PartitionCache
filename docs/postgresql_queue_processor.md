@@ -400,7 +400,7 @@ The configuration table is `{p_queue_prefix}_processor_config`; without `p_queue
 
 ### Prerequisites
 
-1. **PostgreSQL 12+** with `pg_cron` extension available (see [pg_cron installation](https://github.com/citusdata/pg_cron#installation))
+1. **PostgreSQL 13+** with `pg_cron` extension available (see [pg_cron installation](https://github.com/citusdata/pg_cron#installation))
 2. **pg_cron Extension Configurateion**:
    ```
    shared_preload_libraries=pg_cron // Load pg_cron extension
@@ -433,11 +433,13 @@ The processor functions live in the database and are only replaced by `setup`. A
 
 **Role-wide statement timeout.** Earlier versions enforced `timeout_seconds` with `ALTER ROLE <job_owner> SET statement_timeout`, which applied to every new session of that role in every database (by default the role the application connects with). The timeout is now set by the job command itself (see [Timeouts](#timeouts)), and no role setting is changed. `setup` and `remove` reset a role-wide `statement_timeout` of the job owner (and of the current user) only if it still has the value an earlier version set (`timeout_seconds * 1000` ms); any other value is kept, with a warning that names the role, the value and the command to remove it: `ALTER ROLE <role> RESET statement_timeout;`. A reset that lacks the privilege is reported the same way.
 
-**`postgis_bbox`.** The SQL processor does not support the `postgis_bbox` backend: it wrote a different format than the Python handler reads. `setup` refuses it; populate bbox caches with `pcache-monitor`. A processor installed for bbox by an earlier version keeps its old functions until it is removed with `pcache-postgresql-queue-processor remove`; after a `setup` of the new functions, bbox queue items are recorded as `failed`.
+**`postgis_bbox`.** The SQL processor does not support the `postgis_bbox` backend: it wrote a different format than the Python handler reads. `setup` refuses it; populate bbox caches with `pcache-monitor`. A processor installed for bbox by an earlier version keeps its old functions until it is removed with `pcache-postgresql-queue-processor remove`; after a `setup` of the new functions, bbox queue items are recorded as `failed`. Entries that the SQL processor wrote into a bbox cache before this change are in the old format, under the same hashes as entries of the Python handler; delete them and populate the cache again with `pcache-monitor`.
+
+**`partitioncache_manual_process_queue`.** The function now takes `(p_count, p_job_name, p_queue_prefix)`, all with defaults, and `setup` drops the former two-argument version. A client that installs its own older copy of the processor SQL recreates that version, and calls with one or two arguments then become ambiguous; install the functions with `setup` only.
 
 #### Timeouts
 
-Each scheduled job runs `SET statement_timeout = '<timeout_seconds * 1000>ms'; SELECT * FROM partitioncache_run_single_job_with_params(...)`. pg_cron runs a job over its own libpq connection (the default), in one transaction, and arms the timeout for each statement, so the setting applies to that job run only; a fragment that exceeds it is cancelled and recorded with the status `timeout`. With `cron.use_background_workers = on`, pg_cron does not arm a timeout set inside the command, so `timeout_seconds` is not enforced and `setup` warns. In that mode, use a dedicated `--job-owner` role and set the timeout on it (`ALTER ROLE <job_owner> SET statement_timeout = '30min'`); do not set it on a role that other clients use.
+Each scheduled job runs `SET statement_timeout = '<timeout_seconds * 1000>ms'; SELECT * FROM partitioncache_run_single_job_with_params(...)`. pg_cron runs a job over its own libpq connection (the default), in one transaction, and arms the timeout for each statement, so the setting applies to that job run only; a fragment that exceeds it is cancelled and recorded with the status `timeout`. This needs PostgreSQL 13 or later: earlier versions applied `statement_timeout` to the whole command string, where the `SET` comes too late. With `cron.use_background_workers = on`, pg_cron does not arm a timeout set inside the command, so `timeout_seconds` is not enforced and `setup` warns. In that mode, use a dedicated `--job-owner` role and set the timeout on it (`ALTER ROLE <job_owner> SET statement_timeout = '30min'`); do not set it on a role that other clients use.
 
 ## Configuration
 
