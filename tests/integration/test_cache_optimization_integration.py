@@ -112,8 +112,7 @@ class TestCacheOptimizationIntegration:
             assert "Cache optimization ENABLED" in result.stderr
 
         except subprocess.TimeoutExpired:
-            # For timeout cases, check if any expected output was produced
-            pytest.skip("Monitor process timed out - may indicate system load issues")
+            pytest.fail("pcache-monitor --close did not exit before the timeout")
 
     def test_cache_optimization_can_be_disabled(self, cache_optimization_setup):
         """Test that cache optimization can be explicitly disabled."""
@@ -143,7 +142,7 @@ class TestCacheOptimizationIntegration:
             assert "Applied cache optimization" not in result.stderr
 
         except subprocess.TimeoutExpired:
-            pytest.skip("Monitor process timed out - may indicate system load issues")
+            pytest.fail("pcache-monitor --close did not exit before the timeout")
 
     def test_cache_optimization_enabled_with_hits(self, cache_optimization_setup):
         """Test cache optimization when enabled and cache hits are found."""
@@ -184,7 +183,7 @@ class TestCacheOptimizationIntegration:
             # Note: Actual optimization application would depend on the specific query fragments generated
 
         except subprocess.TimeoutExpired:
-            pass  # Expected for monitor processes
+            pytest.fail("pcache-monitor --close did not exit before the timeout")
 
     def test_cache_optimization_method_validation(self, cache_optimization_setup):
         """Test different cache optimization methods."""
@@ -229,7 +228,7 @@ class TestCacheOptimizationIntegration:
                 assert f"Method: {method}" in result.stderr
 
             except subprocess.TimeoutExpired:
-                pass  # Expected for monitor processes
+                pytest.fail(f"pcache-monitor --close did not exit before the timeout (method {method})")
 
     def test_min_cache_hits_threshold(self, cache_optimization_setup):
         """Test that min-cache-hits threshold is respected for non-lazy methods."""
@@ -272,7 +271,7 @@ class TestCacheOptimizationIntegration:
             assert "Prefer lazy: False" in result.stderr
 
         except subprocess.TimeoutExpired:
-            pass  # Expected for monitor processes
+            pytest.fail("pcache-monitor --close did not exit before the timeout")
 
     def test_original_query_preservation(self, cache_optimization_setup):
         """Test that original query and hash are preserved in cache."""
@@ -322,7 +321,7 @@ class TestCacheOptimizationIntegration:
             )
 
         except subprocess.TimeoutExpired:
-            pass  # Expected for monitor processes
+            pytest.fail("pcache-monitor --close did not exit before the timeout")
 
         # Wait a moment for processing to complete
         time.sleep(2)
