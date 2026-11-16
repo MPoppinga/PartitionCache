@@ -360,6 +360,9 @@ All queue operations now use non-blocking upsert functions:
 ### Backend Configuration
 - `--queue-provider QUERY_QUEUE_PROVIDER` - Queue provider (`postgresql`, `redis`)
   - **Default**: `postgresql`
+- `--size-priority` / `--no-size-priority` (`pcache-add`, `pcache-monitor`) - Pop the smaller query variants of all
+  queued queries first (PostgreSQL variant queue, see [Queue System](queue_system.md#size-priority-for-query-variants))
+  - **Default**: on, or `QUERY_QUEUE_SIZE_PRIORITY`
 - `--cache-backend CACHE_BACKEND` - Cache backend type
   - **Default**: `postgresql_bit`
   - **Options**: `postgresql_array`, `postgresql_bit`, `redis_set`, `redis_bit`, etc.

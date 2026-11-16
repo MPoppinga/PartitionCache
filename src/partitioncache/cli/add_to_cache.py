@@ -243,11 +243,15 @@ def main():
             )
             # Smallest variants first, so the monitor's cache optimization can restrict the larger ones with them
             query_hash_pairs = order_variants_for_population(query_hash_pairs)
-            success = partitioncache.push_to_query_fragment_queue(query_hash_pairs, args.partition_key, args.partition_datatype, queue_provider, cache_backend=queue_cache_backend)
+            success = partitioncache.push_to_query_fragment_queue(
+                query_hash_pairs, args.partition_key, args.partition_datatype, queue_provider, cache_backend=queue_cache_backend, size_priority=args.size_priority
+            )
         else:  # Push the cleaned query as a single variant (no recomposition)
             query = clean_query(query)
             query_hash_pairs = [(query, hash_query(query))]
-            success = partitioncache.push_to_query_fragment_queue(query_hash_pairs, args.partition_key, args.partition_datatype, queue_provider, cache_backend=queue_cache_backend)
+            success = partitioncache.push_to_query_fragment_queue(
+                query_hash_pairs, args.partition_key, args.partition_datatype, queue_provider, cache_backend=queue_cache_backend, size_priority=args.size_priority
+            )
         if success:
             logger.info("Query successfully added to query variant queue")
         else:

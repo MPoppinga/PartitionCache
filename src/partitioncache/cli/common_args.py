@@ -211,6 +211,18 @@ def add_queue_args(parser: argparse.ArgumentParser) -> None:
         choices=["postgresql", "redis"],
         help="Queue provider to use (if not specified, uses QUERY_QUEUE_PROVIDER environment variable)",
     )
+    add_size_priority_arg(queue_group)
+
+
+def add_size_priority_arg(group: argparse.ArgumentParser | argparse._ArgumentGroup) -> None:
+    """Add --size-priority / --no-size-priority (unset: QUERY_QUEUE_SIZE_PRIORITY, default on)."""
+    group.add_argument(
+        "--size-priority",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Pop the smaller query variants of all queued queries first: priority 10 - tables in the PostgreSQL "
+        "variant queue (default: on, or QUERY_QUEUE_SIZE_PRIORITY). --no-size-priority pushes every variant with priority 1",
+    )
 
 
 def add_verbosity_args(parser: argparse.ArgumentParser) -> None:

@@ -63,7 +63,12 @@ def push_to_original_query_queue(
 
 
 def push_to_query_fragment_queue(
-    query_hash_pairs: list[tuple[str, str]], partition_key: str = "partition_key", partition_datatype: str = "integer", queue_provider: str | None = None, cache_backend: str | None = None
+    query_hash_pairs: list[tuple[str, str]],
+    partition_key: str = "partition_key",
+    partition_datatype: str = "integer",
+    queue_provider: str | None = None,
+    cache_backend: str | None = None,
+    size_priority: bool | None = None,
 ) -> bool:
     """
     Push query variants (as (query, hash) pairs) directly to the query variant queue.
@@ -77,12 +82,18 @@ def push_to_query_fragment_queue(
         partition_datatype (str): The datatype of the partition key (default: "integer").
         queue_provider (str): The queue provider to use (default: None, which uses the environment variable QUERY_QUEUE_PROVIDER).
         cache_backend (str): The cache backend to use for processing (default: None, uses processor config).
+        size_priority (bool): Pop the smaller fragments of all queries first (PostgreSQL queue). None (default) reads
+            QUERY_QUEUE_SIZE_PRIORITY, which defaults to on; False pushes every fragment with priority 1.
+            The Redis queue has no priority and ignores it.
     Returns:
         bool: True if all variants were pushed successfully, False otherwise.
     """
     try:
         handler = _get_queue_handler(queue_provider)
-        return handler.push_to_query_fragment_queue(query_hash_pairs, partition_key, partition_datatype, cache_backend)  # type: ignore[no-any-return]
+        if size_priority is None:
+            # Handlers read the environment themselves; handlers written before the option keep working
+            return handler.push_to_query_fragment_queue(query_hash_pairs, partition_key, partition_datatype, cache_backend)  # type: ignore[no-any-return]
+        return handler.push_to_query_fragment_queue(query_hash_pairs, partition_key, partition_datatype, cache_backend, size_priority=size_priority)  # type: ignore[no-any-return]
     except Exception as e:
         logger.error(f"Failed to push query variants to the variant queue: {e}")
         return False
