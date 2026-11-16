@@ -239,13 +239,26 @@ class PostgreSQLAbstractCacheHandler(ThreadSafeHandler, AbstractCacheHandler_Laz
         thread uses the connection: a rollback here discarded another thread's pending INSERT, whose set_cache then
         returned True (#24 up to the instance lock). The lock of ThreadSafeHandler makes every public method exclusive,
         and no public method returns with a write pending (``check_pending_writes``), so the rule holds again.
+
+        A read that failed leaves the transaction aborted, also one it did not open (one an earlier read left open):
+        every later statement on the connection would fail until a rollback, and the reads that swallow their error
+        returned "unknown" from then on. An aborted transaction is rolled back whoever opened it; it can no longer
+        commit, so nothing is lost.
         """
         owns = self.db.info.transaction_status == TransactionStatus.IDLE
         try:
             yield
         finally:
-            if owns and self.db.info.transaction_status != TransactionStatus.IDLE:
+            status = self.db.info.transaction_status
+            if status == TransactionStatus.INERROR or (owns and status != TransactionStatus.IDLE):
                 self.db.rollback()  # a read changed nothing, so discard rather than commit
+
+    def _rollback_failed_read(self) -> None:
+        """Roll back the transaction a failed read aborted, so that later statements on the connection run (see _read_txn)."""
+        try:
+            self.db.rollback()
+        except Exception as rollback_error:
+            logger.error(f"Failed to roll back after a failed read: {rollback_error}")
 
     def _ensure_metadata_table_exists(self) -> None:
         """Ensure the metadata table exists, create it if it doesn't."""

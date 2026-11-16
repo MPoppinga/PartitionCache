@@ -179,8 +179,13 @@ class PostgreSQLArrayCacheHandler(PostgreSQLAbstractCacheHandler):
             return None
 
         table_name = f"{self.tableprefix}_cache_{partition_key}"
-        self.cursor.execute(sql.SQL("SELECT partition_keys FROM {0} WHERE query_hash = %s").format(sql.Identifier(table_name)), (key,))
-        result = self.cursor.fetchone()
+        try:
+            self.cursor.execute(sql.SQL("SELECT partition_keys FROM {0} WHERE query_hash = %s").format(sql.Identifier(table_name)), (key,))
+            result = self.cursor.fetchone()
+        except Exception as e:
+            logger.error(f"Failed to get value for key {key} in partition {partition_key}: {e}")
+            self._rollback_failed_read()
+            return None
         if result is None or result[0] is None:
             return None
 
@@ -211,6 +216,7 @@ class PostgreSQLArrayCacheHandler(PostgreSQLAbstractCacheHandler):
             return set(result[0]), len(filtered_keys)
         except Exception as e:
             logger.error(f"Failed to get intersection in partition {partition_key}: {e}")
+            self._rollback_failed_read()
             return None, 0
 
     def get_intersected_lazy(self, keys: set[str], partition_key: str = "partition_key") -> tuple[str | None, int]:
@@ -326,6 +332,7 @@ class PostgreSQLArrayCacheHandler(PostgreSQLAbstractCacheHandler):
             return {row[0] for row in self.cursor.fetchall()}, count
         except Exception as e:
             logger.error(f"Failed to get dilated intersection in partition {partition_key}: {e}")
+            self._rollback_failed_read()
             return None, 0
 
     def set_cache_lazy(self, key: str, query: str, partition_key: str = "partition_key") -> bool:
