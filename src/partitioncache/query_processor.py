@@ -2424,25 +2424,34 @@ def order_variants_for_population(query_hash_pairs: list[tuple[str, str]]) -> li
     """
 
     def size(pair: tuple[str, str]) -> tuple[float, float]:
-        try:
-            select = sqlglot.parse_one(pair[0])
-        except sqlglot.ParseError:
-            return (float("inf"), float("inf"))
-        if not isinstance(select, exp.Select):
-            return (float("inf"), float("inf"))
-        # Only the outer FROM counts; tables of IN/EXISTS subqueries belong to their condition
-        tables = sum(1 for table in select.find_all(exp.Table) if table.parent_select is select)
-        where = select.args.get("where")
-        if where is None:
-            conditions = 0
-        elif isinstance(where.this, exp.And):
-            conditions = len(list(where.this.flatten()))
-        else:
-            conditions = 1
-        return (tables, conditions)
+        measured = variant_size(pair[0])
+        return (float("inf"), float("inf")) if measured is None else measured
 
     # The hash as last key makes the order reproducible; the input comes in set order
     return sorted(query_hash_pairs, key=lambda pair: (*size(pair), pair[1]))
+
+
+def variant_size(query: str) -> tuple[int, int] | None:
+    """(table count, condition count) of a query variant, or None if it is not a single parsable SELECT.
+
+    Only the outer FROM counts as tables; the tables of IN/EXISTS subqueries belong to their condition.
+    The conditions are the conjuncts of the outer WHERE.
+    """
+    try:
+        select = sqlglot.parse_one(query)
+    except sqlglot.ParseError:
+        return None
+    if not isinstance(select, exp.Select):
+        return None
+    tables = sum(1 for table in select.find_all(exp.Table) if table.parent_select is select)
+    where = select.args.get("where")
+    if where is None:
+        conditions = 0
+    elif isinstance(where.this, exp.And):
+        conditions = len(list(where.this.flatten()))
+    else:
+        conditions = 1
+    return (tables, conditions)
 
 
 def variant_key_alias(query: str, partition_key: str, sql_dialect: str = "postgres") -> str | None:

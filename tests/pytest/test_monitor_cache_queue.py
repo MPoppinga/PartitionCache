@@ -75,6 +75,7 @@ def mock_args():
     args.force_recalculate = False
     args.log_query_times = None
     args.disable_lazy_insertion = False
+    args.size_priority = None
     return args
 
 
@@ -153,7 +154,27 @@ class TestQueryFragmentProcessor:
             geometry_column=None,
             max_conditions_removed=mock_args.max_conditions_removed,
         )
-        mock_push_fragments.assert_called_once_with([("SELECT DISTINCT t1.partition_key FROM test_table t1", "hash1")], "test_partition_key", "integer", cache_backend=None)
+        mock_push_fragments.assert_called_once_with(
+            [("SELECT DISTINCT t1.partition_key FROM test_table t1", "hash1")], "test_partition_key", "integer", cache_backend=None, size_priority=None
+        )
+
+    @pytest.mark.parametrize("size_priority", [True, False])
+    @patch("partitioncache.cli.monitor_cache_queue.exit_event")
+    @patch("partitioncache.cli.monitor_cache_queue.pop_from_original_query_queue_blocking")
+    @patch("partitioncache.cli.monitor_cache_queue.generate_all_query_hash_pairs")
+    @patch("partitioncache.cli.monitor_cache_queue.push_to_query_fragment_queue")
+    def test_query_fragment_processor_passes_size_priority(
+        self, mock_push_fragments, mock_generate, mock_pop_blocking, mock_exit_event, size_priority, mock_args, mock_env
+    ):
+        """--size-priority / --no-size-priority reach the push of the generated fragments."""
+        mock_exit_event.is_set.side_effect = [False, True]
+        mock_pop_blocking.return_value = ("SELECT * FROM test_table", "test_partition_key", "integer")
+        mock_generate.return_value = [("SELECT DISTINCT t1.partition_key FROM test_table t1", "hash1")]
+        mock_args.size_priority = size_priority
+
+        query_fragment_processor(mock_args, (None, None, None))
+
+        assert mock_push_fragments.call_args.kwargs["size_priority"] is size_priority
 
     @patch("partitioncache.cli.monitor_cache_queue.exit_event")
     @patch("partitioncache.cli.monitor_cache_queue.pop_from_original_query_queue_blocking")
@@ -708,7 +729,7 @@ class TestIntegration:
             max_conditions_removed=mock_args.max_conditions_removed,
         )
         mock_push_to_outgoing.assert_called_once_with(
-            [("SELECT DISTINCT t1.partition_key FROM test_table t1 WHERE t1.id = 1", "hash1")], "test_partition_key", "integer", cache_backend=None
+            [("SELECT DISTINCT t1.partition_key FROM test_table t1 WHERE t1.id = 1", "hash1")], "test_partition_key", "integer", cache_backend=None, size_priority=None
         )
 
 

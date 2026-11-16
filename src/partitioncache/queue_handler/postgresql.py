@@ -10,6 +10,7 @@ import psycopg
 from psycopg import sql
 
 from partitioncache.queue_handler.abstract import AbstractPriorityQueueHandler
+from partitioncache.queue_handler.size_priority import fragment_size_priority, size_priority_enabled
 
 logger = getLogger("PartitionCache")
 
@@ -321,7 +322,14 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
                 except Exception:
                     pass
 
-    def push_to_query_fragment_queue(self, query_hash_pairs: list[tuple[str, str]], partition_key: str, partition_datatype: str | None = None, cache_backend: str | None = None) -> bool:
+    def push_to_query_fragment_queue(
+        self,
+        query_hash_pairs: list[tuple[str, str]],
+        partition_key: str,
+        partition_datatype: str | None = None,
+        cache_backend: str | None = None,
+        size_priority: bool | None = None,
+    ) -> bool:
         """
         Push query variants to the variant queue (implements AbstractQueueHandler interface;
         the queue table keeps its historical ``query_fragment_queue`` name).
@@ -332,12 +340,16 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
             partition_key (str): The partition key for these query variants.
             partition_datatype (str): The datatype of the partition key (default: None).
             cache_backend (str): The cache backend to use for processing (default: None, uses processor config).
+            size_priority (bool): Pop the smaller fragments of all queries first (see ``queue_handler.size_priority``): a new
+                fragment gets 1000 * (10 - its tables) + 1. False pushes every fragment with priority 1.
+                Either way a push of a waiting fragment adds 1. None reads QUERY_QUEUE_SIZE_PRIORITY (default on).
 
         Returns:
             bool: True if all variants were pushed successfully, False otherwise.
         """
         if not query_hash_pairs:
             return True
+        sized = size_priority_enabled(size_priority)
 
         conn = None
         try:
@@ -368,6 +380,8 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
                         batch_params + (cache_backends,),
                     )
                 results = cursor.fetchall()
+                if sized:
+                    self._lift_created_fragments(cursor, query_hash_pairs, partition_key, results)
                 conn.commit()
 
                 success_count = len([r for r in results if r[3] in ("inserted", "updated")])
@@ -388,7 +402,7 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
                             cache_backend = COALESCE(EXCLUDED.cache_backend, {table}.cache_backend),
                             updated_at = CURRENT_TIMESTAMP
                     """).format(table=sql.Identifier(self.fragment_queue_table)),
-                        (query, hash_value, partition_key, partition_datatype, cache_backend, 1),
+                        (query, hash_value, partition_key, partition_datatype, cache_backend, fragment_size_priority(query) if sized else 1),
                     )
 
                 conn.commit()
@@ -405,6 +419,27 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
                     conn.close()
                 except Exception:
                     pass
+
+    def _lift_created_fragments(self, cursor, query_hash_pairs: list[tuple[str, str]], partition_key: str, results) -> None:
+        """Give the fragments this push created their size priority, in the push's transaction.
+
+        The helper inserts a new fragment with the priority it is given and adds that priority again on a re-push, so
+        the batch runs with priority 1 (+1 per re-push, as without size priority) and the created rows are lifted here.
+        Rows created by this transaction are not visible to other sessions yet. A row another session created while
+        the helper looked (reported as inserted, but updated through ON CONFLICT) keeps its own created_at, so the
+        created_at test leaves it at +1.
+        """
+        created = [query_hash_pairs[idx - 1] for idx, _, _, status in results if status == "inserted"]
+        if not created:
+            return
+        cursor.execute(
+            sql.SQL("""
+            UPDATE {table} AS q SET priority = q.priority - 1 + s.priority
+            FROM unnest(%s::text[], %s::int[]) AS s(hash, priority)
+            WHERE q.hash = s.hash AND q.partition_key = %s AND q.created_at = CURRENT_TIMESTAMP
+        """).format(table=sql.Identifier(self.fragment_queue_table)),
+            ([hash_value for _, hash_value in created], [fragment_size_priority(query) for query, _ in created], partition_key),
+        )
 
     def push_to_original_query_queue_with_priority(self, query: str, partition_key: str, priority: int = 1, partition_datatype: str | None = None) -> bool:
         """

@@ -84,7 +84,14 @@ class RedisQueueHandler(AbstractQueueHandler):
             logger.error(f"Failed to push query to Redis original query queue: {e}")
             return False
 
-    def push_to_query_fragment_queue(self, query_hash_pairs: list[tuple[str, str]], partition_key: str, partition_datatype: str | None = None, cache_backend: str | None = None) -> bool:
+    def push_to_query_fragment_queue(
+        self,
+        query_hash_pairs: list[tuple[str, str]],
+        partition_key: str,
+        partition_datatype: str | None = None,
+        cache_backend: str | None = None,
+        size_priority: bool | None = None,
+    ) -> bool:
         """
         Push query variants (as (query, hash) pairs) directly to the query variant queue
         (persisted as the historical ``query_fragment`` key).
@@ -94,6 +101,7 @@ class RedisQueueHandler(AbstractQueueHandler):
             partition_key (str): The partition key for these query variants.
             partition_datatype (str): The datatype of the partition key (default: None).
             cache_backend (str): The cache backend to use for processing (default: None, uses processor config).
+            size_priority (bool): Ignored: a Redis list has no priority and pops in push order.
 
         Returns:
             bool: True if all variants were pushed successfully, False otherwise.

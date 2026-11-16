@@ -242,6 +242,30 @@ DO UPDATE SET
     updated_at = CURRENT_TIMESTAMP;
 ```
 
+### Size Priority for Query Variants
+
+By default the variant queue pops the smaller variants of **all** queued queries first, not only within one
+query. A new variant gets the priority
+
+```
+1000 * (10 - number of tables in its outer FROM) + 1
+```
+
+so a 1-table variant gets 9001, a 3-table variant 7001, and a variant with more than 10 tables a priority of 0 or
+below (the column is a signed INTEGER, so the order still holds). A push of a variant that is already waiting adds 1,
+as without size priority. The size therefore decides first; among variants of one size the more often pushed one
+pops first, then the older one. A re-push lifts a variant past a smaller one only after 999 pushes.
+
+Conditions do not enter the priority: `pcache-add --queue` and `pcache-monitor` push each query's variants in
+`order_variants_for_population` order (tables, then conditions), and variants of one size and one query keep that
+push order.
+
+The switch is `--size-priority` / `--no-size-priority` on `pcache-add` and `pcache-monitor`, the
+`QUERY_QUEUE_SIZE_PRIORITY` environment variable (`true` by default; `false`, `0` or `no` turn it off), or the
+`size_priority` argument of `push_to_query_variant_queue`. Turned off, every variant is pushed with priority 1 and a
+re-push adds 1, the behaviour before size priority. `push_to_query_fragment_queue_with_priority` of the PostgreSQL
+handler keeps the priority it is given. The Redis provider has no priorities and ignores the setting.
+
 ### Priority-Based Retrieval
 
 Queries are processed in order of:

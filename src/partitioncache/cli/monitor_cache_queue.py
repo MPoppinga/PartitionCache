@@ -20,6 +20,7 @@ from partitioncache.cli.common_args import (
     add_database_args,
     add_environment_args,
     add_grid_args,
+    add_size_priority_arg,
     add_spatial_args,
     add_variant_generation_args,
     add_verbosity_args,
@@ -44,6 +45,7 @@ from partitioncache.queue import (
     pop_from_query_fragment_queue_blocking,
     push_to_query_fragment_queue,
 )
+from partitioncache.queue_handler.size_priority import size_priority_enabled
 from partitioncache.spatial_grid import GRID_GENERATION_KWARGS
 
 logger = get_thread_aware_logger("PartitionCache")
@@ -240,7 +242,9 @@ def query_fragment_processor(args, constraint_args):
             # Push variants to the variant queue using the partition_key and datatype from queue
             # For spatial queries, resolve and pass cache_backend so the processor knows which handler to use
             queue_cache_backend = resolved_backend
-            success = push_to_query_fragment_queue(query_hash_pairs, partition_key, partition_datatype, cache_backend=queue_cache_backend)
+            success = push_to_query_fragment_queue(
+                query_hash_pairs, partition_key, partition_datatype, cache_backend=queue_cache_backend, size_priority=getattr(args, "size_priority", None)
+            )
             if success:
                 logger.debug(f"Pushed {len(query_hash_pairs)} query variants to the variant queue")
             else:
@@ -884,6 +888,7 @@ def main():
     add_spatial_args(parser, include_buffer_distance=False)
     add_grid_args(parser)
     add_verbosity_args(parser)
+    add_size_priority_arg(parser.add_argument_group("queue configuration"))
 
     # Cache backend argument with bitsize support
     cache_group = parser.add_argument_group("cache configuration")
@@ -1056,6 +1061,8 @@ def main():
         settings.pop("geometry_column", None)
         settings["skip_partition_key_joins"] = f"for {sorted(args.skip_partition_key_joins)} and geometry keys"
         logger.info(f"  - Variant settings of decomposition and lookup: {settings}")
+
+    logger.info(f"- Variant queue size priority: {'ENABLED' if size_priority_enabled(args.size_priority) else 'DISABLED'}")
 
     # Log lazy insertion configuration
     logger.info(f"- Lazy insertion: {'DISABLED' if args.disable_lazy_insertion else 'ENABLED (when conditions met)'}")
