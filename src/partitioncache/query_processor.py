@@ -2146,6 +2146,36 @@ def _apply_constraint_modifications(
     return result_queries
 
 
+def _key_source_from_select(parsed: exp.Expr, partition_key: str) -> str | None:
+    """The source of the partition key the query's SELECT names, for variants without partition key joins.
+
+    Without key joins, the tables of a query hold different keys, so a variant is a relaxation of the query
+    only if it selects the key of the alias the query selects. Every table of the top-level FROM and JOIN
+    clauses is a candidate, not only the FROM table: a query selecting a joined table's key would otherwise
+    get variants that select the first table's key. The source is the table name when the table occurs once
+    (the variants are those of passing the name), and the alias when it occurs more than once: with the name,
+    a self-join's variants without the selected alias would be generated, and they hold the other alias's keys.
+
+    Returns:
+        The table name or alias, or None when the SELECT names no qualified partition key column.
+    """
+    select = parsed if isinstance(parsed, exp.Select) else parsed.find(exp.Select)
+    if select is None:
+        return None
+    from_ = select.args.get("from_") or select.args.get("from")
+    items = ([from_.this] if from_ is not None else []) + [join.this for join in select.args.get("joins") or []]
+    tables = [table for item in items for table in item.find_all(exp.Table)]
+    for expression in select.expressions:
+        column = expression.find(exp.Column)
+        if column is None or column.name != partition_key or not column.table:
+            continue
+        for table in tables:
+            if (table.alias or table.name) == column.table:
+                occurrences = sum(1 for other in tables if other.name == table.name)
+                return str(column.table) if occurrences > 1 else str(table.name)
+    return None
+
+
 def generate_all_query_hash_pairs(
     query: str,
     partition_key: str,
@@ -2194,7 +2224,11 @@ def generate_all_query_hash_pairs(
             clause references the correct alias. Can be a table name (e.g., "pois") or a specific
             alias (e.g., "p1") for self-join disambiguation. When None and geometry_column is set,
             auto-detected from the first FROM table. When None and skip_partition_key_joins=True,
-            auto-detected from the original SELECT clause.
+            auto-detected from the original SELECT clause: the table of the selected key column, or its
+            alias when the table occurs more than once. Without key joins, a table name passed for a
+            table that occurs more than once also generates the variants of its other aliases, which hold
+            other keys; pass the alias unless every lookup widens the cached keys (spatial buffer,
+            temporal dilation).
         protected_patterns: If set, conditions containing any of these substrings
             (case-insensitive) are protected from removal during variant generation.
             Only unprotected conditions are candidates for removal. Useful for ensuring
@@ -2264,20 +2298,7 @@ def generate_all_query_hash_pairs(
     # (when skip_partition_key_joins=False, equijoins are generated so t1 is always valid)
     if partition_key_source_table is None and skip_partition_key_joins:
         try:
-            _parsed_for_pk = sqlglot.parse_one(query)
-            _sel_for_pk = _parsed_for_pk if isinstance(_parsed_for_pk, exp.Select) else _parsed_for_pk.find(exp.Select)
-            if _sel_for_pk:
-                for _expr in _sel_for_pk.expressions:
-                    _col = _expr.find(exp.Column)
-                    if _col and _col.name == partition_key and _col.table:
-                        _from = _parsed_for_pk.find(exp.From)
-                        if _from:
-                            for _tbl in _from.find_all(exp.Table):
-                                if (_tbl.alias or _tbl.name) == _col.table:
-                                    partition_key_source_table = _tbl.name
-                                    break
-                    if partition_key_source_table:
-                        break
+            partition_key_source_table = _key_source_from_select(sqlglot.parse_one(query), partition_key)
         except Exception:
             pass
 
