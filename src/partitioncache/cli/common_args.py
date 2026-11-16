@@ -6,9 +6,12 @@ consistency across all CLI tools and reduce code duplication.
 """
 
 import argparse
+import functools
+import ipaddress
 import json
 import os
 import re
+import socket
 import sys
 from logging import getLogger
 from pathlib import Path
@@ -196,6 +199,38 @@ def add_environment_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+class _EnvFileArgumentError(Exception):
+    pass
+
+
+class _EnvFileParser(argparse.ArgumentParser):
+    """Reads only --env-file; its errors are left to the tool's own parser."""
+
+    def error(self, message: str):  # type: ignore[override]
+        raise _EnvFileArgumentError(message)
+
+
+def load_env_file_before_parsing(argv: list[str] | None = None) -> None:
+    """Load the file of --env-file / --env (default: .env) into the environment before a tool builds its parser.
+
+    Argument defaults such as those of add_variant_generation_args are read from the environment while the parser is
+    built, so a variable that stands only in the env file must be in os.environ by then. Variables that are already
+    set keep their values (python-dotenv's default, as for the connection variables); a command-line flag still wins
+    over both. A missing file is reported later by load_environment_with_validation.
+
+    Args:
+        argv: The command-line arguments without the program name (default: sys.argv[1:]).
+    """
+    pre_parser = _EnvFileParser(add_help=False)
+    add_environment_args(pre_parser)
+    try:
+        known, _ = pre_parser.parse_known_args(sys.argv[1:] if argv is None else argv)
+    except _EnvFileArgumentError:
+        return
+    if Path(known.env_file).exists():
+        dotenv.load_dotenv(known.env_file)
+
+
 def add_queue_args(parser: argparse.ArgumentParser) -> None:
     """
     Add queue-related arguments to an ArgumentParser.
@@ -210,6 +245,18 @@ def add_queue_args(parser: argparse.ArgumentParser) -> None:
         type=str,
         choices=["postgresql", "redis"],
         help="Queue provider to use (if not specified, uses QUERY_QUEUE_PROVIDER environment variable)",
+    )
+    add_size_priority_arg(queue_group)
+
+
+def add_size_priority_arg(group: argparse.ArgumentParser | argparse._ArgumentGroup) -> None:
+    """Add --size-priority / --no-size-priority (unset: QUERY_QUEUE_SIZE_PRIORITY, default on)."""
+    group.add_argument(
+        "--size-priority",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Pop the smaller query variants of all queued queries first: priority 10 - tables in the PostgreSQL "
+        "variant queue (default: on, or QUERY_QUEUE_SIZE_PRIORITY). --no-size-priority pushes every variant with priority 1",
     )
 
 
@@ -599,6 +646,112 @@ def get_database_connection_params(args: argparse.Namespace, backend_type: str |
         return {"db_path": getattr(args, "db_dir", "data/test_db.sqlite")}
     else:
         raise ValueError(f"Unsupported database backend: {backend}")
+
+
+ConnectionTarget = tuple[str, int, str]
+
+
+def data_connection_target(args: argparse.Namespace) -> ConnectionTarget | None:
+    """(host, port, database) of the PostgreSQL data connection get_database_connection_params gives, or None.
+
+    None when --db-backend is not postgresql or no database name is configured (--db-name or DB_NAME).
+    """
+    if getattr(args, "db_backend", None) != "postgresql" or not (getattr(args, "db_name", None) or os.getenv("DB_NAME")):
+        return None
+    try:
+        params = get_database_connection_params(args, "postgresql")
+        return str(params["host"]), int(params["port"]), str(params["dbname"])
+    except (TypeError, ValueError):
+        return None
+
+
+def cache_connection_target(cache_handler: Any) -> ConnectionTarget | None:
+    """(host, port, database) the cache handler's psycopg connection resolved to, or None if it has none.
+
+    The PostgreSQL handlers keep the connection in ``db``, rocksdict_h3_grouped in ``pg_conn``; the values come from
+    ``connection.info``, i.e. what the connection actually uses, not the variables it was configured from.
+    """
+    for attribute in ("db", "pg_conn"):
+        info = getattr(getattr(cache_handler, attribute, None), "info", None)
+        host, port, dbname = (getattr(info, name, None) for name in ("host", "port", "dbname"))
+        if isinstance(host, str) and host and isinstance(dbname, str) and dbname and isinstance(port, int | str):
+            try:
+                return host, int(port), dbname
+            except ValueError:
+                return None
+    return None
+
+
+def _is_loopback(host: str) -> bool:
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(host.split("%")[0]).is_loopback
+    except ValueError:
+        return False
+
+
+@functools.lru_cache(maxsize=64)
+def _host_addresses(host: str) -> frozenset[str] | None:
+    """The addresses ``host`` resolves to, None if it does not resolve; cached, the monitor checks every fragment."""
+    try:
+        return frozenset(str(info[4][0]).split("%")[0] for info in socket.getaddrinfo(host, None))
+    except (OSError, UnicodeError):
+        return None
+
+
+def _same_host(host_a: str, host_b: str) -> bool:
+    """Whether two libpq host values name the same server host.
+
+    Loopback spellings (``localhost``, ``127.0.0.1``, ``::1``, ...) are one host; other names are the same host when
+    the addresses they resolve to intersect, or, when one does not resolve, when they are equal ignoring case. A
+    Unix-socket directory is the same host only as the same directory.
+    """
+    a, b = host_a.strip().lower(), host_b.strip().lower()
+    if a == b:
+        return True
+    if a.startswith("/") or b.startswith("/"):
+        return False
+    if _is_loopback(a) and _is_loopback(b):
+        return True
+    addresses_a, addresses_b = _host_addresses(a), _host_addresses(b)
+    if addresses_a is None or addresses_b is None:
+        return False
+    return bool(addresses_a & addresses_b)
+
+
+def lazy_insertion_refusal(data_target: ConnectionTarget | None, cache_target: ConnectionTarget | None) -> str | None:
+    """Why fragments must not be executed on the cache handler's connection (lazy insertion), or None if they may.
+
+    Lazy insertion executes a fragment on the cache handler's connection, not on the data connection. Both must reach
+    the same server and database: the ports and database names must be equal and the hosts the same host (see
+    _same_host). A Unix-socket directory never matches a TCP host: when in doubt, the fragment runs on the data
+    connection.
+
+    Args:
+        data_target: (host, port, database) of the data connection, None if it is not PostgreSQL or not configured.
+        cache_target: (host, port, database) of the cache handler's connection, None if it has none.
+    """
+    if data_target is None:
+        return "the data connection is not a configured PostgreSQL database (--db-backend postgresql with --db-name or DB_NAME)"
+    if cache_target is None:
+        return "the cache handler has no PostgreSQL connection that could be compared with the data connection"
+    data_host, data_port, data_db = data_target
+    cache_host, cache_port, cache_db = cache_target
+    if _same_host(data_host, cache_host) and data_port == cache_port and data_db == cache_db:
+        return None
+    reason = f"the cache handler connects to {cache_host}:{cache_port}/{cache_db}, the data connection to {data_host}:{data_port}/{data_db}"
+    if (data_host.strip().startswith("/")) != (cache_host.strip().startswith("/")):
+        reason += " (a Unix socket and a TCP host are not assumed to be the same server)"
+    return (
+        f"{reason}; to use lazy insertion, give both the same host (DB_HOST / PG_DB_HOST or the handler's own host variable), "
+        "port (DB_PORT / PG_DB_PORT) and database (DB_NAME / --db-name)"
+    )
+
+
+def lazy_insertion_refusal_for(args: argparse.Namespace, cache_handler: Any) -> str | None:
+    """lazy_insertion_refusal for the data connection of ``args`` and the connection of ``cache_handler``."""
+    return lazy_insertion_refusal(data_connection_target(args), cache_connection_target(cache_handler))
 
 
 def setup_logging(verbose: bool = False) -> None:

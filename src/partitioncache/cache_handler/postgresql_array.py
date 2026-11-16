@@ -5,7 +5,7 @@ from logging import getLogger
 from psycopg import sql
 
 from partitioncache.cache_handler.abstract import LAZY_ALL_KEYS_PLACEHOLDER
-from partitioncache.cache_handler.postgresql_abstract import PostgreSQLAbstractCacheHandler
+from partitioncache.cache_handler.postgresql_abstract import PostgreSQLAbstractCacheHandler, _shared_cache_table_refusal
 from partitioncache.key_table_script import lazy_insertion_parts
 
 logger = getLogger("PartitionCache")
@@ -87,6 +87,10 @@ class PostgreSQLArrayCacheHandler(PostgreSQLAbstractCacheHandler):
             return True
         except Exception as e:
             logger.error(f"Failed to ensure partition table for {partition_key}: {e}")
+            refused = _shared_cache_table_refusal(e)
+            if refused:
+                self.db.rollback()
+                raise refused from e
             # Rollback and retry with manual table creation as fallback
             try:
                 self.db.rollback()
@@ -179,8 +183,13 @@ class PostgreSQLArrayCacheHandler(PostgreSQLAbstractCacheHandler):
             return None
 
         table_name = f"{self.tableprefix}_cache_{partition_key}"
-        self.cursor.execute(sql.SQL("SELECT partition_keys FROM {0} WHERE query_hash = %s").format(sql.Identifier(table_name)), (key,))
-        result = self.cursor.fetchone()
+        try:
+            self.cursor.execute(sql.SQL("SELECT partition_keys FROM {0} WHERE query_hash = %s").format(sql.Identifier(table_name)), (key,))
+            result = self.cursor.fetchone()
+        except Exception as e:
+            logger.error(f"Failed to get value for key {key} in partition {partition_key}: {e}")
+            self._rollback_failed_read()
+            return None
         if result is None or result[0] is None:
             return None
 
@@ -211,6 +220,7 @@ class PostgreSQLArrayCacheHandler(PostgreSQLAbstractCacheHandler):
             return set(result[0]), len(filtered_keys)
         except Exception as e:
             logger.error(f"Failed to get intersection in partition {partition_key}: {e}")
+            self._rollback_failed_read()
             return None, 0
 
     def get_intersected_lazy(self, keys: set[str], partition_key: str = "partition_key") -> tuple[str | None, int]:
@@ -318,14 +328,34 @@ class PostgreSQLArrayCacheHandler(PostgreSQLAbstractCacheHandler):
             if dilation == 0:
                 result, count = self.get_intersected(keys, partition_key)
                 return result, count  # type: ignore[return-value]
+            if dilation < 0:
+                raise ValueError(f"dilation must be non-negative, got {dilation}")
 
-            lazy_sql, count = self.get_intersected_dilated_lazy(keys, partition_key, dilation)
-            if lazy_sql is None:
+            datatype = self._get_partition_datatype(partition_key)
+            if datatype is None:
                 return None, 0
-            self.cursor.execute(lazy_sql)
-            return {row[0] for row in self.cursor.fetchall()}, count
+            if datatype != "integer":
+                logger.error(f"Temporal dilation requires an integer partition key, got '{datatype}' for '{partition_key}'")
+                return None, 0
+
+            filtered_keys = self.filter_existing_keys(keys, partition_key)
+            if not filtered_keys:
+                return None, 0
+
+            # INTERSECT over the per-key sets is empty once one entry is missing (deleted after filter_existing_keys),
+            # so the keys count only while every entry is present; otherwise the result is unknown, not empty
+            query = sql.SQL("SELECT {present}, ARRAY({inner})").format(
+                present=self._all_entries_present_sql(filtered_keys, partition_key),
+                inner=self.get_intersected_dilated_sql(filtered_keys, partition_key, dilation),
+            )
+            self.cursor.execute(query)
+            row = self.cursor.fetchone()
+            if row is None or not row[0]:
+                return None, 0
+            return set(row[1]), len(filtered_keys)
         except Exception as e:
             logger.error(f"Failed to get dilated intersection in partition {partition_key}: {e}")
+            self._rollback_failed_read()
             return None, 0
 
     def set_cache_lazy(self, key: str, query: str, partition_key: str = "partition_key") -> bool:
