@@ -9,7 +9,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from partitioncache.cache_handler.rocks_dict import RocksDictCacheHandler
 from partitioncache.cli import add_to_cache, manage_cache, postgresql_queue_processor
 from partitioncache.query_processor import generate_all_query_hash_pairs
 
@@ -57,9 +56,17 @@ def _add_direct_argv(db_path, env_file):
             "--db-backend", "sqlite", "--db-dir", str(db_path), "--env-file", str(env_file), "--min-component-size", "1"]
 
 
-def test_add_direct_exits_1_when_a_variant_cannot_be_stored(tmp_path, sqlite_db, empty_env_file, monkeypatch, caplog):
+@pytest.fixture
+def rocksdict_cache(tmp_path, monkeypatch):
+    """CACHE_BACKEND=rocksdict in tmp_path; skipped where rocksdict has no wheel (e.g. Python 3.15)."""
+    pytest.importorskip("rocksdict")
     monkeypatch.setenv("CACHE_BACKEND", "rocksdict")
     monkeypatch.setenv("ROCKSDB_DICT_PATH", str(tmp_path / "cache"))
+
+
+def test_add_direct_exits_1_when_a_variant_cannot_be_stored(rocksdict_cache, sqlite_db, empty_env_file, caplog):
+    from partitioncache.cache_handler.rocks_dict import RocksDictCacheHandler
+
     variants = generate_all_query_hash_pairs(QUERY, "pk", min_component_size=1, keep_all_attributes=True, warn_no_partition_key=False)
     real_set_cache = RocksDictCacheHandler.set_cache
     calls = []
@@ -75,15 +82,11 @@ def test_add_direct_exits_1_when_a_variant_cannot_be_stored(tmp_path, sqlite_db,
     assert any(f"1 of {len(variants)}" in message for message in _errors(caplog))
 
 
-def test_add_direct_exits_0_when_every_variant_is_stored(tmp_path, sqlite_db, empty_env_file, monkeypatch):
-    monkeypatch.setenv("CACHE_BACKEND", "rocksdict")
-    monkeypatch.setenv("ROCKSDB_DICT_PATH", str(tmp_path / "cache"))
+def test_add_direct_exits_0_when_every_variant_is_stored(rocksdict_cache, sqlite_db, empty_env_file):
     assert _exit_code(add_to_cache.main, _add_direct_argv(sqlite_db, empty_env_file)) == 0
 
 
-def test_add_direct_without_variants_warns(tmp_path, sqlite_db, empty_env_file, monkeypatch, caplog):
-    monkeypatch.setenv("CACHE_BACKEND", "rocksdict")
-    monkeypatch.setenv("ROCKSDB_DICT_PATH", str(tmp_path / "cache"))
+def test_add_direct_without_variants_warns(rocksdict_cache, sqlite_db, empty_env_file, caplog):
     with patch.object(add_to_cache, "generate_all_query_hash_pairs", return_value=[]), caplog.at_level(logging.WARNING, logger="PartitionCache"):
         assert _exit_code(add_to_cache.main, _add_direct_argv(sqlite_db, empty_env_file)) == 0
     assert any("no query variants" in r.getMessage().lower() for r in caplog.records if r.levelno == logging.WARNING)
