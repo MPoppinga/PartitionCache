@@ -85,20 +85,16 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
                         )
                         self.db.commit()
 
-                    # Nothing to do if the trigger is already there and calls the shared trigger function:
-                    # re-running the function loader and the trigger DDL on every handler construction is
-                    # what makes concurrent workers collide on pg_proc and on the metadata table. A trigger
-                    # from before calls the prefix's own function; it is switched over once, here.
-                    self.cursor.execute(
-                        """SELECT 1 FROM pg_trigger WHERE NOT tgisinternal AND tgname = %s
-                            AND tgrelid = to_regclass(quote_ident(%s))
-                            AND tgfoid = to_regprocedure('partitioncache_bit_widen_trigger()')""",
-                        (self.tableprefix + "_bitsize_trigger", self.tableprefix + "_partition_metadata"),
-                    )
-                    if self.cursor.fetchone() is None:
+                    # Nothing to do if the trigger is already there: re-running the function
+                    # loader and the trigger DDL on every handler construction is what makes
+                    # concurrent workers collide on pg_proc and on the metadata table.
+                    trigger_exists, switch_pending = self._bitsize_trigger_state()
+                    if not trigger_exists:
                         self._load_sql_functions()
                         self._create_bitsize_trigger()
                     self.db.commit()
+                    if switch_pending:
+                        self._switch_bitsize_trigger()
                     return
 
                 logger.warning(f"! Setting up {self.tableprefix} cache handler: Loading SQL functions")
@@ -162,8 +158,58 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
         )
         self.db.commit()
 
+    def _bitsize_trigger_state(self) -> tuple[bool, bool]:
+        """(the prefix's bitsize trigger exists, it still needs the switch to the shared function).
+
+        The switch is pending while the trigger calls the prefix's own function from before, or while that own
+        function is still there unused (an older client may re-create it). The names are compared as stored
+        (truncated to 63 bytes): psycopg sends the parameters untyped, so they compare as name.
+        """
+        self.cursor.execute(
+            """SELECT EXISTS (SELECT 1 FROM pg_trigger WHERE NOT tgisinternal AND tgname = %(trigger)s
+                                AND tgrelid = to_regclass(quote_ident(%(metadata)s))),
+                      EXISTS (SELECT 1 FROM pg_trigger WHERE NOT tgisinternal AND tgname = %(trigger)s
+                                AND tgrelid = to_regclass(quote_ident(%(metadata)s))
+                                AND tgfoid IS DISTINCT FROM to_regprocedure('partitioncache_bit_widen_trigger()'))
+                      OR EXISTS (SELECT 1 FROM pg_proc p WHERE p.proname = %(function)s AND p.pronargs = 0
+                                   AND p.prorettype = 'trigger'::regtype
+                                   AND NOT EXISTS (SELECT 1 FROM pg_trigger t WHERE t.tgfoid = p.oid))""",
+            {
+                "trigger": self.tableprefix + "_bitsize_trigger",
+                "metadata": self.tableprefix + "_partition_metadata",
+                "function": self.tableprefix + "_bitsize_trigger_func",
+            },
+        )
+        row = self.cursor.fetchone()
+        if not isinstance(row, tuple) or len(row) != 2:
+            return False, False  # a mocked cursor in unit tests
+        return bool(row[0]), bool(row[1])
+
+    def _switch_bitsize_trigger(self) -> None:
+        """Switch a bitsize trigger from before to the shared function, and drop the prefix's own unused function.
+
+        DROP TRIGGER waits for every open transaction that has read the metadata table (a running job, a worker of
+        the old version), and every later reader of the table would queue behind it. So the switch runs in a short
+        transaction of its own with a lock timeout. On a timeout, or any other failure, the old trigger stays (it
+        keeps working) and the next start of a handler tries again.
+        """
+        try:
+            with self._serialized_ddl():
+                self.cursor.execute("SELECT to_regprocedure('partitioncache_switch_bitsize_trigger(text)') IS NULL")
+                row = self.cursor.fetchone()
+                if row is None or row[0]:
+                    self._load_sql_functions()
+                # After the load: a failed load rolls back, which would also drop a lock timeout set before it
+                self.cursor.execute("SET LOCAL lock_timeout = '2s'")
+                self.cursor.execute("SELECT partitioncache_switch_bitsize_trigger(%s)", (self.tableprefix,))
+            self.db.commit()
+            logger.info(f"TRIGGER: the bitsize trigger of {self.tableprefix} calls the shared function")
+        except Exception as e:
+            logger.warning(f"TRIGGER: kept the bitsize trigger of {self.tableprefix} as it is for now; the next start tries again: {e}")
+            self.db.rollback()
+
     def _create_bitsize_trigger(self) -> None:
-        """Create the bitsize trigger (it calls the shared partitioncache_bit_widen_trigger), or switch one from before to it."""
+        """Create the bitsize trigger; it calls the shared partitioncache_bit_widen_trigger with the prefix."""
         try:
             logger.info(f"TRIGGER: Calling partitioncache_create_bitsize_trigger for {self.tableprefix}")
             # Call the SQL function to create the trigger

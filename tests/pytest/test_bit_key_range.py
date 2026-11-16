@@ -115,7 +115,7 @@ class TestPostgreSQLBitGrowth:
             handler.close()
 
     def test_old_trigger_function_is_replaced_on_growth(self):
-        """A cache whose trigger still calls its own old function is switched to the shared one before it grows."""
+        """A cache whose trigger still calls its own function from before the USING fix grows: the function is replaced in place."""
         handler = _postgresql_bit(bitsize=16)
         prefix = handler.tableprefix
         try:
@@ -131,8 +131,8 @@ class TestPostgreSQLBitGrowth:
             assert handler.set_cache("large", {3, 20}, "pk") is True
             assert handler.get("large", "pk") == {3, 20}
             assert handler.get("small", "pk") == {1, 2}
-            handler.cursor.execute("SELECT count(*) FROM pg_proc WHERE proname = %s", (prefix + "_bitsize_trigger_func",))
-            assert handler.cursor.fetchone()[0] == 0
+            handler.cursor.execute("SELECT prosrc LIKE '%%bitsize trigger v2%%' FROM pg_proc WHERE proname = %s", (prefix + "_bitsize_trigger_func",))
+            assert handler.cursor.fetchone()[0] is True
             handler.db.commit()
         finally:
             handler.close()

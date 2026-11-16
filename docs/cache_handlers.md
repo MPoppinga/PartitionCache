@@ -374,10 +374,13 @@ bitsize = cache._get_partition_bitsize("large_dataset")
 Database triggers automatically update cache table schemas when the bitsize grows. Every bit cache's metadata table
 has the trigger `<prefix>_bitsize_trigger`, which calls the shared function `partitioncache_bit_widen_trigger()` with
 its prefix as the argument. Dropping a cache's tables drops its trigger and leaves no function behind. A cache created
-before the shared function has its own `<prefix>_bitsize_trigger_func()`; the first time a handler of this version
-starts for that prefix, or the pg_cron processor bootstraps one of its partitions once this version's SQL functions
-are loaded, the trigger is switched to the shared function and that prefix's own function is dropped, unless another
-trigger still uses it. Other prefixes are not touched.
+before the shared function has its own `<prefix>_bitsize_trigger_func()`. The first time a bit handler of this version
+starts for that prefix, it switches the trigger to the shared function and drops the prefix's own function, unless
+another trigger still uses it. The switch runs in a short transaction of its own with a 2 s lock timeout: `DROP
+TRIGGER` waits for open transactions that have read the metadata table. On a timeout the old trigger stays and keeps
+working, and the next start tries again. The pg_cron processor's bootstrap never switches a trigger (inside a job the
+lock would be held until the job commits); it only replaces a prefix's own function from before the `USING` fix in
+place, as before. Other prefixes are not touched.
 
 ```python
 # Growing the bitsize triggers a schema update; a smaller value keeps the current bitsize

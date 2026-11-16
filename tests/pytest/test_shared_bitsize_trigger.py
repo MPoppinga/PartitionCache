@@ -4,6 +4,7 @@ Runs with PARTITIONCACHE_TEST_PG_HOST/PORT/USER/PASSWORD/DB.
 """
 
 import os
+import time
 import uuid
 
 import pytest
@@ -104,9 +105,11 @@ def _install_old_trigger(prefix: str, function: str | None = None) -> str:
     return function
 
 
-@pytest.fixture
-def prefix():
-    name = f"pcache_shared_{uuid.uuid4().hex[:8]}"
+@pytest.fixture(params=["short", "long"])
+def prefix(request):
+    """A fresh prefix; the long one (50 characters) gives truncated trigger, metadata table and function names."""
+    suffix = uuid.uuid4().hex[:8]
+    name = f"{LONG}_{suffix}" if request.param == "long" else f"pcache_shared_{suffix}"
     yield name
     _drop_cache(name)
     for function in _functions_of(name):
@@ -121,7 +124,21 @@ def _store_and_grow(handler) -> None:
     assert handler.get("small", "pk") == {1, 2}
 
 
-def test_new_cache_uses_the_shared_function_with_its_prefix(prefix):
+def _old_cache(prefix: str) -> str:
+    """A cache whose trigger calls the prefix's own function, as created before the shared function; returns its name."""
+    handler = _handler(prefix)
+    try:
+        handler.register_partition_key("pk", "integer")
+        assert handler.set_cache("small", {1, 2}, "pk") is True
+    finally:
+        handler.close()
+    _install_old_trigger(prefix)
+    old = _functions_of(prefix)[0]  # as stored, truncated for the long prefix
+    assert _trigger(prefix)[1].strip('"') == old  # type: ignore[index]
+    return old
+
+
+def test_new_cache_uses_the_shared_function_and_grows(prefix):
     handler = _handler(prefix)
     try:
         _store_and_grow(handler)
@@ -135,7 +152,7 @@ def test_new_cache_uses_the_shared_function_with_its_prefix(prefix):
 
 
 def test_dropping_a_cache_leaves_no_function_and_the_others_keep_growing(prefix):
-    other = prefix + "_b"
+    other = f"pcache_shared_other_{uuid.uuid4().hex[:8]}"
     first, second = _handler(prefix), _handler(other)
     try:
         first.register_partition_key("pk", "integer")
@@ -155,14 +172,7 @@ def test_dropping_a_cache_leaves_no_function_and_the_others_keep_growing(prefix)
 
 
 def test_a_cache_from_before_is_switched_when_its_handler_starts(prefix):
-    handler = _handler(prefix)
-    try:
-        handler.register_partition_key("pk", "integer")
-        assert handler.set_cache("small", {1, 2}, "pk") is True
-    finally:
-        handler.close()
-    old = _install_old_trigger(prefix)
-    assert _trigger(prefix)[1] == old  # type: ignore[index]
+    _old_cache(prefix)
 
     handler = _handler(prefix)
     try:
@@ -175,54 +185,84 @@ def test_a_cache_from_before_is_switched_when_its_handler_starts(prefix):
         handler.close()
 
 
-def test_a_cache_from_before_is_switched_by_the_bootstrap_of_the_processor(prefix):
+def test_the_processor_bootstrap_keeps_a_trigger_from_before(prefix):
+    """Inside a job the switch would hold an exclusive lock on the metadata table until the job commits: no switch."""
+    old = _old_cache(prefix)
+
+    _query("SELECT partitioncache_bootstrap_partition(%s, 'pk', 'integer', 'bit', 64)", (prefix,))
+
+    assert _trigger(prefix)[1].strip('"') == old  # type: ignore[index]
+    assert _functions_of(prefix) == [old]
+    assert _query(f'SELECT bitsize FROM "{prefix}_partition_metadata"') == [(64,)]  # grown through the old trigger
+
+
+def test_the_switch_gives_up_on_a_busy_table_and_the_next_start_switches(prefix):
+    """An open transaction that has read the metadata table: the handler starts anyway, with the old trigger."""
+    import psycopg
+
+    old = _old_cache(prefix)
+    busy = psycopg.connect(**_params())
+    try:
+        busy.execute(f'SELECT * FROM "{prefix}_partition_metadata"')  # holds its lock until the transaction ends
+
+        started = time.monotonic()
+        handler = _handler(prefix)
+        try:
+            assert time.monotonic() - started < 10
+            assert _trigger(prefix)[1].strip('"') == old  # type: ignore[index]
+            with psycopg.connect(**_params(), autocommit=True) as reader:
+                reader.execute("SET lock_timeout = '1s'")
+                assert reader.execute(f'SELECT count(*) FROM "{prefix}_partition_metadata"').fetchone() == (1,)
+            assert handler.set_cache("large", {3, 40}, "pk") is True  # the old trigger still widens the table
+            assert handler.get("large", "pk") == {3, 40}
+        finally:
+            handler.close()
+    finally:
+        busy.rollback()
+        busy.close()
+
+    _handler(prefix).close()
+    assert _trigger(prefix)[1] == "partitioncache_bit_widen_trigger"  # type: ignore[index]
+    assert _functions_of(prefix) == []
+
+
+def test_an_own_function_an_older_client_re_created_is_dropped_at_the_next_start(prefix):
     handler = _handler(prefix)
     try:
         handler.register_partition_key("pk", "integer")
     finally:
         handler.close()
-    _install_old_trigger(prefix)
+    _query(OLD_TRIGGER_FUNCTION.format(function=prefix + "_bitsize_trigger_func", prefix=prefix))
+    assert len(_functions_of(prefix)) == 1
 
-    # The in-database processor bootstraps each partition it fills; for a bit cache that sets up the trigger
-    _query("SELECT partitioncache_bootstrap_partition(%s, 'pk', 'integer', 'bit', 64)", (prefix,))
+    _handler(prefix).close()
 
     assert _trigger(prefix)[1] == "partitioncache_bit_widen_trigger"  # type: ignore[index]
     assert _functions_of(prefix) == []
-    assert _query(f'SELECT bitsize FROM "{prefix}_partition_metadata"') == [(64,)]
 
 
 def test_an_old_function_another_trigger_still_uses_is_kept(prefix):
-    handler = _handler(prefix)
+    old = _old_cache(prefix)
+    _query(f'CREATE TABLE "{prefix[:40]}_other" (partition_key TEXT, bitsize INT)')
+    _query(f'CREATE TRIGGER "{prefix[:40]}_other_trigger" AFTER UPDATE ON "{prefix[:40]}_other" FOR EACH ROW EXECUTE FUNCTION "{old}"()')
     try:
-        handler.register_partition_key("pk", "integer")
-    finally:
-        handler.close()
-    old = _install_old_trigger(prefix)
-    _query(f'CREATE TABLE "{prefix}_other" (partition_key TEXT, bitsize INT)')
-    _query(f'CREATE TRIGGER "{prefix}_other_trigger" AFTER UPDATE ON "{prefix}_other" FOR EACH ROW EXECUTE FUNCTION "{old}"()')
-
-    try:
-        _query("SELECT partitioncache_create_bitsize_trigger(%s)", (prefix,))
+        _query("SELECT partitioncache_switch_bitsize_trigger(%s)", (prefix,))
 
         assert _trigger(prefix)[1] == "partitioncache_bit_widen_trigger"  # type: ignore[index]
         assert _functions_of(prefix) == [old]
     finally:
-        _query(f'DROP TABLE IF EXISTS "{prefix}_other"')
+        _query(f'DROP TABLE IF EXISTS "{prefix[:40]}_other"')
 
 
-@pytest.mark.parametrize("long_prefix", [False, True])
-def test_a_current_trigger_is_left_alone(prefix, long_prefix):
-    """A second call finds the trigger current (also under a truncated name) and does no DDL."""
-    name = LONG + "_" + prefix[-8:] if long_prefix else prefix
-    assert len(name) == (50 if long_prefix else len(prefix))
-    handler = _handler(name)
+def test_a_current_trigger_is_left_alone(prefix):
+    """A second call finds the trigger current (also under truncated names) and does no DDL."""
+    handler = _handler(prefix)
     try:
         _store_and_grow(handler)
-        oid = _trigger(name)[0]  # type: ignore[index]
-        _query("SELECT partitioncache_create_bitsize_trigger(%s)", (name,))
-        assert _trigger(name)[0] == oid
+        oid = _trigger(prefix)[0]  # type: ignore[index]
+        _query("SELECT partitioncache_create_bitsize_trigger(%s)", (prefix,))
+        _query("SELECT partitioncache_switch_bitsize_trigger(%s)", (prefix,))
+        _handler(prefix).close()
+        assert _trigger(prefix)[0] == oid  # type: ignore[index]
     finally:
         handler.close()
-        _drop_cache(name)
-        for function in _functions_of(name):
-            _query(f'DROP FUNCTION IF EXISTS "{function}"() CASCADE')

@@ -313,6 +313,8 @@ $$ LANGUAGE plpgsql;
 -- partition's bitsize grows. The trigger passes its table prefix as the argument (TG_ARGV[0]), so dropping a
 -- prefix's tables leaves nothing behind: the trigger goes with its metadata table, and the function serves the
 -- other prefixes. (Before, every prefix had its own <prefix>_bitsize_trigger_func, which outlived its tables.)
+-- The name differs on purpose from <prefix>_bitsize_trigger_func: for the default prefix "partitioncache" that
+-- is partitioncache_bitsize_trigger_func, the own function of an existing cache.
 -- The USING cast zero-pads stored bit arrays on the right; without it the ALTER failed with
 -- "bit string length N does not match type bit(M)" as soon as the table held a row. A smaller
 -- bitsize is refused: the cast would cut every stored bit array and silently drop keys.
@@ -359,19 +361,59 @@ RETURNS BOOLEAN AS $$
     );
 $$ LANGUAGE sql STABLE;
 
--- Function to create the bitsize trigger of a bit cache, or to switch a trigger from before to the shared function
+-- Function to create the bitsize trigger of a bit cache. Called by the bootstrap, inside the caller's transaction
+-- (in the pg_cron processor that is a whole job), so it never takes a table lock for a trigger that is already there.
 CREATE OR REPLACE FUNCTION partitioncache_create_bitsize_trigger(p_table_prefix TEXT)
 RETURNS VOID AS $$
 DECLARE
     v_trigger_name TEXT;
     v_metadata_table TEXT;
-    v_old_function RECORD;
+    v_own_function TEXT;
 BEGIN
     v_trigger_name := p_table_prefix || '_bitsize_trigger';
     v_metadata_table := p_table_prefix || '_partition_metadata';
+    v_own_function := p_table_prefix || '_bitsize_trigger_func';
 
     -- Already current: nothing to create, and no lock either.
     IF partitioncache_bitsize_trigger_is_current(p_table_prefix) THEN
+        RETURN;
+    END IF;
+
+    -- A trigger from before calls the prefix's own function. Switching it to the shared function needs DROP TRIGGER,
+    -- an exclusive lock on the metadata table until the caller commits, so it is left in place here: the bit handler
+    -- switches it at its start, in a short transaction with a lock timeout (partitioncache_switch_bitsize_trigger).
+    -- An own function from before the USING fix and the shrink check is replaced in place, which takes no table lock.
+    IF EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = v_trigger_name::name
+               AND tgrelid = to_regclass(quote_ident(v_metadata_table)) AND NOT tgisinternal) THEN
+        IF EXISTS (SELECT 1 FROM pg_proc WHERE proname = v_own_function::name AND pronargs = 0
+                   AND prosrc NOT LIKE '%partitioncache bitsize trigger v2%') THEN
+            EXECUTE format('
+                CREATE OR REPLACE FUNCTION %I()
+                RETURNS TRIGGER AS $trigger$
+                DECLARE
+                    v_cache_table TEXT;
+                BEGIN
+                    -- partitioncache bitsize trigger v2: grows with USING, refuses to shrink
+                    IF TG_OP = ''UPDATE'' AND NEW.bitsize < OLD.bitsize THEN
+                        RAISE EXCEPTION ''Bitsize of partition %% cannot shrink from %% to %%: stored bit arrays would lose keys'',
+                            NEW.partition_key, OLD.bitsize, NEW.bitsize;
+                    END IF;
+                    IF TG_OP = ''UPDATE'' AND OLD.bitsize != NEW.bitsize THEN
+                        v_cache_table := %L || ''_cache_'' || NEW.partition_key;
+                        IF EXISTS (SELECT 1 FROM information_schema.tables
+                                   WHERE table_name = v_cache_table::name AND table_schema = ''public'') THEN
+                            EXECUTE format(''ALTER TABLE %%I DROP COLUMN IF EXISTS partition_keys_count'', v_cache_table);
+                            EXECUTE format(''ALTER TABLE %%I ALTER COLUMN partition_keys TYPE BIT(%%s) USING partition_keys::BIT(%%s)'',
+                                           v_cache_table, NEW.bitsize, NEW.bitsize);
+                            EXECUTE format(''ALTER TABLE %%I ADD COLUMN partition_keys_count INTEGER GENERATED ALWAYS AS (length(replace(partition_keys::text, ''''0'''', ''''''''))) STORED'',
+                                           v_cache_table);
+                        END IF;
+                    END IF;
+                    RETURN NEW;
+                END;
+                $trigger$ LANGUAGE plpgsql;
+            ', v_own_function, p_table_prefix);
+        END IF;
         RETURN;
     END IF;
 
@@ -383,14 +425,15 @@ BEGIN
     -- every processor queued behind the first one. Measured 2026-09-04 with five
     -- processors: four in `Lock: advisory` for eleven minutes, one in `IO: DataFileRead`,
     -- then all five killed by the 1800 s statement timeout with nothing materialised.
-    -- The early return above is therefore the hot path and this is the bootstrap path.
+    -- The early returns above are therefore the hot path and this is the bootstrap path.
     -- Same key as the Python handler (hashtext, not a client-side hash) so both serialise
     -- against each other; re-entrant, so bootstrap calling the trigger creator is fine.
     PERFORM pg_advisory_xact_lock(hashtext(p_table_prefix));
 
-    -- Another worker may have done it while this one waited for the lock (seen under READ COMMITTED, where a new
+    -- Another worker may have created it while this one waited for the lock (seen under READ COMMITTED, where a new
     -- statement takes a new snapshot; under REPEATABLE READ the DDL below runs again, which is still correct).
-    IF partitioncache_bitsize_trigger_is_current(p_table_prefix) THEN
+    IF EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = v_trigger_name::name
+               AND tgrelid = to_regclass(quote_ident(v_metadata_table)) AND NOT tgisinternal) THEN
         RETURN;
     END IF;
 
@@ -401,10 +444,39 @@ BEGIN
             FOR EACH ROW
             EXECUTE FUNCTION partitioncache_bit_widen_trigger(%L)
     ', v_trigger_name, v_metadata_table, p_table_prefix);
+END;
+$$ LANGUAGE plpgsql;
 
-    -- The prefix's own trigger function from before the shared one, once no trigger uses it any more.
-    -- Only this prefix's name (truncated as stored), only a trigger function without arguments.
-    FOR v_old_function IN
+-- Switch a prefix's trigger from before to the shared function, and drop the prefix's own trigger function once no
+-- trigger uses it (also one an older client re-created after the switch). DROP TRIGGER waits for every open
+-- transaction that has read the metadata table, and every later reader queues behind it: call this in a short
+-- transaction of its own with a lock_timeout, as the bit handler does at its start. The old trigger keeps working
+-- until then.
+CREATE OR REPLACE FUNCTION partitioncache_switch_bitsize_trigger(p_table_prefix TEXT)
+RETURNS VOID AS $$
+DECLARE
+    v_trigger_name TEXT;
+    v_metadata_table TEXT;
+    v_own_function RECORD;
+BEGIN
+    v_trigger_name := p_table_prefix || '_bitsize_trigger';
+    v_metadata_table := p_table_prefix || '_partition_metadata';
+
+    IF NOT partitioncache_bitsize_trigger_is_current(p_table_prefix) THEN
+        PERFORM pg_advisory_xact_lock(hashtext(p_table_prefix));
+        IF NOT partitioncache_bitsize_trigger_is_current(p_table_prefix) THEN
+            EXECUTE format('DROP TRIGGER IF EXISTS %I ON %I', v_trigger_name, v_metadata_table);
+            EXECUTE format('
+                CREATE TRIGGER %I
+                    AFTER UPDATE ON %I
+                    FOR EACH ROW
+                    EXECUTE FUNCTION partitioncache_bit_widen_trigger(%L)
+            ', v_trigger_name, v_metadata_table, p_table_prefix);
+        END IF;
+    END IF;
+
+    -- Only this prefix's name (truncated as stored), only a trigger function without arguments that no trigger uses
+    FOR v_own_function IN
         SELECT p.oid::regprocedure AS ident
         FROM pg_proc p
         WHERE p.proname = (p_table_prefix || '_bitsize_trigger_func')::name
@@ -414,10 +486,11 @@ BEGIN
           AND NOT EXISTS (SELECT 1 FROM pg_trigger t WHERE t.tgfoid = p.oid)
     LOOP
         BEGIN
-            EXECUTE format('DROP FUNCTION %s', v_old_function.ident);
+            -- IF EXISTS: a concurrent switch of the same prefix (under REPEATABLE READ) may have dropped it
+            EXECUTE format('DROP FUNCTION IF EXISTS %s', v_own_function.ident);
         EXCEPTION WHEN insufficient_privilege OR dependent_objects_still_exist THEN
-            -- Owned by another role, or something depends on it: keep it, the trigger no longer uses it
-            RAISE NOTICE 'Kept the unused trigger function %: %', v_old_function.ident, SQLERRM;
+            -- Owned by another role, or something depends on it: keep it, no trigger uses it
+            RAISE NOTICE 'Kept the unused trigger function %: %', v_own_function.ident, SQLERRM;
         END;
     END LOOP;
 END;
