@@ -358,10 +358,11 @@ class AbstractCacheHandler(ABC):
                 # Entry exists, only update query metadata
                 return self.set_query(key, query_text, partition_key)
             else:
-                # Entry doesn't exist or force_update=True, set both
-                success_data = self.set_cache(key, partition_key_identifiers, partition_key)
-                success_query = self.set_query(key, query_text, partition_key)
-                return success_data and success_query
+                # Entry doesn't exist or force_update=True, set both. The query row only with its cache row: a
+                # query row reads as done (status 'ok'), and the queue processor never computes such a hash again
+                if not self.set_cache(key, partition_key_identifiers, partition_key):
+                    return False
+                return self.set_query(key, query_text, partition_key)
         except Exception as e:
             # Log error but don't raise exception to maintain API consistency
             logger.error(f"Failed to set cache entry for key {key}: {e}")

@@ -28,7 +28,8 @@ def test_default_backend_uses_legacy_compatible_batch_signature():
         [("SELECT 1", "hash-1")], "pkey", "integer"
     )
 
-    statement, params = cursor.execute.call_args.args
+    # The batch helper call; size priority (default on) follows it with an UPDATE of the created rows
+    statement, params = cursor.execute.call_args_list[0].args
     assert statement.count("%s") == 6
     assert len(params) == 6
     connection.rollback.assert_not_called()
@@ -42,7 +43,8 @@ def test_explicit_backend_uses_extended_batch_signature():
         [("SELECT 1", "hash-1")], "geom", "geometry", cache_backend="postgis_bbox"
     )
 
-    statement, params = cursor.execute.call_args.args
+    # The batch helper call; size priority (default on) follows it with an UPDATE of the created rows
+    statement, params = cursor.execute.call_args_list[0].args
     assert statement.count("%s") == 7
     assert len(params) == 7
     assert params[-1] == ["postgis_bbox"]

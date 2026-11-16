@@ -5,10 +5,17 @@ from bitarray import bitarray
 from psycopg import sql
 from pyroaring import BitMap
 
-from partitioncache.cache_handler.postgresql_abstract import PostgreSQLAbstractCacheHandler
+from partitioncache.cache_handler.postgresql_abstract import PostgreSQLAbstractCacheHandler, _shared_cache_table_refusal
 from partitioncache.key_table_script import lazy_insertion_parts
 
 logger = getLogger("PartitionCache")
+
+# rb_build stores keys as unsigned 32-bit values: a negative key was read back by get as a large positive number.
+# Run by the lazy insertion between the variant query and the INSERT (see _store_keys_lazily)
+NEGATIVE_KEY_CHECK = (
+    "SELECT min(k) FROM unnest(v_keys) AS k INTO v_min; "
+    "IF v_min < 0 THEN RAISE EXCEPTION 'Partition key % is negative; roaring bitmaps cannot store it', v_min; END IF;"
+)
 
 
 class PostgreSQLRoaringBitCacheHandler(PostgreSQLAbstractCacheHandler):
@@ -141,6 +148,10 @@ class PostgreSQLRoaringBitCacheHandler(PostgreSQLAbstractCacheHandler):
         except Exception as e:
             logger.error(f"Failed to ensure roaringbit partition table for {partition_key}: {e}")
             self.db.rollback()
+            refused = _shared_cache_table_refusal(e)
+            if refused:
+                # Returning False here, set_cache would write into the other key's table
+                raise refused from e
             return False
 
     def set_cache(
@@ -151,7 +162,7 @@ class PostgreSQLRoaringBitCacheHandler(PostgreSQLAbstractCacheHandler):
     ) -> bool:
         """
         Set the partition key identifiers of the given key in the cache for a specific partition key.
-        Only integer values are supported for roaring bitmaps.
+        Only integer values from 0 to 2147483647 are supported for roaring bitmaps; a negative key raises ValueError.
 
         Args:
             key: The cache key
@@ -179,6 +190,9 @@ class PostgreSQLRoaringBitCacheHandler(PostgreSQLAbstractCacheHandler):
                     value_list.append(int(item))  # type: ignore
             else:
                 raise ValueError(f"Unsupported partition key identifier type for roaring bitmap: {type(partition_key_identifiers)}")
+            negative = [k for k in value_list if k < 0]
+            if negative:
+                raise ValueError(f"Roaring bitmaps cannot store negative partition keys: {sorted(negative)[:5]}")
 
             table_name = f"{self.tableprefix}_cache_{partition_key}"
             self.cursor.execute(
@@ -336,7 +350,8 @@ class PostgreSQLRoaringBitCacheHandler(PostgreSQLAbstractCacheHandler):
             partition_key: Partition key namespace
 
         Returns:
-            bool: True if successful, False otherwise
+            bool: True if successful, False otherwise (also when the query returns a negative key, which a roaring
+            bitmap cannot store)
         """
         try:
             # Security check: a single query without DELETE or DROP, or a key-table restriction script
@@ -356,7 +371,7 @@ class PostgreSQLRoaringBitCacheHandler(PostgreSQLAbstractCacheHandler):
 
             # Server-side SELECT then INSERT: parallel, and the keys stay in the database.
             # rb_build('{}') is an empty bitmap; rb_build_agg over zero rows was NULL, the set_null marker.
-            self._store_keys_lazily(table_name, key, query, partition_key, "INTEGER[]", "rb_build($2)")
+            self._store_keys_lazily(table_name, key, query, partition_key, "INTEGER[]", "rb_build($2)", NEGATIVE_KEY_CHECK)
 
             # Also store in queries table for existence checks. An upsert instead of INSERT plus UPDATE on
             # IntegrityError: after the failed INSERT the transaction is aborted and the UPDATE raised too.

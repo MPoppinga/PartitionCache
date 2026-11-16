@@ -152,6 +152,25 @@ class TestPostgreSQLRoaringBitCacheHandler:
         with pytest.raises(ValueError, match="Only integer values are supported"):
             cache_handler.set_cache("test_key", test_values, "test_partition")
 
+    @pytest.mark.parametrize("values", [{-1, 2, 3}, [5, -7]], ids=["set", "list"])
+    def test_set_cache_refuses_negative_keys(self, cache_handler, mock_cursor, values):
+        """rb_build stores keys as unsigned 32-bit values: -1 came back from get as 4294967295."""
+        mock_cursor.fetchone.return_value = ("integer",)
+        mock_cursor.reset_mock()
+
+        with pytest.raises(ValueError, match="negative"):
+            cache_handler.set_cache("test_key", values, "test_partition")
+        assert not any("rb_build" in s for s, _ in _get_sql_calls(mock_cursor)), "nothing may be stored"
+
+    def test_set_cache_lazy_refuses_negative_keys_in_the_database(self, cache_handler):
+        """The lazy path never sees the keys in Python; the DO block checks them before the INSERT."""
+        cache_handler._get_partition_datatype = MagicMock(return_value="integer")
+        cache_handler._store_keys_lazily = MagicMock()
+
+        assert cache_handler.set_cache_lazy("lazy_key", "SELECT pk FROM t", "pk") is True
+        check = cache_handler._store_keys_lazily.call_args.args[6]
+        assert "v_min < 0" in check and "RAISE EXCEPTION" in check
+
     def test_set_cache_unsupported_value_type(self, cache_handler, mock_cursor):
         """Test setting with unsupported value type."""
         # Mock partition datatype exists

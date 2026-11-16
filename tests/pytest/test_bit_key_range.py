@@ -115,15 +115,25 @@ class TestPostgreSQLBitGrowth:
             handler.close()
 
     def test_old_trigger_function_is_replaced_on_growth(self):
+        """A cache whose trigger still calls its own function from before the USING fix grows: the function is replaced in place."""
         handler = _postgresql_bit(bitsize=16)
+        prefix = handler.tableprefix
         try:
             handler.register_partition_key("pk", "integer")
             assert handler.set_cache("small", {1, 2}, "pk") is True
-            handler.cursor.execute(OLD_TRIGGER_FUNCTION.format(prefix=handler.tableprefix))
+            handler.cursor.execute(OLD_TRIGGER_FUNCTION.format(prefix=prefix))
+            handler.cursor.execute(f"DROP TRIGGER {prefix}_bitsize_trigger ON {prefix}_partition_metadata")
+            handler.cursor.execute(
+                f"CREATE TRIGGER {prefix}_bitsize_trigger AFTER UPDATE ON {prefix}_partition_metadata "
+                f"FOR EACH ROW EXECUTE FUNCTION {prefix}_bitsize_trigger_func()"
+            )
             handler.db.commit()
             assert handler.set_cache("large", {3, 20}, "pk") is True
             assert handler.get("large", "pk") == {3, 20}
             assert handler.get("small", "pk") == {1, 2}
+            handler.cursor.execute("SELECT prosrc LIKE '%%bitsize trigger v2%%' FROM pg_proc WHERE proname = %s", (prefix + "_bitsize_trigger_func",))
+            assert handler.cursor.fetchone()[0] is True
+            handler.db.commit()
         finally:
             handler.close()
 

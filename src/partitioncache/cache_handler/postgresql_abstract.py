@@ -21,6 +21,16 @@ logger = getLogger("PartitionCache")
 P = ParamSpec("P")
 R = TypeVar("R")
 
+# SQLSTATE of partitioncache_bootstrap_partition's refusal of a new partition key whose cache table would be another's
+SHARED_CACHE_TABLE_SQLSTATE = "PCT01"
+
+
+def _shared_cache_table_refusal(error: Exception) -> ValueError | None:
+    """The ValueError for partitioncache_bootstrap_partition's refusal of a shared cache table; None for other errors."""
+    if isinstance(error, psycopg.Error) and error.sqlstate == SHARED_CACHE_TABLE_SQLSTATE:
+        return ValueError(error.diag.message_primary or str(error))
+    return None
+
 
 def _ends_read_transaction(fn: Callable[P, R]) -> Callable[P, R]:  # ParamSpec instead of PEP 695 type parameters: the package supports Python 3.11
     """Mark a read-only handler method so it leaves the connection idle. See _read_txn."""
@@ -178,6 +188,33 @@ class PostgreSQLAbstractCacheHandler(ThreadSafeHandler, AbstractCacheHandler_Laz
         """Take this prefix's transaction-scoped DDL advisory lock (see _serialized_ddl)."""
         self.cursor.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (self.tableprefix,))
 
+    def _refuse_shared_cache_table(self, partition_key: str) -> None:
+        """Refuse a new partition key whose cache table would be the one of another registered key.
+
+        PostgreSQL truncates identifiers to 63 bytes (without splitting a character), so two keys whose cache table names
+        share their first 63 bytes would share one table, and a hash cached under one key would be read for the other.
+        A truncated name alone is fine. Same rule as partitioncache_bootstrap_partition, for handlers that register a
+        key without it; run it under the prefix's DDL lock, before the metadata row is written.
+
+        Raises:
+            ValueError: If partition_key is not registered and its truncated cache table name is another key's.
+        """
+        metadata = sql.Identifier(self.tableprefix + "_partition_metadata")
+        self.cursor.execute(
+            sql.SQL(
+                "SELECT partition_key, (%s || '_cache_' || partition_key)::name::text FROM {0} "
+                "WHERE partition_key <> %s AND (%s || '_cache_' || partition_key)::name = (%s || '_cache_' || %s)::name "
+                "AND NOT EXISTS (SELECT 1 FROM {0} WHERE partition_key = %s) LIMIT 1"
+            ).format(metadata),
+            (self.tableprefix, partition_key, self.tableprefix, self.tableprefix, partition_key, partition_key),
+        )
+        row = self.cursor.fetchone()
+        if row:
+            raise ValueError(
+                f"Partition key {partition_key!r} would share the cache table {row[1]!r} with partition key {row[0]!r}: "
+                "PostgreSQL truncates identifiers to 63 bytes"
+            )
+
     def _load_sql_functions(self) -> None:
         """Load the SQL functions from postgresql_cache_handlers.sql.
 
@@ -239,13 +276,26 @@ class PostgreSQLAbstractCacheHandler(ThreadSafeHandler, AbstractCacheHandler_Laz
         thread uses the connection: a rollback here discarded another thread's pending INSERT, whose set_cache then
         returned True (#24 up to the instance lock). The lock of ThreadSafeHandler makes every public method exclusive,
         and no public method returns with a write pending (``check_pending_writes``), so the rule holds again.
+
+        A read that failed leaves the transaction aborted, also one it did not open (one an earlier read left open):
+        every later statement on the connection would fail until a rollback, and the reads that swallow their error
+        returned "unknown" from then on. An aborted transaction is rolled back whoever opened it; it can no longer
+        commit, so nothing is lost.
         """
         owns = self.db.info.transaction_status == TransactionStatus.IDLE
         try:
             yield
         finally:
-            if owns and self.db.info.transaction_status != TransactionStatus.IDLE:
+            status = self.db.info.transaction_status
+            if status == TransactionStatus.INERROR or (owns and status != TransactionStatus.IDLE):
                 self.db.rollback()  # a read changed nothing, so discard rather than commit
+
+    def _rollback_failed_read(self) -> None:
+        """Roll back the transaction a failed read aborted, so that later statements on the connection run (see _read_txn)."""
+        try:
+            self.db.rollback()
+        except Exception as rollback_error:
+            logger.error(f"Failed to roll back after a failed read: {rollback_error}")
 
     def _ensure_metadata_table_exists(self) -> None:
         """Ensure the metadata table exists, create it if it doesn't."""
@@ -659,7 +709,7 @@ class PostgreSQLAbstractCacheHandler(ThreadSafeHandler, AbstractCacheHandler_Laz
         try:
             # Get queries older than specified days
             self.cursor.execute(
-                sql.SQL("SELECT partition_key, query_hash FROM {0} WHERE last_seen < now() - interval '%s days'").format(
+                sql.SQL("SELECT partition_key, query_hash FROM {0} WHERE last_seen < now() - make_interval(days => %s)").format(
                     sql.Identifier(self.tableprefix + "_queries")
                 ),
                 (days_old,),
@@ -678,7 +728,7 @@ class PostgreSQLAbstractCacheHandler(ThreadSafeHandler, AbstractCacheHandler_Laz
 
             # Delete from queries table
             self.cursor.execute(
-                sql.SQL("DELETE FROM {0} WHERE last_seen < now() - interval '%s days'").format(sql.Identifier(self.tableprefix + "_queries")), (days_old,)
+                sql.SQL("DELETE FROM {0} WHERE last_seen < now() - make_interval(days => %s)").format(sql.Identifier(self.tableprefix + "_queries")), (days_old,)
             )
 
             self.db.commit()

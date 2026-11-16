@@ -116,6 +116,11 @@ The priority functions use PostgreSQL's `FOR UPDATE NOWAIT` to avoid blocking wh
 3. If row doesn't exist → INSERT with ON CONFLICT handling
 4. If row is locked → Return 'skipped_locked'
 5. Handle concurrent INSERT races → Return 'skipped_concurrent'
+6. Any other error → Return 'error'
+
+A push returns False, and logs at error level how many rows failed, if any row came back with a status other than
+'inserted', 'updated', 'skipped_locked' or 'skipped_concurrent'. The two skipped statuses leave the item queued: the
+row exists and a pop or another push holds it; only the priority increment is skipped.
 
 **Python API for Priority Operations:**
 ```python
@@ -166,7 +171,7 @@ partitioncache.push_to_query_variant_queue(
 Retrieve original queries for processing:
 
 ```python
-# Returns (query, partition_key, partition_datatype) tuple or None
+# Returns (query, partition_key, partition_datatype) tuple or None; partition_datatype is None if none was pushed
 result = partitioncache.pop_from_original_query_queue()
 if result:
     query, partition_key, partition_datatype = result
@@ -177,7 +182,7 @@ if result:
 Retrieve query fragments for execution:
 
 ```python
-# Returns (query, hash, partition_key, partition_datatype, cache_backend) tuple or None
+# Returns (query, hash, partition_key, partition_datatype, cache_backend) tuple or None; partition_datatype is None if none was pushed
 result = partitioncache.pop_from_query_fragment_queue()
 if result:
     query, hash_val, partition_key, partition_datatype, cache_backend = result
@@ -206,11 +211,17 @@ The monitor implements a sophisticated two-threaded architecture:
 - Uses partition key from queue (not command line)
 - Breaks down queries using `generate_all_query_hash_pairs()`
 - Pushes fragments with partition key to query fragment queue
+- If the push fails, puts the original query back into its queue once (error log with the query hash); a second failure drops it
 
 **Thread 2: Execution Pool**
 - Consumes `(query, hash, partition_key, partition_datatype, cache_backend)` from query fragment queue
 - Executes fragments against database
 - Stores results in cache with partition key tracking
+- A fragment queued without a datatype uses the datatype registered for its partition key; for an unregistered key
+  it runs without lazy insertion and the datatype is inferred from the result (an empty result gets the status 'failed')
+
+With `--close` the monitor exits once both queues are empty, no original query is being decomposed and no fragment
+is running.
 
 ### Usage Example
 
@@ -241,6 +252,36 @@ DO UPDATE SET
     priority = original_query_queue.priority + 1,
     updated_at = CURRENT_TIMESTAMP;
 ```
+
+### Size Priority for Query Variants
+
+By default the variant queue pops the smaller variants of **all** queued queries first, not only within one
+query. A new variant gets the priority
+
+```
+10 - number of tables in its outer FROM
+```
+
+so a 1-table variant gets 9, a 3-table variant 7, and a variant with more than 10 tables a priority below 0 (the
+column is a signed INTEGER, so the order still holds). A push of a variant that is already waiting adds 1, as without
+size priority. A query that is pushed again pushes all its variants again, its smaller sub-variants included, so they
+all gain 1 and keep their order. The variants of a query that is pushed more often can pop before smaller variants of
+other queries; at equal priority the older variant pops first. The order is not fair across sizes: while small
+variants keep arriving, large ones wait.
+
+Use the same setting for all clients of one queue: variants pushed with it off get priority 1, which a sized variant
+of 9 tables also gets, so they wait behind every sized variant of up to 8 tables. A variant that is not a single
+SELECT gets priority 1 as well.
+
+Conditions do not enter the priority: `pcache-add --queue` and `pcache-monitor` push each query's variants in
+`order_variants_for_population` order (tables, then conditions), and variants of one size and one query keep that
+push order.
+
+The switch is `--size-priority` / `--no-size-priority` on `pcache-add` and `pcache-monitor`, the
+`QUERY_QUEUE_SIZE_PRIORITY` environment variable (`true` by default; `false`, `0` or `no` turn it off), or the
+`size_priority` argument of `push_to_query_variant_queue`. Turned off, every variant is pushed with priority 1 and a
+re-push adds 1, the behaviour before size priority. `push_to_query_fragment_queue_with_priority` of the PostgreSQL
+handler keeps the priority it is given. The Redis provider has no priorities and ignores the setting.
 
 ### Priority-Based Retrieval
 
