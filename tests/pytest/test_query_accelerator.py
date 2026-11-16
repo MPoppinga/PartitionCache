@@ -593,11 +593,11 @@ class _ReferencePostgresCursor:
     def execute(self, query):
         import re
 
-        from partitioncache.key_table_script import _statements
+        from partitioncache.key_table_script import statement_spans
 
         self.queries.append(query)
         self._sets = []
-        for begin, end in _statements(query):
+        for begin, end in statement_spans(query):
             statement = re.sub(r"^CREATE\s+UNLOGGED\s+TABLE", "CREATE TABLE", query[begin:end].strip(), flags=re.IGNORECASE)
             rows = self._conn.execute(statement).fetchall()
             self._sets.append(rows if re.match(r"(SELECT|WITH)\b", statement, re.IGNORECASE) else None)

@@ -23,7 +23,7 @@ import duckdb
 import psycopg
 
 from partitioncache.db_handler.postgres import fetch_final_result_set
-from partitioncache.key_table_script import _statements
+from partitioncache.key_table_script import statement_spans
 from partitioncache.logging_utils import get_thread_aware_logger
 
 logger = get_thread_aware_logger("PartitionCache")
@@ -452,7 +452,7 @@ class DuckDBQueryAccelerator:
         # DuckDB executes every statement of a script and returns the LAST one's result, e.g. the DROP after the SELECT of
         # an UNLOGGED_TABLE_* script. Counted with the PostgreSQL tokenizer, independent of what DuckDB can parse; a text
         # it cannot tokenize, or a trailing comment after the semicolon (counted as a statement), also goes to PostgreSQL
-        spans = _statements(query)
+        spans = statement_spans(query)
         if spans is None or len(spans) != 1:
             statements = "cannot be tokenized" if spans is None else f"{len(spans)} statements"
             logger.debug(f"Query is not one statement ({statements}); DuckDB would return the last statement's result, running it on PostgreSQL")
