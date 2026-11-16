@@ -116,6 +116,11 @@ The priority functions use PostgreSQL's `FOR UPDATE NOWAIT` to avoid blocking wh
 3. If row doesn't exist → INSERT with ON CONFLICT handling
 4. If row is locked → Return 'skipped_locked'
 5. Handle concurrent INSERT races → Return 'skipped_concurrent'
+6. Any other error → Return 'error'
+
+A push returns False, and logs at error level how many rows failed, if any row came back with a status other than
+'inserted', 'updated', 'skipped_locked' or 'skipped_concurrent'. The two skipped statuses leave the item queued: the
+row exists and a pop or another push holds it; only the priority increment is skipped.
 
 **Python API for Priority Operations:**
 ```python
@@ -166,7 +171,7 @@ partitioncache.push_to_query_variant_queue(
 Retrieve original queries for processing:
 
 ```python
-# Returns (query, partition_key, partition_datatype) tuple or None
+# Returns (query, partition_key, partition_datatype) tuple or None; partition_datatype is None if none was pushed
 result = partitioncache.pop_from_original_query_queue()
 if result:
     query, partition_key, partition_datatype = result
@@ -177,7 +182,7 @@ if result:
 Retrieve query fragments for execution:
 
 ```python
-# Returns (query, hash, partition_key, partition_datatype, cache_backend) tuple or None
+# Returns (query, hash, partition_key, partition_datatype, cache_backend) tuple or None; partition_datatype is None if none was pushed
 result = partitioncache.pop_from_query_fragment_queue()
 if result:
     query, hash_val, partition_key, partition_datatype, cache_backend = result
@@ -206,11 +211,17 @@ The monitor implements a sophisticated two-threaded architecture:
 - Uses partition key from queue (not command line)
 - Breaks down queries using `generate_all_query_hash_pairs()`
 - Pushes fragments with partition key to query fragment queue
+- If the push fails, puts the original query back into its queue once (error log with the query hash); a second failure drops it
 
 **Thread 2: Execution Pool**
 - Consumes `(query, hash, partition_key, partition_datatype, cache_backend)` from query fragment queue
 - Executes fragments against database
 - Stores results in cache with partition key tracking
+- A fragment queued without a datatype uses the datatype registered for its partition key; for an unregistered key
+  it runs without lazy insertion and the datatype is inferred from the result (an empty result gets the status 'failed')
+
+With `--close` the monitor exits once both queues are empty, no original query is being decomposed and no fragment
+is running.
 
 ### Usage Example
 

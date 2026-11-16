@@ -65,7 +65,7 @@ def push_to_original_query_queue(
 def push_to_query_fragment_queue(
     query_hash_pairs: list[tuple[str, str]],
     partition_key: str = "partition_key",
-    partition_datatype: str = "integer",
+    partition_datatype: str | None = "integer",
     queue_provider: str | None = None,
     cache_backend: str | None = None,
     size_priority: bool | None = None,
@@ -105,12 +105,12 @@ def push_to_query_fragment_queue(
 push_to_query_variant_queue = push_to_query_fragment_queue
 
 
-def pop_from_original_query_queue(queue_provider: str | None = None) -> tuple[str, str, str] | None:
+def pop_from_original_query_queue(queue_provider: str | None = None) -> tuple[str, str, str | None] | None:
     """
     Pop an original query from the original query queue.
 
     Returns:
-        Tuple[str, str, str] or None: (query, partition_key, partition_datatype) tuple if available, None if queue is empty or error occurred.
+        Tuple[str, str, str | None] or None: (query, partition_key, partition_datatype) tuple if available, None if queue is empty or error occurred.
     """
     try:
         handler = _get_queue_handler(queue_provider)
@@ -120,7 +120,7 @@ def pop_from_original_query_queue(queue_provider: str | None = None) -> tuple[st
         return None
 
 
-def pop_from_original_query_queue_blocking(timeout: int = 60, queue_provider: str | None = None) -> tuple[str, str, str] | None:
+def pop_from_original_query_queue_blocking(timeout: int = 60, queue_provider: str | None = None) -> tuple[str, str, str | None] | None:
     """
     Pop an original query from the original query queue with blocking wait.
     Uses provider-specific blocking mechanisms when available.
@@ -129,7 +129,7 @@ def pop_from_original_query_queue_blocking(timeout: int = 60, queue_provider: st
         timeout (int): Maximum time to wait in seconds (default: 60)
 
     Returns:
-        Tuple[str, str, str] or None: (query, partition_key, partition_datatype) tuple if available, None if timeout or error occurred.
+        Tuple[str, str, str | None] or None: (query, partition_key, partition_datatype) tuple if available, None if timeout or error occurred.
     """
     try:
         handler = _get_queue_handler(queue_provider)
@@ -145,12 +145,12 @@ def pop_from_original_query_queue_blocking(timeout: int = 60, queue_provider: st
         return None
 
 
-def pop_from_query_fragment_queue(queue_provider: str | None = None) -> tuple[str, str, str, str, str | None] | None:
+def pop_from_query_fragment_queue(queue_provider: str | None = None) -> tuple[str, str, str, str | None, str | None] | None:
     """
     Pop a query variant from the query variant queue (persisted as ``query_fragment_queue``).
 
     Returns:
-        Tuple[str, str, str, str, str | None] or None: (variant_query, hash, partition_key, partition_datatype, cache_backend) tuple if available, None if queue is empty or error occurred.
+        Tuple[str, str, str, str | None, str | None] or None: (variant_query, hash, partition_key, partition_datatype, cache_backend) tuple if available, None if queue is empty or error occurred.
     """
     try:
         handler = _get_queue_handler(queue_provider)
@@ -160,7 +160,7 @@ def pop_from_query_fragment_queue(queue_provider: str | None = None) -> tuple[st
         return None
 
 
-def pop_from_query_fragment_queue_blocking(timeout: int = 60, queue_provider: str | None = None) -> tuple[str, str, str, str, str | None] | None:
+def pop_from_query_fragment_queue_blocking(timeout: int = 60, queue_provider: str | None = None) -> tuple[str, str, str, str | None, str | None] | None:
     """
     Pop a query variant from the query variant queue with blocking wait.
     Uses provider-specific blocking mechanisms when available.
@@ -169,7 +169,7 @@ def pop_from_query_fragment_queue_blocking(timeout: int = 60, queue_provider: st
         timeout (int): Maximum time to wait in seconds (default: 60)
 
     Returns:
-        Tuple[str, str, str, str, str | None] or None: (query, hash, partition_key, partition_datatype, cache_backend) tuple if available, None if timeout or error occurred.
+        Tuple[str, str, str, str | None, str | None] or None: (query, hash, partition_key, partition_datatype, cache_backend) tuple if available, None if timeout or error occurred.
     """
     try:
         handler = _get_queue_handler(queue_provider)

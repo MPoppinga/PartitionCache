@@ -15,6 +15,41 @@ from partitioncache.queue_handler.size_priority import fragment_size_priority, s
 logger = getLogger("PartitionCache")
 
 
+def _wait_for_notification(listen_conn: psycopg.Connection, wait_time: float) -> bool:
+    """Wait at most wait_time seconds for a notification on a LISTEN connection; True if one arrived.
+
+    The readable list of select() decides: its result tuple is truthy even on a timeout. The notifications are read
+    with libpq calls that never block, as Connection.notifies() waits for one without end unless it gets a timeout,
+    which it accepts from psycopg 3.2 on.
+    """
+    readable, _, _ = select.select([listen_conn.fileno()], [], [], wait_time)
+    if not readable:
+        return False
+    pgconn = listen_conn.pgconn
+    pgconn.consume_input()
+    notified = False
+    while pgconn.notifies() is not None:
+        notified = True
+    return notified
+
+
+# Statuses of the upsert helpers (postgresql_queue_helper.sql) that leave the item queued. 'skipped_locked': the row
+# exists and a pop that is taking it (or another push) holds its lock; 'skipped_concurrent': another session inserted
+# or updated the same row at the same time. Both only skip the priority increment. Any other status, 'error' from
+# the helpers' WHEN OTHERS branch included, means the item may not be in the queue.
+QUEUED_STATUSES = frozenset({"inserted", "updated", "skipped_locked", "skipped_concurrent"})
+
+
+def _all_queued(statuses: list[tuple[str, str | None]], what: str) -> bool:
+    """True if every (hash or query, status) pair of a push left its item queued; else logs the failed rows."""
+    failed = [(item, status) for item, status in statuses if status not in QUEUED_STATUSES]
+    if not failed:
+        return True
+    item, status = failed[0]
+    logger.error(f"Failed to push {len(failed)} of {len(statuses)} {what} to the PostgreSQL queue, e.g. {item} with status '{status}'")
+    return False
+
+
 class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
     def __init__(self, host: str, port: int, user: str, password: str, dbname: str, table_prefix: str):
         """
@@ -289,7 +324,7 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
                 result = cursor.fetchone()[0]  # type: ignore
                 conn.commit()
                 logger.debug(f"Non-blocking original queue upsert result: {result}")
-                return True
+                return _all_queued([("the original query", result)], "original queries")
             except Exception as func_error:
                 # Fallback to traditional approach if function doesn't exist
                 logger.debug(f"Non-blocking function not available, using fallback: {func_error}")
@@ -384,9 +419,7 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
                     self._lift_created_fragments(cursor, query_hash_pairs, partition_key, results)
                 conn.commit()
 
-                success_count = len([r for r in results if r[3] in ("inserted", "updated")])
-                logger.debug(f"Batch upsert results: {success_count}/{len(query_hash_pairs)} successful")
-                return True
+                return _all_queued([(f"hash {hash_value}", status) for _, hash_value, _, status in results], "query variants")
 
             except Exception as func_error:
                 # Fallback to individual inserts if batch function doesn't exist
@@ -470,7 +503,7 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
                 result = cursor.fetchone()[0]  # type: ignore
                 conn.commit()
                 logger.debug(f"Non-blocking original queue upsert result: {result}")
-                return True
+                return _all_queued([("the original query", result)], "original queries")
             except Exception as func_error:
                 # Fallback to traditional approach if function doesn't exist
                 logger.debug(f"Non-blocking function not available, using fallback: {func_error}")
@@ -549,9 +582,7 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
                 results = cursor.fetchall()
                 conn.commit()
 
-                success_count = len([r for r in results if r[3] in ("inserted", "updated")])
-                logger.debug(f"Batch upsert with priority results: {success_count}/{len(query_hash_pairs)} successful")
-                return True
+                return _all_queued([(f"hash {hash_value}", status) for _, hash_value, _, status in results], "query variants")
             except Exception as func_error:
                 # Fallback to traditional approach if function doesn't exist
                 logger.debug(f"Non-blocking function not available, using fallback: {func_error}")
@@ -585,13 +616,13 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
                 except Exception:
                     pass
 
-    def pop_from_original_query_queue(self) -> tuple[str, str, str] | None:
+    def pop_from_original_query_queue(self) -> tuple[str, str, str | None] | None:
         """
         Pop an original query from the original query queue.
         Uses PostgreSQL's SELECT FOR UPDATE SKIP LOCKED for atomic operations.
 
         Returns:
-            Tuple[str, str, str] or None: (query, partition_key, partition_datatype) tuple if available, None if queue is empty.
+            Tuple[str, str, str | None] or None: (query, partition_key, partition_datatype) tuple if available, None if queue is empty.
         """
         cursor = None
         try:
@@ -622,7 +653,7 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
             cursor.execute("COMMIT")
 
             logger.debug("Popped query from PostgreSQL original query queue")
-            return (query, partition_key, partition_datatype or "")
+            return (query, partition_key, partition_datatype or None)
 
         except Exception as e:
             logger.error(f"Failed to pop from PostgreSQL original query queue: {e}")
@@ -633,7 +664,7 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
                 pass
             return None
 
-    def pop_from_original_query_queue_blocking(self, timeout: int = 60) -> tuple[str, str, str] | None:
+    def pop_from_original_query_queue_blocking(self, timeout: int = 60) -> tuple[str, str, str | None] | None:
         """
         Pop an original query from the original query queue with blocking wait.
         Uses PostgreSQL LISTEN/NOTIFY for efficient blocking with timeout fallback.
@@ -642,7 +673,7 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
             timeout (int): Maximum time to wait in seconds (default: 60)
 
         Returns:
-            Tuple[str, str, str] or None: (query, partition_key, partition_datatype) tuple if available, None if timeout or error occurred.
+            Tuple[str, str, str | None] or None: (query, partition_key, partition_datatype) tuple if available, None if timeout or error occurred.
         """
 
         # First try to get an item immediately
@@ -673,21 +704,11 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
                 wait_time = min(5.0, remaining_time)
 
                 try:
-                    # Use select to wait for notifications with timeout
-                    if select.select([listen_conn.fileno()], [], [], wait_time):
-                        # Check for notifications
-                        for notify in listen_conn.notifies():
-                            if notify.channel == "original_query_available":
-                                # Try to pop an item after notification
-                                result = self.pop_from_original_query_queue()
-                                if result is not None:
-                                    return result
-                                break
-                    else:
-                        # Timeout on select, check for items anyway (safety net)
-                        result = self.pop_from_original_query_queue()
-                        if result is not None:
-                            return result
+                    # Pop after a notification, and after a wait without one as a safety net
+                    _wait_for_notification(listen_conn, wait_time)
+                    result = self.pop_from_original_query_queue()
+                    if result is not None:
+                        return result
 
                 except (OSError, psycopg.Error, psycopg.OperationalError) as e:
                     logger.debug(f"LISTEN/NOTIFY error, falling back to polling: {e}")
@@ -721,13 +742,13 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
                 except Exception:
                     pass
 
-    def pop_from_query_fragment_queue(self) -> tuple[str, str, str, str, str | None] | None:
+    def pop_from_query_fragment_queue(self) -> tuple[str, str, str, str | None, str | None] | None:
         """
         Pop a query variant from the variant queue (persisted as ``query_fragment_queue``).
         Uses PostgreSQL's SELECT FOR UPDATE SKIP LOCKED for atomic operations.
 
         Returns:
-            Tuple[str, str, str, str, str | None] or None: (query, hash, partition_key, partition_datatype, cache_backend) tuple if available, None if queue is empty.
+            Tuple[str, str, str, str | None, str | None] or None: (query, hash, partition_key, partition_datatype, cache_backend) tuple if available, None if queue is empty.
         """
         cursor = None
         try:
@@ -758,7 +779,7 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
             cursor.execute("COMMIT")
 
             logger.debug("Popped query fragment from PostgreSQL query fragment queue")
-            return (query, hash_value, partition_key, partition_datatype or "", item_cache_backend)
+            return (query, hash_value, partition_key, partition_datatype or None, item_cache_backend)
 
         except Exception as e:
             logger.error(f"Failed to pop from PostgreSQL query fragment queue: {e}")
@@ -769,7 +790,7 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
                 pass
             return None
 
-    def pop_from_query_fragment_queue_blocking(self, timeout: int = 60) -> tuple[str, str, str, str, str | None] | None:
+    def pop_from_query_fragment_queue_blocking(self, timeout: int = 60) -> tuple[str, str, str, str | None, str | None] | None:
         """
         Pop a query variant from the variant queue with blocking wait.
         Uses PostgreSQL LISTEN/NOTIFY for efficient blocking with timeout fallback.
@@ -778,7 +799,7 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
             timeout (int): Maximum time to wait in seconds (default: 60)
 
         Returns:
-            Tuple[str, str, str, str, str | None] or None: (query, hash, partition_key, partition_datatype, cache_backend) tuple if available, None if timeout or error occurred.
+            Tuple[str, str, str, str | None, str | None] or None: (query, hash, partition_key, partition_datatype, cache_backend) tuple if available, None if timeout or error occurred.
         """
 
         # First try to get an item immediately
@@ -809,21 +830,11 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
                 wait_time = min(5.0, remaining_time)
 
                 try:
-                    # Use select to wait for notifications with timeout
-                    if select.select([listen_conn.fileno()], [], [], wait_time):
-                        # Check for notifications
-                        for notify in listen_conn.notifies():
-                            if notify.channel == "query_fragment_available":
-                                # Try to pop an item after notification
-                                result = self.pop_from_query_fragment_queue()
-                                if result is not None:
-                                    return result
-                                break
-                    else:
-                        # Timeout on select, check for items anyway (safety net)
-                        result = self.pop_from_query_fragment_queue()
-                        if result is not None:
-                            return result
+                    # Pop after a notification, and after a wait without one as a safety net
+                    _wait_for_notification(listen_conn, wait_time)
+                    result = self.pop_from_query_fragment_queue()
+                    if result is not None:
+                        return result
 
                 except (OSError, psycopg.Error, psycopg.OperationalError) as e:
                     logger.debug(f"LISTEN/NOTIFY error, falling back to polling: {e}")
