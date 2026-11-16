@@ -2519,13 +2519,52 @@ def _single_alias(node: exp.Expr) -> str | None:
     return aliases.pop()
 
 
+# PostGIS functions whose value is at least the distance between their first two geometries
+_DISTANCE_CALLS = frozenset({"ST_DISTANCE", "ST_DISTANCESPHERE", "ST_DISTANCESPHEROID", "ST_3DDISTANCE", "ST_MAXDISTANCE", "ST_3DMAXDISTANCE"})
+
+
+def _comparison_sides(node: exp.Expr) -> tuple[exp.Expr, exp.Expr] | None:
+    """``(d, r)`` if ``node`` is an upper bound ``d < r``, ``d <= r``, ``r > d``, ``r >= d`` or ``d BETWEEN x AND r``, else None."""
+    if isinstance(node, exp.LT | exp.LTE):
+        return node.this, node.expression
+    if isinstance(node, exp.GT | exp.GTE):
+        return node.expression, node.this
+    if isinstance(node, exp.Between) and node.args.get("high") is not None:
+        return node.this, node.args["high"]
+    return None
+
+
+def _distance_call_aliases(node: exp.Expr) -> tuple[str, str] | None:
+    """The two aliases of a PostGIS distance call between two of them (``ST_Distance(a.geom, b.geom)``), else None.
+
+    Other expressions, also those :func:`is_distance_function` accepts (a squared distance, ``SQRT(...)`` of
+    coordinates, a user function), are not read as a distance: their value need not be the distance in the unit of
+    the geometry column.
+    """
+    while isinstance(node, exp.Paren):
+        node = node.this
+    if isinstance(node, exp.Anonymous):
+        name, args = str(node.name).upper(), list(node.expressions)
+    elif isinstance(node, exp.Func):
+        name, args = node.sql_name().upper(), [arg for arg in node.args.values() if isinstance(arg, exp.Expr)]
+    else:
+        return None
+    if name not in _DISTANCE_CALLS or len(args) < 2:
+        return None
+    alias1, alias2 = _single_alias(args[0]), _single_alias(args[1])
+    if alias1 is None or alias2 is None or alias1 == alias2:
+        return None
+    a1, a2 = sorted((alias1, alias2))
+    return a1, a2
+
+
 def _distance_predicate(node: exp.Expr) -> tuple[str, str, float | None] | None:
     """``(alias1, alias2, radius)`` if ``node`` holds only for rows of two aliases within ``radius`` of each other.
 
-    Recognised: ``ST_DWithin(a.g, b.g, r)`` and ``ST_DFullyWithin``, and an upper bound on a distance expression of two
-    aliases (as :func:`is_distance_function` detects them) in either direction: ``d < r``, ``d <= r``, ``r > d``,
+    Recognised: ``ST_DWithin(a.g, b.g, r)`` and ``ST_DFullyWithin``, and an upper bound on a PostGIS distance call of
+    two aliases (``ST_Distance``, ``ST_DistanceSphere``, ...) in either direction: ``d < r``, ``d <= r``, ``r > d``,
     ``r >= d``, ``d BETWEEN x AND r``. The radius is None when it is not a constant expression. Anything else,
-    including a lower bound, is None.
+    including a lower bound and a bound on another expression of the two aliases, is None.
     """
     while isinstance(node, exp.Paren):
         node = node.this
@@ -2539,22 +2578,21 @@ def _distance_predicate(node: exp.Expr) -> tuple[str, str, float | None] | None:
         radius = _constant_number(args[2])
         a1, a2 = sorted((alias1, alias2))
         return a1, a2, None if radius is None else max(float(radius[0]), 0.0)
-    if isinstance(node, exp.LT | exp.LTE):
-        distance, bound = node.this, node.expression
-    elif isinstance(node, exp.GT | exp.GTE):
-        distance, bound = node.expression, node.this
-    elif isinstance(node, exp.Between):
-        distance, bound = node.this, node.args.get("high")
-    else:
+    sides = _comparison_sides(node)
+    aliases = None if sides is None else _distance_call_aliases(sides[0])
+    if sides is None or aliases is None:
         return None
-    if bound is None or distance.find(exp.Select) is not None or not is_distance_function(distance.sql()):
-        return None
-    aliases = {column.table for column in distance.find_all(exp.Column)}
-    if len(aliases) != 2 or "" in aliases:
-        return None
-    a1, a2 = sorted(aliases)
-    radius = _constant_number(bound)
-    return a1, a2, None if radius is None else max(float(radius[0]), 0.0)
+    radius = _constant_number(sides[1])
+    return aliases[0], aliases[1], None if radius is None else max(float(radius[0]), 0.0)
+
+
+def _is_distance_comparison(node: exp.Expr) -> bool:
+    """Whether ``node`` compares a distance-like expression of two aliases (:func:`is_distance_function`) with a bound."""
+    sides = _comparison_sides(node)
+    if sides is None or sides[0].find(exp.Select) is not None or not is_distance_function(sides[0].sql()):
+        return False
+    aliases = {column.table for column in sides[0].find_all(exp.Column)}
+    return len(aliases) == 2 and "" not in aliases
 
 
 def _top_level_conjuncts(select: exp.Select) -> list[exp.Expr]:
@@ -2594,9 +2632,12 @@ def extract_distance_constraints(query: str, sql_dialect: str = "postgres") -> l
     A constraint counts only as a top-level conjunct of the outer query (its WHERE or the ON of an inner join), not
     under NOT, inside OR or in a subquery, and only with a constant distance (literals and arithmetic). Two kinds:
       1. ``ST_DWithin(a.geom, b.geom, distance)`` (and ``ST_DFullyWithin``)
-      2. An upper bound on a distance expression detected by :func:`is_distance_function`, in either direction,
-         e.g. ``SQRT(POWER(p1.x - p2.x, 2)) < 0.008``, ``500 > ST_Distance(a.g, b.g)``,
-         ``DIST(t1.g, t2.g) BETWEEN 1.6 AND 3.6`` (upper bound 3.6). A lower bound alone bounds nothing.
+      2. An upper bound on a PostGIS distance call of two aliases (``ST_Distance``, ``ST_DistanceSphere``,
+         ``ST_DistanceSpheroid``, ``ST_3DDistance``, ``ST_MaxDistance``, ``ST_3DMaxDistance``) in either direction,
+         e.g. ``ST_Distance(a.g, b.g) < 500``, ``500 > ST_Distance(a.g, b.g)``,
+         ``ST_Distance(a.g, b.g) BETWEEN 1.6 AND 3.6`` (upper bound 3.6). A lower bound alone bounds nothing, and
+         neither does a bound on another expression: a squared distance (``POWER(dx, 2) + POWER(dy, 2) < 90000``),
+         ``SQRT(...)`` of coordinates or a user function need not be the distance in the geometry column's unit.
 
     Args:
         query: SQL query string to parse.
@@ -2633,7 +2674,7 @@ def has_distance_predicate(query: str, sql_dialect: str = "postgres") -> bool:
     for node in parsed.find_all(exp.Anonymous, exp.LT, exp.LTE, exp.GT, exp.GTE, exp.Between):
         if isinstance(node, exp.Anonymous) and str(node.name).upper() in _RADIUS_DISTANCE_FUNCTIONS:
             return True
-        if _distance_predicate(node) is not None:
+        if _distance_predicate(node) is not None or _is_distance_comparison(node):
             return True
     return False
 

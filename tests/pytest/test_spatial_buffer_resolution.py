@@ -221,3 +221,33 @@ def test_h3_mode_restricting_every_alias_of_the_table_runs_uncached(lazy: bool) 
     enhanced, stats = apply(query=ATTRIBUTE_TIED, cache_handler=handler, partition_key="spatial_h3", geometry_column="geom", p0_alias="p1")
     assert enhanced == ATTRIBUTE_TIED and stats["uncached_reason"] == "spatial_unbounded"
     handler.get_h3_cell_filter.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "condition",
+    [
+        "POWER(a.x - b.x, 2) + POWER(a.y - b.y, 2) < 90000",  # a squared distance: 90000 would be read as the distance
+        "POWER(a.x - b.x, 2) + POWER(a.y - b.y, 2) < 0.25",  # squared below 1: read as a distance it would be too small
+        "SQRT(POWER(a.x - b.x, 2) + POWER(a.y - b.y, 2)) < 300",
+        "ABS(SQRT(POWER(a.x - b.x, 2))) <= 0.1",  # one coordinate only
+        "COALESCE(a.x, b.x) < 5",
+        "DIST(a.geom, b.geom) < 5",
+    ],
+)
+def test_bound_on_an_expression_other_than_a_distance_call_is_unknown(condition: str) -> None:
+    query = f"SELECT a.id FROM pois a, pois b WHERE {condition}"
+    assert compute_buffer_distance(query) is None
+    assert _resolve_buffer_distance(query, None) is None  # unknown, not "no distance predicate" (no ValueError)
+
+
+@pytest.mark.parametrize(
+    "condition",
+    [
+        "ST_DistanceSphere(a.geom, b.geom) < 500",
+        "ST_Distance(a.geom::geography, b.geom::geography, true) < 500",
+        "ST_3DDistance(a.geom, b.geom) <= 500",
+        "ST_MaxDistance(a.geom, b.geom) < 500",
+    ],
+)
+def test_postgis_distance_calls_bound_the_pair(condition: str) -> None:
+    assert compute_buffer_distance(f"SELECT a.id FROM pois a, pois b WHERE {condition}") == 500.0

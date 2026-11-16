@@ -1821,40 +1821,45 @@ class TestExtractDistanceConstraints:
     # --- Comparison-based distance constraint tests ---
 
     def test_sqrt_power_less_than(self):
-        """SQRT(POWER(...)) < value -> extract upper bound."""
+        """SQRT(POWER(...)) of coordinates need not be in the geometry column's unit: no bound."""
         query = (
             "SELECT * FROM t1 AS p1, t2 AS p2 "
             "WHERE SQRT(POWER(p1.x - p2.x, 2) + POWER(p1.y - p2.y, 2)) < 0.008"
         )
-        result = extract_distance_constraints(query)
-        assert len(result) == 1
-        assert result[0] == ("p1", "p2", 0.008)
+        assert extract_distance_constraints(query) == []
+
+    def test_st_distance_less_than(self):
+        """ST_Distance(...) < value -> extract upper bound."""
+        query = "SELECT * FROM t1 AS p1, t2 AS p2 WHERE ST_Distance(p1.geom, p2.geom) < 0.008"
+        assert extract_distance_constraints(query) == [("p1", "p2", 0.008)]
 
     def test_abs_sqrt_less_equal(self):
-        """ABS(SQRT(...)) <= value -> extract upper bound."""
+        """ABS(SQRT(POWER(dx, 2))) bounds one coordinate only, not the distance: no bound."""
         query = (
             "SELECT * FROM t1 AS p1, t2 AS p2 "
             "WHERE ABS(SQRT(POWER(p1.x - p2.x, 2))) <= 0.1"
         )
-        result = extract_distance_constraints(query)
-        assert len(result) == 1
-        assert result[0] == ("p1", "p2", 0.1)
+        assert extract_distance_constraints(query) == []
 
     def test_dist_between(self):
         """DIST(...) BETWEEN x AND y -> extract y (upper bound)."""
         query = (
             "SELECT * FROM t1, t2 "
-            "WHERE DIST(t1.g, t2.g) BETWEEN 1.6 AND 3.6"
+            "WHERE ST_Distance(t1.g, t2.g) BETWEEN 1.6 AND 3.6"
         )
         result = extract_distance_constraints(query)
         assert len(result) == 1
         assert result[0] == ("t1", "t2", 3.6)
 
+    def test_user_distance_function_is_no_bound(self):
+        """A user function such as DIST(...) is not known to be the distance: no bound."""
+        assert extract_distance_constraints("SELECT * FROM t1, t2 WHERE DIST(t1.g, t2.g) BETWEEN 1.6 AND 3.6") == []
+
     def test_dist_between_mixed_case(self):
         """Mixed-case BETWEEN/AND keywords are handled correctly."""
         query = (
             "SELECT * FROM t1, t2 "
-            "WHERE DIST(t1.g, t2.g) Between 1.6 And 3.6"
+            "WHERE ST_Distance(t1.g, t2.g) Between 1.6 And 3.6"
         )
         result = extract_distance_constraints(query)
         assert len(result) == 1
@@ -1874,7 +1879,7 @@ class TestExtractDistanceConstraints:
         query = (
             "SELECT * FROM t1 AS p1, t2 AS p2, t3 AS p3 "
             "WHERE ST_DWithin(p1.geom, p2.geom, 400) "
-            "AND SQRT(POWER(p2.x - p3.x, 2) + POWER(p2.y - p3.y, 2)) <= 0.1"
+            "AND ST_Distance(p2.geom, p3.geom) <= 0.1"
         )
         result = extract_distance_constraints(query)
         assert len(result) == 2
@@ -1885,8 +1890,8 @@ class TestExtractDistanceConstraints:
         """Multiple comparison-based distances -> correct tuples for each pair."""
         query = (
             "SELECT * FROM t1 AS p1, t2 AS p2, t3 AS p3 "
-            "WHERE SQRT(POWER(p1.x - p2.x, 2)) <= 0.1 "
-            "AND SQRT(POWER(p2.x - p3.x, 2)) <= 0.2"
+            "WHERE ST_Distance(p1.geom, p2.geom) <= 0.1 "
+            "AND ST_Distance(p2.geom, p3.geom) <= 0.2"
         )
         result = extract_distance_constraints(query)
         assert len(result) == 2
@@ -1969,20 +1974,20 @@ class TestComputeBufferDistance:
         assert compute_buffer_distance(query) == 800.0
 
     def test_arithmetic_distance_chain(self):
-        """Chain with SQRT-based distances: 0.1 + 0.2 -> diameter=0.3."""
+        """Chain with ST_Distance comparisons: 0.1 + 0.2 -> diameter=0.3."""
         query = (
             "SELECT * FROM t1 AS p1, t2 AS p2, t3 AS p3 "
-            "WHERE SQRT(POWER(p1.x - p2.x, 2)) <= 0.1 "
-            "AND SQRT(POWER(p2.x - p3.x, 2)) <= 0.2"
+            "WHERE ST_Distance(p1.geom, p2.geom) <= 0.1 "
+            "AND ST_Distance(p2.geom, p3.geom) <= 0.2"
         )
         assert compute_buffer_distance(query) == pytest.approx(0.3)
 
     def test_mixed_st_dwithin_and_arithmetic(self):
-        """Mixed: ST_DWithin(p1,p2,400) + SQRT(p2,p3)<=0.1 -> diameter=400.1."""
+        """Mixed: ST_DWithin(p1,p2,400) + ST_Distance(p2,p3)<=0.1 -> diameter=400.1."""
         query = (
             "SELECT * FROM t1 AS p1, t2 AS p2, t3 AS p3 "
             "WHERE ST_DWithin(p1.geom, p2.geom, 400) "
-            "AND SQRT(POWER(p2.x - p3.x, 2) + POWER(p2.y - p3.y, 2)) <= 0.1"
+            "AND ST_Distance(p2.geom, p3.geom) <= 0.1"
         )
         assert compute_buffer_distance(query) == pytest.approx(400.1)
 
