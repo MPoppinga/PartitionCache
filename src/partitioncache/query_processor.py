@@ -429,6 +429,43 @@ def _ordered_between(node: exp.Expr) -> exp.Expr:
     )
 
 
+_FOLDED_IDENTIFIER_RE = re.compile(r"[a-z_][a-z0-9_$]*")
+
+
+def _needs_its_quotes(identifier: exp.Identifier) -> bool:
+    """True for the name (not the alias) of a column, or of a table with an alias, that differs from its folded form.
+
+    A table without an alias is referenced by its name, which the alias handling takes for an alias; it loses
+    its quotes as before.
+    """
+    if _FOLDED_IDENTIFIER_RE.fullmatch(identifier.name):
+        return False
+    parent = identifier.parent
+    if isinstance(parent, exp.Column):
+        return parent.args.get("this") is identifier
+    if isinstance(parent, exp.Table):
+        return bool(parent.alias) and any(parent.args.get(part) is identifier for part in ("this", "db", "catalog"))
+    return False
+
+
+def _unaliased_quoted_table(query: str) -> str | None:
+    """Return a quoted table name that needs its quotes but has no alias, or None (also when unparseable).
+
+    Such a table is referenced by its name, which the alias handling treats as an alias and leaves unquoted.
+    """
+    try:
+        parsed = sqlglot.parse_one(query)
+    except Exception:
+        return None
+    for table in parsed.find_all(exp.Table):
+        if not table.alias and any(
+            isinstance(part, exp.Identifier) and part.quoted and not _FOLDED_IDENTIFIER_RE.fullmatch(part.name)
+            for part in (table.args.get("this"), table.args.get("db"), table.args.get("catalog"))
+        ):
+            return table.sql()
+    return None
+
+
 def clean_query(query: str) -> str:
     """
     Perform query cleaning to ensure stable output for cache variant generation.
@@ -496,10 +533,12 @@ def clean_query(query: str) -> str:
     if outermost_select:
         outermost_select.set("expressions", [exp.Star()])
 
-    # Quoted identifiers are not supported downstream, so drop the quotes on the AST,
-    # where string literals are left untouched.
+    # Drop the quotes of identifiers on the AST, where string literals are left untouched: the alias handling
+    # downstream does not support quoted aliases, and "name" is name. A table or column name that is not lower
+    # case keeps its quotes, since PostgreSQL folds the unquoted name to another table or column.
     for identifier in parsed.find_all(exp.Identifier):
-        identifier.set("quoted", False)
+        if not (identifier.quoted and _needs_its_quotes(identifier)):
+            identifier.set("quoted", False)
 
     query = parsed.sql(comments=False)
 
@@ -2515,6 +2554,14 @@ def generate_all_query_hash_pairs(
             "generate_all_query_hash_pairs: query uses a table alias or name that is not a plain identifier "
             "(letters, digits and underscores, not starting with a digit); PartitionCache does not generate "
             "cache variants for it. Returning no variants; execute the query unchanged."
+        )
+        return []
+
+    if (unaliased := _unaliased_quoted_table(query)) is not None:
+        logger.warning(
+            f"generate_all_query_hash_pairs: table {unaliased} has no alias and a name that needs its quotes; the variants "
+            "refer to it unquoted. PartitionCache does not generate cache variants for it (give the table an alias). "
+            "Returning no variants; execute the query unchanged."
         )
         return []
 

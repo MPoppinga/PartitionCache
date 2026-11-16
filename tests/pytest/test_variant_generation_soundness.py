@@ -265,3 +265,29 @@ class TestBetweenSymmetric:
         assert _variants("SELECT x.pk FROM a AS x WHERE x.v BETWEEN SYMMETRIC x.z AND 3") == [
             "SELECT DISTINCT t1.pk FROM a AS t1 WHERE (t1.v <= 3 AND t1.v >= t1.z) OR (t1.v <= t1.z AND t1.v >= 3)"
         ]
+
+
+class TestQuotedIdentifiers:
+    def test_mixed_case_names_keep_their_quotes(self):
+        variants = _variants('SELECT x.pk FROM "MyTab" AS x WHERE x."Name" = \'a\'')
+        assert variants == ['SELECT DISTINCT t1.pk FROM "MyTab" AS t1 WHERE t1."Name" = \'a\'']
+
+    def test_lower_case_quoted_names_hash_as_before(self):
+        assert _variants('SELECT x.pk FROM "mytab" AS x WHERE x."name" = \'a\'') == _variants("SELECT x.pk FROM mytab AS x WHERE x.name = 'a'")
+
+    def test_quoted_and_unquoted_names_differ(self):
+        assert _variants('SELECT x.pk FROM a AS x WHERE x."Name" = \'a\'') != _variants("SELECT x.pk FROM a AS x WHERE x.name = 'a'")
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            'SELECT "MyTab".pk FROM "MyTab" WHERE "MyTab"."Name" = \'a\'',
+            'SELECT x.pk FROM a AS x WHERE x.id IN (SELECT "Other".id FROM "Other" WHERE "Other"."Flag" = 1)',
+        ],
+    )
+    def test_quoted_table_without_alias_gets_no_variants(self, query):
+        assert _variants(query) == []
+
+    def test_quoted_names_in_a_subquery_keep_their_quotes(self):
+        query = 'SELECT x.pk FROM "MySchema"."Tab" AS x WHERE x."Name" IN (SELECT o."Name" FROM "Other" AS o WHERE o."Flag" = 1)'
+        assert _variants(query) == ['SELECT DISTINCT t1.pk FROM "MySchema"."Tab" AS t1 WHERE t1."Name" IN (SELECT o."Name" FROM "Other" AS o WHERE o."Flag" = 1)']
