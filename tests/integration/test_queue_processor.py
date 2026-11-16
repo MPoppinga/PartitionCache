@@ -327,12 +327,7 @@ class TestQueueProcessor:
         Test integration between queue processing and cache population.
         Simulates the complete workflow from query queuing to cache storage.
         """
-        import pytest
-
-        # Skip PostgreSQL bit/roaringbit backends in CI due to table creation issues
         backend_name = getattr(cache_client, "__class__", type(cache_client)).__name__.lower()
-        if "postgresql" in backend_name and ("bit" in backend_name or "roaring" in backend_name):
-            pytest.skip(f"Skipping {backend_name} due to CI table creation issues")
 
         partition_key = "zipcode"
         test_query = """

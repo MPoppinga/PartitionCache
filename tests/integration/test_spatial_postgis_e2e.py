@@ -25,16 +25,11 @@ Usage:
 import os
 from pathlib import Path
 
+import psycopg
 import pytest
 
-try:
-    import psycopg2
-
-    PSYCOPG2_AVAILABLE = True
-except ImportError:
-    PSYCOPG2_AVAILABLE = False
-
 import partitioncache
+from partitioncache.db_handler.postgres import fetch_final_result_set
 from partitioncache.query_processor import compute_buffer_distance, generate_all_query_hash_pairs
 
 # Path to spatial test queries
@@ -56,9 +51,9 @@ def _load_env_if_needed():
 
 
 def _get_db_connection():
-    """Create a psycopg2 connection to the POI database."""
+    """Create a psycopg connection to the POI database."""
     _load_env_if_needed()
-    return psycopg2.connect(
+    return psycopg.connect(
         dbname=os.getenv("DB_NAME", "osm_poi_db"),
         user=os.getenv("DB_USER", "osmuser"),
         password=os.getenv("DB_PASSWORD", "osmpassword"),
@@ -147,10 +142,12 @@ def spatial_queries():
 
 
 def _run_query(conn, sql_query: str) -> list:
-    """Execute a query and return all rows."""
+    """Execute a (possibly multi-statement) query in one transaction and return the rows of its last statement."""
     with conn.cursor() as cur:
         cur.execute(sql_query)
-        return cur.fetchall()
+        rows = fetch_final_result_set(cur)
+    conn.rollback()  # ends the transaction, which drops the ON COMMIT DROP temporary tables of the enhanced query
+    return rows
 
 
 def _has_cache_entries(backend_name: str, partition_key: str) -> bool:
@@ -198,7 +195,6 @@ def _ensure_cache_entries(backend_name: str, partition_key: str, queries: list[t
     return _has_cache_entries(backend_name, partition_key)
 
 
-@pytest.mark.skipif(not PSYCOPG2_AVAILABLE, reason="psycopg2 not installed")
 class TestPostGISSpatialE2E:
     """
     End-to-end tests for PostGIS spatial cache handlers.
@@ -429,7 +425,7 @@ class TestPostGISSpatialE2E:
                     with self.conn.cursor() as cur:
                         cur.execute(
                             "SELECT ST_IsValid(ST_GeomFromWKB(%s, %s)), ST_SRID(ST_GeomFromWKB(%s, %s))",
-                            (psycopg2.Binary(wkb), srid, psycopg2.Binary(wkb), srid),
+                            (wkb, srid, wkb, srid),
                         )
                         row = cur.fetchone()
                         assert row is not None
