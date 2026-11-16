@@ -154,7 +154,7 @@ PostgreSQL 17 and later run the following maintenance operations with `search_pa
 All cache handlers support multiple partition keys with independent datatypes:
 
 **PostgreSQL Handlers:**
-- Separate tables per partition: `{table_name}_cache_{partition_key}`. PostgreSQL truncates a name longer than 63 bytes; such a name works, but a new partition key whose truncated table name is that of another registered key would share its table, so registering it raises a `ValueError` naming both keys (the PL/pgSQL queue processor's bootstrap refuses it as well)
+- Separate tables per partition: `{table_name}_cache_{partition_key}`. PostgreSQL truncates a name longer than 63 bytes; such a name works, but a new partition key whose truncated table name is that of another registered key would share its table, so registering it raises a `ValueError` naming both keys (the PL/pgSQL queue processor's bootstrap refuses it as well). Two keys that were registered by an earlier version and already share a table keep sharing it and read each other's entries; find such pairs with `SELECT a.partition_key, b.partition_key FROM <prefix>_partition_metadata a JOIN <prefix>_partition_metadata b ON a.partition_key < b.partition_key AND ('<prefix>_cache_' || a.partition_key)::name = ('<prefix>_cache_' || b.partition_key)::name`, and delete the cache of one of them
 - Metadata table: `{table_name}_partition_metadata` 
 - Shared queries table: `{table_name}_queries`
 - Queue integration: Dual-strategy operations for optimal performance
