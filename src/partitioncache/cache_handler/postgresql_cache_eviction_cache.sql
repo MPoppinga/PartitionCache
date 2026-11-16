@@ -144,10 +144,10 @@ BEGIN
         RETURN 0;
     END IF;
 
-    -- Check if a count column exists
+    -- Check if a count column exists (cast to name: a table name over 63 bytes is stored truncated)
     SELECT EXISTS (
         SELECT 1 FROM information_schema.columns
-        WHERE table_name = v_cache_table AND column_name LIKE '%_count'
+        WHERE table_name = v_cache_table::name AND column_name LIKE '%_count'
     ) INTO v_count_column_exists;
 
     IF NOT v_count_column_exists THEN
@@ -209,8 +209,9 @@ BEGIN
 
     v_metadata_table := partitioncache_get_metadata_table_name(p_table_prefix);
 
-    -- Check if metadata table exists
-    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = v_metadata_table) THEN
+    -- Check if metadata table exists. The cast matters for a long prefix: the table is stored under a name
+    -- truncated to 63 bytes, and compared with the untruncated text the job found no table and evicted nothing.
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = v_metadata_table::name) THEN
         EXECUTE format('INSERT INTO %I (job_name, partition_key, queries_removed_count, status, message) VALUES (%L, ''N/A'', 0, ''success'', ''No cache metadata table found. Cache may be empty or not initialized.'')',
             v_log_table, p_job_name);
         RETURN;
