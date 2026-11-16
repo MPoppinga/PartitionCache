@@ -929,3 +929,13 @@ class TestDuckDBAccelerationRobustness:
             reference.close()
         finally:
             objects.execute("DROP TABLE IF EXISTS acc_rb_ev")
+
+    def test_key_table_script_returns_the_rows_of_its_select(self, postgresql_params, objects):
+        """DuckDB would return the result of the script's last statement (its DROP, no rows); the script runs on PostgreSQL."""
+        from partitioncache.apply_cache import extend_query_with_partition_keys
+
+        query = "SELECT p.pk FROM acc_rb_points AS p WHERE p.pk <= 5"
+        script = extend_query_with_partition_keys(query, {2, 3, 7}, "pk", method="UNLOGGED_TABLE_IN", p0_alias="p")
+        with self._accelerator(postgresql_params, ["acc_rb_points"]) as accelerator:
+            assert accelerator.execute_query(script) == {2, 3}
+            assert accelerator.stats["queries_accelerated"] == 0

@@ -101,7 +101,7 @@ Cache entries are computed from what DuckDB returns, so DuckDB must see the same
 - **Other differences** that can change results: `round()` of doubles at .5 (DuckDB rounds half away from zero, PostgreSQL to even), and regular expressions (RE2 in DuckDB, POSIX in PostgreSQL).
 - **Text ordering** is byte-wise in DuckDB; with a non-C collation in PostgreSQL, range comparisons on text (`name > 'M'`) can differ. Equality and `LIKE` are not affected.
 - **NULL keys** are dropped from the result, as on PostgreSQL.
-- A query DuckDB cannot run (unknown table or function, PostgreSQL-only syntax) runs on PostgreSQL instead, through an autocommit connection. A DuckDB query that exceeds the timeout is interrupted and also runs on PostgreSQL.
+- A query DuckDB cannot run (unknown table or function, PostgreSQL-only syntax) runs on PostgreSQL instead, through an autocommit connection. So does a text of several statements, such as the key-table scripts of `--enable-cache-optimization` with the `TMP_TABLE_*` and `UNLOGGED_TABLE_*` methods: DuckDB would return the last statement's result, not the SELECT's. A DuckDB query that exceeds the timeout is interrupted and also runs on PostgreSQL.
 - With `--duckdb-read-unloaded-tables`, names that are not preloaded are read from PostgreSQL's `public` schema through DuckDB's read-only attachment, live, while preloaded tables are the snapshot from startup; a query joining both mixes the two states. Schema-qualified names outside `public` that are not preloaded still run on PostgreSQL.
 
 ## Requirements

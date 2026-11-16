@@ -72,6 +72,10 @@ def _key_set(rows: list) -> set[Any]:
     return {row[0] if len(row) == 1 else row for row in rows if row[0] is not None}
 
 
+class _NotOneStatementError(Exception):
+    """The query text is not exactly one statement; DuckDB would return the result of its last statement."""
+
+
 class DuckDBQueryAccelerator:
     """
     DuckDB-based query accelerator for PostgreSQL database queries.
@@ -443,9 +447,10 @@ class DuckDBQueryAccelerator:
             else:
                 # Execute query with thread-local cursor
                 cursor = self._cursor()
-                result = cursor.execute(query).fetchall()
-                result_set = _key_set(result)
-                cursor.close()
+                try:
+                    result_set = self._execute_on_duckdb(cursor, query)
+                finally:
+                    cursor.close()
 
             duration = time.perf_counter() - start_time
             self._update_stats(queries_accelerated=1, total_acceleration_time=duration)
@@ -454,6 +459,10 @@ class DuckDBQueryAccelerator:
             logger.debug(f"DuckDB query completed in {duration:.3f}s, returned {len(result_set)} results")
             return result_set
 
+        except _NotOneStatementError as e:
+            logger.debug(f"Query is not one statement ({e}); DuckDB would return the last statement's result, running it on PostgreSQL")
+            self._update_stats(queries_fallback=1)
+            return self._execute_fallback(query)
         except concurrent.futures.TimeoutError:
             logger.warning(f"DuckDB query timed out after {self.query_timeout}s, falling back to PostgreSQL")
             self._update_stats(queries_timeout=1, queries_fallback=1)
@@ -463,6 +472,20 @@ class DuckDBQueryAccelerator:
             # Increment fallback counter since we're attempting fallback
             self._update_stats(queries_fallback=1)
             return self._execute_fallback(query)
+
+    @staticmethod
+    def _execute_on_duckdb(cursor: "duckdb.DuckDBPyConnection", query: str) -> set[Any]:
+        """Run a single-statement query on the cursor and return its keys.
+
+        Raises:
+            _NotOneStatementError: If DuckDB's parser finds more or fewer than one statement. DuckDB executes all
+                statements of a script and returns the last one's result, e.g. the DROP after the SELECT of an
+                UNLOGGED_TABLE_* script, which has no rows.
+        """
+        statements = cursor.extract_statements(query)
+        if len(statements) != 1:
+            raise _NotOneStatementError(f"{len(statements)} statements")
+        return _key_set(cursor.execute(query).fetchall())
 
     def _execute_with_timeout(self, query: str) -> set[Any]:
         """
@@ -486,10 +509,9 @@ class DuckDBQueryAccelerator:
                 # Create thread-local cursor for thread safety
                 cursor = self._cursor()
                 result_container["cursor"] = cursor
-                result = cursor.execute(query).fetchall()
-                result_container["result"] = _key_set(result)
+                result_container["result"] = self._execute_on_duckdb(cursor, query)
                 result_container["completed"] = True
-                logger.debug(f"DuckDB query worker completed successfully with {len(result)} rows")
+                logger.debug(f"DuckDB query worker completed successfully with {len(result_container['result'])} keys")
             except Exception as e:
                 logger.debug(f"DuckDB query worker failed: {e}")
                 result_container["exception"] = e
@@ -548,6 +570,8 @@ class DuckDBQueryAccelerator:
 
             logger.debug(f"Executing query with PostgreSQL fallback: {query[:100]}...")
 
+            if self.postgresql_conn is None:
+                raise RuntimeError("PostgreSQL fallback connection is not available; the query is not executed")
             with self.postgresql_conn.cursor() as cursor:
                 cursor.execute(query)
                 # An integration script (TMP_TABLE_*, UNLOGGED_TABLE_*) has its rows in the result set of its SELECT,

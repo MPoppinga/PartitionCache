@@ -189,6 +189,7 @@ class TestDuckDBQueryAccelerator:
         # Cursor execute path
         mock_cursor = Mock()
         mock_cursor.execute.return_value = mock_result
+        mock_cursor.extract_statements.return_value = [Mock()]  # DuckDB's parser finds one statement
         mock_cursor.close.return_value = None
         mock_duckdb_conn.cursor.return_value = mock_cursor
 
@@ -645,6 +646,43 @@ def _accelerator_on_duckdb(query_timeout: float = 0):
     accelerator.postgresql_conn = _ReferencePostgresConnection(reference)
     accelerator._initialized = True
     return accelerator
+
+
+@pytest.mark.parametrize("query_timeout", [0, 30])
+@pytest.mark.parametrize("method", ["UNLOGGED_TABLE_IN", "UNLOGGED_TABLE_JOIN"])
+def test_key_table_script_returns_the_select_keys_not_the_trailing_drop(method, query_timeout):
+    """DuckDB returns the LAST statement's result, here the DROP's: a script runs on the fallback, which reads the SELECT."""
+    from partitioncache.apply_cache import extend_query_with_partition_keys
+
+    script = extend_query_with_partition_keys("SELECT r.region_id FROM readings AS r WHERE r.value > 5", {1, 2}, "region_id", method=method, p0_alias="r")
+    accelerator = _accelerator_on_duckdb(query_timeout)
+
+    assert accelerator.execute_query(script) == {1}
+    assert accelerator.postgresql_conn.cursor_.queries == [script]
+    assert accelerator.stats["queries_accelerated"] == 0
+    assert accelerator.stats["queries_fallback"] == 1
+
+
+@pytest.mark.parametrize("query_timeout", [0, 30])
+def test_single_statement_fragment_runs_in_duckdb(query_timeout):
+    accelerator = _accelerator_on_duckdb(query_timeout)
+    # A semicolon in a string literal and in a trailing comment does not make a second statement
+    query = "SELECT r.region_id FROM readings AS r WHERE r.value > 5 AND r.label <> 'x;y'; -- done; really"
+
+    assert accelerator.execute_query(query) == {1, 3}
+    assert accelerator.postgresql_conn.cursor_.queries == []
+    assert accelerator.stats["queries_accelerated"] == 1
+
+
+def test_script_without_fallback_connection_raises_instead_of_returning_the_drop_result():
+    from partitioncache.apply_cache import extend_query_with_partition_keys
+
+    script = extend_query_with_partition_keys("SELECT r.region_id FROM readings AS r", {1}, "region_id", method="UNLOGGED_TABLE_IN", p0_alias="r")
+    accelerator = _accelerator_on_duckdb()
+    accelerator.postgresql_conn = None
+
+    with pytest.raises(RuntimeError, match="fallback"):
+        accelerator.execute_query(script)
 
 
 @pytest.mark.parametrize("path", ["duckdb", "duckdb_timeout", "fallback"])
