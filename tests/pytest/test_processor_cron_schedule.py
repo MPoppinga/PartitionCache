@@ -146,3 +146,33 @@ def test_config_trigger_rejects_or_schedules_the_frequency(pg_conn):
         assert cur.fetchone() == (["0 */1 * * *"],)
         cur.execute(f"DELETE FROM {config_table}")  # unschedules the job
     # pg_conn is rolled back by the fixture, which also drops the table, the trigger and the job
+
+
+def test_config_trigger_sets_the_timeout_in_the_job_command_not_on_the_role(pg_conn):
+    """The fragment timeout is a session setting of the job's own connection: the scheduled command sets it before
+    the function call, and scheduling leaves the role settings of the job owner unchanged."""
+    import uuid
+
+    _require_pg_cron(pg_conn)
+    queue_prefix = f"cron_timeout_{uuid.uuid4().hex[:8]}"
+    config_table = f"{queue_prefix}_processor_config"
+    role_settings = "SELECT setconfig FROM pg_db_role_setting WHERE setrole = (SELECT oid FROM pg_roles WHERE rolname = current_user) AND setdatabase = 0"
+    with pg_conn.cursor() as cur:
+        cur.execute(SQL_CRON_FILE.read_text())
+        cur.execute("SELECT partitioncache_initialize_cron_config_table(%s)", (queue_prefix,))
+        cur.execute("SELECT partitioncache_create_cron_config_trigger(%s)", (queue_prefix,))
+        cur.execute(role_settings)
+        settings_before = cur.fetchall()
+        cur.execute(
+            f"INSERT INTO {config_table} (job_name, enabled, max_parallel_jobs, frequency_seconds, timeout_seconds, table_prefix, queue_prefix, cache_backend, "
+            f"target_database) VALUES (%s, false, 2, 5, 7, 'unused', '{queue_prefix}', 'array', current_database())",
+            (f"{queue_prefix}_job",),
+        )
+        cur.execute(f"SELECT command FROM cron.job WHERE jobid IN (SELECT unnest(job_ids) FROM {config_table})")
+        commands = [row[0] for row in cur.fetchall()]
+        assert len(commands) == 2
+        for command in commands:
+            assert command.startswith("SET statement_timeout = '7000ms'; SELECT * FROM partitioncache_run_single_job_with_params("), command
+        cur.execute(role_settings)
+        assert cur.fetchall() == settings_before
+        cur.execute(f"DELETE FROM {config_table}")

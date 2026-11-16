@@ -174,16 +174,12 @@ BEGIN
     v_timeout_seconds := COALESCE(NEW.timeout_seconds, 1800);
     v_job_owner := COALESCE(NEW.job_owner, current_user);
 
-    -- Set statement_timeout on the job owner role (persistent across sessions)
-    BEGIN
-        EXECUTE format('ALTER ROLE %I SET statement_timeout = %L',
-                       v_job_owner, (v_timeout_seconds * 1000)::TEXT || 'ms');
-    EXCEPTION WHEN OTHERS THEN
-        RAISE NOTICE 'Could not set statement_timeout on role %: %', v_job_owner, SQLERRM;
-    END;
-
-    -- Build command to execute in target database (no transaction wrapper needed)
-    v_command := format('SELECT * FROM partitioncache_run_single_job_with_params(%L, %L, %L, %L, %L, %L, %L)',
+    -- The timeout is a session setting of the job's own connection, set by the command itself: pg_cron (libpq
+    -- mode) opens one connection per run and arms statement_timeout for each statement of the command, so the
+    -- function call runs under it. A timeout changed inside the running function would not be armed for that call.
+    -- Background-worker mode (cron.use_background_workers) does not arm it; see docs/postgresql_queue_processor.md.
+    v_command := format('SET statement_timeout = %L; SELECT * FROM partitioncache_run_single_job_with_params(%L, %L, %L, %L, %L, %L, %L)',
+                       (v_timeout_seconds * 1000)::TEXT || 'ms',
                        NEW.job_name, NEW.table_prefix, NEW.queue_prefix,
                        NEW.cache_backend, NEW.timeout_seconds, NEW.result_limit, NEW.default_bitsize);
 

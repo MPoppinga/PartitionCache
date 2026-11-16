@@ -105,15 +105,28 @@ DIRECT_PROCESSOR_BACKENDS = {
     "postgresql_array": ("array", "PG_ARRAY_CACHE_TABLE_PREFIX"),
     "postgresql_bit": ("bit", "PG_BIT_CACHE_TABLE_PREFIX"),
     "postgresql_roaringbit": ("roaringbit", "PG_ROARINGBIT_CACHE_TABLE_PREFIX"),
-    "postgis_bbox": ("bbox", "PG_BBOX_CACHE_TABLE_PREFIX"),
+}
+
+# Backends the processor cannot populate, with their table prefix variable: setup refuses them, while the other
+# subcommands still resolve the table prefix so that an installation made by an earlier version can be inspected and removed.
+UNSUPPORTED_PROCESSOR_BACKENDS = {
+    "postgis_bbox": "PG_BBOX_CACHE_TABLE_PREFIX",
 }
 
 
 def get_cache_backend_from_env() -> str:
     """
     Get the cache backend type from environment variables.
+
+    Raises:
+        ValueError: If the processor does not support the backend (for postgis_bbox the message names pcache-monitor).
     """
     cache_backend = os.getenv("CACHE_BACKEND", "postgresql_array")
+    if cache_backend in UNSUPPORTED_PROCESSOR_BACKENDS:
+        raise ValueError(
+            f"The PostgreSQL queue processor does not support the {cache_backend} cache backend; populate it with pcache-monitor "
+            "(or pcache-add --direct) instead."
+        )
     backend_config = DIRECT_PROCESSOR_BACKENDS.get(cache_backend)
     if backend_config is None:
         raise ValueError(f"Unsupported CACHE_BACKEND for direct processor: {cache_backend}")
@@ -129,10 +142,13 @@ def get_table_prefix_from_env() -> str:
     """
     cache_backend = os.getenv("CACHE_BACKEND", "postgresql_array")
     backend_config = DIRECT_PROCESSOR_BACKENDS.get(cache_backend)
-    if backend_config is None:
+    if backend_config is not None:
+        table_prefix_env = backend_config[1]
+    elif cache_backend in UNSUPPORTED_PROCESSOR_BACKENDS:
+        table_prefix_env = UNSUPPORTED_PROCESSOR_BACKENDS[cache_backend]
+    else:
         raise ValueError(f"Unsupported CACHE_BACKEND for direct processor: {cache_backend}")
 
-    table_prefix_env = backend_config[1]
     table_prefix = os.getenv(table_prefix_env)
 
     if not table_prefix:
@@ -281,30 +297,33 @@ def check_and_grant_pg_cron_permissions() -> tuple[bool, str]:
                 if schema_usage and schedule_exec and unschedule_exec:
                     return True, "All required permissions are already granted"
 
-                # Try to grant missing permissions (requires superuser privileges)
+                # Try to grant missing permissions (needs a role that may grant them, usually the owner of the cron schema).
+                # The grantee is an identifier: GRANT takes no bound parameters.
+                grantee = sql.Identifier(work_user)
                 missing_perms = []
                 try:
                     if not schema_usage:
-                        cur.execute("GRANT USAGE ON SCHEMA cron TO %s", (work_user,))
+                        cur.execute(sql.SQL("GRANT USAGE ON SCHEMA cron TO {}").format(grantee))
                         missing_perms.append("SCHEMA cron USAGE")
 
                     if not schedule_exec:
-                        cur.execute("GRANT EXECUTE ON FUNCTION cron.schedule_in_database TO %s", (work_user,))
+                        cur.execute(sql.SQL("GRANT EXECUTE ON FUNCTION cron.schedule_in_database(text, text, text, text, text, boolean) TO {}").format(grantee))
                         missing_perms.append("cron.schedule_in_database")
 
                     if not unschedule_exec:
-                        cur.execute("GRANT EXECUTE ON FUNCTION cron.unschedule TO %s", (work_user,))
-                        cur.execute("GRANT EXECUTE ON FUNCTION cron.alter_job TO %s", (work_user,))
+                        cur.execute(sql.SQL("GRANT EXECUTE ON FUNCTION cron.unschedule(bigint), cron.unschedule(text) TO {}").format(grantee))
+                        cur.execute(sql.SQL("GRANT EXECUTE ON FUNCTION cron.alter_job(bigint, text, text, text, text, boolean) TO {}").format(grantee))
                         missing_perms.append("cron.unschedule and cron.alter_job")
 
                     # Also grant SELECT on cron.job for monitoring (optional)
-                    cur.execute("GRANT SELECT ON cron.job TO %s", (work_user,))
+                    cur.execute(sql.SQL("GRANT SELECT ON cron.job TO {}").format(grantee))
 
                     conn.commit()
                     return True, f"Successfully granted permissions: {', '.join(missing_perms)}"
 
-                except Exception as grant_error:
-                    return False, f"Failed to grant permissions (need superuser): {grant_error}"
+                except psycopg.Error as grant_error:
+                    conn.rollback()
+                    return False, f"Failed to grant pg_cron permissions to {work_user}: {grant_error}"
 
     except Exception as e:
         return False, f"Error checking pg_cron permissions: {e}"
@@ -567,6 +586,101 @@ def insert_cache_config(
     logger.info("Configuration inserted successfully in cache database for worker function access.")
 
 
+def _quote_role(role: str) -> str:
+    return '"' + role.replace('"', '""') + '"'
+
+
+def processor_job_owners(conn, queue_prefix: str) -> dict[str, set[str]]:
+    """Return the job owner roles of a processor installation with the statement_timeout values earlier versions set on them.
+
+    Queue processors set up by earlier versions ran ``ALTER ROLE <job_owner> SET statement_timeout = '<timeout_seconds * 1000>ms'``
+    for every row of the configuration table. The current user is always included (it is the default job owner), with no
+    expected value unless a configuration row names it.
+
+    Args:
+        conn: Connection to the database that holds the configuration table (the pg_cron database).
+        queue_prefix: Queue table prefix of the installation.
+
+    Returns:
+        Mapping from role name to the set of statement_timeout values an earlier version would have set on it.
+    """
+    config_table = f"{queue_prefix}_processor_config"
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT current_user, to_regclass(quote_ident(%s)) IS NOT NULL, EXISTS (SELECT 1 FROM information_schema.columns "
+            "WHERE table_schema = current_schema() AND table_name = %s AND column_name = 'job_owner')",
+            (config_table, config_table),
+        )
+        current_user, has_table, has_owner_column = cur.fetchone()
+        owners: dict[str, set[str]] = {current_user: set()}
+        if has_table:
+            owner = sql.SQL("COALESCE(job_owner, current_user)") if has_owner_column else sql.SQL("current_user")
+            cur.execute(sql.SQL("SELECT {}, timeout_seconds FROM {}").format(owner, sql.Identifier(config_table)))
+            for role, timeout_seconds in cur.fetchall():
+                owners.setdefault(role, set()).add(f"{timeout_seconds * 1000}ms")
+    return owners
+
+
+def release_legacy_role_statement_timeout(conn, owners: dict[str, set[str]]) -> None:
+    """Remove the role-wide statement_timeout that queue processors of earlier versions left on their job owners.
+
+    The setting (``ALTER ROLE ... SET``, all databases) is reset only where it still has the value such a processor set.
+    Any other role-wide statement_timeout is left in place with a warning that names the role, the value and the command
+    that removes it, since it may have been set on purpose.
+
+    Args:
+        conn: Connection to any database of the cluster; it must have no open transaction with pending work.
+        owners: Result of :func:`processor_job_owners`.
+    """
+    for role, legacy_values in owners.items():
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT cfg FROM pg_db_role_setting s JOIN pg_roles r ON r.oid = s.setrole, unnest(s.setconfig) AS cfg "
+                "WHERE r.rolname = %s AND s.setdatabase = 0 AND cfg LIKE 'statement_timeout=%%'",
+                (role,),
+            )
+            row = cur.fetchone()
+        if row is None:
+            continue
+        value = row[0].split("=", 1)[1]
+        reset_command = f"ALTER ROLE {_quote_role(role)} RESET statement_timeout;"
+        if value not in legacy_values:
+            logger.warning(
+                f"Role {role} has statement_timeout = {value} for all its sessions. Queue processors set up by earlier versions "
+                f"set this on their job owner; this version does not and leaves it unchanged. If it is left over, remove it with: {reset_command}"
+            )
+            continue
+        try:
+            with conn.cursor() as cur:
+                cur.execute(sql.SQL("ALTER ROLE {} RESET statement_timeout").format(sql.Identifier(role)))
+            conn.commit()
+            logger.info(f"Removed statement_timeout = {value} from role {role}, set there by a queue processor of an earlier version")
+        except psycopg.Error as e:
+            conn.rollback()
+            logger.warning(
+                f"Role {role} keeps statement_timeout = {value} for all its sessions, set by a queue processor of an earlier version; "
+                f"it could not be removed ({e}). Remove it as a role that may alter {role}: {reset_command}"
+            )
+
+
+def warn_if_pg_cron_background_workers(conn) -> None:
+    """Warn that the fragment timeout is not enforced when pg_cron runs jobs in background workers.
+
+    The job command sets statement_timeout before it calls the processor function. pg_cron arms that timeout when it
+    runs jobs over libpq connections (the default), but not with ``cron.use_background_workers = on``.
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT current_setting('cron.use_background_workers', true)")
+        row = cur.fetchone()
+    conn.commit()
+    if row is not None and row[0] == "on":
+        logger.warning(
+            "pg_cron runs jobs in background workers (cron.use_background_workers = on), which do not apply the statement_timeout "
+            "set by the job command: the processor's timeout is not enforced. Use a dedicated --job-owner role and set the timeout "
+            "on that role (ALTER ROLE <job_owner> SET statement_timeout = ...), or run pg_cron with libpq connections."
+        )
+
+
 def remove_all_processor_objects(conn, queue_prefix: str):
     """Remove all processor-related tables, cron job and PartitionCache functions."""
     logger.info("Removing all PostgreSQL queue processor objects and functions...")
@@ -578,6 +692,15 @@ def remove_all_processor_objects(conn, queue_prefix: str):
     target_database = get_cache_database_name()
     # Match all processor jobs for this database
     job_name_pattern = f"partitioncache_process_queue_{target_database}%"
+
+    # The job owners are read from the configuration table before it is dropped
+    same_database = get_cron_database_name() == target_database
+    owners_conn = conn if same_database else get_pg_cron_connection()
+    try:
+        release_legacy_role_statement_timeout(owners_conn, processor_job_owners(owners_conn, queue_prefix))
+    finally:
+        if not same_database:
+            owners_conn.close()
 
     with conn.cursor() as cur:
         # Drop processor-specific tables first. The DELETE trigger on the config
@@ -747,8 +870,8 @@ def handle_setup(table_prefix: str, queue_prefix: str, cache_backend: str, frequ
             logger.warning("You may need to manually grant permissions as superuser:")
             work_user = os.getenv("DB_USER")
             logger.warning(f"  GRANT USAGE ON SCHEMA cron TO {work_user};")
-            logger.warning(f"  GRANT EXECUTE ON FUNCTION cron.schedule_in_database TO {work_user};")
-            logger.warning(f"  GRANT EXECUTE ON FUNCTION cron.unschedule TO {work_user};")
+            logger.warning(f"  GRANT EXECUTE ON FUNCTION cron.schedule_in_database(text, text, text, text, text, boolean) TO {work_user};")
+            logger.warning(f"  GRANT EXECUTE ON FUNCTION cron.unschedule(bigint), cron.unschedule(text) TO {work_user};")
 
     # Setup all database objects in both databases
     if get_cron_database_name() == get_cache_database_name():
@@ -765,7 +888,15 @@ def handle_setup(table_prefix: str, queue_prefix: str, cache_backend: str, frequ
 
     # Insert configuration in cron database for pg_cron job management
     actual_cron_conn = cache_conn if get_cron_database_name() == get_cache_database_name() else cron_conn
+    # Read before the configuration row is replaced: earlier versions set the old timeout on the old job owner
+    owners = processor_job_owners(actual_cron_conn, queue_prefix)
+    if job_owner:
+        owners.setdefault(job_owner, set())
+    actual_cron_conn.commit()
     insert_initial_config(actual_cron_conn, job_name, table_prefix, queue_prefix, cache_backend, frequency, enabled, timeout, target_database, default_bitsize, job_owner=job_owner)
+    release_legacy_role_statement_timeout(actual_cron_conn, owners)
+    if pg_cron_available:
+        warn_if_pg_cron_background_workers(actual_cron_conn)
 
     # Optional: schedule processor log cleanup if helper functions are available.
     if pg_cron_available:
@@ -1077,13 +1208,25 @@ def view_logs(conn, limit: int = 20, status_filter: str | None = None, queue_pre
             print(f"Error: Log table '{log_table}' not found. Please run setup first.")
 
 
-def manual_process_queue(conn, count: int):
-    """Manually process a number of items from the queue."""
+def manual_process_queue(conn, count: int, table_prefix: str, queue_prefix: str):
+    """Process up to ``count`` queue items in this session with the configuration that setup stored for the prefixes.
+
+    The batch runs as one statement, so the processor's ``timeout_seconds`` does not apply. The session's
+    statement_timeout (none unless set, for example with ``PGOPTIONS="-c statement_timeout=10min"``) bounds the whole
+    batch: the fragment it cancels is recorded as 'timeout', and the rest of the batch then runs without a limit.
+
+    Args:
+        conn: Connection to the cache database.
+        count: Maximum number of queue items to process.
+        table_prefix: Cache table prefix; selects the configuration row (job name) of this installation.
+        queue_prefix: Queue table prefix; selects the configuration table ``{queue_prefix}_processor_config``.
+    """
     logger.info(f"Manually processing up to {count} items from the queue...")
+    job_name = construct_processor_job_name(get_cache_database_name(), table_prefix)
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT * FROM partitioncache_manual_process_queue(%s)",
-            (count,),
+            "SELECT * FROM partitioncache_manual_process_queue(%s, %s, %s)",
+            (count, job_name, queue_prefix),
         )
         result = cur.fetchone()
         if result:
@@ -1364,13 +1507,24 @@ def main():
     parser_perms.set_defaults(func=check_permissions_command)
 
     # manual-process command
-    parser_manual = subparsers.add_parser("manual-process", help="Manually trigger processing of queue items for testing")
+    parser_manual = subparsers.add_parser(
+        "manual-process",
+        help="Manually trigger processing of queue items for testing",
+        description=(
+            "Process queue items in this session with the configuration that setup stored for the table and queue prefix. "
+            "The batch runs as one statement: the processor's --timeout does not apply. The session's statement_timeout "
+            "(none unless set, e.g. PGOPTIONS='-c statement_timeout=10min') bounds the whole batch; the fragment it cancels "
+            "is recorded as 'timeout' and the rest of the batch then runs without a limit."
+        ),
+    )
     parser_manual.add_argument("count", type=int, help="Number of items to process")
     parser_manual.add_argument("--table-prefix", default=None, help="Table prefix for cache tables (default: based on env vars)")
     parser_manual.set_defaults(
         func=lambda args: manual_process_queue(
             get_db_connection(),
             args.count,
+            args.table_prefix or get_table_prefix_from_env(),
+            get_queue_table_prefix_from_env(),
         )
     )
 
