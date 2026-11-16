@@ -34,6 +34,53 @@ def _compare_cache_values(retrieved, expected):
     return retrieved == expected
 
 
+EDGE_CASES: dict[str, set[int]] = {
+    "single_value": {42},
+    "large_numbers": {2**31 - 1, 2**31 - 2},
+    "zero_value": {0},
+    "negative_values": {-1, -100, -1000},
+}
+
+# A key is a bit position: negative keys have none, and 2**31 - 1 is above every bit size the fixtures and CI
+# configure (and above PostgreSQL's limit for a BIT column, so postgresql_bit cannot grow to it)
+BIT_ARRAY_BACKENDS = {"postgresql_bit", "redis_bit", "rocksdb_bit"}
+# Roaring bitmaps hold unsigned 32-bit values; rocksdb_set packs integer keys as unsigned 32-bit values
+UNSIGNED_32_BACKENDS = {"postgresql_roaringbit", "redis_roaringbit", "rocksdict_roaringbit", "rocksdb_set"}
+
+
+def edge_case_is_refused(backend: str, case_name: str) -> bool:
+    """Whether a backend documents that it cannot store the keys of an edge case."""
+    if case_name == "negative_values":
+        return backend in BIT_ARRAY_BACKENDS | UNSIGNED_32_BACKENDS
+    if case_name == "large_numbers":
+        return backend in BIT_ARRAY_BACKENDS
+    return False
+
+
+def check_edge_case(cache_client: AbstractCacheHandler, backend: str, case_name: str) -> None:
+    """Store an edge case and read it back as a set, or check that the backend refuses it and stores nothing.
+
+    A refusal is either ``set_cache`` returning False or raising; which one depends on the handler.
+    """
+    partition_key = "zipcode"
+    cache_key = f"edge_{case_name}"
+    test_set = EDGE_CASES[case_name]
+
+    if edge_case_is_refused(backend, case_name):
+        try:
+            stored = cache_client.set_cache(cache_key, test_set, partition_key)
+        except Exception:
+            stored = False
+        assert not stored, f"{backend} accepted {case_name} {sorted(test_set)}, read back as {cache_client.get(cache_key, partition_key)!r}"
+        assert cache_client.get(cache_key, partition_key) is None, f"{backend} refused {case_name} but holds an entry for it"
+        return
+
+    assert cache_client.set_cache(cache_key, test_set, partition_key), f"{backend} failed to store {case_name}"
+    retrieved = cache_client.get(cache_key, partition_key)
+    assert retrieved is not None, f"{backend} lost {case_name}"
+    assert set(retrieved) == test_set, f"{backend} read {case_name} back as {sorted(retrieved)}"
+
+
 class TestCachePerformance:
     """
     Performance tests for cache operations across different backends.
@@ -302,28 +349,11 @@ class TestCacheStress:
         # Should handle rapid operations efficiently
         assert ops_per_second > 100, f"Rapid operations too slow: {ops_per_second:.1f} ops/sec"
 
-    def test_edge_case_values(self, cache_client: AbstractCacheHandler):
-        """Test cache with edge case values."""
-        partition_key = "zipcode"
-
-        edge_cases = [
-            ("single_value", {42}),
-            ("large_numbers", {2**31 - 1, 2**31 - 2}),
-            ("zero_value", {0}),
-            ("negative_values", {-1, -100, -1000}),
-        ]
-
-        for case_name, test_set in edge_cases:
-            cache_key = f"edge_{case_name}"
-
-            try:
-                success = cache_client.set_cache(cache_key, test_set, partition_key)
-                if success:
-                    retrieved = cache_client.get(cache_key, partition_key)
-                    assert retrieved == test_set, f"Edge case {case_name} failed"
-            except Exception as e:
-                # Some backends may not support certain value ranges
-                pytest.skip(f"Backend doesn't support {case_name}: {e}")
+    @pytest.mark.parametrize("case_name", sorted(EDGE_CASES))
+    def test_edge_case_values(self, cache_client: AbstractCacheHandler, request, case_name: str):
+        """Each edge case is stored and read back, or refused by a backend that documents it cannot store it."""
+        backend = request.node.callspec.params["cache_client"]
+        check_edge_case(cache_client, backend, case_name)
 
 
 class TestCacheRealWorldScenarios:

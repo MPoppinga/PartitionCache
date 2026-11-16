@@ -43,6 +43,10 @@ rocksdb = [
     "rocksdb",  # Seperate because it is not available on all platforms
 ]
 
+spatial = [
+    "h3>=4,<5",  # rocksdict_h3_grouped and the k-ring lookup of rocksdict
+]
+
 benchmark = [
     "pyyaml",
     "duckdb>=2.0",

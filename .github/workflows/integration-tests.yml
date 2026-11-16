@@ -295,7 +295,7 @@ jobs:
     - name: Install PartitionCache
       shell: micromamba-shell {0}
       run: |
-        pip install -e ".[testing,db]"
+        pip install -e ".[testing,db,spatial]"  # spatial: h3 for the rocksdict H3 handlers
         pip install pytest-xdist  # Additional for parallel execution
 
     - name: Create and configure test database

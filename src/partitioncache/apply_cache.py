@@ -23,6 +23,7 @@ import sqlglot.expressions as exp
 
 from partitioncache.cache_handler.abstract import LAZY_ALL_KEYS_PLACEHOLDER, AbstractCacheHandler, AbstractCacheHandler_Lazy
 from partitioncache.query_processor import (
+    _key_source_from_select,
     _outer_table_aliases,
     _top_level_conjuncts,
     compute_buffer_distance,
@@ -260,6 +261,92 @@ def _intersect_dilated_fallback(
     return intersection, len(existing)
 
 
+def _first_branch_query(parsed: exp.Expr) -> str | None:
+    """The first SELECT of a set operation as a query of its own, with the statement's WITH clause; None if there is none."""
+    select = _restricted_select(parsed)
+    if select is None:
+        return None
+    branch = select.copy()
+    with_ = parsed.args.get("with_")
+    if with_ is not None and branch.args.get("with_") is None:
+        branch.set("with_", with_.copy())
+    return branch.sql()
+
+
+def _variants_of_first_branch(query: str, hashes: list[str], generate: Callable[[str], list[str]]) -> bool:
+    """Whether the variants of a set operation are variants of its first SELECT, the one the cache restricts; True for other queries.
+
+    Variant generation reads a set operation's tables from its first FROM and its conditions from the first WHERE in
+    breadth-first order, which is another branch's when the first branch is parenthesised or the operation chains three
+    branches. Such variants are no relaxations of the first branch, and their keys must not restrict it: the query then
+    runs without the cache. ``generate`` returns the hashes of a query with the lookup's settings.
+    """
+    try:
+        parsed = sqlglot.parse_one(query)
+    except sqlglot.errors.ParseError:
+        return True  # the variant generation parsed it; a parse error here leaves the decision to it
+    if not isinstance(parsed, exp.SetOperation) or not hashes:
+        return True
+    branch = _first_branch_query(parsed)
+    if branch is not None and set(hashes) <= set(generate(branch)):
+        return True
+    logger.warning("The variants of the set operation are not all variants of its first SELECT, which the cache restricts; the query runs without the cache")
+    return False
+
+
+_NO_KEY_SOURCE = "\x00no key source"  # _plain_lookup_source: the restricted alias is no plain table of the restricted SELECT
+
+
+def _restricted_alias_source(query: str, partition_key: str, alias: str | None, auto_detect_partition_join: bool, partition_join_table: str | None) -> str | None:
+    """The ``partition_key_source_table`` of the restricted alias (``alias``, or ``find_p0_alias``), or None if it is no plain table.
+
+    As the variant generation names the source it reads from a query's SELECT: the table name when the table occurs once
+    among the tables of the restricted SELECT's FROM and JOIN clauses, else the alias.
+    """
+    parsed = sqlglot.parse_one(query)
+    if alias is None:
+        alias = find_p0_alias(query, partition_key, auto_detect_partition_join, partition_join_table)
+    items = [clause.this for clause in _from_clauses(parsed)]
+    tables = [table for item in items for table in item.find_all(exp.Table)]
+    for item in items:
+        if isinstance(item, exp.Table) and item.alias_or_name == alias:
+            return alias if sum(1 for table in tables if table.name == item.name) > 1 else item.name
+    return None
+
+
+def _plain_lookup_source(
+    query: str,
+    partition_key: str,
+    skip_partition_key_joins: bool,
+    temporal_bucket_width: float | None,
+    dilation_buckets: int | None,
+    partition_key_source_table: str | None,
+    alias: str | None,
+    auto_detect_partition_join: bool,
+    partition_join_table: str | None,
+) -> str | None:
+    """The ``partition_key_source_table`` of a lookup of apply_cache / apply_cache_lazy, or ``_NO_KEY_SOURCE``.
+
+    A temporal lookup keeps the caller's (dilation covers the other aliases' buckets), other lookups with key joins none.
+    Without key joins and without dilation, the aliases are not joined on the key and each has its own: the single-table
+    variants of another alias hold that alias's keys, not the restricted alias's, so only the variants that select the
+    restricted alias's key may restrict it. Their source is the restricted alias (``_restricted_alias_source``);
+    ``_NO_KEY_SOURCE`` when it is no plain table of the restricted SELECT, and the query then runs without the cache.
+    """
+    if _is_temporal(temporal_bucket_width, dilation_buckets):
+        return partition_key_source_table
+    if not skip_partition_key_joins:
+        return None
+    source = _restricted_alias_source(query, partition_key, alias, auto_detect_partition_join, partition_join_table)
+    if source is None:
+        logger.warning(
+            "skip_partition_key_joins: the restricted alias is no plain table of the query, so the variants of its key cannot be told "
+            "apart; the query runs without the cache"
+        )
+        return _NO_KEY_SOURCE
+    return source
+
+
 def get_partition_keys(
     query: str,
     cache_handler: AbstractCacheHandler,
@@ -300,6 +387,9 @@ def get_partition_keys(
         remove_constraints_all: List of attribute names to remove from all query variants
         remove_constraints_add: List of attribute names to remove, creating additional variants
         protected_patterns: Conditions matching these patterns are never removed during variant generation.
+        skip_partition_key_joins: Generate the variants without partition key joins (each alias has its own key). Without
+            temporal parameters, geometry_column or partition_key_source_table, and without a key in the SELECT, only the
+            variants that select the p0 alias's key are looked up (no lookup if it is no plain table).
         temporal_bucket_width: Width of one bucket of a time-bucket partition key, in the unit of ``temporal_column``;
             enables temporal dilation: each cached set is widened by ceil(window / width) buckets before the
             intersection, with the window read from the query's conditions on ``temporal_column``.
@@ -333,27 +423,36 @@ def get_partition_keys(
         return None, 0, 0
     if _is_temporal(temporal_bucket_width, dilation_buckets):
         skip_partition_key_joins = True
+    elif skip_partition_key_joins and geometry_column is None and partition_key_source_table is None:
+        if _key_source_from_select(sqlglot.parse_one(query), partition_key) is None:
+            # Without key joins only the variants of one alias's key are sound; without a key in the SELECT, the p0 alias's
+            partition_key_source_table = _restricted_alias_source(query, partition_key, None, auto_detect_partition_join, partition_join_table)
+            if partition_key_source_table is None:
+                logger.warning("skip_partition_key_joins: the p0 alias is no plain table of the query; no cache lookup")
+                return None, 0, 0
 
     # Generate all hashes for the given query (Only consider subqueries with two ore more components that are connected, allow modifying attributes)
-    cache_entry_hashes = generate_all_hashes(
-        partition_key_source_table=partition_key_source_table,
-        query=query,
-        partition_key=partition_key,
-        min_component_size=min_component_size,
-        follow_graph=follow_graph,
-        fix_attributes=keep_all_attributes,
-        canonicalize_queries=canonicalize_queries,
-        auto_detect_partition_join=auto_detect_partition_join,
-        partition_join_table=partition_join_table,
-        bucket_steps=bucket_steps,
-        add_constraints=add_constraints,
-        remove_constraints_all=remove_constraints_all,
-        remove_constraints_add=remove_constraints_add,
-        skip_partition_key_joins=skip_partition_key_joins,
-        geometry_column=geometry_column,
-        max_conditions_removed=max_conditions_removed,
-        protected_patterns=protected_patterns,
-    )
+    generation: dict[str, Any] = {
+        "partition_key_source_table": partition_key_source_table,
+        "partition_key": partition_key,
+        "min_component_size": min_component_size,
+        "follow_graph": follow_graph,
+        "fix_attributes": keep_all_attributes,
+        "canonicalize_queries": canonicalize_queries,
+        "auto_detect_partition_join": auto_detect_partition_join,
+        "partition_join_table": partition_join_table,
+        "bucket_steps": bucket_steps,
+        "add_constraints": add_constraints,
+        "remove_constraints_all": remove_constraints_all,
+        "remove_constraints_add": remove_constraints_add,
+        "skip_partition_key_joins": skip_partition_key_joins,
+        "geometry_column": geometry_column,
+        "max_conditions_removed": max_conditions_removed,
+        "protected_patterns": protected_patterns,
+    }
+    cache_entry_hashes = generate_all_hashes(query=query, **generation)
+    if not _variants_of_first_branch(query, cache_entry_hashes, lambda branch: generate_all_hashes(query=branch, **generation)):
+        return None, 0, 0
 
     logger.info(f"Found {len(cache_entry_hashes)} subqueries in query")
 
@@ -414,6 +513,9 @@ def get_partition_keys_lazy(
         remove_constraints_all: List of attribute names to remove from all query variants
         remove_constraints_add: List of attribute names to remove, creating additional variants
         protected_patterns: Conditions matching these patterns are never removed during variant generation.
+        skip_partition_key_joins: Generate the variants without partition key joins (each alias has its own key). Without
+            temporal parameters, geometry_column or partition_key_source_table, and without a key in the SELECT, only the
+            variants that select the p0 alias's key are looked up (no lookup if it is no plain table).
         temporal_bucket_width: Width of one bucket of a time-bucket partition key, in the unit of ``temporal_column``;
             enables temporal dilation: each cached set is widened by ceil(window / width) buckets before the
             intersection, with the window read from the query's conditions on ``temporal_column``.
@@ -453,26 +555,35 @@ def get_partition_keys_lazy(
         return None, 0, 0
     if _is_temporal(temporal_bucket_width, dilation_buckets):
         skip_partition_key_joins = True
+    elif skip_partition_key_joins and geometry_column is None and partition_key_source_table is None:
+        if _key_source_from_select(sqlglot.parse_one(query), partition_key) is None:
+            # Without key joins only the variants of one alias's key are sound; without a key in the SELECT, the p0 alias's
+            partition_key_source_table = _restricted_alias_source(query, partition_key, None, auto_detect_partition_join, partition_join_table)
+            if partition_key_source_table is None:
+                logger.warning("skip_partition_key_joins: the p0 alias is no plain table of the query; no cache lookup")
+                return None, 0, 0
 
-    hashes = generate_all_hashes(
-        partition_key_source_table=partition_key_source_table,
-        query=query,
-        partition_key=partition_key,
-        min_component_size=min_component_size,
-        fix_attributes=keep_all_attributes,
-        canonicalize_queries=canonicalize_queries,
-        follow_graph=follow_graph,
-        auto_detect_partition_join=auto_detect_partition_join,
-        partition_join_table=partition_join_table,
-        bucket_steps=bucket_steps,
-        add_constraints=add_constraints,
-        remove_constraints_all=remove_constraints_all,
-        remove_constraints_add=remove_constraints_add,
-        skip_partition_key_joins=skip_partition_key_joins,
-        geometry_column=geometry_column,
-        max_conditions_removed=max_conditions_removed,
-        protected_patterns=protected_patterns,
-    )
+    generation: dict[str, Any] = {
+        "partition_key_source_table": partition_key_source_table,
+        "partition_key": partition_key,
+        "min_component_size": min_component_size,
+        "fix_attributes": keep_all_attributes,
+        "canonicalize_queries": canonicalize_queries,
+        "follow_graph": follow_graph,
+        "auto_detect_partition_join": auto_detect_partition_join,
+        "partition_join_table": partition_join_table,
+        "bucket_steps": bucket_steps,
+        "add_constraints": add_constraints,
+        "remove_constraints_all": remove_constraints_all,
+        "remove_constraints_add": remove_constraints_add,
+        "skip_partition_key_joins": skip_partition_key_joins,
+        "geometry_column": geometry_column,
+        "max_conditions_removed": max_conditions_removed,
+        "protected_patterns": protected_patterns,
+    }
+    hashes = generate_all_hashes(query=query, **generation)
+    if not _variants_of_first_branch(query, hashes, lambda branch: generate_all_hashes(query=branch, **generation)):
+        return None, 0, 0
 
     if dilation > 0:
         lazy_cache_subquery, used_hashes = cache_handler.get_intersected_dilated_lazy(set(hashes), partition_key, dilation)  # type: ignore[attr-defined]
@@ -550,6 +661,10 @@ def rewrite_query_with_p0_table( # TODO: Check duplication with query_processor
     SELECT * FROM tt AS t1, tt AS t2, partition_key_mv AS p0
     WHERE t1.partition_key = p0.partition_key AND t2.partition_key = p0.partition_key
 
+    Only the tables of the restricted SELECT's FROM and top-level JOIN clauses whose key equals the p0 alias's
+    (``find_p0_alias``) through top-level equalities ``a.<key> = b.<key>`` are tied to p0, and only these equalities
+    are removed; an equality inside an OR or a longer condition stays.
+
     Args:
         query (str): The original SQL query to rewrite.
         partition_key (str): The identifier for the partition.
@@ -570,18 +685,22 @@ def rewrite_query_with_p0_table( # TODO: Check duplication with query_processor
     if mv_table_name in existing_tables:
         return query
 
-    # Find all table aliases that have partition_key joins
-    table_aliases_with_partition_key = []
-    for table in parsed_query.find_all(exp.Table):
-        alias = table.alias if table.alias else table.name
-        table_aliases_with_partition_key.append(alias)
+    # The p0 table replaces the key equalities of the restricted SELECT: it is tied to the aliases whose key equals the
+    # p0 alias's (find_p0_alias) through top-level equalities a.<key> = b.<key>, in the order the tables occur. A table of
+    # a subquery, or one related to them otherwise (a time window, a dimension, an outer join), keeps its own key.
+    select = _restricted_select(parsed_query)
+    from_clause = select.args.get("from_") if select is not None else None
+    if select is None or from_clause is None:
+        return query
+    try:
+        anchor = find_p0_alias(query, partition_key)
+    except (ValueError, sqlglot.errors.SqlglotError):
+        return query
+    top_level = {clause.alias_or_name for clause in _from_clauses(select)}
+    component = _key_component(select, partition_key, anchor) & top_level
+    table_aliases_with_partition_key = list(dict.fromkeys(table.alias_or_name for table in parsed_query.find_all(exp.Table) if table.alias_or_name in component))
 
     if not table_aliases_with_partition_key:
-        return query
-
-    # Add p0 table to FROM clause
-    from_clause = parsed_query.find(exp.From)
-    if from_clause is None:
         return query
 
     # Convert to comma-separated tables format including p0
@@ -589,11 +708,11 @@ def rewrite_query_with_p0_table( # TODO: Check duplication with query_processor
     from_clause.set("this", exp.Table(this=f"{current_table.sql(dialect=sql_dialect)}, {mv_table_name} AS {p0_alias}"))
 
     # Remove existing partition_key join conditions and replace with star-schema joins
-    where_clause = _outer_where(parsed_query)
+    where_clause = select.args.get("where")
     if where_clause is None:
         # Without a WHERE the star joins were dropped and p0 was cross-joined with every row
         where_clause = exp.Where()
-        parsed_query.set("where", where_clause)
+        select.set("where", where_clause)
     if where_clause:
         # Collect all conditions
         conditions = []
@@ -607,23 +726,16 @@ def rewrite_query_with_p0_table( # TODO: Check duplication with query_processor
 
         collect_conditions(where_clause.this)
 
-        # Filter out partition_key join conditions and add star-schema joins
-        new_conditions = []
-        for condition in conditions:
-            condition_sql = condition.sql()
-            # Skip existing partition_key joins between tables
-            is_partition_join = False
-            for alias1 in table_aliases_with_partition_key:
-                for alias2 in table_aliases_with_partition_key:
-                    if alias1 != alias2:
-                        if f"{alias1}.{partition_key} = {alias2}.{partition_key}" in condition_sql:
-                            is_partition_join = True
-                            break
-                if is_partition_join:
-                    break
+        def is_tied_key_equality(condition: exp.Expr) -> bool:
+            # Exactly a.<key> = b.<key> between two tied aliases; an OR or a longer expression that contains one is kept
+            node = condition.unnest()
+            if not isinstance(node, exp.EQ) or not isinstance(node.this, exp.Column) or not isinstance(node.expression, exp.Column):
+                return False
+            left, right = node.this, node.expression
+            return left.name == right.name == partition_key and left.table != right.table and {left.table, right.table} <= component
 
-            if not is_partition_join:
-                new_conditions.append(condition)
+        # Filter out partition_key join conditions and add star-schema joins
+        new_conditions = [condition for condition in conditions if not is_tied_key_equality(condition)]
 
         # Add star-schema joins through p0
         for alias in table_aliases_with_partition_key:
@@ -741,25 +853,59 @@ def _splice_key_list(rendered_sql: str, sentinel: str, key_list: str) -> str:
     return rendered_sql.replace(sentinel, key_list, 1)
 
 
+def _restricted_select(parsed_query: exp.Expr) -> exp.Select | None:
+    """Return the SELECT the cache restricts: the query itself, or the first branch of a set operation.
+
+    The variants are generated from the first SELECT of a set operation, so their keys restrict that branch only;
+    a restriction in another branch drops rows of a UNION and adds rows to an EXCEPT. Parentheses around a branch
+    are looked through. None when the first branch is not a SELECT (VALUES, for one).
+    """
+    node = parsed_query
+    while not isinstance(node, exp.Select):
+        if isinstance(node, exp.SetOperation | exp.Subquery | exp.Paren):
+            node = node.this
+        else:
+            return None
+    return node
+
+
 def _outer_where(parsed_query: exp.Expr) -> exp.Where | None:
-    """Return the WHERE clause of the outermost SELECT, not one of a FILTER, subquery or CTE.
+    """Return the WHERE clause of the restricted SELECT (``_restricted_select``), not one of a FILTER, subquery or CTE.
 
     ``find(exp.Where)`` returns the first WHERE anywhere in the tree, so a query without an outer WHERE got the
-    condition in a nested one. Set operations have no WHERE of their own; they keep the first nested one.
+    condition in a nested one, and a set operation whose first branch has no WHERE got it in another branch.
     """
-    if isinstance(parsed_query, exp.Select):
-        return parsed_query.args.get("where")
-    return parsed_query.find(exp.Where)
+    select = _restricted_select(parsed_query)
+    return select.args.get("where") if select is not None else None
 
 
 def _add_where_condition(parsed_query: exp.Expr, condition_expr: exp.Expr) -> None:
-    """Add a WHERE condition to the outermost SELECT of a parsed query, creating the WHERE clause if needed."""
-    existing_where: exp.Where | None = _outer_where(parsed_query)
+    """Add a WHERE condition to the restricted SELECT of a parsed query, creating its WHERE clause if needed.
+
+    Raises:
+        ValueError: When the query has no restricted SELECT (``_restricted_select``).
+    """
+    select = _restricted_select(parsed_query)
+    if select is None:
+        raise ValueError(f"The query has no SELECT to restrict (first branch: {type(parsed_query).__name__}); run it without the cache")
+    existing_where: exp.Where | None = select.args.get("where")
     if existing_where is None:
-        new_where = exp.Where(this=condition_expr)
-        parsed_query.args["where"] = new_where
+        select.set("where", exp.Where(this=condition_expr))
     else:
         existing_where.args["this"] = exp.and_(existing_where.args["this"], condition_expr)
+
+
+def _from_clauses(parsed_query: exp.Expr) -> list[exp.Join | exp.From]:
+    """The top-level JOIN clauses and the FROM clause of the restricted SELECT (``_restricted_select``).
+
+    These are the tables the JOIN methods may join the key table to: a table of a subquery, a CTE or another branch of a
+    set operation is not restricted by the cached keys, even when it reuses the p0 alias.
+    """
+    select = _restricted_select(parsed_query)
+    if select is None:
+        return []
+    from_ = select.args.get("from_")
+    return [*(select.args.get("joins") or []), *([from_] if from_ is not None else [])]
 
 
 EMPTY_INTERSECTION_COMMENT = "PartitionCache: cache intersection is empty, query cannot return rows"
@@ -772,16 +918,17 @@ def _add_empty_intersection_condition(query: str, sql_dialect: str = "postgres")
     intersection of valid entries means the query has no result. The empty set itself cannot be
     expressed with the regular methods (``IN ()`` is invalid SQL, ``VALUES`` needs at least one row,
     and an empty temporary table has no known key type), so a commented ``FALSE`` condition is added
-    to the outermost WHERE instead. The query shape is kept, so aggregates still return their
-    empty-input result (e.g. ``COUNT(*) = 0``).
+    to the WHERE of the restricted SELECT (the first branch of a set operation) instead. The query shape
+    is kept, so aggregates still return their empty-input result (e.g. ``COUNT(*) = 0``).
     """
     parsed_query = sqlglot.parse_one(query, read=sql_dialect)
+    select = _restricted_select(parsed_query)
+    if select is None:
+        logger.warning("The query has no SELECT to restrict to no rows; it runs without the cache")
+        return query
     condition = exp.false()
     condition.add_comments([EMPTY_INTERSECTION_COMMENT])
-    if isinstance(parsed_query, exp.Select):
-        parsed_query.where(condition, copy=False)
-    else:
-        _add_where_condition(parsed_query, condition)
+    select.where(condition, copy=False)
     return parsed_query.sql(dialect=sql_dialect)
 
 
@@ -802,8 +949,26 @@ def _temp_table_ddl(table_name: str, sql_dialect: str) -> tuple[str, str]:
     return f"DROP TABLE IF EXISTS {table_name};\n", ""
 
 
+def _join_key_column(parsed_query: exp.Expr, column: str) -> str:
+    """The column name of a JOIN method's key table: ``column``, or ``_FOLDED_KEY_COLUMN_NAME`` where ``column`` would clash.
+
+    Joined into the query, the key table's column is visible to it: an unqualified reference to a column of that name,
+    a ``USING`` of it or a ``NATURAL`` join became ambiguous, and the query failed. The lazy key table's column is named
+    like the partition key, the eager one ``partition_key``. Queries without such a reference keep the name.
+    """
+    name = column.lower()
+    clashes = any(not col.table and col.name.lower() == name for col in parsed_query.find_all(exp.Column))
+    for join in parsed_query.find_all(exp.Join):
+        clashes |= join.args.get("method") == "NATURAL" or any(ident.name.lower() == name for ident in join.args.get("using") or [])
+    return _FOLDED_KEY_COLUMN_NAME if clashes else column
+
+
 def _create_tmp_table_setup(
-    partition_keys: set[int] | set[str] | set[float] | set[datetime], analyze_tmp_table: bool, sql_dialect: str = "postgres", key_filters: list[str] | None = None
+    partition_keys: set[int] | set[str] | set[float] | set[datetime],
+    analyze_tmp_table: bool,
+    sql_dialect: str = "postgres",
+    key_filters: list[str] | None = None,
+    key_column: str = "partition_key",
 ) -> tuple[str, str]:
     """Create the SQL for temporary table setup.
 
@@ -825,14 +990,14 @@ def _create_tmp_table_setup(
     # (see execute_with_temp_tables / PostgresDBHandler.execute and docs/api_reference.md).
     ddl_prefix, ddl_suffix = _temp_table_ddl(table_name, sql_dialect)
     if key_filters and sql_dialect == "postgres":
-        setup_sql = f"CREATE TEMPORARY TABLE {table_name} (partition_key {partition_key_type} PRIMARY KEY){ddl_suffix};\n"
-        setup_sql += _folded_fill_sql(table_name, "partition_key", key_filters, partition_keys=partition_keys, sql_dialect=sql_dialect)
+        setup_sql = f"CREATE TEMPORARY TABLE {table_name} ({key_column} {partition_key_type} PRIMARY KEY){ddl_suffix};\n"
+        setup_sql += _folded_fill_sql(table_name, key_column, key_filters, partition_keys=partition_keys, sql_dialect=sql_dialect)
     else:
-        setup_sql = f"""{ddl_prefix}CREATE TEMPORARY TABLE {table_name} (partition_key {partition_key_type} PRIMARY KEY){ddl_suffix};
-                    INSERT INTO {table_name} (partition_key) VALUES ({partition_keys_str});
+        setup_sql = f"""{ddl_prefix}CREATE TEMPORARY TABLE {table_name} ({key_column} {partition_key_type} PRIMARY KEY){ddl_suffix};
+                    INSERT INTO {table_name} ({key_column}) VALUES ({partition_keys_str});
                     """
         for key_filter in key_filters or ():
-            setup_sql += f"DELETE FROM {table_name} WHERE (partition_key IN ({key_filter})) IS NOT TRUE;\n"
+            setup_sql += f"DELETE FROM {table_name} WHERE ({key_column} IN ({key_filter})) IS NOT TRUE;\n"
 
     if analyze_tmp_table:
         # PRIMARY KEY above already creates a B-tree index; ANALYZE updates statistics for the planner
@@ -879,15 +1044,17 @@ def _planner_collapse_limit_sql(planner_collapse_limit: int | None) -> str:
     return "".join(f"SET LOCAL {setting} = {planner_collapse_limit};\n" for setting in COLLAPSE_LIMIT_SETTINGS)
 
 
-def _unlogged_keys_sql(partition_keys: set[int] | set[str] | set[float] | set[datetime], sql_dialect: str) -> str:
-    """Return the SELECT over a VALUES list of the keys that fills an eager unlogged key table (column ``partition_key``).
+def _unlogged_keys_sql(partition_keys: set[int] | set[str] | set[float] | set[datetime], sql_dialect: str, key_column: str = "partition_key") -> str:
+    """Return the SELECT over a VALUES list of the keys that fills an eager unlogged key table (column ``key_column``).
 
     String keys are escaped string literals; float and timestamp keys are cast to their type, as in the temporary
     key table (``_get_partition_key_sql_type``).
     """
     key_rows = "), (".join(_format_partition_key_for_sql(pk, sql_dialect) for pk in partition_keys)
     key_type = _get_partition_key_sql_type(partition_keys, sql_dialect)
-    column = "partition_key" if key_type in ("INT", "BIGINT", "TEXT") else f"CAST(partition_key AS {key_type}) AS partition_key"
+    column = "partition_key" if key_type in ("INT", "BIGINT", "TEXT") else f"CAST(partition_key AS {key_type})"
+    if column != "partition_key" or key_column != "partition_key":
+        column += f" AS {key_column}"
     return f"SELECT {column} FROM (VALUES ({key_rows})) AS pcache_keys(partition_key)"
 
 
@@ -897,10 +1064,7 @@ def _every_table_joined_on_partition_key(parsed_query: exp.Expr, partition_key: 
     Only then is joining every table to the keys equivalent to joining the p0 table: through the equalities, every
     table's key equals the p0 table's. Equalities under OR or NOT do not hold for every row and do not count.
     """
-    clauses: list[exp.Join | exp.From] = list(parsed_query.find_all(exp.Join))
-    from_1st = parsed_query.find(exp.From)
-    if from_1st is not None:
-        clauses.append(from_1st)
+    clauses = _from_clauses(parsed_query)
     aliases = {clause.alias_or_name for clause in clauses}
     if len(aliases) <= 1:
         return True
@@ -919,7 +1083,7 @@ def _every_table_joined_on_partition_key(parsed_query: exp.Expr, partition_key: 
 
     where = _outer_where(parsed_query)
     collect(where.this if where is not None else None)
-    for join in parsed_query.find_all(exp.Join):
+    for join in clauses:
         collect(join.args.get("on"))
 
     component = {alias: alias for alias in aliases}
@@ -1604,6 +1768,7 @@ def extend_query_with_partition_keys(
             method to use to extend the query. ``UNLOGGED_TABLE_JOIN`` / ``UNLOGGED_TABLE_IN`` (PostgreSQL only) are
             ``TMP_TABLE_JOIN`` / ``TMP_TABLE_IN`` with an unlogged table, always with index and ANALYZE; the script
             ends with its DROP, after the SELECT. Execute it as ONE string so that it runs in one transaction.
+            The JOIN methods add the key table's column to the output of ``SELECT *`` (see ``_join_key_column`` for its name).
         p0_alias (str | None): The alias of the table to use for the partition key; None detects it (``find_p0_alias``).
             The JOIN methods join the key table to this table only.
         analyze_tmp_table (bool): Whether to create index and analyze. (only for temporary table methods)
@@ -1683,27 +1848,21 @@ def extend_query_with_partition_keys(
         return _splice_key_list(parsed_query.sql(dialect=sql_dialect), sentinel, key_list)
 
     elif method == "TMP_TABLE_JOIN" or method == "UNLOGGED_TABLE_JOIN":
+        key_column = _join_key_column(parsed_query, "partition_key")
         if typed_source is not None:
             kind = "UNLOGGED" if method == "UNLOGGED_TABLE_JOIN" else "TEMPORARY"
             tmp_table_setup, table_name = _typed_key_table_setup(
-                kind, "partition_key", typed_source, partition_key, _untyped_key_rows(partition_keys, sql_dialect), analyze_tmp_table, sql_dialect, key_filters, method
+                kind, key_column, typed_source, partition_key, _untyped_key_rows(partition_keys, sql_dialect), analyze_tmp_table, sql_dialect, key_filters, method
             )
         elif method == "UNLOGGED_TABLE_JOIN":
             tmp_table_setup, table_name = _create_unlogged_table_setup(
-                _unlogged_keys_sql(partition_keys, sql_dialect), "partition_key", sql_dialect, method, key_filters, partition_keys
+                _unlogged_keys_sql(partition_keys, sql_dialect, key_column), key_column, sql_dialect, method, key_filters, partition_keys
             )
         else:
-            tmp_table_setup, table_name = _create_tmp_table_setup(partition_keys, analyze_tmp_table, sql_dialect, key_filters)
+            tmp_table_setup, table_name = _create_tmp_table_setup(partition_keys, analyze_tmp_table, sql_dialect, key_filters, key_column)
 
-        # Add as inner join to the p0 table, or with join_every_table to every table
-        from_clauses: list[exp.Join | exp.From] = list(parsed_query.find_all(exp.Join))
-
-        # Add first table from FROM as not present in JOINs
-        from_1st = parsed_query.find(exp.From)
-        if from_1st is not None:
-            from_clauses.append(from_1st)
-
-        for from_clause in from_clauses:
+        # Add as inner join to the p0 table, or with join_every_table to every table, of the restricted SELECT only
+        for from_clause in _from_clauses(parsed_query):
             # Get alias of the table
             table_alias = from_clause.alias_or_name
 
@@ -1717,7 +1876,7 @@ def extend_query_with_partition_keys(
                 + exp.Join(
                     this=exp.Identifier(this=f"{table_name} AS tmp_{table_alias}"),
                     on=exp.EQ(
-                        this=exp.Identifier(this=f"tmp_{table_alias}.partition_key"),
+                        this=exp.Identifier(this=f"tmp_{table_alias}.{key_column}"),
                         expression=exp.Identifier(this=f"{table_alias}.{partition_key}"),
                     ),
                     kind="INNER",
@@ -1787,17 +1946,11 @@ def _all_partition_keys_sql(parsed_query: exp.Expr, p0_alias: str | None, partit
     method and join_every_table (no alias) every table of the FROM and JOIN clauses. Returns None when a target is not a
     plain table (a subquery or a CTE, whose rows a separate statement could not read).
     """
-    targets: list[exp.Expr]
+    # The same clauses TMP_TABLE_JOIN joins the key table to
+    clauses = _from_clauses(parsed_query)
     if p0_alias is not None:
-        targets = [table for table in parsed_query.find_all(exp.Table) if table.alias_or_name == p0_alias]
-        del targets[1:]  # the first table with that alias
-    else:
-        # The same clauses TMP_TABLE_JOIN joins the temporary table to
-        clauses: list[exp.Join | exp.From] = list(parsed_query.find_all(exp.Join))
-        from_1st = parsed_query.find(exp.From)
-        if from_1st is not None:
-            clauses.append(from_1st)
-        targets = [clause.this for clause in clauses]
+        clauses = [clause for clause in clauses if clause.alias_or_name == p0_alias][:1]
+    targets: list[exp.Expr] = [clause.this for clause in clauses]
     cte_names = {cte.alias_or_name for cte in parsed_query.find_all(exp.CTE)}
     if not targets or any(not isinstance(target, exp.Table) or target.name in cte_names for target in targets):
         return None
@@ -1921,25 +2074,21 @@ def extend_query_with_partition_keys_lazy(
 
     elif method == "TMP_TABLE_JOIN" or method == "UNLOGGED_TABLE_JOIN":
         # Create the key table (temporary or unlogged) from the lazy subquery, then JOIN
+        key_column = _join_key_column(parsed_query, partition_key)
+        if key_column != partition_key:
+            lazy_subquery = f"SELECT pcache_keys_src.{partition_key} AS {key_column} FROM ({lazy_subquery}) AS pcache_keys_src"
         if typed_source is not None:
             kind = "UNLOGGED" if method == "UNLOGGED_TABLE_JOIN" else "TEMPORARY"
             tmp_table_setup, table_name = _typed_key_table_setup(
-                kind, partition_key, typed_source, partition_key, lazy_subquery, analyze_tmp_table, sql_dialect, key_filters, method
+                kind, key_column, typed_source, partition_key, lazy_subquery, analyze_tmp_table, sql_dialect, key_filters, method
             )
         elif method == "UNLOGGED_TABLE_JOIN":
-            tmp_table_setup, table_name = _create_unlogged_table_setup(lazy_subquery, partition_key, sql_dialect, method, key_filters)
+            tmp_table_setup, table_name = _create_unlogged_table_setup(lazy_subquery, key_column, sql_dialect, method, key_filters)
         else:
-            tmp_table_setup, table_name = _create_tmp_table_setup_from_subquery(lazy_subquery, partition_key, analyze_tmp_table, sql_dialect, key_filters)
+            tmp_table_setup, table_name = _create_tmp_table_setup_from_subquery(lazy_subquery, key_column, analyze_tmp_table, sql_dialect, key_filters)
 
-        # Add as inner join to the p0 table, or with join_every_table to every table
-        from_clauses: list[exp.Join | exp.From] = list(parsed_query.find_all(exp.Join))
-
-        # Add first table from FROM as not present in JOINs
-        from_1st = parsed_query.find(exp.From)
-        if from_1st is not None:
-            from_clauses.append(from_1st)
-
-        for from_clause in from_clauses:
+        # Add as inner join to the p0 table, or with join_every_table to every table, of the restricted SELECT only
+        for from_clause in _from_clauses(parsed_query):
             # Get alias of the table
             table_alias = from_clause.alias_or_name
 
@@ -1953,7 +2102,7 @@ def extend_query_with_partition_keys_lazy(
                 + exp.Join(
                     this=exp.Identifier(this=f"{table_name} AS tmp_{table_alias}"),
                     on=exp.EQ(
-                        this=exp.Identifier(this=f"tmp_{table_alias}.{partition_key}"),
+                        this=exp.Identifier(this=f"tmp_{table_alias}.{key_column}"),
                         expression=exp.Identifier(this=f"{table_alias}.{partition_key}"),
                     ),
                     kind="INNER",
@@ -2787,6 +2936,9 @@ def apply_cache_lazy(
     """
     Complete wrapper function that applies partition cache to a query using lazy intersection.
 
+    The partition key column must not be NULL in rows the query can return: cached key sets hold no NULL, so the
+    restriction removes the rows of the restricted table whose key is NULL.
+
     Args:
         query (str): The original SQL query to be enhanced with cache functionality.
         cache_handler (AbstractCacheHandler_Lazy): The lazy cache handler instance.
@@ -2808,6 +2960,7 @@ def apply_cache_lazy(
         remove_constraints_all: List of attribute names to remove from all query variants
         remove_constraints_add: List of attribute names to remove, creating additional variants
         protected_patterns: Conditions matching these patterns are never removed during variant generation.
+        skip_partition_key_joins: Variants without partition key joins; see apply_cache.
         temporal_bucket_width: Width of one bucket of a time-bucket partition key, in the unit of ``temporal_column``;
             enables temporal dilation: each cached set is widened by ceil(window / width) buckets before the
             intersection, with the window read from the query's conditions on ``temporal_column``.
@@ -3016,6 +3169,13 @@ def apply_cache_lazy(
         stats["enhanced"] = 1
         return enhanced_query, stats
 
+    # Without key joins and without dilation every alias has its own key: only the variants that select the key of the
+    # restricted alias may restrict it
+    lookup_source = _plain_lookup_source(query, partition_key, skip_partition_key_joins, temporal_bucket_width, dilation_buckets,
+                                         partition_key_source_table, None if use_p0_table else p0_alias, auto_detect_partition_join, partition_join_table)
+    if lookup_source is _NO_KEY_SOURCE:
+        return query, _uncached_stats("no_key_source", gate_stats)
+
     # Non-spatial path: use partition key lazy intersection
     # Step 1: Generate query variants from original query
     lazy_cache_subquery, generated_variants, used_hashes = get_partition_keys_lazy(
@@ -3038,17 +3198,18 @@ def apply_cache_lazy(
         dilation_buckets=dilation_buckets,
         temporal_column=temporal_column,
         keep_all_attributes=keep_all_attributes,
-        # Only temporal lookups use it here, so that other lookups keep the variants they had
-        partition_key_source_table=partition_key_source_table if _is_temporal(temporal_bucket_width, dilation_buckets) else None,
+        # Only temporal lookups and lookups without key joins use it here, so that other lookups keep the variants they had
+        partition_key_source_table=lookup_source,
     )
 
     # Step 2: Optionally rewrite with p0 table
     working_query = query
     p0_rewritten = 0
-    if use_p0_table and _is_temporal(temporal_bucket_width, dilation_buckets):
+    if use_p0_table and (_is_temporal(temporal_bucket_width, dilation_buckets) or skip_partition_key_joins):
         # The p0 rewrite joins every alias on the partition key (alias.w = p0.w), which drops the pairs across a bucket
-        # boundary that temporal dilation keeps; restrict the anchor alias instead (p0_alias names the p0 table here)
-        logger.warning("use_p0_table is ignored for a temporal partition key: it would put all aliases into the same bucket")
+        # boundary that temporal dilation keeps, and the pairs of different keys a lookup without key joins keeps;
+        # restrict the anchor alias instead (p0_alias names the p0 table here)
+        logger.warning("use_p0_table is ignored for a temporal partition key or skip_partition_key_joins: it would put all aliases into the same partition")
         use_p0_table = False
         p0_alias = None
     if use_p0_table:
@@ -3155,6 +3316,9 @@ def apply_cache(
     Supports spatial mode when geometry_column is set: uses spatial cache handlers to get
     a pre-computed geometry filter (WKB) and applies it via ST_DWithin.
 
+    The partition key column must not be NULL in rows the query can return: cached key sets hold no NULL, so the
+    restriction (also the FALSE of an empty intersection) removes the rows of the restricted table whose key is NULL.
+
     Args:
         query (str): The original SQL query to be enhanced with cache functionality.
         cache_handler (AbstractCacheHandler): The cache handler instance.
@@ -3179,6 +3343,9 @@ def apply_cache(
             the cache was populated with, as in apply_cache_lazy.
         protected_patterns: Conditions matching these patterns are never removed during variant generation.
         skip_partition_key_joins (bool): If True, skip partition key joins in variant generation.
+            Each alias then has its own key; without temporal or spatial parameters only the variants that select the
+            restricted alias's key are looked up, and a restricted alias that is no plain table runs the query uncached
+            (``uncached_reason``: ``no_key_source``). ``use_p0_table`` is ignored with it.
         temporal_bucket_width: Width of one bucket of a time-bucket partition key, in the unit of ``temporal_column``;
             enables temporal dilation: each cached set is widened by ceil(window / width) buckets before the
             intersection, with the window read from the query's conditions on ``temporal_column``.
@@ -3420,6 +3587,13 @@ def apply_cache(
         logger.info(f"Successfully enhanced query with spatial cache. Generated {generated_variants} subqueries, {used_hashes} cache hits")
         return enhanced_query, stats
 
+    # Without key joins and without dilation every alias has its own key: only the variants that select the key of the
+    # restricted alias may restrict it
+    lookup_source = _plain_lookup_source(query, partition_key, skip_partition_key_joins, temporal_bucket_width, dilation_buckets,
+                                         partition_key_source_table, None if use_p0_table else p0_alias, auto_detect_partition_join, partition_join_table)
+    if lookup_source is _NO_KEY_SOURCE:
+        return query, _uncached_stats("no_key_source", gate_stats)
+
     # Non-spatial path (original logic)
     # Step 1: Generate all query variants from ORIGINAL query (not p0-rewritten)
     partition_keys, generated_variants, used_hashes = get_partition_keys(
@@ -3442,17 +3616,18 @@ def apply_cache(
         dilation_buckets=dilation_buckets,
         temporal_column=temporal_column,
         keep_all_attributes=keep_all_attributes,
-        # Only temporal lookups use it here, so that other lookups keep the variants they had
-        partition_key_source_table=partition_key_source_table if _is_temporal(temporal_bucket_width, dilation_buckets) else None,
+        # Only temporal lookups and lookups without key joins use it here, so that other lookups keep the variants they had
+        partition_key_source_table=lookup_source,
     )
 
     # Step 2: Optionally rewrite original query with p0 table
     working_query = query
     p0_rewritten = 0
-    if use_p0_table and _is_temporal(temporal_bucket_width, dilation_buckets):
+    if use_p0_table and (_is_temporal(temporal_bucket_width, dilation_buckets) or skip_partition_key_joins):
         # The p0 rewrite joins every alias on the partition key (alias.w = p0.w), which drops the pairs across a bucket
-        # boundary that temporal dilation keeps; restrict the anchor alias instead (p0_alias names the p0 table here)
-        logger.warning("use_p0_table is ignored for a temporal partition key: it would put all aliases into the same bucket")
+        # boundary that temporal dilation keeps, and the pairs of different keys a lookup without key joins keeps;
+        # restrict the anchor alias instead (p0_alias names the p0 table here)
+        logger.warning("use_p0_table is ignored for a temporal partition key or skip_partition_key_joins: it would put all aliases into the same partition")
         use_p0_table = False
         p0_alias = None
     if use_p0_table:

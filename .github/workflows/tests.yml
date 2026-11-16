@@ -38,10 +38,10 @@ jobs:
       run: |
         python -m pip install --upgrade pip
         if [ "${{ matrix.python-version }}" = "3.15" ]; then
-          # rocksdict has no 3.15 wheel; tests/pytest/conftest.py skips the files that need it
+          # rocksdict and h3 have no 3.15 wheel; tests/pytest/conftest.py skips the files that need rocksdict, the h3 tests skip
           pip install -e ".[testing]" psycopg redis "duckdb>=2.0" mysql-connector-python
         else
-          pip install -e ".[testing,db]"
+          pip install -e ".[testing,db,spatial]"
         fi
     
     - name: Run linting
