@@ -20,8 +20,8 @@ Against `main` at 3b132dc (#76), the state the release review started from:
 - **Fragment queue order.** New fragments get a priority by size (`10 - tables`), so the smaller fragments of all
   queued queries are popped first. On by default; `--no-size-priority` or `QUERY_QUEUE_SIZE_PRIORITY=false` gives
   the former order (#77).
-- **JOIN restriction methods** join the key table only to the p0 table of the restricted SELECT;
-  `join_every_table` opts in to joining every table of that SELECT (#62, #86).
+- **JOIN restriction methods** join the key table only to tables of the FROM clause and the top-level joins of
+  the restricted SELECT, not to tables of subqueries or other branches that reuse an alias (#86).
 - **Settings in an `--env` file.** `PARTITION_CACHE_*` values that stand only in the env file now take effect; they
   were ignored before. Precedence: command-line flag, exported variable, env file, built-in default (#80).
 - **Lazy insertion** is used only when the cache handler's connection and the data connection are the same server
@@ -58,19 +58,20 @@ Against `main` at 3b132dc (#76), the state the release review started from:
   one day). The roaring bitmap handler refuses negative keys. A new partition key whose truncated cache table name is
   that of another registered key is refused (#83).
 
+- **Bit caches.** The bit cache tables of one prefix share one bitsize trigger function; older caches are switched
+  when a handler starts (#81).
+
 Earlier changes that a user of an older untagged state meets (see the history for the full list):
 
 - `partitioncache.query_processor.variant_signature` and `is_relaxation_of` are gone; population restricts a
   variant through the cache lookup of its query (#61).
-- `pcache-monitor` joins the key table to the p0 table as well; `--join-every-table` restores the former
-  behaviour (#62).
+- The JOIN restriction methods join the key table to the p0 table only; `join_every_table`
+  (`--join-every-table` in `pcache-add` and `pcache-monitor`) joins every table as before (#62).
 - `pcache-monitor` records a fragment that timed out, failed or hit `--limit` and skips it from then on (#42).
 - Key lists and key tables are typed like the key column for timestamp, `char(n)` and `real` keys (#64, #68).
 - With `skip_partition_key_joins` and no explicit source, the alias whose key the query selects is the key
   source; variants of self-joins got other hashes (#72).
 - `set_entry_lazy` writes the query row only together with its cache row (#76).
-- The bit cache tables of one prefix share one bitsize trigger function; older caches are switched when a
-  handler starts (#81).
 
 ### Fixed
 
@@ -94,7 +95,19 @@ Earlier changes that a user of an older untagged state meets (see the history fo
   LIMIT, GROUP BY and HAVING were removed from negated subqueries; a CTE query was decomposed from the CTE body;
   table names containing FROM or WHERE were cut; with `skip_partition_key_joins` a key condition moved to another
   alias; `BETWEEN SYMMETRIC` on one table became a contradiction; mixed-case quoted names lost their quotes (#87).
+- Long table prefixes: with a prefix over 44 characters, eviction evicted nothing and the status report did not
+  list the cache; with a cache table name over 63 bytes the queue processor bootstrapped the partition again in
+  every job (#89).
 - Tests that reported failures as skips now fail; the H3 tests run in CI (#79).
+
+### Upgrading an existing installation
+
+The SQL functions live in the database. Reload them with `pcache-postgresql-queue-processor setup` (processor and
+status report) and `pcache-postgresql-eviction-manager setup` (eviction); until then the scheduled jobs keep
+running the old functions. A process of an older version that runs its setup on the same database reinstalls the
+old ones. The queue-processor notes are in `docs/postgresql_queue_processor.md` under "Upgrading". Clear the caches
+of queries whose variants changed (see "Queries without variants" and the `skip_partition_key_joins` entries
+above): their old entries are no longer looked up, and for these shapes some were wrong.
 
 ### Known limitations
 
