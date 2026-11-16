@@ -6,7 +6,7 @@ import psycopg
 from bitarray import bitarray
 from psycopg import sql
 
-from partitioncache.cache_handler.postgresql_abstract import PostgreSQLAbstractCacheHandler, _ends_read_transaction
+from partitioncache.cache_handler.postgresql_abstract import PostgreSQLAbstractCacheHandler, _ends_read_transaction, _shared_cache_table_refusal
 from partitioncache.key_table_script import lazy_insertion_parts
 
 logger = getLogger("PartitionCache")
@@ -205,7 +205,6 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
         Returns:
             tuple: (success, actual_bitsize) - The actual bitsize that was set/retrieved
         """
-        self._check_cache_table_name(partition_key)
         bitsize = kwargs.get("bitsize", self.default_bitsize)
         try:
             # Check if partition already exists with sufficient bitsize
@@ -274,6 +273,9 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
         except Exception as e:
             logger.error(f"Failed to ensure partition table for {partition_key}: {e}")
             self.db.rollback()
+            refused = _shared_cache_table_refusal(e)
+            if refused:
+                raise refused from e
             raise
 
     def set_cache(self, key: str, partition_key_identifiers: set[int] | set[str] | set[float] | set[datetime], partition_key: str = "partition_key") -> bool:

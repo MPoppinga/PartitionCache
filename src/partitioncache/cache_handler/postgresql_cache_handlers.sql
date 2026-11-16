@@ -131,16 +131,10 @@ DECLARE
     v_partition_exists BOOLEAN;
     v_bitsize_sufficient BOOLEAN;
     v_index_name TEXT;
+    v_sharing_key TEXT;
 BEGIN
     v_metadata_table := partitioncache_get_metadata_table_name(p_table_prefix);
     v_cache_table := partitioncache_get_cache_table_name(p_table_prefix, p_partition_key);
-
-    -- PostgreSQL truncates longer identifiers without an error: partition keys with a long common beginning
-    -- would share one cache table (the Python handlers refuse them as well)
-    IF octet_length(v_cache_table) > 63 THEN
-        RAISE EXCEPTION 'Cache table name % of partition key % is % bytes; PostgreSQL truncates identifiers longer than 63 bytes',
-            v_cache_table, p_partition_key, octet_length(v_cache_table);
-    END IF;
 
     -- Already exists: nothing to create. Nested rather than one AND -- the row probe below
     -- reads v_metadata_table, and it is the outer test that guarantees the table is there.
@@ -180,6 +174,21 @@ BEGIN
     -- Check if partition already exists
     EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I WHERE partition_key = %L)', v_metadata_table, p_partition_key)
     INTO v_partition_exists;
+
+    -- PostgreSQL truncates identifiers to 63 bytes (without splitting a character). A truncated cache table name
+    -- works, but a new key whose truncated name is that of another registered key would share its table and read its
+    -- entries: refuse it. Keys already registered are left as they are. Under the prefix's lock taken above.
+    IF NOT v_partition_exists THEN
+        EXECUTE format('SELECT partition_key FROM %I WHERE partition_key <> %L
+                        AND partitioncache_get_cache_table_name(%L, partition_key)::name = %L::name LIMIT 1',
+                       v_metadata_table, p_partition_key, p_table_prefix, v_cache_table)
+        INTO v_sharing_key;
+        IF v_sharing_key IS NOT NULL THEN
+            RAISE EXCEPTION 'Partition key % would share the cache table % with partition key %: PostgreSQL truncates identifiers to 63 bytes',
+                p_partition_key, v_cache_table::name, v_sharing_key
+                USING ERRCODE = 'PCT01';
+        END IF;
+    END IF;
     
     -- For bit cache, handle bitsize conflicts by allowing growth
     IF v_partition_exists AND p_cache_backend = 'bit' AND p_bitsize IS NOT NULL THEN

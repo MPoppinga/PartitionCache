@@ -5,7 +5,7 @@ from bitarray import bitarray
 from psycopg import sql
 from pyroaring import BitMap
 
-from partitioncache.cache_handler.postgresql_abstract import PostgreSQLAbstractCacheHandler
+from partitioncache.cache_handler.postgresql_abstract import PostgreSQLAbstractCacheHandler, _shared_cache_table_refusal
 from partitioncache.key_table_script import lazy_insertion_parts
 
 logger = getLogger("PartitionCache")
@@ -126,7 +126,6 @@ class PostgreSQLRoaringBitCacheHandler(PostgreSQLAbstractCacheHandler):
 
     def _ensure_partition_table(self, partition_key: str, datatype: str, **kwargs) -> bool:
         """Ensure a partition table exists using SQL bootstrap function."""
-        self._check_cache_table_name(partition_key)
         try:
             with self._serialized_ddl():
                 # Load SQL functions first to ensure they're available
@@ -149,6 +148,10 @@ class PostgreSQLRoaringBitCacheHandler(PostgreSQLAbstractCacheHandler):
         except Exception as e:
             logger.error(f"Failed to ensure roaringbit partition table for {partition_key}: {e}")
             self.db.rollback()
+            refused = _shared_cache_table_refusal(e)
+            if refused:
+                # Returning False here, set_cache would write into the other key's table
+                raise refused from e
             return False
 
     def set_cache(

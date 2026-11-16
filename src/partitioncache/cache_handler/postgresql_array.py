@@ -5,7 +5,7 @@ from logging import getLogger
 from psycopg import sql
 
 from partitioncache.cache_handler.abstract import LAZY_ALL_KEYS_PLACEHOLDER
-from partitioncache.cache_handler.postgresql_abstract import PostgreSQLAbstractCacheHandler
+from partitioncache.cache_handler.postgresql_abstract import PostgreSQLAbstractCacheHandler, _shared_cache_table_refusal
 from partitioncache.key_table_script import lazy_insertion_parts
 
 logger = getLogger("PartitionCache")
@@ -61,7 +61,6 @@ class PostgreSQLArrayCacheHandler(PostgreSQLAbstractCacheHandler):
 
     def _ensure_partition_table(self, partition_key: str, datatype: str, **kwargs):
         """Ensure a partition table exists with the correct datatype using SQL bootstrap function."""
-        self._check_cache_table_name(partition_key)
         try:
             with self._serialized_ddl():
                 # Load SQL functions first to ensure they're available
@@ -88,6 +87,10 @@ class PostgreSQLArrayCacheHandler(PostgreSQLAbstractCacheHandler):
             return True
         except Exception as e:
             logger.error(f"Failed to ensure partition table for {partition_key}: {e}")
+            refused = _shared_cache_table_refusal(e)
+            if refused:
+                self.db.rollback()
+                raise refused from e
             # Rollback and retry with manual table creation as fallback
             try:
                 self.db.rollback()
