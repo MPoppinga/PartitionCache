@@ -2812,6 +2812,9 @@ def apply_cache_lazy(
     """
     Complete wrapper function that applies partition cache to a query using lazy intersection.
 
+    The partition key column must not be NULL in rows the query can return: cached key sets hold no NULL, so the
+    restriction removes the rows of the restricted table whose key is NULL.
+
     Args:
         query (str): The original SQL query to be enhanced with cache functionality.
         cache_handler (AbstractCacheHandler_Lazy): The lazy cache handler instance.
@@ -3163,6 +3166,9 @@ def apply_cache(
 
     Supports spatial mode when geometry_column is set: uses spatial cache handlers to get
     a pre-computed geometry filter (WKB) and applies it via ST_DWithin.
+
+    The partition key column must not be NULL in rows the query can return: cached key sets hold no NULL, so the
+    restriction (also the FALSE of an empty intersection) removes the rows of the restricted table whose key is NULL.
 
     Args:
         query (str): The original SQL query to be enhanced with cache functionality.

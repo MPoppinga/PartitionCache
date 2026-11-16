@@ -435,6 +435,8 @@ enhanced_query, stats = partitioncache.apply_cache_lazy(
 
 Applies partition cache to a query using regular (non-lazy) cache handlers. Supports spatial mode. Accepts the same `cost_estimator` / `min_query_cost` gate and `join_every_table` option as `apply_cache_lazy`. Like `apply_cache_lazy`, it takes `sql_dialect` (default `"postgres"`), the sqlglot dialect the enhanced non-spatial query is parsed and rendered in.
 
+**Requirement (both `apply_cache` and `apply_cache_lazy`):** the partition key column must not be NULL in rows the query can return. Cached key sets never contain NULL, so every restriction (`IN`, a key table, the `FALSE` of an empty intersection) removes the rows of the restricted table whose key is NULL.
+
 **Spatial Parameters** (in addition to standard parameters):
 - `geometry_column` (str | None, optional): Enables spatial mode. Requires a spatial cache handler with `get_spatial_filter()` method.
 - `buffer_distance` (float | None, optional): Buffer distance in meters for spatial filter (required when `geometry_column` is set).
