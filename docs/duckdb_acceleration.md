@@ -100,6 +100,7 @@ Cache entries are computed from what DuckDB returns, so DuckDB must see the same
 - **Time zone:** `timestamptz` is evaluated in PostgreSQL's session time zone (comparisons with literals, `extract`, `::date`, `date_trunc`). If DuckDB does not know the zone name, the accelerator stays off.
 - **Other differences** that can change results: `round()` of doubles at .5 (DuckDB rounds half away from zero, PostgreSQL to even), and regular expressions (RE2 in DuckDB, POSIX in PostgreSQL).
 - **Text ordering** is byte-wise in DuckDB; with a non-C collation in PostgreSQL, range comparisons on text (`name > 'M'`) can differ. Equality and `LIKE` are not affected.
+- **NULL keys** are dropped from the result, as on PostgreSQL.
 - A query DuckDB cannot run (unknown table or function, PostgreSQL-only syntax) runs on PostgreSQL instead, through an autocommit connection. A DuckDB query that exceeds the timeout is interrupted and also runs on PostgreSQL.
 - With `--duckdb-read-unloaded-tables`, names that are not preloaded are read from PostgreSQL's `public` schema through DuckDB's read-only attachment, live, while preloaded tables are the snapshot from startup; a query joining both mixes the two states. Schema-qualified names outside `public` that are not preloaded still run on PostgreSQL.
 

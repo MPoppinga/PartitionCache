@@ -63,6 +63,15 @@ def _conninfo_value(value: Any) -> str:
     return "'" + str(value).replace("\\", "\\\\").replace("'", "\\'") + "'"
 
 
+def _key_set(rows: list) -> set[Any]:
+    """The keys of a result (its first column, or whole rows if it has several), without NULL keys.
+
+    PostgresDBHandler.execute and the PL/pgSQL queue processor drop NULL keys too; a None would count toward the
+    monitor's --limit, could make set_cache reject the set, or be stored as a NULL element.
+    """
+    return {row[0] if len(row) == 1 else row for row in rows if row[0] is not None}
+
+
 class DuckDBQueryAccelerator:
     """
     DuckDB-based query accelerator for PostgreSQL database queries.
@@ -435,7 +444,7 @@ class DuckDBQueryAccelerator:
                 # Execute query with thread-local cursor
                 cursor = self._cursor()
                 result = cursor.execute(query).fetchall()
-                result_set = {row[0] if len(row) == 1 else row for row in result}
+                result_set = _key_set(result)
                 cursor.close()
 
             duration = time.perf_counter() - start_time
@@ -478,7 +487,7 @@ class DuckDBQueryAccelerator:
                 cursor = self._cursor()
                 result_container["cursor"] = cursor
                 result = cursor.execute(query).fetchall()
-                result_container["result"] = {row[0] if len(row) == 1 else row for row in result}
+                result_container["result"] = _key_set(result)
                 result_container["completed"] = True
                 logger.debug(f"DuckDB query worker completed successfully with {len(result)} rows")
             except Exception as e:
@@ -545,8 +554,7 @@ class DuckDBQueryAccelerator:
                 # not in the first one; the connection is in autocommit, so the one-string script is one transaction
                 result = fetch_final_result_set(cursor)
 
-            # Convert to set for compatibility
-            result_set = {row[0] if len(row) == 1 else row for row in result}
+            result_set = _key_set(result)
 
             duration = time.perf_counter() - start_time
             self._update_stats(total_fallback_time=duration)

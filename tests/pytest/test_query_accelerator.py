@@ -576,3 +576,83 @@ def test_duckdb_uses_the_postgresql_session_time_zone():
     accelerator.duckdb_conn = Mock()
     accelerator._use_postgresql_timezone()
     accelerator.duckdb_conn.execute.assert_called_once_with("SET GLOBAL TimeZone = 'America/St_John''s'")
+
+
+class _ReferencePostgresCursor:
+    """Stands in for the PostgreSQL fallback: runs a script statement by statement on its own DuckDB connection and
+    exposes the result sets as psycopg does (a SELECT has rows, the other statements have no description)."""
+
+    def __init__(self, conn):
+        self._conn = conn
+        self._sets: list = []
+        self._index = 0
+        self.description = None
+        self.queries: list[str] = []
+
+    def execute(self, query):
+        import duckdb
+
+        self.queries.append(query)
+        self._sets = []
+        for statement in self._conn.extract_statements(query):
+            rows = self._conn.execute(statement.query).fetchall()
+            self._sets.append(rows if statement.type == duckdb.StatementType.SELECT else None)
+        self._index = 0
+        self._position()
+
+    def _position(self):
+        self.description = None if self._sets[self._index] is None else [("key",)]
+
+    def fetchall(self):
+        return self._sets[self._index]
+
+    def nextset(self):
+        if self._index + 1 >= len(self._sets):
+            return None
+        self._index += 1
+        self._position()
+        return True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return None
+
+
+class _ReferencePostgresConnection:
+    def __init__(self, conn):
+        self.cursor_ = _ReferencePostgresCursor(conn)
+
+    def cursor(self):
+        return self.cursor_
+
+
+_READINGS = "CREATE TABLE readings (region_id INT, value INT, label VARCHAR); INSERT INTO readings VALUES (1, 10, 'a_b'), (2, 1, 'axb'), (3, 10, 'axb'), (NULL, 10, 'a_b')"
+
+
+def _accelerator_on_duckdb(query_timeout: float = 0):
+    """An accelerator with a real in-memory DuckDB and a reference fallback, both holding the readings table."""
+    import duckdb
+
+    from partitioncache.query_accelerator import DuckDBQueryAccelerator
+
+    accelerator = DuckDBQueryAccelerator({}, query_timeout=query_timeout)
+    accelerator.duckdb_conn = duckdb.connect()
+    accelerator.duckdb_conn.execute(_READINGS)
+    reference = duckdb.connect()
+    reference.execute(_READINGS)
+    accelerator.postgresql_conn = _ReferencePostgresConnection(reference)
+    accelerator._initialized = True
+    return accelerator
+
+
+@pytest.mark.parametrize("path", ["duckdb", "duckdb_timeout", "fallback"])
+def test_null_keys_are_dropped_on_every_path(path):
+    """PostgresDBHandler.execute drops NULL keys; the accelerator must return the same set."""
+    accelerator = _accelerator_on_duckdb(query_timeout=30 if path == "duckdb_timeout" else 0)
+    if path == "fallback":
+        accelerator._initialized = False
+
+    assert accelerator.execute_query("SELECT r.region_id FROM readings AS r WHERE r.value > 5") == {1, 3}
+    assert len(accelerator.postgresql_conn.cursor_.queries) == (1 if path == "fallback" else 0)
