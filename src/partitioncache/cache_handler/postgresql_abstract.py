@@ -14,6 +14,7 @@ from psycopg.pq import TransactionStatus
 
 from partitioncache.cache_handler.abstract import LAZY_ALL_KEYS_PLACEHOLDER, AbstractCacheHandler_Lazy
 from partitioncache.cache_handler.thread_safety import ThreadSafeHandler
+from partitioncache.key_table_script import lazy_insertion_parts
 
 logger = getLogger("PartitionCache")
 
@@ -372,7 +373,14 @@ class PostgreSQLAbstractCacheHandler(ThreadSafeHandler, AbstractCacheHandler_Laz
 
         check is PL/pgSQL run between the two statements, with the keys in v_keys and the variables
         v_min / v_max (bigint) available, e.g. to reject keys a bit array cannot hold.
+
+        query can also be a key-table restriction script (``TMP_TABLE_*``, ``UNLOGGED_TABLE_*``): its setup runs
+        first and its teardown last, in this transaction, and the keys of its SELECT are stored as above
+        (``lazy_insertion_parts``). The caller commits.
         """
+        setup, query, teardown = lazy_insertion_parts(query)
+        if setup.strip():
+            self.cursor.execute(setup)  # type: ignore[arg-type]
         select = sql.SQL("SELECT ARRAY(SELECT {col} FROM ({query}) AS query_result WHERE {col} IS NOT NULL)").format(
             col=sql.Identifier(partition_key),
             query=sql.SQL(query),  # type: ignore[arg-type]
@@ -398,6 +406,8 @@ class PostgreSQLAbstractCacheHandler(ThreadSafeHandler, AbstractCacheHandler_Laz
         )
         # No parameters are passed, so psycopg does not interpret % in the block
         self.cursor.execute(block)  # type: ignore[arg-type]
+        if teardown.strip():
+            self.cursor.execute(teardown)  # type: ignore[arg-type]
 
     def set_null(self, key: str, partition_key: str = "partition_key") -> bool:
         """Set null value in partition-specific table."""
