@@ -20,12 +20,15 @@ from partitioncache.cli.common_args import (
     add_database_args,
     add_environment_args,
     add_grid_args,
+    add_size_priority_arg,
     add_spatial_args,
     add_variant_generation_args,
     add_verbosity_args,
     check_grid_key,
     get_database_connection_params,
     grid_cell_size_for,
+    lazy_insertion_refusal_for,
+    load_env_file_before_parsing,
     load_environment_with_validation,
     parse_variant_generation_json_args,
     resolve_cache_backend,
@@ -35,15 +38,17 @@ from partitioncache.db_handler import get_db_handler
 from partitioncache.logging_utils import configure_enhanced_logging, get_thread_aware_logger
 from partitioncache.population import RestrictionCounts, restrict_with_cache
 from partitioncache.query_accelerator import create_query_accelerator
-from partitioncache.query_processor import generate_all_query_hash_pairs, order_variants_for_population
+from partitioncache.query_processor import generate_all_query_hash_pairs, hash_query, order_variants_for_population
 from partitioncache.queue import (
     get_queue_lengths,
     pop_from_original_query_queue,
     pop_from_original_query_queue_blocking,
     pop_from_query_fragment_queue,
     pop_from_query_fragment_queue_blocking,
+    push_to_original_query_queue,
     push_to_query_fragment_queue,
 )
+from partitioncache.queue_handler.size_priority import size_priority_enabled
 from partitioncache.spatial_grid import GRID_GENERATION_KWARGS
 
 logger = get_thread_aware_logger("PartitionCache")
@@ -178,6 +183,14 @@ last_status_log_time = 0.0
 status_log_interval = 10  # Log status every 10 seconds when idle
 
 
+# Held by the decomposer from its pop of an original query to the push of the query's fragments. --close counts the
+# queues under it, so no query can be popped between that count and the exit.
+decomposition_lock = threading.Lock()
+
+# Original queries put back after their fragments could not be pushed, as (query hash, partition key)
+_requeued_original_queries: set[tuple[str, str]] = set()
+
+
 def query_fragment_processor(args, constraint_args):
     """Thread function that decomposes and recomposes original queries into query variants and pushes them to the variant queue.
 
@@ -186,71 +199,105 @@ def query_fragment_processor(args, constraint_args):
         constraint_args: Tuple of (add_constraints, remove_constraints_all, remove_constraints_add)
     """
     logger.info("Starting query fragment processor thread")
+    # Under --close the pop does not wait for new queries while it holds decomposition_lock: that would keep the
+    # close check out; the decomposer waits outside the lock instead
+    waits_in_pop = not getattr(args, "disable_optimized_polling", False) and not getattr(args, "close", False)
 
-    while not exit_event.is_set():
+    while True:
+        query_result = None
         try:
-            # Pop query from original query queue
-            # Use blocking or non-blocking based on settings
-            if not getattr(args, "disable_optimized_polling", False):
-                # Use efficient blocking pop (with LISTEN/NOTIFY for PostgreSQL, native blocking for Redis)
-                query_result = pop_from_original_query_queue_blocking(timeout=60)
-            else:
-                # Use regular pop when optimized polling is disabled
-                query_result = pop_from_original_query_queue()
-
-            if query_result is None:
-                continue  # Timeout occurred, check exit event and try again
-
-            query, partition_key, partition_datatype = query_result
-            logger.debug(f"Processing original query into query variants for partition_key: {partition_key} (datatype: {partition_datatype})")
-
-            # Grid-cell keys: fragments select cells; the forced flags must match the grid lookup's
-            grid_size = grid_cell_size_for(args, partition_key)
-            if grid_size is not None:
-                problem = check_grid_key(partition_key, partition_datatype, resolve_cache_backend(args))
-                if problem is not None:
-                    logger.error(f"Skipping query: {problem}")
-                    continue
-
-            # Detect spatial mode and resolve geometry column from handler
-            is_spatial = partition_datatype == "geometry"
-            resolved_backend = resolve_cache_backend(args) if is_spatial else None
-            geometry_column = None
-            if resolved_backend is not None:
-                try:
-                    spatial_cache_handler = get_cache_handler(resolved_backend, singleton=True)
-                    geometry_column = getattr(spatial_cache_handler, "geometry_column", "geom")
-                except Exception as e:
-                    logger.debug("Could not resolve geometry column from cache handler, using default 'geom': %s", e)
-                    geometry_column = "geom"
-            elif grid_size is not None:
-                geometry_column = getattr(args, "geometry_column", None) or "geom"
-
-            # Process the query into query variants using the partition_key from queue
-            query_hash_pairs = generate_all_query_hash_pairs(
-                query,
-                partition_key,
-                warn_no_partition_key=not args.no_warn_partition_key,
-                **variant_settings(args, constraint_args, partition_key, partition_datatype, geometry_column),
-            )
-            # Smallest variants first, so cache optimization can restrict the larger ones with them
-            query_hash_pairs = order_variants_for_population(query_hash_pairs)
-            logger.debug(f"Generated {len(query_hash_pairs)} query variants from original query")
-
-            # Push variants to the variant queue using the partition_key and datatype from queue
-            # For spatial queries, resolve and pass cache_backend so the processor knows which handler to use
-            queue_cache_backend = resolved_backend
-            success = push_to_query_fragment_queue(query_hash_pairs, partition_key, partition_datatype, cache_backend=queue_cache_backend)
-            if success:
-                logger.debug(f"Pushed {len(query_hash_pairs)} query variants to the variant queue")
-            else:
-                logger.error("Error pushing query variants to the variant queue")
-
+            with decomposition_lock:
+                if exit_event.is_set():
+                    break
+                if waits_in_pop:
+                    # Efficient blocking pop (LISTEN/NOTIFY for PostgreSQL, native blocking for Redis)
+                    query_result = pop_from_original_query_queue_blocking(timeout=60)
+                else:
+                    query_result = pop_from_original_query_queue()
+                if query_result is not None:
+                    decompose_original_query(*query_result, args, constraint_args)
         except Exception as e:
             logger.error(f"Error in query fragment processor: {e}")
             time.sleep(1)  # Brief pause before retrying
+            continue
+        if query_result is None and not waits_in_pop:
+            exit_event.wait(0.5)
 
     logger.info("Query fragment processor thread exiting")
+
+
+def decompose_original_query(query: str, partition_key: str, partition_datatype: str | None, args, constraint_args) -> None:
+    """Decompose an original query into query variants and push them to the variant queue.
+
+    Args:
+        query: The original query.
+        partition_key: Its partition key.
+        partition_datatype: The datatype of the partition key, None if the query was queued without one.
+        args: Command line arguments.
+        constraint_args: Tuple of (add_constraints, remove_constraints_all, remove_constraints_add).
+    """
+    logger.debug(f"Processing original query into query variants for partition_key: {partition_key} (datatype: {partition_datatype})")
+
+    # Grid-cell keys: fragments select cells; the forced flags must match the grid lookup's
+    grid_size = grid_cell_size_for(args, partition_key)
+    if grid_size is not None:
+        problem = check_grid_key(partition_key, partition_datatype, resolve_cache_backend(args))  # type: ignore[arg-type]
+        if problem is not None:
+            logger.error(f"Skipping query: {problem}")
+            return
+
+    # Detect spatial mode and resolve geometry column from handler
+    is_spatial = partition_datatype == "geometry"
+    resolved_backend = resolve_cache_backend(args) if is_spatial else None
+    geometry_column = None
+    if resolved_backend is not None:
+        try:
+            spatial_cache_handler = get_cache_handler(resolved_backend, singleton=True)
+            geometry_column = getattr(spatial_cache_handler, "geometry_column", "geom")
+        except Exception as e:
+            logger.debug("Could not resolve geometry column from cache handler, using default 'geom': %s", e)
+            geometry_column = "geom"
+    elif grid_size is not None:
+        geometry_column = getattr(args, "geometry_column", None) or "geom"
+
+    # Process the query into query variants using the partition_key from queue
+    query_hash_pairs = generate_all_query_hash_pairs(
+        query,
+        partition_key,
+        warn_no_partition_key=not args.no_warn_partition_key,
+        **variant_settings(args, constraint_args, partition_key, partition_datatype, geometry_column),
+    )
+    # Smallest variants first, so cache optimization can restrict the larger ones with them
+    query_hash_pairs = order_variants_for_population(query_hash_pairs)
+    logger.debug(f"Generated {len(query_hash_pairs)} query variants from original query")
+
+    # Push variants to the variant queue using the partition_key and datatype from queue
+    # For spatial queries, resolve and pass cache_backend so the processor knows which handler to use
+    queue_cache_backend = resolved_backend
+    success = push_to_query_fragment_queue(
+        query_hash_pairs, partition_key, partition_datatype, cache_backend=queue_cache_backend, size_priority=getattr(args, "size_priority", None)
+    )
+    if success:
+        logger.debug(f"Pushed {len(query_hash_pairs)} query variants to the variant queue")
+        if _requeued_original_queries:
+            _requeued_original_queries.discard((hash_query(query), partition_key))
+    else:
+        _put_back_original_query(query, partition_key, partition_datatype, len(query_hash_pairs))
+
+
+def _put_back_original_query(query: str, partition_key: str, partition_datatype: str | None, variant_count: int) -> None:
+    """Put an original query whose variants could not all be pushed back into its queue, once; the second time drop it."""
+    query_hash = hash_query(query)
+    requeue_key = (query_hash, partition_key)
+    failure = f"Failed to push the {variant_count} query variants of original query {query_hash} (partition key '{partition_key}')"
+    if requeue_key in _requeued_original_queries:
+        _requeued_original_queries.discard(requeue_key)
+        logger.error(f"{failure} after it was put back once; the query is dropped")
+    elif push_to_original_query_queue(query, partition_key, partition_datatype):
+        _requeued_original_queries.add(requeue_key)
+        logger.error(f"{failure}; put back into the original query queue for one more try")
+    else:
+        logger.error(f"{failure} and failed to put it back into the original query queue; the query is lost")
 
 
 # Cache optimization method of the CLI -> method of the lazy path (IN means IN_SUBQUERY there) and of the eager path
@@ -393,6 +440,23 @@ def has_terminal_status(cache_handler, query_hash: str, partition_key: str) -> b
     return False
 
 
+# The reasons against lazy insertion already logged, so each is logged once
+_lazy_insertion_refusals: set[str] = set()
+_lazy_insertion_lock = threading.Lock()
+
+
+def lazy_insertion_refused(cache_backend: str, cache_handler) -> str | None:
+    """Why fragments of this cache handler must not be stored by lazy insertion, or None; each reason is logged once."""
+    reason = lazy_insertion_refusal_for(args, cache_handler)
+    if reason is not None:
+        message = f"Lazy insertion is not used for cache backend '{cache_backend}' because {reason}; fragments run on the data connection"
+        with _lazy_insertion_lock:
+            if message not in _lazy_insertion_refusals:
+                _lazy_insertion_refusals.add(message)
+                logger.warning(message)
+    return reason
+
+
 def run_and_store_query(query: str, query_hash: str, partition_key: str, partition_datatype: str | None = None, item_cache_backend: str | None = None):
     """Worker function to execute and store a query."""
     logger.info(f"WORKER THREAD START: Processing query {query_hash}")
@@ -407,6 +471,13 @@ def run_and_store_query(query: str, query_hash: str, partition_key: str, partiti
         cache_backend = item_cache_backend or resolve_cache_backend(args)
         cache_handler = get_cache_handler(cache_backend, singleton=True)
         logger.info(f"Got cache handler for {query_hash}")
+
+        if not partition_datatype:
+            # Queued without a datatype: use the registered one; for an unregistered key the non-lazy path below
+            # infers it from the result (an empty result cannot be stored and gets the status 'failed')
+            partition_datatype = cache_handler.get_datatype(partition_key)
+            if partition_datatype is None:
+                logger.info(f"No datatype for partition key '{partition_key}' in the queue or the cache: {query_hash} runs without lazy insertion")
 
         query_to_execute = query
         optimization_applied = False
@@ -444,13 +515,17 @@ def run_and_store_query(query: str, query_hash: str, partition_key: str, partiti
         limit_applies = args.limit is not None and partition_datatype != "geometry"
         if args.limit is not None and not limit_applies:
             logger.warning(f"--limit is not applied to spatial datatype '{partition_datatype}' (query {query_hash}), it needs lazy insertion")
-        use_lazy_insertion = (
+        lazy_insertion_allowed = (
             lazy_insertion_available
             and not args.force_recalculate
             and args.long_running_query_timeout == "0"
             and not args.disable_lazy_insertion
             and not limit_applies
+            and partition_datatype is not None
         )
+        # Lazy insertion runs the fragment on the cache handler's connection: only if that is the data database
+        lazy_refusal = lazy_insertion_refused(cache_backend, cache_handler) if lazy_insertion_allowed else None
+        use_lazy_insertion = lazy_insertion_allowed and lazy_refusal is None
 
         if use_lazy_insertion:
             logger.info(f"STARTING LAZY INSERTION: Beginning lazy insertion for query {query_hash}")
@@ -488,7 +563,7 @@ def run_and_store_query(query: str, query_hash: str, partition_key: str, partiti
             # Spatial datatypes require lazy insertion - cannot fall back to execute + set_cache
             if not success and partition_datatype == "geometry":
                 logger.error(f"Spatial datatype '{partition_datatype}' requires lazy insertion for query {query_hash}. "
-                             "Ensure lazy insertion is enabled and the cache handler supports it.")
+                             + (f"It is not used because {lazy_refusal}." if lazy_refusal else "Ensure lazy insertion is enabled and the cache handler supports it."))
                 return False
 
             logger.info(f"Beginning calculation for cache population for query {query_hash}")
@@ -606,6 +681,34 @@ def get_timeout_for_state(can_consume, exit_event_set, error_count=0):
         return 0.1  # Short wait when waiting for capacity
 
 
+def close_when_done(active: int) -> bool:
+    """For --close: set exit_event if no worker is active, no decomposition is in flight and both queues are empty.
+
+    Counts the queues while it holds decomposition_lock, which the decomposer holds from its pop of an original query
+    to the push of the query's fragments and under which it checks exit_event before it pops. A failed count is not
+    taken as empty.
+
+    Args:
+        active: The number of fragments the workers run.
+
+    Returns:
+        bool: True if exit_event was set.
+    """
+    if active > 0 or not decomposition_lock.acquire(blocking=False):
+        return False
+    try:
+        lengths = get_queue_lengths()
+        if lengths["original_query_queue"] != 0 or lengths["query_fragment_queue"] != 0:
+            return False
+        exit_event.set()
+        return True
+    except Exception as e:
+        logger.error(f"Error counting the queues for --close: {e}")
+        return False
+    finally:
+        decomposition_lock.release()
+
+
 def fragment_executor():
     """Thread pool function that executes query variants from the variant queue."""
     global pool, last_status_log_time
@@ -679,9 +782,8 @@ def fragment_executor():
                     should_log_status = True
 
                 # Check if we should close
-                if args.close and active == 0 and fragment_count == 0:
+                if args.close and active == 0 and fragment_count == 0 and close_when_done(active):
                     logger.info(f"Closing cache at {datetime.datetime.now()}")
-                    exit_event.set()
                     continue
 
                 # Determine waiting reason for logging
@@ -808,11 +910,18 @@ def validate_queue_configuration():
 
 
 def main():
+    # Argument defaults are read from the environment, so the --env file is loaded first
+    load_env_file_before_parsing()
     parser = argparse.ArgumentParser(description="Monitor cache queue and process queries")
 
     # Processing configuration
     processing_group = parser.add_argument_group("processing options")
-    processing_group.add_argument("--close", action="store_true", default=False, help="Close the cache after operation")
+    processing_group.add_argument(
+        "--close",
+        action="store_true",
+        default=False,
+        help="Exit once both queues are empty, no original query is being decomposed and no fragment is running",
+    )
     processing_group.add_argument("--max-processes", type=int, default=12, help="Max number of processes to use")
     processing_group.add_argument("--long-running-query-timeout", type=str, default="0", help="Timeout for long running queries")
     processing_group.add_argument("--limit", type=int, default=None, help="Limit the number of returned partition keys")
@@ -884,6 +993,7 @@ def main():
     add_spatial_args(parser, include_buffer_distance=False)
     add_grid_args(parser)
     add_verbosity_args(parser)
+    add_size_priority_arg(parser.add_argument_group("queue configuration"))
 
     # Cache backend argument with bitsize support
     cache_group = parser.add_argument_group("cache configuration")
@@ -1056,6 +1166,8 @@ def main():
         settings.pop("geometry_column", None)
         settings["skip_partition_key_joins"] = f"for {sorted(args.skip_partition_key_joins)} and geometry keys"
         logger.info(f"  - Variant settings of decomposition and lookup: {settings}")
+
+    logger.info(f"- Variant queue size priority: {'ENABLED' if size_priority_enabled(args.size_priority) else 'DISABLED'}")
 
     # Log lazy insertion configuration
     logger.info(f"- Lazy insertion: {'DISABLED' if args.disable_lazy_insertion else 'ENABLED (when conditions met)'}")

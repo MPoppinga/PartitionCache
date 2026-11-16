@@ -328,6 +328,34 @@ class TestManualProcessingCacheBackend:
             print(f"COALESCE test: processed={result[0]}, message={result[1]}")
 
 
+    def test_bbox_item_is_recorded_as_failed(self, db_session, cache_client, manual_queue_processor):
+        """The SQL processor does not support postgis_bbox: such an item is recorded as failed, nothing is stored."""
+        import uuid
+
+        suffix = uuid.uuid4().hex[:8]
+        partition_key = f"geom_{suffix}"
+        query_hash = f"bbox_item_{suffix}"
+        queue_prefix = manual_queue_processor["queue_prefix"]
+        table_prefix = manual_queue_processor["table_prefix"]
+        assert push_to_query_fragment_queue([(f"SELECT 1 AS {partition_key}", query_hash)], partition_key, "geometry", cache_backend="postgis_bbox")
+
+        with db_session.cursor() as cur:
+            cur.execute("SELECT * FROM partitioncache_manual_process_queue(1)")
+            assert cur.fetchone()[0] == 1
+            cur.execute(f"SELECT status, error_message FROM {queue_prefix}_processor_log WHERE query_hash = %s AND status <> 'started'", (query_hash,))
+            status, error_message = cur.fetchone()
+            assert status == "failed"
+            assert "postgis_bbox" in error_message and "pcache-monitor" in error_message
+            cur.execute("SELECT to_regclass(partitioncache_get_cache_table_name(%s, %s))", (table_prefix, partition_key))
+            assert cur.fetchone() == (None,), "no cache table may be created for a bbox item"
+            cur.execute("SELECT partitioncache_get_queries_table_name(%s)", (table_prefix,))
+            queries_table = cur.fetchone()[0]
+            cur.execute(f"SELECT status FROM {queries_table} WHERE query_hash = %s AND partition_key = %s", (query_hash, partition_key))
+            assert cur.fetchone() == ("failed",)
+            cur.execute(f"DELETE FROM {queries_table} WHERE query_hash = %s", (query_hash,))
+        db_session.commit()
+
+
 class TestManualProcessingIntegration:
     """Integration tests for manual queue processing with other components."""
 
@@ -437,3 +465,93 @@ class TestManualProcessingResultLimit:
             with db_session.cursor() as cur:
                 cur.execute(f"UPDATE {config_table} SET result_limit = NULL")
                 db_session.commit()
+
+
+class TestManualProcessingConfigurationChoice:
+    """partitioncache_manual_process_queue uses the configuration it is given and never guesses between installations."""
+
+    @pytest.fixture(autouse=True)
+    def setup_manual_processing(self):
+        from partitioncache.queue import clear_all_queues, reset_queue_handler
+
+        reset_queue_handler()
+        clear_all_queues()
+        yield
+        reset_queue_handler()
+
+    def _queue_one_fragment(self, suffix: str) -> None:
+        query = f"SELECT 1 AS zipcode WHERE '{suffix}' <> ''"
+        assert push_to_query_fragment_queue([(query, f"config_choice_{suffix}")], "zipcode", "integer")
+
+    def _process(self, db_session, *args):
+        with db_session.cursor() as cur:
+            cur.execute(f"SELECT * FROM partitioncache_manual_process_queue({', '.join(['%s'] * len(args))})", args)
+            result = cur.fetchone()
+        db_session.commit()
+        return result
+
+    def test_second_configuration_table_needs_the_queue_prefix(self, db_session, manual_queue_processor):
+        import uuid
+
+        import psycopg
+
+        suffix = uuid.uuid4().hex[:8]
+        other_table = f"pct_{suffix}_processor_config"
+        with db_session.cursor() as cur:
+            cur.execute(f"CREATE TABLE {other_table} (LIKE {manual_queue_processor['config_table']} INCLUDING ALL)")
+            cur.execute(
+                f"INSERT INTO {other_table} (job_name, table_prefix, queue_prefix, cache_backend, target_database) "
+                "VALUES ('partitioncache_process_queue_' || current_database() || '_other', 'pct_other', %s, 'array', current_database())",
+                (f"pct_{suffix}",),
+            )
+        db_session.commit()
+        try:
+            self._queue_one_fragment(suffix)
+            with pytest.raises(psycopg.errors.RaiseException, match="More than one processor configuration table"):
+                self._process(db_session, 5)
+            db_session.rollback()
+            assert get_queue_lengths()["query_fragment_queue"] == 1
+
+            processed, message = self._process(db_session, 5, None, manual_queue_processor["queue_prefix"])
+            assert processed == 1, message
+            assert get_queue_lengths()["query_fragment_queue"] == 0
+        finally:
+            db_session.rollback()
+            with db_session.cursor() as cur:
+                cur.execute(f"DROP TABLE IF EXISTS {other_table}")
+            db_session.commit()
+
+    def test_second_configuration_row_needs_the_job_name(self, db_session, manual_queue_processor):
+        import uuid
+
+        import psycopg
+
+        suffix = uuid.uuid4().hex[:8]
+        config_table = manual_queue_processor["config_table"]
+        with db_session.cursor() as cur:
+            cur.execute(f"SELECT job_name FROM {config_table} WHERE target_database = current_database()")
+            (fixture_job,) = cur.fetchone()
+            cur.execute(
+                f"INSERT INTO {config_table} (job_name, table_prefix, queue_prefix, cache_backend, target_database) "
+                "VALUES (%s, 'pct_other', %s, 'array', current_database())",
+                (f"{fixture_job}_pct{suffix}", manual_queue_processor["queue_prefix"]),
+            )
+        db_session.commit()
+        try:
+            self._queue_one_fragment(suffix)
+            with pytest.raises(psycopg.errors.RaiseException, match="More than one processor configuration for database"):
+                self._process(db_session, 5)
+            db_session.rollback()
+
+            processed, message = self._process(db_session, 5, "partitioncache_process_queue_not_set_up", manual_queue_processor["queue_prefix"])
+            assert processed == 0
+            assert "No configuration partitioncache_process_queue_not_set_up" in message
+            assert get_queue_lengths()["query_fragment_queue"] == 1
+
+            processed, message = self._process(db_session, 5, fixture_job, manual_queue_processor["queue_prefix"])
+            assert processed == 1, message
+        finally:
+            db_session.rollback()
+            with db_session.cursor() as cur:
+                cur.execute(f"DELETE FROM {config_table} WHERE job_name = %s", (f"{fixture_job}_pct{suffix}",))
+            db_session.commit()

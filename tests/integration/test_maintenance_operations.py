@@ -174,6 +174,23 @@ class TestPruneOldQueries:
         # Region query should still exist
         assert maintenance_cache.exists(region_hash, "region"), "Recent region query should still exist"
 
+    def test_prune_uses_the_given_window_not_one_day(self, maintenance_cache, db_session):
+        """A query last seen 2 days ago is inside a 30-day window and outside a 1-day window.
+
+        The window was a bound parameter inside a quoted interval literal, which PostgreSQL read as 1 day.
+        """
+        hashes = _populate_cache(maintenance_cache)
+        with db_session.cursor() as cur:
+            cur.execute("UPDATE maint_test_cache_queries SET last_seen = NOW() - INTERVAL '2 days' WHERE query_hash = %s", (hashes[0],))
+
+        assert maintenance_cache.prune_old_queries(days_old=30) == 0
+        assert maintenance_cache.exists(hashes[0], "zipcode")
+
+        assert maintenance_cache.prune_old_queries(days_old=1) == 1
+        assert not maintenance_cache.exists(hashes[0], "zipcode")
+        for h in hashes[1:]:
+            assert maintenance_cache.exists(h, "zipcode")
+
 
 class TestCleanupTerminationEntries:
     """Tests for removing _LIMIT_ and _TIMEOUT_ prefixed entries."""

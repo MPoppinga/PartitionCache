@@ -88,6 +88,7 @@ PartitionCache supports multiple cache backends with different performance chara
 - **Best for**: Hexagonal spatial partitioning, uniform spatial distribution
 - **Spatial filtering**: Connected-component intersection of cell groups with k-ring buffer expansion
 - **Population**: `set_cache_lazy()` runs the spatial variant on PostgreSQL and maps every geometry column to an H3 cell in the same statement; each result row becomes one cell group. Used by `pcache-add --direct` and `pcache-monitor`. The pg_cron queue processor cannot populate this backend because its cache lives in RocksDict.
+- **Limits**: Sound for point geometries only: each geometry is mapped to the cell of its centroid, and the buffer bounds distances between points, not between extended geometries. The buffer is converted to rings assuming metres, so the query's distances must be in metres (a degree-valued SRID is not detected).
 - **Scalability**: Good (single-instance)
 
 #### PostGIS BBox Handler
@@ -97,6 +98,7 @@ PartitionCache supports multiple cache backends with different performance chara
 - **Requirements**: PostgreSQL + PostGIS extension
 - **Best for**: Grid-based spatial partitioning, bounding box intersection
 - **Spatial filtering**: `ST_Intersection` of the cached collections, each widened by `ST_Buffer` with the query's buffer distance. Unbuffered for a buffer of 0, which a query over a single table gets when no `buffer_distance` is given.
+- **Limits**: Sound for point geometries only. The buffer adds up the query's distances along a path of tables, which bounds how far two points can be apart; two polygons each within 100 m of a third can be far apart at their far ends, so with extended geometries rows can be lost.
 - **Scalability**: Excellent (database-native)
 
 #### Grid-cell keys (any integer handler)
@@ -154,7 +156,7 @@ PostgreSQL 17 and later run the following maintenance operations with `search_pa
 All cache handlers support multiple partition keys with independent datatypes:
 
 **PostgreSQL Handlers:**
-- Separate tables per partition: `{table_name}_cache_{partition_key}`
+- Separate tables per partition: `{table_name}_cache_{partition_key}`. PostgreSQL truncates a name longer than 63 bytes; such a name works, but a new partition key whose truncated table name is that of another registered key would share its table, so registering it raises a `ValueError` naming both keys (the PL/pgSQL queue processor's bootstrap refuses it as well). Two keys that were registered by an earlier version and already share a table keep sharing it and read each other's entries; find such pairs with `SELECT a.partition_key, b.partition_key FROM <prefix>_partition_metadata a JOIN <prefix>_partition_metadata b ON a.partition_key < b.partition_key AND ('<prefix>_cache_' || a.partition_key)::name = ('<prefix>_cache_' || b.partition_key)::name`, and delete the cache of one of them
 - Metadata table: `{table_name}_partition_metadata` 
 - Shared queries table: `{table_name}_queries`
 - Queue integration: Dual-strategy operations for optimal performance
@@ -371,7 +373,16 @@ bitsize = cache._get_partition_bitsize("large_dataset")
 ```
 
 **Automatic Schema Updates:**
-Database triggers automatically update cache table schemas when the bitsize grows:
+Database triggers automatically update cache table schemas when the bitsize grows. Every bit cache's metadata table
+has the trigger `<prefix>_bitsize_trigger`, which calls the shared function `partitioncache_bit_widen_trigger()` with
+its prefix as the argument. Dropping a cache's tables drops its trigger and leaves no function behind. A cache created
+before the shared function has its own `<prefix>_bitsize_trigger_func()`. The first time a bit handler of this version
+starts for that prefix, it switches the trigger to the shared function and drops the prefix's own function, unless
+another trigger still uses it. The switch runs in a short transaction of its own with a 2 s lock timeout: `DROP
+TRIGGER` waits for open transactions that have read the metadata table. On a timeout the old trigger stays and keeps
+working, and the next start tries again. The pg_cron processor's bootstrap never switches a trigger (inside a job the
+lock would be held until the job commits); it only replaces a prefix's own function from before the `USING` fix in
+place, as before. Other prefixes are not touched.
 
 ```python
 # Growing the bitsize triggers a schema update; a smaller value keeps the current bitsize

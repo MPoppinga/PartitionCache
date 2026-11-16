@@ -576,3 +576,163 @@ def test_duckdb_uses_the_postgresql_session_time_zone():
     accelerator.duckdb_conn = Mock()
     accelerator._use_postgresql_timezone()
     accelerator.duckdb_conn.execute.assert_called_once_with("SET GLOBAL TimeZone = 'America/St_John''s'")
+
+
+class _ReferencePostgresCursor:
+    """Stands in for the PostgreSQL fallback: runs a script statement by statement on its own DuckDB connection and
+    exposes the result sets as psycopg does (a SELECT has rows, the other statements have no description).
+    DuckDB 2 cannot parse CREATE UNLOGGED TABLE, so the reference creates an ordinary table instead."""
+
+    def __init__(self, conn):
+        self._conn = conn
+        self._sets: list = []
+        self._index = 0
+        self.description = None
+        self.queries: list[str] = []
+
+    def execute(self, query):
+        import re
+
+        from partitioncache.key_table_script import statement_spans
+
+        self.queries.append(query)
+        self._sets = []
+        for begin, end in statement_spans(query):
+            statement = re.sub(r"^CREATE\s+UNLOGGED\s+TABLE", "CREATE TABLE", query[begin:end].strip(), flags=re.IGNORECASE)
+            rows = self._conn.execute(statement).fetchall()
+            self._sets.append(rows if re.match(r"(SELECT|WITH)\b", statement, re.IGNORECASE) else None)
+        self._index = 0
+        self._position()
+
+    def _position(self):
+        self.description = None if self._sets[self._index] is None else [("key",)]
+
+    def fetchall(self):
+        return self._sets[self._index]
+
+    def nextset(self):
+        if self._index + 1 >= len(self._sets):
+            return None
+        self._index += 1
+        self._position()
+        return True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return None
+
+
+class _ReferencePostgresConnection:
+    def __init__(self, conn):
+        self.cursor_ = _ReferencePostgresCursor(conn)
+
+    def cursor(self):
+        return self.cursor_
+
+
+_READINGS = "CREATE TABLE readings (region_id INT, value INT, label VARCHAR); INSERT INTO readings VALUES (1, 10, 'a_b'), (2, 1, 'axb'), (3, 10, 'axb'), (NULL, 10, 'a_b')"
+
+
+def _accelerator_on_duckdb(query_timeout: float = 0):
+    """An accelerator with a real in-memory DuckDB and a reference fallback, both holding the readings table."""
+    import duckdb
+
+    from partitioncache.query_accelerator import DuckDBQueryAccelerator
+
+    accelerator = DuckDBQueryAccelerator({}, query_timeout=query_timeout)
+    accelerator.duckdb_conn = duckdb.connect()
+    accelerator.duckdb_conn.execute(_READINGS)
+    reference = duckdb.connect()
+    reference.execute(_READINGS)
+    accelerator.postgresql_conn = _ReferencePostgresConnection(reference)
+    accelerator._initialized = True
+    return accelerator
+
+
+@pytest.mark.parametrize("query_timeout", [0, 30])
+@pytest.mark.parametrize("method", ["UNLOGGED_TABLE_IN", "UNLOGGED_TABLE_JOIN"])
+def test_key_table_script_returns_the_select_keys_not_the_trailing_drop(method, query_timeout):
+    """DuckDB returns the LAST statement's result, here the DROP's: a script runs on the fallback, which reads the SELECT."""
+    from partitioncache.apply_cache import extend_query_with_partition_keys
+
+    script = extend_query_with_partition_keys("SELECT r.region_id FROM readings AS r WHERE r.value > 5", {1, 2}, "region_id", method=method, p0_alias="r")
+    accelerator = _accelerator_on_duckdb(query_timeout)
+
+    assert accelerator.execute_query(script) == {1}
+    assert accelerator.postgresql_conn.cursor_.queries == [script]
+    assert accelerator.stats["queries_accelerated"] == 0
+    assert accelerator.stats["queries_fallback"] == 1
+
+
+@pytest.mark.parametrize("query_timeout", [0, 30])
+def test_script_duckdb_can_parse_returns_the_select_keys_not_the_trailing_drop(query_timeout):
+    """The same shape with an ordinary key table, which every DuckDB version parses and runs, returning the DROP's result."""
+    script = "CREATE TABLE k AS SELECT 1 AS pk; SELECT r.region_id FROM readings AS r WHERE r.region_id IN (SELECT pk FROM k); DROP TABLE IF EXISTS k"
+    accelerator = _accelerator_on_duckdb(query_timeout)
+
+    assert accelerator.execute_query(script) == {1}
+    assert accelerator.postgresql_conn.cursor_.queries == [script]
+    assert accelerator.stats["queries_accelerated"] == 0
+
+
+@pytest.mark.parametrize("query_timeout", [0, 30])
+def test_single_statement_fragment_runs_in_duckdb(query_timeout):
+    accelerator = _accelerator_on_duckdb(query_timeout)
+    # A semicolon in a string literal, a quoted identifier or a comment does not make a second statement
+    query = "SELECT r.region_id AS \"id;\" FROM readings AS r WHERE r.value > 5 AND r.label <> 'x;y' /* ; */;"
+
+    assert accelerator.execute_query(query) == {1, 3}
+    assert accelerator.postgresql_conn.cursor_.queries == []
+    assert accelerator.stats["queries_accelerated"] == 1
+
+
+@pytest.mark.parametrize("query", ["SELECT 1; -- a trailing comment", "SELECT 'unterminated", ";"])
+def test_text_that_is_not_one_tokenized_statement_runs_on_the_fallback(query):
+    """A comment after the last semicolon counts as a statement, untokenizable text as none: both stay out of DuckDB."""
+    accelerator = _accelerator_on_duckdb()
+    accelerator._execute_fallback = lambda q: {"fallback"}
+
+    assert accelerator.execute_query(query) == {"fallback"}
+    assert accelerator.stats["queries_accelerated"] == 0
+
+
+def test_script_without_fallback_connection_raises_instead_of_returning_the_drop_result():
+    from partitioncache.apply_cache import extend_query_with_partition_keys
+
+    script = extend_query_with_partition_keys("SELECT r.region_id FROM readings AS r", {1}, "region_id", method="UNLOGGED_TABLE_IN", p0_alias="r")
+    accelerator = _accelerator_on_duckdb()
+    accelerator.postgresql_conn = None
+
+    with pytest.raises(RuntimeError, match="fallback"):
+        accelerator.execute_query(script)
+
+
+@pytest.mark.parametrize("path", ["duckdb", "duckdb_timeout", "fallback"])
+def test_null_keys_are_dropped_on_every_path(path):
+    """PostgresDBHandler.execute drops NULL keys; the accelerator must return the same set."""
+    accelerator = _accelerator_on_duckdb(query_timeout=30 if path == "duckdb_timeout" else 0)
+    if path == "fallback":
+        accelerator._initialized = False
+
+    assert accelerator.execute_query("SELECT r.region_id FROM readings AS r WHERE r.value > 5") == {1, 3}
+    assert len(accelerator.postgresql_conn.cursor_.queries) == (1 if path == "fallback" else 0)
+
+
+def test_like_pattern_with_backslash_runs_on_the_fallback():
+    """DuckDB's LIKE has no default escape character ('a_b' LIKE 'a\\_b' is false), PostgreSQL's is the backslash."""
+    accelerator = _accelerator_on_duckdb()
+    query = "SELECT r.region_id FROM readings AS r WHERE r.label LIKE 'a\\_b'"
+
+    accelerator.execute_query(query)
+
+    assert accelerator.postgresql_conn.cursor_.queries == [query]
+    assert accelerator.stats["queries_accelerated"] == 0
+
+
+def test_like_pattern_without_backslash_runs_in_duckdb():
+    accelerator = _accelerator_on_duckdb()
+
+    assert accelerator.execute_query("SELECT r.region_id FROM readings AS r WHERE r.label LIKE 'a_b'") == {1, 2, 3}
+    assert accelerator.postgresql_conn.cursor_.queries == []

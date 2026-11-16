@@ -245,12 +245,15 @@ class TestNonBlockingQueueFunctions:
         assert priority > 1, "Priority function should increment priority on duplicate"
 
         # Test fragment queue behavior - now both functions use proper upsert
+        # The first push sets the fragment's size priority (on by default); a push of the waiting fragment adds 1
         success1 = postgresql_handler.push_to_query_fragment_queue([("SELECT frag", "regular_hash")], "test_partition", "text")
+        cursor.execute(f"SELECT priority FROM {postgresql_handler.fragment_queue_table} WHERE hash = %s", ("regular_hash",))
+        priority_first = cursor.fetchone()[0]
         success2 = postgresql_handler.push_to_query_fragment_queue([("SELECT frag", "regular_hash")], "test_partition", "text")  # Same
 
         cursor.execute(f"SELECT priority FROM {postgresql_handler.fragment_queue_table} WHERE hash = %s", ("regular_hash",))
         priority_regular = cursor.fetchone()[0]
-        assert priority_regular == 2, "Regular fragment function now properly increments priority on duplicate"
+        assert priority_regular == priority_first + 1, "Regular fragment function now properly increments priority on duplicate"
 
         success1 = postgresql_handler.push_to_query_fragment_queue_with_priority([("SELECT frag2", "priority_hash")], "test_partition", 1, "text")
         success2 = postgresql_handler.push_to_query_fragment_queue_with_priority([("SELECT frag2", "priority_hash")], "test_partition", 1, "text")  # Same

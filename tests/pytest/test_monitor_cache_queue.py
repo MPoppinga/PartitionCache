@@ -4,6 +4,7 @@ Unit tests for the monitor cache queue module.
 
 import logging
 import os
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
@@ -75,6 +76,7 @@ def mock_args():
     args.force_recalculate = False
     args.log_query_times = None
     args.disable_lazy_insertion = False
+    args.size_priority = None
     return args
 
 
@@ -153,7 +155,27 @@ class TestQueryFragmentProcessor:
             geometry_column=None,
             max_conditions_removed=mock_args.max_conditions_removed,
         )
-        mock_push_fragments.assert_called_once_with([("SELECT DISTINCT t1.partition_key FROM test_table t1", "hash1")], "test_partition_key", "integer", cache_backend=None)
+        mock_push_fragments.assert_called_once_with(
+            [("SELECT DISTINCT t1.partition_key FROM test_table t1", "hash1")], "test_partition_key", "integer", cache_backend=None, size_priority=None
+        )
+
+    @pytest.mark.parametrize("size_priority", [True, False])
+    @patch("partitioncache.cli.monitor_cache_queue.exit_event")
+    @patch("partitioncache.cli.monitor_cache_queue.pop_from_original_query_queue_blocking")
+    @patch("partitioncache.cli.monitor_cache_queue.generate_all_query_hash_pairs")
+    @patch("partitioncache.cli.monitor_cache_queue.push_to_query_fragment_queue")
+    def test_query_fragment_processor_passes_size_priority(
+        self, mock_push_fragments, mock_generate, mock_pop_blocking, mock_exit_event, size_priority, mock_args, mock_env
+    ):
+        """--size-priority / --no-size-priority reach the push of the generated fragments."""
+        mock_exit_event.is_set.side_effect = [False, True]
+        mock_pop_blocking.return_value = ("SELECT * FROM test_table", "test_partition_key", "integer")
+        mock_generate.return_value = [("SELECT DISTINCT t1.partition_key FROM test_table t1", "hash1")]
+        mock_args.size_priority = size_priority
+
+        query_fragment_processor(mock_args, (None, None, None))
+
+        assert mock_push_fragments.call_args.kwargs["size_priority"] is size_priority
 
     @patch("partitioncache.cli.monitor_cache_queue.exit_event")
     @patch("partitioncache.cli.monitor_cache_queue.pop_from_original_query_queue_blocking")
@@ -295,7 +317,11 @@ class TestRunAndStoreQuery:
         """Spatial handlers such as rocksdict_h3_grouped populate lazily but are no AbstractCacheHandler_Lazy."""
         mock_args.force_recalculate = False
         mock_args.disable_lazy_insertion = False
+        # Lazy insertion runs the fragment on the handler's connection, so it must be the data database
+        mock_args.db_backend = "postgresql"
+        mock_args.db_name = "gis"
         mock_cache = Mock(spec=["set_cache_lazy", "set_entry_lazy", "register_partition_key", "close"])
+        mock_cache.pg_conn = SimpleNamespace(info=SimpleNamespace(host="localhost", port=5432, dbname="gis"))
         mock_cache.set_entry_lazy.return_value = True
         mock_get_cache.return_value = mock_cache
 
@@ -305,7 +331,10 @@ class TestRunAndStoreQuery:
         mcq_module.args = mock_args
 
         try:
-            result = run_and_store_query("SELECT geom FROM pois", "geo_hash", "spatial_h3", "geometry", item_cache_backend="rocksdict_h3_grouped")
+            with patch.dict(os.environ, {"DB_HOST": "localhost", "DB_PORT": "5432"}):
+                os.environ.pop("PG_DB_HOST", None)
+                os.environ.pop("PG_DB_PORT", None)
+                result = run_and_store_query("SELECT geom FROM pois", "geo_hash", "spatial_h3", "geometry", item_cache_backend="rocksdict_h3_grouped")
         finally:
             if original_args is not None:
                 mcq_module.args = original_args
@@ -708,7 +737,7 @@ class TestIntegration:
             max_conditions_removed=mock_args.max_conditions_removed,
         )
         mock_push_to_outgoing.assert_called_once_with(
-            [("SELECT DISTINCT t1.partition_key FROM test_table t1 WHERE t1.id = 1", "hash1")], "test_partition_key", "integer", cache_backend=None
+            [("SELECT DISTINCT t1.partition_key FROM test_table t1 WHERE t1.id = 1", "hash1")], "test_partition_key", "integer", cache_backend=None, size_priority=None
         )
 
 

@@ -135,6 +135,7 @@ def monitor_args():
     args.skip_partition_key_joins = []
     args.max_conditions_removed = None
     args.disable_optimized_polling = False
+    args.close = False
     args.cache_backend = "postgresql_array"
     args.geometry_column = None
     args.grid_cell_size = {"cell200": 200.0}

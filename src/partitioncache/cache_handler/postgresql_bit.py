@@ -6,7 +6,7 @@ import psycopg
 from bitarray import bitarray
 from psycopg import sql
 
-from partitioncache.cache_handler.postgresql_abstract import PostgreSQLAbstractCacheHandler, _ends_read_transaction
+from partitioncache.cache_handler.postgresql_abstract import PostgreSQLAbstractCacheHandler, _ends_read_transaction, _shared_cache_table_refusal
 from partitioncache.key_table_script import lazy_insertion_parts
 
 logger = getLogger("PartitionCache")
@@ -88,14 +88,13 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
                     # Nothing to do if the trigger is already there: re-running the function
                     # loader and the trigger DDL on every handler construction is what makes
                     # concurrent workers collide on pg_proc and on the metadata table.
-                    self.cursor.execute(
-                        "SELECT 1 FROM pg_trigger WHERE NOT tgisinternal AND tgname = %s",
-                        (self.tableprefix + "_bitsize_trigger",),
-                    )
-                    if self.cursor.fetchone() is None:
+                    trigger_exists, switch_pending = self._bitsize_trigger_state()
+                    if not trigger_exists:
                         self._load_sql_functions()
                         self._create_bitsize_trigger()
                     self.db.commit()
+                    if switch_pending:
+                        self._switch_bitsize_trigger()
                     return
 
                 logger.warning(f"! Setting up {self.tableprefix} cache handler: Loading SQL functions")
@@ -159,8 +158,58 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
         )
         self.db.commit()
 
+    def _bitsize_trigger_state(self) -> tuple[bool, bool]:
+        """(the prefix's bitsize trigger exists, it still needs the switch to the shared function).
+
+        The switch is pending while the trigger calls the prefix's own function from before, or while that own
+        function is still there unused (an older client may re-create it). The names are compared as stored
+        (truncated to 63 bytes): psycopg sends the parameters untyped, so they compare as name.
+        """
+        self.cursor.execute(
+            """SELECT EXISTS (SELECT 1 FROM pg_trigger WHERE NOT tgisinternal AND tgname = %(trigger)s
+                                AND tgrelid = to_regclass(quote_ident(%(metadata)s))),
+                      EXISTS (SELECT 1 FROM pg_trigger WHERE NOT tgisinternal AND tgname = %(trigger)s
+                                AND tgrelid = to_regclass(quote_ident(%(metadata)s))
+                                AND tgfoid IS DISTINCT FROM to_regprocedure('partitioncache_bit_widen_trigger()'))
+                      OR EXISTS (SELECT 1 FROM pg_proc p WHERE p.proname = %(function)s AND p.pronargs = 0
+                                   AND p.prorettype = 'trigger'::regtype
+                                   AND NOT EXISTS (SELECT 1 FROM pg_trigger t WHERE t.tgfoid = p.oid))""",
+            {
+                "trigger": self.tableprefix + "_bitsize_trigger",
+                "metadata": self.tableprefix + "_partition_metadata",
+                "function": self.tableprefix + "_bitsize_trigger_func",
+            },
+        )
+        row = self.cursor.fetchone()
+        if not isinstance(row, tuple) or len(row) != 2:
+            return False, False  # a mocked cursor in unit tests
+        return bool(row[0]), bool(row[1])
+
+    def _switch_bitsize_trigger(self) -> None:
+        """Switch a bitsize trigger from before to the shared function, and drop the prefix's own unused function.
+
+        DROP TRIGGER waits for every open transaction that has read the metadata table (a running job, a worker of
+        the old version), and every later reader of the table would queue behind it. So the switch runs in a short
+        transaction of its own with a lock timeout. On a timeout, or any other failure, the old trigger stays (it
+        keeps working) and the next start of a handler tries again.
+        """
+        try:
+            with self._serialized_ddl():
+                self.cursor.execute("SELECT to_regprocedure('partitioncache_switch_bitsize_trigger(text)') IS NULL")
+                row = self.cursor.fetchone()
+                if row is None or row[0]:
+                    self._load_sql_functions()
+                # After the load: a failed load rolls back, which would also drop a lock timeout set before it
+                self.cursor.execute("SET LOCAL lock_timeout = '2s'")
+                self.cursor.execute("SELECT partitioncache_switch_bitsize_trigger(%s)", (self.tableprefix,))
+            self.db.commit()
+            logger.info(f"TRIGGER: the bitsize trigger of {self.tableprefix} calls the shared function")
+        except Exception as e:
+            logger.warning(f"TRIGGER: kept the bitsize trigger of {self.tableprefix} as it is for now; the next start tries again: {e}")
+            self.db.rollback()
+
     def _create_bitsize_trigger(self) -> None:
-        """Create trigger function and trigger for handling bitsize changes."""
+        """Create the bitsize trigger; it calls the shared partitioncache_bit_widen_trigger with the prefix."""
         try:
             logger.info(f"TRIGGER: Calling partitioncache_create_bitsize_trigger for {self.tableprefix}")
             # Call the SQL function to create the trigger
@@ -273,6 +322,9 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
         except Exception as e:
             logger.error(f"Failed to ensure partition table for {partition_key}: {e}")
             self.db.rollback()
+            refused = _shared_cache_table_refusal(e)
+            if refused:
+                raise refused from e
             raise
 
     def set_cache(self, key: str, partition_key_identifiers: set[int] | set[str] | set[float] | set[datetime], partition_key: str = "partition_key") -> bool:
@@ -400,7 +452,8 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
             self.cursor.execute(q, (list(keys_set),))
 
             result = self.cursor.fetchone()
-            if result is None:
+            if result is None or result[0] is None:
+                # BIT_AND over no row: the entries were deleted after the check above. Unknown, not empty
                 return None, 0
             r = set(bitarray(result[0]).search(bitarray("1")))
             return r, len(keys_set)
@@ -500,12 +553,20 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
             if dilation == 0:
                 result, count = self.get_intersected(keys, partition_key)
                 return result, count  # type: ignore[return-value]
+            if dilation < 0:
+                raise ValueError(f"dilation must be non-negative, got {dilation}")
 
-            lazy_sql, count = self.get_intersected_dilated_lazy(keys, partition_key, dilation)
-            if lazy_sql is None:
+            filtered_keys = self.filter_existing_keys(keys, partition_key)
+            if not filtered_keys:
                 return None, 0
-            self.cursor.execute(lazy_sql)  # type: ignore[arg-type]
-            return {row[0] for row in self.cursor.fetchall()}, count
+
+            # NULL when every entry was deleted after filter_existing_keys: unknown, not an empty intersection
+            intersect_sql_str = self.get_intersected_dilated_sql_wk(filtered_keys, partition_key, dilation)
+            self.cursor.execute(sql.SQL("SELECT {}").format(self._set_bits_array_sql(intersect_sql_str)))
+            row = self.cursor.fetchone()
+            if row is None or row[0] is None:
+                return None, 0
+            return set(row[0]), len(filtered_keys)
         except Exception as e:
             logger.error(f"Failed to get dilated intersection in partition {partition_key}: {e}")
             return None, 0

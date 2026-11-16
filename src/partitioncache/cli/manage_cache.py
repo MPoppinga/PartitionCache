@@ -457,11 +457,15 @@ def check_table_status() -> None:
         logger.info("  Run: python -m partitioncache.cli.manage_cache setup cache")
 
 
-def copy_cache(from_cache_type: str, to_cache_type: str, partition_key: str | None = None):
+def copy_cache(from_cache_type: str, to_cache_type: str, partition_key: str | None = None) -> bool:
+    """Copy the entries and queries of all (or one) partitions; False if anything could not be copied."""
     added = 0
     skipped = 0
     prefixed_skipped = 0
     partitions_registered = 0
+    failed_keys = 0
+    failed_queries = 0
+    failed_partitions = 0
 
     from_cache = get_cache_handler(from_cache_type)
     to_cache = get_cache_handler(to_cache_type)
@@ -478,7 +482,7 @@ def copy_cache(from_cache_type: str, to_cache_type: str, partition_key: str | No
                 logger.info(f"Available partitions: {[p[0] if isinstance(p, tuple) else p for p in all_partitions]}")
                 from_cache.close()
                 to_cache.close()
-                return
+                return False
             logger.info(f"Copying only partition: {partition_key}")
         else:
             from_partitions = all_partitions
@@ -507,6 +511,7 @@ def copy_cache(from_cache_type: str, to_cache_type: str, partition_key: str | No
                     partitions_registered += 1
                     logger.info(f"Registered partition '{pk}' with datatype '{datatype}'")
             except Exception as e:
+                failed_partitions += 1
                 logger.error(f"Failed to register partition '{pk}': {e}")
 
         # Copy keys by partition
@@ -529,8 +534,11 @@ def copy_cache(from_cache_type: str, to_cache_type: str, partition_key: str | No
                     if not to_cache.exists(key, current_partition_key):
                         value = from_cache.get(key, current_partition_key)
                         if value is not None:
-                            to_cache.set_cache(key, value, current_partition_key)
-                            added += 1
+                            if to_cache.set_cache(key, value, current_partition_key):
+                                added += 1
+                            else:
+                                failed_keys += 1
+                                logger.debug(f"Failed to copy key {key} of partition {current_partition_key}")
                     else:
                         skipped += 1
 
@@ -541,12 +549,17 @@ def copy_cache(from_cache_type: str, to_cache_type: str, partition_key: str | No
                         try:
                             if to_cache.set_query(query_hash, query_text, current_partition_key):
                                 queries_copied += 1
+                            else:
+                                failed_queries += 1
                         except Exception as e:
+                            failed_queries += 1
                             logger.debug(f"Failed to copy query {query_hash} for partition {current_partition_key}: {e}")
                 except Exception as e:
+                    failed_partitions += 1
                     logger.debug(f"Error copying queries for partition {current_partition_key}: {e}")
 
             except Exception as e:
+                failed_partitions += 1
                 logger.error(f"Error copying partition {current_partition_key}: {e}")
                 continue
 
@@ -559,12 +572,18 @@ def copy_cache(from_cache_type: str, to_cache_type: str, partition_key: str | No
     logger.info(
         f"Copy completed: {added} keys copied, {skipped} keys skipped, {prefixed_skipped} prefixed keys skipped, {partitions_registered} partitions registered, {queries_copied} queries copied"
     )
+    if failed_keys or failed_queries or failed_partitions:
+        logger.error(f"Copy incomplete: {failed_keys} keys, {failed_queries} queries and {failed_partitions} partitions failed")
+        return False
+    return True
 
 
-def export_cache(cache_type: str, archive_file: str, partition_key: str | None = None):
+def export_cache(cache_type: str, archive_file: str, partition_key: str | None = None) -> bool:
+    """Export the entries and queries of all (or one) partitions to a pickle archive; False if anything could not be exported."""
     cache = get_cache_handler(cache_type)
     exported_count = 0
     total_keys_found = 0
+    failed_partitions = 0
 
     with open(archive_file, "wb") as file:
         # First, export partition metadata
@@ -578,7 +597,7 @@ def export_cache(cache_type: str, archive_file: str, partition_key: str | None =
                     logger.error(f"Partition key '{partition_key}' not found in cache")
                     logger.info(f"Available partitions: {[p[0] if isinstance(p, tuple) else p for p in all_partitions]}")
                     cache.close()
-                    return
+                    return False
                 logger.info(f"Exporting only partition: {partition_key}")
             else:
                 partitions = all_partitions
@@ -619,6 +638,7 @@ def export_cache(cache_type: str, archive_file: str, partition_key: str | None =
                     for query_hash, query_text in queries:
                         queries_metadata.append((query_hash, query_text, current_partition_key))
                 except Exception as e:
+                    failed_partitions += 1
                     logger.debug(f"Error exporting queries for partition {current_partition_key}: {e}")
                     continue
 
@@ -647,6 +667,7 @@ def export_cache(cache_type: str, archive_file: str, partition_key: str | None =
                             exported_count += 1
 
                 except Exception as e:
+                    failed_partitions += 1
                     logger.debug(f"Error exporting partition {current_partition_key}: {e}")
                     continue
 
@@ -656,10 +677,16 @@ def export_cache(cache_type: str, archive_file: str, partition_key: str | None =
 
     logger.info(f"Export completed: {exported_count} keys exported from {total_keys_found} total keys, queries metadata included, to {archive_file}")
     cache.close()
+    if failed_partitions:
+        logger.error(f"Export incomplete: {failed_partitions} partition entries or query lists could not be read")
+        return False
+    return True
 
 
-def restore_cache(cache_type: str, archive_file: str, target_partition_key: str | None = None, bitsize: int | None = None):
+def restore_cache(cache_type: str, archive_file: str, target_partition_key: str | None = None, bitsize: int | None = None) -> bool:
+    """Import a pickle archive written by export_cache; False if any entry, query or partition could not be stored."""
     cache = get_cache_handler(cache_type)
+    failed = 0
     restored = 0
     skipped_already_exists = 0
     skipped_partition_filtered = 0
@@ -726,6 +753,7 @@ def restore_cache(cache_type: str, archive_file: str, target_partition_key: str 
                             elif existing_datatype != datatype:
                                 logger.warning(f"Partition '{effective_pk}' exists with different datatype: '{existing_datatype}' vs '{datatype}'")
                         except Exception as e:
+                            failed += 1
                             logger.error(f"Failed to register partition '{effective_pk}': {e}")
                     continue
 
@@ -746,7 +774,10 @@ def restore_cache(cache_type: str, archive_file: str, target_partition_key: str 
                             # Store the query using the cache's set_query method
                             if cache.set_query(query_hash, query_text, effective_partition_key):
                                 queries_restored += 1
+                            else:
+                                failed += 1
                         except Exception as e:
+                            failed += 1
                             logger.debug(f"Failed to restore query {query_hash} for partition {effective_partition_key}: {e}")
 
                     logger.info(f"Restored {queries_restored} queries metadata")
@@ -803,14 +834,18 @@ def restore_cache(cache_type: str, archive_file: str, target_partition_key: str 
                         logger.warning(f"Could not register partition '{effective_partition_key}': {e}")
 
                     if not cache.exists(key, effective_partition_key):
-                        cache.set_cache(key, value, effective_partition_key)
-                        restored += 1
+                        if cache.set_cache(key, value, effective_partition_key):
+                            restored += 1
+                        else:
+                            failed += 1
+                            logger.debug(f"Failed to restore key {key} of partition {effective_partition_key}")
                     else:
                         skipped_already_exists += 1
 
             except EOFError:
                 break
             except Exception as e:
+                failed += 1
                 logger.error(f"Error processing import entry: {e}")
                 continue
 
@@ -819,6 +854,10 @@ def restore_cache(cache_type: str, archive_file: str, target_partition_key: str 
         f"Restore completed: {restored} keys restored, {total_skipped} keys skipped ({skipped_already_exists} already exist, {skipped_partition_filtered} partition filtered), {partitions_registered} partitions registered"
     )
     cache.close()
+    if failed:
+        logger.error(f"Restore incomplete: {failed} entries, queries or partitions could not be stored")
+        return False
+    return True
 
 
 def delete_cache(cache_type: str):
@@ -954,7 +993,7 @@ def count_queue():
         logger.error(f"Error counting queues: {e}")
 
 
-def clear_queue():
+def clear_queue() -> bool:
     """Clear both original query and query fragment queues."""
     provider = os.environ.get("QUERY_QUEUE_PROVIDER", "postgresql")
 
@@ -969,9 +1008,11 @@ def clear_queue():
 
     except Exception as e:
         logger.error(f"Error clearing {provider} queues: {e}")
+        return False
+    return True
 
 
-def clear_original_query_queue():
+def clear_original_query_queue() -> bool:
     """Clear only the original query queue."""
     provider = os.environ.get("QUERY_QUEUE_PROVIDER", "postgresql")
 
@@ -982,6 +1023,8 @@ def clear_original_query_queue():
         logger.info(f"Original query queue: {deleted_count} entries cleared")
     except Exception as e:
         logger.error(f"Error clearing {provider} original query queue: {e}")
+        return False
+    return True
 
 
 def show_comprehensive_status() -> None:
@@ -1172,7 +1215,7 @@ def show_comprehensive_status() -> None:
     logger.info("\n" + "=" * 70 + "\n")
 
 
-def clear_query_fragment_queue():
+def clear_query_fragment_queue() -> bool:
     """Clear only the query fragment queue."""
     provider = os.environ.get("QUERY_QUEUE_PROVIDER", "postgresql")
 
@@ -1183,6 +1226,8 @@ def clear_query_fragment_queue():
         logger.info(f"Query fragment queue: {deleted_count} entries cleared")
     except Exception as e:
         logger.error(f"Error clearing {provider} query fragment queue: {e}")
+        return False
+    return True
 
 
 def delete_partition(cache_type: str, partition_key: str) -> bool:
@@ -1211,8 +1256,8 @@ def delete_partition(cache_type: str, partition_key: str) -> bool:
         return False
 
 
-def prune_old_queries(cache_type: str, days_old: int):
-    """Remove queries older than specified days."""
+def prune_old_queries(cache_type: str, days_old: int) -> bool:
+    """Remove queries older than specified days; False on an error."""
     try:
         cache = get_cache_handler(cache_type)
 
@@ -1226,15 +1271,19 @@ def prune_old_queries(cache_type: str, days_old: int):
         cache.close()
     except ValueError as e:
         logger.error(f"Cache configuration error for {cache_type}: {e}")
+        return False
     except Exception as e:
         logger.error(f"Error pruning old queries from {cache_type}: {e}")
+        return False
+    return True
 
 
-def prune_all_caches(days_old: int):
-    """Remove old queries from all cache types."""
+def prune_all_caches(days_old: int) -> bool:
+    """Remove old queries from all configured cache types; False if pruning one of them failed."""
     cache_types = ["postgresql_array", "postgresql_bit", "redis_set", "redis_bit", "rocksdb_set", "rocksdb_bit", "rocksdict"]
 
     total_removed = 0
+    failed_types = []
     for cache_type in cache_types:
         try:
             cache = get_cache_handler(cache_type)
@@ -1246,9 +1295,14 @@ def prune_all_caches(days_old: int):
         except ValueError:
             logger.debug(f"Cache type {cache_type} not configured, skipping")
         except Exception as e:
+            failed_types.append(cache_type)
             logger.error(f"Error pruning {cache_type}: {e}")
 
     logger.info(f"Total queries pruned across all caches: {total_removed}")
+    if failed_types:
+        logger.error(f"Pruning failed for: {', '.join(failed_types)}")
+        return False
+    return True
 
 
 def delete_all_caches():
@@ -1874,6 +1928,8 @@ valid environment variables. Use --env to load configuration from a custom file.
         parser.print_help()
         return
 
+    # False when a command did part of its work but some of it failed: exit 1 after the clean-up below
+    succeeded = True
     try:
         if args.command == "setup":
             if not args.setup_command:
@@ -1935,18 +1991,18 @@ valid environment variables. Use --env to load configuration from a custom file.
                 cache_type = args.cache_type or get_cache_type_from_env()
                 show_partition_overview(cache_type)
             elif args.cache_command == "copy":
-                copy_cache(args.from_cache_type, args.to_cache_type, getattr(args, "partition_key", None))
+                succeeded = copy_cache(args.from_cache_type, args.to_cache_type, getattr(args, "partition_key", None)) is not False
             elif args.cache_command == "export":
                 cache_type = args.cache_type or get_cache_type_from_env()
-                export_cache(cache_type, args.archive_file, getattr(args, "partition_key", None))
+                succeeded = export_cache(cache_type, args.archive_file, getattr(args, "partition_key", None)) is not False
             elif args.cache_command == "import":
                 cache_type = args.cache_type or get_cache_type_from_env()
-                restore_cache(
+                succeeded = restore_cache(
                     cache_type,
                     args.archive_file,
                     getattr(args, "target_partition_key", None),
                     getattr(args, "bitsize", None),
-                )
+                ) is not False
             elif args.cache_command == "delete":
                 if args.all:
                     delete_all_caches()
@@ -1963,11 +2019,11 @@ valid environment variables. Use --env to load configuration from a custom file.
                 count_queue()
             elif args.queue_command == "clear":
                 if args.original:
-                    clear_original_query_queue()
+                    succeeded = clear_original_query_queue() is not False
                 elif args.fragment:
-                    clear_query_fragment_queue()
+                    succeeded = clear_query_fragment_queue() is not False
                 else:
-                    clear_queue()
+                    succeeded = clear_queue() is not False
 
         elif args.command == "maintenance":
             if not args.maintenance_command:
@@ -1976,9 +2032,9 @@ valid environment variables. Use --env to load configuration from a custom file.
 
             if args.maintenance_command == "prune":
                 if args.cache_type:
-                    prune_old_queries(args.cache_type, args.days)
+                    succeeded = prune_old_queries(args.cache_type, args.days) is not False
                 else:
-                    prune_all_caches(args.days)
+                    succeeded = prune_all_caches(args.days) is not False
             elif args.maintenance_command == "cleanup":
                 cache_type = args.cache_type or get_cache_type_from_env()
                 if args.remove_termination:
@@ -2012,6 +2068,9 @@ valid environment variables. Use --env to load configuration from a custom file.
             cache.close()
         except Exception as e:
             logger.error(f"Error compacting {args.cache_type}: {e}")
+
+    if not succeeded:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

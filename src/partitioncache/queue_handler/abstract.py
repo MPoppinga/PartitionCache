@@ -38,7 +38,14 @@ class AbstractQueueHandler(ABC):
         pass
 
     @abstractmethod
-    def push_to_query_fragment_queue(self, query_hash_pairs: list[tuple[str, str]], partition_key: str, partition_datatype: str | None = None, cache_backend: str | None = None) -> bool:
+    def push_to_query_fragment_queue(
+        self,
+        query_hash_pairs: list[tuple[str, str]],
+        partition_key: str,
+        partition_datatype: str | None = None,
+        cache_backend: str | None = None,
+        size_priority: bool | None = None,
+    ) -> bool:
         """
         Push query variants (as (query, hash) pairs) directly to the query variant queue
         (persisted as the historical ``query_fragment_queue``).
@@ -48,6 +55,8 @@ class AbstractQueueHandler(ABC):
             partition_key (str): The partition key for these query variants.
             partition_datatype (str): The datatype of the partition key (default: None).
             cache_backend (str): The cache backend to use for processing (default: None, uses processor config).
+            size_priority (bool): Pop the smaller fragments of all queries first, in a queue with priorities
+                (None: QUERY_QUEUE_SIZE_PRIORITY, default on). A queue without priorities ignores it.
 
         Returns:
             bool: True if all variants were pushed successfully, False otherwise.
@@ -55,22 +64,24 @@ class AbstractQueueHandler(ABC):
         pass
 
     @abstractmethod
-    def pop_from_original_query_queue(self) -> tuple[str, str, str] | None:
+    def pop_from_original_query_queue(self) -> tuple[str, str, str | None] | None:
         """
         Pop an original query from the original query queue.
 
         Returns:
-            Tuple[str, str, str] or None: (query, partition_key, partition_datatype) tuple if available, None if queue is empty or error occurred.
+            Tuple[str, str, str | None] or None: (query, partition_key, partition_datatype) tuple if available, None if queue is empty or error occurred.
+            partition_datatype is None when the query was pushed without one.
         """
         pass
 
     @abstractmethod
-    def pop_from_query_fragment_queue(self) -> tuple[str, str, str, str, str | None] | None:
+    def pop_from_query_fragment_queue(self) -> tuple[str, str, str, str | None, str | None] | None:
         """
         Pop a query variant from the query variant queue (persisted as ``query_fragment_queue``).
 
         Returns:
-            Tuple[str, str, str, str, str | None] or None: (variant_query, hash, partition_key, partition_datatype, cache_backend) tuple if available, None if queue is empty or error occurred.
+            Tuple[str, str, str, str | None, str | None] or None: (variant_query, hash, partition_key, partition_datatype, cache_backend) tuple if available, None if queue is empty or error occurred.
+            partition_datatype is None when the variant was pushed without one.
         """
         pass
 
@@ -171,8 +182,15 @@ class AbstractPriorityQueueHandler(AbstractQueueHandler):
         """
         return self.push_to_original_query_queue_with_priority(query, partition_key, 1, partition_datatype)
 
-    def push_to_query_fragment_queue(self, query_hash_pairs: list[tuple[str, str]], partition_key: str, partition_datatype: str | None = None, cache_backend: str | None = None) -> bool:
+    def push_to_query_fragment_queue(
+        self,
+        query_hash_pairs: list[tuple[str, str]],
+        partition_key: str,
+        partition_datatype: str | None = None,
+        cache_backend: str | None = None,
+        size_priority: bool | None = None,
+    ) -> bool:
         """
-        Default implementation using priority system with priority=1.
+        Default implementation using priority system with priority=1; a handler that supports size priority overrides it.
         """
         return self.push_to_query_fragment_queue_with_priority(query_hash_pairs, partition_key, 1, partition_datatype, cache_backend)

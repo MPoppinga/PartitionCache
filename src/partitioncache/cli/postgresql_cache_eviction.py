@@ -41,6 +41,7 @@ from partitioncache.cli.common_args import (
     get_cron_database_name,
     get_db_connection,
     get_pg_cron_connection,
+    load_env_file_before_parsing,
     load_environment_with_validation,
     parse_duration_to_seconds,
     table_exists,
@@ -774,6 +775,8 @@ def verify_eviction_setup(table_prefix: str) -> int:
 def main():
     """Main function to handle CLI commands."""
 
+    # Argument defaults are read from the environment, so the --env file is loaded first
+    load_env_file_before_parsing()
     parser = argparse.ArgumentParser(description="Manage PostgreSQL cache eviction for PartitionCache.", formatter_class=argparse.RawTextHelpFormatter)
 
     add_environment_args(parser)

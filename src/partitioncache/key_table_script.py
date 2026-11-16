@@ -39,7 +39,7 @@ def _guarded(statement: str, allow_on_commit_drop: bool = False) -> bool:
     return "DELETE " not in text.upper() and "DROP " not in text.upper()
 
 
-def _statements(script: str) -> list[tuple[int, int]] | None:
+def statement_spans(script: str) -> list[tuple[int, int]] | None:
     """(start, end) offsets of the script's statements, split at top-level semicolons; None if it cannot be tokenized."""
     try:
         from sqlglot.dialects.postgres import Postgres
@@ -72,7 +72,7 @@ def lazy_insertion_parts(query: str) -> tuple[str, str, str]:
         ValueError: For a query with DELETE or DROP, or a script with any statement the key-table methods do not
             emit (the message names it).
     """
-    spans = _statements(query)
+    spans = statement_spans(query)
     if spans is None or len(spans) <= 1:
         if not _guarded(query):
             raise ValueError("Query contains DELETE or DROP")
