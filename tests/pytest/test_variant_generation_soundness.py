@@ -193,3 +193,42 @@ class TestSubqueryAliases:
     def test_correlated_subquery_with_other_aliases_is_unchanged(self):
         query = "SELECT x.pk FROM a AS x WHERE x.v = 1 AND EXISTS (SELECT 1 FROM b AS q WHERE q.z = x.id)"
         assert _variants(query) == ["SELECT DISTINCT t1.pk FROM a AS t1 WHERE EXISTS(SELECT 1 FROM b AS q WHERE q.z = t1.id) AND t1.v = 1"]
+
+
+class TestKeyConditionsWithoutKeyJoins:
+    """With skip_partition_key_joins each alias has its own key: a key condition stays on the alias it restricts."""
+
+    QUERY = "SELECT x.pk FROM a x, b y WHERE x.v = 1 AND y.w = 2 AND y.pk IN (8, 9) AND x.id = y.id"
+
+    def test_condition_stays_on_its_alias(self):
+        assert _variants(self.QUERY, skip_partition_key_joins=True) == [
+            "SELECT DISTINCT t1.pk FROM a AS t1 WHERE t1.v = 1",
+            "SELECT DISTINCT t1.pk FROM a AS t1, b AS t2 WHERE t1.id = t2.id AND t1.v = 1 AND t2.pk IN (8, 9) AND t2.w = 2",
+            "SELECT DISTINCT t1.pk FROM a AS t1, b AS t2 WHERE t1.id = t2.id AND t1.v = 1 AND t2.w = 2",
+        ]
+
+    def test_subquery_of_another_alias_is_no_variant(self):
+        """``y.pk IN (subquery)`` lists y's keys, which are not the keys the query selects."""
+        query = "SELECT x.pk FROM a x, b y WHERE x.v = 1 AND y.w = 2 AND y.pk IN (SELECT pk FROM nowhere) AND x.id = y.id"
+        variants = _variants(query, skip_partition_key_joins=True)
+        assert "SELECT pk FROM nowhere" not in variants
+        assert all(variant.startswith("SELECT DISTINCT t1.pk FROM a AS t1") for variant in variants)
+
+    def test_subquery_of_the_selected_alias_is_a_variant(self):
+        query = "SELECT x.pk FROM a x, b y WHERE x.v = 1 AND y.w = 2 AND x.pk IN (SELECT pk FROM nowhere) AND x.id = y.id"
+        assert "SELECT pk FROM nowhere" in _variants(query, skip_partition_key_joins=True)
+
+    def test_partition_join_table_keeps_its_condition(self):
+        """With a partition-join table the variants select its key; none moves its condition or drops the table."""
+        query = "SELECT h.pk FROM a AS x, hub AS h WHERE ST_DWithin(x.g, h.g, 5) AND x.v = 1 AND x.pk IN (1, 2) AND h.pk IN (3, 4)"
+        assert _variants(query, skip_partition_key_joins=True, partition_join_table="h") == [
+            "SELECT DISTINCT p1.pk FROM a AS t1, hub AS p1 WHERE ST_DWITHIN(t1.g, p1.g, 5) AND p1.pk IN (3, 4) AND t1.pk IN (1, 2) AND t1.v = 1",
+            "SELECT DISTINCT p1.pk FROM a AS t1, hub AS p1 WHERE ST_DWITHIN(t1.g, p1.g, 5) AND p1.pk IN (3, 4) AND t1.v = 1",
+            "SELECT DISTINCT p1.pk FROM a AS t1, hub AS p1 WHERE ST_DWITHIN(t1.g, p1.g, 5) AND t1.pk IN (1, 2) AND t1.v = 1",
+            "SELECT DISTINCT p1.pk FROM a AS t1, hub AS p1 WHERE ST_DWITHIN(t1.g, p1.g, 5) AND t1.v = 1",
+        ]
+
+    def test_key_joined_aliases_share_the_condition(self):
+        """With key joins every alias has the same key, so the condition may restrict any of them (unchanged)."""
+        query = "SELECT x.pk FROM a x, b y WHERE x.v = 1 AND y.w = 2 AND y.pk IN (8, 9) AND x.pk = y.pk"
+        assert "SELECT DISTINCT t1.pk FROM a AS t1 WHERE t1.pk IN (8, 9) AND t1.v = 1" in _variants(query)

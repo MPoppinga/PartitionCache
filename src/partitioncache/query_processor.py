@@ -1772,7 +1772,13 @@ def generate_partial_queries(
                         for comb in itertools.combinations(all_pk_conditions_pj, i):
                             query_where_comb = combined_where.copy()
                             for orig_alias, subquery in comb:
-                                remapped = _sub_outside_literals(rf'\b{re.escape(orig_alias)}\.', f'{partition_join_new_alias}.', subquery)
+                                pj_target: str | None = partition_join_new_alias
+                                if skip_partition_key_joins and orig_alias != detected_partition_join_alias:
+                                    # Without key joins each alias has its own key: the condition stays on its alias
+                                    pj_target = new_alias_by_key.get(orig_alias)
+                                    if pj_target is None:
+                                        continue
+                                remapped = _sub_outside_literals(rf'\b{re.escape(orig_alias)}\.', f'{pj_target}.', subquery)
                                 query_where_comb.append(remapped)
                             # Build WHERE clause only if conditions exist
                             select_clause = _build_select_clause(
@@ -1799,13 +1805,21 @@ def generate_partial_queries(
 
             # Flatten partition_key_conditions for combinatorial generation
             all_pk_conditions = [(alias, cond) for alias, conds in partition_key_conditions.items() for cond in conds]
-            if all_pk_conditions:  # TODO handle CTE expressions
+            # Without key joins, variants without the partition-join table would select another table's key
+            if all_pk_conditions and not (skip_partition_key_joins and detected_partition_join_alias):
                 # Create variants of the query with partition key conditions
                 for i in range(1, len(all_pk_conditions) + 1):
                     for comb in itertools.combinations(all_pk_conditions, i):
                         query_where_comb = query_where.copy()
                         for orig_alias, subquery in comb:
-                            if restrict_to_pk_bearing:
+                            remap_target: str | None
+                            if skip_partition_key_joins:
+                                # Without key joins each alias has its own key: the condition restricts its own alias
+                                # only, and a variant without that alias does not take it
+                                remap_target = new_alias_by_key.get(orig_alias)
+                                if remap_target is None:
+                                    continue
+                            elif restrict_to_pk_bearing:
                                 # Attach the pk condition to its own alias (or the
                                 # variant's pk-bearing SELECT alias), never to a
                                 # dimension alias that lacks the pk column.
@@ -1828,8 +1842,15 @@ def generate_partial_queries(
                                 q = f"{select_clause} FROM {', '.join(new_table_list_with_alias)}"
                         ret.append(q)
 
-    # Add also the subqueries of `pk IN (SELECT ...)` conditions as variants of their own
-    for pk_conds in partition_key_conditions.values():
+    # Add also the subqueries of `pk IN (SELECT ...)` conditions as variants of their own. Without key joins they list
+    # the keys of their own alias, which are the query's keys only for the alias whose key the variants select.
+    for pk_alias, pk_conds in partition_key_conditions.items():
+        if skip_partition_key_joins and not (
+            len(table_aliases) == 1
+            or pk_alias == detected_partition_join_alias
+            or (not detected_partition_join_alias and partition_key_source_table in (pk_alias, alias_to_table_map.get(pk_alias)))
+        ):
+            continue
         for partition_key_part in pk_conds:
             ret.extend(_partition_key_subqueries(partition_key_part, table_aliases))
 
