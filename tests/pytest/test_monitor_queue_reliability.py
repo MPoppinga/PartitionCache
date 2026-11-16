@@ -1,7 +1,9 @@
 """pcache-monitor: --close waits for both queues and the decomposer, a missing datatype is resolved, a failed push is not lost silently."""
 
 import logging
+import os
 import threading
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
@@ -173,8 +175,15 @@ class TestMissingDatatype:
         cache = Mock()
         cache.get_datatype.return_value = "integer"
         cache.set_entry_lazy.return_value = True
+        # Lazy insertion runs the fragment on the cache handler's connection, which must be the data database
+        args.db_backend = "postgresql"
+        args.db_name = "sales"
+        cache.db = SimpleNamespace(info=SimpleNamespace(host="localhost", port=5432, dbname="sales"))
 
-        assert self._run(cache, datatype) is True
+        with patch.dict(os.environ, {"DB_HOST": "localhost", "DB_PORT": "5432"}):
+            os.environ.pop("PG_DB_HOST", None)
+            os.environ.pop("PG_DB_PORT", None)
+            assert self._run(cache, datatype) is True
 
         cache.register_partition_key.assert_called_once()
         assert cache.register_partition_key.call_args.args == ("pk", "integer")
