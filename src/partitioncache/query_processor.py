@@ -258,6 +258,112 @@ def normalize_joins_to_cross_join(query: str) -> str:
     return parsed.sql()
 
 
+_WIDENING, _SET, _OTHER = "widening", "set", "other"
+
+
+def _aggregates(select: exp.Select) -> bool:
+    """True if the SELECT list computes values over several rows (aggregate or window functions)."""
+    return any(expression.find(exp.AggFunc, exp.Window) is not None for expression in select.expressions)
+
+
+def _distinct_on(select: exp.Select) -> bool:
+    distinct = select.args.get("distinct")
+    return distinct is not None and distinct.args.get("on") is not None
+
+
+def _plain_group(select: exp.Select) -> bool:
+    """True for a GROUP BY of plain expressions; ROLLUP, CUBE and GROUPING SETS add rows of their own."""
+    group = select.args.get("group")
+    if group is None or not group.expressions or any(group.args.get(arg) for arg in ("grouping_sets", "cube", "rollup", "totals")):
+        return False
+    return not any(isinstance(node, exp.Rollup | exp.Cube | exp.GroupingSets | exp.Tuple) for node in group.expressions)
+
+
+def _subquery_contexts(parsed: exp.Expr, outermost: exp.Select | None) -> dict[int, str]:
+    """Classify every nested SELECT by how its rows reach the result of the outermost query.
+
+    ``_WIDENING``: more rows of it can only add rows to the outer result (a positive ``IN``, ``= ANY`` or ``EXISTS``
+    in a WHERE of conjunctions and disjunctions, a branch of a UNION or INTERSECT, the left branch of an EXCEPT,
+    a table of an inner join, each inside a widening SELECT). ``_SET``: only which rows it has matters, not their
+    number or order (the same predicates negated, ``<op> ALL``, or in any other expression). ``_OTHER``: anything
+    else, e.g. a scalar subquery or the table of an outer join.
+
+    Returns:
+        ``id(select)`` -> context for every SELECT except ``outermost``.
+    """
+    contexts: dict[int, str] = {}
+
+    def context(select: exp.Select) -> str:
+        if id(select) not in contexts:
+            contexts[id(select)] = classify(select)
+        return contexts[id(select)]
+
+    def classify(select: exp.Select) -> str:
+        node: exp.Expr = select
+        monotone = True
+        parent = node.parent
+        while isinstance(parent, exp.Subquery | exp.Paren | exp.SetOperation):
+            if isinstance(parent, exp.Intersect | exp.Except) and not parent.args.get("distinct"):
+                return _OTHER  # INTERSECT ALL / EXCEPT ALL count rows
+            if isinstance(parent, exp.Except) and node is not parent.this:
+                monotone = False
+            node, parent = parent, parent.parent
+        if parent is None:  # a branch of a set operation at the top: its rows are result rows
+            return _WIDENING if monotone else _SET
+        if isinstance(parent, exp.From | exp.Join):
+            if node is not parent.this or (isinstance(parent, exp.Join) and (parent.side or parent.kind not in ("", "INNER", "CROSS"))):
+                return _OTHER
+            host = parent.parent
+            if host is outermost:  # its SELECT list becomes * and its row limits go
+                return _WIDENING if monotone else _SET
+            if not isinstance(host, exp.Select) or _aggregates(host) or _distinct_on(host):
+                return _OTHER
+            host_context = context(host)
+            if host_context == _WIDENING:
+                return _WIDENING if monotone else _SET
+            if host_context == _SET and not any(host.args.get(clause) for clause in ("limit", "offset", "having")):
+                return _SET  # the host keeps no clause that counts or orders this table's rows
+            return _OTHER
+        if (isinstance(parent, exp.In) and node is parent.args.get("query")) or isinstance(parent, exp.Exists):
+            predicate: exp.Expr = parent
+        elif isinstance(parent, exp.Any | exp.All) and isinstance(parent.parent, exp.Binary) and parent.parent.expression is parent:
+            predicate = parent.parent
+            monotone = monotone and isinstance(parent, exp.Any)
+        else:
+            return _OTHER
+        # The predicate depends only on which rows exist; it widens with them only in a WHERE of ANDs and ORs
+        while isinstance(predicate.parent, exp.And | exp.Or | exp.Paren):
+            predicate = predicate.parent
+        where = predicate.parent
+        if not monotone or not isinstance(where, exp.Where) or not isinstance(where.parent, exp.Select):
+            return _SET
+        host = where.parent
+        return _WIDENING if host is outermost or context(host) == _WIDENING else _SET
+
+    for select in parsed.find_all(exp.Select):
+        if select is not outermost:
+            context(select)
+    return contexts
+
+
+def _clean_subquery_clauses(select: exp.Select, context: str) -> None:
+    """Remove the clauses of a nested SELECT whose removal cannot remove rows from the outer result."""
+    distinct_on = _distinct_on(select)
+    if context == _WIDENING:
+        for clause in ("limit", "offset", "having"):
+            select.set(clause, None)
+        if not distinct_on:
+            select.set("order", None)
+        if _plain_group(select) and not _aggregates(select) and select.args.get("order") is None:
+            select.set("group", None)
+        return
+    if select.args.get("limit") or select.args.get("offset") or distinct_on:
+        return
+    select.set("order", None)  # without row limits and DISTINCT ON the order of the rows never matters
+    if context == _SET and _plain_group(select) and not _aggregates(select) and select.args.get("having") is None:
+        select.set("group", None)
+
+
 def clean_query(query: str) -> str:
     """
     Perform query cleaning to ensure stable output for cache variant generation.
@@ -271,10 +377,11 @@ def clean_query(query: str) -> str:
 
     Removes:
     - SELECT expressions (replaced with *, don't affect partition key access patterns)
-    - ORDER BY clauses (don't affect partition key access patterns)
-    - LIMIT clauses (don't affect partition key access patterns)
-    - GROUP BY clauses (don't affect partition key access patterns)
-    - HAVING clauses (don't affect partition key access patterns)
+    - ORDER BY, LIMIT, OFFSET, GROUP BY and HAVING of the outermost SELECT (removing them can only add rows)
+    - The same clauses of a subquery where that cannot remove rows of the outer result: all of them under a
+      positive IN, = ANY or EXISTS (GROUP BY only without aggregates in the SELECT list); under NOT IN,
+      NOT EXISTS, <op> ALL or in a scalar subquery the subquery stays as written, except an ORDER BY without
+      LIMIT, OFFSET or DISTINCT ON
     - Comments
     - Trailing semicolons
     - Unnecessary parentheses in WHERE clauses
@@ -305,32 +412,20 @@ def clean_query(query: str) -> str:
     # Simplification e.g. Sort comparison operators to ensure consistent order
     parsed = sqlglot.optimizer.simplify.simplify(parsed)
 
-    # Remove clauses that don't affect which partition keys are accessed
-    for select_stmt in parsed.find_all(exp.Select):
-        # Remove ORDER BY
-        if select_stmt.args.get("order"):
-            select_stmt.set("order", None)
-            logger.debug("Removed ORDER BY clause for cache variant generation")
-
-        # Remove LIMIT
-        if select_stmt.args.get("limit"):
-            select_stmt.set("limit", None)
-            logger.debug("Removed LIMIT clause for cache variant generation")
-
-        # Remove GROUP BY
-        if select_stmt.args.get("group"):
-            select_stmt.set("group", None)
-            logger.debug("Removed GROUP BY clause for cache variant generation")
-
-        # Remove HAVING
-        if select_stmt.args.get("having"):
-            select_stmt.set("having", None)
-            logger.debug("Removed HAVING clause for cache variant generation")
+    # The outermost SELECT's ORDER BY, row limits, GROUP BY and HAVING can only remove result rows. In a subquery
+    # they go only where that cannot remove rows of the outer result (see _subquery_contexts).
+    outermost_select = parsed if isinstance(parsed, exp.Select) else parsed.find(exp.Select)
+    contexts = _subquery_contexts(parsed, outermost_select)
+    for select_stmt in list(parsed.find_all(exp.Select)):
+        if select_stmt is outermost_select:
+            for clause in ("order", "limit", "offset", "group", "having"):
+                select_stmt.set(clause, None)
+        else:
+            _clean_subquery_clauses(select_stmt, contexts[id(select_stmt)])
 
     # Replace only the outermost SELECT expressions with * to avoid confusing
     # downstream regex-based parsing (e.g., aliases containing SQL keywords like FROM)
     # Only the outermost SELECT is replaced; subqueries/CTEs keep their columns
-    outermost_select = parsed if isinstance(parsed, exp.Select) else parsed.find(exp.Select)
     if outermost_select:
         outermost_select.set("expressions", [exp.Star()])
 

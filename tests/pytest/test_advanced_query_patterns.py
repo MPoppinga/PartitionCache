@@ -147,8 +147,8 @@ class TestCleanQueryAdvancedPatterns:
         # Outermost SELECT is replaced with *; subquery columns preserved
         assert result.startswith("SELECT * FROM"), "Outermost SELECT should be replaced with *"
         assert "COUNT(*) AS cnt" in result, "Subquery aggregate should be preserved"
-        # GROUP BY inside subquery is removed for cache variant generation
-        assert "GROUP BY" not in result, "GROUP BY should be removed"
+        # Without its GROUP BY the derived table would have a single row (COUNT over all users): it stays
+        assert "GROUP BY zipcode" in result, "GROUP BY of an aggregating subquery should be kept"
         assert "AS t" in result, "Derived table alias should be preserved"
         assert "t.zipcode = 1001" in result, "WHERE condition should be preserved"
 

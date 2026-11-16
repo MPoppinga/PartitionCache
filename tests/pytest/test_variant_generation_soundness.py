@@ -103,3 +103,32 @@ class TestPartitionKeyJoinDetection:
     )
     def test_variants_hold_the_keys_of_the_query(self, condition):
         _assert_sound(f"SELECT x.pk FROM a AS x, b AS y WHERE x.v = 1 AND y.w = 2 AND {condition}")
+
+
+class TestSubqueryClauses:
+    """ORDER BY, LIMIT, OFFSET, GROUP BY and HAVING of a subquery go only where that cannot remove rows of the query."""
+
+    @pytest.mark.parametrize(
+        "condition",
+        [
+            "x.id NOT IN (SELECT id FROM b ORDER BY score DESC LIMIT 1)",
+            "NOT EXISTS (SELECT b.k FROM b WHERE b.id = x.id GROUP BY b.k HAVING COUNT(*) > 1)",
+            "x.v IN (SELECT MAX(b.w) - 1 FROM b GROUP BY b.k)",
+            "x.id IN (SELECT id FROM b ORDER BY score DESC LIMIT 2)",
+        ],
+    )
+    def test_variants_hold_the_keys_of_the_query(self, condition):
+        variants = _assert_sound(f"SELECT x.pk FROM a AS x WHERE x.v = 1 AND {condition}")
+        assert variants
+
+    def test_negated_subquery_keeps_its_limit(self):
+        query = "SELECT x.pk FROM a AS x WHERE x.v = 1 AND x.id NOT IN (SELECT id FROM b ORDER BY score DESC LIMIT 1)"
+        assert _variants(query) == ["SELECT DISTINCT t1.pk FROM a AS t1 WHERE NOT t1.id IN (SELECT id FROM b ORDER BY score DESC LIMIT 1) AND t1.v = 1"]
+
+    def test_positive_subquery_loses_its_limit(self):
+        query = "SELECT x.pk FROM a AS x WHERE x.v = 1 AND x.id IN (SELECT id FROM b ORDER BY score DESC LIMIT 1)"
+        assert _variants(query) == ["SELECT DISTINCT t1.pk FROM a AS t1 WHERE t1.id IN (SELECT id FROM b) AND t1.v = 1"]
+
+    def test_offset_goes_with_its_order_by(self):
+        query = "SELECT x.pk FROM a AS x WHERE x.v = 1 AND x.id IN (SELECT id FROM b ORDER BY s OFFSET 10)"
+        assert _variants(query) == ["SELECT DISTINCT t1.pk FROM a AS t1 WHERE t1.id IN (SELECT id FROM b) AND t1.v = 1"]
