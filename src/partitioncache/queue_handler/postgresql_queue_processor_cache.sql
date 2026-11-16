@@ -337,8 +337,9 @@ BEGIN
             END IF;
         END IF;
         
-        -- Bootstrap partition with existing or default bitsize (to be expanded later if needed)
-        IF NOT EXISTS (SELECT 1 FROM pg_tables WHERE tablename = v_cache_table) THEN
+        -- Bootstrap partition with existing or default bitsize (to be expanded later if needed).
+        -- Cast to name: a table name over 63 bytes is stored truncated, and without the cast every job bootstrapped again.
+        IF NOT EXISTS (SELECT 1 FROM pg_tables WHERE tablename = v_cache_table::name) THEN
             DECLARE v_bitsize_for_bootstrap INTEGER;
             DECLARE v_existing_bitsize INTEGER;
             BEGIN
