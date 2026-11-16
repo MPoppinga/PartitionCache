@@ -11,7 +11,7 @@ import re
 import pytest
 
 from partitioncache import query_processor
-from partitioncache.apply_cache import apply_cache, apply_cache_lazy
+from partitioncache.apply_cache import apply_cache, apply_cache_lazy, rewrite_query_with_p0_table
 from partitioncache.cache_handler.abstract import AbstractCacheHandler_Lazy
 
 duckdb = pytest.importorskip("duckdb")
@@ -23,6 +23,7 @@ LAZY_METHODS = ["IN_SUBQUERY", "TMP_TABLE_IN", "TMP_TABLE_JOIN"]
 def _load(conn) -> None:
     conn.execute("CREATE TABLE t (id INTEGER, pk INTEGER, x INTEGER, y INTEGER)")
     conn.execute("INSERT INTO t SELECT i, i % 20, i % 7, i % 5 FROM range(1, 201) AS r(i)")
+    conn.execute("CREATE TABLE pk_mv AS SELECT DISTINCT pk FROM t")  # the p0 table of use_p0_table
     conn.execute("CREATE TABLE d (id INTEGER, z INTEGER)")
     conn.execute("INSERT INTO d SELECT i, i % 3 FROM range(1, 201, 4) AS r(i)")
     # Events in hour buckets (w); a pair's events are up to 30 minutes apart, so a pair can cross a bucket boundary
@@ -208,3 +209,40 @@ class TestJoinMethodsJoinOnlyTheRestrictedSelect:
             assert rows == run(query), rewritten
             assert len(re.findall(r"AS tmp_\w+ ON", rewritten)) == (2 if join_every_table else 1)
 
+
+P0_TABLE_QUERIES = {
+    "key_join": "SELECT p1.id, p2.id FROM t AS p1, t AS p2 WHERE p1.pk = p2.pk AND p1.x = 3 AND p2.y = 1",
+    "key_join_under_or": "SELECT p1.id, p2.id FROM t AS p1, t AS p2 WHERE (p1.pk = p2.pk OR p2.id = p1.id + 1) AND p1.x = 3 AND p2.y = 1",
+    "subquery_table": "SELECT p1.id FROM t AS p1 WHERE p1.x = 3 AND p1.id IN (SELECT q.id FROM t AS q WHERE q.y = 1)",
+    "table_not_joined_on_the_key": "SELECT p1.id, d1.z FROM t AS p1, d AS d1 WHERE d1.id = p1.id AND p1.x = 3",
+}
+
+
+class TestUseP0Table:
+    @pytest.mark.parametrize("name", list(P0_TABLE_QUERIES))
+    def test_rewrite_keeps_the_rows(self, db, name):
+        run, _ = db
+        query = P0_TABLE_QUERIES[name]
+        rewritten = rewrite_query_with_p0_table(query, "pk", sql_dialect="duckdb")
+        assert rewritten != query
+        assert run(rewritten) == run(query), rewritten
+
+    # Not key_join_under_or: without skip_partition_key_joins the variants take every table to share the key
+    @pytest.mark.parametrize("name", ["key_join", "subquery_table", "table_not_joined_on_the_key"])
+    @pytest.mark.parametrize("method", ["IN", "TMP_TABLE_IN"])
+    def test_apply_cache(self, db, name, method):
+        run, cache = db
+        query = P0_TABLE_QUERIES[name]
+        for apply, kind in ((_eager, method), (_lazy, "IN_SUBQUERY" if method == "IN" else method)):
+            rows, stats, rewritten = apply(run, cache, query, kind, use_p0_table=True)
+            assert stats["p0_rewritten"] == 1 and stats["enhanced"] == 1
+            assert rows == run(query), rewritten
+
+    def test_only_an_exact_key_equality_is_replaced(self):
+        rewritten = rewrite_query_with_p0_table(P0_TABLE_QUERIES["key_join_under_or"], "pk")
+        assert "(p1.pk = p2.pk OR p2.id = p1.id + 1)" in rewritten
+        assert "p2.pk = p0.pk" not in rewritten and "p1.pk = p0.pk" in rewritten
+
+    def test_tables_of_subqueries_are_not_tied(self):
+        rewritten = rewrite_query_with_p0_table(P0_TABLE_QUERIES["subquery_table"], "pk")
+        assert "q.pk = p0.pk" not in rewritten and rewritten.endswith("AND p1.pk = p0.pk")

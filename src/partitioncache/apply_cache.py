@@ -504,6 +504,10 @@ def rewrite_query_with_p0_table( # TODO: Check duplication with query_processor
     SELECT * FROM tt AS t1, tt AS t2, partition_key_mv AS p0
     WHERE t1.partition_key = p0.partition_key AND t2.partition_key = p0.partition_key
 
+    Only the tables of the restricted SELECT's FROM and top-level JOIN clauses whose key equals the p0 alias's
+    (``find_p0_alias``) through top-level equalities ``a.<key> = b.<key>`` are tied to p0, and only these equalities
+    are removed; an equality inside an OR or a longer condition stays.
+
     Args:
         query (str): The original SQL query to rewrite.
         partition_key (str): The identifier for the partition.
@@ -524,18 +528,22 @@ def rewrite_query_with_p0_table( # TODO: Check duplication with query_processor
     if mv_table_name in existing_tables:
         return query
 
-    # Find all table aliases that have partition_key joins
-    table_aliases_with_partition_key = []
-    for table in parsed_query.find_all(exp.Table):
-        alias = table.alias if table.alias else table.name
-        table_aliases_with_partition_key.append(alias)
+    # The p0 table replaces the key equalities of the restricted SELECT: it is tied to the aliases whose key equals the
+    # p0 alias's (find_p0_alias) through top-level equalities a.<key> = b.<key>, in the order the tables occur. A table of
+    # a subquery, or one related to them otherwise (a time window, a dimension, an outer join), keeps its own key.
+    select = _restricted_select(parsed_query)
+    from_clause = select.args.get("from_") if select is not None else None
+    if select is None or from_clause is None:
+        return query
+    try:
+        anchor = find_p0_alias(query, partition_key)
+    except (ValueError, sqlglot.errors.SqlglotError):
+        return query
+    top_level = {clause.alias_or_name for clause in _from_clauses(select)}
+    component = _key_component(select, partition_key, anchor) & top_level
+    table_aliases_with_partition_key = list(dict.fromkeys(table.alias_or_name for table in parsed_query.find_all(exp.Table) if table.alias_or_name in component))
 
     if not table_aliases_with_partition_key:
-        return query
-
-    # Add p0 table to FROM clause
-    from_clause = parsed_query.find(exp.From)
-    if from_clause is None:
         return query
 
     # Convert to comma-separated tables format including p0
@@ -543,11 +551,11 @@ def rewrite_query_with_p0_table( # TODO: Check duplication with query_processor
     from_clause.set("this", exp.Table(this=f"{current_table.sql(dialect=sql_dialect)}, {mv_table_name} AS {p0_alias}"))
 
     # Remove existing partition_key join conditions and replace with star-schema joins
-    where_clause = _outer_where(parsed_query)
+    where_clause = select.args.get("where")
     if where_clause is None:
         # Without a WHERE the star joins were dropped and p0 was cross-joined with every row
         where_clause = exp.Where()
-        parsed_query.set("where", where_clause)
+        select.set("where", where_clause)
     if where_clause:
         # Collect all conditions
         conditions = []
@@ -561,23 +569,16 @@ def rewrite_query_with_p0_table( # TODO: Check duplication with query_processor
 
         collect_conditions(where_clause.this)
 
-        # Filter out partition_key join conditions and add star-schema joins
-        new_conditions = []
-        for condition in conditions:
-            condition_sql = condition.sql()
-            # Skip existing partition_key joins between tables
-            is_partition_join = False
-            for alias1 in table_aliases_with_partition_key:
-                for alias2 in table_aliases_with_partition_key:
-                    if alias1 != alias2:
-                        if f"{alias1}.{partition_key} = {alias2}.{partition_key}" in condition_sql:
-                            is_partition_join = True
-                            break
-                if is_partition_join:
-                    break
+        def is_tied_key_equality(condition: exp.Expr) -> bool:
+            # Exactly a.<key> = b.<key> between two tied aliases; an OR or a longer expression that contains one is kept
+            node = condition.unnest()
+            if not isinstance(node, exp.EQ) or not isinstance(node.this, exp.Column) or not isinstance(node.expression, exp.Column):
+                return False
+            left, right = node.this, node.expression
+            return left.name == right.name == partition_key and left.table != right.table and {left.table, right.table} <= component
 
-            if not is_partition_join:
-                new_conditions.append(condition)
+        # Filter out partition_key join conditions and add star-schema joins
+        new_conditions = [condition for condition in conditions if not is_tied_key_equality(condition)]
 
         # Add star-schema joins through p0
         for alias in table_aliases_with_partition_key:
