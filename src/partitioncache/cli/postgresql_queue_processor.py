@@ -566,6 +566,101 @@ def insert_cache_config(
     logger.info("Configuration inserted successfully in cache database for worker function access.")
 
 
+def _quote_role(role: str) -> str:
+    return '"' + role.replace('"', '""') + '"'
+
+
+def processor_job_owners(conn, queue_prefix: str) -> dict[str, set[str]]:
+    """Return the job owner roles of a processor installation with the statement_timeout values earlier versions set on them.
+
+    Queue processors set up by earlier versions ran ``ALTER ROLE <job_owner> SET statement_timeout = '<timeout_seconds * 1000>ms'``
+    for every row of the configuration table. The current user is always included (it is the default job owner), with no
+    expected value unless a configuration row names it.
+
+    Args:
+        conn: Connection to the database that holds the configuration table (the pg_cron database).
+        queue_prefix: Queue table prefix of the installation.
+
+    Returns:
+        Mapping from role name to the set of statement_timeout values an earlier version would have set on it.
+    """
+    config_table = f"{queue_prefix}_processor_config"
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT current_user, to_regclass(quote_ident(%s)) IS NOT NULL, EXISTS (SELECT 1 FROM information_schema.columns "
+            "WHERE table_schema = current_schema() AND table_name = %s AND column_name = 'job_owner')",
+            (config_table, config_table),
+        )
+        current_user, has_table, has_owner_column = cur.fetchone()
+        owners: dict[str, set[str]] = {current_user: set()}
+        if has_table:
+            owner = sql.SQL("COALESCE(job_owner, current_user)") if has_owner_column else sql.SQL("current_user")
+            cur.execute(sql.SQL("SELECT {}, timeout_seconds FROM {}").format(owner, sql.Identifier(config_table)))
+            for role, timeout_seconds in cur.fetchall():
+                owners.setdefault(role, set()).add(f"{timeout_seconds * 1000}ms")
+    return owners
+
+
+def release_legacy_role_statement_timeout(conn, owners: dict[str, set[str]]) -> None:
+    """Remove the role-wide statement_timeout that queue processors of earlier versions left on their job owners.
+
+    The setting (``ALTER ROLE ... SET``, all databases) is reset only where it still has the value such a processor set.
+    Any other role-wide statement_timeout is left in place with a warning that names the role, the value and the command
+    that removes it, since it may have been set on purpose.
+
+    Args:
+        conn: Connection to any database of the cluster; it must have no open transaction with pending work.
+        owners: Result of :func:`processor_job_owners`.
+    """
+    for role, legacy_values in owners.items():
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT cfg FROM pg_db_role_setting s JOIN pg_roles r ON r.oid = s.setrole, unnest(s.setconfig) AS cfg "
+                "WHERE r.rolname = %s AND s.setdatabase = 0 AND cfg LIKE 'statement_timeout=%%'",
+                (role,),
+            )
+            row = cur.fetchone()
+        if row is None:
+            continue
+        value = row[0].split("=", 1)[1]
+        reset_command = f"ALTER ROLE {_quote_role(role)} RESET statement_timeout;"
+        if value not in legacy_values:
+            logger.warning(
+                f"Role {role} has statement_timeout = {value} for all its sessions. Queue processors set up by earlier versions "
+                f"set this on their job owner; this version does not and leaves it unchanged. If it is left over, remove it with: {reset_command}"
+            )
+            continue
+        try:
+            with conn.cursor() as cur:
+                cur.execute(sql.SQL("ALTER ROLE {} RESET statement_timeout").format(sql.Identifier(role)))
+            conn.commit()
+            logger.info(f"Removed statement_timeout = {value} from role {role}, set there by a queue processor of an earlier version")
+        except psycopg.Error as e:
+            conn.rollback()
+            logger.warning(
+                f"Role {role} keeps statement_timeout = {value} for all its sessions, set by a queue processor of an earlier version; "
+                f"it could not be removed ({e}). Remove it as a role that may alter {role}: {reset_command}"
+            )
+
+
+def warn_if_pg_cron_background_workers(conn) -> None:
+    """Warn that the fragment timeout is not enforced when pg_cron runs jobs in background workers.
+
+    The job command sets statement_timeout before it calls the processor function. pg_cron arms that timeout when it
+    runs jobs over libpq connections (the default), but not with ``cron.use_background_workers = on``.
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT current_setting('cron.use_background_workers', true)")
+        row = cur.fetchone()
+    conn.commit()
+    if row is not None and row[0] == "on":
+        logger.warning(
+            "pg_cron runs jobs in background workers (cron.use_background_workers = on), which do not apply the statement_timeout "
+            "set by the job command: the processor's timeout is not enforced. Use a dedicated --job-owner role and set the timeout "
+            "on that role (ALTER ROLE <job_owner> SET statement_timeout = ...), or run pg_cron with libpq connections."
+        )
+
+
 def remove_all_processor_objects(conn, queue_prefix: str):
     """Remove all processor-related tables, cron job and PartitionCache functions."""
     logger.info("Removing all PostgreSQL queue processor objects and functions...")
@@ -577,6 +672,15 @@ def remove_all_processor_objects(conn, queue_prefix: str):
     target_database = get_cache_database_name()
     # Match all processor jobs for this database
     job_name_pattern = f"partitioncache_process_queue_{target_database}%"
+
+    # The job owners are read from the configuration table before it is dropped
+    same_database = get_cron_database_name() == target_database
+    owners_conn = conn if same_database else get_pg_cron_connection()
+    try:
+        release_legacy_role_statement_timeout(owners_conn, processor_job_owners(owners_conn, queue_prefix))
+    finally:
+        if not same_database:
+            owners_conn.close()
 
     with conn.cursor() as cur:
         # Drop processor-specific tables first. The DELETE trigger on the config
@@ -764,7 +868,15 @@ def handle_setup(table_prefix: str, queue_prefix: str, cache_backend: str, frequ
 
     # Insert configuration in cron database for pg_cron job management
     actual_cron_conn = cache_conn if get_cron_database_name() == get_cache_database_name() else cron_conn
+    # Read before the configuration row is replaced: earlier versions set the old timeout on the old job owner
+    owners = processor_job_owners(actual_cron_conn, queue_prefix)
+    if job_owner:
+        owners.setdefault(job_owner, set())
+    actual_cron_conn.commit()
     insert_initial_config(actual_cron_conn, job_name, table_prefix, queue_prefix, cache_backend, frequency, enabled, timeout, target_database, default_bitsize, job_owner=job_owner)
+    release_legacy_role_statement_timeout(actual_cron_conn, owners)
+    if pg_cron_available:
+        warn_if_pg_cron_background_workers(actual_cron_conn)
 
     # Optional: schedule processor log cleanup if helper functions are available.
     if pg_cron_available:

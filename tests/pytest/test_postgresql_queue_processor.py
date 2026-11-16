@@ -637,9 +637,11 @@ class TestDurationParsingAndVerifyCommand:
 class TestScopedRemove:
     """Verify remove_all_processor_objects uses scoped function lists, not blanket LIKE."""
 
+    @patch("partitioncache.cli.postgresql_queue_processor.release_legacy_role_statement_timeout")
+    @patch("partitioncache.cli.postgresql_queue_processor.processor_job_owners", return_value={})
     @patch("partitioncache.cli.postgresql_queue_processor.get_cache_database_name", return_value="testdb")
     @patch("partitioncache.cli.postgresql_queue_processor.get_cron_database_name", return_value="testdb")
-    def test_scoped_function_drop_uses_any_not_like(self, mock_cron_db, mock_cache_db):
+    def test_scoped_function_drop_uses_any_not_like(self, mock_cron_db, mock_cache_db, mock_owners, mock_release):
         from partitioncache.cli.postgresql_queue_processor import remove_all_processor_objects
 
         mock_conn = Mock()
@@ -659,9 +661,11 @@ class TestScopedRemove:
         # Must NOT use LIKE pattern for function discovery
         assert "LIKE 'partitioncache_%'" not in all_sql or "jobname LIKE" in all_sql  # jobname LIKE is OK for cron.job cleanup
 
+    @patch("partitioncache.cli.postgresql_queue_processor.release_legacy_role_statement_timeout")
+    @patch("partitioncache.cli.postgresql_queue_processor.processor_job_owners", return_value={})
     @patch("partitioncache.cli.postgresql_queue_processor.get_cache_database_name", return_value="testdb")
     @patch("partitioncache.cli.postgresql_queue_processor.get_cron_database_name", return_value="testdb")
-    def test_does_not_drop_eviction_functions(self, mock_cron_db, mock_cache_db):
+    def test_does_not_drop_eviction_functions(self, mock_cron_db, mock_cache_db, mock_owners, mock_release):
         """Processor remove must not include eviction-specific function names."""
         from partitioncache.cli.postgresql_queue_processor import remove_all_processor_objects
 
@@ -738,3 +742,144 @@ class TestLiveMetrics:
         metrics = _fetch_processor_live_metrics("partitioncache_queue")
 
         assert metrics["queue_length"] == 42
+
+
+def _mock_conn():
+    conn = Mock()
+    cursor = Mock()
+    conn.cursor.return_value.__enter__ = Mock(return_value=cursor)
+    conn.cursor.return_value.__exit__ = Mock(return_value=None)
+    return conn, cursor
+
+
+class TestLegacyRoleStatementTimeout:
+    """Earlier versions set statement_timeout on the job owner role; setup and remove take it back without touching other values."""
+
+    def test_job_owners_with_the_values_earlier_versions_set(self):
+        from partitioncache.cli.postgresql_queue_processor import processor_job_owners
+
+        conn, cursor = _mock_conn()
+        cursor.fetchone.return_value = ("app", True, True)
+        cursor.fetchall.return_value = [("cron_owner", 1800), ("app", 30)]
+
+        assert processor_job_owners(conn, "partitioncache_queue") == {"app": {"30000ms"}, "cron_owner": {"1800000ms"}}
+
+    def test_job_owners_without_configuration_table_is_the_current_user(self):
+        from partitioncache.cli.postgresql_queue_processor import processor_job_owners
+
+        conn, cursor = _mock_conn()
+        cursor.fetchone.return_value = ("app", False, False)
+
+        assert processor_job_owners(conn, "partitioncache_queue") == {"app": set()}
+        cursor.fetchall.assert_not_called()
+
+    def test_value_set_by_an_earlier_version_is_reset(self):
+        from psycopg import sql
+
+        from partitioncache.cli.postgresql_queue_processor import release_legacy_role_statement_timeout
+
+        conn, cursor = _mock_conn()
+        cursor.fetchone.return_value = ("statement_timeout=1800000ms",)
+
+        release_legacy_role_statement_timeout(conn, {"app": {"1800000ms"}})
+
+        assert cursor.execute.call_args_list[-1][0][0] == sql.SQL("ALTER ROLE {} RESET statement_timeout").format(sql.Identifier("app"))
+        conn.commit.assert_called_once()
+
+    def test_other_value_is_kept_with_a_warning(self, caplog):
+        from partitioncache.cli.postgresql_queue_processor import release_legacy_role_statement_timeout
+
+        conn, cursor = _mock_conn()
+        cursor.fetchone.return_value = ("statement_timeout=5min",)
+
+        with caplog.at_level("WARNING", logger="PartitionCache.PostgreSQLQueueProcessor"):
+            release_legacy_role_statement_timeout(conn, {"app": {"1800000ms"}})
+
+        assert cursor.execute.call_count == 1  # only the lookup
+        conn.commit.assert_not_called()
+        assert "Role app has statement_timeout = 5min" in caplog.text
+        assert 'ALTER ROLE "app" RESET statement_timeout;' in caplog.text
+
+    def test_role_without_setting_is_left_alone(self, caplog):
+        from partitioncache.cli.postgresql_queue_processor import release_legacy_role_statement_timeout
+
+        conn, cursor = _mock_conn()
+        cursor.fetchone.return_value = None
+
+        with caplog.at_level("WARNING", logger="PartitionCache.PostgreSQLQueueProcessor"):
+            release_legacy_role_statement_timeout(conn, {"app": {"1800000ms"}})
+
+        assert cursor.execute.call_count == 1
+        assert caplog.text == ""
+
+    def test_reset_without_privilege_warns_with_the_command(self, caplog):
+        import psycopg
+
+        from partitioncache.cli.postgresql_queue_processor import release_legacy_role_statement_timeout
+
+        conn, cursor = _mock_conn()
+        cursor.fetchone.return_value = ("statement_timeout=1800000ms",)
+        cursor.execute.side_effect = [None, psycopg.errors.InsufficientPrivilege("permission denied to alter role")]
+
+        with caplog.at_level("WARNING", logger="PartitionCache.PostgreSQLQueueProcessor"):
+            release_legacy_role_statement_timeout(conn, {"cron owner": {"1800000ms"}})
+
+        conn.rollback.assert_called_once()
+        assert "permission denied to alter role" in caplog.text
+        assert 'ALTER ROLE "cron owner" RESET statement_timeout;' in caplog.text
+
+    @patch("partitioncache.cli.postgresql_queue_processor.release_legacy_role_statement_timeout")
+    @patch("partitioncache.cli.postgresql_queue_processor.processor_job_owners", return_value={"app": {"1800000ms"}})
+    @patch("partitioncache.cli.postgresql_queue_processor.get_cache_database_name", return_value="testdb")
+    @patch("partitioncache.cli.postgresql_queue_processor.get_cron_database_name", return_value="testdb")
+    def test_remove_releases_the_role_setting_before_dropping_the_configuration(self, mock_cron_db, mock_cache_db, mock_owners, mock_release):
+        from partitioncache.cli.postgresql_queue_processor import remove_all_processor_objects
+
+        conn, cursor = _mock_conn()
+        dropped_before_release = []
+        mock_release.side_effect = lambda *args: dropped_before_release.append(cursor.execute.call_count)
+
+        remove_all_processor_objects(conn, "partitioncache_queue")
+
+        mock_owners.assert_called_once_with(conn, "partitioncache_queue")
+        mock_release.assert_called_once_with(conn, {"app": {"1800000ms"}})
+        assert dropped_before_release == [0]
+
+
+class TestSetupRoleTimeout:
+    """setup reads the job owners before it replaces the configuration row, and releases their legacy role timeout after."""
+
+    @patch("partitioncache.cli.postgresql_queue_processor.warn_if_pg_cron_background_workers")
+    @patch("partitioncache.cli.postgresql_queue_processor.check_pg_cron_installed", return_value=True)
+    @patch("partitioncache.cli.postgresql_queue_processor.get_cron_database_name", return_value="appdb")
+    @patch("partitioncache.cli.postgresql_queue_processor.get_cache_database_name", return_value="appdb")
+    @patch("partitioncache.cli.postgresql_queue_processor.get_pg_cron_connection")
+    @patch("partitioncache.cli.postgresql_queue_processor.get_db_connection")
+    def test_setup_order(self, mock_db_conn, mock_cron_conn, mock_cache_db, mock_cron_db, mock_pg_cron, mock_warn_bgw):
+        from partitioncache.cli import postgresql_queue_processor as module
+
+        order = Mock()
+        with (
+            patch.object(module, "setup_database_objects", order.setup_database_objects),
+            patch.object(module, "processor_job_owners", order.processor_job_owners),
+            patch.object(module, "insert_initial_config", order.insert_initial_config),
+            patch.object(module, "release_legacy_role_statement_timeout", order.release),
+        ):
+            order.processor_job_owners.return_value = {"app": {"1800000ms"}}
+            module.handle_setup("orders_cache", "orders_queue", "array", 1, False, 600, None, job_owner="cron_owner")
+
+        names = [c[0] for c in order.mock_calls if c[0] in ("setup_database_objects", "processor_job_owners", "insert_initial_config", "release")]
+        assert names == ["setup_database_objects", "processor_job_owners", "insert_initial_config", "release"]
+        order.release.assert_called_once_with(mock_db_conn.return_value, {"app": {"1800000ms"}, "cron_owner": set()})
+        mock_warn_bgw.assert_called_once_with(mock_db_conn.return_value)
+
+    @pytest.mark.parametrize(("setting", "warned"), [("on", True), ("off", False), (None, False)])
+    def test_background_worker_warning(self, setting, warned, caplog):
+        from partitioncache.cli.postgresql_queue_processor import warn_if_pg_cron_background_workers
+
+        conn, cursor = _mock_conn()
+        cursor.fetchone.return_value = (setting,)
+        with caplog.at_level("WARNING", logger="PartitionCache.PostgreSQLQueueProcessor"):
+            warn_if_pg_cron_background_workers(conn)
+
+        assert ("cron.use_background_workers = on" in caplog.text) is warned

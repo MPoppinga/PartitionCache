@@ -428,6 +428,12 @@ pcache-postgresql-queue-processor setup \
 
 The processor functions live in the database and are only replaced by `setup`. After upgrading PartitionCache, run `pcache-postgresql-queue-processor setup` again; until then the jobs keep running the old functions. In particular, processors installed before bit arrays grew automatically drop keys at or beyond the bitsize from `postgresql_bit` entries instead of growing the bit arrays (see the PostgreSQL bit handler in [Cache Handlers](cache_handlers.md)).
 
+**Role-wide statement timeout.** Earlier versions enforced `timeout_seconds` with `ALTER ROLE <job_owner> SET statement_timeout`, which applied to every new session of that role in every database (by default the role the application connects with). The timeout is now set by the job command itself (see [Timeouts](#timeouts)), and no role setting is changed. `setup` and `remove` reset a role-wide `statement_timeout` of the job owner (and of the current user) only if it still has the value an earlier version set (`timeout_seconds * 1000` ms); any other value is kept, with a warning that names the role, the value and the command to remove it: `ALTER ROLE <role> RESET statement_timeout;`. A reset that lacks the privilege is reported the same way.
+
+#### Timeouts
+
+Each scheduled job runs `SET statement_timeout = '<timeout_seconds * 1000>ms'; SELECT * FROM partitioncache_run_single_job_with_params(...)`. pg_cron runs a job over its own libpq connection (the default), in one transaction, and arms the timeout for each statement, so the setting applies to that job run only; a fragment that exceeds it is cancelled and recorded with the status `timeout`. With `cron.use_background_workers = on`, pg_cron does not arm a timeout set inside the command, so `timeout_seconds` is not enforced and `setup` warns. In that mode, use a dedicated `--job-owner` role and set the timeout on it (`ALTER ROLE <job_owner> SET statement_timeout = '30min'`); do not set it on a role that other clients use.
+
 ## Configuration
 
 ### Environment Variables
