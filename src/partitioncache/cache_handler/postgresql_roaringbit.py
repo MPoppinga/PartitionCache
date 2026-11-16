@@ -6,6 +6,7 @@ from psycopg import sql
 from pyroaring import BitMap
 
 from partitioncache.cache_handler.postgresql_abstract import PostgreSQLAbstractCacheHandler
+from partitioncache.key_table_script import lazy_insertion_parts
 
 logger = getLogger("PartitionCache")
 
@@ -338,9 +339,11 @@ class PostgreSQLRoaringBitCacheHandler(PostgreSQLAbstractCacheHandler):
             bool: True if successful, False otherwise
         """
         try:
-            # Security check
-            if "DELETE " in query.upper() or "DROP " in query.upper():
-                logger.error("Query contains DELETE or DROP")
+            # Security check: a single query without DELETE or DROP, or a key-table restriction script
+            try:
+                lazy_insertion_parts(query)
+            except ValueError as refused:
+                logger.error(f"Lazy insertion refused: {refused}")
                 return False
 
             # Get partition datatype - must be integer for roaring bitmaps
