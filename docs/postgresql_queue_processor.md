@@ -346,18 +346,21 @@ SELECT partitioncache_update_processor_config_cron(
 
 **Result limit:** with `result_limit` set (also `pcache-postgresql-queue-processor update-config --result-limit N`), a variant whose result has at least that many partition keys is not stored: its cache entry is removed and the query is recorded with the status `limit` in `{table_prefix}_queries`, so it is not computed again, and lookups leave it out. Processors set up before this fix ignored the setting; run `setup` again after upgrading. The cache handlers extend the status constraint of existing queries tables on startup.
 
-#### `partitioncache_manual_process_queue(p_count, p_job_name)`
+#### `partitioncache_manual_process_queue(p_count, p_job_name, p_queue_prefix)`
 Manually process queue items:
 
 ```sql
--- Simple usage (job name automatically constructed from current database)
+-- One installation in this database: its configuration is found without arguments
 SELECT partitioncache_manual_process_queue(5);
 
--- Advanced usage with explicit job name
-SELECT partitioncache_manual_process_queue(10, 'partitioncache_process_queue_<db_name>');
+-- Explicit configuration row and queue prefix (what `pcache-postgresql-queue-processor manual-process` passes,
+-- from --table-prefix / the table prefix variable and PG_QUEUE_TABLE_PREFIX)
+SELECT partitioncache_manual_process_queue(10, 'partitioncache_process_queue_<db_name>_<suffix>', 'partitioncache_queue');
 ```
 
-**Note**: Job names are automatically constructed from the current database when not explicitly provided, enabling multi-database deployments.
+The configuration table is `{p_queue_prefix}_processor_config`; without `p_queue_prefix` the setting `partitioncache.queue_prefix` is used, else the only `*_processor_config` table of the schema. The row is `p_job_name`, else the only `partitioncache_process_queue_<current database>*` row. If more than one table or row qualifies, the function raises an error instead of choosing one; an unknown job name returns 0 with a message.
+
+**Timeout:** the batch runs as one statement in the calling session, so the configured `timeout_seconds` does not apply. The session's `statement_timeout` (none unless set, e.g. `PGOPTIONS='-c statement_timeout=10min' pcache-postgresql-queue-processor manual-process 100`) bounds the whole batch: the fragment it cancels is recorded as `timeout`, and the rest of the batch then runs without a limit.
 
 ## Processing State Machine
 

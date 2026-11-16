@@ -1204,13 +1204,25 @@ def view_logs(conn, limit: int = 20, status_filter: str | None = None, queue_pre
             print(f"Error: Log table '{log_table}' not found. Please run setup first.")
 
 
-def manual_process_queue(conn, count: int):
-    """Manually process a number of items from the queue."""
+def manual_process_queue(conn, count: int, table_prefix: str, queue_prefix: str):
+    """Process up to ``count`` queue items in this session with the configuration that setup stored for the prefixes.
+
+    The batch runs as one statement, so the processor's ``timeout_seconds`` does not apply. The session's
+    statement_timeout (none unless set, for example with ``PGOPTIONS="-c statement_timeout=10min"``) bounds the whole
+    batch: the fragment it cancels is recorded as 'timeout', and the rest of the batch then runs without a limit.
+
+    Args:
+        conn: Connection to the cache database.
+        count: Maximum number of queue items to process.
+        table_prefix: Cache table prefix; selects the configuration row (job name) of this installation.
+        queue_prefix: Queue table prefix; selects the configuration table ``{queue_prefix}_processor_config``.
+    """
     logger.info(f"Manually processing up to {count} items from the queue...")
+    job_name = construct_processor_job_name(get_cache_database_name(), table_prefix)
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT * FROM partitioncache_manual_process_queue(%s)",
-            (count,),
+            "SELECT * FROM partitioncache_manual_process_queue(%s, %s, %s)",
+            (count, job_name, queue_prefix),
         )
         result = cur.fetchone()
         if result:
@@ -1485,13 +1497,24 @@ def main():
     parser_perms.set_defaults(func=check_permissions_command)
 
     # manual-process command
-    parser_manual = subparsers.add_parser("manual-process", help="Manually trigger processing of queue items for testing")
+    parser_manual = subparsers.add_parser(
+        "manual-process",
+        help="Manually trigger processing of queue items for testing",
+        description=(
+            "Process queue items in this session with the configuration that setup stored for the table and queue prefix. "
+            "The batch runs as one statement: the processor's --timeout does not apply. The session's statement_timeout "
+            "(none unless set, e.g. PGOPTIONS='-c statement_timeout=10min') bounds the whole batch; the fragment it cancels "
+            "is recorded as 'timeout' and the rest of the batch then runs without a limit."
+        ),
+    )
     parser_manual.add_argument("count", type=int, help="Number of items to process")
     parser_manual.add_argument("--table-prefix", default=None, help="Table prefix for cache tables (default: based on env vars)")
     parser_manual.set_defaults(
         func=lambda args: manual_process_queue(
             get_db_connection(),
             args.count,
+            args.table_prefix or get_table_prefix_from_env(),
+            get_queue_table_prefix_from_env(),
         )
     )
 

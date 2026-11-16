@@ -550,77 +550,74 @@ $$ LANGUAGE plpgsql;
 -- Note: No backward compatibility wrapper needed since manual commands 
 -- read config from cron database and call parameter-based function directly
 
--- Manual processing function for testing - reads config and calls parameter-based function
-CREATE OR REPLACE FUNCTION partitioncache_manual_process_queue(p_count INTEGER DEFAULT 100, p_job_name TEXT DEFAULT NULL)
+-- Manual processing: runs up to p_count items in this session as one statement, so the configured timeout_seconds
+-- does not apply; the session's statement_timeout (if any) bounds the whole batch. The configuration table is
+-- {p_queue_prefix}_processor_config, else that of the setting partitioncache.queue_prefix, else the only one in the
+-- schema; the row is p_job_name, else the only processor row for the current database. Ambiguity is an error.
+-- The version without p_queue_prefix is dropped: next to the new one, a call with one or two arguments would be ambiguous.
+DROP FUNCTION IF EXISTS partitioncache_manual_process_queue(INTEGER, TEXT);
+CREATE OR REPLACE FUNCTION partitioncache_manual_process_queue(
+    p_count INTEGER DEFAULT 100,
+    p_job_name TEXT DEFAULT NULL,
+    p_queue_prefix TEXT DEFAULT NULL
+)
 RETURNS TABLE(processed_count INTEGER, message TEXT) AS $$
 DECLARE
     v_total INTEGER := 0;
     v_result RECORD;
-    v_job_name TEXT;
     v_config RECORD;
     v_config_table TEXT;
-    v_current_db TEXT;
+    v_queue_prefix TEXT;
+    v_candidates TEXT[];
 BEGIN
-    -- Get current database name for dynamic job name
-    v_current_db := current_database();
-    
-    -- Try to get configuration from local config table first
-    v_config_table := COALESCE(current_setting('partitioncache.queue_prefix', true), 'partitioncache_queue') || '_processor_config';
-    
-    -- If job name provided, try exact match first
-    IF p_job_name IS NOT NULL THEN
-        v_job_name := p_job_name;
-        BEGIN
-            EXECUTE format('SELECT job_name, enabled, max_parallel_jobs, frequency_seconds, timeout_seconds, table_prefix, queue_prefix, cache_backend, target_database, result_limit, default_bitsize FROM %I WHERE job_name = %L', 
-                          v_config_table, v_job_name) INTO v_config;
-        EXCEPTION WHEN OTHERS THEN
-            v_config := NULL;
-        END;
-    END IF;
-    
-    -- If no config found with exact name, try to find config for current database
-    IF v_config IS NULL THEN
-        BEGIN
-            -- Look for any job starting with the pattern for this database
-            EXECUTE format('SELECT job_name, enabled, max_parallel_jobs, frequency_seconds, timeout_seconds, table_prefix, queue_prefix, cache_backend, target_database, result_limit, default_bitsize FROM %I WHERE job_name LIKE %L AND (target_database = %L OR target_database = current_database()) LIMIT 1', 
-                          v_config_table, 'partitioncache_process_queue_' || v_current_db || '%', v_current_db) INTO v_config;
-        EXCEPTION WHEN OTHERS THEN
-            v_config := NULL;
-        END;
-    END IF;
-    
-    -- If still no local config found, try to find any config table
-    IF v_config IS NULL THEN
-        SELECT tablename INTO v_config_table
-        FROM pg_tables 
-        WHERE schemaname = 'public' 
-        AND tablename LIKE '%_processor_config'
-        AND EXISTS (
-            SELECT 1 FROM information_schema.columns 
-            WHERE table_name = tablename 
-            AND column_name = 'job_name'
-        )
-        LIMIT 1;
-        
-        IF v_config_table IS NOT NULL THEN
-            -- Try exact match first if job_name was provided
-            IF p_job_name IS NOT NULL THEN
-                EXECUTE format('SELECT job_name, enabled, max_parallel_jobs, frequency_seconds, timeout_seconds, table_prefix, queue_prefix, cache_backend, target_database, result_limit, default_bitsize FROM %I WHERE job_name = %L', 
-                              v_config_table, v_job_name) INTO v_config;
-            END IF;
-            
-            -- If no config found yet, try pattern match for current database
-            IF v_config IS NULL THEN
-                EXECUTE format('SELECT job_name, enabled, max_parallel_jobs, frequency_seconds, timeout_seconds, table_prefix, queue_prefix, cache_backend, target_database, result_limit, default_bitsize FROM %I WHERE job_name LIKE %L AND (target_database = %L OR target_database = current_database()) LIMIT 1', 
-                              v_config_table, 'partitioncache_process_queue_' || v_current_db || '%', v_current_db) INTO v_config;
-            END IF;
-        END IF;
-        
-        IF v_config IS NULL THEN
-            RETURN QUERY SELECT 0, 'No configuration found for job. Please run setup first.';
+    v_queue_prefix := COALESCE(p_queue_prefix, NULLIF(current_setting('partitioncache.queue_prefix', true), ''));
+
+    IF v_queue_prefix IS NOT NULL THEN
+        v_config_table := v_queue_prefix || '_processor_config';
+        IF to_regclass(quote_ident(v_config_table)) IS NULL THEN
+            RETURN QUERY SELECT 0, format('No configuration table %s for queue prefix %s. Please run setup first.', v_config_table, v_queue_prefix);
             RETURN;
         END IF;
+    ELSE
+        SELECT array_agg(t.tablename::TEXT ORDER BY t.tablename) INTO v_candidates
+        FROM pg_tables t
+        WHERE t.schemaname = current_schema()
+        AND t.tablename LIKE '%\_processor\_config'
+        AND EXISTS (
+            SELECT 1 FROM information_schema.columns c
+            WHERE c.table_schema = t.schemaname AND c.table_name = t.tablename AND c.column_name = 'job_name'
+        );
+
+        IF v_candidates IS NULL THEN
+            RETURN QUERY SELECT 0, 'No configuration found for job. Please run setup first.';
+            RETURN;
+        ELSIF array_length(v_candidates, 1) > 1 THEN
+            RAISE EXCEPTION 'More than one processor configuration table in this database (%); pass the queue prefix: partitioncache_manual_process_queue(count, job_name, queue_prefix), or pcache-postgresql-queue-processor manual-process with PG_QUEUE_TABLE_PREFIX set',
+                array_to_string(v_candidates, ', ');
+        END IF;
+        v_config_table := v_candidates[1];
     END IF;
+
+    IF p_job_name IS NOT NULL THEN
+        EXECUTE format('SELECT array_agg(job_name) FROM %I WHERE job_name = %L', v_config_table, p_job_name) INTO v_candidates;
+        IF v_candidates IS NULL THEN
+            RETURN QUERY SELECT 0, format('No configuration %s in %s. Please run setup first.', p_job_name, v_config_table);
+            RETURN;
+        END IF;
+    ELSE
+        EXECUTE format('SELECT array_agg(job_name ORDER BY job_name) FROM %I WHERE job_name LIKE %L AND target_database = current_database()',
+                       v_config_table, 'partitioncache_process_queue_' || current_database() || '%') INTO v_candidates;
+        IF v_candidates IS NULL THEN
+            RETURN QUERY SELECT 0, 'No configuration found for job. Please run setup first.';
+            RETURN;
+        ELSIF array_length(v_candidates, 1) > 1 THEN
+            RAISE EXCEPTION 'More than one processor configuration for database % in % (%); pass the job name: partitioncache_manual_process_queue(count, job_name, queue_prefix), or pcache-postgresql-queue-processor manual-process --table-prefix',
+                current_database(), v_config_table, array_to_string(v_candidates, ', ');
+        END IF;
+    END IF;
+
+    EXECUTE format('SELECT job_name, table_prefix, queue_prefix, cache_backend, timeout_seconds, result_limit, default_bitsize FROM %I WHERE job_name = %L',
+                   v_config_table, v_candidates[1]) INTO v_config;
 
     FOR i IN 1..p_count LOOP
         -- Call the parameter-based function with config values

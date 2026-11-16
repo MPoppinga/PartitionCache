@@ -873,6 +873,39 @@ class TestLegacyRoleStatementTimeout:
         assert dropped_before_release == [0]
 
 
+class TestManualProcessPrefixes:
+    """manual-process resolves table and queue prefix like the other subcommands and passes both to the SQL function."""
+
+    @patch("partitioncache.cli.postgresql_queue_processor.get_cache_database_name", return_value="appdb")
+    def test_job_name_and_queue_prefix_are_passed(self, mock_cache_db):
+        from partitioncache.cli.postgresql_queue_processor import manual_process_queue
+
+        conn, cursor = _mock_conn()
+        cursor.fetchone.return_value = (2, "Attempted to process 2 items")
+
+        manual_process_queue(conn, 5, "orders_cache", "orders_queue")
+
+        cursor.execute.assert_called_once_with(
+            "SELECT * FROM partitioncache_manual_process_queue(%s, %s, %s)", (5, "partitioncache_process_queue_appdb_orderscache", "orders_queue")
+        )
+        conn.commit.assert_called_once()
+
+    @pytest.mark.parametrize(("argv", "table_prefix"), [(["--table-prefix", "orders_cache"], "orders_cache"), ([], "env_cache")])
+    @patch("partitioncache.cli.postgresql_queue_processor.get_db_connection")
+    @patch("partitioncache.cli.postgresql_queue_processor.get_queue_table_prefix_from_env", return_value="orders_queue")
+    @patch("partitioncache.cli.postgresql_queue_processor.get_table_prefix_from_env", return_value="env_cache")
+    @patch("partitioncache.cli.postgresql_queue_processor.manual_process_queue")
+    @patch("partitioncache.cli.postgresql_queue_processor.validate_environment", return_value=(True, "OK"))
+    @patch("partitioncache.cli.postgresql_queue_processor.load_environment_with_validation")
+    def test_cli_passes_the_prefixes(self, mock_load_env, mock_validate, mock_manual, mock_table_prefix, mock_queue_prefix, mock_get_conn, argv, table_prefix):
+        from partitioncache.cli.postgresql_queue_processor import main
+
+        with patch("sys.argv", ["postgresql_queue_processor.py", "manual-process", "5", *argv]):
+            main()
+
+        mock_manual.assert_called_once_with(mock_get_conn.return_value, 5, table_prefix, "orders_queue")
+
+
 class TestSetupRoleTimeout:
     """setup reads the job owners before it replaces the configuration row, and releases their legacy role timeout after."""
 
