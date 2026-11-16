@@ -182,6 +182,7 @@ class TestMissingDatatype:
 
     def test_empty_result_of_an_unregistered_key_gets_the_status_failed(self, args, tmp_path):
         """The datatype cannot be inferred from an empty result; the fragment is marked, not dropped silently."""
+        pytest.importorskip("rocksdict")
         from partitioncache.cache_handler.rocks_dict import RocksDictCacheHandler
 
         cache = RocksDictCacheHandler(str(tmp_path / "cache"))
@@ -193,6 +194,7 @@ class TestMissingDatatype:
 
     def test_real_handler_with_empty_string_datatype(self, args, tmp_path):
         """A queue row with '' as datatype (stored by an older client) registers nothing and stores the inferred keys."""
+        pytest.importorskip("rocksdict")
         from partitioncache.cache_handler.rocks_dict import RocksDictCacheHandler
 
         cache = RocksDictCacheHandler(str(tmp_path / "cache"))
