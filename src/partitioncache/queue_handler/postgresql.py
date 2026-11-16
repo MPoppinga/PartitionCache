@@ -15,6 +15,24 @@ from partitioncache.queue_handler.size_priority import fragment_size_priority, s
 logger = getLogger("PartitionCache")
 
 
+def _wait_for_notification(listen_conn: psycopg.Connection, wait_time: float) -> bool:
+    """Wait at most wait_time seconds for a notification on a LISTEN connection; True if one arrived.
+
+    The readable list of select() decides: its result tuple is truthy even on a timeout. The notifications are read
+    with libpq calls that never block, as Connection.notifies() waits for one without end unless it gets a timeout,
+    which it accepts from psycopg 3.2 on.
+    """
+    readable, _, _ = select.select([listen_conn.fileno()], [], [], wait_time)
+    if not readable:
+        return False
+    pgconn = listen_conn.pgconn
+    pgconn.consume_input()
+    notified = False
+    while pgconn.notifies() is not None:
+        notified = True
+    return notified
+
+
 class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
     def __init__(self, host: str, port: int, user: str, password: str, dbname: str, table_prefix: str):
         """
@@ -673,21 +691,11 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
                 wait_time = min(5.0, remaining_time)
 
                 try:
-                    # Use select to wait for notifications with timeout
-                    if select.select([listen_conn.fileno()], [], [], wait_time):
-                        # Check for notifications
-                        for notify in listen_conn.notifies():
-                            if notify.channel == "original_query_available":
-                                # Try to pop an item after notification
-                                result = self.pop_from_original_query_queue()
-                                if result is not None:
-                                    return result
-                                break
-                    else:
-                        # Timeout on select, check for items anyway (safety net)
-                        result = self.pop_from_original_query_queue()
-                        if result is not None:
-                            return result
+                    # Pop after a notification, and after a wait without one as a safety net
+                    _wait_for_notification(listen_conn, wait_time)
+                    result = self.pop_from_original_query_queue()
+                    if result is not None:
+                        return result
 
                 except (OSError, psycopg.Error, psycopg.OperationalError) as e:
                     logger.debug(f"LISTEN/NOTIFY error, falling back to polling: {e}")
@@ -809,21 +817,11 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
                 wait_time = min(5.0, remaining_time)
 
                 try:
-                    # Use select to wait for notifications with timeout
-                    if select.select([listen_conn.fileno()], [], [], wait_time):
-                        # Check for notifications
-                        for notify in listen_conn.notifies():
-                            if notify.channel == "query_fragment_available":
-                                # Try to pop an item after notification
-                                result = self.pop_from_query_fragment_queue()
-                                if result is not None:
-                                    return result
-                                break
-                    else:
-                        # Timeout on select, check for items anyway (safety net)
-                        result = self.pop_from_query_fragment_queue()
-                        if result is not None:
-                            return result
+                    # Pop after a notification, and after a wait without one as a safety net
+                    _wait_for_notification(listen_conn, wait_time)
+                    result = self.pop_from_query_fragment_queue()
+                    if result is not None:
+                        return result
 
                 except (OSError, psycopg.Error, psycopg.OperationalError) as e:
                     logger.debug(f"LISTEN/NOTIFY error, falling back to polling: {e}")
