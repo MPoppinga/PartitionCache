@@ -133,7 +133,7 @@ enhanced_query, stats = partitioncache.apply_cache_lazy(
 
 | Backend | Datatypes | Use Case |
 |---------|-----------|----------|
-| **postgresql_array** | Various types | Production, full features |
+| **postgresql_array** | Integer, text, timestamp; float rounded (see below) | Production, full features |
 | **postgresql_bit** | Integer only | efficient integers |
 | **postgresql_roaringbit** | Integer only | Memory-efficient integers (roaring bitmaps) |
 | **redis_set** | Int, Text | High-throughput, distributed |
@@ -144,6 +144,9 @@ enhanced_query, stats = partitioncache.apply_cache_lazy(
 | **redis_roaringbit**, **rocksdict_roaringbit** | Integer only | Roaring bitmaps in Redis / RocksDict |
 | **duckdb_bit** | Integer only | Analytical workloads, DuckDB BITSTRING |
 | **postgis_bbox**, **rocksdict_h3_grouped** | Geometry (points) | Spatial filters, see [Cache Handlers](docs/cache_handlers.md) |
+
+Float keys are stored as NUMERIC, with 15 significant digits for double precision and 6 for real; a key with more
+digits is stored rounded and its rows are missing from restricted queries ([datatype support](docs/datatype_support.md)).
 
 ## Processing Models
 
@@ -304,6 +307,11 @@ query = (
     "WHERE r.city_id = p.city_id AND r.rating > 4.0 AND p.area > 10000"
 )
 
+# The variants assume that the tables of a query share the partition key value, as here through
+# r.city_id = p.city_id. A query that does not join its tables on the key is treated as if it did;
+# for tables with keys of their own (spatial, temporal, self-joins across partitions) pass
+# skip_partition_key_joins=True.
+#
 # PartitionCache automatically:
 # 1. Decomposes into variants, one per table here:
 #    - SELECT DISTINCT t1.city_id FROM restaurants AS t1 WHERE t1.rating > 4.0

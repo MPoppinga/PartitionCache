@@ -4,7 +4,18 @@
 
 First tagged release. The version is in `partitioncache.__version__`.
 
-### Behaviour changes against earlier, untagged states of `main`
+### Requirements
+
+- Python 3.11 or later.
+- PostgreSQL 13 or later for the queue processor (its fragment timeout is set per statement of the job command);
+  `pg_cron` for the queue processor and the eviction manager; `intarray` for `postgresql_array`; `roaringbitmap`
+  for `postgresql_roaringbit`; PostGIS only for the spatial handlers.
+- DuckDB 2.0 or later for `duckdb_bit` and the DuckDB acceleration.
+- The database drivers are in the `db` extra, the H3 library in the `spatial` extra.
+
+### Behaviour changes
+
+Against `main` at 3b132dc (#76), the state the release review started from:
 
 - **Fragment queue order.** New fragments get a priority by size (`10 - tables`), so the smaller fragments of all
   queued queries are popped first. On by default; `--no-size-priority` or `QUERY_QUEUE_SIZE_PRIORITY=false` gives
@@ -47,6 +58,20 @@ First tagged release. The version is in `partitioncache.__version__`.
   one day). The roaring bitmap handler refuses negative keys. A new partition key whose truncated cache table name is
   that of another registered key is refused (#83).
 
+Earlier changes that a user of an older untagged state meets (see the history for the full list):
+
+- `partitioncache.query_processor.variant_signature` and `is_relaxation_of` are gone; population restricts a
+  variant through the cache lookup of its query (#61).
+- `pcache-monitor` joins the key table to the p0 table as well; `--join-every-table` restores the former
+  behaviour (#62).
+- `pcache-monitor` records a fragment that timed out, failed or hit `--limit` and skips it from then on (#42).
+- Key lists and key tables are typed like the key column for timestamp, `char(n)` and `real` keys (#64, #68).
+- With `skip_partition_key_joins` and no explicit source, the alias whose key the query selects is the key
+  source; variants of self-joins got other hashes (#72).
+- `set_entry_lazy` writes the query row only together with its cache row (#76).
+- The bit cache tables of one prefix share one bitsize trigger function; older caches are switched when a
+  handler starts (#81).
+
 ### Fixed
 
 - `pcache-monitor`: blocking pops of the PostgreSQL queue ignored their timeout and could hang the monitor; a queue
@@ -76,7 +101,7 @@ Requirements on the data and the queries:
   restriction removes such rows.
 - **Float partition keys** in `postgresql_array` are stored as NUMERIC with 15 significant digits for double
   precision and 6 for real values; keys with more digits are stored rounded and their rows are missing from
-  restricted queries.
+  restricted queries (see `docs/datatype_support.md`). Use integer, text or timestamp keys where exactness matters.
 - **Spatial handlers.** `postgis_bbox` and `rocksdict_h3_grouped` are sound for point geometries only, and
   `rocksdict_h3_grouped` converts the buffer to H3 rings assuming metres. Grid-cell keys have neither limit.
 - **JOIN restriction methods** add the key table's column to the output of `SELECT *`.
