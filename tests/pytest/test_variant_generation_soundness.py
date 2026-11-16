@@ -152,3 +152,44 @@ class TestCommonTableExpressions:
         query = "SELECT x.pk FROM a AS x, nowhere AS y WHERE x.v = 1 AND y.w = 2 AND x.pk = y.pk"
         assert _assert_sound(query) == ["SELECT DISTINCT t1.pk FROM a AS t1 WHERE t1.v = 1", "SELECT DISTINCT t1.pk FROM nowhere AS t1 WHERE t1.w = 2"]
         assert _assert_sound("SELECT x.pk FROM data_from_2020 AS x WHERE x.v = 1") == ["SELECT DISTINCT t1.pk FROM data_from_2020 AS t1 WHERE t1.v = 1"]
+
+
+class TestSubqueryAliases:
+    """A subquery that defines an outer alias's name, or a variant alias it would capture, gets no variants."""
+
+    @pytest.mark.parametrize(
+        "condition",
+        [
+            "x.id IN (SELECT x.id FROM b AS x WHERE x.z = 1)",
+            "EXISTS (SELECT 1 FROM b AS t1 WHERE t1.z = x.id)",
+            "x.id IN (SELECT y.id FROM x AS y WHERE y.z = 1)",
+        ],
+    )
+    def test_no_variants(self, condition, caplog):
+        with caplog.at_level(logging.WARNING):
+            assert _variants(f"SELECT x.pk FROM a AS x WHERE x.v = 1 AND {condition}") == []
+        assert "subquery" in caplog.text
+
+    @pytest.mark.parametrize(
+        "condition",
+        ["x.id IN (SELECT x.id FROM b AS x WHERE x.z = 1)", "EXISTS (SELECT 1 FROM b AS t1 WHERE t1.z = x.id)"],
+    )
+    def test_variants_hold_the_keys_of_the_query(self, condition):
+        _assert_sound(f"SELECT x.pk FROM a AS x WHERE x.v = 1 AND {condition}")
+
+    def test_uncorrelated_subquery_with_a_variant_alias_is_unchanged(self):
+        query = "SELECT x.pk FROM a AS x WHERE x.v = 1 AND x.id IN (SELECT t1.id FROM b AS t1 WHERE t1.z = 1)"
+        assert _variants(query) == ["SELECT DISTINCT t1.pk FROM a AS t1 WHERE t1.id IN (SELECT t1.id FROM b AS t1 WHERE t1.z = 1) AND t1.v = 1"]
+
+    def test_partition_join_alias_in_a_correlated_subquery(self):
+        """The partition-join table becomes p1; a correlated subquery defining p1 would capture its references."""
+        query = (
+            "SELECT x.pk FROM a AS x, b AS y, hub AS h WHERE x.pk = h.pk AND y.pk = h.pk AND x.v = 1 AND y.w = 2 "
+            "AND EXISTS (SELECT 1 FROM b AS p1 WHERE p1.z = h.id)"
+        )
+        assert _variants(query, partition_join_table="h") == []
+        assert _variants(query.replace("AS p1 WHERE p1.z", "AS q WHERE q.z"), partition_join_table="h")
+
+    def test_correlated_subquery_with_other_aliases_is_unchanged(self):
+        query = "SELECT x.pk FROM a AS x WHERE x.v = 1 AND EXISTS (SELECT 1 FROM b AS q WHERE q.z = x.id)"
+        assert _variants(query) == ["SELECT DISTINCT t1.pk FROM a AS t1 WHERE EXISTS(SELECT 1 FROM b AS q WHERE q.z = t1.id) AND t1.v = 1"]

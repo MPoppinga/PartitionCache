@@ -143,6 +143,41 @@ def _has_with_clause(query: str) -> bool:
         return False
 
 
+_VARIANT_ALIAS_RE = re.compile(r"t\d+")
+_PARTITION_JOIN_ALIAS_RE = re.compile(r"p1")
+
+
+def _subquery_alias_conflict(query: str, variant_alias_re: re.Pattern[str] = _VARIANT_ALIAS_RE) -> str | None:
+    """Return a name a subquery defines that the alias renaming would capture, or None.
+
+    Variants rename the outer aliases to t1, t2, ... (and a partition-join table to p1) by text, also inside
+    subqueries. That is wrong when a subquery defines a table or alias named like an outer alias (its own
+    references would be renamed too), or defines a name matching ``variant_alias_re`` while referencing an outer
+    alias (the renamed reference would bind to the subquery's table).
+    """
+    try:
+        parsed = sqlglot.parse_one(query)
+    except Exception:
+        return None
+    outermost = parsed if isinstance(parsed, exp.Select) else parsed.find(exp.Select)
+    if outermost is None:
+        return None
+    outer_aliases = {table.alias_or_name for table in outermost.find_all(exp.Table) if table.parent_select is outermost}
+    # Only the outermost SELECT's conditions reach the variants (not the other branches of a set operation)
+    for source in outermost.find_all(exp.Table, exp.Subquery):
+        if source.parent_select is outermost:
+            continue
+        names = {source.alias} | ({source.name} if isinstance(source, exp.Table) else set())
+        names.discard("")
+        if names & outer_aliases:
+            return sorted(names & outer_aliases)[0]
+        scope = source.parent_select
+        variant_names = sorted(name for name in names if variant_alias_re.fullmatch(name))
+        if variant_names and scope is not None and any(column.table in outer_aliases for column in scope.find_all(exp.Column)):
+            return variant_names[0]
+    return None
+
+
 def query_contains_top_level_outer_join(query: str) -> bool:
     """Return True if the query has a LEFT/RIGHT/FULL JOIN at the outermost SELECT scope.
 
@@ -1348,6 +1383,14 @@ def generate_partial_queries(
         partition_join_table,
     )
 
+    # The partition-join table is renamed to p1, which a correlated subquery defining that name would capture
+    if detected_partition_join_alias and (captured := _subquery_alias_conflict(query, _PARTITION_JOIN_ALIAS_RE)) is not None:
+        logger.warning(
+            f"A subquery defines '{captured}', which the renaming of the partition-join table in the variants would capture. "
+            "Returning no variants; execute the query unchanged."
+        )
+        return []
+
     # Dimension-table attachment: when the query joins a dimension table via an
     # attachment join (alias.partition_key = other_alias.other_column), restrict
     # variant generation to combinations containing a pk-bearing alias, inject
@@ -2427,6 +2470,14 @@ def generate_all_query_hash_pairs(
             "generate_all_query_hash_pairs: query uses a table alias or name that is not a plain identifier "
             "(letters, digits and underscores, not starting with a digit); PartitionCache does not generate "
             "cache variants for it. Returning no variants; execute the query unchanged."
+        )
+        return []
+
+    if (captured := _subquery_alias_conflict(query)) is not None:
+        logger.warning(
+            f"generate_all_query_hash_pairs: a subquery defines the table or alias '{captured}', which the renaming of the "
+            "outer aliases in the variants would capture; PartitionCache does not generate cache variants for it. "
+            "Returning no variants; execute the query unchanged."
         )
         return []
 
