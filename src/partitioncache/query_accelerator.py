@@ -23,6 +23,7 @@ import duckdb
 import psycopg
 
 from partitioncache.db_handler.postgres import fetch_final_result_set
+from partitioncache.key_table_script import _statements
 from partitioncache.logging_utils import get_thread_aware_logger
 
 logger = get_thread_aware_logger("PartitionCache")
@@ -70,10 +71,6 @@ def _key_set(rows: list) -> set[Any]:
     monitor's --limit, could make set_cache reject the set, or be stored as a NULL element.
     """
     return {row[0] if len(row) == 1 else row for row in rows if row[0] is not None}
-
-
-class _NotOneStatementError(Exception):
-    """The query text is not exactly one statement; DuckDB would return the result of its last statement."""
 
 
 # PostgreSQL's LIKE (also ILIKE, ~~, ~~*) has the backslash as default escape character, DuckDB's has none
@@ -452,6 +449,16 @@ class DuckDBQueryAccelerator:
             self._update_stats(queries_fallback=1)
             return self._execute_fallback(query)
 
+        # DuckDB executes every statement of a script and returns the LAST one's result, e.g. the DROP after the SELECT of
+        # an UNLOGGED_TABLE_* script. Counted with the PostgreSQL tokenizer, independent of what DuckDB can parse; a text
+        # it cannot tokenize, or a trailing comment after the semicolon (counted as a statement), also goes to PostgreSQL
+        spans = _statements(query)
+        if spans is None or len(spans) != 1:
+            statements = "cannot be tokenized" if spans is None else f"{len(spans)} statements"
+            logger.debug(f"Query is not one statement ({statements}); DuckDB would return the last statement's result, running it on PostgreSQL")
+            self._update_stats(queries_fallback=1)
+            return self._execute_fallback(query)
+
         try:
             # Try DuckDB acceleration first with timeout support
             start_time = time.perf_counter()
@@ -476,10 +483,6 @@ class DuckDBQueryAccelerator:
             logger.debug(f"DuckDB query completed in {duration:.3f}s, returned {len(result_set)} results")
             return result_set
 
-        except _NotOneStatementError as e:
-            logger.debug(f"Query is not one statement ({e}); DuckDB would return the last statement's result, running it on PostgreSQL")
-            self._update_stats(queries_fallback=1)
-            return self._execute_fallback(query)
         except concurrent.futures.TimeoutError:
             logger.warning(f"DuckDB query timed out after {self.query_timeout}s, falling back to PostgreSQL")
             self._update_stats(queries_timeout=1, queries_fallback=1)
@@ -492,16 +495,7 @@ class DuckDBQueryAccelerator:
 
     @staticmethod
     def _execute_on_duckdb(cursor: "duckdb.DuckDBPyConnection", query: str) -> set[Any]:
-        """Run a single-statement query on the cursor and return its keys.
-
-        Raises:
-            _NotOneStatementError: If DuckDB's parser finds more or fewer than one statement. DuckDB executes all
-                statements of a script and returns the last one's result, e.g. the DROP after the SELECT of an
-                UNLOGGED_TABLE_* script, which has no rows.
-        """
-        statements = cursor.extract_statements(query)
-        if len(statements) != 1:
-            raise _NotOneStatementError(f"{len(statements)} statements")
+        """Run a query of one statement (checked by execute_query) on the cursor and return its keys."""
         return _key_set(cursor.execute(query).fetchall())
 
     def _execute_with_timeout(self, query: str) -> set[Any]:

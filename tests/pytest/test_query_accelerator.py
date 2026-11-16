@@ -189,7 +189,6 @@ class TestDuckDBQueryAccelerator:
         # Cursor execute path
         mock_cursor = Mock()
         mock_cursor.execute.return_value = mock_result
-        mock_cursor.extract_statements.return_value = [Mock()]  # DuckDB's parser finds one statement
         mock_cursor.close.return_value = None
         mock_duckdb_conn.cursor.return_value = mock_cursor
 
@@ -581,7 +580,8 @@ def test_duckdb_uses_the_postgresql_session_time_zone():
 
 class _ReferencePostgresCursor:
     """Stands in for the PostgreSQL fallback: runs a script statement by statement on its own DuckDB connection and
-    exposes the result sets as psycopg does (a SELECT has rows, the other statements have no description)."""
+    exposes the result sets as psycopg does (a SELECT has rows, the other statements have no description).
+    DuckDB 2 cannot parse CREATE UNLOGGED TABLE, so the reference creates an ordinary table instead."""
 
     def __init__(self, conn):
         self._conn = conn
@@ -591,13 +591,16 @@ class _ReferencePostgresCursor:
         self.queries: list[str] = []
 
     def execute(self, query):
-        import duckdb
+        import re
+
+        from partitioncache.key_table_script import _statements
 
         self.queries.append(query)
         self._sets = []
-        for statement in self._conn.extract_statements(query):
-            rows = self._conn.execute(statement.query).fetchall()
-            self._sets.append(rows if statement.type == duckdb.StatementType.SELECT else None)
+        for begin, end in _statements(query):
+            statement = re.sub(r"^CREATE\s+UNLOGGED\s+TABLE", "CREATE TABLE", query[begin:end].strip(), flags=re.IGNORECASE)
+            rows = self._conn.execute(statement).fetchall()
+            self._sets.append(rows if re.match(r"(SELECT|WITH)\b", statement, re.IGNORECASE) else None)
         self._index = 0
         self._position()
 
@@ -664,14 +667,35 @@ def test_key_table_script_returns_the_select_keys_not_the_trailing_drop(method, 
 
 
 @pytest.mark.parametrize("query_timeout", [0, 30])
+def test_script_duckdb_can_parse_returns_the_select_keys_not_the_trailing_drop(query_timeout):
+    """The same shape with an ordinary key table, which every DuckDB version parses and runs, returning the DROP's result."""
+    script = "CREATE TABLE k AS SELECT 1 AS pk; SELECT r.region_id FROM readings AS r WHERE r.region_id IN (SELECT pk FROM k); DROP TABLE IF EXISTS k"
+    accelerator = _accelerator_on_duckdb(query_timeout)
+
+    assert accelerator.execute_query(script) == {1}
+    assert accelerator.postgresql_conn.cursor_.queries == [script]
+    assert accelerator.stats["queries_accelerated"] == 0
+
+
+@pytest.mark.parametrize("query_timeout", [0, 30])
 def test_single_statement_fragment_runs_in_duckdb(query_timeout):
     accelerator = _accelerator_on_duckdb(query_timeout)
-    # A semicolon in a string literal and in a trailing comment does not make a second statement
-    query = "SELECT r.region_id FROM readings AS r WHERE r.value > 5 AND r.label <> 'x;y'; -- done; really"
+    # A semicolon in a string literal, a quoted identifier or a comment does not make a second statement
+    query = "SELECT r.region_id AS \"id;\" FROM readings AS r WHERE r.value > 5 AND r.label <> 'x;y' /* ; */;"
 
     assert accelerator.execute_query(query) == {1, 3}
     assert accelerator.postgresql_conn.cursor_.queries == []
     assert accelerator.stats["queries_accelerated"] == 1
+
+
+@pytest.mark.parametrize("query", ["SELECT 1; -- a trailing comment", "SELECT 'unterminated", ";"])
+def test_text_that_is_not_one_tokenized_statement_runs_on_the_fallback(query):
+    """A comment after the last semicolon counts as a statement, untokenizable text as none: both stay out of DuckDB."""
+    accelerator = _accelerator_on_duckdb()
+    accelerator._execute_fallback = lambda q: {"fallback"}
+
+    assert accelerator.execute_query(query) == {"fallback"}
+    assert accelerator.stats["queries_accelerated"] == 0
 
 
 def test_script_without_fallback_connection_raises_instead_of_returning_the_drop_result():
