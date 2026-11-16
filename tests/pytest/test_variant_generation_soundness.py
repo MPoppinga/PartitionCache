@@ -10,7 +10,7 @@ import sqlite3
 
 import pytest
 
-from partitioncache.query_processor import generate_all_query_hash_pairs
+from partitioncache.query_processor import generate_all_hashes, generate_all_query_hash_pairs
 
 _TABLES = {
     "a": ("pk INTEGER, v INTEGER, id INTEGER, z INTEGER", [(1, 1, 10, 0), (2, 1, 20, 0), (3, 2, 30, 0), (5, 1, 50, 0)]),
@@ -132,3 +132,23 @@ class TestSubqueryClauses:
     def test_offset_goes_with_its_order_by(self):
         query = "SELECT x.pk FROM a AS x WHERE x.v = 1 AND x.id IN (SELECT id FROM b ORDER BY s OFFSET 10)"
         assert _variants(query) == ["SELECT DISTINCT t1.pk FROM a AS t1 WHERE t1.id IN (SELECT id FROM b) AND t1.v = 1"]
+
+
+class TestCommonTableExpressions:
+    """A query with a WITH clause runs without the cache; table names containing FROM or WHERE stay whole."""
+
+    QUERY = "WITH c AS (SELECT id FROM b WHERE b.z = 1) SELECT x.pk FROM a AS x WHERE x.v = 1 AND x.id IN (SELECT id FROM c)"
+
+    def test_no_variants_and_no_lookup_hashes(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            assert generate_all_query_hash_pairs(self.QUERY, "pk") == []
+            assert generate_all_hashes(self.QUERY, "pk") == []
+        assert "WITH clause" in caplog.text
+
+    def test_variants_hold_the_keys_of_the_query(self):
+        assert _assert_sound(self.QUERY) == []
+
+    def test_table_names_containing_keywords(self):
+        query = "SELECT x.pk FROM a AS x, nowhere AS y WHERE x.v = 1 AND y.w = 2 AND x.pk = y.pk"
+        assert _assert_sound(query) == ["SELECT DISTINCT t1.pk FROM a AS t1 WHERE t1.v = 1", "SELECT DISTINCT t1.pk FROM nowhere AS t1 WHERE t1.w = 2"]
+        assert _assert_sound("SELECT x.pk FROM data_from_2020 AS x WHERE x.v = 1") == ["SELECT DISTINCT t1.pk FROM data_from_2020 AS t1 WHERE t1.v = 1"]

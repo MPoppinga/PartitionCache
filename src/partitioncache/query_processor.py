@@ -135,6 +135,14 @@ def _has_alias_that_needs_quotes(query: str) -> bool:
     )
 
 
+def _has_with_clause(query: str) -> bool:
+    """True if the query has a WITH clause anywhere; False also when it cannot be parsed."""
+    try:
+        return sqlglot.parse_one(query).find(exp.With) is not None
+    except Exception:
+        return False
+
+
 def query_contains_top_level_outer_join(query: str) -> bool:
     """Return True if the query has a LEFT/RIGHT/FULL JOIN at the outermost SELECT scope.
 
@@ -815,7 +823,7 @@ def extract_and_group_query_conditions(
     partition_key_joins: dict[tuple[str, str], list[str]] = defaultdict(list)  # Track PK joins for star detection
 
     # get tables
-    tables = re.split("FROM|WHERE", query, flags=re.IGNORECASE)[1]
+    tables = re.split(r"\b(?:FROM|WHERE)\b", query, flags=re.IGNORECASE)[1]
     tables = tables.split(",")
     tables = [x.strip() for x in tables]
 
@@ -2400,6 +2408,15 @@ def generate_all_query_hash_pairs(
             "(LEFT/RIGHT/FULL JOIN); PartitionCache does not generate cache variants for it "
             "because the inner-join rewrite could exclude valid partitions. Returning no "
             "variants; execute the query unchanged."
+        )
+        return []
+
+    # Decomposition reads the tables and conditions of the outermost SELECT; a common table expression would be
+    # decomposed from its body or lost from the variants
+    if _has_with_clause(query):
+        logger.warning(
+            "generate_all_query_hash_pairs: query has a WITH clause (common table expression); PartitionCache does not "
+            "generate cache variants for it. Returning no variants; execute the query unchanged."
         )
         return []
 

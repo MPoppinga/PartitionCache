@@ -9,6 +9,8 @@ These tests document current behavior and verify graceful handling
 of patterns that the fragment generator may not fully decompose.
 """
 
+import pytest
+
 from partitioncache.query_processor import (
     clean_query,
     extract_conjunctive_conditions,
@@ -154,90 +156,26 @@ class TestCleanQueryAdvancedPatterns:
 
 
 class TestCTEFragmentGeneration:
-    """Test fragment generation with CTE (WITH clause) queries.
+    """A query with a WITH clause gets no variants and runs without the cache.
 
-    The fragment generator currently processes CTEs by extracting tables from
-    the CTE body (not the CTE alias). Fragments are generated from the inner
-    query's tables. This provides partial but useful cache coverage.
+    Decomposition reads the tables and conditions of the outermost SELECT; it used to take the CTE body's
+    table without its conditions, which restricted the query to the wrong keys.
     """
 
-    def test_simple_cte_extracts_inner_table(self):
-        """CTE should generate fragments from the inner table (test_locations)."""
-        query = """
-        WITH filtered AS (
-            SELECT id, zipcode FROM test_locations WHERE population > 10000
-        )
-        SELECT * FROM filtered WHERE zipcode = 1001
-        """
-        pairs = generate_all_query_hash_pairs(query, "zipcode")
-        # Should not crash; generates 2 fragments from the actual inner table
-        assert len(pairs) == 2, f"Should generate exactly 2 fragments, got {len(pairs)}"
-        fragment_texts = {qt.lower() for qt, _ in pairs}
-        # Both fragments should reference test_locations (the real table), not the CTE alias "filtered"
-        assert all("test_locations" in t for t in fragment_texts), "All fragments should reference test_locations"
-        assert any("zipcode = 1001" in t for t in fragment_texts), "One fragment should include the partition key condition"
-        # Verify hashes are non-empty SHA1 hex strings
-        for _, query_hash in pairs:
-            assert len(query_hash) == 40, "Hash should be a 40-char SHA1 hex digest"
-
-    def test_cte_with_join_in_main_query(self):
-        """CTE used as a table in a JOIN should still produce fragments."""
-        query = """
-        WITH user_data AS (
-            SELECT id, zipcode FROM test_locations WHERE region = 'northeast'
-        )
-        SELECT u.zipcode, b.name
-        FROM user_data u, test_businesses b
-        WHERE u.zipcode = b.zipcode AND u.zipcode = 1001
-        """
-        pairs = generate_all_query_hash_pairs(query, "zipcode")
-        # Should not crash; CTE inner table is extracted producing 2 fragments
-        assert len(pairs) == 2, f"Should generate exactly 2 fragments from CTE inner table, got {len(pairs)}"
-        fragment_texts = {qt.lower() for qt, _ in pairs}
-        # Fragments should reference test_locations (the actual table inside the CTE)
-        assert all("test_locations" in t for t in fragment_texts), "Fragments should reference test_locations"
-        assert any("zipcode = 1001" in t for t in fragment_texts), "One fragment should include the partition key condition"
-        for _, query_hash in pairs:
-            assert len(query_hash) == 40, "Hash should be a 40-char SHA1 hex digest"
-
-    def test_nested_cte(self):
-        """Nested CTEs should not crash the fragment generator."""
-        query = """
-        WITH
-            base AS (SELECT id, zipcode, region FROM test_locations),
-            filtered AS (SELECT id, zipcode FROM base WHERE region = 'northeast')
-        SELECT * FROM filtered WHERE zipcode = 1001
-        """
-        # Should not crash - nested CTEs produce fragments (CTE resolution is imperfect,
-        # so some fragments may reference CTE aliases like "filtered" instead of real tables)
-        pairs = generate_all_query_hash_pairs(query, "zipcode")
-        assert len(pairs) == 4, f"Should generate exactly 4 fragments for nested CTEs, got {len(pairs)}"
-        fragment_texts = {qt.lower() for qt, _ in pairs}
-        # At least one fragment should include the partition key condition
-        assert any("zipcode = 1001" in t for t in fragment_texts), "Some fragments should include partition key condition"
-        for _, query_hash in pairs:
-            assert len(query_hash) == 40, "Hash should be a 40-char SHA1 hex digest"
-
-    def test_cte_with_aggregation(self):
-        """CTE with GROUP BY should not crash the fragment generator.
-
-        Note: GROUP BY is removed during clean_query (doesn't affect partition key access).
-        CTE parsing through the regex-based FROM/WHERE extractor is a known limitation,
-        so the number of fragments may vary.
-        """
-        query = """
-        WITH region_stats AS (
-            SELECT zipcode, COUNT(*) as loc_count
-            FROM test_locations
-            GROUP BY zipcode
-        )
-        SELECT * FROM region_stats WHERE zipcode = 1001
-        """
-        pairs = generate_all_query_hash_pairs(query, "zipcode")
-        # Should not crash; fragment count depends on CTE parsing depth
-        assert isinstance(pairs, list)
-        for _, h in pairs:
-            assert len(h) == 40, "All hashes should be 40-char SHA1 hex digests"
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "WITH filtered AS (SELECT id, zipcode FROM test_locations WHERE population > 10000) SELECT * FROM filtered WHERE zipcode = 1001",
+            "WITH user_data AS (SELECT id, zipcode FROM test_locations WHERE region = 'northeast') "
+            "SELECT u.zipcode, b.name FROM user_data u, test_businesses b WHERE u.zipcode = b.zipcode AND u.zipcode = 1001",
+            "WITH base AS (SELECT id, zipcode, region FROM test_locations), filtered AS (SELECT id, zipcode FROM base WHERE region = 'northeast') "
+            "SELECT * FROM filtered WHERE zipcode = 1001",
+            "WITH region_stats AS (SELECT zipcode, COUNT(*) as loc_count FROM test_locations GROUP BY zipcode) SELECT * FROM region_stats WHERE zipcode = 1001",
+            "SELECT * FROM test_locations AS l WHERE l.zipcode IN (WITH z AS (SELECT zipcode FROM test_businesses) SELECT zipcode FROM z)",
+        ],
+    )
+    def test_no_variants(self, query):
+        assert generate_all_query_hash_pairs(query, "zipcode") == []
 
 
 class TestWindowFunctionFragmentGeneration:
