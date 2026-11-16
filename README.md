@@ -1,6 +1,6 @@
 # PartitionCache
 
-[![License: LGPL v3](https://img.shields.io/badge/License-LGPL%20v3-blue.svg)](LICENSE)
+[![License: LGPL v3](https://img.shields.io/badge/License-LGPL%20v3-blue.svg)](COPYING.LESSER)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![Research Paper](https://img.shields.io/badge/Paper-10.18420/BTW2025--23-blue)](https://doi.org/10.18420/BTW2025-23)
 
@@ -35,8 +35,11 @@ Partition-based query optimization middleware for heavily partitioned datasets. 
 ## Installation
 
 ```bash
-pip install git+https://github.com/MPoppinga/PartitionCache@main
+pip install "partitioncache[db] @ git+https://github.com/MPoppinga/PartitionCache@v1.0.0"
 ```
+
+The `db` extra installs the database drivers (psycopg, redis, rocksdict, duckdb, mysql-connector-python); without it
+only the query processing is usable. Release notes and known limitations are in [CHANGELOG.md](CHANGELOG.md).
 
 ## Quick Start
 
@@ -53,6 +56,7 @@ DB_NAME=application_db
 
 # Cache Backend
 CACHE_BACKEND=postgresql_array
+PG_ARRAY_CACHE_TABLE_PREFIX=partitioncache_array
 
 # Queue System
 QUERY_QUEUE_PROVIDER=postgresql
@@ -63,33 +67,40 @@ PG_QUEUE_PASSWORD=secure_password
 PG_QUEUE_DB=application_db
 ```
 
+The command-line tools read this file (`--env`). The Python API reads the process environment, so load the file
+first, for example with `dotenv.load_dotenv()`.
+
 ### Basic Usage
 
 ```python
+import dotenv
 import partitioncache
+
+dotenv.load_dotenv()
 
 # Create cache handler
 cache = partitioncache.create_cache_helper("postgresql_array", "user_id", "integer")
 
 # Store partition keys
-cache.set_set("query_hash", {1, 2, 3, 4, 5})
+cache.set_cache("query_hash", {1, 2, 3, 4, 5})
 
 # Retrieve partition keys
 partition_keys = cache.get("query_hash")
 
 # Apply cache to optimize query (recommended approach)
 # This automatically:
-# 1. Decomposes query into variants (e.g., "WHERE age > 25")
-# 2. Checks cache for which user_id partitions have matches
-# 3. Rewrites query to only search those partitions
+# 1. Decomposes the query into variants
+# 2. Checks the cache for the user_id partitions each cached variant matches
+# 3. Rewrites the query to search only those partitions
 enhanced_query, stats = partitioncache.apply_cache_lazy(
     query="SELECT * FROM users WHERE age > 25",
     cache_handler=cache.underlying_handler,
     partition_key="user_id",
-    method="TMP_TABLE_IN"  # Options: "IN_SUBQUERY", "TMP_TABLE_IN", "TMP_TABLE_JOIN"
+    method="TMP_TABLE_IN",  # also "IN_SUBQUERY" (default), "TMP_TABLE_JOIN", "UNLOGGED_TABLE_IN", "UNLOGGED_TABLE_JOIN"
+    min_component_size=1,  # the lookup default is 2: variants over a single table are then not looked up
 )
 print(f"Cache hits: {stats['cache_hits']}/{stats['generated_variants']}")
-# If cached: query now includes "AND user_id IN (1,2,3,4,5)" to skip other partitions
+# With a cached variant, the query is restricted to the cached user_id values
 
 ```
 
@@ -112,9 +123,9 @@ for fragment_query, query_hash in partitioncache.generate_all_query_hash_pairs(q
         result = {row[0] for row in conn.execute(fragment_query).fetchall()}
         cache.set_entry(query_hash, result, fragment_query)
 
-# Future queries are now automatically optimized
+# Later queries that contain a cached variant are restricted to its keys
 enhanced_query, stats = partitioncache.apply_cache_lazy(
-    query=query, cache_handler=cache.underlying_handler, partition_key="city_id"
+    query=query, cache_handler=cache.underlying_handler, partition_key="city_id", min_component_size=1
 )
 ```
 
@@ -124,12 +135,15 @@ enhanced_query, stats = partitioncache.apply_cache_lazy(
 |---------|-----------|----------|
 | **postgresql_array** | Various types | Production, full features |
 | **postgresql_bit** | Integer only | efficient integers |
-| **postgresql_roaringbitmap** | Integer only | Memory-efficient integers |
+| **postgresql_roaringbit** | Integer only | Memory-efficient integers (roaring bitmaps) |
 | **redis_set** | Int, Text | High-throughput, distributed |
 | **redis_bit** | Integer only | Memory-efficient Redis |
 | **rocksdb_set** | Int, Text | File-based storage |
 | **rocksdb_bit** | Integer only | Memory-efficient integers |
 | **rocksdict** | Various types | Local storage |
+| **redis_roaringbit**, **rocksdict_roaringbit** | Integer only | Roaring bitmaps in Redis / RocksDict |
+| **duckdb_bit** | Integer only | Analytical workloads, DuckDB BITSTRING |
+| **postgis_bbox**, **rocksdict_h3_grouped** | Geometry (points) | Spatial filters, see [Cache Handlers](docs/cache_handlers.md) |
 
 ## Processing Models
 
@@ -137,7 +151,7 @@ enhanced_query, stats = partitioncache.apply_cache_lazy(
 ```python
 cache = partitioncache.create_cache_helper("postgresql_array", "city_id", "integer")
 # Store query results directly in cache for single query
-cache.set_set("query_hash", {1, 5, 10, 15})
+cache.set_cache("query_hash", {1, 5, 10, 15})
 if cache.exists("query_hash"):
     cached_cities = cache.get("query_hash")
 ```
@@ -150,10 +164,8 @@ partitioncache.push_to_original_query_queue(
     partition_key="city_id",
     partition_datatype="integer"
 )
-# This query will be decomposed into:
-# - "WHERE rating > 4.0"
-# - "WHERE type = 'italian'"
-# Each variant executes and caches its city_id results
+# pcache-monitor decomposes the query into its variants, executes each
+# and caches the city_id values it returns
 
 # Monitor queue
 lengths = partitioncache.get_queue_lengths()
@@ -193,7 +205,7 @@ pcache-postgresql-queue-processor setup
 
 
 # Configure queue processor (optional)
-pcache-postgresql-queue-processor config --max-jobs 10 --frequency 2
+pcache-postgresql-queue-processor update-config --max-parallel-jobs 10 --frequency 2
 
 # Enable queue processor
 pcache-postgresql-queue-processor enable
@@ -270,35 +282,40 @@ city_cache = partitioncache.create_cache_helper("postgresql_array", "city_id", "
 region_cache = partitioncache.create_cache_helper("postgresql_array", "region", "text")
 
 # Cache data for both partitions
-city_cache.set_set("restaurants_query", {1, 5, 10, 15})
-region_cache.set_set("restaurants_query", {"NYC", "LA", "SF"})
+city_cache.set_cache("restaurants_query", {1, 5, 10, 15})
+region_cache.set_cache("restaurants_query", {"NYC", "LA", "SF"})
 
 # Apply cache to queries
 for cache, key in [(city_cache, "city_id"), (region_cache, "region")]:
     enhanced_query, stats = partitioncache.apply_cache_lazy(
         query="SELECT * FROM restaurants WHERE rating > 4.0",
         cache_handler=cache.underlying_handler,
-        partition_key=key
+        partition_key=key,
+        min_component_size=1,
     )
 ```
 
 ### Query Decomposition and Intersection Example
 See how queries are decomposed and optimized:
 ```python
-# Original complex query
-query = "SELECT * FROM restaurants WHERE rating > 4.0 AND cuisine = 'italian'"
+# Restaurants and parks of the same city
+query = (
+    "SELECT r.name, p.name FROM restaurants AS r, parks AS p "
+    "WHERE r.city_id = p.city_id AND r.rating > 4.0 AND p.area > 10000"
+)
 
 # PartitionCache automatically:
-# 1. Decomposes into variants:
-#    - "WHERE rating > 4.0" 
-#    - "WHERE cuisine = 'italian'"
-# 2. Checks cache for each variant's partition keys
-# 3. Intersects results: cities with BOTH conditions
+# 1. Decomposes into variants, one per table here:
+#    - SELECT DISTINCT t1.city_id FROM restaurants AS t1 WHERE t1.rating > 4.0
+#    - SELECT DISTINCT t1.city_id FROM parks AS t1 WHERE t1.area > 10000
+# 2. Checks the cache for each variant's partition keys
+# 3. Intersects the results: cities with BOTH a matching restaurant and a matching park
 
 enhanced_query, stats = partitioncache.apply_cache_lazy(
     query=query,
     cache_handler=cache.underlying_handler,
-    partition_key="city_id"
+    partition_key="city_id",
+    min_component_size=1,
 )
 
 print(f"Generated {stats['generated_variants']} query variants")
@@ -323,8 +340,8 @@ pcache-postgresql-queue-processor setup
 pcache-postgresql-queue-processor enable
 
 # 4. Setup automatic cache eviction
-pcache-postgresql-eviction-manager setup
-pcache-postgresql-eviction-manager enable --ttl-days 30
+pcache-postgresql-eviction-manager setup --strategy oldest --threshold 1000
+pcache-postgresql-eviction-manager enable
 
 # 5. Monitor system
 pcache-manage cache overview
@@ -337,7 +354,7 @@ pcache-postgresql-queue-processor status-detailed
 - **[Documentation Overview](docs/README.md)** - Overview of the system and how it works
 
 ### Core Architecture
-- **[System Overview](docs/system_overview.md)** - Architecture and concepts
+- **[Architecture and Design Decisions](docs/architecture_and_design_decisions.md)** - Architecture and concepts
 - **[API Reference](docs/api_reference.md)** - Complete API documentation
 - **[Cache Handlers](docs/cache_handlers.md)** - Backend comparison guide
 - **[Queue System](docs/queue_system.md)** - Asynchronous processing
@@ -368,7 +385,7 @@ For production deployments, the **PostgreSQL Queue Processor** is strongly recom
   - Configure: Add `shared_preload_libraries = 'pg_cron'` to postgresql.conf
 
 - **roaringbitmap** - Required for postgresql_roaringbit backend
-  - Install: `./scripts/install_pg_extensions.sh postgresql_roaringbit`
+  - Install: `./scripts/install_pg_extensions.sh`
 
 ### Quick Docker Setup
 

@@ -7,6 +7,7 @@ with automatic datatype validation and consistent interfaces.
 
 from datetime import datetime
 
+from partitioncache._version import __version__
 from partitioncache.apply_cache import (
     apply_cache,
     apply_cache_lazy,
@@ -94,6 +95,7 @@ def list_cache_types() -> dict[str, list[str]]:
 
 
 __all__ = [
+    "__version__",
     "create_cache_helper",
     "create_partitioncache_helper",
     "get_cache_handler",
