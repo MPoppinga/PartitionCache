@@ -635,6 +635,7 @@ Controls how query variants are generated when processing original queries from 
   - **Default**: Lazy insertion enabled (when handler supports `set_cache_lazy`)
   - **Purpose**: Debug or compare execution strategies
   - **Note**: Lazy insertion wraps fragment SQL for server-side execution without materializing results
+  - **Same database only**: lazy insertion runs the fragment on the cache handler's connection, so it is used only with `--db-backend postgresql` when that connection has the same host, port and database name as the data connection (hosts compared as written: `localhost` and `127.0.0.1` differ). Otherwise fragments run on the data connection, and the reason is logged once; spatial datatypes, which need lazy insertion, fail (likewise `pcache-add --direct` with a spatial datatype)
 - `--log-query-times LOG_FILE` - Log query execution times to CSV file
   - **Format**: CSV with columns for query hash, execution time, result count
   - **Purpose**: Performance analysis and profiling

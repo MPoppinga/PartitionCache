@@ -645,6 +645,67 @@ def get_database_connection_params(args: argparse.Namespace, backend_type: str |
         raise ValueError(f"Unsupported database backend: {backend}")
 
 
+ConnectionTarget = tuple[str, int, str]
+
+
+def data_connection_target(args: argparse.Namespace) -> ConnectionTarget | None:
+    """(host, port, database) of the PostgreSQL data connection get_database_connection_params gives, or None.
+
+    None when --db-backend is not postgresql or no database name is configured (--db-name or DB_NAME).
+    """
+    if getattr(args, "db_backend", None) != "postgresql" or not (getattr(args, "db_name", None) or os.getenv("DB_NAME")):
+        return None
+    try:
+        params = get_database_connection_params(args, "postgresql")
+        return str(params["host"]), int(params["port"]), str(params["dbname"])
+    except (TypeError, ValueError):
+        return None
+
+
+def cache_connection_target(cache_handler: Any) -> ConnectionTarget | None:
+    """(host, port, database) the cache handler's psycopg connection resolved to, or None if it has none.
+
+    The PostgreSQL handlers keep the connection in ``db``, rocksdict_h3_grouped in ``pg_conn``; the values come from
+    ``connection.info``, i.e. what the connection actually uses, not the variables it was configured from.
+    """
+    for attribute in ("db", "pg_conn"):
+        info = getattr(getattr(cache_handler, attribute, None), "info", None)
+        host, port, dbname = (getattr(info, name, None) for name in ("host", "port", "dbname"))
+        if isinstance(host, str) and host and isinstance(dbname, str) and dbname and isinstance(port, int | str):
+            try:
+                return host, int(port), dbname
+            except ValueError:
+                return None
+    return None
+
+
+def lazy_insertion_refusal(data_target: ConnectionTarget | None, cache_target: ConnectionTarget | None) -> str | None:
+    """Why fragments must not be executed on the cache handler's connection (lazy insertion), or None if they may.
+
+    Lazy insertion executes a fragment on the cache handler's connection, not on the data connection. Both must be
+    the same server and database; hosts are compared as written (case-insensitive), so ``localhost`` and
+    ``127.0.0.1`` count as different: when in doubt, the fragment runs on the data connection.
+
+    Args:
+        data_target: (host, port, database) of the data connection, None if it is not PostgreSQL or not configured.
+        cache_target: (host, port, database) of the cache handler's connection, None if it has none.
+    """
+    if data_target is None:
+        return "the data connection is not a configured PostgreSQL database (--db-backend postgresql with --db-name or DB_NAME)"
+    if cache_target is None:
+        return "the cache handler has no PostgreSQL connection that could be compared with the data connection"
+    data_host, data_port, data_db = data_target
+    cache_host, cache_port, cache_db = cache_target
+    if (data_host.strip().lower(), data_port, data_db) != (cache_host.strip().lower(), cache_port, cache_db):
+        return f"the cache handler connects to {cache_host}:{cache_port}/{cache_db}, the data connection to {data_host}:{data_port}/{data_db}"
+    return None
+
+
+def lazy_insertion_refusal_for(args: argparse.Namespace, cache_handler: Any) -> str | None:
+    """lazy_insertion_refusal for the data connection of ``args`` and the connection of ``cache_handler``."""
+    return lazy_insertion_refusal(data_connection_target(args), cache_connection_target(cache_handler))
+
+
 def setup_logging(verbose: bool = False) -> None:
     """
     Setup consistent logging configuration for CLI tools.

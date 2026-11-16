@@ -21,6 +21,7 @@ from partitioncache.cli.common_args import (
     configure_logging,
     get_database_connection_params,
     grid_cell_size_for,
+    lazy_insertion_refusal_for,
     load_env_file_before_parsing,
     load_environment_with_validation,
     parse_variant_generation_json_args,
@@ -329,6 +330,14 @@ def main():
                 # Spatial mode: use lazy insertion (the handler wraps variant queries with H3/BBox SQL)
                 if not hasattr(cache_handler, "set_cache_lazy"):
                     logger.error(f"Spatial datatype '{args.partition_datatype}' requires a handler with set_cache_lazy support")
+                    exit(1)
+                # The handler runs the variants on its own connection, which must be the data database
+                lazy_refusal = lazy_insertion_refusal_for(args, cache_handler)
+                if lazy_refusal is not None:
+                    logger.error(
+                        f"Spatial datatype '{args.partition_datatype}' needs lazy insertion, which runs the variants on the cache handler's "
+                        f"connection, but {lazy_refusal}. Point --db-name / PG_DB_HOST / PG_DB_PORT at the cache handler's database."
+                    )
                     exit(1)
 
                 for fragment_query, hash_value in query_hash_pairs:
