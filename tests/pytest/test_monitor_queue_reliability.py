@@ -1,11 +1,13 @@
 """pcache-monitor: --close waits for both queues and the decomposer, a missing datatype is resolved, a failed push is not lost silently."""
 
+import logging
 import threading
 from unittest.mock import Mock, patch
 
 import pytest
 
 import partitioncache.cli.monitor_cache_queue as mcq
+from partitioncache.query_processor import hash_query
 
 MODULE = "partitioncache.cli.monitor_cache_queue"
 QUERY = "SELECT * FROM orders AS o WHERE o.total > 10"
@@ -47,6 +49,13 @@ def exit_event():
     event = threading.Event()
     with patch(f"{MODULE}.exit_event", event):
         yield event
+
+
+@pytest.fixture(autouse=True)
+def no_requeue_memory():
+    mcq._requeued_original_queries.clear()
+    yield
+    mcq._requeued_original_queries.clear()
 
 
 def _lengths(original: int, fragments: int) -> dict:
@@ -193,3 +202,47 @@ class TestMissingDatatype:
             assert cache.get_datatype("pk") == "integer"
         finally:
             cache.close()
+
+
+class TestFailedFragmentPush:
+    def _decompose_once(self, args, push_back=True):
+        with (
+            patch(f"{MODULE}.exit_event") as event,
+            patch(f"{MODULE}.pop_from_original_query_queue_blocking", return_value=(QUERY, "pk", "integer")),
+            patch(f"{MODULE}.generate_all_query_hash_pairs", return_value=PAIRS),
+            patch(f"{MODULE}.push_to_query_fragment_queue", return_value=False),
+            patch(f"{MODULE}.push_to_original_query_queue", return_value=push_back) as requeue,
+        ):
+            event.is_set.side_effect = [False, True]
+            mcq.query_fragment_processor(args, (None, None, None))
+        return requeue
+
+    def test_query_is_put_back_once_then_dropped(self, args, caplog):
+        with caplog.at_level(logging.ERROR, logger="PartitionCache"):
+            first = self._decompose_once(args)
+            second = self._decompose_once(args)
+
+        first.assert_called_once_with(QUERY, "pk", "integer")
+        second.assert_not_called()
+        errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(errors) == 2
+        assert all(hash_query(QUERY) in message for message in errors)
+        assert "put back" in errors[0] and "dropped" in errors[1]
+
+    def test_failed_put_back_is_logged_as_lost(self, args, caplog):
+        with caplog.at_level(logging.ERROR, logger="PartitionCache"):
+            self._decompose_once(args, push_back=False)
+        errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(errors) == 1 and hash_query(QUERY) in errors[0] and "lost" in errors[0]
+
+    def test_successful_push_forgets_an_earlier_put_back(self, args):
+        self._decompose_once(args)
+        with (
+            patch(f"{MODULE}.exit_event") as event,
+            patch(f"{MODULE}.pop_from_original_query_queue_blocking", return_value=(QUERY, "pk", "integer")),
+            patch(f"{MODULE}.generate_all_query_hash_pairs", return_value=PAIRS),
+            patch(f"{MODULE}.push_to_query_fragment_queue", return_value=True),
+        ):
+            event.is_set.side_effect = [False, True]
+            mcq.query_fragment_processor(args, (None, None, None))
+        assert not mcq._requeued_original_queries

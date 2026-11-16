@@ -1,6 +1,7 @@
 """Queue handlers: blocking pops honour their timeout, a missing datatype pops as None, a push with failed rows is False."""
 
 import json
+import logging
 import socket
 import threading
 import time
@@ -162,3 +163,80 @@ class TestMissingDatatype:
             popped = (handler.pop_from_original_query_queue(), handler.pop_from_query_fragment_queue())
 
         assert popped == (("SELECT 1", "pk", None), ("SELECT 1", "h1", "pk", None, None))
+
+
+PAIRS = [("SELECT 1", "h1"), ("SELECT 2", "h2"), ("SELECT 3", "h3")]
+
+
+def _push_fragments(handler, with_priority: bool):
+    if with_priority:
+        return handler.push_to_query_fragment_queue_with_priority(PAIRS, "pk", 2, "integer")
+    return handler.push_to_query_fragment_queue(PAIRS, "pk", "integer", size_priority=False)
+
+
+def _push_original(handler, with_priority: bool):
+    if with_priority:
+        return handler.push_to_original_query_queue_with_priority("SELECT 1", "pk", 2, "integer")
+    return handler.push_to_original_query_queue("SELECT 1", "pk", "integer")
+
+
+class TestPushStatus:
+    @pytest.mark.parametrize("with_priority", [False, True])
+    def test_fragment_push_with_an_error_row_is_false(self, with_priority, caplog):
+        handler, connection, cursor = _handler_with_connection()
+        cursor.fetchall.return_value = [(1, "h1", "pk", "inserted"), (2, "h2", "pk", "error"), (3, "h3", "pk", "error")]
+
+        with caplog.at_level(logging.ERROR, logger="PartitionCache"):
+            assert _push_fragments(handler, with_priority) is False
+
+        errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(errors) == 1
+        assert "2 of 3" in errors[0] and "h2" in errors[0] and "'error'" in errors[0]
+        connection.commit.assert_called_once_with()  # the rows that were queued stay queued
+
+    @pytest.mark.parametrize("with_priority", [False, True])
+    @pytest.mark.parametrize("status", ["inserted", "updated", "skipped_locked", "skipped_concurrent"])
+    def test_fragment_push_of_queued_rows_is_true(self, with_priority, status):
+        handler, _, cursor = _handler_with_connection()
+        cursor.fetchall.return_value = [(1, "h1", "pk", "inserted"), (2, "h2", "pk", status), (3, "h3", "pk", "updated")]
+
+        assert _push_fragments(handler, with_priority) is True
+
+    @pytest.mark.parametrize("with_priority", [False, True])
+    def test_original_push_with_error_status_is_false(self, with_priority, caplog):
+        handler, _, cursor = _handler_with_connection()
+        cursor.fetchone.return_value = ("error",)
+
+        with caplog.at_level(logging.ERROR, logger="PartitionCache"):
+            assert _push_original(handler, with_priority) is False
+
+        assert any("'error'" in r.getMessage() for r in caplog.records if r.levelno == logging.ERROR)
+
+    @pytest.mark.parametrize("with_priority", [False, True])
+    @pytest.mark.parametrize("status", ["inserted", "updated", "skipped_locked", "skipped_concurrent"])
+    def test_original_push_of_a_queued_row_is_true(self, with_priority, status):
+        handler, _, cursor = _handler_with_connection()
+        cursor.fetchone.return_value = (status,)
+
+        assert _push_original(handler, with_priority) is True
+
+
+@pytest.mark.parametrize("mode", ["--queue", "--queue-original"])
+def test_pcache_add_exits_non_zero_when_a_row_was_not_queued(mode, monkeypatch):
+    import sys
+
+    from partitioncache import queue
+    from partitioncache.cli import add_to_cache
+
+    handler, _, cursor = _handler_with_connection()
+    cursor.fetchall.side_effect = lambda: [(i + 1, f"h{i + 1}", "pk", "error") for i in range(len(cursor.execute.call_args.args[1][0]))]
+    cursor.fetchone.return_value = ("error",)
+    monkeypatch.setattr(queue, "_queue_handler", handler)
+    argv = ["pcache-add", mode, "--query", "SELECT * FROM orders AS o WHERE o.total > 10", "--partition-key", "pk", "--partition-datatype", "integer"]
+    with (
+        patch.object(sys, "argv", argv),
+        patch.object(add_to_cache, "load_environment_with_validation"),
+        pytest.raises(SystemExit) as exit_info,
+    ):
+        add_to_cache.main()
+    assert exit_info.value.code == 1

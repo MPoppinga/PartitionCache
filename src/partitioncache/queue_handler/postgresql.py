@@ -33,6 +33,23 @@ def _wait_for_notification(listen_conn: psycopg.Connection, wait_time: float) ->
     return notified
 
 
+# Statuses of the upsert helpers (postgresql_queue_helper.sql) that leave the item queued. 'skipped_locked': the row
+# exists and a pop that is taking it (or another push) holds its lock; 'skipped_concurrent': another session inserted
+# or updated the same row at the same time. Both only skip the priority increment. Any other status, 'error' from
+# the helpers' WHEN OTHERS branch included, means the item may not be in the queue.
+QUEUED_STATUSES = frozenset({"inserted", "updated", "skipped_locked", "skipped_concurrent"})
+
+
+def _all_queued(statuses: list[tuple[str, str | None]], what: str) -> bool:
+    """True if every (hash or query, status) pair of a push left its item queued; else logs the failed rows."""
+    failed = [(item, status) for item, status in statuses if status not in QUEUED_STATUSES]
+    if not failed:
+        return True
+    item, status = failed[0]
+    logger.error(f"Failed to push {len(failed)} of {len(statuses)} {what} to the PostgreSQL queue, e.g. {item} with status '{status}'")
+    return False
+
+
 class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
     def __init__(self, host: str, port: int, user: str, password: str, dbname: str, table_prefix: str):
         """
@@ -307,7 +324,7 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
                 result = cursor.fetchone()[0]  # type: ignore
                 conn.commit()
                 logger.debug(f"Non-blocking original queue upsert result: {result}")
-                return True
+                return _all_queued([("the original query", result)], "original queries")
             except Exception as func_error:
                 # Fallback to traditional approach if function doesn't exist
                 logger.debug(f"Non-blocking function not available, using fallback: {func_error}")
@@ -402,9 +419,7 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
                     self._lift_created_fragments(cursor, query_hash_pairs, partition_key, results)
                 conn.commit()
 
-                success_count = len([r for r in results if r[3] in ("inserted", "updated")])
-                logger.debug(f"Batch upsert results: {success_count}/{len(query_hash_pairs)} successful")
-                return True
+                return _all_queued([(f"hash {hash_value}", status) for _, hash_value, _, status in results], "query variants")
 
             except Exception as func_error:
                 # Fallback to individual inserts if batch function doesn't exist
@@ -488,7 +503,7 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
                 result = cursor.fetchone()[0]  # type: ignore
                 conn.commit()
                 logger.debug(f"Non-blocking original queue upsert result: {result}")
-                return True
+                return _all_queued([("the original query", result)], "original queries")
             except Exception as func_error:
                 # Fallback to traditional approach if function doesn't exist
                 logger.debug(f"Non-blocking function not available, using fallback: {func_error}")
@@ -567,9 +582,7 @@ class PostgreSQLQueueHandler(AbstractPriorityQueueHandler):
                 results = cursor.fetchall()
                 conn.commit()
 
-                success_count = len([r for r in results if r[3] in ("inserted", "updated")])
-                logger.debug(f"Batch upsert with priority results: {success_count}/{len(query_hash_pairs)} successful")
-                return True
+                return _all_queued([(f"hash {hash_value}", status) for _, hash_value, _, status in results], "query variants")
             except Exception as func_error:
                 # Fallback to traditional approach if function doesn't exist
                 logger.debug(f"Non-blocking function not available, using fallback: {func_error}")

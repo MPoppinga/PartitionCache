@@ -36,13 +36,14 @@ from partitioncache.db_handler import get_db_handler
 from partitioncache.logging_utils import configure_enhanced_logging, get_thread_aware_logger
 from partitioncache.population import RestrictionCounts, restrict_with_cache
 from partitioncache.query_accelerator import create_query_accelerator
-from partitioncache.query_processor import generate_all_query_hash_pairs, order_variants_for_population
+from partitioncache.query_processor import generate_all_query_hash_pairs, hash_query, order_variants_for_population
 from partitioncache.queue import (
     get_queue_lengths,
     pop_from_original_query_queue,
     pop_from_original_query_queue_blocking,
     pop_from_query_fragment_queue,
     pop_from_query_fragment_queue_blocking,
+    push_to_original_query_queue,
     push_to_query_fragment_queue,
 )
 from partitioncache.queue_handler.size_priority import size_priority_enabled
@@ -184,6 +185,9 @@ status_log_interval = 10  # Log status every 10 seconds when idle
 # queues under it, so no query can be popped between that count and the exit.
 decomposition_lock = threading.Lock()
 
+# Original queries put back after their fragments could not be pushed, as (query hash, partition key)
+_requeued_original_queries: set[tuple[str, str]] = set()
+
 
 def query_fragment_processor(args, constraint_args):
     """Thread function that decomposes and recomposes original queries into query variants and pushes them to the variant queue.
@@ -273,8 +277,25 @@ def decompose_original_query(query: str, partition_key: str, partition_datatype:
     )
     if success:
         logger.debug(f"Pushed {len(query_hash_pairs)} query variants to the variant queue")
+        if _requeued_original_queries:
+            _requeued_original_queries.discard((hash_query(query), partition_key))
     else:
-        logger.error("Error pushing query variants to the variant queue")
+        _put_back_original_query(query, partition_key, partition_datatype, len(query_hash_pairs))
+
+
+def _put_back_original_query(query: str, partition_key: str, partition_datatype: str | None, variant_count: int) -> None:
+    """Put an original query whose variants could not all be pushed back into its queue, once; the second time drop it."""
+    query_hash = hash_query(query)
+    requeue_key = (query_hash, partition_key)
+    failure = f"Failed to push the {variant_count} query variants of original query {query_hash} (partition key '{partition_key}')"
+    if requeue_key in _requeued_original_queries:
+        _requeued_original_queries.discard(requeue_key)
+        logger.error(f"{failure} after it was put back once; the query is dropped")
+    elif push_to_original_query_queue(query, partition_key, partition_datatype):
+        _requeued_original_queries.add(requeue_key)
+        logger.error(f"{failure}; put back into the original query queue for one more try")
+    else:
+        logger.error(f"{failure} and failed to put it back into the original query queue; the query is lost")
 
 
 # Cache optimization method of the CLI -> method of the lazy path (IN means IN_SUBQUERY there) and of the eager path

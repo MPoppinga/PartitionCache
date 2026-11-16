@@ -116,6 +116,11 @@ The priority functions use PostgreSQL's `FOR UPDATE NOWAIT` to avoid blocking wh
 3. If row doesn't exist → INSERT with ON CONFLICT handling
 4. If row is locked → Return 'skipped_locked'
 5. Handle concurrent INSERT races → Return 'skipped_concurrent'
+6. Any other error → Return 'error'
+
+A push returns False, and logs at error level how many rows failed, if any row came back with a status other than
+'inserted', 'updated', 'skipped_locked' or 'skipped_concurrent'. The two skipped statuses leave the item queued: the
+row exists and a pop or another push holds it; only the priority increment is skipped.
 
 **Python API for Priority Operations:**
 ```python
@@ -206,6 +211,7 @@ The monitor implements a sophisticated two-threaded architecture:
 - Uses partition key from queue (not command line)
 - Breaks down queries using `generate_all_query_hash_pairs()`
 - Pushes fragments with partition key to query fragment queue
+- If the push fails, puts the original query back into its queue once (error log with the query hash); a second failure drops it
 
 **Thread 2: Execution Pool**
 - Consumes `(query, hash, partition_key, partition_datatype, cache_backend)` from query fragment queue
