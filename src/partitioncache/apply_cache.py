@@ -23,10 +23,14 @@ import sqlglot.expressions as exp
 
 from partitioncache.cache_handler.abstract import LAZY_ALL_KEYS_PLACEHOLDER, AbstractCacheHandler, AbstractCacheHandler_Lazy
 from partitioncache.query_processor import (
+    _outer_table_aliases,
+    _top_level_conjuncts,
     compute_buffer_distance,
     detect_partition_join_from_query,
+    distance_bounded_aliases,
     generate_all_hashes,
     handle_deprecated_kwargs,
+    has_distance_predicate,
     normalize_regex_operators,
 )
 from partitioncache.temporal_dilation import compute_dilation_buckets, compute_temporal_window, dilate_bucket_set
@@ -66,10 +70,10 @@ def _resolve_dilation(
     return compute_dilation_buckets(window, temporal_bucket_width)
 
 
-def _has_single_from_item(query: str) -> bool:
+def _has_single_from_item(query: str, sql_dialect: str = "postgres") -> bool:
     """Whether the outermost FROM clause holds exactly one table (no join, no derived table, no CTE)."""
     try:
-        parsed = sqlglot.parse_one(query)
+        parsed = sqlglot.parse_one(query, read=sql_dialect)
     except sqlglot.errors.ParseError:
         return False
     if parsed.find(exp.With) is not None:  # the fragments are generated from the CTE bodies, which may join tables
@@ -81,22 +85,95 @@ def _has_single_from_item(query: str) -> bool:
     return not parsed.args.get("joins") and isinstance(parsed.args["from_"].this, exp.Table)
 
 
-def _resolve_buffer_distance(query: str, buffer_distance: float | None) -> float:
-    """The distance the cached geometries are widened by before they restrict the query.
+def _resolve_buffer_distance(query: str, buffer_distance: float | None, sql_dialect: str = "postgres") -> float | None:
+    """The distance the cached geometries are widened by before they restrict the query, or None if it is unknown.
 
-    An explicit value wins. A query over a single table needs no widening: every cached fragment holds that
-    table's own geometries, so each row the query returns lies in every cached set. A radius around a constant
-    point, as in ``ST_DWithin(p1.geom, ST_MakePoint(...), r)``, must therefore not widen the filter by r.
-    Otherwise it is the diameter of the query's distance graph (:func:`compute_buffer_distance`).
+    An explicit value wins: the caller guarantees that it bounds the distance between p0 and every alias of every
+    fragment. A query over a single table needs no widening: every cached fragment holds that table's own
+    geometries, so each row the query returns lies in every cached set. A radius around a constant point, as in
+    ``ST_DWithin(p1.geom, ST_MakePoint(...), r)``, must therefore not widen the filter by r.
+    Otherwise it is the diameter of the query's distance graph (:func:`compute_buffer_distance`), None if some alias
+    is not bounded by top-level distance constraints; then only some fragments may be used
+    (:func:`_bounded_spatial_fragments`).
+
+    Raises:
+        ValueError: The query has several tables and no distance predicate at all.
     """
     if buffer_distance is not None:
         return buffer_distance
-    if _has_single_from_item(query):
+    if _has_single_from_item(query, sql_dialect):
         return 0.0
-    buffer_distance = compute_buffer_distance(query)
-    if buffer_distance == 0.0:
+    if not has_distance_predicate(query, sql_dialect):
         raise ValueError("buffer_distance is required when geometry_column is set and query has no distance constraints")
-    return buffer_distance
+    return compute_buffer_distance(query, sql_dialect)
+
+
+SPATIAL_UNBOUNDED = "spatial_unbounded"
+
+
+def _query_over_aliases(query: str, aliases: set[str]) -> str | None:
+    """The query reduced to the tables ``aliases`` name and the top-level conjuncts that reference no other table.
+
+    Its variants are the variants of the query whose aliases all lie in ``aliases`` (or relaxations of them). It is
+    parsed and rendered in sqlglot's default dialect, the one variant generation reads. None for a query with an outer
+    join or that is not one SELECT over tables.
+    """
+    try:
+        parsed = sqlglot.parse_one(query)
+    except sqlglot.errors.ParseError:
+        return None
+    outer = _outer_table_aliases(parsed)
+    if outer is None or not isinstance(parsed, exp.Select) or any(join.side for join in parsed.args.get("joins") or []):
+        return None
+    others = set(outer) - aliases
+    tables = [parsed.args["from_"].this] + [join.this for join in parsed.args.get("joins") or []]
+    kept_tables = [table.sql() for table in tables if table.alias_or_name in aliases]
+    # Dropping a conjunct only relaxes the variants, so any conjunct whose tables are unclear is dropped
+    kept = [
+        conjunct.copy()
+        for conjunct in _top_level_conjuncts(parsed)
+        if all(column.table and column.table not in others for column in conjunct.find_all(exp.Column))
+    ]
+    if not kept_tables:
+        return None
+    reduced = f"SELECT * FROM {', '.join(kept_tables)}"
+    return reduced + f" WHERE {exp.and_(*kept).sql()}" if kept else reduced
+
+
+def _restricts_p0_only(cache_handler: Any) -> bool:
+    """Whether the spatial rewrite restricts p0 alone; the H3 ``mv`` and ``column`` modes restrict every alias of its table."""
+    return getattr(cache_handler, "spatial_filter_type", "geometry") != "h3_cell_ids" or getattr(cache_handler, "h3_cell_mode", "inline") == "inline"
+
+
+def _bounded_spatial_fragments(
+    query: str, hashes: set[str], p0_alias: str | None, sql_dialect: str, variant_hashes: Callable[[str], list[str]]
+) -> tuple[float, set[str]] | None:
+    """The buffer and the cached fragments that may restrict p0 when not every alias of the query is bounded to it.
+
+    A fragment restricts p0 soundly only if each of its aliases is linked to p0 by top-level distance constraints;
+    the buffer is then the diameter of those aliases' distance graph. Variants are generated with canonical aliases,
+    so the usable ones are found as the cached variants of the query reduced to the bounded aliases
+    (``variant_hashes`` generates the variant hashes of a query as the lookup does).
+
+    Returns:
+        ``(buffer_distance, usable hashes)``, or None if no cached fragment is usable.
+    """
+    if p0_alias is None:
+        first_table = sqlglot.parse_one(query, read=sql_dialect).find(exp.Table)  # as the spatial rewrite chooses p0
+        if first_table is None:
+            return None
+        p0_alias = first_table.alias_or_name
+    plan = distance_bounded_aliases(query, p0_alias, sql_dialect)
+    if plan is None:
+        return None
+    bounded, diameter = plan
+    reduced = _query_over_aliases(query, bounded)
+    if reduced is None:
+        return None
+    usable = hashes & set(variant_hashes(reduced))
+    if not usable:
+        return None
+    return diameter, usable
 
 
 def _is_temporal(temporal_bucket_width: float | None, dilation_buckets: int | None) -> bool:
@@ -2730,10 +2807,16 @@ def apply_cache_lazy(
         geometry_column: If set, enables spatial cache mode. Uses this geometry column for variant
             SELECT clauses and spatial filter application. Requires a spatial cache handler with
             get_spatial_filter_lazy() method.
-        buffer_distance: Buffer distance in meters for spatial filter. If None and geometry_column
-            is set, auto-derived from distance constraints in the query (graph diameter); 0 for a
-            query over a single table, whose rows lie in every cached set. Required when
-            geometry_column is set and a query over several tables has no distance constraints.
+        buffer_distance: Buffer distance in meters for spatial filter. If given, the caller guarantees that it is
+            at least the distance between p0 and every row of every cached fragment the query uses (with the default
+            ``min_component_size``, fragments may contain any of the query's tables); it is used unchecked. If None,
+            it is the diameter of the query's distance graph, built from top-level distance conjuncts with a constant
+            distance (``compute_buffer_distance``); 0 for a query over a single table, whose rows lie in every cached
+            set. If some table is not linked to p0 by such conjuncts (e.g. joined only on an attribute, or a distance
+            under NOT or OR), only the fragments of tables linked to p0 are used, with the diameter of those tables;
+            if none of them is cached, the query runs without the cache and the statistics carry
+            ``uncached_reason: "spatial_unbounded"``. Required when a query over several tables has no distance
+            predicate at all (ValueError).
         spatial_method: Method for applying the spatial filter:
             - "SUBDIVIDE_TMP_TABLE": Create a temp table with ST_Subdivide + GiST index (default, optimal).
             - "SUBDIVIDE_INLINE": Inline ST_Subdivide in an EXISTS subquery (simpler, no temp table).
@@ -2789,28 +2872,32 @@ def apply_cache_lazy(
         # Unlike the non-spatial path, we skip get_partition_keys_lazy() / get_intersected_lazy()
         # because spatial handlers need get_spatial_filter_lazy() (buffered geometric intersection),
         # not partition key intersection (cell ID / bbox intersection).
-        hashes = generate_all_hashes(
-            partition_key_source_table=partition_key_source_table,
-            query=query,
-            partition_key=partition_key,
-            min_component_size=min_component_size,
-            fix_attributes=keep_all_attributes,
-            canonicalize_queries=canonicalize_queries,
-            follow_graph=follow_graph,
-            auto_detect_partition_join=False,
-            partition_join_table=partition_join_table,
-            bucket_steps=bucket_steps,
-            add_constraints=add_constraints,
-            remove_constraints_all=remove_constraints_all,
-            remove_constraints_add=remove_constraints_add,
-            skip_partition_key_joins=True,
-            geometry_column=geometry_column,
-            max_conditions_removed=max_conditions_removed,
-            protected_patterns=protected_patterns,
-        )
+
+        def variant_hashes(q: str) -> list[str]:
+            return generate_all_hashes(
+                partition_key_source_table=partition_key_source_table,
+                query=q,
+                partition_key=partition_key,
+                min_component_size=min_component_size,
+                fix_attributes=keep_all_attributes,
+                canonicalize_queries=canonicalize_queries,
+                follow_graph=follow_graph,
+                auto_detect_partition_join=False,
+                partition_join_table=partition_join_table,
+                bucket_steps=bucket_steps,
+                add_constraints=add_constraints,
+                remove_constraints_all=remove_constraints_all,
+                remove_constraints_add=remove_constraints_add,
+                skip_partition_key_joins=True,
+                geometry_column=geometry_column,
+                max_conditions_removed=max_conditions_removed,
+                protected_patterns=protected_patterns,
+            )
+
+        hashes = variant_hashes(query)
 
         generated_variants = len(hashes)
-        stats: dict[str, int] = {"generated_variants": generated_variants, "cache_hits": 0, "enhanced": 0, "p0_rewritten": 0, **gate_stats}
+        stats: dict[str, Any] = {"generated_variants": generated_variants, "cache_hits": 0, "enhanced": 0, "p0_rewritten": 0, **gate_stats}
         if not hashes:
             return query, stats
 
@@ -2819,7 +2906,17 @@ def apply_cache_lazy(
         if not existing_hashes:
             return query, stats
 
-        buffer_distance = _resolve_buffer_distance(query, buffer_distance)
+        resolved_buffer = _resolve_buffer_distance(query, buffer_distance, sql_dialect)
+        if resolved_buffer is None:
+            bounded = _bounded_spatial_fragments(query, existing_hashes, p0_alias, sql_dialect, variant_hashes) if _restricts_p0_only(cache_handler) else None
+            if bounded is None:
+                logger.warning("No cached fragment has all its tables bounded in distance to p0; the query runs without the spatial cache")
+                stats["uncached_reason"] = SPATIAL_UNBOUNDED
+                return query, stats
+            resolved_buffer, existing_hashes = bounded
+            stats["cache_hits"] = len(existing_hashes)
+            logger.info(f"Using the {len(existing_hashes)} cached fragments whose tables are all bounded in distance to p0")
+        buffer_distance = resolved_buffer
 
         srid = getattr(cache_handler, "srid", 4326)
         spatial_filter_type = getattr(cache_handler, "spatial_filter_type", "geometry")
@@ -3074,10 +3171,16 @@ def apply_cache(
         geometry_column: If set, enables spatial cache mode. Uses this geometry column for variant
             SELECT clauses and spatial filter application. Requires a spatial cache handler with
             get_spatial_filter() method.
-        buffer_distance: Buffer distance in meters for spatial filter. If None and geometry_column
-            is set, auto-derived from distance constraints in the query (graph diameter); 0 for a
-            query over a single table, whose rows lie in every cached set. Required when
-            geometry_column is set and a query over several tables has no distance constraints.
+        buffer_distance: Buffer distance in meters for spatial filter. If given, the caller guarantees that it is
+            at least the distance between p0 and every row of every cached fragment the query uses (with the default
+            ``min_component_size``, fragments may contain any of the query's tables); it is used unchecked. If None,
+            it is the diameter of the query's distance graph, built from top-level distance conjuncts with a constant
+            distance (``compute_buffer_distance``); 0 for a query over a single table, whose rows lie in every cached
+            set. If some table is not linked to p0 by such conjuncts (e.g. joined only on an attribute, or a distance
+            under NOT or OR), only the fragments of tables linked to p0 are used, with the diameter of those tables;
+            if none of them is cached, the query runs without the cache and the statistics carry
+            ``uncached_reason: "spatial_unbounded"``. Required when a query over several tables has no distance
+            predicate at all (ValueError).
         spatial_method: Method for applying the spatial filter:
             - "SUBDIVIDE_TMP_TABLE": Create a temp table with ST_Subdivide + GiST index (default, optimal).
             - "SUBDIVIDE_INLINE": Inline ST_Subdivide in an EXISTS subquery (simpler, no temp table).
@@ -3159,39 +3262,56 @@ def apply_cache(
     # Spatial mode is selected by passing a geometry column
     if geometry_column is not None:
         # Spatial path: generate hashes with spatial params, apply spatial filter
-        buffer_distance = _resolve_buffer_distance(query, buffer_distance)
+        resolved_buffer = _resolve_buffer_distance(query, buffer_distance, sql_dialect)
+
+        def variant_hashes(q: str) -> list[str]:
+            return generate_all_hashes(
+                partition_key_source_table=partition_key_source_table,
+                query=q,
+                partition_key=partition_key,
+                min_component_size=min_component_size,
+                follow_graph=True,
+                fix_attributes=keep_all_attributes,
+                canonicalize_queries=canonicalize_queries,
+                auto_detect_partition_join=False,
+                partition_join_table=partition_join_table,
+                bucket_steps=bucket_steps,
+                add_constraints=add_constraints,
+                remove_constraints_all=remove_constraints_all,
+                remove_constraints_add=remove_constraints_add,
+                max_conditions_removed=max_conditions_removed,
+                protected_patterns=protected_patterns,
+                skip_partition_key_joins=True,
+                geometry_column=geometry_column,
+            )
 
         # Step 1: Generate hashes with spatial params
-        cache_entry_hashes = generate_all_hashes(
-            partition_key_source_table=partition_key_source_table,
-            query=query,
-            partition_key=partition_key,
-            min_component_size=min_component_size,
-            follow_graph=True,
-            fix_attributes=keep_all_attributes,
-            canonicalize_queries=canonicalize_queries,
-            auto_detect_partition_join=False,
-            partition_join_table=partition_join_table,
-            bucket_steps=bucket_steps,
-            add_constraints=add_constraints,
-            remove_constraints_all=remove_constraints_all,
-            remove_constraints_add=remove_constraints_add,
-            max_conditions_removed=max_conditions_removed,
-            protected_patterns=protected_patterns,
-            skip_partition_key_joins=True,
-            geometry_column=geometry_column,
-        )
+        cache_entry_hashes = variant_hashes(query)
 
         generated_variants = len(cache_entry_hashes)
-        stats: dict[str, int] = {"generated_variants": generated_variants, "cache_hits": 0, "enhanced": 0, "p0_rewritten": 0, **gate_stats}
+        stats: dict[str, Any] = {"generated_variants": generated_variants, "cache_hits": 0, "enhanced": 0, "p0_rewritten": 0, **gate_stats}
 
         # Count cache hits
-        used_hashes = len(cache_handler.filter_existing_keys(set(cache_entry_hashes), partition_key))  # type: ignore[attr-defined]
+        existing_hashes = set(cache_handler.filter_existing_keys(set(cache_entry_hashes), partition_key))  # type: ignore[attr-defined]
+        used_hashes = len(existing_hashes)
         stats["cache_hits"] = used_hashes
 
         if used_hashes == 0:
             logger.info(f"No spatial cache hits found for query. Generated {generated_variants} subqueries")
             return query, stats
+
+        lookup_keys = set(cache_entry_hashes)
+        if resolved_buffer is None:
+            bounded = _bounded_spatial_fragments(query, existing_hashes, p0_alias, sql_dialect, variant_hashes) if _restricts_p0_only(cache_handler) else None
+            if bounded is None:
+                logger.warning("No cached fragment has all its tables bounded in distance to p0; the query runs without the spatial cache")
+                stats["uncached_reason"] = SPATIAL_UNBOUNDED
+                return query, stats
+            resolved_buffer, lookup_keys = bounded
+            used_hashes = len(lookup_keys)
+            stats["cache_hits"] = used_hashes
+            logger.info(f"Using the {used_hashes} cached fragments whose tables are all bounded in distance to p0")
+        buffer_distance = resolved_buffer
 
         # Step 2: Route by spatial_filter_type
         srid = getattr(cache_handler, "srid", 4326)
@@ -3203,7 +3323,7 @@ def apply_cache(
                 raise ValueError("Cache handler does not support H3 cell filtering (missing get_h3_cell_filter method)")
 
             cell_ids = cache_handler.get_h3_cell_filter(  # type: ignore[attr-defined]
-                keys=set(cache_entry_hashes),
+                keys=lookup_keys,
                 partition_key=partition_key,
                 buffer_distance=buffer_distance,
             )
@@ -3228,7 +3348,7 @@ def apply_cache(
                 raise ValueError("Cache handler does not support spatial filtering (missing get_spatial_filter method)")
 
             spatial_result = cache_handler.get_spatial_filter(  # type: ignore[attr-defined]
-                keys=set(cache_entry_hashes),
+                keys=lookup_keys,
                 partition_key=partition_key,
                 buffer_distance=buffer_distance,
             )

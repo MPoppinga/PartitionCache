@@ -304,7 +304,7 @@ Lazy counterpart to `extend_query_with_partition_keys`: integrates a lazy SQL su
 - `skip_partition_key_joins` (bool, optional): Spatial mode — generate query variants without partition-key equijoins (default: False)
 - `temporal_bucket_width`, `temporal_column`, `dilation_buckets` (optional): Temporal dilation for time-bucket partition keys, see below
 - `geometry_column` (str | None, optional): Enables spatial mode. Uses this geometry column for variant SELECT clauses and spatial filter. Requires a spatial cache handler with `get_spatial_filter_lazy()` method.
-- `buffer_distance` (float | None, optional): Buffer distance in meters for spatial filter (required when `geometry_column` is set).
+- `buffer_distance` (float | None, optional): Buffer distance for the spatial filter, see [Spatial buffer](#spatial-buffer-buffer_distance).
 - `spatial_method` (Literal["SUBDIVIDE_INLINE", "SUBDIVIDE_TMP_TABLE", "DUMP_TMP_TABLE", "DUMP_CTE"], optional): Strategy for applying the spatial filter (default: "SUBDIVIDE_TMP_TABLE")
 - `subdivide_max_vertices` (int, optional): Maximum vertices per subdivided filter geometry (default: 256)
 - `cost_estimator` (Callable[[str], float | None] | None, optional): Returns the planner cost of a query without executing it, e.g. `PostgresDBHandler.estimate_cost`. Only used together with `min_query_cost` (default: None)
@@ -431,13 +431,22 @@ enhanced_query, stats = partitioncache.apply_cache_lazy(
 - Dilated intersections are implemented in SQL for `postgresql_array` and `postgresql_bit`; the non-lazy API falls back to a Python intersection for other handlers with integer keys. A lazy call on a handler without a dilated intersection, and non-integer keys, run without the cache.
 - Dilation inflates each cached set by up to `2k + 1` buckets. A bucket width at least as large as the typical window keeps `k` at 1.
 
+#### Spatial buffer (`buffer_distance`)
+
+With `geometry_column`, each cached fragment is a region (the geometries of the rows that satisfy it, or their H3 cells), and p0 is restricted to the rows within `buffer_distance` of the intersection of these regions. The buffer must be at least the distance between p0 and any row of any fragment that is used.
+
+- Explicit `buffer_distance`: used unchecked. The caller guarantees this bound for every fragment of the query (with the default `min_component_size`, fragments may contain any of its tables).
+- `None` (default): derived by `compute_buffer_distance(query)`, the diameter of the query's distance graph. Only top-level conjuncts of the outer query (its `WHERE` and inner-join `ON`) with a constant distance link two tables: `ST_DWithin(a.geom, b.geom, d)`, `ST_DFullyWithin`, or an upper bound on a distance function in either direction (`ST_Distance(a.geom, b.geom) < d`, `d > ST_Distance(...)`, `... BETWEEN x AND d`). A distance under `NOT`, inside `OR`, in a subquery, or with a non-constant radius links nothing. A query over a single table gets 0.
+- If some table is not linked to p0 (for example joined only on an attribute, `p1.name = p3.name`), only the fragments whose tables are all linked to p0 are used, with the diameter of those tables. If none of them is cached, if the H3 `mv` or `column` cell mode would restrict the other aliases of p0's table too, or if the query is not a single `SELECT` over tables (CTE, set operation, derived table), the query runs without the cache: the statistics contain `uncached_reason: "spatial_unbounded"` and a warning is logged.
+- A query over several tables without any distance predicate raises `ValueError`; pass `buffer_distance`.
+
 #### `apply_cache(query, cache_handler, partition_key, ..., geometry_column=None, buffer_distance=None)`
 
 Applies partition cache to a query using regular (non-lazy) cache handlers. Supports spatial mode. Accepts the same `cost_estimator` / `min_query_cost` gate and `join_every_table` option as `apply_cache_lazy`. Like `apply_cache_lazy`, it takes `sql_dialect` (default `"postgres"`), the sqlglot dialect the enhanced non-spatial query is parsed and rendered in.
 
 **Spatial Parameters** (in addition to standard parameters):
 - `geometry_column` (str | None, optional): Enables spatial mode. Requires a spatial cache handler with `get_spatial_filter()` method.
-- `buffer_distance` (float | None, optional): Buffer distance in meters for spatial filter (required when `geometry_column` is set).
+- `buffer_distance` (float | None, optional): Buffer distance for the spatial filter, as for `apply_cache_lazy` (see [Spatial buffer](#spatial-buffer-buffer_distance)).
 
 **Example:**
 ```python
