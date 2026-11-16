@@ -10,6 +10,10 @@ collapse limits, and CREATE / INSERT INTO / CREATE INDEX / ANALYZE / DROP TABLE 
 (``tmp_cache_keys_<n>``, ``partitioncache_unl_<hex>``, ``pcache_stage_<hex>``). Every other statement, a DELETE
 anywhere, and a DROP other than of a key table (``ON COMMIT DROP`` is a clause, not a statement) refuse the script,
 as the guard of a single query refuses DELETE and DROP.
+
+The DELETE / DROP guard reads text, as before: a text key or a literal in the query that contains "DELETE " or
+"DROP " also refuses the script. Such a fragment is then stored through the caller's non-lazy path, which is safe,
+only slower.
 """
 
 import re
