@@ -21,6 +21,8 @@ from partitioncache.cli.common_args import (
     configure_logging,
     get_database_connection_params,
     grid_cell_size_for,
+    lazy_insertion_refusal_for,
+    load_env_file_before_parsing,
     load_environment_with_validation,
     parse_variant_generation_json_args,
     resolve_cache_backend,
@@ -70,6 +72,8 @@ def _exit_if_grid_key_invalid(args: argparse.Namespace, grid_size: float | None)
 
 
 def main():
+    # Argument defaults are read from the environment, so the --env file is loaded first
+    load_env_file_before_parsing()
     parser = argparse.ArgumentParser(description="Add queries to the partition cache either directly or via the queue")
 
     # Query configuration
@@ -321,11 +325,22 @@ def main():
                 query_hash_pairs = [(query, hash_query(query))]
 
             logger.debug(f"Found {len(query_hash_pairs)} subqueries to process")
+            if not query_hash_pairs:
+                logger.warning("No query variants were generated for the query; nothing was stored")
+            store_failures = 0
 
             if is_spatial:
                 # Spatial mode: use lazy insertion (the handler wraps variant queries with H3/BBox SQL)
                 if not hasattr(cache_handler, "set_cache_lazy"):
                     logger.error(f"Spatial datatype '{args.partition_datatype}' requires a handler with set_cache_lazy support")
+                    exit(1)
+                # The handler runs the variants on its own connection, which must be the data database
+                lazy_refusal = lazy_insertion_refusal_for(args, cache_handler)
+                if lazy_refusal is not None:
+                    logger.error(
+                        f"Spatial datatype '{args.partition_datatype}' needs lazy insertion, which runs the variants on the cache handler's "
+                        f"connection, but {lazy_refusal}"
+                    )
                     exit(1)
 
                 for fragment_query, hash_value in query_hash_pairs:
@@ -339,6 +354,7 @@ def main():
                         cache.set_query(hash_value, fragment_query)
                         logger.debug(f"Lazily stored spatial query {hash_value}")
                     else:
+                        store_failures += 1
                         logger.warning(f"Failed to lazily store spatial query {hash_value}")
 
                 cache.close()
@@ -386,6 +402,7 @@ def main():
                         if cache.set_cache(hash_value, result) and cache.set_query(hash_value, fragment_query):
                             logger.debug(f"Stored query {hash_value} with {len(result)} results")
                         else:
+                            store_failures += 1
                             logger.error(f"Failed to store query {hash_value} with {len(result)} results")
 
                 db_handler.close()
@@ -394,6 +411,9 @@ def main():
                     # Same outcome as the plain loop, where a failing variant aborts with an error
                     logger.error(f"{stats.failed} variants failed to execute and {stats.store_failed} failed to store")
                     exit(1)
+            if store_failures:
+                logger.error(f"{store_failures} of {len(query_hash_pairs)} query variants could not be stored")
+                exit(1)
 
         except Exception as e:
             logger.error(f"Error processing query: {str(e)}")

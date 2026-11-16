@@ -4,6 +4,7 @@ Unit tests for the monitor cache queue module.
 
 import logging
 import os
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
@@ -316,7 +317,11 @@ class TestRunAndStoreQuery:
         """Spatial handlers such as rocksdict_h3_grouped populate lazily but are no AbstractCacheHandler_Lazy."""
         mock_args.force_recalculate = False
         mock_args.disable_lazy_insertion = False
+        # Lazy insertion runs the fragment on the handler's connection, so it must be the data database
+        mock_args.db_backend = "postgresql"
+        mock_args.db_name = "gis"
         mock_cache = Mock(spec=["set_cache_lazy", "set_entry_lazy", "register_partition_key", "close"])
+        mock_cache.pg_conn = SimpleNamespace(info=SimpleNamespace(host="localhost", port=5432, dbname="gis"))
         mock_cache.set_entry_lazy.return_value = True
         mock_get_cache.return_value = mock_cache
 
@@ -326,7 +331,10 @@ class TestRunAndStoreQuery:
         mcq_module.args = mock_args
 
         try:
-            result = run_and_store_query("SELECT geom FROM pois", "geo_hash", "spatial_h3", "geometry", item_cache_backend="rocksdict_h3_grouped")
+            with patch.dict(os.environ, {"DB_HOST": "localhost", "DB_PORT": "5432"}):
+                os.environ.pop("PG_DB_HOST", None)
+                os.environ.pop("PG_DB_PORT", None)
+                result = run_and_store_query("SELECT geom FROM pois", "geo_hash", "spatial_h3", "geometry", item_cache_backend="rocksdict_h3_grouped")
         finally:
             if original_args is not None:
                 mcq_module.args = original_args

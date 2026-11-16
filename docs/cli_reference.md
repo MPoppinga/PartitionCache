@@ -31,6 +31,9 @@ pcache-manage [--env ENV_FILE] {setup,status,cache,queue,maintenance} ...
   - Loads database credentials and configuration
   - Supports custom environment files for different deployments
 
+### Exit Status
+- `cache copy`, `cache export`, `cache import`, `maintenance prune` and `queue clear` exit 1 when any entry, query or partition could not be processed (after processing the others); the logged counts include only entries that were stored. `copy` and `export` with a `--partition-key` that does not exist exit 1
+
 ### Subcommands
 
 #### setup - Setup PartitionCache Infrastructure
@@ -325,6 +328,7 @@ Advanced options for controlling how query variants are generated for better cac
 - Executes query immediately and stores results in cache
 - **Best for**: Development, testing, small queries
 - **Warning**: Can be slow for complex queries with many fragments
+- Exits 1 if any variant could not be stored (after trying the others); a query without variants is logged as a warning
 - `--restrict-variants`: executes the variants smallest first and restricts each to the cached keys of its relaxations, found by the cache lookup of a query with the same variant generation flags. An empty intersection is stored as an empty result without executing the variant. Spatial and grid keys are populated unrestricted. See `populate_query_variants` in the [API reference](api_reference.md).
 - `--max-restriction-keys N`: only restrict when the intersection has at most N keys (implies `--restrict-variants`); a restriction to most of the keys filters little and costs a long key list
 - `--restriction-method {IN,VALUES,TMP_TABLE_IN,TMP_TABLE_JOIN,UNLOGGED_TABLE_JOIN,UNLOGGED_TABLE_IN}`: how the keys restrict a variant (default: `IN`; `UNLOGGED_TABLE_*` needs `--db-backend postgresql`)
@@ -635,6 +639,7 @@ Controls how query variants are generated when processing original queries from 
   - **Default**: Lazy insertion enabled (when handler supports `set_cache_lazy`)
   - **Purpose**: Debug or compare execution strategies
   - **Note**: Lazy insertion wraps fragment SQL for server-side execution without materializing results
+  - **Same database only**: lazy insertion runs the fragment on the cache handler's connection, so it is used only with `--db-backend postgresql` when that connection has the same host, port and database name as the data connection. Loopback spellings (`localhost`, `127.0.0.1`, `::1`) are one host; other host names count as the same host when the addresses they resolve to overlap (if a name does not resolve, they must be equal ignoring case); a Unix-socket directory never matches a TCP host. Otherwise fragments run on the data connection and a warning names both targets once; spatial datatypes, which need lazy insertion, fail (likewise `pcache-add --direct` with a spatial datatype)
 - `--log-query-times LOG_FILE` - Log query execution times to CSV file
   - **Format**: CSV with columns for query hash, execution time, result count
   - **Purpose**: Performance analysis and profiling
@@ -832,6 +837,7 @@ pcache-postgresql-queue-processor check-permissions [--grant]
 ```
 - Checks that required pg_cron permissions are granted
 - `--grant` - Automatically grant missing permissions
+- Exits 1 when the permissions are missing and could not be granted
 - **Use case**: Diagnosing setup issues
 
 #### verify - Verify Setup Integrity
@@ -981,6 +987,7 @@ pcache-postgresql-eviction-manager --table-prefix "app2_cache" setup
 - Use separate `.env` files for different environments (dev, staging, prod)
 - Test environment configuration with `pcache-manage status env`
 - Use `--env` parameter to switch between configurations
+- A setting is taken from, in this order: the command-line flag, a variable already exported in the shell, the `--env` file (which also sets the defaults of flags such as `--bucket-steps`, as an exported `PARTITION_CACHE_*` variable does), the built-in default; the env file never overrides an exported variable
 
 ### Queue Processing
 - **Development**: Use `pcache-monitor` for flexibility and debugging

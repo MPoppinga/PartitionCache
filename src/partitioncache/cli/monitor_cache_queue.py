@@ -27,6 +27,8 @@ from partitioncache.cli.common_args import (
     check_grid_key,
     get_database_connection_params,
     grid_cell_size_for,
+    lazy_insertion_refusal_for,
+    load_env_file_before_parsing,
     load_environment_with_validation,
     parse_variant_generation_json_args,
     resolve_cache_backend,
@@ -397,6 +399,23 @@ def has_terminal_status(cache_handler, query_hash: str, partition_key: str) -> b
     return False
 
 
+# The reasons against lazy insertion already logged, so each is logged once
+_lazy_insertion_refusals: set[str] = set()
+_lazy_insertion_lock = threading.Lock()
+
+
+def lazy_insertion_refused(cache_backend: str, cache_handler) -> str | None:
+    """Why fragments of this cache handler must not be stored by lazy insertion, or None; each reason is logged once."""
+    reason = lazy_insertion_refusal_for(args, cache_handler)
+    if reason is not None:
+        message = f"Lazy insertion is not used for cache backend '{cache_backend}' because {reason}; fragments run on the data connection"
+        with _lazy_insertion_lock:
+            if message not in _lazy_insertion_refusals:
+                _lazy_insertion_refusals.add(message)
+                logger.warning(message)
+    return reason
+
+
 def run_and_store_query(query: str, query_hash: str, partition_key: str, partition_datatype: str | None = None, item_cache_backend: str | None = None):
     """Worker function to execute and store a query."""
     logger.info(f"WORKER THREAD START: Processing query {query_hash}")
@@ -448,13 +467,16 @@ def run_and_store_query(query: str, query_hash: str, partition_key: str, partiti
         limit_applies = args.limit is not None and partition_datatype != "geometry"
         if args.limit is not None and not limit_applies:
             logger.warning(f"--limit is not applied to spatial datatype '{partition_datatype}' (query {query_hash}), it needs lazy insertion")
-        use_lazy_insertion = (
+        lazy_insertion_allowed = (
             lazy_insertion_available
             and not args.force_recalculate
             and args.long_running_query_timeout == "0"
             and not args.disable_lazy_insertion
             and not limit_applies
         )
+        # Lazy insertion runs the fragment on the cache handler's connection: only if that is the data database
+        lazy_refusal = lazy_insertion_refused(cache_backend, cache_handler) if lazy_insertion_allowed else None
+        use_lazy_insertion = lazy_insertion_allowed and lazy_refusal is None
 
         if use_lazy_insertion:
             logger.info(f"STARTING LAZY INSERTION: Beginning lazy insertion for query {query_hash}")
@@ -492,7 +514,7 @@ def run_and_store_query(query: str, query_hash: str, partition_key: str, partiti
             # Spatial datatypes require lazy insertion - cannot fall back to execute + set_cache
             if not success and partition_datatype == "geometry":
                 logger.error(f"Spatial datatype '{partition_datatype}' requires lazy insertion for query {query_hash}. "
-                             "Ensure lazy insertion is enabled and the cache handler supports it.")
+                             + (f"It is not used because {lazy_refusal}." if lazy_refusal else "Ensure lazy insertion is enabled and the cache handler supports it."))
                 return False
 
             logger.info(f"Beginning calculation for cache population for query {query_hash}")
@@ -812,6 +834,8 @@ def validate_queue_configuration():
 
 
 def main():
+    # Argument defaults are read from the environment, so the --env file is loaded first
+    load_env_file_before_parsing()
     parser = argparse.ArgumentParser(description="Monitor cache queue and process queries")
 
     # Processing configuration

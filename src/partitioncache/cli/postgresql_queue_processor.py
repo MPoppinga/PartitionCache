@@ -42,6 +42,7 @@ from partitioncache.cli.common_args import (
     get_cron_database_name,
     get_db_connection,
     get_pg_cron_connection,
+    load_env_file_before_parsing,
     load_environment_with_validation,
     parse_duration_to_seconds,
     table_exists,
@@ -1214,6 +1215,8 @@ def verify_processor_setup(table_prefix: str, queue_prefix: str) -> int:
 def main():
     """Main function to handle CLI commands."""
     # Create main parser
+    # Argument defaults are read from the environment, so the --env file is loaded first
+    load_env_file_before_parsing()
     parser = argparse.ArgumentParser(description="Manage PostgreSQL queue processor for PartitionCache.")
 
     # Add common environment arguments
@@ -1353,6 +1356,10 @@ def main():
         print("Checking pg_cron permissions...")
         result = check_and_grant_pg_cron_permissions()
         print(f"Result: {result[1]}")
+        if not result[0]:
+            logger.error(f"pg_cron permission check failed: {result[1]}")
+            return 1
+        return None
 
     parser_perms.set_defaults(func=check_permissions_command)
 
