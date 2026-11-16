@@ -31,6 +31,9 @@ pcache-manage [--env ENV_FILE] {setup,status,cache,queue,maintenance} ...
   - Loads database credentials and configuration
   - Supports custom environment files for different deployments
 
+### Exit Status
+- `cache copy`, `cache export`, `cache import`, `maintenance prune` and `queue clear` exit 1 when any entry, query or partition could not be processed (after processing the others); the logged counts include only entries that were stored. `copy` and `export` with a `--partition-key` that does not exist exit 1
+
 ### Subcommands
 
 #### setup - Setup PartitionCache Infrastructure
@@ -325,6 +328,7 @@ Advanced options for controlling how query variants are generated for better cac
 - Executes query immediately and stores results in cache
 - **Best for**: Development, testing, small queries
 - **Warning**: Can be slow for complex queries with many fragments
+- Exits 1 if any variant could not be stored (after trying the others); a query without variants is logged as a warning
 - `--restrict-variants`: executes the variants smallest first and restricts each to the cached keys of its relaxations, found by the cache lookup of a query with the same variant generation flags. An empty intersection is stored as an empty result without executing the variant. Spatial and grid keys are populated unrestricted. See `populate_query_variants` in the [API reference](api_reference.md).
 - `--max-restriction-keys N`: only restrict when the intersection has at most N keys (implies `--restrict-variants`); a restriction to most of the keys filters little and costs a long key list
 - `--restriction-method {IN,VALUES,TMP_TABLE_IN,TMP_TABLE_JOIN,UNLOGGED_TABLE_JOIN,UNLOGGED_TABLE_IN}`: how the keys restrict a variant (default: `IN`; `UNLOGGED_TABLE_*` needs `--db-backend postgresql`)
@@ -833,6 +837,7 @@ pcache-postgresql-queue-processor check-permissions [--grant]
 ```
 - Checks that required pg_cron permissions are granted
 - `--grant` - Automatically grant missing permissions
+- Exits 1 when the permissions are missing and could not be granted
 - **Use case**: Diagnosing setup issues
 
 #### verify - Verify Setup Integrity

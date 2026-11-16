@@ -325,6 +325,9 @@ def main():
                 query_hash_pairs = [(query, hash_query(query))]
 
             logger.debug(f"Found {len(query_hash_pairs)} subqueries to process")
+            if not query_hash_pairs:
+                logger.warning("No query variants were generated for the query; nothing was stored")
+            store_failures = 0
 
             if is_spatial:
                 # Spatial mode: use lazy insertion (the handler wraps variant queries with H3/BBox SQL)
@@ -351,6 +354,7 @@ def main():
                         cache.set_query(hash_value, fragment_query)
                         logger.debug(f"Lazily stored spatial query {hash_value}")
                     else:
+                        store_failures += 1
                         logger.warning(f"Failed to lazily store spatial query {hash_value}")
 
                 cache.close()
@@ -398,6 +402,7 @@ def main():
                         if cache.set_cache(hash_value, result) and cache.set_query(hash_value, fragment_query):
                             logger.debug(f"Stored query {hash_value} with {len(result)} results")
                         else:
+                            store_failures += 1
                             logger.error(f"Failed to store query {hash_value} with {len(result)} results")
 
                 db_handler.close()
@@ -406,6 +411,9 @@ def main():
                     # Same outcome as the plain loop, where a failing variant aborts with an error
                     logger.error(f"{stats.failed} variants failed to execute and {stats.store_failed} failed to store")
                     exit(1)
+            if store_failures:
+                logger.error(f"{store_failures} of {len(query_hash_pairs)} query variants could not be stored")
+                exit(1)
 
         except Exception as e:
             logger.error(f"Error processing query: {str(e)}")

@@ -1356,6 +1356,10 @@ def main():
         print("Checking pg_cron permissions...")
         result = check_and_grant_pg_cron_permissions()
         print(f"Result: {result[1]}")
+        if not result[0]:
+            logger.error(f"pg_cron permission check failed: {result[1]}")
+            return 1
+        return None
 
     parser_perms.set_defaults(func=check_permissions_command)
 
