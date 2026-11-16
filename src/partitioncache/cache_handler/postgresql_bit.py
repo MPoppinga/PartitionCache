@@ -85,12 +85,15 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
                         )
                         self.db.commit()
 
-                    # Nothing to do if the trigger is already there: re-running the function
-                    # loader and the trigger DDL on every handler construction is what makes
-                    # concurrent workers collide on pg_proc and on the metadata table.
+                    # Nothing to do if the trigger is already there and calls the shared trigger function:
+                    # re-running the function loader and the trigger DDL on every handler construction is
+                    # what makes concurrent workers collide on pg_proc and on the metadata table. A trigger
+                    # from before calls the prefix's own function; it is switched over once, here.
                     self.cursor.execute(
-                        "SELECT 1 FROM pg_trigger WHERE NOT tgisinternal AND tgname = %s",
-                        (self.tableprefix + "_bitsize_trigger",),
+                        """SELECT 1 FROM pg_trigger WHERE NOT tgisinternal AND tgname = %s
+                            AND tgrelid = to_regclass(quote_ident(%s))
+                            AND tgfoid = to_regprocedure('partitioncache_bit_widen_trigger()')""",
+                        (self.tableprefix + "_bitsize_trigger", self.tableprefix + "_partition_metadata"),
                     )
                     if self.cursor.fetchone() is None:
                         self._load_sql_functions()
@@ -160,7 +163,7 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
         self.db.commit()
 
     def _create_bitsize_trigger(self) -> None:
-        """Create trigger function and trigger for handling bitsize changes."""
+        """Create the bitsize trigger (it calls the shared partitioncache_bit_widen_trigger), or switch one from before to it."""
         try:
             logger.info(f"TRIGGER: Calling partitioncache_create_bitsize_trigger for {self.tableprefix}")
             # Call the SQL function to create the trigger

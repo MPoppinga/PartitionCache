@@ -371,7 +371,13 @@ bitsize = cache._get_partition_bitsize("large_dataset")
 ```
 
 **Automatic Schema Updates:**
-Database triggers automatically update cache table schemas when the bitsize grows:
+Database triggers automatically update cache table schemas when the bitsize grows. Every bit cache's metadata table
+has the trigger `<prefix>_bitsize_trigger`, which calls the shared function `partitioncache_bit_widen_trigger()` with
+its prefix as the argument. Dropping a cache's tables drops its trigger and leaves no function behind. A cache created
+before the shared function has its own `<prefix>_bitsize_trigger_func()`; the first time a handler of this version
+starts for that prefix, or the pg_cron processor bootstraps one of its partitions once this version's SQL functions
+are loaded, the trigger is switched to the shared function and that prefix's own function is dropped, unless another
+trigger still uses it. Other prefixes are not touched.
 
 ```python
 # Growing the bitsize triggers a schema update; a smaller value keeps the current bitsize

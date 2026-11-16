@@ -309,69 +309,69 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- Function to create bitsize trigger for PostgreSQL bit cache handler
+-- The bitsize trigger function, shared by every bit cache: it widens the cache table's BIT column when the
+-- partition's bitsize grows. The trigger passes its table prefix as the argument (TG_ARGV[0]), so dropping a
+-- prefix's tables leaves nothing behind: the trigger goes with its metadata table, and the function serves the
+-- other prefixes. (Before, every prefix had its own <prefix>_bitsize_trigger_func, which outlived its tables.)
+-- The USING cast zero-pads stored bit arrays on the right; without it the ALTER failed with
+-- "bit string length N does not match type bit(M)" as soon as the table held a row. A smaller
+-- bitsize is refused: the cast would cut every stored bit array and silently drop keys.
+CREATE OR REPLACE FUNCTION partitioncache_bit_widen_trigger()
+RETURNS TRIGGER AS $$
+DECLARE
+    v_cache_table TEXT;
+BEGIN
+    IF TG_OP = 'UPDATE' AND NEW.bitsize < OLD.bitsize THEN
+        RAISE EXCEPTION 'Bitsize of partition % cannot shrink from % to %: stored bit arrays would lose keys',
+            NEW.partition_key, OLD.bitsize, NEW.bitsize;
+    END IF;
+
+    -- Only handle UPDATE operations where bitsize changes
+    IF TG_OP = 'UPDATE' AND OLD.bitsize != NEW.bitsize THEN
+        v_cache_table := TG_ARGV[0] || '_cache_' || NEW.partition_key;
+
+        -- The cast to name: a table name over 63 bytes is stored truncated, and compared as text it never matches
+        IF EXISTS (SELECT 1 FROM information_schema.tables
+                   WHERE table_name = v_cache_table::name AND table_schema = 'public') THEN
+            -- To alter the BIT column type, drop the generated column, alter, and recreate it
+            EXECUTE format('ALTER TABLE %I DROP COLUMN IF EXISTS partition_keys_count', v_cache_table);
+            EXECUTE format('ALTER TABLE %I ALTER COLUMN partition_keys TYPE BIT(%s) USING partition_keys::BIT(%s)',
+                           v_cache_table, NEW.bitsize, NEW.bitsize);
+            EXECUTE format('ALTER TABLE %I ADD COLUMN partition_keys_count INTEGER GENERATED ALWAYS AS '
+                           '(length(replace(partition_keys::text, ''0'', ''''))) STORED', v_cache_table);
+        END IF;
+    END IF;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Whether a prefix's bitsize trigger exists and calls the shared function
+CREATE OR REPLACE FUNCTION partitioncache_bitsize_trigger_is_current(p_table_prefix TEXT)
+RETURNS BOOLEAN AS $$
+    -- The casts to name: with a long prefix the trigger and the table exist under truncated names
+    SELECT EXISTS (
+        SELECT 1 FROM pg_trigger
+        WHERE tgname = (p_table_prefix || '_bitsize_trigger')::name
+          AND tgrelid = to_regclass(quote_ident(p_table_prefix || '_partition_metadata'))
+          AND tgfoid = to_regprocedure('partitioncache_bit_widen_trigger()')
+          AND NOT tgisinternal
+    );
+$$ LANGUAGE sql STABLE;
+
+-- Function to create the bitsize trigger of a bit cache, or to switch a trigger from before to the shared function
 CREATE OR REPLACE FUNCTION partitioncache_create_bitsize_trigger(p_table_prefix TEXT)
 RETURNS VOID AS $$
 DECLARE
-    v_trigger_function_name TEXT;
     v_trigger_name TEXT;
     v_metadata_table TEXT;
-    v_function_sql TEXT;
+    v_old_function RECORD;
 BEGIN
-    v_trigger_function_name := p_table_prefix || '_bitsize_trigger_func';
     v_trigger_name := p_table_prefix || '_bitsize_trigger';
     v_metadata_table := p_table_prefix || '_partition_metadata';
 
-    -- The trigger function widens the cache table's BIT column when the partition's bitsize grows.
-    -- The USING cast zero-pads stored bit arrays on the right; without it the ALTER failed with
-    -- "bit string length N does not match type bit(M)" as soon as the table held a row. A smaller
-    -- bitsize is refused: the cast would cut every stored bit array and silently drop keys.
-    v_function_sql := format('
-        CREATE OR REPLACE FUNCTION %I()
-        RETURNS TRIGGER AS $trigger$
-        DECLARE
-            v_cache_table TEXT;
-        BEGIN
-            -- partitioncache bitsize trigger v2: grows with USING, refuses to shrink
-            IF TG_OP = ''UPDATE'' AND NEW.bitsize < OLD.bitsize THEN
-                RAISE EXCEPTION ''Bitsize of partition %% cannot shrink from %% to %%: stored bit arrays would lose keys'',
-                    NEW.partition_key, OLD.bitsize, NEW.bitsize;
-            END IF;
-
-            -- Only handle UPDATE operations where bitsize changes
-            IF TG_OP = ''UPDATE'' AND OLD.bitsize != NEW.bitsize THEN
-                v_cache_table := ''%s_cache_'' || NEW.partition_key;
-
-                -- Check if cache table exists
-                IF EXISTS (SELECT 1 FROM information_schema.tables
-                          WHERE table_name = v_cache_table AND table_schema = ''public'') THEN
-
-                    -- To alter BIT column type, we need to handle the generated column constraint
-                    -- Step 1: Drop the generated column temporarily
-                    EXECUTE format(''ALTER TABLE %%I DROP COLUMN IF EXISTS partition_keys_count'',
-                                 v_cache_table);
-
-                    -- Step 2: ALTER the cache table to use new bitsize (USING pads stored rows with zeros)
-                    EXECUTE format(''ALTER TABLE %%I ALTER COLUMN partition_keys TYPE BIT(%%s) USING partition_keys::BIT(%%s)'',
-                                 v_cache_table, NEW.bitsize, NEW.bitsize);
-
-                    -- Step 3: Recreate the generated column
-                    EXECUTE format(''ALTER TABLE %%I ADD COLUMN partition_keys_count INTEGER GENERATED ALWAYS AS (length(replace(partition_keys::text, ''''0'''', ''''''''))) STORED'',
-                                 v_cache_table);
-                END IF;
-            END IF;
-
-            RETURN NEW;
-        END;
-        $trigger$ LANGUAGE plpgsql;
-    ', v_trigger_function_name, p_table_prefix);
-
-    -- Already exists: nothing to create, and no lock either. An older trigger function (without the
-    -- USING cast or the shrink check) is replaced in place (CREATE OR REPLACE FUNCTION takes no table lock).
-    IF EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = v_trigger_name AND NOT tgisinternal) THEN
-        IF NOT EXISTS (SELECT 1 FROM pg_proc WHERE proname = v_trigger_function_name AND prosrc LIKE '%partitioncache bitsize trigger v2%') THEN
-            EXECUTE v_function_sql;
-        END IF;
+    -- Already current: nothing to create, and no lock either.
+    IF partitioncache_bitsize_trigger_is_current(p_table_prefix) THEN
         RETURN;
     END IF;
 
@@ -388,20 +388,38 @@ BEGIN
     -- against each other; re-entrant, so bootstrap calling the trigger creator is fine.
     PERFORM pg_advisory_xact_lock(hashtext(p_table_prefix));
 
-    -- Create trigger function
-    EXECUTE v_function_sql;
+    -- Another worker may have done it while this one waited for the lock (seen under READ COMMITTED, where a new
+    -- statement takes a new snapshot; under REPEATABLE READ the DDL below runs again, which is still correct).
+    IF partitioncache_bitsize_trigger_is_current(p_table_prefix) THEN
+        RETURN;
+    END IF;
 
-    -- Drop existing trigger if it exists
     EXECUTE format('DROP TRIGGER IF EXISTS %I ON %I', v_trigger_name, v_metadata_table);
-
-    -- Create trigger
     EXECUTE format('
         CREATE TRIGGER %I
             AFTER UPDATE ON %I
             FOR EACH ROW
-            EXECUTE FUNCTION %I()
-    ', v_trigger_name, v_metadata_table, v_trigger_function_name);
+            EXECUTE FUNCTION partitioncache_bit_widen_trigger(%L)
+    ', v_trigger_name, v_metadata_table, p_table_prefix);
 
+    -- The prefix's own trigger function from before the shared one, once no trigger uses it any more.
+    -- Only this prefix's name (truncated as stored), only a trigger function without arguments.
+    FOR v_old_function IN
+        SELECT p.oid::regprocedure AS ident
+        FROM pg_proc p
+        WHERE p.proname = (p_table_prefix || '_bitsize_trigger_func')::name
+          AND p.pronargs = 0
+          AND p.prorettype = 'trigger'::regtype
+          AND p.oid <> to_regprocedure('partitioncache_bit_widen_trigger()')
+          AND NOT EXISTS (SELECT 1 FROM pg_trigger t WHERE t.tgfoid = p.oid)
+    LOOP
+        BEGIN
+            EXECUTE format('DROP FUNCTION %s', v_old_function.ident);
+        EXCEPTION WHEN insufficient_privilege OR dependent_objects_still_exist THEN
+            -- Owned by another role, or something depends on it: keep it, the trigger no longer uses it
+            RAISE NOTICE 'Kept the unused trigger function %: %', v_old_function.ident, SQLERRM;
+        END;
+    END LOOP;
 END;
 $$ LANGUAGE plpgsql;
 
