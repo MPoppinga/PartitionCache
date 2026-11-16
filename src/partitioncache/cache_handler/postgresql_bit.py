@@ -400,7 +400,8 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
             self.cursor.execute(q, (list(keys_set),))
 
             result = self.cursor.fetchone()
-            if result is None:
+            if result is None or result[0] is None:
+                # BIT_AND over no row: the entries were deleted after the check above. Unknown, not empty
                 return None, 0
             r = set(bitarray(result[0]).search(bitarray("1")))
             return r, len(keys_set)
@@ -500,12 +501,20 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
             if dilation == 0:
                 result, count = self.get_intersected(keys, partition_key)
                 return result, count  # type: ignore[return-value]
+            if dilation < 0:
+                raise ValueError(f"dilation must be non-negative, got {dilation}")
 
-            lazy_sql, count = self.get_intersected_dilated_lazy(keys, partition_key, dilation)
-            if lazy_sql is None:
+            filtered_keys = self.filter_existing_keys(keys, partition_key)
+            if not filtered_keys:
                 return None, 0
-            self.cursor.execute(lazy_sql)  # type: ignore[arg-type]
-            return {row[0] for row in self.cursor.fetchall()}, count
+
+            # NULL when every entry was deleted after filter_existing_keys: unknown, not an empty intersection
+            intersect_sql_str = self.get_intersected_dilated_sql_wk(filtered_keys, partition_key, dilation)
+            self.cursor.execute(sql.SQL("SELECT {}").format(self._set_bits_array_sql(intersect_sql_str)))
+            row = self.cursor.fetchone()
+            if row is None or row[0] is None:
+                return None, 0
+            return set(row[0]), len(filtered_keys)
         except Exception as e:
             logger.error(f"Failed to get dilated intersection in partition {partition_key}: {e}")
             return None, 0

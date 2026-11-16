@@ -119,3 +119,36 @@ def test_a_read_fails_inside_a_transaction_an_earlier_read_left_open(handler, lo
     assert handler.get_partition_keys() == []
     release()
     assert [key for key, _ in handler.get_partition_keys()] == ["zipcode"]
+
+
+def _deleting_before(handler, db_session, method: str, deleted: list[str]):
+    """Replace handler.<method> (called between the existence check and the intersection) with one that first deletes
+    the given entries in another session, as eviction or another process's delete would."""
+    original = getattr(handler, method)
+    table = sql.Identifier(f"{handler.tableprefix}_cache_zipcode")
+
+    def deleting(*args, **kwargs):
+        with db_session.cursor() as cur:
+            cur.execute(sql.SQL("DELETE FROM {} WHERE query_hash = ANY(%s)").format(table), (deleted,))
+        return original(*args, **kwargs)
+
+    setattr(handler, method, deleting)
+
+
+def test_an_intersection_whose_entries_were_deleted_during_the_call_is_unknown(handler, db_session):
+    _deleting_before(handler, db_session, "get_intersected_sql", ["h1", "h2"])
+    assert handler.get_intersected({"h1", "h2"}, "zipcode") == (None, 0)
+
+
+@pytest.mark.parametrize("deleted", [["h2"], ["h1", "h2"]], ids=["one_entry", "every_entry"])
+def test_a_dilated_intersection_with_entries_deleted_during_the_call_is_not_empty(handler, db_session, deleted):
+    method = {"postgresql_array": "get_intersected_dilated_sql", "postgresql_bit": "get_intersected_dilated_sql_wk"}.get(repr(handler))
+    if method is None:
+        pytest.skip(f"{handler!r} has no dilated intersection")
+    result, count = handler.get_intersected_dilated({"h1", "h2"}, "zipcode", dilation=1)
+    assert (set(result), count) == ({1, 2, 3, 4}, 2)
+
+    _deleting_before(handler, db_session, method, deleted)
+    result, count = handler.get_intersected_dilated({"h1", "h2"}, "zipcode", dilation=1)
+    # Unknown, or the intersection over the entries that are left (h1 dilated is {0, ..., 4}); never a lost key
+    assert result is None or {1, 2, 3, 4} <= set(result), result

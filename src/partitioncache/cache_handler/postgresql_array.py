@@ -324,12 +324,31 @@ class PostgreSQLArrayCacheHandler(PostgreSQLAbstractCacheHandler):
             if dilation == 0:
                 result, count = self.get_intersected(keys, partition_key)
                 return result, count  # type: ignore[return-value]
+            if dilation < 0:
+                raise ValueError(f"dilation must be non-negative, got {dilation}")
 
-            lazy_sql, count = self.get_intersected_dilated_lazy(keys, partition_key, dilation)
-            if lazy_sql is None:
+            datatype = self._get_partition_datatype(partition_key)
+            if datatype is None:
                 return None, 0
-            self.cursor.execute(lazy_sql)
-            return {row[0] for row in self.cursor.fetchall()}, count
+            if datatype != "integer":
+                logger.error(f"Temporal dilation requires an integer partition key, got '{datatype}' for '{partition_key}'")
+                return None, 0
+
+            filtered_keys = self.filter_existing_keys(keys, partition_key)
+            if not filtered_keys:
+                return None, 0
+
+            # INTERSECT over the per-key sets is empty once one entry is missing (deleted after filter_existing_keys),
+            # so the keys count only while every entry is present; otherwise the result is unknown, not empty
+            query = sql.SQL("SELECT {present}, ARRAY({inner})").format(
+                present=self._all_entries_present_sql(filtered_keys, partition_key),
+                inner=self.get_intersected_dilated_sql(filtered_keys, partition_key, dilation),
+            )
+            self.cursor.execute(query)
+            row = self.cursor.fetchone()
+            if row is None or not row[0]:
+                return None, 0
+            return set(row[1]), len(filtered_keys)
         except Exception as e:
             logger.error(f"Failed to get dilated intersection in partition {partition_key}: {e}")
             self._rollback_failed_read()
