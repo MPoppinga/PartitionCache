@@ -3,7 +3,9 @@
 The cache (postgresql_array) holds every variant the generator gives for the query and for the same query selecting
 each alias's key, i.e. what different clients could have populated. Covered: lookups without key joins, the JOIN
 methods (temporary and unlogged key tables, the renamed key column, join_every_table), use_p0_table and set
-operations. Scripts are run in one execute() and read with fetch_final_result_set, as the product does.
+operations. Queries that get no variants (a subquery reusing an outer alias, keys related by an OR) run without the
+cache; for them the rewriting functions are also called directly with the correct keys. Scripts are run in one
+execute() and read with fetch_final_result_set, as the product does.
 
 The module name contains postgresql_array so the CI job of that backend selects it (-k postgresql_array).
 """
@@ -14,7 +16,13 @@ import re
 import psycopg
 import pytest
 
-from partitioncache.apply_cache import apply_cache, apply_cache_lazy
+from partitioncache.apply_cache import (
+    apply_cache,
+    apply_cache_lazy,
+    extend_query_with_partition_keys,
+    extend_query_with_partition_keys_lazy,
+    rewrite_query_with_p0_table,
+)
 from partitioncache.cache_handler.postgresql_array import PostgreSQLArrayCacheHandler
 from partitioncache.db_handler.postgres import fetch_final_result_set
 from partitioncache.query_processor import generate_all_query_hash_pairs
@@ -107,8 +115,25 @@ def _check(conn, handler, query, partition_key, lazy, method, expect_enhanced=Tr
     apply = apply_cache_lazy if lazy else apply_cache
     rewritten, stats = apply(query, handler, partition_key, method=method, min_component_size=1, **kwargs)
     assert stats["enhanced"] == int(expect_enhanced), stats
+    _check_rewritten(conn, query, rewritten, unlogged_before)
+    return rewritten
+
+
+def _check_rewritten(conn, query, rewritten, unlogged_before):
     assert _rows(conn, rewritten) == _rows(conn, query), rewritten
     assert _unlogged_tables(conn) == unlogged_before, "an unlogged key table was left behind"
+
+
+def _extend_directly(conn, query, keys_query, method, lazy, **target):
+    """Restrict with the rewriting functions themselves, given the correct keys (no variant generation, no cache)."""
+    unlogged_before = _unlogged_tables(conn)
+    if lazy:
+        rewritten = extend_query_with_partition_keys_lazy(query, keys_query, "pk", method=method, partition_datatype="integer", **target)
+    else:
+        keys = {row[0] for row in conn.execute(keys_query).fetchall()}
+        assert keys
+        rewritten = extend_query_with_partition_keys(query, keys, "pk", method=method, **target)
+    _check_rewritten(conn, query, rewritten, unlogged_before)
     return rewritten
 
 
@@ -145,14 +170,26 @@ class TestJoinMethods:
         f"SELECT p1.id FROM {T} AS p1 JOIN {T} AS p2 ON p1.pk = p2.pk WHERE p1.x IN (3, 4) AND p2.y = 1 "
         f"AND p1.x NOT IN (SELECT p1.x FROM {D} AS d1 JOIN {T} AS p1 ON d1.id = p1.id WHERE p1.pk = 5 AND p1.x = 4)"
     )
+    # The keys of p1 in its rows: the key set a correct cache gives for p1
+    NOT_IN_P1_KEYS = f"SELECT DISTINCT p1.pk AS pk FROM {T} AS p1 JOIN {T} AS p2 ON p1.pk = p2.pk WHERE p1.x IN (3, 4) AND p2.y = 1"
     UNQUALIFIED_KEY = f"SELECT pk, p1.id FROM {T} AS p1 WHERE p1.x = 3 AND pk > 4"
     KEY_JOINED = f"SELECT p1.id, p2.id FROM {T} AS p1, {T} AS p2 WHERE p1.pk = p2.pk AND p1.x = 3 AND p2.y = 1"
 
     @pytest.mark.parametrize(("lazy", "method"), JOIN_LOOKUPS, ids=JOIN_IDS)
-    def test_p0_alias_reused_in_a_not_in_subquery(self, conn, cache, lazy, method):
-        _populate(cache, self.NOT_IN_REUSING_P1, "pk", ["p1", "p2"])
-        rewritten = _check(conn, cache, self.NOT_IN_REUSING_P1, "pk", lazy, method)
-        assert len(re.findall(r"AS tmp_\w+ ON", rewritten)) == 1
+    def test_p0_alias_reused_in_a_not_in_subquery_runs_uncached(self, conn, cache, lazy, method):
+        """A subquery defining an outer alias gets no variants (their alias renaming would capture it): no cache."""
+        _populate(cache, self.NOT_IN_REUSING_P1.partition(" AND p1.x NOT IN")[0], "pk", ["p1", "p2"])
+        for join_every_table in (False, True):
+            rewritten = _check(conn, cache, self.NOT_IN_REUSING_P1, "pk", lazy, method, expect_enhanced=False, join_every_table=join_every_table)
+            assert rewritten == self.NOT_IN_REUSING_P1
+
+    @pytest.mark.parametrize(("lazy", "method"), JOIN_LOOKUPS, ids=JOIN_IDS)
+    @pytest.mark.parametrize("join_every_table", [False, True])
+    def test_p0_alias_reused_in_a_not_in_subquery_direct(self, conn, lazy, method, join_every_table):
+        """The rewriting functions called with p1's keys join the key table to the outer p1 (and p2) only."""
+        target = {"join_every_table": True} if join_every_table else {"p0_alias": "p1"}
+        rewritten = _extend_directly(conn, self.NOT_IN_REUSING_P1, self.NOT_IN_P1_KEYS, method, lazy, **target)
+        assert len(re.findall(r"AS tmp_\w+ ON", rewritten)) == (2 if join_every_table else 1)
 
     @pytest.mark.parametrize(("lazy", "method"), JOIN_LOOKUPS, ids=JOIN_IDS)
     def test_unqualified_key_column(self, conn, cache, lazy, method):
@@ -169,14 +206,30 @@ class TestJoinMethods:
 
 
 class TestUseP0Table:
-    # Conditions on p1 only: the variants are relaxations of p1, and the OR must stay as it is
+    # The OR must stay as it is, and only p1 is tied to p0
     KEY_EQUALITY_UNDER_OR = f"SELECT p1.id, p2.id FROM {T} AS p1, {T} AS p2 WHERE (p1.pk = p2.pk OR p2.id = p1.id + 1) AND p1.x = 3"
+    P1_KEYS = f"SELECT DISTINCT p1.pk AS pk FROM {T} AS p1 WHERE p1.x = 3"
+    METHODS = [(False, "IN"), (True, "IN_SUBQUERY"), (False, "TMP_TABLE_IN")]
+    METHOD_IDS = ["eager-IN", "lazy-IN_SUBQUERY", "eager-TMP_TABLE_IN"]
 
-    @pytest.mark.parametrize(("lazy", "method"), [(False, "IN"), (True, "IN_SUBQUERY"), (False, "TMP_TABLE_IN")], ids=["eager-IN", "lazy-IN_SUBQUERY", "eager-TMP_TABLE_IN"])
-    def test_or_with_a_key_equality(self, conn, cache, lazy, method):
-        _populate(cache, self.KEY_EQUALITY_UNDER_OR, "pk", ["p1", "p2"])
-        rewritten = _check(conn, cache, self.KEY_EQUALITY_UNDER_OR, "pk", lazy, method, use_p0_table=True, p0_table_name=MV)
-        assert "p1.pk = p2.pk OR" in rewritten and "p2.pk = p0.pk" not in rewritten
+    @pytest.mark.parametrize(("lazy", "method"), METHODS, ids=METHOD_IDS)
+    def test_or_with_a_key_equality_runs_uncached(self, conn, cache, lazy, method):
+        """The keys are related by an OR, not by key equality: the query gets no variants and runs without the cache.
+
+        Without cache hits apply_cache still returns the p0 rewrite, unrestricted.
+        """
+        _populate(cache, f"SELECT p1.id FROM {T} AS p1 WHERE p1.x = 3", "pk", ["p1"])
+        rewritten = _check(conn, cache, self.KEY_EQUALITY_UNDER_OR, "pk", lazy, method, expect_enhanced=False, use_p0_table=True, p0_table_name=MV)
+        assert "p1.pk = p2.pk OR" in rewritten and "p2.pk = p0.pk" not in rewritten and "p0.pk IN" not in rewritten
+
+    @pytest.mark.parametrize(("lazy", "method"), METHODS, ids=METHOD_IDS)
+    def test_or_with_a_key_equality_rewritten_directly(self, conn, lazy, method):
+        """rewrite_query_with_p0_table, then the restriction of p0 to p1's keys."""
+        with_p0 = rewrite_query_with_p0_table(self.KEY_EQUALITY_UNDER_OR, "pk", mv_table_name=MV)
+        assert "p1.pk = p2.pk OR" in with_p0 and "p1.pk = p0.pk" in with_p0 and "p2.pk = p0.pk" not in with_p0
+        assert _rows(conn, with_p0) == _rows(conn, self.KEY_EQUALITY_UNDER_OR)
+        rewritten = _extend_directly(conn, with_p0, self.P1_KEYS, method, lazy, p0_alias="p0")
+        assert _rows(conn, rewritten) == _rows(conn, self.KEY_EQUALITY_UNDER_OR)
 
 
 class TestSetOperations:

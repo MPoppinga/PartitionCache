@@ -23,20 +23,21 @@ BEGIN
     v_queries_table := partitioncache_get_queries_table_name(p_table_prefix);
     v_queue_table := p_queue_prefix || '_query_fragment_queue';
     
-    -- Check if tables exist
+    -- Check if tables exist. Names are cast to name throughout this function: a table name over 63 bytes is
+    -- stored truncated, and compared with the untruncated text a cache with a long prefix was reported as missing.
     SELECT EXISTS (
         SELECT 1 FROM information_schema.tables 
-        WHERE table_name = v_metadata_table
+        WHERE table_name = v_metadata_table::name
     ) INTO v_metadata_exists;
     
     SELECT EXISTS (
         SELECT 1 FROM information_schema.tables 
-        WHERE table_name = v_queries_table
+        WHERE table_name = v_queries_table::name
     ) INTO v_queries_exists;
     
     SELECT EXISTS (
         SELECT 1 FROM information_schema.tables 
-        WHERE table_name = v_queue_table
+        WHERE table_name = v_queue_table::name
     ) INTO v_queue_exists;
     
     -- If none of the key tables exist, return empty result
@@ -49,7 +50,7 @@ BEGIN
         -- Full query with both metadata and queue - Check if bitsize column exists
         IF EXISTS (
             SELECT 1 FROM information_schema.columns 
-            WHERE table_name = v_metadata_table 
+            WHERE table_name = v_metadata_table::name 
             AND column_name = 'bitsize'
         ) THEN
             -- Metadata table has bitsize column (bit cache)
@@ -75,7 +76,7 @@ BEGIN
                         CASE 
                             WHEN EXISTS (
                                 SELECT 1 FROM information_schema.tables 
-                                WHERE table_name = partitioncache_get_cache_table_name(%L, pi.partition_key)
+                                WHERE table_name = partitioncache_get_cache_table_name(%L, pi.partition_key)::name
                             ) THEN true
                             ELSE false
                         END as cache_exists,
@@ -84,7 +85,7 @@ BEGIN
                                     ELSE data_type
                                 END
                          FROM information_schema.columns 
-                         WHERE table_name = partitioncache_get_cache_table_name(%L, pi.partition_key)
+                         WHERE table_name = partitioncache_get_cache_table_name(%L, pi.partition_key)::name
                          AND column_name = ''partition_keys''
                         )::TEXT as cache_column_type,
                         %s as last_cache_update
@@ -136,7 +137,7 @@ BEGIN
                         CASE 
                             WHEN EXISTS (
                                 SELECT 1 FROM information_schema.tables 
-                                WHERE table_name = partitioncache_get_cache_table_name(%L, pi.partition_key)
+                                WHERE table_name = partitioncache_get_cache_table_name(%L, pi.partition_key)::name
                             ) THEN true
                             ELSE false
                         END as cache_exists,
@@ -145,7 +146,7 @@ BEGIN
                                     ELSE data_type
                                 END
                          FROM information_schema.columns 
-                         WHERE table_name = partitioncache_get_cache_table_name(%L, pi.partition_key)
+                         WHERE table_name = partitioncache_get_cache_table_name(%L, pi.partition_key)::name
                          AND column_name = ''partition_keys''
                         )::TEXT as cache_column_type,
                         %s as last_cache_update
@@ -197,7 +198,7 @@ BEGIN
                     CASE 
                         WHEN EXISTS (
                             SELECT 1 FROM information_schema.tables 
-                            WHERE table_name = partitioncache_get_cache_table_name(%L, pi.partition_key)
+                            WHERE table_name = partitioncache_get_cache_table_name(%L, pi.partition_key)::name
                         ) THEN true
                         ELSE false
                     END as cache_exists,
@@ -206,7 +207,7 @@ BEGIN
                                 ELSE data_type
                             END
                      FROM information_schema.columns 
-                     WHERE table_name = partitioncache_get_cache_table_name(%L, pi.partition_key)
+                     WHERE table_name = partitioncache_get_cache_table_name(%L, pi.partition_key)::name
                      AND column_name = ''partition_keys''
                     )::TEXT as cache_column_type,
                     %s as last_cache_update
@@ -240,7 +241,7 @@ BEGIN
         -- For array caches, bitsize column might not exist
         IF EXISTS (
             SELECT 1 FROM information_schema.columns 
-            WHERE table_name = v_metadata_table 
+            WHERE table_name = v_metadata_table::name 
             AND column_name = 'bitsize'
         ) THEN
             -- Metadata table has bitsize column (bit cache)
@@ -264,7 +265,7 @@ BEGIN
                         CASE 
                             WHEN EXISTS (
                                 SELECT 1 FROM information_schema.tables 
-                                WHERE table_name = partitioncache_get_cache_table_name(%L, pi.partition_key)
+                                WHERE table_name = partitioncache_get_cache_table_name(%L, pi.partition_key)::name
                             ) THEN true
                             ELSE false
                         END as cache_exists,
@@ -273,7 +274,7 @@ BEGIN
                                     ELSE data_type
                                 END
                          FROM information_schema.columns 
-                         WHERE table_name = partitioncache_get_cache_table_name(%L, pi.partition_key)
+                         WHERE table_name = partitioncache_get_cache_table_name(%L, pi.partition_key)::name
                          AND column_name = ''partition_keys''
                         )::TEXT as cache_column_type,
                         %s as last_cache_update
@@ -323,7 +324,7 @@ BEGIN
                         CASE 
                             WHEN EXISTS (
                                 SELECT 1 FROM information_schema.tables 
-                                WHERE table_name = partitioncache_get_cache_table_name(%L, pi.partition_key)
+                                WHERE table_name = partitioncache_get_cache_table_name(%L, pi.partition_key)::name
                             ) THEN true
                             ELSE false
                         END as cache_exists,
@@ -332,7 +333,7 @@ BEGIN
                                     ELSE data_type
                                 END
                          FROM information_schema.columns 
-                         WHERE table_name = partitioncache_get_cache_table_name(%L, pi.partition_key)
+                         WHERE table_name = partitioncache_get_cache_table_name(%L, pi.partition_key)::name
                          AND column_name = ''partition_keys''
                         )::TEXT as cache_column_type,
                         %s as last_cache_update
