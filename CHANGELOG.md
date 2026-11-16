@@ -85,7 +85,10 @@ Earlier changes that a user of an older untagged state meets (see the history fo
   under NOT or OR, for a radius written as arithmetic and for a reversed comparison; the spatial rewrite re-rendered
   PostgreSQL syntax in a generic dialect (#84).
 - `apply_cache`: the restriction of a set operation could land in another branch; JOIN methods joined the key table
-  into subqueries; `use_p0_table` removed conditions that only contained a key equality (#86).
+  into subqueries and other branches that reuse the p0 alias; `use_p0_table` removed conditions that only contained
+  a key equality (#86). A query whose subquery reuses the p0 alias gets no variants since #87, so through the
+  lookup this part of the fix is reached for set operations only; it also holds for
+  `extend_query_with_partition_keys` and `extend_query_with_partition_keys_lazy` called directly.
 - Queue processor: `manual-process --table-prefix` was ignored; the automatic `GRANT` never worked (#85).
 - Variant generation: `x.pk = y.pk + 1`, `x.pk = y.pk_old` and `(x.pk = y.pk OR ...)` counted as key joins;
   LIMIT, GROUP BY and HAVING were removed from negated subqueries; a CTE query was decomposed from the CTE body;
