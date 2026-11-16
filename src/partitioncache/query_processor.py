@@ -407,6 +407,28 @@ def _clean_subquery_clauses(select: exp.Select, context: str) -> None:
         select.set("group", None)
 
 
+def _ordered_between(node: exp.Expr) -> exp.Expr:
+    """Rewrite ``a BETWEEN SYMMETRIC x AND y`` without SYMMETRIC, which sqlglot's simplification drops.
+
+    With numeric literal bounds the bounds are put in ascending order; otherwise the condition becomes
+    ``(a BETWEEN x AND y OR a BETWEEN y AND x)``, its definition.
+    """
+    if not (isinstance(node, exp.Between) and node.args.get("symmetric")):
+        return node
+    low, high = node.args["low"], node.args["high"]
+    low_value, high_value = _numeric_literal(low, allow_negative=True), _numeric_literal(high, allow_negative=True)
+    if low_value is not None and high_value is not None:
+        if low_value > high_value:
+            low, high = high, low
+        return exp.Between(this=node.this, low=low, high=high)
+    return exp.paren(
+        exp.or_(
+            exp.Between(this=node.this.copy(), low=low.copy(), high=high.copy()),
+            exp.Between(this=node.this.copy(), low=high.copy(), high=low.copy()),
+        )
+    )
+
+
 def clean_query(query: str) -> str:
     """
     Perform query cleaning to ensure stable output for cache variant generation.
@@ -448,6 +470,8 @@ def clean_query(query: str) -> str:
 
     # Parse the query
     parsed = sqlglot.parse_one(query)
+
+    parsed = parsed.transform(_ordered_between)
 
     # Normalize the query (building CNF)
     parsed = sqlglot.optimizer.normalize.normalize(parsed)

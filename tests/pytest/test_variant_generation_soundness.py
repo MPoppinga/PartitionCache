@@ -232,3 +232,36 @@ class TestKeyConditionsWithoutKeyJoins:
         """With key joins every alias has the same key, so the condition may restrict any of them (unchanged)."""
         query = "SELECT x.pk FROM a x, b y WHERE x.v = 1 AND y.w = 2 AND y.pk IN (8, 9) AND x.pk = y.pk"
         assert "SELECT DISTINCT t1.pk FROM a AS t1 WHERE t1.pk IN (8, 9) AND t1.v = 1" in _variants(query)
+
+
+class TestBetweenSymmetric:
+    """sqlglot's simplification drops SYMMETRIC: ``BETWEEN SYMMETRIC 9 AND 3`` became ``>= 9 AND <= 3``, an empty variant."""
+
+    @pytest.mark.parametrize(
+        ("query", "ordered"),
+        [
+            ("SELECT x.pk FROM a AS x WHERE x.v BETWEEN SYMMETRIC 2 AND 1", "SELECT x.pk FROM a AS x WHERE x.v BETWEEN 1 AND 2"),
+            ("SELECT x.pk FROM a AS x WHERE x.v BETWEEN SYMMETRIC x.z + 2 AND 1", "SELECT x.pk FROM a AS x WHERE x.v BETWEEN MIN(x.z + 2, 1) AND MAX(x.z + 2, 1)"),
+            (
+                "SELECT x.pk FROM a AS x, b AS y WHERE x.pk = y.pk AND y.w BETWEEN SYMMETRIC 2.5 AND 1.5",
+                "SELECT x.pk FROM a AS x, b AS y WHERE x.pk = y.pk AND y.w BETWEEN 1.5 AND 2.5",
+            ),
+        ],
+    )
+    def test_variants_hold_the_keys_of_the_query(self, query, ordered):
+        connection = _connection()
+        query_keys = _keys(connection, ordered)  # SQLite has no BETWEEN SYMMETRIC
+        assert query_keys
+        variants = _variants(query)
+        assert variants
+        for variant in variants:
+            assert query_keys <= _keys(connection, variant), variant
+
+    def test_literal_bounds_are_ordered(self):
+        assert _variants("SELECT x.pk FROM a AS x WHERE x.v BETWEEN SYMMETRIC 5.5 AND 1.5") == ["SELECT DISTINCT t1.pk FROM a AS t1 WHERE t1.v <= 5.5 AND t1.v >= 1.5"]
+        assert _variants("SELECT x.pk FROM a AS x WHERE x.v BETWEEN SYMMETRIC 9 AND -3") == _variants("SELECT x.pk FROM a AS x WHERE x.v BETWEEN -3 AND 9")
+
+    def test_other_bounds_take_both_orders(self):
+        assert _variants("SELECT x.pk FROM a AS x WHERE x.v BETWEEN SYMMETRIC x.z AND 3") == [
+            "SELECT DISTINCT t1.pk FROM a AS t1 WHERE (t1.v <= 3 AND t1.v >= t1.z) OR (t1.v <= t1.z AND t1.v >= 3)"
+        ]
