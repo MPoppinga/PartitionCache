@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "partitioncache"
-version = "0.7.0"
+dynamic = ["version"]
 description = "A partition cache implementation"
 requires-python = ">=3.11"
 license = { text = "LGPL-3.0-or-later" }
@@ -60,6 +60,9 @@ repository = "https://github.com/MPoppinga/PartitionCache"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.dynamic]
+version = {attr = "partitioncache._version.__version__"}
 
 [tool.setuptools.package-data]
 "partitioncache" = ["py.typed", "**/*.sql"]
