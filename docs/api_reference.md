@@ -207,6 +207,12 @@ print(optimized)
 > PostgreSQL 15, `public` no longer grants it to every role), while temporary tables only need `TEMP`.
 > Without it the enhanced script fails when it runs.
 
+> **Output of the JOIN methods (`TMP_TABLE_JOIN`, `UNLOGGED_TABLE_JOIN`).** The key table is joined into the
+> query as `tmp_<alias>`, so `SELECT *` also returns its key column. Its column is
+> named `partition_key` (eager) or like the partition key (lazy); when the query references a column of that
+> name unqualified, in `USING`, or has a `NATURAL` join, the column is named `pcache_key` instead, so the
+> reference stays unambiguous. Select the columns explicitly, or use an `IN` method, where the output must not change.
+
 > **`UNLOGGED_TABLE_IN` (PostgreSQL only).** `TMP_TABLE_IN` with the same unlogged key table: the restriction is
 > `alias.key IN (SELECT partition_key FROM partitioncache_unl_<hex>)`, and the script ends with the `DROP`, as for
 > `UNLOGGED_TABLE_JOIN`.

@@ -24,6 +24,9 @@ def _load(conn) -> None:
     conn.execute("CREATE TABLE t (id INTEGER, pk INTEGER, x INTEGER, y INTEGER)")
     conn.execute("INSERT INTO t SELECT i, i % 20, i % 7, i % 5 FROM range(1, 201) AS r(i)")
     conn.execute("CREATE TABLE pk_mv AS SELECT DISTINCT pk FROM t")  # the p0 table of use_p0_table
+    # A key column named like the eager key table's column
+    conn.execute("CREATE TABLE s (id INTEGER, partition_key INTEGER, x INTEGER)")
+    conn.execute("INSERT INTO s SELECT i, i % 20, i % 7 FROM range(1, 101) AS r(i)")
     conn.execute("CREATE TABLE d (id INTEGER, z INTEGER)")
     conn.execute("INSERT INTO d SELECT i, i % 3 FROM range(1, 201, 4) AS r(i)")
     # Events in hour buckets (w); a pair's events are up to 30 minutes apart, so a pair can cross a bucket boundary
@@ -292,3 +295,67 @@ class TestSkipPartitionKeyJoins:
         apply = apply_cache_lazy if lazy else apply_cache
         rewritten, stats = apply(query, cache, "w", sql_dialect="duckdb", min_component_size=1, skip_partition_key_joins=True, p0_alias="e1")
         assert rewritten == query and stats["uncached_reason"] == "no_key_source"
+
+
+UNQUALIFIED_KEY = {
+    "select_and_where": ("pk", "SELECT pk, p1.id FROM t AS p1 WHERE p1.x = 3 AND pk > 4"),
+    "using": ("pk", "SELECT p1.id, p2.id FROM t AS p1 JOIN t AS p2 USING (pk) WHERE p1.x = 3 AND p2.y = 1"),
+    "natural": ("pk", "SELECT q.id FROM t AS p1 NATURAL JOIN (SELECT id, pk FROM t) AS q WHERE p1.x = 3"),
+    "named_like_the_eager_column": ("partition_key", "SELECT partition_key, s1.id FROM s AS s1 WHERE s1.x = 3 AND partition_key > 4"),
+}
+
+
+@pytest.mark.parametrize("name", list(UNQUALIFIED_KEY))
+class TestJoinMethodsKeepUnqualifiedKeyColumns:
+    """The key table's column must not make an unqualified reference to the partition key column ambiguous."""
+
+    def test_eager(self, db, name):
+        run, cache = db
+        key, query = UNQUALIFIED_KEY[name]
+        rewritten, stats = apply_cache(query, cache, key, method="TMP_TABLE_JOIN", sql_dialect="duckdb", min_component_size=1)
+        assert stats["enhanced"] == 1
+        assert run(rewritten) == run(query), rewritten
+
+    def test_lazy(self, db, name):
+        run, cache = db
+        key, query = UNQUALIFIED_KEY[name]
+        rewritten, stats = apply_cache_lazy(query, cache, key, method="TMP_TABLE_JOIN", sql_dialect="duckdb", min_component_size=1)
+        assert stats["enhanced"] == 1
+        assert run(rewritten) == run(query), rewritten
+
+    def test_folded(self, db, name):
+        run, cache = db
+        key, query = UNQUALIFIED_KEY[name]
+        alias = "s1" if key == "partition_key" else "p1"
+        query = f"{query} AND {alias}.{key} IN (SELECT d1.id % 20 FROM d AS d1 WHERE d1.z = 1)"
+        for apply in (apply_cache, apply_cache_lazy):
+            rewritten, stats = apply(query, cache, key, method="TMP_TABLE_JOIN", sql_dialect="duckdb", min_component_size=1, fold_key_subqueries=True)
+            assert stats["enhanced"] == 1 and "d.z" not in rewritten.rpartition(";")[2] and "d1.z" not in rewritten.rpartition(";")[2]
+            assert run(rewritten) == run(query), rewritten
+
+
+@pytest.mark.parametrize("method", ["TMP_TABLE_JOIN", "UNLOGGED_TABLE_JOIN"])
+@pytest.mark.parametrize("keys", [set(range(1, 30)), {"a", "b"}], ids=["integer", "text"])
+@pytest.mark.parametrize("folded", [False, True])
+def test_renamed_key_table_scripts_split_for_lazy_insertion(method, keys, folded):
+    """Lazy insertion accepts the PostgreSQL scripts whose key table column is renamed (the unchanged ones are pinned elsewhere)."""
+    from partitioncache.apply_cache import extend_query_with_partition_keys, extend_query_with_partition_keys_lazy
+    from partitioncache.key_table_script import lazy_insertion_parts
+
+    # An unqualified key column named like the eager and the lazy key table's column
+    query = "SELECT DISTINCT partition_key FROM sites AS s WHERE s.zone = 'north'"
+    if folded:
+        query += " AND s.partition_key IN (SELECT m.site_id FROM site_meta AS m WHERE m.level >= 2)"
+    datatype = "integer" if isinstance(next(iter(keys)), int) else "text"
+    fold = "any_key_type" if folded else False
+    scripts = [
+        extend_query_with_partition_keys(query, keys, "partition_key", method=method, p0_alias="s", fold_key_subqueries=fold),
+        extend_query_with_partition_keys_lazy(
+            query, "SELECT g AS partition_key FROM generate_series(1, 50) AS g", "partition_key", method=method, p0_alias="s",
+            fold_key_subqueries=fold, partition_datatype=datatype,
+        ),
+    ]
+    for script in scripts:
+        assert "tmp_s.pcache_key = s.partition_key" in script
+        setup, select, _ = lazy_insertion_parts(script)
+        assert setup.strip() and select.lstrip().startswith("SELECT DISTINCT partition_key")

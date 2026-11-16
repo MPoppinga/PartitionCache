@@ -866,8 +866,26 @@ def _temp_table_ddl(table_name: str, sql_dialect: str) -> tuple[str, str]:
     return f"DROP TABLE IF EXISTS {table_name};\n", ""
 
 
+def _join_key_column(parsed_query: exp.Expr, column: str) -> str:
+    """The column name of a JOIN method's key table: ``column``, or ``_FOLDED_KEY_COLUMN_NAME`` where ``column`` would clash.
+
+    Joined into the query, the key table's column is visible to it: an unqualified reference to a column of that name,
+    a ``USING`` of it or a ``NATURAL`` join became ambiguous, and the query failed. The lazy key table's column is named
+    like the partition key, the eager one ``partition_key``. Queries without such a reference keep the name.
+    """
+    name = column.lower()
+    clashes = any(not col.table and col.name.lower() == name for col in parsed_query.find_all(exp.Column))
+    for join in parsed_query.find_all(exp.Join):
+        clashes |= join.args.get("method") == "NATURAL" or any(ident.name.lower() == name for ident in join.args.get("using") or [])
+    return _FOLDED_KEY_COLUMN_NAME if clashes else column
+
+
 def _create_tmp_table_setup(
-    partition_keys: set[int] | set[str] | set[float] | set[datetime], analyze_tmp_table: bool, sql_dialect: str = "postgres", key_filters: list[str] | None = None
+    partition_keys: set[int] | set[str] | set[float] | set[datetime],
+    analyze_tmp_table: bool,
+    sql_dialect: str = "postgres",
+    key_filters: list[str] | None = None,
+    key_column: str = "partition_key",
 ) -> tuple[str, str]:
     """Create the SQL for temporary table setup.
 
@@ -889,14 +907,14 @@ def _create_tmp_table_setup(
     # (see execute_with_temp_tables / PostgresDBHandler.execute and docs/api_reference.md).
     ddl_prefix, ddl_suffix = _temp_table_ddl(table_name, sql_dialect)
     if key_filters and sql_dialect == "postgres":
-        setup_sql = f"CREATE TEMPORARY TABLE {table_name} (partition_key {partition_key_type} PRIMARY KEY){ddl_suffix};\n"
-        setup_sql += _folded_fill_sql(table_name, "partition_key", key_filters, partition_keys=partition_keys, sql_dialect=sql_dialect)
+        setup_sql = f"CREATE TEMPORARY TABLE {table_name} ({key_column} {partition_key_type} PRIMARY KEY){ddl_suffix};\n"
+        setup_sql += _folded_fill_sql(table_name, key_column, key_filters, partition_keys=partition_keys, sql_dialect=sql_dialect)
     else:
-        setup_sql = f"""{ddl_prefix}CREATE TEMPORARY TABLE {table_name} (partition_key {partition_key_type} PRIMARY KEY){ddl_suffix};
-                    INSERT INTO {table_name} (partition_key) VALUES ({partition_keys_str});
+        setup_sql = f"""{ddl_prefix}CREATE TEMPORARY TABLE {table_name} ({key_column} {partition_key_type} PRIMARY KEY){ddl_suffix};
+                    INSERT INTO {table_name} ({key_column}) VALUES ({partition_keys_str});
                     """
         for key_filter in key_filters or ():
-            setup_sql += f"DELETE FROM {table_name} WHERE (partition_key IN ({key_filter})) IS NOT TRUE;\n"
+            setup_sql += f"DELETE FROM {table_name} WHERE ({key_column} IN ({key_filter})) IS NOT TRUE;\n"
 
     if analyze_tmp_table:
         # PRIMARY KEY above already creates a B-tree index; ANALYZE updates statistics for the planner
@@ -943,15 +961,17 @@ def _planner_collapse_limit_sql(planner_collapse_limit: int | None) -> str:
     return "".join(f"SET LOCAL {setting} = {planner_collapse_limit};\n" for setting in COLLAPSE_LIMIT_SETTINGS)
 
 
-def _unlogged_keys_sql(partition_keys: set[int] | set[str] | set[float] | set[datetime], sql_dialect: str) -> str:
-    """Return the SELECT over a VALUES list of the keys that fills an eager unlogged key table (column ``partition_key``).
+def _unlogged_keys_sql(partition_keys: set[int] | set[str] | set[float] | set[datetime], sql_dialect: str, key_column: str = "partition_key") -> str:
+    """Return the SELECT over a VALUES list of the keys that fills an eager unlogged key table (column ``key_column``).
 
     String keys are escaped string literals; float and timestamp keys are cast to their type, as in the temporary
     key table (``_get_partition_key_sql_type``).
     """
     key_rows = "), (".join(_format_partition_key_for_sql(pk, sql_dialect) for pk in partition_keys)
     key_type = _get_partition_key_sql_type(partition_keys, sql_dialect)
-    column = "partition_key" if key_type in ("INT", "BIGINT", "TEXT") else f"CAST(partition_key AS {key_type}) AS partition_key"
+    column = "partition_key" if key_type in ("INT", "BIGINT", "TEXT") else f"CAST(partition_key AS {key_type})"
+    if column != "partition_key" or key_column != "partition_key":
+        column += f" AS {key_column}"
     return f"SELECT {column} FROM (VALUES ({key_rows})) AS pcache_keys(partition_key)"
 
 
@@ -1665,6 +1685,7 @@ def extend_query_with_partition_keys(
             method to use to extend the query. ``UNLOGGED_TABLE_JOIN`` / ``UNLOGGED_TABLE_IN`` (PostgreSQL only) are
             ``TMP_TABLE_JOIN`` / ``TMP_TABLE_IN`` with an unlogged table, always with index and ANALYZE; the script
             ends with its DROP, after the SELECT. Execute it as ONE string so that it runs in one transaction.
+            The JOIN methods add the key table's column to the output of ``SELECT *`` (see ``_join_key_column`` for its name).
         p0_alias (str | None): The alias of the table to use for the partition key; None detects it (``find_p0_alias``).
             The JOIN methods join the key table to this table only.
         analyze_tmp_table (bool): Whether to create index and analyze. (only for temporary table methods)
@@ -1744,17 +1765,18 @@ def extend_query_with_partition_keys(
         return _splice_key_list(parsed_query.sql(dialect=sql_dialect), sentinel, key_list)
 
     elif method == "TMP_TABLE_JOIN" or method == "UNLOGGED_TABLE_JOIN":
+        key_column = _join_key_column(parsed_query, "partition_key")
         if typed_source is not None:
             kind = "UNLOGGED" if method == "UNLOGGED_TABLE_JOIN" else "TEMPORARY"
             tmp_table_setup, table_name = _typed_key_table_setup(
-                kind, "partition_key", typed_source, partition_key, _untyped_key_rows(partition_keys, sql_dialect), analyze_tmp_table, sql_dialect, key_filters, method
+                kind, key_column, typed_source, partition_key, _untyped_key_rows(partition_keys, sql_dialect), analyze_tmp_table, sql_dialect, key_filters, method
             )
         elif method == "UNLOGGED_TABLE_JOIN":
             tmp_table_setup, table_name = _create_unlogged_table_setup(
-                _unlogged_keys_sql(partition_keys, sql_dialect), "partition_key", sql_dialect, method, key_filters, partition_keys
+                _unlogged_keys_sql(partition_keys, sql_dialect, key_column), key_column, sql_dialect, method, key_filters, partition_keys
             )
         else:
-            tmp_table_setup, table_name = _create_tmp_table_setup(partition_keys, analyze_tmp_table, sql_dialect, key_filters)
+            tmp_table_setup, table_name = _create_tmp_table_setup(partition_keys, analyze_tmp_table, sql_dialect, key_filters, key_column)
 
         # Add as inner join to the p0 table, or with join_every_table to every table, of the restricted SELECT only
         for from_clause in _from_clauses(parsed_query):
@@ -1771,7 +1793,7 @@ def extend_query_with_partition_keys(
                 + exp.Join(
                     this=exp.Identifier(this=f"{table_name} AS tmp_{table_alias}"),
                     on=exp.EQ(
-                        this=exp.Identifier(this=f"tmp_{table_alias}.partition_key"),
+                        this=exp.Identifier(this=f"tmp_{table_alias}.{key_column}"),
                         expression=exp.Identifier(this=f"{table_alias}.{partition_key}"),
                     ),
                     kind="INNER",
@@ -1969,15 +1991,18 @@ def extend_query_with_partition_keys_lazy(
 
     elif method == "TMP_TABLE_JOIN" or method == "UNLOGGED_TABLE_JOIN":
         # Create the key table (temporary or unlogged) from the lazy subquery, then JOIN
+        key_column = _join_key_column(parsed_query, partition_key)
+        if key_column != partition_key:
+            lazy_subquery = f"SELECT pcache_keys_src.{partition_key} AS {key_column} FROM ({lazy_subquery}) AS pcache_keys_src"
         if typed_source is not None:
             kind = "UNLOGGED" if method == "UNLOGGED_TABLE_JOIN" else "TEMPORARY"
             tmp_table_setup, table_name = _typed_key_table_setup(
-                kind, partition_key, typed_source, partition_key, lazy_subquery, analyze_tmp_table, sql_dialect, key_filters, method
+                kind, key_column, typed_source, partition_key, lazy_subquery, analyze_tmp_table, sql_dialect, key_filters, method
             )
         elif method == "UNLOGGED_TABLE_JOIN":
-            tmp_table_setup, table_name = _create_unlogged_table_setup(lazy_subquery, partition_key, sql_dialect, method, key_filters)
+            tmp_table_setup, table_name = _create_unlogged_table_setup(lazy_subquery, key_column, sql_dialect, method, key_filters)
         else:
-            tmp_table_setup, table_name = _create_tmp_table_setup_from_subquery(lazy_subquery, partition_key, analyze_tmp_table, sql_dialect, key_filters)
+            tmp_table_setup, table_name = _create_tmp_table_setup_from_subquery(lazy_subquery, key_column, analyze_tmp_table, sql_dialect, key_filters)
 
         # Add as inner join to the p0 table, or with join_every_table to every table, of the restricted SELECT only
         for from_clause in _from_clauses(parsed_query):
@@ -1994,7 +2019,7 @@ def extend_query_with_partition_keys_lazy(
                 + exp.Join(
                     this=exp.Identifier(this=f"{table_name} AS tmp_{table_alias}"),
                     on=exp.EQ(
-                        this=exp.Identifier(this=f"tmp_{table_alias}.{partition_key}"),
+                        this=exp.Identifier(this=f"tmp_{table_alias}.{key_column}"),
                         expression=exp.Identifier(this=f"{table_alias}.{partition_key}"),
                     ),
                     kind="INNER",
