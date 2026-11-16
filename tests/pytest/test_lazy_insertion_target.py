@@ -7,6 +7,7 @@ fragment would be computed on the wrong dataset and stored under a hash that dep
 """
 
 import os
+import socket
 import sys
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -14,7 +15,7 @@ from unittest.mock import Mock, patch
 import pytest
 
 import partitioncache.cli.monitor_cache_queue as mcq_module
-from partitioncache.cli import add_to_cache
+from partitioncache.cli import add_to_cache, common_args
 from partitioncache.cli.common_args import cache_connection_target, data_connection_target, lazy_insertion_refusal
 
 SF1 = ("db.example", 5432, "bench_sf1")
@@ -27,6 +28,24 @@ def _handler(host="db.example", port=5432, dbname="bench_sf1", attribute="db"):
     return handler
 
 
+# Name resolution of the tests: no real DNS lookups
+FAKE_DNS = {"db.example": ["10.0.0.5"], "db-alias.example": ["10.0.0.5", "10.0.0.6"], "other.example": ["10.0.0.9"], "10.0.0.5": ["10.0.0.5"]}
+
+
+def _fake_getaddrinfo(host, port, *args, **kwargs):
+    if host not in FAKE_DNS:
+        raise socket.gaierror(socket.EAI_NONAME, "Name or service not known")
+    return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (address, 0)) for address in FAKE_DNS[host]]
+
+
+@pytest.fixture(autouse=True)
+def fake_dns():
+    common_args._host_addresses.cache_clear()
+    with patch.object(common_args.socket, "getaddrinfo", side_effect=_fake_getaddrinfo) as getaddrinfo:
+        yield getaddrinfo
+    common_args._host_addresses.cache_clear()
+
+
 class TestLazyInsertionRefusal:
     def test_same_server_and_database(self):
         assert lazy_insertion_refusal(SF1, SF1) is None
@@ -34,22 +53,40 @@ class TestLazyInsertionRefusal:
     def test_host_compared_case_insensitively(self):
         assert lazy_insertion_refusal(("DB.Example", 5432, "bench_sf1"), SF1) is None
 
+    @pytest.mark.parametrize("data_host, cache_host", [("localhost", "127.0.0.1"), ("127.0.0.1", "::1"), ("LOCALHOST", "127.0.1.1"), ("::1", "localhost")])
+    def test_loopback_spellings_are_the_same_host(self, data_host, cache_host, fake_dns):
+        assert lazy_insertion_refusal((data_host, 5432, "bench_sf1"), (cache_host, 5432, "bench_sf1")) is None
+        fake_dns.assert_not_called()
+
+    @pytest.mark.parametrize("cache_host", ["10.0.0.5", "db-alias.example"])
+    def test_name_and_its_address_are_the_same_host(self, cache_host):
+        assert lazy_insertion_refusal(SF1, (cache_host, 5432, "bench_sf1")) is None
+
     @pytest.mark.parametrize(
         "cache_target",
         [
             ("db.example", 5432, "bench_sf10"),  # other database on the same server
             ("db.example", 5433, "bench_sf1"),  # other server on the same host
-            ("other.example", 5432, "bench_sf1"),
-            ("127.0.0.1", 5432, "bench_sf1"),  # not resolved: when in doubt, not lazy
-            ("/var/run/postgresql", 5432, "bench_sf1"),  # Unix socket against a TCP host
+            ("other.example", 5432, "bench_sf1"),  # resolves to another address
+            ("localhost", 5432, "bench_sf1"),  # a remote name against the loopback
         ],
     )
     def test_different_target_is_refused(self, cache_target):
         reason = lazy_insertion_refusal(SF1, cache_target)
-        assert reason is not None and cache_target[2] in reason
+        assert reason is not None and cache_target[0] in reason and "DB_HOST" in reason
 
-    def test_localhost_and_loopback_address_are_not_assumed_equal(self):
-        assert lazy_insertion_refusal(("localhost", 5432, "bench_sf1"), ("127.0.0.1", 5432, "bench_sf1")) is not None
+    @pytest.mark.parametrize("data_host", ["localhost", "db.example"])
+    def test_socket_directory_against_tcp_is_refused(self, data_host):
+        reason = lazy_insertion_refusal((data_host, 5432, "bench_sf1"), ("/var/run/postgresql", 5432, "bench_sf1"))
+        assert reason is not None and "Unix socket" in reason
+
+    def test_same_socket_directory_is_the_same_host(self):
+        assert lazy_insertion_refusal(("/tmp", 5432, "bench_sf1"), ("/tmp", 5432, "bench_sf1")) is None
+
+    def test_failed_resolution_falls_back_to_the_string_comparison(self):
+        assert lazy_insertion_refusal(("unknown.example", 5432, "bench_sf1"), ("Unknown.Example", 5432, "bench_sf1")) is None
+        assert lazy_insertion_refusal(("unknown.example", 5432, "bench_sf1"), ("unknown-2.example", 5432, "bench_sf1")) is not None
+        assert lazy_insertion_refusal(("unknown.example", 5432, "bench_sf1"), SF1) is not None
 
     def test_unknown_targets_are_refused(self):
         assert lazy_insertion_refusal(None, SF1) is not None
@@ -142,7 +179,7 @@ class TestMonitor:
         db.execute.assert_called_once_with("SELECT pk FROM t")
         handler.set_cache.assert_called_with("h1", {1, 2}, "pk")
         reasons = [r for r in caplog.records if "lazy insertion" in r.getMessage().lower() and "bench_sf10" in r.getMessage()]
-        assert len(reasons) == 1 and reasons[0].levelname == "INFO"  # logged once
+        assert len(reasons) == 1 and reasons[0].levelname == "WARNING"  # logged once
 
     def test_non_postgresql_data_backend_is_not_lazy(self, monitor_args):
         monitor_args.db_backend = "sqlite"

@@ -6,9 +6,12 @@ consistency across all CLI tools and reduce code duplication.
 """
 
 import argparse
+import functools
+import ipaddress
 import json
 import os
 import re
+import socket
 import sys
 from logging import getLogger
 from pathlib import Path
@@ -679,12 +682,51 @@ def cache_connection_target(cache_handler: Any) -> ConnectionTarget | None:
     return None
 
 
+def _is_loopback(host: str) -> bool:
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(host.split("%")[0]).is_loopback
+    except ValueError:
+        return False
+
+
+@functools.lru_cache(maxsize=64)
+def _host_addresses(host: str) -> frozenset[str] | None:
+    """The addresses ``host`` resolves to, None if it does not resolve; cached, the monitor checks every fragment."""
+    try:
+        return frozenset(str(info[4][0]).split("%")[0] for info in socket.getaddrinfo(host, None))
+    except (OSError, UnicodeError):
+        return None
+
+
+def _same_host(host_a: str, host_b: str) -> bool:
+    """Whether two libpq host values name the same server host.
+
+    Loopback spellings (``localhost``, ``127.0.0.1``, ``::1``, ...) are one host; other names are the same host when
+    the addresses they resolve to intersect, or, when one does not resolve, when they are equal ignoring case. A
+    Unix-socket directory is the same host only as the same directory.
+    """
+    a, b = host_a.strip().lower(), host_b.strip().lower()
+    if a == b:
+        return True
+    if a.startswith("/") or b.startswith("/"):
+        return False
+    if _is_loopback(a) and _is_loopback(b):
+        return True
+    addresses_a, addresses_b = _host_addresses(a), _host_addresses(b)
+    if addresses_a is None or addresses_b is None:
+        return False
+    return bool(addresses_a & addresses_b)
+
+
 def lazy_insertion_refusal(data_target: ConnectionTarget | None, cache_target: ConnectionTarget | None) -> str | None:
     """Why fragments must not be executed on the cache handler's connection (lazy insertion), or None if they may.
 
-    Lazy insertion executes a fragment on the cache handler's connection, not on the data connection. Both must be
-    the same server and database; hosts are compared as written (case-insensitive), so ``localhost`` and
-    ``127.0.0.1`` count as different: when in doubt, the fragment runs on the data connection.
+    Lazy insertion executes a fragment on the cache handler's connection, not on the data connection. Both must reach
+    the same server and database: the ports and database names must be equal and the hosts the same host (see
+    _same_host). A Unix-socket directory never matches a TCP host: when in doubt, the fragment runs on the data
+    connection.
 
     Args:
         data_target: (host, port, database) of the data connection, None if it is not PostgreSQL or not configured.
@@ -696,9 +738,15 @@ def lazy_insertion_refusal(data_target: ConnectionTarget | None, cache_target: C
         return "the cache handler has no PostgreSQL connection that could be compared with the data connection"
     data_host, data_port, data_db = data_target
     cache_host, cache_port, cache_db = cache_target
-    if (data_host.strip().lower(), data_port, data_db) != (cache_host.strip().lower(), cache_port, cache_db):
-        return f"the cache handler connects to {cache_host}:{cache_port}/{cache_db}, the data connection to {data_host}:{data_port}/{data_db}"
-    return None
+    if _same_host(data_host, cache_host) and data_port == cache_port and data_db == cache_db:
+        return None
+    reason = f"the cache handler connects to {cache_host}:{cache_port}/{cache_db}, the data connection to {data_host}:{data_port}/{data_db}"
+    if (data_host.strip().startswith("/")) != (cache_host.strip().startswith("/")):
+        reason += " (a Unix socket and a TCP host are not assumed to be the same server)"
+    return (
+        f"{reason}; to use lazy insertion, give both the same host (DB_HOST / PG_DB_HOST or the handler's own host variable), "
+        "port (DB_PORT / PG_DB_PORT) and database (DB_NAME / --db-name)"
+    )
 
 
 def lazy_insertion_refusal_for(args: argparse.Namespace, cache_handler: Any) -> str | None:

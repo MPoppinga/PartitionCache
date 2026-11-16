@@ -412,7 +412,7 @@ def lazy_insertion_refused(cache_backend: str, cache_handler) -> str | None:
         with _lazy_insertion_lock:
             if message not in _lazy_insertion_refusals:
                 _lazy_insertion_refusals.add(message)
-                logger.info(message)
+                logger.warning(message)
     return reason
 
 

@@ -339,7 +339,7 @@ def main():
                 if lazy_refusal is not None:
                     logger.error(
                         f"Spatial datatype '{args.partition_datatype}' needs lazy insertion, which runs the variants on the cache handler's "
-                        f"connection, but {lazy_refusal}. Point --db-name / PG_DB_HOST / PG_DB_PORT at the cache handler's database."
+                        f"connection, but {lazy_refusal}"
                     )
                     exit(1)
 
