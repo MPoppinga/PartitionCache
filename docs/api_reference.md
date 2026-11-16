@@ -110,7 +110,7 @@ Retrieves cached partition keys for a query with comprehensive statistics.
 - `add_constraints` (dict[str, str] | None): Dict mapping table names to constraints to add
 - `remove_constraints_all` (list[str] | None): List of attribute names to remove from all query variants
 - `remove_constraints_add` (list[str] | None): List of attribute names to remove, creating additional variants
-- `skip_partition_key_joins` (bool): Spatial mode — generate query variants without partition-key equijoins (default: False)
+- `skip_partition_key_joins` (bool): Spatial mode — generate query variants without partition-key equijoins (default: False). Without temporal or spatial parameters, only the variants that select the key of the restricted alias (the p0 alias) are looked up, since the other aliases hold their own keys; if that alias is no plain table of the query, the query runs uncached (`uncached_reason: no_key_source`).
 - `temporal_bucket_width`, `temporal_column`, `dilation_buckets`: Temporal dilation for time-bucket partition keys, see [Temporal dilation](#temporal-dilation-temporal_bucket_width-temporal_column)
 - `geometry_column` (str | None): Geometry column for spatial variant generation
 - `max_conditions_removed` (int | None): Upper bound on the number of conditions removed when generating reduced variants
@@ -207,6 +207,12 @@ print(optimized)
 > PostgreSQL 15, `public` no longer grants it to every role), while temporary tables only need `TEMP`.
 > Without it the enhanced script fails when it runs.
 
+> **Output of the JOIN methods (`TMP_TABLE_JOIN`, `UNLOGGED_TABLE_JOIN`).** The key table is joined into the
+> query as `tmp_<alias>`, so `SELECT *` also returns its key column. Its column is
+> named `partition_key` (eager) or like the partition key (lazy); when the query references a column of that
+> name unqualified, in `USING`, or has a `NATURAL` join, the column is named `pcache_key` instead, so the
+> reference stays unambiguous. Select the columns explicitly, or use an `IN` method, where the output must not change.
+
 > **`UNLOGGED_TABLE_IN` (PostgreSQL only).** `TMP_TABLE_IN` with the same unlogged key table: the restriction is
 > `alias.key IN (SELECT partition_key FROM partitioncache_unl_<hex>)`, and the script ends with the `DROP`, as for
 > `UNLOGGED_TABLE_JOIN`.
@@ -301,7 +307,7 @@ Lazy counterpart to `extend_query_with_partition_keys`: integrates a lazy SQL su
 - `remove_constraints_add` (list[str] | None, optional): List of attribute names to remove, creating additional variants
 - `max_conditions_removed` (int | None, optional): Upper bound on the number of conditions removed when generating reduced variants (default: None)
 - `protected_patterns` (list[str] | None, optional): Condition substrings that must never be removed (default: None)
-- `skip_partition_key_joins` (bool, optional): Spatial mode — generate query variants without partition-key equijoins (default: False)
+- `skip_partition_key_joins` (bool, optional): Spatial mode — generate query variants without partition-key equijoins (default: False). Without temporal or spatial parameters, only the variants that select the key of the restricted alias (the p0 alias) are looked up, since the other aliases hold their own keys; if that alias is no plain table of the query, the query runs uncached (`uncached_reason: no_key_source`).
 - `temporal_bucket_width`, `temporal_column`, `dilation_buckets` (optional): Temporal dilation for time-bucket partition keys, see below
 - `geometry_column` (str | None, optional): Enables spatial mode. Uses this geometry column for variant SELECT clauses and spatial filter. Requires a spatial cache handler with `get_spatial_filter_lazy()` method. Sound for point geometries only, see [Spatial buffer](#spatial-buffer-buffer_distance).
 - `buffer_distance` (float | None, optional): Buffer distance for the spatial filter, see [Spatial buffer](#spatial-buffer-buffer_distance).
@@ -446,6 +452,8 @@ With `geometry_column`, each cached fragment is a region (the geometries of the 
 #### `apply_cache(query, cache_handler, partition_key, ..., geometry_column=None, buffer_distance=None)`
 
 Applies partition cache to a query using regular (non-lazy) cache handlers. Supports spatial mode. Accepts the same `cost_estimator` / `min_query_cost` gate and `join_every_table` option as `apply_cache_lazy`. Like `apply_cache_lazy`, it takes `sql_dialect` (default `"postgres"`), the sqlglot dialect the enhanced query is parsed and rendered in (spatial mode: PostgreSQL only).
+
+**Requirement (both `apply_cache` and `apply_cache_lazy`):** the partition key column must not be NULL in rows the query can return. Cached key sets never contain NULL, so every restriction (`IN`, a key table, the `FALSE` of an empty intersection) removes the rows of the restricted table whose key is NULL.
 
 **Spatial Parameters** (in addition to standard parameters):
 - `geometry_column` (str | None, optional): Enables spatial mode. Requires a spatial cache handler with `get_spatial_filter()` method. Sound for point geometries only.
