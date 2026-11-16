@@ -11,7 +11,7 @@ import re
 import pytest
 
 from partitioncache import query_processor
-from partitioncache.apply_cache import apply_cache, apply_cache_lazy, rewrite_query_with_p0_table
+from partitioncache.apply_cache import apply_cache, apply_cache_lazy, get_partition_keys, rewrite_query_with_p0_table
 from partitioncache.cache_handler.abstract import AbstractCacheHandler_Lazy
 
 duckdb = pytest.importorskip("duckdb")
@@ -246,3 +246,49 @@ class TestUseP0Table:
     def test_tables_of_subqueries_are_not_tied(self):
         rewritten = rewrite_query_with_p0_table(P0_TABLE_QUERIES["subquery_table"], "pk")
         assert "q.pk = p0.pk" not in rewritten and rewritten.endswith("AND p1.pk = p0.pk")
+
+
+# Each login with the failures up to 5 minutes after it; three pairs cross an hour boundary (bucket w)
+EVENT_PAIRS = (
+    "SELECT e1.id, e2.id FROM events AS e1, events AS e2 WHERE e1.kind = 'login' AND e2.kind = 'fail' "
+    "AND e2.ts >= e1.ts AND e2.ts <= e1.ts + 300"
+)
+
+
+class TestSkipPartitionKeyJoins:
+    """Without key joins every alias has its own key: only variants of the restricted alias's key may restrict it."""
+
+    @pytest.mark.parametrize("lazy", [False, True], ids=["eager", "lazy"])
+    @pytest.mark.parametrize("p0_alias", [None, "e1", "e2"])
+    def test_plain_lookup_keeps_the_rows(self, db, lazy, p0_alias):
+        run, cache = db
+        apply = apply_cache_lazy if lazy else apply_cache
+        method = "IN_SUBQUERY" if lazy else "IN"
+        rewritten, stats = apply(
+            EVENT_PAIRS, cache, "w", method=method, sql_dialect="duckdb", min_component_size=1, skip_partition_key_joins=True, p0_alias=p0_alias
+        )
+        assert stats["enhanced"] == 1
+        assert run(rewritten) == run(EVENT_PAIRS), rewritten
+
+    @pytest.mark.parametrize("lazy", [False, True], ids=["eager", "lazy"])
+    def test_dilation_is_unchanged(self, db, lazy):
+        run, cache = db
+        apply = apply_cache_lazy if lazy else apply_cache
+        rewritten, stats = apply(EVENT_PAIRS, cache, "w", sql_dialect="duckdb", min_component_size=1, dilation_buckets=1)
+        if not lazy:  # the fake handler has no lazy dilated intersection: that lookup runs uncached
+            assert stats["enhanced"] == 1
+        assert run(rewritten) == run(EVENT_PAIRS), rewritten
+
+    def test_get_partition_keys_returns_the_p0_alias_keys(self, db):
+        run, cache = db
+        keys, _, hits = get_partition_keys(EVENT_PAIRS, cache, "w", min_component_size=1, skip_partition_key_joins=True)
+        assert hits > 0
+        assert {row[0] for row in run(EVENT_PAIRS.replace("SELECT e1.id, e2.id", "SELECT DISTINCT e1.w"))} <= keys
+
+    @pytest.mark.parametrize("lazy", [False, True], ids=["eager", "lazy"])
+    def test_a_derived_table_runs_uncached(self, db, lazy):
+        _, cache = db
+        query = EVENT_PAIRS.replace("FROM events AS e1", "FROM (SELECT * FROM events) AS e1")
+        apply = apply_cache_lazy if lazy else apply_cache
+        rewritten, stats = apply(query, cache, "w", sql_dialect="duckdb", min_component_size=1, skip_partition_key_joins=True, p0_alias="e1")
+        assert rewritten == query and stats["uncached_reason"] == "no_key_source"

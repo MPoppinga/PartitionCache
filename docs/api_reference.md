@@ -110,7 +110,7 @@ Retrieves cached partition keys for a query with comprehensive statistics.
 - `add_constraints` (dict[str, str] | None): Dict mapping table names to constraints to add
 - `remove_constraints_all` (list[str] | None): List of attribute names to remove from all query variants
 - `remove_constraints_add` (list[str] | None): List of attribute names to remove, creating additional variants
-- `skip_partition_key_joins` (bool): Spatial mode — generate query variants without partition-key equijoins (default: False)
+- `skip_partition_key_joins` (bool): Spatial mode — generate query variants without partition-key equijoins (default: False). Without temporal or spatial parameters, only the variants that select the key of the restricted alias (the p0 alias) are looked up, since the other aliases hold their own keys; if that alias is no plain table of the query, the query runs uncached (`uncached_reason: no_key_source`).
 - `temporal_bucket_width`, `temporal_column`, `dilation_buckets`: Temporal dilation for time-bucket partition keys, see [Temporal dilation](#temporal-dilation-temporal_bucket_width-temporal_column)
 - `geometry_column` (str | None): Geometry column for spatial variant generation
 - `max_conditions_removed` (int | None): Upper bound on the number of conditions removed when generating reduced variants
@@ -301,7 +301,7 @@ Lazy counterpart to `extend_query_with_partition_keys`: integrates a lazy SQL su
 - `remove_constraints_add` (list[str] | None, optional): List of attribute names to remove, creating additional variants
 - `max_conditions_removed` (int | None, optional): Upper bound on the number of conditions removed when generating reduced variants (default: None)
 - `protected_patterns` (list[str] | None, optional): Condition substrings that must never be removed (default: None)
-- `skip_partition_key_joins` (bool, optional): Spatial mode — generate query variants without partition-key equijoins (default: False)
+- `skip_partition_key_joins` (bool, optional): Spatial mode — generate query variants without partition-key equijoins (default: False). Without temporal or spatial parameters, only the variants that select the key of the restricted alias (the p0 alias) are looked up, since the other aliases hold their own keys; if that alias is no plain table of the query, the query runs uncached (`uncached_reason: no_key_source`).
 - `temporal_bucket_width`, `temporal_column`, `dilation_buckets` (optional): Temporal dilation for time-bucket partition keys, see below
 - `geometry_column` (str | None, optional): Enables spatial mode. Uses this geometry column for variant SELECT clauses and spatial filter. Requires a spatial cache handler with `get_spatial_filter_lazy()` method.
 - `buffer_distance` (float | None, optional): Buffer distance in meters for spatial filter (required when `geometry_column` is set).

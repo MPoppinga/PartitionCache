@@ -23,6 +23,7 @@ import sqlglot.expressions as exp
 
 from partitioncache.cache_handler.abstract import LAZY_ALL_KEYS_PLACEHOLDER, AbstractCacheHandler, AbstractCacheHandler_Lazy
 from partitioncache.query_processor import (
+    _key_source_from_select,
     compute_buffer_distance,
     detect_partition_join_from_query,
     generate_all_hashes,
@@ -210,6 +211,59 @@ def _variants_of_first_branch(query: str, hashes: list[str], generate: Callable[
     return False
 
 
+_NO_KEY_SOURCE = "\x00no key source"  # _plain_lookup_source: the restricted alias is no plain table of the restricted SELECT
+
+
+def _restricted_alias_source(query: str, partition_key: str, alias: str | None, auto_detect_partition_join: bool, partition_join_table: str | None) -> str | None:
+    """The ``partition_key_source_table`` of the restricted alias (``alias``, or ``find_p0_alias``), or None if it is no plain table.
+
+    As the variant generation names the source it reads from a query's SELECT: the table name when the table occurs once
+    among the tables of the restricted SELECT's FROM and JOIN clauses, else the alias.
+    """
+    parsed = sqlglot.parse_one(query)
+    if alias is None:
+        alias = find_p0_alias(query, partition_key, auto_detect_partition_join, partition_join_table)
+    items = [clause.this for clause in _from_clauses(parsed)]
+    tables = [table for item in items for table in item.find_all(exp.Table)]
+    for item in items:
+        if isinstance(item, exp.Table) and item.alias_or_name == alias:
+            return alias if sum(1 for table in tables if table.name == item.name) > 1 else item.name
+    return None
+
+
+def _plain_lookup_source(
+    query: str,
+    partition_key: str,
+    skip_partition_key_joins: bool,
+    temporal_bucket_width: float | None,
+    dilation_buckets: int | None,
+    partition_key_source_table: str | None,
+    alias: str | None,
+    auto_detect_partition_join: bool,
+    partition_join_table: str | None,
+) -> str | None:
+    """The ``partition_key_source_table`` of a lookup of apply_cache / apply_cache_lazy, or ``_NO_KEY_SOURCE``.
+
+    A temporal lookup keeps the caller's (dilation covers the other aliases' buckets), other lookups with key joins none.
+    Without key joins and without dilation, the aliases are not joined on the key and each has its own: the single-table
+    variants of another alias hold that alias's keys, not the restricted alias's, so only the variants that select the
+    restricted alias's key may restrict it. Their source is the restricted alias (``_restricted_alias_source``);
+    ``_NO_KEY_SOURCE`` when it is no plain table of the restricted SELECT, and the query then runs without the cache.
+    """
+    if _is_temporal(temporal_bucket_width, dilation_buckets):
+        return partition_key_source_table
+    if not skip_partition_key_joins:
+        return None
+    source = _restricted_alias_source(query, partition_key, alias, auto_detect_partition_join, partition_join_table)
+    if source is None:
+        logger.warning(
+            "skip_partition_key_joins: the restricted alias is no plain table of the query, so the variants of its key cannot be told "
+            "apart; the query runs without the cache"
+        )
+        return _NO_KEY_SOURCE
+    return source
+
+
 def get_partition_keys(
     query: str,
     cache_handler: AbstractCacheHandler,
@@ -250,6 +304,9 @@ def get_partition_keys(
         remove_constraints_all: List of attribute names to remove from all query variants
         remove_constraints_add: List of attribute names to remove, creating additional variants
         protected_patterns: Conditions matching these patterns are never removed during variant generation.
+        skip_partition_key_joins: Generate the variants without partition key joins (each alias has its own key). Without
+            temporal parameters, geometry_column or partition_key_source_table, and without a key in the SELECT, only the
+            variants that select the p0 alias's key are looked up (no lookup if it is no plain table).
         temporal_bucket_width: Width of one bucket of a time-bucket partition key, in the unit of ``temporal_column``;
             enables temporal dilation: each cached set is widened by ceil(window / width) buckets before the
             intersection, with the window read from the query's conditions on ``temporal_column``.
@@ -283,6 +340,13 @@ def get_partition_keys(
         return None, 0, 0
     if _is_temporal(temporal_bucket_width, dilation_buckets):
         skip_partition_key_joins = True
+    elif skip_partition_key_joins and geometry_column is None and partition_key_source_table is None:
+        if _key_source_from_select(sqlglot.parse_one(query), partition_key) is None:
+            # Without key joins only the variants of one alias's key are sound; without a key in the SELECT, the p0 alias's
+            partition_key_source_table = _restricted_alias_source(query, partition_key, None, auto_detect_partition_join, partition_join_table)
+            if partition_key_source_table is None:
+                logger.warning("skip_partition_key_joins: the p0 alias is no plain table of the query; no cache lookup")
+                return None, 0, 0
 
     # Generate all hashes for the given query (Only consider subqueries with two ore more components that are connected, allow modifying attributes)
     generation: dict[str, Any] = {
@@ -366,6 +430,9 @@ def get_partition_keys_lazy(
         remove_constraints_all: List of attribute names to remove from all query variants
         remove_constraints_add: List of attribute names to remove, creating additional variants
         protected_patterns: Conditions matching these patterns are never removed during variant generation.
+        skip_partition_key_joins: Generate the variants without partition key joins (each alias has its own key). Without
+            temporal parameters, geometry_column or partition_key_source_table, and without a key in the SELECT, only the
+            variants that select the p0 alias's key are looked up (no lookup if it is no plain table).
         temporal_bucket_width: Width of one bucket of a time-bucket partition key, in the unit of ``temporal_column``;
             enables temporal dilation: each cached set is widened by ceil(window / width) buckets before the
             intersection, with the window read from the query's conditions on ``temporal_column``.
@@ -405,6 +472,13 @@ def get_partition_keys_lazy(
         return None, 0, 0
     if _is_temporal(temporal_bucket_width, dilation_buckets):
         skip_partition_key_joins = True
+    elif skip_partition_key_joins and geometry_column is None and partition_key_source_table is None:
+        if _key_source_from_select(sqlglot.parse_one(query), partition_key) is None:
+            # Without key joins only the variants of one alias's key are sound; without a key in the SELECT, the p0 alias's
+            partition_key_source_table = _restricted_alias_source(query, partition_key, None, auto_detect_partition_join, partition_join_table)
+            if partition_key_source_table is None:
+                logger.warning("skip_partition_key_joins: the p0 alias is no plain table of the query; no cache lookup")
+                return None, 0, 0
 
     generation: dict[str, Any] = {
         "partition_key_source_table": partition_key_source_table,
@@ -2759,6 +2833,7 @@ def apply_cache_lazy(
         remove_constraints_all: List of attribute names to remove from all query variants
         remove_constraints_add: List of attribute names to remove, creating additional variants
         protected_patterns: Conditions matching these patterns are never removed during variant generation.
+        skip_partition_key_joins: Variants without partition key joins; see apply_cache.
         temporal_bucket_width: Width of one bucket of a time-bucket partition key, in the unit of ``temporal_column``;
             enables temporal dilation: each cached set is widened by ceil(window / width) buckets before the
             intersection, with the window read from the query's conditions on ``temporal_column``.
@@ -2942,6 +3017,13 @@ def apply_cache_lazy(
         stats["enhanced"] = 1
         return enhanced_query, stats
 
+    # Without key joins and without dilation every alias has its own key: only the variants that select the key of the
+    # restricted alias may restrict it
+    lookup_source = _plain_lookup_source(query, partition_key, skip_partition_key_joins, temporal_bucket_width, dilation_buckets,
+                                         partition_key_source_table, None if use_p0_table else p0_alias, auto_detect_partition_join, partition_join_table)
+    if lookup_source is _NO_KEY_SOURCE:
+        return query, _uncached_stats("no_key_source", gate_stats)
+
     # Non-spatial path: use partition key lazy intersection
     # Step 1: Generate query variants from original query
     lazy_cache_subquery, generated_variants, used_hashes = get_partition_keys_lazy(
@@ -2964,17 +3046,18 @@ def apply_cache_lazy(
         dilation_buckets=dilation_buckets,
         temporal_column=temporal_column,
         keep_all_attributes=keep_all_attributes,
-        # Only temporal lookups use it here, so that other lookups keep the variants they had
-        partition_key_source_table=partition_key_source_table if _is_temporal(temporal_bucket_width, dilation_buckets) else None,
+        # Only temporal lookups and lookups without key joins use it here, so that other lookups keep the variants they had
+        partition_key_source_table=lookup_source,
     )
 
     # Step 2: Optionally rewrite with p0 table
     working_query = query
     p0_rewritten = 0
-    if use_p0_table and _is_temporal(temporal_bucket_width, dilation_buckets):
+    if use_p0_table and (_is_temporal(temporal_bucket_width, dilation_buckets) or skip_partition_key_joins):
         # The p0 rewrite joins every alias on the partition key (alias.w = p0.w), which drops the pairs across a bucket
-        # boundary that temporal dilation keeps; restrict the anchor alias instead (p0_alias names the p0 table here)
-        logger.warning("use_p0_table is ignored for a temporal partition key: it would put all aliases into the same bucket")
+        # boundary that temporal dilation keeps, and the pairs of different keys a lookup without key joins keeps;
+        # restrict the anchor alias instead (p0_alias names the p0 table here)
+        logger.warning("use_p0_table is ignored for a temporal partition key or skip_partition_key_joins: it would put all aliases into the same partition")
         use_p0_table = False
         p0_alias = None
     if use_p0_table:
@@ -3105,6 +3188,9 @@ def apply_cache(
             the cache was populated with, as in apply_cache_lazy.
         protected_patterns: Conditions matching these patterns are never removed during variant generation.
         skip_partition_key_joins (bool): If True, skip partition key joins in variant generation.
+            Each alias then has its own key; without temporal or spatial parameters only the variants that select the
+            restricted alias's key are looked up, and a restricted alias that is no plain table runs the query uncached
+            (``uncached_reason``: ``no_key_source``). ``use_p0_table`` is ignored with it.
         temporal_bucket_width: Width of one bucket of a time-bucket partition key, in the unit of ``temporal_column``;
             enables temporal dilation: each cached set is widened by ceil(window / width) buckets before the
             intersection, with the window read from the query's conditions on ``temporal_column``.
@@ -3318,6 +3404,13 @@ def apply_cache(
         logger.info(f"Successfully enhanced query with spatial cache. Generated {generated_variants} subqueries, {used_hashes} cache hits")
         return enhanced_query, stats
 
+    # Without key joins and without dilation every alias has its own key: only the variants that select the key of the
+    # restricted alias may restrict it
+    lookup_source = _plain_lookup_source(query, partition_key, skip_partition_key_joins, temporal_bucket_width, dilation_buckets,
+                                         partition_key_source_table, None if use_p0_table else p0_alias, auto_detect_partition_join, partition_join_table)
+    if lookup_source is _NO_KEY_SOURCE:
+        return query, _uncached_stats("no_key_source", gate_stats)
+
     # Non-spatial path (original logic)
     # Step 1: Generate all query variants from ORIGINAL query (not p0-rewritten)
     partition_keys, generated_variants, used_hashes = get_partition_keys(
@@ -3340,17 +3433,18 @@ def apply_cache(
         dilation_buckets=dilation_buckets,
         temporal_column=temporal_column,
         keep_all_attributes=keep_all_attributes,
-        # Only temporal lookups use it here, so that other lookups keep the variants they had
-        partition_key_source_table=partition_key_source_table if _is_temporal(temporal_bucket_width, dilation_buckets) else None,
+        # Only temporal lookups and lookups without key joins use it here, so that other lookups keep the variants they had
+        partition_key_source_table=lookup_source,
     )
 
     # Step 2: Optionally rewrite original query with p0 table
     working_query = query
     p0_rewritten = 0
-    if use_p0_table and _is_temporal(temporal_bucket_width, dilation_buckets):
+    if use_p0_table and (_is_temporal(temporal_bucket_width, dilation_buckets) or skip_partition_key_joins):
         # The p0 rewrite joins every alias on the partition key (alias.w = p0.w), which drops the pairs across a bucket
-        # boundary that temporal dilation keeps; restrict the anchor alias instead (p0_alias names the p0 table here)
-        logger.warning("use_p0_table is ignored for a temporal partition key: it would put all aliases into the same bucket")
+        # boundary that temporal dilation keeps, and the pairs of different keys a lookup without key joins keeps;
+        # restrict the anchor alias instead (p0_alias names the p0 table here)
+        logger.warning("use_p0_table is ignored for a temporal partition key or skip_partition_key_joins: it would put all aliases into the same partition")
         use_p0_table = False
         p0_alias = None
     if use_p0_table:
