@@ -64,6 +64,7 @@ def mock_args():
     args.cache_optimization_method = "IN"
     args.prefer_lazy_optimization = True
     args.join_every_table = False
+    args.isolate_key_table_join = False
     args.planner_collapse_limit = None
     args.fold_key_subqueries = None
     # Add DuckDB acceleration args
@@ -809,6 +810,7 @@ class TestCacheOptimization:
             analyze_tmp_table=True,
             sql_dialect="sqlite",  # from --db-backend
             join_every_table=False,
+            isolate_key_table_join=False,
             planner_collapse_limit=None,
             fold_key_subqueries=False,
             fold_column_resolver=None,
@@ -857,6 +859,7 @@ class TestCacheOptimization:
             analyze_tmp_table=True,
             sql_dialect="sqlite",  # from --db-backend
             join_every_table=False,
+            isolate_key_table_join=False,
             planner_collapse_limit=None,
             fold_key_subqueries=False,
             fold_column_resolver=None,

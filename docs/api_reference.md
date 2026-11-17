@@ -165,6 +165,7 @@ Optimizes a query by adding partition key restrictions.
 - `p0_alias` (str | None): The alias of the table to use for the partition key. `None` detects it (`find_p0_alias`); the JOIN methods join the key table to this table only.
 - `analyze_tmp_table` (bool): Whether to create index and analyze. (only for temporary table methods)
 - `join_every_table` (bool, default `False`): `TMP_TABLE_JOIN` and `UNLOGGED_TABLE_JOIN` only. Joins the key table to every table of the `FROM`/`JOIN` list instead of the p0 table. Raises `ValueError` unless every table is connected to the others by equalities on the partition key (`a.key = b.key`, not under `OR`); only then is it equivalent to joining the p0 table.
+- `isolate_key_table_join` (bool, default `False`): `TMP_TABLE_JOIN` and `UNLOGGED_TABLE_JOIN` only (others raise `ValueError`). Writes the key table's side of the join as `ON COALESCE(tmp_<alias>.<key>, tmp_<alias>.<key>) = <alias>.<key>`. The rows are those of the plain join for every key type: the key table holds no NULL, and `COALESCE(k, k)` keeps the column's type. See [The JOIN methods and the equivalence class](#the-join-methods-and-the-equivalence-class) for when to use it. Combines with `join_every_table` (every join is written so) and with `fold_key_subqueries` (the folded key table is joined so).
 - `auto_detect_partition_join` (bool): Whether to auto-detect partition-join tables when resolving the target alias (default: True)
 - `partition_join_table` (str | None): Explicitly specified partition-join table alias or name
 
@@ -188,6 +189,14 @@ optimized = partitioncache.extend_query_with_partition_keys(
 print(optimized)
 # SELECT * FROM users WHERE age > 25 AND user_id IN (1, 5, 10, 15, 20)
 ```
+
+#### The JOIN methods and the equivalence class
+
+In a query whose tables are all equated on the partition key (`a.key = f1.key AND a.key = f2.key ...`), PostgreSQL keeps one equivalence class for the key. The JOIN methods' key table joins that class with `tmp.k = a.key`, so the planner may join it to any table of the class, not only to the restricted one, and estimates each equality through it as `1 / max(n_distinct)` of the two sides. If the restricted table is a unique list of keys and the other tables' `n_distinct` on the key is underestimated (common for large tables, where it comes from a sample), the equalities through a smaller key table become less selective than those through the list, the error compounds with every alias, and the estimate of the restricted query can be far larger than that of the unrestricted one. The planner then applies the key table last and the restricted query can be slower than without the cache.
+
+- `isolate_key_table_join=True` (`--isolate-key-table-join`) keeps the key table out of the class: it is joined to the table it is written next to, can drive an index scan of that table, and its selectivity comes from that table's statistics, as with the `*_IN` methods. Use it when the restricted table is unique on the key and larger than the key table.
+- Otherwise it can over-estimate: PostgreSQL has no statistics for `COALESCE(k, k)` and assumes 200 distinct values, so on a restricted table with fewer distinct keys than the key table the estimate grows instead. Prefer the `*_IN` methods there; they restrict through a semi-join, which only filters.
+- Correcting the statistics also helps, outside the library: `ALTER TABLE <table> ALTER COLUMN <key> SET (n_distinct = <value>)`, then `ANALYZE`.
 
 > **Executing temp-table methods (`TMP_TABLE_IN` / `TMP_TABLE_JOIN`).** These methods return a
 > **multi-statement script**: `CREATE TEMPORARY TABLE ... ON COMMIT DROP; INSERT ...; ANALYZE ...; SELECT ...`.
@@ -301,6 +310,7 @@ Lazy counterpart to `extend_query_with_partition_keys`: integrates a lazy SQL su
 - `method` (Literal["IN_SUBQUERY", "TMP_TABLE_IN", "TMP_TABLE_JOIN", "UNLOGGED_TABLE_JOIN", "UNLOGGED_TABLE_IN"]): Integration method
 - `p0_alias` (str | None, optional): Table alias for cache restrictions
 - `join_every_table` (bool, optional): JOIN methods only: join the key table to every table instead of the p0 table; see `extend_query_with_partition_keys` (default: False)
+- `isolate_key_table_join` (bool, optional): JOIN methods only: write the key table's side of the join as `COALESCE(k, k)`; see `extend_query_with_partition_keys` (default: False)
 - `min_component_size` (int, optional): Minimum size of query components to consider for cache lookup (default: 2)
 - `canonicalize_queries` (bool, optional): Whether to canonicalize queries before hashing (default: False)
 - `follow_graph` (bool, optional): Whether to follow the query graph for generating variants (default: True)
@@ -873,6 +883,7 @@ Executes and caches the variants of one query sequentially, smallest first. Each
 - An empty eager intersection means the variant has no rows; it is stored as an empty set without executing it.
 - `max_restriction_keys` (eager only): restrict only when the intersection has at most this many keys.
 - `join_every_table=True` (`TMP_TABLE_JOIN` and `UNLOGGED_TABLE_JOIN` only) joins the key table to every table of a variant; refused for keys without partition key joins. Without it, the JOIN methods join the key table to the variant's key table (p0).
+- `isolate_key_table_join=True` (`TMP_TABLE_JOIN` and `UNLOGGED_TABLE_JOIN` only) writes the key table's side of the join as `COALESCE(k, k)`; see `extend_query_with_partition_keys`.
 - `lazy=True` restricts with a subquery on the cache (`IN_SUBQUERY`, `TMP_TABLE_IN`, `TMP_TABLE_JOIN`, `UNLOGGED_TABLE_IN` or `UNLOGGED_TABLE_JOIN`); it needs an `AbstractCacheHandler_Lazy` whose tables the database can read, and no key limit.
 - Spatial and grid variants (`geometry_column`, `grid_cell_size` in `variant_settings`) are populated unrestricted with a warning.
 - Relaxations that failed, timed out or are still running have no entry and do not restrict.

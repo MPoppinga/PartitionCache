@@ -131,6 +131,12 @@ def main():
         help="With --restriction-method TMP_TABLE_JOIN or UNLOGGED_TABLE_JOIN: join the key table to every table of a variant instead of its key "
         "table; only for keys whose tables are all joined on the partition key",
     )
+    mode_group.add_argument(
+        "--isolate-key-table-join",
+        action="store_true",
+        default=False,
+        help="With --restriction-method TMP_TABLE_JOIN or UNLOGGED_TABLE_JOIN: write the key table's side of the join as COALESCE(k, k), so that PostgreSQL joins the key table to the restricted table and estimates it from that table's statistics instead of attaching it to any table equated on the partition key. For a restricted table that is unique on the key and larger than the key table; otherwise prefer the *_IN methods",
+    )
 
     # Add common argument groups
     add_cache_args(parser, require_partition_key=True)
@@ -151,6 +157,8 @@ def main():
         parser.error("--fold-key-subqueries needs a TMP_TABLE_* or UNLOGGED_TABLE_* --restriction-method")
     if args.join_every_table and args.restriction_method not in ("TMP_TABLE_JOIN", "UNLOGGED_TABLE_JOIN"):
         parser.error("--join-every-table needs --restriction-method TMP_TABLE_JOIN or UNLOGGED_TABLE_JOIN")
+    if args.isolate_key_table_join and args.restriction_method not in ("TMP_TABLE_JOIN", "UNLOGGED_TABLE_JOIN"):
+        parser.error("--isolate-key-table-join needs --restriction-method TMP_TABLE_JOIN or UNLOGGED_TABLE_JOIN")
     if args.planner_collapse_limit is not None and (args.planner_collapse_limit < 1 or not args.restriction_method.startswith(("TMP_TABLE", "UNLOGGED_TABLE"))):
         parser.error("--planner-collapse-limit needs a positive integer and a TMP_TABLE_* or UNLOGGED_TABLE_* --restriction-method")
 
@@ -383,6 +391,7 @@ def main():
                         sql_dialect=sql_dialect_for_backend(args.db_backend),
                         variant_settings=variant_settings,
                         join_every_table=args.join_every_table,
+                        isolate_key_table_join=args.isolate_key_table_join,
                         planner_collapse_limit=args.planner_collapse_limit,
                         fold_key_subqueries={None: False, "integer": True}.get(args.fold_key_subqueries, args.fold_key_subqueries),
                     )

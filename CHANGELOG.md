@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `isolate_key_table_join` (`--isolate-key-table-join` in `pcache-add` and `pcache-monitor`) for `TMP_TABLE_JOIN` and
+  `UNLOGGED_TABLE_JOIN`: the key table's side of the join is written as `COALESCE(k, k)`. The rows are unchanged. On
+  PostgreSQL the key table then stays out of the equivalence class of the partition key: it is joined to the restricted
+  table and estimated from that table's statistics, instead of being attached to any table equated on the key, where an
+  underestimated `n_distinct` of those tables could make the restricted query's estimate, and its plan, far worse than
+  the unrestricted one's. Off by default; for a restricted table that is unique on the key and larger than the key
+  table.
+
 ## 1.0.0
 
 First tagged release. The version is in `partitioncache.__version__`.
