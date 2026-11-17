@@ -1841,7 +1841,11 @@ def extend_query_with_partition_keys(
             the table it is written next to (and can drive an index scan of it) instead of to any table equated on the
             key, and its selectivity comes from that table's statistics, as for the IN methods. Use it when the
             restricted table is unique on the key and larger than the key table; otherwise the estimate (PostgreSQL's
-            default of 200 distinct values for the expression) can be too high. Default False: unchanged output.
+            default of 200 distinct values for the expression) can be too high. What it gives up: PostgreSQL no longer
+            derives the key restriction for the other tables of the class from the key table, so a plan that reaches
+            another table's index on the key through the key table is not available (unless join_every_table joins
+            the key table to every table). The effect is PostgreSQL's; on other engines only the condition's text
+            changes. Default False: unchanged output.
 
     Returns:
         str: The extended SQL query as string. An empty ``partition_keys`` set is a valid cache result

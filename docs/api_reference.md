@@ -196,6 +196,8 @@ In a query whose tables are all equated on the partition key (`a.key = f1.key AN
 
 - `isolate_key_table_join=True` (`--isolate-key-table-join`) keeps the key table out of the class: it is joined to the table it is written next to, can drive an index scan of that table, and its selectivity comes from that table's statistics, as with the `*_IN` methods. Use it when the restricted table is unique on the key and larger than the key table.
 - Otherwise it can over-estimate: PostgreSQL has no statistics for `COALESCE(k, k)` and assumes 200 distinct values, so on a restricted table with fewer distinct keys than the key table the estimate grows instead. Prefer the `*_IN` methods there; they restrict through a semi-join, which only filters.
+- What it gives up: PostgreSQL no longer derives the key restriction for the other tables of the class from the key table, so a plan that reaches another table's index on the key through the key table is not available, unless `join_every_table=True` joins the key table to every table (each join written so).
+- The effect is PostgreSQL's. The option is accepted for every `sql_dialect`; on other engines only the text of the condition changes.
 - Correcting the statistics also helps, outside the library: `ALTER TABLE <table> ALTER COLUMN <key> SET (n_distinct = <value>)`, then `ANALYZE`.
 
 > **Executing temp-table methods (`TMP_TABLE_IN` / `TMP_TABLE_JOIN`).** These methods return a
