@@ -161,7 +161,10 @@ Workers:
   support `postgis_bbox`.
 - **DuckDB acceleration** must not be used for fragments that compare text under a non-C collation, compare
   `char(n)` columns, or use a LIKE pattern whose backslash comes from data; they can produce key sets that are too
-  small.
+  small. A fragment that compares a `real` column with a decimal literal can differ by the keys whose value equals
+  the literal rounded to single precision (DuckDB compares in single precision, PostgreSQL in double): `=` and one
+  non-strict bound give more keys, `<>` and one strict bound fewer, so a key set that is too small is possible there
+  as well. Casting the column to `double precision` in the fragment avoids the difference.
 - **Lazy cache optimisation in `pcache-monitor`** reads the cache tables on the data connection. If the cache lives
   in another database that has cache tables of the same names, it reads those.
 
