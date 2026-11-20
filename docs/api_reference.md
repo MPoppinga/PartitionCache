@@ -313,6 +313,7 @@ Lazy counterpart to `extend_query_with_partition_keys`: integrates a lazy SQL su
 - `p0_alias` (str | None, optional): Table alias for cache restrictions
 - `join_every_table` (bool, optional): JOIN methods only: join the key table to every table instead of the p0 table; see `extend_query_with_partition_keys` (default: False)
 - `isolate_key_table_join` (bool, optional): JOIN methods only: write the key table's side of the join as `COALESCE(k, k)`; see `extend_query_with_partition_keys` (default: False)
+- `max_restriction_keys` (int | None, optional): A restriction with more partition keys than this is not applied, and the statistics carry `uncached_reason: "weak_restriction"`. A cached key set is a superset of the keys the query needs, so the result is the same. `apply_cache_lazy` counts the keys with one extra query and needs a PostgreSQL handler for it; with other lazy handlers the restriction is applied. (default: None, always applied)
 - `min_component_size` (int, optional): Minimum size of query components to consider for cache lookup (default: 2)
 - `canonicalize_queries` (bool, optional): Whether to canonicalize queries before hashing (default: False)
 - `follow_graph` (bool, optional): Whether to follow the query graph for generating variants (default: True)

@@ -390,6 +390,10 @@ class AbstractCacheHandler_Lazy(AbstractCacheHandler):
         """
         raise NotImplementedError
 
+    def count_lazy_keys(self, lazy_subquery: str) -> int | None:
+        """The number of partition keys a lazy intersection returns, or None if the handler cannot count them."""
+        return None
+
     @abstractmethod
     def set_cache_lazy(self, key: str, query: str, partition_key: str = "partition_key") -> bool:
         """

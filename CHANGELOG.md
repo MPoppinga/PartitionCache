@@ -11,6 +11,10 @@
   underestimated `n_distinct` of those tables could make the restricted query's estimate, and its plan, far worse than
   the unrestricted one's. Off by default; for a restricted table that is unique on the key and larger than the key
   table.
+- `max_restriction_keys` for `apply_cache` and `apply_cache_lazy`: a restriction with more partition keys than the
+  limit is not applied (`uncached_reason: "weak_restriction"`). The result is unchanged, because a cached key set
+  is a superset of the keys the query needs. Off by default; for restrictions that keep most partitions, where the
+  key table costs more than it excludes.
 
 ## 1.0.0
 

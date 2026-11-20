@@ -633,6 +633,11 @@ class PostgreSQLAbstractCacheHandler(ThreadSafeHandler, AbstractCacheHandler_Laz
             return set()
 
     @_ends_read_transaction
+    def count_lazy_keys(self, lazy_subquery: str) -> int | None:
+        self.cursor.execute(f"SELECT count(*) FROM ({lazy_subquery}) AS lazy_keys")  # type: ignore[arg-type]
+        row = self.cursor.fetchone()
+        return row[0] if row else None
+
     def get_all_keys(self, partition_key: str) -> list:
         """Get all keys for a specific partition key."""
         datatype = self._get_partition_datatype(partition_key)

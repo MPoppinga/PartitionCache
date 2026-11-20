@@ -152,6 +152,13 @@ def test_an_empty_intersection_still_returns_no_rows(points, handler, method):
     assert _run(conn, _enhanced(handler, {"h3", "h4"}, method, query)) == [(0,)]
 
 
+def test_count_lazy_keys_is_the_size_of_the_intersection(handler):
+    handler.set_cache("h1", set(range(1, 31)), "city_id")
+    handler.set_cache("h2", set(range(21, 41)), "city_id")
+    subquery, used = handler.get_intersected_lazy({"h1", "h2"}, "city_id")
+    assert used == 2 and handler.count_lazy_keys(subquery) == 10
+
+
 def test_join_without_alias_falls_back_to_the_keys_of_every_joined_table(points, handler):
     """Without an alias TMP_TABLE_JOIN joins the keys to every table, so the fallback must cover the keys of all of them."""
     conn, table = points
