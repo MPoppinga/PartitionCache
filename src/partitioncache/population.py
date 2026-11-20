@@ -128,7 +128,8 @@ def restrict_with_cache(
         variant_settings: The keyword arguments of generate_all_query_hash_pairs the variants were generated with.
         lazy: Restrict with a subquery on the cache (``get_partition_keys_lazy``) instead of the fetched keys.
         method: One of EAGER_METHODS, or with lazy one of LAZY_METHODS.
-        max_restriction_keys: Eager only: do not restrict when the intersection has more keys.
+        max_restriction_keys: Do not restrict when the intersection has more keys. Lazy counts them with one extra
+            query and needs a handler that can (``count_lazy_keys``, the PostgreSQL handlers); others restrict.
         min_cache_hits: Eager only: do not restrict with fewer cached relaxations.
         sql_dialect: Dialect of the database the variant runs on.
         join_every_table: JOIN methods only: join the key table to every table of the variant instead of its key
@@ -144,7 +145,7 @@ def restrict_with_cache(
             variant on the queried database; populate_query_variants builds one from its db_handler.
 
     Raises:
-        ValueError: For an unknown method, a key limit with lazy, a spatial or grid key, or join_every_table with
+        ValueError: For an unknown method, a spatial or grid key, or join_every_table with
             another method, a key without partition key joins, or a variant whose tables are not all joined on it.
     """
     kwargs = lookup_settings(variant_settings)
@@ -152,8 +153,6 @@ def restrict_with_cache(
     _check_isolate_key_table_join(isolate_key_table_join, method)
     if method not in (LAZY_METHODS if lazy else EAGER_METHODS):
         raise ValueError(f"Unknown {'lazy' if lazy else 'eager'} restriction method {method!r}")
-    if lazy and max_restriction_keys is not None:
-        raise ValueError("A key limit needs the key count, which only the eager lookup fetches")
     if join_every_table and kwargs["skip_partition_key_joins"]:
         raise ValueError("join_every_table needs every table joined on the partition key; variants without partition key joins are not")
 
@@ -167,6 +166,10 @@ def restrict_with_cache(
         subquery, generated, hits = get_partition_keys_lazy(query=query, cache_handler=cache_handler, partition_key=partition_key, **kwargs)
         if hits == 0 or not subquery:
             return Restriction(query, generated=generated, hits=hits, reason=_miss(generated))
+        if max_restriction_keys is not None:
+            key_count = cache_handler.count_lazy_keys(subquery)  # type: ignore[attr-defined]
+            if key_count is not None and key_count > max_restriction_keys:
+                return Restriction(query, generated=generated, hits=hits, keys=key_count, reason="over_key_limit")
         restricted = extend_query_with_partition_keys_lazy(
             query=query,
             lazy_subquery=subquery,
@@ -285,8 +288,9 @@ def populate_query_variants(
             a failure reported as an empty result would be cached as "no rows" and, through the intersection,
             empty every variant it restricts (SQLiteDBHandler logs errors and returns []).
         restrict: Restrict each variant with the cache, see ``restrict_with_cache``.
-        max_restriction_keys: Eager only: restrict only when the intersection has at most this many keys; a
-            restriction to most of the keys filters little and costs a long key list. None means no limit.
+        max_restriction_keys: Restrict only when the intersection has at most this many keys; a restriction to most
+            of the keys filters little and costs a long key list. None means no limit. See ``restrict_with_cache``
+            for lazy.
         method: How the keys are attached: IN, VALUES, TMP_TABLE_IN, TMP_TABLE_JOIN, UNLOGGED_TABLE_JOIN or
             UNLOGGED_TABLE_IN; with lazy IN_SUBQUERY or one of the table methods. An UNLOGGED_TABLE_* script drops its
             key table itself; db_handler must send it as one string (PostgresDBHandler.execute does).
@@ -297,7 +301,7 @@ def populate_query_variants(
             settings than the pairs', the lookup finds fewer relaxations, and with another skip_partition_key_joins
             it can hit entries that are not relaxations.
         lazy: Restrict with a subquery on the cache instead of the fetched keys; needs an AbstractCacheHandler_Lazy
-            whose cache the database can read, and no key limit.
+            whose cache the database can read.
         join_every_table: JOIN methods only: join the key table to every table of a variant instead of its key
             table; only for keys whose tables are all joined on the partition key (a variant whose tables are not
             is counted as a failed lookup and runs unrestricted).
@@ -323,8 +327,6 @@ def populate_query_variants(
             raise ValueError(f"Unknown {'lazy' if lazy else 'eager'} restriction method {method!r}")
         if lazy and not isinstance(cache_handler, AbstractCacheHandler_Lazy):
             raise ValueError("lazy restriction needs a cache handler with lazy intersection")
-        if lazy and max_restriction_keys is not None:
-            raise ValueError("A key limit needs the key count, which only the eager lookup fetches")
         _check_planner_collapse_limit(planner_collapse_limit, method, sql_dialect)
         _check_fold_key_subqueries(fold_key_subqueries, method, sql_dialect)
         if join_every_table and lookup_settings(variant_settings)["skip_partition_key_joins"]:

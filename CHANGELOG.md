@@ -15,6 +15,8 @@
   limit is not applied (`uncached_reason: "weak_restriction"`). The result is unchanged, because a cached key set
   is a superset of the keys the query needs. Off by default; for restrictions that keep most partitions, where the
   key table costs more than it excludes.
+- The key limit of the population path (`max_restriction_keys`, `--max-restriction-keys`) also works with lazy
+  restriction on the PostgreSQL handlers. `pcache-monitor` no longer switches to the non-lazy path for it there.
 
 ## 1.0.0
 

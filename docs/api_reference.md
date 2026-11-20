@@ -884,7 +884,7 @@ Executes and caches the variants of one query sequentially, smallest first. Each
 - For a key generated with `skip_partition_key_joins=True` the tables of a variant are not all joined on the key, so only the table whose key the variant selects is restricted.
 - Variants already in the cache are not executed; their entries restrict the others through the lookup, as do entries of other queries.
 - An empty eager intersection means the variant has no rows; it is stored as an empty set without executing it.
-- `max_restriction_keys` (eager only): restrict only when the intersection has at most this many keys.
+- `max_restriction_keys`: restrict only when the intersection has at most this many keys. With `lazy=True` the keys are counted with one extra query, which needs a PostgreSQL handler; other lazy handlers restrict without the limit.
 - `join_every_table=True` (`TMP_TABLE_JOIN` and `UNLOGGED_TABLE_JOIN` only) joins the key table to every table of a variant; refused for keys without partition key joins. Without it, the JOIN methods join the key table to the variant's key table (p0).
 - `isolate_key_table_join=True` (`TMP_TABLE_JOIN` and `UNLOGGED_TABLE_JOIN` only) writes the key table's side of the join as `COALESCE(k, k)`; see `extend_query_with_partition_keys`.
 - `lazy=True` restricts with a subquery on the cache (`IN_SUBQUERY`, `TMP_TABLE_IN`, `TMP_TABLE_JOIN`, `UNLOGGED_TABLE_IN` or `UNLOGGED_TABLE_JOIN`); it needs an `AbstractCacheHandler_Lazy` whose tables the database can read, and no key limit.

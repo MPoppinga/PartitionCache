@@ -373,15 +373,14 @@ class TestLookupSettings:
         assert stats.restricted == 0 and stats.executed == len(_pairs())
         assert "populated unrestricted" in caplog.text
 
-    def test_lazy_needs_a_lazy_handler_and_no_key_limit(self):
+    def test_lazy_needs_a_lazy_handler(self):
         from unittest.mock import Mock
 
         from partitioncache.cache_handler.abstract import AbstractCacheHandler_Lazy
 
         with pytest.raises(ValueError, match="lazy intersection"):
             populate_query_variants([], "pk", FakeCache(), None, lazy=True, method="IN_SUBQUERY")  # type: ignore[arg-type]
-        with pytest.raises(ValueError, match="key limit"):
-            populate_query_variants([], "pk", Mock(spec=AbstractCacheHandler_Lazy), None, lazy=True, method="IN_SUBQUERY", max_restriction_keys=5)  # type: ignore[arg-type]
+        populate_query_variants([], "pk", Mock(spec=AbstractCacheHandler_Lazy), None, lazy=True, method="IN_SUBQUERY", max_restriction_keys=5)  # type: ignore[arg-type]
         with pytest.raises(ValueError, match="method"):
             populate_query_variants([], "pk", FakeCache(), None, method="IN_SUBQUERY")  # type: ignore[arg-type]
 

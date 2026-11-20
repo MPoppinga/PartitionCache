@@ -597,7 +597,7 @@ Cache-aware optimization leverages existing cache entries to restrict the search
   - **Default**: 1
   - **Note**: Only applies to non-lazy methods (IN, VALUES)
   - **Purpose**: Avoid optimization overhead for minimal cache hits
-- `--max-restriction-keys N` - Only restrict a variant when the cached intersection has at most N keys
+- `--max-restriction-keys N` - Only restrict a variant when the cached intersection has at most N keys. With a PostgreSQL cache handler the lazy path stays lazy and counts the keys with one extra query; other handlers take the non-lazy path
   - **Default**: no limit
   - **Purpose**: Skip restrictions that filter little; a restriction to most of the keys costs a long key list or temp table and saves almost nothing
   - **Sizing**: a fraction of the number of distinct partition keys, e.g. a quarter

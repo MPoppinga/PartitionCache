@@ -16,6 +16,7 @@ import psycopg
 from partitioncache.apply_cache import catalog_column_resolver
 from partitioncache.cache_handler import get_cache_handler
 from partitioncache.cache_handler.abstract import AbstractCacheHandler_Lazy
+from partitioncache.cache_handler.postgresql_abstract import PostgreSQLAbstractCacheHandler
 from partitioncache.cli.common_args import (
     add_database_args,
     add_environment_args,
@@ -343,8 +344,9 @@ def apply_cache_optimization(query: str, query_hash: str, partition_key: str, pa
         return query, False, stats
 
     max_keys = args.max_restriction_keys
-    # A key limit needs the key count, which only the eager path fetches
-    use_lazy = args.prefer_lazy_optimization and isinstance(cache_handler, AbstractCacheHandler_Lazy) and max_keys is None
+    # A key limit needs the key count: the PostgreSQL handlers count a lazy intersection, others take the eager path
+    can_count = max_keys is None or isinstance(cache_handler, PostgreSQLAbstractCacheHandler)
+    use_lazy = args.prefer_lazy_optimization and isinstance(cache_handler, AbstractCacheHandler_Lazy) and can_count
     method = (LAZY_METHOD_MAP if use_lazy else EAGER_METHOD_MAP).get(args.cache_optimization_method, "IN_SUBQUERY" if use_lazy else "IN")
     try:
         fold = _fold_mode(args.fold_key_subqueries)
@@ -986,7 +988,8 @@ def main():
         "--max-restriction-keys",
         type=int,
         default=None,
-        help="Only restrict a variant when the cached intersection has at most this many keys; implies non-lazy optimization (default: no limit)",
+        help="Only restrict a variant when the cached intersection has at most this many keys; non-lazy optimization unless the cache is a "
+        "PostgreSQL handler, which counts the keys with one extra query (default: no limit)",
     )
     optimization_group.add_argument("--prefer-lazy-optimization", action="store_true", default=True, help="Prefer lazy methods when available (default: True)")
     optimization_group.add_argument(
