@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- `get_all_keys` of the PostgreSQL cache handlers ends its read transaction again. In 1.1.0 it left the connection
+  idle in transaction until the next commit or rollback.
+
 ## 1.1.0
 
 ### Added
