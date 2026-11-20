@@ -91,6 +91,10 @@ def _respond(text: str, params) -> list:
         return [("k", "integer")]
     if "SELECT query_hash, query FROM" in text:
         return [(k, "SELECT 1") for k in ENTRIES]
+    if "SELECT query_hash FROM" in text:
+        return [(k,) for k in ENTRIES]
+    if "SELECT count(*) FROM" in text:
+        return [(2,)]
     raise AssertionError(f"unexpected statement: {text}")
 
 
@@ -133,3 +137,13 @@ def test_a_failed_read_returns_unknown_and_later_reads_work(handler, after_open_
 
     assert read(handler) == expected
     assert handler.get("h1", "k") == {1, 2, 3}
+
+
+@pytest.mark.parametrize(
+    ("read", "expected"),
+    [(lambda h: h.get_all_keys("k"), ["h1", "h2"]), (lambda h: h.count_lazy_keys("SELECT 1 AS k"), 2)],
+    ids=["get_all_keys", "count_lazy_keys"],
+)
+def test_a_read_ends_the_transaction_it_opened(handler, read, expected):
+    assert read(handler) == expected
+    assert handler.db.info.transaction_status == TransactionStatus.IDLE
