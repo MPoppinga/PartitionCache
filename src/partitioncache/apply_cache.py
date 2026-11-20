@@ -2941,6 +2941,7 @@ def apply_cache_lazy(
     fold_key_subqueries: bool | str = False,
     fold_column_resolver: ColumnResolver | None = None,
     fold_assume_inner_columns: bool = False,
+    max_restriction_keys: int | None = None,
     **kwargs: Any,
 ) -> tuple[str, dict[str, int]]:
     """
@@ -2987,6 +2988,10 @@ def apply_cache_lazy(
         isolate_key_table_join: TMP_TABLE_JOIN and UNLOGGED_TABLE_JOIN only: write the key table's side of the ON
             clause as ``COALESCE(k, k)``, so that PostgreSQL joins the key table to the restricted table and estimates
             it from that table. See extend_query_with_partition_keys.
+        max_restriction_keys: A restriction with more partition keys than this is not applied; the statistics then
+            carry ``uncached_reason: "weak_restriction"``. A cached key set is a superset of the keys the query
+            needs, so the result is the same. None (default) always applies the restriction. Needs a handler
+            that can count the keys of a lazy intersection (the PostgreSQL handlers); others apply the restriction.
         planner_collapse_limit: If set to N, a rewritten script begins with ``SET LOCAL join_collapse_limit = N;`` and
             ``SET LOCAL from_collapse_limit = N;`` (``geqo`` is not touched). Needs a script method (TMP_TABLE_*,
             UNLOGGED_TABLE_*) and PostgreSQL, else ValueError (checked before the lookup). Not applied when the query
@@ -3244,6 +3249,11 @@ def apply_cache_lazy(
     if not lazy_cache_subquery or not lazy_cache_subquery.strip():
         return working_query, stats
 
+    if max_restriction_keys is not None:
+        key_count = cache_handler.count_lazy_keys(lazy_cache_subquery)
+        if key_count is not None and key_count > max_restriction_keys:
+            return working_query, {**stats, "uncached_reason": "weak_restriction"}
+
     # Step 3: Apply partition key restrictions
     cache_target_alias: str | None
     if use_p0_table and p0_rewritten:
@@ -3317,6 +3327,7 @@ def apply_cache(
     fold_key_subqueries: bool | str = False,
     fold_column_resolver: ColumnResolver | None = None,
     fold_assume_inner_columns: bool = False,
+    max_restriction_keys: int | None = None,
     **kwargs: Any,
 ) -> tuple[str, dict[str, int]]:
     """
@@ -3380,6 +3391,9 @@ def apply_cache(
         isolate_key_table_join: TMP_TABLE_JOIN and UNLOGGED_TABLE_JOIN only: write the key table's side of the ON
             clause as ``COALESCE(k, k)``, so that PostgreSQL joins the key table to the restricted table and estimates
             it from that table. See extend_query_with_partition_keys.
+        max_restriction_keys: A restriction with more partition keys than this is not applied; the statistics then
+            carry ``uncached_reason: "weak_restriction"``. A cached key set is a superset of the keys the query
+            needs, so the result is the same. None (default) always applies the restriction.
         planner_collapse_limit: If set to N, a rewritten script begins with ``SET LOCAL join_collapse_limit = N;`` and
             ``SET LOCAL from_collapse_limit = N;``; see ``apply_cache_lazy``. None (default) is off.
         geometry_column: If set, enables spatial cache mode. Uses this geometry column for variant
@@ -3675,6 +3689,9 @@ def apply_cache(
         stats["enhanced"] = 1
         logger.info(f"Cache intersection of {used_hashes} cache hits is empty, restricting query to no rows")
         return _add_empty_intersection_condition(working_query, sql_dialect), stats
+
+    if max_restriction_keys is not None and len(partition_keys) > max_restriction_keys:
+        return working_query, {**stats, "uncached_reason": "weak_restriction"}
 
     # Step 3: Apply the partition keys to the working query
     # Determine the correct alias for cache restrictions
