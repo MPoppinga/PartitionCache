@@ -1009,6 +1009,42 @@ def _create_tmp_table_setup(
 UNLOGGED_TABLE_PREFIX = "partitioncache_unl_"
 # The key table is joined to the p0 table (as the IN methods restrict it), or with join_every_table to every table
 _TABLE_JOIN_METHODS = ("TMP_TABLE_JOIN", "UNLOGGED_TABLE_JOIN")
+
+
+def _check_isolate_key_table_join(isolate_key_table_join: bool, method: str) -> None:
+    """Raise ValueError for ``isolate_key_table_join`` with a method that does not join a key table."""
+    if isolate_key_table_join and method not in _TABLE_JOIN_METHODS:
+        raise ValueError(f"isolate_key_table_join applies to {' and '.join(_TABLE_JOIN_METHODS)}, not to {method}")
+
+
+def _join_key_table(
+    parsed_query: exp.Expr, table_name: str, key_column: str, partition_key: str, p0_alias: str | None, sql_dialect: str, isolate_key_table_join: bool
+) -> None:
+    """Join the key table to the p0 table, or with p0_alias None (join_every_table) to every table, of the restricted SELECT.
+
+    With ``isolate_key_table_join`` the key table's side of the ON clause is ``COALESCE(k, k)``. It is the key itself (the
+    key table holds no NULL) and keeps its type, but PostgreSQL has no statistics for it, and the key table's column no
+    longer stands for the partition key in the planner's estimates: the key table is joined to the table it is written
+    next to and is estimated from that table's statistics, instead of being joined to any table equated on the
+    partition key.
+    """
+    for from_clause in _from_clauses(parsed_query):
+        table_alias = from_clause.alias_or_name
+        if p0_alias is not None and table_alias != p0_alias:
+            continue
+        key: exp.Expr = exp.Identifier(this=f"tmp_{table_alias}.{key_column}")
+        if isolate_key_table_join:
+            key = exp.Coalesce(this=key, expressions=[key.copy()])
+        join_expr = (
+            from_clause.this.sql(dialect=sql_dialect)  # Original table
+            + " "  # Space between tables
+            + exp.Join(
+                this=exp.Identifier(this=f"{table_name} AS tmp_{table_alias}"),
+                on=exp.EQ(this=key, expression=exp.Identifier(this=f"{table_alias}.{partition_key}")),
+                kind="INNER",
+            ).sql(dialect=sql_dialect)
+        )
+        from_clause.this.replace(join_expr)
 # Methods whose rewrite is a script (key table setup, then the SELECT); only these take planner_collapse_limit
 _SCRIPT_METHODS = ("TMP_TABLE_IN", "TMP_TABLE_JOIN", "UNLOGGED_TABLE_JOIN", "UNLOGGED_TABLE_IN")
 # The planner settings of planner_collapse_limit, emitted in this order as the first statements of the script
@@ -1753,6 +1789,7 @@ def extend_query_with_partition_keys(
     fold_key_subqueries: bool | str = False,
     fold_column_resolver: ColumnResolver | None = None,
     fold_assume_inner_columns: bool = False,
+    isolate_key_table_join: bool = False,
 ) -> str:
     """
     Extend a given SQL query with the cache functionality.
@@ -1798,6 +1835,17 @@ def extend_query_with_partition_keys(
             Default False. On PostgreSQL a wrong statement makes the script fail ("column does not exist"), it cannot
             change the rows; on the other dialects the key table's column names (partition_key, pcache_key) stay
             refused.
+        isolate_key_table_join: JOIN methods only (others raise ValueError): write the key table's side of the ON clause
+            as ``COALESCE(tmp_<alias>.<key>, tmp_<alias>.<key>)``. The rows are the same. On PostgreSQL the key table's
+            column then does not join the planner's equivalence class of the partition key: the key table is joined to
+            the table it is written next to (and can drive an index scan of it) instead of to any table equated on the
+            key, and its selectivity comes from that table's statistics, as for the IN methods. Use it when the
+            restricted table is unique on the key and larger than the key table; otherwise the estimate (PostgreSQL's
+            default of 200 distinct values for the expression) can be too high. What it gives up: PostgreSQL no longer
+            derives the key restriction for the other tables of the class from the key table, so a plan that reaches
+            another table's index on the key through the key table is not available (unless join_every_table joins
+            the key table to every table). The effect is PostgreSQL's; on other engines only the condition's text
+            changes. Default False: unchanged output.
 
     Returns:
         str: The extended SQL query as string. An empty ``partition_keys`` set is a valid cache result
@@ -1811,6 +1859,7 @@ def extend_query_with_partition_keys(
     """
     _check_planner_collapse_limit(planner_collapse_limit, method, sql_dialect)
     _check_fold_key_subqueries(fold_key_subqueries, method, sql_dialect)
+    _check_isolate_key_table_join(isolate_key_table_join, method)
     if not partition_keys:
         return _add_empty_intersection_condition(query, sql_dialect)
     _refuse_float_keys(partition_keys, method)
@@ -1862,29 +1911,7 @@ def extend_query_with_partition_keys(
             tmp_table_setup, table_name = _create_tmp_table_setup(partition_keys, analyze_tmp_table, sql_dialect, key_filters, key_column)
 
         # Add as inner join to the p0 table, or with join_every_table to every table, of the restricted SELECT only
-        for from_clause in _from_clauses(parsed_query):
-            # Get alias of the table
-            table_alias = from_clause.alias_or_name
-
-            if p0_alias is not None and table_alias != p0_alias:
-                continue
-
-            # Create the new join expression using sqlglot
-            join_expr = (
-                from_clause.this.sql(dialect=sql_dialect)  # Original table
-                + " "  # Space between tables
-                + exp.Join(
-                    this=exp.Identifier(this=f"{table_name} AS tmp_{table_alias}"),
-                    on=exp.EQ(
-                        this=exp.Identifier(this=f"tmp_{table_alias}.{key_column}"),
-                        expression=exp.Identifier(this=f"{table_alias}.{partition_key}"),
-                    ),
-                    kind="INNER",
-                ).sql(dialect=sql_dialect)  # New join expression
-            )
-
-            # Replace the old join expression with the new one
-            from_clause.this.replace(join_expr)
+        _join_key_table(parsed_query, table_name, key_column, partition_key, p0_alias, sql_dialect, isolate_key_table_join)
 
         script = _planner_collapse_limit_sql(planner_collapse_limit) + tmp_table_setup + parsed_query.sql(dialect=sql_dialect)
         if method == "UNLOGGED_TABLE_JOIN":
@@ -1979,6 +2006,7 @@ def extend_query_with_partition_keys_lazy(
     fold_column_resolver: ColumnResolver | None = None,
     fold_assume_inner_columns: bool = False,
     partition_datatype: str | None = None,
+    isolate_key_table_join: bool = False,
 ) -> str:
     """
     Extend a given SQL query with the cache functionality using a lazy SQL subquery.
@@ -2010,12 +2038,15 @@ def extend_query_with_partition_keys_lazy(
             keys are not known here. For a non-integer datatype the key tables take the key column's type and
             IN_SUBQUERY is guarded against a char(n) / real column, which it would silently miss; folding needs it too.
             None (unknown): neither, the script is built as for integer keys.
+        isolate_key_table_join: JOIN methods only: write the key table's side of the ON clause as ``COALESCE(k, k)``;
+            see ``extend_query_with_partition_keys``.
 
     Returns:
         str: The extended SQL query as string.
     """
     _check_planner_collapse_limit(planner_collapse_limit, method, sql_dialect)
     _check_fold_key_subqueries(fold_key_subqueries, method, sql_dialect)
+    _check_isolate_key_table_join(isolate_key_table_join, method)
     if not lazy_subquery or not lazy_subquery.strip():
         return query
 
@@ -2088,29 +2119,7 @@ def extend_query_with_partition_keys_lazy(
             tmp_table_setup, table_name = _create_tmp_table_setup_from_subquery(lazy_subquery, key_column, analyze_tmp_table, sql_dialect, key_filters)
 
         # Add as inner join to the p0 table, or with join_every_table to every table, of the restricted SELECT only
-        for from_clause in _from_clauses(parsed_query):
-            # Get alias of the table
-            table_alias = from_clause.alias_or_name
-
-            if p0_alias is not None and table_alias != p0_alias:
-                continue
-
-            # Create the new join expression using sqlglot
-            join_expr = (
-                from_clause.this.sql(dialect=sql_dialect)  # Original table
-                + " "  # Space between tables
-                + exp.Join(
-                    this=exp.Identifier(this=f"{table_name} AS tmp_{table_alias}"),
-                    on=exp.EQ(
-                        this=exp.Identifier(this=f"tmp_{table_alias}.{key_column}"),
-                        expression=exp.Identifier(this=f"{table_alias}.{partition_key}"),
-                    ),
-                    kind="INNER",
-                ).sql(dialect=sql_dialect)  # New join expression
-            )
-
-            # Replace the old join expression with the new one
-            from_clause.this.replace(join_expr)
+        _join_key_table(parsed_query, table_name, key_column, partition_key, p0_alias, sql_dialect, isolate_key_table_join)
 
         script = _planner_collapse_limit_sql(planner_collapse_limit) + tmp_table_setup + parsed_query.sql(dialect=sql_dialect)
         if method == "UNLOGGED_TABLE_JOIN":
@@ -2927,6 +2936,7 @@ def apply_cache_lazy(
     min_query_cost: float | None = None,
     keep_all_attributes: bool = False,
     join_every_table: bool = False,
+    isolate_key_table_join: bool = False,
     planner_collapse_limit: int | None = None,
     fold_key_subqueries: bool | str = False,
     fold_column_resolver: ColumnResolver | None = None,
@@ -2974,6 +2984,9 @@ def apply_cache_lazy(
         join_every_table: TMP_TABLE_JOIN and UNLOGGED_TABLE_JOIN only: join the key table to every table instead of
             the p0 table; raises ValueError unless every table is joined on the partition key. See
             extend_query_with_partition_keys.
+        isolate_key_table_join: TMP_TABLE_JOIN and UNLOGGED_TABLE_JOIN only: write the key table's side of the ON
+            clause as ``COALESCE(k, k)``, so that PostgreSQL joins the key table to the restricted table and estimates
+            it from that table. See extend_query_with_partition_keys.
         planner_collapse_limit: If set to N, a rewritten script begins with ``SET LOCAL join_collapse_limit = N;`` and
             ``SET LOCAL from_collapse_limit = N;`` (``geqo`` is not touched). Needs a script method (TMP_TABLE_*,
             UNLOGGED_TABLE_*) and PostgreSQL, else ValueError (checked before the lookup). Not applied when the query
@@ -3018,6 +3031,7 @@ def apply_cache_lazy(
         auto_detect_partition_join = deprecated["auto_detect_partition_join"]
     _check_fold_key_subqueries(fold_key_subqueries, method, sql_dialect)
     _check_planner_collapse_limit(planner_collapse_limit, method, sql_dialect)
+    _check_isolate_key_table_join(isolate_key_table_join, method)
 
     gated, gate_stats = _check_cost_gate(query, cost_estimator, min_query_cost)
     if gated:
@@ -3248,6 +3262,7 @@ def apply_cache_lazy(
         partition_join_table=partition_join_table,
         sql_dialect=sql_dialect,
         join_every_table=join_every_table,
+        isolate_key_table_join=isolate_key_table_join,
         planner_collapse_limit=planner_collapse_limit,
         fold_key_subqueries=fold_key_subqueries,
         fold_column_resolver=fold_column_resolver,
@@ -3297,6 +3312,7 @@ def apply_cache(
     protected_patterns: list[str] | None = None,
     sql_dialect: str = "postgres",
     join_every_table: bool = False,
+    isolate_key_table_join: bool = False,
     planner_collapse_limit: int | None = None,
     fold_key_subqueries: bool | str = False,
     fold_column_resolver: ColumnResolver | None = None,
@@ -3361,6 +3377,9 @@ def apply_cache(
         join_every_table: TMP_TABLE_JOIN and UNLOGGED_TABLE_JOIN only: join the key table to every table instead of
             the p0 table; raises ValueError unless every table is joined on the partition key. See
             extend_query_with_partition_keys.
+        isolate_key_table_join: TMP_TABLE_JOIN and UNLOGGED_TABLE_JOIN only: write the key table's side of the ON
+            clause as ``COALESCE(k, k)``, so that PostgreSQL joins the key table to the restricted table and estimates
+            it from that table. See extend_query_with_partition_keys.
         planner_collapse_limit: If set to N, a rewritten script begins with ``SET LOCAL join_collapse_limit = N;`` and
             ``SET LOCAL from_collapse_limit = N;``; see ``apply_cache_lazy``. None (default) is off.
         geometry_column: If set, enables spatial cache mode. Uses this geometry column for variant
@@ -3430,6 +3449,7 @@ def apply_cache(
         auto_detect_partition_join = deprecated["auto_detect_partition_join"]
     _check_fold_key_subqueries(fold_key_subqueries, method, "postgres")
     _check_planner_collapse_limit(planner_collapse_limit, method, "postgres")  # the eager rewrite below renders PostgreSQL
+    _check_isolate_key_table_join(isolate_key_table_join, method)
 
     gated, gate_stats = _check_cost_gate(query, cost_estimator, min_query_cost)
     if gated:
@@ -3677,6 +3697,7 @@ def apply_cache(
         partition_join_table=partition_join_table,
         sql_dialect=sql_dialect,
         join_every_table=join_every_table,
+        isolate_key_table_join=isolate_key_table_join,
         planner_collapse_limit=planner_collapse_limit,
         fold_key_subqueries=fold_key_subqueries,
         fold_column_resolver=fold_column_resolver,

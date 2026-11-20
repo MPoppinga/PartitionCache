@@ -359,6 +359,7 @@ def apply_cache_optimization(query: str, query_hash: str, partition_key: str, pa
                 max_restriction_keys=max_keys,
                 min_cache_hits=args.min_cache_hits,
                 join_every_table=args.join_every_table,
+                isolate_key_table_join=args.isolate_key_table_join,
                 planner_collapse_limit=args.planner_collapse_limit,
                 fold_key_subqueries=fold,
                 fold_column_resolver=column_resolver,
@@ -974,6 +975,12 @@ def main():
         help="With TMP_TABLE_JOIN or UNLOGGED_TABLE_JOIN: join the key table to every table of a fragment instead of its key table (the monitor's "
         "behavior before 2026-11). Only for keys whose tables are all joined on the partition key; other fragments run unrestricted",
     )
+    optimization_group.add_argument(
+        "--isolate-key-table-join",
+        action="store_true",
+        default=False,
+        help="With TMP_TABLE_JOIN or UNLOGGED_TABLE_JOIN: write the key table's side of the join as COALESCE(k, k), so that PostgreSQL joins the key table to the restricted table and estimates it from that table's statistics instead of attaching it to any table equated on the partition key. For a restricted table that is unique on the key and larger than the key table; otherwise prefer the *_IN methods",
+    )
     optimization_group.add_argument("--min-cache-hits", type=int, default=1, help="Minimum cache hits required for non-lazy optimization (default: 1)")
     optimization_group.add_argument(
         "--max-restriction-keys",
@@ -1034,6 +1041,8 @@ def main():
         parser.error("--max-restriction-keys must not be negative")
     if args.join_every_table and args.cache_optimization_method not in JOIN_METHODS:
         parser.error("--join-every-table needs --cache-optimization-method TMP_TABLE_JOIN or UNLOGGED_TABLE_JOIN")
+    if args.isolate_key_table_join and args.cache_optimization_method not in JOIN_METHODS:
+        parser.error("--isolate-key-table-join needs --cache-optimization-method TMP_TABLE_JOIN or UNLOGGED_TABLE_JOIN")
     if args.fold_key_subqueries is not None and args.cache_optimization_method not in _TABLE_METHODS:
         parser.error("--fold-key-subqueries needs a TMP_TABLE_* or UNLOGGED_TABLE_* --cache-optimization-method")
     if args.planner_collapse_limit is not None:
@@ -1160,6 +1169,7 @@ def main():
             logger.info(f"  - Planner collapse limit: {args.planner_collapse_limit}")
         if args.cache_optimization_method in JOIN_METHODS:
             logger.info(f"  - Joined tables: {'every table (--join-every-table)' if args.join_every_table else 'the key table of each fragment'}")
+            logger.info(f"  - Key table join: {'COALESCE(k, k), isolated (--isolate-key-table-join)' if args.isolate_key_table_join else 'k'}")
         # The lookup generates each fragment's sub-variants with these settings, also for fragments that another
         # client generated and pushed; generated with other settings, they find fewer cached relaxations
         settings = variant_settings(args, constraint_args, "<partition key>", None)

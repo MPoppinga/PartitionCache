@@ -20,6 +20,7 @@ from partitioncache.apply_cache import (
     ColumnResolver,
     _cache_datatype,
     _check_fold_key_subqueries,
+    _check_isolate_key_table_join,
     _check_planner_collapse_limit,
     catalog_column_resolver,
     extend_query_with_partition_keys,
@@ -107,6 +108,7 @@ def restrict_with_cache(
     min_cache_hits: int = 1,
     sql_dialect: str = "postgres",
     join_every_table: bool = False,
+    isolate_key_table_join: bool = False,
     planner_collapse_limit: int | None = None,
     fold_key_subqueries: bool | str = False,
     fold_column_resolver: ColumnResolver | None = None,
@@ -131,6 +133,8 @@ def restrict_with_cache(
         sql_dialect: Dialect of the database the variant runs on.
         join_every_table: JOIN methods only: join the key table to every table of the variant instead of its key
             table; refused (ValueError) unless every table is joined on the partition key.
+        isolate_key_table_join: JOIN methods only: write the key table's side of the ON clause as ``COALESCE(k, k)``
+            (see ``extend_query_with_partition_keys``); other methods raise ValueError.
         planner_collapse_limit: Script methods and PostgreSQL only: the script begins with SET LOCAL
             join_collapse_limit / from_collapse_limit = N.
         fold_key_subqueries: Key-table methods only: fold the variant's partition key subqueries into the key table
@@ -145,6 +149,7 @@ def restrict_with_cache(
     """
     kwargs = lookup_settings(variant_settings)
     _check_fold_key_subqueries(fold_key_subqueries, method, sql_dialect)
+    _check_isolate_key_table_join(isolate_key_table_join, method)
     if method not in (LAZY_METHODS if lazy else EAGER_METHODS):
         raise ValueError(f"Unknown {'lazy' if lazy else 'eager'} restriction method {method!r}")
     if lazy and max_restriction_keys is not None:
@@ -171,6 +176,7 @@ def restrict_with_cache(
             analyze_tmp_table=True,
             sql_dialect=sql_dialect,
             join_every_table=join_every_table,
+            isolate_key_table_join=isolate_key_table_join,
             planner_collapse_limit=planner_collapse_limit,
             fold_key_subqueries=fold_key_subqueries,
             fold_column_resolver=fold_column_resolver,
@@ -199,6 +205,7 @@ def restrict_with_cache(
         analyze_tmp_table=True,
         sql_dialect=sql_dialect,
         join_every_table=join_every_table,
+        isolate_key_table_join=isolate_key_table_join,
         planner_collapse_limit=planner_collapse_limit,
         fold_key_subqueries=fold_key_subqueries,
         fold_column_resolver=fold_column_resolver,
@@ -264,6 +271,7 @@ def populate_query_variants(
     variant_settings: Mapping[str, Any] | None = None,
     lazy: bool = False,
     join_every_table: bool = False,
+    isolate_key_table_join: bool = False,
     planner_collapse_limit: int | None = None,
     fold_key_subqueries: bool | str = False,
 ) -> PopulationStats:
@@ -293,6 +301,8 @@ def populate_query_variants(
         join_every_table: JOIN methods only: join the key table to every table of a variant instead of its key
             table; only for keys whose tables are all joined on the partition key (a variant whose tables are not
             is counted as a failed lookup and runs unrestricted).
+        isolate_key_table_join: JOIN methods only: write the key table's side of the ON clause as ``COALESCE(k, k)``
+            (see ``extend_query_with_partition_keys``); other methods raise ValueError.
         planner_collapse_limit: Script methods and PostgreSQL only: restricted variants begin with SET LOCAL
             join_collapse_limit / from_collapse_limit = N. None (default) is off.
         fold_key_subqueries: Key-table methods only: fold each variant's partition key subqueries into its key table,
@@ -342,6 +352,7 @@ def populate_query_variants(
                     max_restriction_keys=max_restriction_keys,
                     sql_dialect=sql_dialect,
                     join_every_table=join_every_table,
+                    isolate_key_table_join=isolate_key_table_join,
                     planner_collapse_limit=planner_collapse_limit,
                     fold_key_subqueries=fold_key_subqueries,
                     fold_column_resolver=fold_column_resolver,

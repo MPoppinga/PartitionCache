@@ -335,6 +335,7 @@ Advanced options for controlling how query variants are generated for better cac
 - `--fold-key-subqueries [integer|any_key_type]`: with a `TMP_TABLE_*` or `UNLOGGED_TABLE_*` restriction method, fold each variant's partition key subqueries into its key table (default: off)
 - `--planner-collapse-limit N`: with a `TMP_TABLE_*` or `UNLOGGED_TABLE_*` restriction method, begin each restricted variant with `SET LOCAL join_collapse_limit = N` and `from_collapse_limit = N`
 - `--join-every-table`: with `--restriction-method TMP_TABLE_JOIN` or `UNLOGGED_TABLE_JOIN`, join the key table to every table of a variant instead of its key table; only for keys whose tables are all joined on the partition key
+- `--isolate-key-table-join`: with `--restriction-method TMP_TABLE_JOIN` or `UNLOGGED_TABLE_JOIN`, write the key table's side of the join as `COALESCE(k, k)`, so that PostgreSQL joins the key table to the restricted table and estimates it from that table (default: off). For a restricted table that is unique on the key and larger than the key table; see [The JOIN methods and the equivalence class](api_reference.md#the-join-methods-and-the-equivalence-class)
 
 #### Queue Processing
 ```bash
@@ -589,6 +590,9 @@ Cache-aware optimization leverages existing cache entries to restrict the search
 - `--join-every-table` - With `TMP_TABLE_JOIN` or `UNLOGGED_TABLE_JOIN`: join the key table to every table of a fragment instead of its key table
   - **Default**: off. Before 2026-11 the monitor joined every table; pass this flag to reproduce such runs
   - **Only for keys whose tables are all joined on the partition key**: a fragment whose tables are not (keys in `--skip-partition-key-joins`, dimension joins) is refused and runs unrestricted, counted as a failed lookup
+- `--isolate-key-table-join` - With `TMP_TABLE_JOIN` or `UNLOGGED_TABLE_JOIN`: write the key table's side of the join as `COALESCE(k, k)`
+  - **Default**: off, the join is written as before
+  - **When**: the restricted table is unique on the key and larger than the key table; it keeps PostgreSQL from attaching the key table to the other tables equated on the key. Otherwise prefer the `*_IN` methods. See [The JOIN methods and the equivalence class](api_reference.md#the-join-methods-and-the-equivalence-class)
 - `--min-cache-hits MIN_CACHE_HITS` - Minimum cache hits required for non-lazy optimization
   - **Default**: 1
   - **Note**: Only applies to non-lazy methods (IN, VALUES)
