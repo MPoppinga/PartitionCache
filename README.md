@@ -35,7 +35,7 @@ Partition-based query optimization middleware for heavily partitioned datasets. 
 ## Installation
 
 ```bash
-pip install "partitioncache[db] @ git+https://github.com/MPoppinga/PartitionCache@v1.1.0"
+pip install "partitioncache[db] @ git+https://github.com/MPoppinga/PartitionCache@v1.1.1"
 ```
 
 The `db` extra installs the database drivers (psycopg, redis, rocksdict, duckdb, mysql-connector-python); without it
