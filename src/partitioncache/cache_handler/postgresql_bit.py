@@ -587,6 +587,11 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
 
         BIT_AND skips missing entries and is NULL only when none is left; the array is then NULL as well. An
         intersection without set bits gives ``'{}'`` (array_agg over no rows would be NULL).
+
+        ``bit_result`` is referenced only once: PostgreSQL materializes a CTE that is referenced more than once,
+        and a CTE Scan is parallel restricted, which would keep the statement this subquery is embedded in from
+        a parallel plan. A NULL intersection therefore keeps one row (index 0, get_bit NULL), which the NULL
+        check in the aggregate sees.
         """
         return sql.SQL("""(
         WITH bit_result AS (
@@ -595,12 +600,12 @@ class PostgreSQLBitCacheHandler(PostgreSQLAbstractCacheHandler):
         numbered_bits AS (
             SELECT
                 bit_result,
-                generate_series(0, bit_length(bit_result) - 1) AS bit_index
+                generate_series(0, COALESCE(bit_length(bit_result), 1) - 1) AS bit_index
             FROM bit_result
         )
-        SELECT CASE WHEN (SELECT bit_result FROM bit_result) IS NULL THEN NULL ELSE COALESCE(array_agg(bit_index), '{{}}') END
+        SELECT CASE WHEN bool_or(bit_result IS NULL) THEN NULL ELSE COALESCE(array_agg(bit_index), '{{}}') END
         FROM numbered_bits
-        WHERE get_bit(bit_result, bit_index) = 1)""").format(sql.SQL(intersect_sql_str))  # type: ignore[arg-type]
+        WHERE get_bit(bit_result, bit_index) IS DISTINCT FROM 0)""").format(sql.SQL(intersect_sql_str))  # type: ignore[arg-type]
 
     def _expand_bitsize(self, partition_key: str, max_key: int, current_bitsize: int | None) -> int:
         """Grow the partition's bit arrays so that max_key fits, plus the configured buffer.
