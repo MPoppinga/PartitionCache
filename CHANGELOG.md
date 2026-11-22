@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.1.2
+
+### Fixed
+
+- The lazy intersection of `postgresql_bit` (`get_intersected_lazy`, `get_intersected_dilated_lazy`) reads its CTE
+  once again. Since 1.0.0 the check for evicted entries read it a second time, so PostgreSQL materialized it. A CTE
+  Scan is parallel restricted: a statement restricted with `IN_SUBQUERY` could no longer get a parallel plan over the
+  whole statement. The keys and the fallback for evicted entries are unchanged. The key-table methods and
+  `count_lazy_keys` embed the same subquery, so their text changes the same way; the other handlers are unchanged.
+
 ## 1.1.1
 
 ### Fixed

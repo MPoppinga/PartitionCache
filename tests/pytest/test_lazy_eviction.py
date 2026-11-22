@@ -261,3 +261,44 @@ def test_array_keys_of_other_types_are_restricted_and_fall_back(method, datatype
             cur.execute(f"DROP TABLE IF EXISTS {table}")
         conn.commit()
         conn.close()
+
+
+def _parallel_plan(conn, statement):
+    """The plan of ``statement`` with debug_parallel_query on: its top node is a Gather only if the whole plan is parallel safe."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT current_setting('server_version_num')::int")
+        setting = "debug_parallel_query" if cur.fetchone()[0] >= 160000 else "force_parallel_mode"
+        cur.execute(f"SET LOCAL {setting} = on")
+        cur.execute("EXPLAIN (FORMAT JSON) " + statement)
+        plan = cur.fetchone()[0][0]["Plan"]
+    conn.rollback()
+    return plan
+
+
+def _node_types(node):
+    yield node["Node Type"]
+    for child in node.get("Plans", []):
+        yield from _node_types(child)
+
+
+@pytest.mark.parametrize("dilation", [0, 1], ids=["plain", "dilated"])
+def test_the_bit_lazy_restriction_keeps_the_statement_parallel_safe(points, dilation):
+    """A CTE read more than once is materialized, and a CTE Scan is parallel restricted: the restricted statement
+    could then not run in parallel workers."""
+    conn, table = points
+    handler = _make_handler("bit", _connection_params(), f"lazypar_{uuid.uuid4().hex[:8]}")
+    try:
+        handler.set_cache("h1", set(range(1, 31)), "city_id")
+        handler.set_cache("h2", set(range(5, 26)), "city_id")
+        lazy_subquery, used = handler.get_intersected_dilated_lazy({"h1", "h2"}, "city_id", dilation)
+        assert lazy_subquery is not None and used == 2
+        statement = extend_query_with_partition_keys_lazy(f"SELECT p.id FROM {table} AS p", lazy_subquery, "city_id", method="IN_SUBQUERY", p0_alias="p")
+
+        plan = _parallel_plan(conn, statement)
+
+        assert "CTE Scan" not in set(_node_types(plan))
+        assert plan["Node Type"] in ("Gather", "Gather Merge")
+    finally:
+        for key in ("h1", "h2"):
+            handler.delete(key, "city_id")
+        handler.close()

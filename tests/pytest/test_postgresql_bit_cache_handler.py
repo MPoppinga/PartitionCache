@@ -1,10 +1,12 @@
 from unittest.mock import Mock, PropertyMock, patch
 
 import pytest
+import sqlglot
 from psycopg import sql
 from psycopg.pq import TransactionStatus
+from sqlglot import exp
 
-from partitioncache.cache_handler.abstract import AbstractCacheHandler_Lazy
+from partitioncache.cache_handler.abstract import LAZY_ALL_KEYS_PLACEHOLDER, AbstractCacheHandler_Lazy
 from partitioncache.cache_handler.postgresql_bit import PostgreSQLBitCacheHandler
 
 INIT_CALLS = [
@@ -229,7 +231,25 @@ def test_lazy_intersection_copies_the_bit_and_result_before_get_bit(cache_handle
     query, count = cache_handler.get_intersected_lazy(keys)
     assert count == len(keys)
     assert "SELECT BIT_AND(partition_keys) || B'' AS bit_result FROM" in query
-    assert "get_bit(bit_result, bit_index) = 1" in query
+    assert "get_bit(bit_result, bit_index)" in query
+
+
+def _cte_reference_counts(query: str) -> dict[str, int]:
+    """How often each CTE of ``query`` is read."""
+    tree = sqlglot.parse_one(query.replace(LAZY_ALL_KEYS_PLACEHOLDER, "NULL"), read="postgres")
+    names = [cte.alias_or_name for cte in tree.find_all(exp.CTE)]
+    return {name: sum(1 for table in tree.find_all(exp.Table) if table.name == name and not table.db) for name in names}
+
+
+@pytest.mark.parametrize("dilation", [0, 2], ids=["plain", "dilated"])
+def test_lazy_intersection_reads_each_cte_once(cache_handler, dilation):
+    """PostgreSQL materializes a CTE that is read more than once. A CTE Scan is parallel restricted, so the statement
+    the lazy subquery is embedded in could no longer run in parallel workers."""
+    cache_handler.filter_existing_keys = Mock(return_value={"key1", "key2"})
+    query, count = cache_handler.get_intersected_dilated_lazy({"key1", "key2"}, "partition_key", dilation)
+    assert count == 2
+    counts = _cte_reference_counts(query)
+    assert counts and all(n == 1 for n in counts.values()), counts
 
 
 def test_get_all_keys(cache_handler):
