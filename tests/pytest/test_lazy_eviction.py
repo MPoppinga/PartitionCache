@@ -264,15 +264,17 @@ def test_array_keys_of_other_types_are_restricted_and_fall_back(method, datatype
 
 
 def _parallel_plan(conn, statement):
-    """The plan of ``statement`` with debug_parallel_query on: its top node is a Gather only if the whole plan is parallel safe."""
+    """The server version and the plan of ``statement`` with debug_parallel_query on: its top node is a Gather only if
+    the whole plan is parallel safe."""
     with conn.cursor() as cur:
         cur.execute("SELECT current_setting('server_version_num')::int")
-        setting = "debug_parallel_query" if cur.fetchone()[0] >= 160000 else "force_parallel_mode"
+        version = cur.fetchone()[0]
+        setting = "debug_parallel_query" if version >= 160000 else "force_parallel_mode"
         cur.execute(f"SET LOCAL {setting} = on")
         cur.execute("EXPLAIN (FORMAT JSON) " + statement)
         plan = cur.fetchone()[0][0]["Plan"]
     conn.rollback()
-    return plan
+    return version, plan
 
 
 def _node_types(node):
@@ -294,10 +296,11 @@ def test_the_bit_lazy_restriction_keeps_the_statement_parallel_safe(points, dila
         assert lazy_subquery is not None and used == 2
         statement = extend_query_with_partition_keys_lazy(f"SELECT p.id FROM {table} AS p", lazy_subquery, "city_id", method="IN_SUBQUERY", p0_alias="p")
 
-        plan = _parallel_plan(conn, statement)
+        version, plan = _parallel_plan(conn, statement)
 
         assert "CTE Scan" not in set(_node_types(plan))
-        assert plan["Node Type"] in ("Gather", "Gather Merge")
+        if version >= 170000:  # before PostgreSQL 17 a plan node with an InitPlan is never parallel safe
+            assert plan["Node Type"] in ("Gather", "Gather Merge")
     finally:
         for key in ("h1", "h2"):
             handler.delete(key, "city_id")
