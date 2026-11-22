@@ -284,24 +284,41 @@ def _node_types(node):
 
 
 @pytest.mark.parametrize("dilation", [0, 1], ids=["plain", "dilated"])
-def test_the_bit_lazy_restriction_keeps_the_statement_parallel_safe(points, dilation):
-    """A CTE read more than once is materialized, and a CTE Scan is parallel restricted: the restricted statement
-    could then not run in parallel workers."""
+def test_the_lazy_restriction_keeps_the_statement_parallel_safe(points, handler, dilation):
+    """A CTE read more than once is materialized, and a CTE Scan is parallel restricted; a parallel unsafe function
+    keeps the whole statement from a parallel plan. Either way the restricted statement could not run in parallel workers."""
+    if dilation and not hasattr(handler, "get_intersected_dilated_lazy"):
+        pytest.skip(f"{type(handler).__name__} has no lazy dilated intersection")
     conn, table = points
-    handler = _make_handler("bit", _connection_params(), f"lazypar_{uuid.uuid4().hex[:8]}")
-    try:
-        handler.set_cache("h1", set(range(1, 31)), "city_id")
-        handler.set_cache("h2", set(range(5, 26)), "city_id")
+    handler.set_cache("h1", set(range(1, 31)), "city_id")
+    handler.set_cache("h2", set(range(5, 26)), "city_id")
+    if dilation:
         lazy_subquery, used = handler.get_intersected_dilated_lazy({"h1", "h2"}, "city_id", dilation)
-        assert lazy_subquery is not None and used == 2
-        statement = extend_query_with_partition_keys_lazy(f"SELECT p.id FROM {table} AS p", lazy_subquery, "city_id", method="IN_SUBQUERY", p0_alias="p")
+    else:
+        lazy_subquery, used = handler.get_intersected_lazy({"h1", "h2"}, "city_id")
+    assert lazy_subquery is not None and used == 2
+    statement = extend_query_with_partition_keys_lazy(f"SELECT p.id FROM {table} AS p", lazy_subquery, "city_id", method="IN_SUBQUERY", p0_alias="p")
 
-        version, plan = _parallel_plan(conn, statement)
+    version, plan = _parallel_plan(conn, statement)
 
-        assert "CTE Scan" not in set(_node_types(plan))
-        if version >= 170000:  # before PostgreSQL 17 a plan node with an InitPlan is never parallel safe
-            assert plan["Node Type"] in ("Gather", "Gather Merge")
+    assert "CTE Scan" not in set(_node_types(plan))
+    from partitioncache.cache_handler.postgresql_array import PostgreSQLArrayCacheHandler
+
+    # The dilated intersection of postgresql_array is an INTERSECT, which PostgreSQL does not plan in parallel
+    intersect =dilation and isinstance(handler, PostgreSQLArrayCacheHandler)
+    if version >= 170000 and not intersect:  # before PostgreSQL 17 a plan node with an InitPlan is never parallel safe
+        assert plan["Node Type"] in ("Gather", "Gather Merge")
+
+
+def test_the_array_intersection_aggregate_is_parallel_safe():
+    """Checked in the catalog, as before PostgreSQL 17 the lazy subquery's InitPlan hides it from the plan."""
+    params = _connection_params()
+    handler = _make_handler("array_aggregate", params, f"lazypar_{uuid.uuid4().hex[:8]}")
+    try:
+        if not handler.array_intersect_agg_available:
+            pytest.skip("array_intersect_agg not available")
+        handler.cursor.execute("SELECT proname, proparallel FROM pg_proc WHERE proname IN ('array_intersect_agg', '_array_intersect') ORDER BY 1")
+        assert handler.cursor.fetchall() == [("_array_intersect", "s"), ("array_intersect_agg", "s")]
+        handler.db.rollback()
     finally:
-        for key in ("h1", "h2"):
-            handler.delete(key, "city_id")
         handler.close()

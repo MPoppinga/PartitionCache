@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.1.3
+
+### Fixed
+
+- `postgresql_array`: the intersection aggregate `array_intersect_agg` and its state function `_array_intersect` are
+  `PARALLEL SAFE`. They were parallel unsafe, so a statement restricted with the lazy subquery of the aggregate path
+  got no parallel plan at all, on every PostgreSQL version. The generated SQL is unchanged; an existing database gets
+  the new definitions when a handler connects, as the handler recreates both on every start.
+
 ## 1.1.2
 
 ### Fixed
