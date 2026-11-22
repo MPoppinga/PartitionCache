@@ -539,15 +539,17 @@ BEGIN
                     WHEN $2 IS NULL THEN $1
                     ELSE ARRAY(SELECT unnest($1) INTERSECT SELECT unnest($2) ORDER BY 1)
                 END;
-            $func$ LANGUAGE sql IMMUTABLE;
+            $func$ LANGUAGE sql IMMUTABLE PARALLEL SAFE;
         ';
-        
-        -- Drop and recreate the aggregate
+
+        -- Drop and recreate the aggregate; PARALLEL SAFE, as an unsafe function keeps the whole statement that calls
+        -- it (a lazy restriction) from a parallel plan
         EXECUTE 'DROP AGGREGATE IF EXISTS array_intersect_agg(anyarray)';
         EXECUTE '
             CREATE AGGREGATE array_intersect_agg(anyarray) (
                 SFUNC = _array_intersect,
-                STYPE = anyarray
+                STYPE = anyarray,
+                PARALLEL = SAFE
             );
         ';
         v_aggregate_created := true;
