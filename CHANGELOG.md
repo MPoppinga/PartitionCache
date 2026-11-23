@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.1.4
+
+### Fixed
+
+- Fragments of queries with a PostgreSQL array constructor are valid SQL again. The query processor parsed and
+  rendered queries in sqlglot's default dialect, which writes `ARRAY['a', 'b']` as `ARRAY('a', 'b')`. PostgreSQL
+  rejects that, so every fragment that kept such a condition (`x ILIKE ANY (ARRAY[...])`, `x = ANY (ARRAY[...])`)
+  failed when it was populated and never reached the cache. Queries are now parsed and rendered in the PostgreSQL
+  dialect throughout variant generation and in the parts of `apply_cache` that compute variants.
+- Changed hashes: the fragment text, and so the hash, changes for every fragment with an array constructor (these
+  entries could not be populated before), and for fragments with constructs the two dialects render differently:
+  regex matches (`REGEXP_LIKE(a, 'p')` is now `a ~ 'p'`), casts to `float`, `real` and `double precision`, JSON
+  operators (`->>`), `^`, and `now()` with intervals. Cache entries of such fragments are not found anymore and are
+  repopulated. Fragments without these constructs keep their hashes.
+
 ## 1.1.3
 
 ### Fixed

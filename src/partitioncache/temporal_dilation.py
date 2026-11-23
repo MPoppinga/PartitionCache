@@ -192,7 +192,7 @@ def compute_temporal_window(query: str, temporal_column: str, partition_key: str
         The window in the unit of ``temporal_column``; 0.0 for a single alias, None if two aliases of the
         partition key's table are not connected by bounded time differences (then no dilation is sound).
     """
-    parsed = sqlglot.parse_one(query)
+    parsed = sqlglot.parse_one(query, read="postgres")
     if not isinstance(parsed, exp.Select):
         return None
     alias_to_table = {table.alias_or_name: table.name for table in _outer_tables(parsed)}

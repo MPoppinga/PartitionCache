@@ -20,10 +20,7 @@ import sqlglot.optimizer
 import sqlglot.optimizer.canonicalize
 import sqlglot.optimizer.normalize
 import sqlglot.optimizer.simplify
-from sqlglot import tokens
-from sqlglot.dialects.dialect import Dialect
 from sqlglot.errors import ParseError
-from sqlglot.tokens import TokenType
 
 import partitioncache.sqlglot_compat  # noqa: F401 -- keeps ST_Point/ST_MakePoint as parsed before sqlglot 26
 
@@ -57,19 +54,13 @@ def handle_deprecated_kwargs(kwargs: dict[str, Any], func_name: str) -> dict[str
     return result
 
 
+# Fragments are executed on PostgreSQL, so queries are parsed and rendered in its dialect. The default dialect
+# renders an array constructor ARRAY[...] as ARRAY(...), which PostgreSQL rejects.
+_DIALECT = "postgres"
+
 # An alias as the condition split recognises it: word characters, not starting with a digit
 _IDENTIFIER_RE = re.compile(r"[^\W\d]\w*")
 _ALIAS_REFERENCE_RE = re.compile(_IDENTIFIER_RE.pattern + r"(?=\.)")
-
-
-class _RegexMatchOperators(Dialect):
-    """The default dialect, with ``~`` read as PostgreSQL reads it: a regex match.
-
-    Only used for queries the default dialect rejects, because it loses the unary bitwise NOT ``~x``.
-    """
-
-    class Tokenizer(tokens.Tokenizer):
-        KEYWORDS = {**tokens.Tokenizer.KEYWORDS, "~": TokenType.RLIKE}
 
 
 def _as_regexp_like(node: exp.Expr) -> exp.Expr:
@@ -84,47 +75,36 @@ def _require_literal_patterns(parsed: exp.Expr, kinds: tuple[type[exp.Expr], ...
         pattern = match.expression
         if not (isinstance(pattern, exp.Literal) and pattern.is_string):
             raise ParseError(
-                f"Unsupported '{match.sql()}': PartitionCache reads '~' only as a regex match against a plain string "
+                f"Unsupported '{match.sql(dialect=_DIALECT)}': PartitionCache reads '~' only as a regex match against a plain string "
                 "literal (a.col ~ 'pattern'), not as a PostGIS bounding-box operator (a.geom ~ b.geom, a.geom ~ 'POINT(1 1)'::geometry)"
             )
 
 
 def normalize_regex_operators(query: str) -> str:
-    """Rewrite PostgreSQL's regex match operators into ``REGEXP_LIKE``.
+    """Rewrite the case-insensitive regex match ``a ~* 'p'`` into ``REGEXP_LIKE(a, 'p', 'i')``.
 
-    The default dialect rejects ``a ~ 'p'`` and ``a !~ 'p'``, and it reads ``a ~* 'p'`` but renders it as
-    ``REGEXP_I_LIKE``, which no database provides. These become ``REGEXP_LIKE(a, 'p')`` and
-    ``REGEXP_LIKE(a, 'p', 'i')``, negated with ``NOT``. Rendered for PostgreSQL they are ``~`` and ``~*`` again
-    (``sqlglot_compat`` keeps the flag); the default rendering, which the hashes use, needs PostgreSQL 15+.
-    Any other query is returned unchanged, so its hashes stay the same.
+    Rendered for PostgreSQL it is ``~*`` again (``sqlglot_compat`` keeps the flag). ``a ~ 'p'`` and ``a !~ 'p'`` are
+    kept as they are. Any query without ``~*`` is returned unchanged, so its hashes stay the same.
 
     Raises:
-        sqlglot.errors.ParseError: if the query does not parse with either reading, or if a regex match does not
-            compare against a plain string literal. PostGIS uses ``~`` and ``~=`` for bounding-box containment and
-            equality (``a.geom ~ b.geom``, ``a.geom ~ 'POINT(1 1)'::geometry``), which must not become a regex match.
+        sqlglot.errors.ParseError: if the query does not parse, or if a regex match does not compare against a plain
+            string literal. PostGIS uses ``~`` and ``~=`` for bounding-box containment and equality
+            (``a.geom ~ b.geom``, ``a.geom ~ 'POINT(1 1)'::geometry``), which must not become a regex match.
             ``apply_cache`` runs such queries without the cache, as before.
     """
     if "~" not in query:
         return query
-    try:
-        parsed = sqlglot.parse_one(query)
-    except ParseError as default_error:
-        try:
-            parsed = sqlglot.parse_one(query, read=_RegexMatchOperators)
-        except ParseError:
-            raise default_error from None
-        _require_literal_patterns(parsed, (exp.RegexpLike, exp.RegexpILike))
-    else:
-        if parsed.find(exp.RegexpILike) is None:
-            return query
-        _require_literal_patterns(parsed, (exp.RegexpILike,))
-    return parsed.transform(_as_regexp_like).sql()
+    parsed = sqlglot.parse_one(query, read=_DIALECT)
+    _require_literal_patterns(parsed, (exp.RegexpLike, exp.RegexpILike))
+    if parsed.find(exp.RegexpILike) is None:
+        return query
+    return parsed.transform(_as_regexp_like).sql(dialect=_DIALECT)
 
 
 def _has_alias_that_needs_quotes(query: str) -> bool:
     """True if a table of the outermost FROM clause has an alias (or, without one, a name) the condition split does not recognise."""
     try:
-        parsed = sqlglot.parse_one(query)
+        parsed = sqlglot.parse_one(query, read=_DIALECT)
     except Exception:
         return False
     select = parsed if isinstance(parsed, exp.Select) else parsed.find(exp.Select)
@@ -138,7 +118,7 @@ def _has_alias_that_needs_quotes(query: str) -> bool:
 def _has_with_clause(query: str) -> bool:
     """True if the query has a WITH clause anywhere; False also when it cannot be parsed."""
     try:
-        return sqlglot.parse_one(query).find(exp.With) is not None
+        return sqlglot.parse_one(query, read=_DIALECT).find(exp.With) is not None
     except Exception:
         return False
 
@@ -156,7 +136,7 @@ def _subquery_alias_conflict(query: str, variant_alias_re: re.Pattern[str] = _VA
     alias (the renamed reference would bind to the subquery's table).
     """
     try:
-        parsed = sqlglot.parse_one(query)
+        parsed = sqlglot.parse_one(query, read=_DIALECT)
     except Exception:
         return None
     outermost = parsed if isinstance(parsed, exp.Select) else parsed.find(exp.Select)
@@ -201,7 +181,7 @@ def query_contains_top_level_outer_join(query: str) -> bool:
         when the query cannot be parsed).
     """
     try:
-        parsed = sqlglot.parse_one(query)
+        parsed = sqlglot.parse_one(query, read=_DIALECT)
     except Exception:
         return False
 
@@ -244,7 +224,7 @@ def normalize_joins_to_cross_join(query: str) -> str:
         unchanged if it contains a top-level outer join.
     """
     try:
-        parsed = sqlglot.parse_one(query)
+        parsed = sqlglot.parse_one(query, read=_DIALECT)
     except Exception:
         return query
 
@@ -298,7 +278,7 @@ def normalize_joins_to_cross_join(query: str) -> str:
                     combined = exp.And(this=combined, expression=cond)
                 select.set("where", exp.Where(this=combined))
 
-    return parsed.sql()
+    return parsed.sql(dialect=_DIALECT)
 
 
 _WIDENING, _SET, _OTHER = "widening", "set", "other"
@@ -454,7 +434,7 @@ def _unaliased_quoted_table(query: str) -> str | None:
     Such a table is referenced by its name, which the alias handling treats as an alias and leaves unquoted.
     """
     try:
-        parsed = sqlglot.parse_one(query)
+        parsed = sqlglot.parse_one(query, read=_DIALECT)
     except Exception:
         return None
     for table in parsed.find_all(exp.Table):
@@ -462,7 +442,7 @@ def _unaliased_quoted_table(query: str) -> str | None:
             isinstance(part, exp.Identifier) and part.quoted and not _FOLDED_IDENTIFIER_RE.fullmatch(part.name)
             for part in (table.args.get("this"), table.args.get("db"), table.args.get("catalog"))
         ):
-            return table.sql()
+            return table.sql(dialect=_DIALECT)
     return None
 
 
@@ -506,7 +486,7 @@ def clean_query(query: str) -> str:
     query = normalize_joins_to_cross_join(query)
 
     # Parse the query
-    parsed = sqlglot.parse_one(query)
+    parsed = sqlglot.parse_one(query, read=_DIALECT)
 
     parsed = parsed.transform(_ordered_between)
 
@@ -540,7 +520,7 @@ def clean_query(query: str) -> str:
         if not (identifier.quoted and _needs_its_quotes(identifier)):
             identifier.set("quoted", False)
 
-    query = parsed.sql(comments=False)
+    query = parsed.sql(dialect=_DIALECT, comments=False)
 
     # Removing tailing semicolon
     query = re.sub(r";\s*$", "", query)
@@ -673,7 +653,7 @@ def extract_conjunctive_conditions(sql: str) -> list[str]:
     """
     Returns all conjunctive conditions from a query.
     """
-    parsed = sqlglot.parse_one(sql)
+    parsed = sqlglot.parse_one(sql, read=_DIALECT)
     where_clause = parsed.find(exp.Where)
     conditions = []
 
@@ -682,7 +662,7 @@ def extract_conjunctive_conditions(sql: str) -> list[str]:
             extract_conditions_from_expression(expression.left)
             extract_conditions_from_expression(expression.right)
         else:
-            conditions.append(expression.sql())
+            conditions.append(expression.sql(dialect=_DIALECT))
 
     if where_clause:
         extract_conditions_from_expression(where_clause.this)
@@ -693,7 +673,7 @@ def extract_conjunctive_conditions(sql: str) -> list[str]:
 def _unwrap_condition(condition: str) -> tuple[exp.Expr | None, bool]:
     """Parse a condition and strip parentheses and NOT; returns (node, negated) or (None, False) on parse errors."""
     try:
-        node = sqlglot.parse_one(condition)
+        node = sqlglot.parse_one(condition, read=_DIALECT)
     except Exception:
         return None, False
     negated = False
@@ -757,7 +737,7 @@ def _partition_key_subqueries(condition: str, table_aliases: list[str]) -> list[
     else:
         return []
     return [
-        branch.sql()
+        branch.sql(dialect=_DIALECT)
         for branch in _key_set_queries(query)
         if not any(column.table in table_aliases for column in branch.find_all(exp.Column))
     ]
@@ -782,7 +762,7 @@ def _is_partition_key_fk_join(condition: str, partition_key: str, table_aliases:
         on parse errors, non-equality conditions, or unknown aliases).
     """
     try:
-        parsed = sqlglot.parse_one(condition)
+        parsed = sqlglot.parse_one(condition, read=_DIALECT)
         if isinstance(parsed, exp.Paren):
             parsed = parsed.this
         if not isinstance(parsed, exp.EQ):
@@ -817,7 +797,7 @@ def _is_inequality_condition(condition: str) -> bool:
         on parse errors).
     """
     try:
-        parsed = sqlglot.parse_one(condition)
+        parsed = sqlglot.parse_one(condition, read=_DIALECT)
         if isinstance(parsed, exp.Paren):
             parsed = parsed.this
         return isinstance(parsed, exp.NEQ)
@@ -987,7 +967,7 @@ def extract_and_group_query_conditions(
         # Multi-reference, multi-alias, or zero-alias conditions need alias substitution
         # Filter against outer FROM aliases to exclude inner subquery table references
         all_alias: set = set(_ALIAS_REFERENCE_RE.findall(condition_refs)) & set(table_aliases)
-        parsed = sqlglot.parse_one(condition)
+        parsed = sqlglot.parse_one(condition, read=_DIALECT)
         # Keyed by the outer aliases only: an alias of a subquery inside the condition is in no combination
         table_identifiers = tuple(sorted(all_alias)) or tuple(sorted({col.table for col in parsed.find_all(exp.Column) if col.table}))
         # AND/OR are exp.Func subclasses since sqlglot 30; only real function calls count here
@@ -1403,12 +1383,12 @@ def generate_partial_queries(
     original_select_clause = pre_clean_select_clause
     if not strip_select and original_select_clause is None:
         try:
-            parsed_query = sqlglot.parse_one(query)
+            parsed_query = sqlglot.parse_one(query, read=_DIALECT)
             if parsed_query and parsed_query.find(exp.Select):
                 select_expr = parsed_query.find(exp.Select)
                 if select_expr and select_expr.expressions:
                     # Extract SELECT expressions (columns) without the SELECT keyword
-                    original_select_clause = ", ".join(expr.sql() for expr in select_expr.expressions)
+                    original_select_clause = ", ".join(expr.sql(dialect=_DIALECT) for expr in select_expr.expressions)
         except Exception as e:
             logger.warning(f"Failed to extract original SELECT clause: {e}. Falling back to stripped SELECT.")
             original_select_clause = None
@@ -1921,12 +1901,12 @@ def generate_partial_queries(
     result = []
     for q in ret:
         try:
-            parsed = sqlglot.parse_one(q)
+            parsed = sqlglot.parse_one(q, read=_DIALECT)
             simplified = sqlglot.optimizer.simplify.simplify(parsed)
             # The tree is discarded after rendering: without copy=False the generator deep-copies it first, which for
             # a statement with a long IN list was most of a lookup's time (copy only protects the caller's tree, the
             # text is the same)
-            sql_result = simplified.sql(copy=False)
+            sql_result = simplified.sql(dialect=_DIALECT, copy=False)
             result.append(sql_result)
         except Exception:
             # If parsing fails, skip this variant
@@ -2050,19 +2030,19 @@ def normalize_distance_conditions(
             return original_query
         allow_negative = False
 
-    parsed = sqlglot.parse_one(original_query)
+    parsed = sqlglot.parse_one(original_query, read=_DIALECT)
     where = parsed.args.get("where") if isinstance(parsed, exp.Select) else None
     if where is None:
-        return parsed.sql()
+        return parsed.sql(dialect=_DIALECT)
 
     def step_for(side: exp.Expr) -> Decimal | None:
         """Bucket width for comparisons of this expression, None if it is not bucketed."""
         while isinstance(side, exp.Paren):
             side = side.this
         if allow_negative:  # per-attribute steps
-            text = side.sql().lower()
+            text = side.sql(dialect=_DIALECT).lower()
             return next((v for k, v in per_attr.items() if k in text), None)
-        if not restrict_to_dist_functions or (isinstance(side, exp.Func) and is_distance_function(side.sql())):
+        if not restrict_to_dist_functions or (isinstance(side, exp.Func) and is_distance_function(side.sql(dialect=_DIALECT))):
             return steps
         return None
 
@@ -2110,7 +2090,7 @@ def normalize_distance_conditions(
         if bound is not None:
             func.expressions[2].replace(bound)
 
-    return parsed.sql()
+    return parsed.sql(dialect=_DIALECT)
 
 
 def normalize_attribute_conditions(query: str, bucket_steps: dict[str, float]) -> str:
@@ -2141,7 +2121,7 @@ def _add_constraints_to_query(query: str, add_constraints: dict[str, str]) -> st
         return query
 
     try:
-        parsed = sqlglot.parse_one(query)
+        parsed = sqlglot.parse_one(query, read=_DIALECT)
         select_stmt = parsed if isinstance(parsed, exp.Select) else parsed.find(exp.Select)
         if not select_stmt:
             return query
@@ -2152,7 +2132,7 @@ def _add_constraints_to_query(query: str, add_constraints: dict[str, str]) -> st
                 continue
             try:
                 # Detached from the helper SELECT, so only columns inside subqueries of the constraint have a SELECT ancestor
-                constraint_expr = sqlglot.parse_one(f"SELECT * FROM t WHERE {add_constraints[table.name]}").args["where"].this.copy()
+                constraint_expr = sqlglot.parse_one(f"SELECT * FROM t WHERE {add_constraints[table.name]}", read=_DIALECT).args["where"].this.copy()
             except Exception as e:
                 logger.warning(f"Failed to parse constraint '{add_constraints[table.name]}': {e}")
                 continue
@@ -2187,10 +2167,10 @@ def _add_constraints_to_query(query: str, add_constraints: dict[str, str]) -> st
         for constraint_expr in new_constraints:
             conjuncts.extend(constraint_expr.flatten() if isinstance(constraint_expr, exp.And) else [constraint_expr])
         # An OR conjunct keeps its parentheses, as in generated variants; joined with AND it would otherwise bind differently
-        texts = sorted({(exp.paren(c, copy=False) if isinstance(c, exp.Or) else c).sql() for c in conjuncts})
-        select_stmt.set("where", exp.Where(this=sqlglot.parse_one(f"SELECT * FROM t WHERE {' AND '.join(texts)}").args["where"].this))
+        texts = sorted({(exp.paren(c, copy=False) if isinstance(c, exp.Or) else c).sql(dialect=_DIALECT) for c in conjuncts})
+        select_stmt.set("where", exp.Where(this=sqlglot.parse_one(f"SELECT * FROM t WHERE {' AND '.join(texts)}", read=_DIALECT).args["where"].this))
         simplified: exp.Expr = sqlglot.optimizer.simplify.simplify(parsed)
-        return simplified.sql()
+        return simplified.sql(dialect=_DIALECT)
     except Exception as e:
         logger.warning(f"Failed to add constraints to query: {e}")
         return query
@@ -2286,20 +2266,20 @@ def _remove_orphaned_tables(parsed: exp.Expr) -> exp.Expr:
         if not referenced or not (referenced & orphaned):
             new_conditions.append(condition)
 
-    select_clause = ", ".join(expr.sql() for expr in select.expressions)
+    select_clause = ", ".join(expr.sql(dialect=_DIALECT) for expr in select.expressions)
     distinct_keyword = "DISTINCT " if select.args.get("distinct") else ""
-    from_parts = [t.sql() for _, t in kept_tables]
+    from_parts = [t.sql(dialect=_DIALECT) for _, t in kept_tables]
     sql = f"SELECT {distinct_keyword}{select_clause} FROM {', '.join(from_parts)}"
     if new_conditions:
-        where_parts = [c.sql() for c in new_conditions]
+        where_parts = [c.sql(dialect=_DIALECT) for c in new_conditions]
         sql += f" WHERE {' AND '.join(where_parts)}"
 
     for clause_name in ["group", "order", "limit", "having"]:
         clause = select.args.get(clause_name)
         if clause:
-            sql += f" {clause.sql()}"
+            sql += f" {clause.sql(dialect=_DIALECT)}"
 
-    return sqlglot.parse_one(sql)
+    return sqlglot.parse_one(sql, read=_DIALECT)
 
 
 def _remove_constraints_from_query(query: str, attributes_to_remove: list[str]) -> str:
@@ -2317,7 +2297,7 @@ def _remove_constraints_from_query(query: str, attributes_to_remove: list[str]) 
         return query
 
     try:
-        parsed = sqlglot.parse_one(query)
+        parsed = sqlglot.parse_one(query, read=_DIALECT)
 
         # Function to check if an expression contains any of the attributes to remove
         def contains_attribute(expr, attrs):
@@ -2359,7 +2339,7 @@ def _remove_constraints_from_query(query: str, attributes_to_remove: list[str]) 
         # Remove orphaned tables (tables with no remaining conditions connecting them)
         parsed = _remove_orphaned_tables(parsed)
 
-        return parsed.sql()
+        return parsed.sql(dialect=_DIALECT)
     except Exception as e:
         logger.warning(f"Failed to remove constraints from query: {e}")
         return query
@@ -2580,12 +2560,12 @@ def generate_all_query_hash_pairs(
     pre_clean_select_clause: str | None = None
     if not strip_select:
         try:
-            _parsed = sqlglot.parse_one(query)
+            _parsed = sqlglot.parse_one(query, read=_DIALECT)
             _sel = _parsed.find(exp.Select) if not isinstance(_parsed, exp.Select) else _parsed
             if _sel and _sel.expressions and not (len(_sel.expressions) == 1 and isinstance(_sel.expressions[0], exp.Star)):
                 # Without comments: a comment such as "-- user's name" holds a quote that would read as the
                 # start of a string literal and stop alias renaming; comments also do not belong in hashes
-                pre_clean_select_clause = ", ".join(e.sql(comments=False) for e in _sel.expressions)
+                pre_clean_select_clause = ", ".join(e.sql(dialect=_DIALECT, comments=False) for e in _sel.expressions)
         except Exception:
             pre_clean_select_clause = None
 
@@ -2594,7 +2574,7 @@ def generate_all_query_hash_pairs(
     # (when skip_partition_key_joins=False, equijoins are generated so t1 is always valid)
     if partition_key_source_table is None and skip_partition_key_joins:
         try:
-            partition_key_source_table = _key_source_from_select(sqlglot.parse_one(query), partition_key)
+            partition_key_source_table = _key_source_from_select(sqlglot.parse_one(query, read=_DIALECT), partition_key)
         except Exception:
             pass
 
@@ -2683,9 +2663,9 @@ def generate_all_query_hash_pairs(
         # Not needed if the query is already canonicalized (e.g. if the query is always generated by the same functions)
         can_query_set = set()
         for baseq in query_set:  # TODO Performance needs to be improved
-            sqlglot_query = sqlglot.parse_one(baseq)
+            sqlglot_query = sqlglot.parse_one(baseq, read=_DIALECT)
             nquery = sqlglot.optimizer.canonicalize.canonicalize(sqlglot_query)
-            q = nquery.sql(copy=False)
+            q = nquery.sql(dialect=_DIALECT, copy=False)
             can_query_set.add(q)
         pairs = [(q, hash_query(q)) for q in can_query_set]
     else:
@@ -2731,7 +2711,7 @@ def variant_size(query: str) -> tuple[int, int] | None:
     The conditions are the conjuncts of the outer WHERE.
     """
     try:
-        select = sqlglot.parse_one(query)
+        select = sqlglot.parse_one(query, read=_DIALECT)
     except sqlglot.ParseError:
         return None
     if not isinstance(select, exp.Select):
@@ -2891,7 +2871,7 @@ def _distance_predicate(node: exp.Expr) -> tuple[str, str, float | None] | None:
 def _is_distance_comparison(node: exp.Expr) -> bool:
     """Whether ``node`` compares a distance-like expression of two aliases (:func:`is_distance_function`) with a bound."""
     sides = _comparison_sides(node)
-    if sides is None or sides[0].find(exp.Select) is not None or not is_distance_function(sides[0].sql()):
+    if sides is None or sides[0].find(exp.Select) is not None or not is_distance_function(sides[0].sql(dialect=_DIALECT)):
         return False
     aliases = {column.table for column in sides[0].find_all(exp.Column)}
     return len(aliases) == 2 and "" not in aliases

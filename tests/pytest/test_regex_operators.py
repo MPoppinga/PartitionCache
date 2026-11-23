@@ -1,4 +1,4 @@
-"""PostgreSQL regex match operators (~, !~, ~*, !~*) in queries: read, rewritten to REGEXP_LIKE, and hashed."""
+"""PostgreSQL regex match operators (~, !~, ~*, !~*) in queries: read and hashed in the PostgreSQL dialect."""
 
 from __future__ import annotations
 
@@ -16,14 +16,14 @@ BASE = "SELECT * FROM t AS a WHERE "
 @pytest.mark.parametrize(
     ("condition", "expected"),
     [
-        ("a.x ~ '^Bio'", "REGEXP_LIKE(a.x, '^Bio')"),
-        ("a.x !~ '^Bio'", "NOT REGEXP_LIKE(a.x, '^Bio')"),
-        ("a.x ~* 'bio'", "REGEXP_LIKE(a.x, 'bio', 'i')"),
-        ("a.x !~* 'bio'", "NOT REGEXP_LIKE(a.x, 'bio', 'i')"),
-        ("a.x ~ '^Bio' AND a.y LIKE 'a~b'", "REGEXP_LIKE(a.x, '^Bio') AND a.y LIKE 'a~b'"),
+        ("a.x ~ '^Bio'", "a.x ~ '^Bio'"),
+        ("a.x !~ '^Bio'", "a.x !~ '^Bio'"),
+        ("a.x ~* 'bio'", "a.x ~* 'bio'"),
+        ("a.x !~* 'bio'", "NOT a.x ~* 'bio'"),
+        ("a.x ~ '^Bio' AND a.y LIKE 'a~b'", "a.x ~ '^Bio' AND a.y LIKE 'a~b'"),
     ],
 )
-def test_regex_operators_become_regexp_like(condition: str, expected: str) -> None:
+def test_regex_operators_stay_postgresql_operators(condition: str, expected: str) -> None:
     assert normalize_regex_operators(BASE + condition) == BASE + expected
 
 
@@ -52,11 +52,11 @@ KW = {"partition_key": "spatial", "geometry_column": "geom", "skip_partition_key
 
 
 def test_regex_query_generates_the_hashes_of_its_regexp_like_form() -> None:
-    """a ~ 'p' and REGEXP_LIKE(a, 'p') share cache entries; ~* gets fragments PostgreSQL can execute."""
+    """a ~ 'p' and REGEXP_LIKE(a, 'p') share cache entries, both rendered as PostgreSQL's ~; so do ~* and the flag 'i'."""
     tilde = generate_all_query_hash_pairs(SPATIAL.format(cond="p1.name ~ '^Bio'"), warn_no_partition_key=False, **KW)
     explicit = generate_all_query_hash_pairs(SPATIAL.format(cond="REGEXP_LIKE(p1.name, '^Bio')"), warn_no_partition_key=False, **KW)
     assert tilde and sorted(tilde) == sorted(explicit)
-    assert any("REGEXP_LIKE(t1.name, '^Bio')" in q for q, _ in tilde)
+    assert any("t1.name ~ '^Bio'" in q for q, _ in tilde)
 
     insensitive = generate_all_hashes(SPATIAL.format(cond="p1.name ~* 'bio'"), **KW)
     assert set(insensitive) == set(generate_all_hashes(SPATIAL.format(cond="REGEXP_LIKE(p1.name, 'bio', 'i')"), **KW))

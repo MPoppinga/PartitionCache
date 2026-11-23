@@ -13,7 +13,7 @@ Other dialects (e.g. DuckDB, whose spatial extension expects ``ST_Point``) are l
 Second, sqlglot renders ``REGEXP_LIKE(a, 'p', 'i')`` for PostgreSQL as ``a ~ 'p'``: the flag is lost and the
 case-insensitive match becomes case-sensitive, which drops rows from queries rendered for PostgreSQL (the lazy
 cache paths). The PostgreSQL rendering keeps it: ``~*`` for the flag ``i``, the ``REGEXP_LIKE`` function
-(PostgreSQL 15+) for any other flag. The default rendering, which the hashes use, is unchanged.
+(PostgreSQL 15+) for any other flag.
 """
 
 from sqlglot import exp

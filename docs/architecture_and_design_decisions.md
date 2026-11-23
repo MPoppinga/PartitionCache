@@ -205,16 +205,13 @@ The correctness invariant maintained throughout is: *every generated query varia
 
 Before that, `generate_all_query_hash_pairs`, `apply_cache` and `apply_cache_lazy` pass the query through `src/partitioncache/query_processor.py::normalize_regex_operators`.
 
-- It rewrites PostgreSQL's regex match operators into `REGEXP_LIKE`, which needs PostgreSQL 15 or later:
-  - `a ~ 'p'` → `REGEXP_LIKE(a, 'p')`
-  - `a ~* 'p'` → `REGEXP_LIKE(a, 'p', 'i')`
-  - `!~` and `!~*` → the same form negated with `NOT`
-- The default sqlglot dialect rejects `~`, and it renders `~*` as `REGEXP_I_LIKE`, a function no database provides.
-- A query without `~` is returned unchanged, so its hashes are unaffected.
+- Queries are parsed and rendered in sqlglot's PostgreSQL dialect, so PostgreSQL's regex match operators stay operators: `a ~ 'p'`, `a !~ 'p'` and `a ~* 'p'` keep their form, `a !~* 'p'` becomes `NOT a ~* 'p'`, and `REGEXP_LIKE(a, 'p')` is rendered as `a ~ 'p'`, so both spellings share cache entries.
+- A query without `~` is returned unchanged.
 - When the cache leaves a query unchanged (no hits, cost gate), `apply_cache` returns the caller's own text.
 - A regex match whose pattern is not a plain string literal is rejected as a `ParseError`, so `apply_cache` runs the query without the cache. PostGIS's bounding-box operators `a.geom ~ b.geom` and `a.geom ~ 'POINT(1 1)'::geometry` must not become regex matches.
-- Rendered for PostgreSQL, as the lazy paths do, `REGEXP_LIKE(a, 'p', 'i')` becomes `a ~* 'p'` again. `src/partitioncache/sqlglot_compat.py` patches sqlglot here, whose PostgreSQL rendering dropped the flag and made the match case-sensitive.
-- The default rendering, which the hashes and the non-lazy rewrite use, keeps `REGEXP_LIKE`. On PostgreSQL 14 or older, such an enhanced query fails (PostgreSQL 14 reaches end of life on 2026-11-12).
+- `REGEXP_LIKE(a, 'p', 'i')` is rendered as `a ~* 'p'`. `src/partitioncache/sqlglot_compat.py` patches sqlglot here, whose PostgreSQL rendering dropped the flag and made the match case-sensitive.
+
+The query processor parses and renders every query in sqlglot's PostgreSQL dialect, the dialect the fragments are executed in. sqlglot's default dialect renders constructs differently from PostgreSQL, e.g. the array constructor `ARRAY['a']` as `ARRAY('a')`, which PostgreSQL rejects, or the cast `::real` as `CAST(... AS FLOAT)`, which PostgreSQL reads as double precision.
 
 `clean_query` performs, in order:
 

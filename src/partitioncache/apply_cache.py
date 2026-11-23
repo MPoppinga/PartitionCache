@@ -116,11 +116,11 @@ def _query_over_aliases(query: str, aliases: set[str]) -> str | None:
     """The query reduced to the tables ``aliases`` name and the top-level conjuncts that reference no other table.
 
     Its variants are the variants of the query whose aliases all lie in ``aliases`` (or relaxations of them). It is
-    parsed and rendered in sqlglot's default dialect, the one variant generation reads. None for a query with an outer
+    parsed and rendered in the PostgreSQL dialect, the one variant generation reads. None for a query with an outer
     join or that is not one SELECT over tables.
     """
     try:
-        parsed = sqlglot.parse_one(query)
+        parsed = sqlglot.parse_one(query, read="postgres")
     except sqlglot.errors.ParseError:
         return None
     outer = _outer_table_aliases(parsed)
@@ -128,7 +128,7 @@ def _query_over_aliases(query: str, aliases: set[str]) -> str | None:
         return None
     others = set(outer) - aliases
     tables = [parsed.args["from_"].this] + [join.this for join in parsed.args.get("joins") or []]
-    kept_tables = [table.sql() for table in tables if table.alias_or_name in aliases]
+    kept_tables = [table.sql(dialect="postgres") for table in tables if table.alias_or_name in aliases]
     # Dropping a conjunct only relaxes the variants, so any conjunct whose tables are unclear is dropped
     kept = [
         conjunct.copy()
@@ -138,7 +138,7 @@ def _query_over_aliases(query: str, aliases: set[str]) -> str | None:
     if not kept_tables:
         return None
     reduced = f"SELECT * FROM {', '.join(kept_tables)}"
-    return reduced + f" WHERE {exp.and_(*kept).sql()}" if kept else reduced
+    return reduced + f" WHERE {exp.and_(*kept).sql(dialect='postgres')}" if kept else reduced
 
 
 def _restricts_p0_only(cache_handler: Any) -> bool:
@@ -270,7 +270,7 @@ def _first_branch_query(parsed: exp.Expr) -> str | None:
     with_ = parsed.args.get("with_")
     if with_ is not None and branch.args.get("with_") is None:
         branch.set("with_", with_.copy())
-    return branch.sql()
+    return branch.sql(dialect="postgres")
 
 
 def _variants_of_first_branch(query: str, hashes: list[str], generate: Callable[[str], list[str]]) -> bool:
@@ -282,7 +282,7 @@ def _variants_of_first_branch(query: str, hashes: list[str], generate: Callable[
     runs without the cache. ``generate`` returns the hashes of a query with the lookup's settings.
     """
     try:
-        parsed = sqlglot.parse_one(query)
+        parsed = sqlglot.parse_one(query, read="postgres")
     except sqlglot.errors.ParseError:
         return True  # the variant generation parsed it; a parse error here leaves the decision to it
     if not isinstance(parsed, exp.SetOperation) or not hashes:
@@ -303,7 +303,7 @@ def _restricted_alias_source(query: str, partition_key: str, alias: str | None, 
     As the variant generation names the source it reads from a query's SELECT: the table name when the table occurs once
     among the tables of the restricted SELECT's FROM and JOIN clauses, else the alias.
     """
-    parsed = sqlglot.parse_one(query)
+    parsed = sqlglot.parse_one(query, read="postgres")
     if alias is None:
         alias = find_p0_alias(query, partition_key, auto_detect_partition_join, partition_join_table)
     items = [clause.this for clause in _from_clauses(parsed)]
@@ -424,7 +424,7 @@ def get_partition_keys(
     if _is_temporal(temporal_bucket_width, dilation_buckets):
         skip_partition_key_joins = True
     elif skip_partition_key_joins and geometry_column is None and partition_key_source_table is None:
-        if _key_source_from_select(sqlglot.parse_one(query), partition_key) is None:
+        if _key_source_from_select(sqlglot.parse_one(query, read="postgres"), partition_key) is None:
             # Without key joins only the variants of one alias's key are sound; without a key in the SELECT, the p0 alias's
             partition_key_source_table = _restricted_alias_source(query, partition_key, None, auto_detect_partition_join, partition_join_table)
             if partition_key_source_table is None:
@@ -556,7 +556,7 @@ def get_partition_keys_lazy(
     if _is_temporal(temporal_bucket_width, dilation_buckets):
         skip_partition_key_joins = True
     elif skip_partition_key_joins and geometry_column is None and partition_key_source_table is None:
-        if _key_source_from_select(sqlglot.parse_one(query), partition_key) is None:
+        if _key_source_from_select(sqlglot.parse_one(query, read="postgres"), partition_key) is None:
             # Without key joins only the variants of one alias's key are sound; without a key in the SELECT, the p0 alias's
             partition_key_source_table = _restricted_alias_source(query, partition_key, None, auto_detect_partition_join, partition_join_table)
             if partition_key_source_table is None:
@@ -612,7 +612,7 @@ def find_p0_alias(query: str, partition_key: str, auto_detect_partition_join: bo
         The alias to use for cache restrictions
     """
     # First check if query has tables at all
-    parsed_query = sqlglot.parse_one(query)
+    parsed_query = sqlglot.parse_one(query, read="postgres")
     first_table = parsed_query.find(exp.Table)
     if first_table is None:
         raise ValueError("No table found in query")
