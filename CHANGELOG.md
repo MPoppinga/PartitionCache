@@ -12,8 +12,10 @@
 - Changed hashes: the fragment text, and so the hash, changes for every fragment with an array constructor (these
   entries could not be populated before), and for fragments with constructs the two dialects render differently:
   regex matches (`REGEXP_LIKE(a, 'p')` is now `a ~ 'p'`), casts to `float`, `real` and `double precision`, JSON
-  operators (`->>`), `^`, and `now()` with intervals. Cache entries of such fragments are not found anymore and are
-  repopulated. Fragments without these constructs keep their hashes.
+  operators (`->>`), `^`, `now()` with intervals, and `IS NOT NULL` (the default dialect wrote `x IS NOT NULL` as
+  `NOT x IS NULL`). Because the conditions of a fragment are sorted by their text, such a condition can also move
+  within the fragment. Cache entries of such fragments are not found anymore and are repopulated. Fragments without
+  these constructs keep their hashes.
 
 ## 1.1.3
 
